@@ -10,5 +10,7 @@ classification = "extension"
 
 [dependencies]
 ndn-packet = { workspace = true, features = ["std"] }
+ndn-tlv    = { workspace = true, features = ["std"] }
+bytes      = { workspace = true, features = ["std"] }
 rand_core  = { version = "0.6", default-features = false, features = ["getrandom"] }
 thiserror  = { workspace = true }

@@ -26,7 +26,9 @@
 
 #![deny(missing_docs)]
 
+pub mod messages;
 pub mod names;
 pub mod tokens;
 
+pub use messages::{AckMessage, MsgError, RequestMessage, ResponseMessage, SelectionMessage};
 pub use tokens::{PendingCoordination, PendingProviderTokens, ProviderToken, TokenError};
