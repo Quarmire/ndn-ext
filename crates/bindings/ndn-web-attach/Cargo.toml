@@ -33,7 +33,7 @@ ndn-mgmt    = { workspace = true }
 ndn-config  = { workspace = true, features = ["mgmt"] }
 # Direct path + default-features = false (drop the SQLite PIB); see ndn-app's
 # Cargo.toml for why `workspace = true` can't carry default-features = false.
-ndn-security = { path = "../../../../ndn-rs/crates/security/ndn-security", default-features = false }
+ndn-security = { git = "https://github.com/Quarmire/ndn-rs", tag = "v0.1.0-alpha.1", default-features = false }
 
 # Still deferred (see lib.rs TODOs): ndn-face-shared-worker (SharedWorker tier),
 # WebTransport upstream dial for InPage, and a `web-sys` SharedWorker probe.

@@ -32,7 +32,7 @@ async-trait   = { workspace = true }
 ndn-config    = { workspace = true }
 ndn-mgmt-wire = { workspace = true }
 # default-features = false drops sqlite-pib so the web target stays wasm-safe.
-ndn-security  = { path = "../../../../ndn-rs/crates/security/ndn-security", default-features = false, features = ["custodian"] }
+ndn-security  = { git = "https://github.com/Quarmire/ndn-rs", tag = "v0.1.0-alpha.1", default-features = false, features = ["custodian"] }
 ndn-packet    = { workspace = true }
 ndn-tlv       = { workspace = true }
 # Native token-join (NDNCERT enrollment). Desktop/native only — pulled by the

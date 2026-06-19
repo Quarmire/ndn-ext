@@ -9,7 +9,7 @@ edition = "2024"
 # `RemoteSignerTransport`). The wasm/PWA path is a later phase.
 
 [dependencies]
-ndn-security = { path = "../../../../ndn-rs/crates/security/ndn-security", default-features = false, features = ["custodian"] }
+ndn-security = { git = "https://github.com/Quarmire/ndn-rs", tag = "v0.1.0-alpha.1", default-features = false, features = ["custodian"] }
 ndn-face-webrtc        = { workspace = true }
 ndn-rtc-signaling-relay = { workspace = true }
 bytes                  = { workspace = true, features = ["std"] }
