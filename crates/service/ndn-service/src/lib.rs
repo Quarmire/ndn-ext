@@ -42,6 +42,10 @@ pub use session::{
     RoleScopePolicy, ScopeKeyring, ScopedSession, ScopedSubscription, ScopedTopic, Session,
 };
 
+/// Key distribution: seal a member's role-scoped keyring to its X25519 key.
+pub mod key_dist;
+pub use key_dist::{open_keyring, provision_keyring};
+
 /// Tier-1 discovery-selection carrier: discover providers, select, invoke over an
 /// inner Tier-0 carrier.
 pub mod discovery_carrier;

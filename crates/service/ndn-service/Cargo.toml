@@ -29,6 +29,8 @@ ndn-sync         = { workspace = true }
 tokio            = { workspace = true, features = ["sync"] }
 # Tier-1 discovery-selection carrier (Carrier/SelectCarrier impls).
 async-trait      = { workspace = true }
+# Key distribution: seal a member's role-scoped keyring to its X25519 key.
+ndn-sealed-box   = { workspace = true }
 # KP-ABE key authority (issue_with_policy) for the policy→issuance bridge.
 ndn-nacabe       = { workspace = true, optional = true }
 # ServiceDiscoveryProtocol-backed ProviderDirectory (the `discovery` feature).
@@ -38,7 +40,6 @@ ndn-discovery    = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
 # End-to-end issuance-loop witness: master keys, content seal/open, recipient.
 ndn-nacabe = { workspace = true }
-ndn-sealed-box = { workspace = true }
 ndn-foundation-types = { workspace = true, features = ["std"] }
 # Discovery-carrier witness: inner Tier-0 carrier + a macro-defined service.
 ndn-rpc = { workspace = true }
