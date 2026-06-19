@@ -9,6 +9,7 @@
 //! (strategy, policy-epoch, assignment payload) extend the same loop.
 
 use bytes::Bytes;
+use ndn_packet::Name;
 use ndn_tlv::{TlvReader, TlvWriter};
 
 /// `RequestMessage` envelope.
@@ -24,8 +25,71 @@ const PAYLOAD: u64 = 151;
 const STATUS: u64 = 152;
 const ERROR_INFO: u64 = 153;
 const REQUEST_ID: u64 = 154;
+const STRATEGY: u64 = 155;
+const TARGET_IDENTITY: u64 = 161;
 const USER_TOKEN: u64 = 170;
 const PROVIDER_TOKEN: u64 = 171;
+const REQUEST_MODE: u64 = 189;
+const TLV_NAME: u64 = 0x07;
+
+/// Provider-selection strategy a user requests (NDNSF `StrategyType`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Strategy {
+    /// Select the first provider to ACK (default).
+    #[default]
+    FirstResponding,
+    /// Select a random provider among those that ACK.
+    RandomSelection,
+    /// Select every provider that ACKs.
+    AllSelected,
+}
+
+impl Strategy {
+    fn to_u8(self) -> u8 {
+        match self {
+            Strategy::FirstResponding => 0,
+            Strategy::RandomSelection => 1,
+            Strategy::AllSelected => 2,
+        }
+    }
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Strategy::RandomSelection,
+            2 => Strategy::AllSelected,
+            _ => Strategy::FirstResponding,
+        }
+    }
+}
+
+/// Request mode (NDNSF `RequestModeType`): the full four-phase exchange, or the
+/// Targeted fast path that skips ACK/SELECTION using a pre-shared token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum RequestMode {
+    /// REQUEST→ACK→SELECTION→RESPONSE (default).
+    #[default]
+    Normal,
+    /// Direct REQUEST→RESPONSE to a known provider with a pre-issued token.
+    Targeted,
+    /// Targeted invocation that also requests a fresh token batch.
+    TargetedBootstrap,
+}
+
+impl RequestMode {
+    fn to_u8(self) -> u8 {
+        match self {
+            RequestMode::Normal => 0,
+            RequestMode::Targeted => 1,
+            RequestMode::TargetedBootstrap => 2,
+        }
+    }
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => RequestMode::Targeted,
+            2 => RequestMode::TargetedBootstrap,
+            _ => RequestMode::Normal,
+        }
+    }
+}
 
 /// A malformed NDNSF message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -53,6 +117,12 @@ fn put_bytes(w: &mut TlvWriter, typ: u64, b: &[u8]) {
 fn put_bool(w: &mut TlvWriter, typ: u64, v: bool) {
     w.write_nested(typ, |i| i.write_raw(&[u8::from(v)]));
 }
+fn put_u8(w: &mut TlvWriter, typ: u64, v: u8) {
+    w.write_nested(typ, |i| i.write_raw(&[v]));
+}
+fn put_name(w: &mut TlvWriter, typ: u64, name: &Name) {
+    w.write_nested(typ, |i| i.write_raw(&name.encode_to_tlv()));
+}
 
 /// Read the inner sub-TLVs of a message envelope of type `expected`, returning
 /// `(type, value)` pairs for a caller to fold into a struct.
@@ -74,6 +144,15 @@ fn as_str(b: &Bytes) -> Result<String, MsgError> {
     String::from_utf8(b.to_vec()).map_err(|_| MsgError::Malformed)
 }
 
+fn as_name(b: &Bytes) -> Result<Name, MsgError> {
+    let mut r = TlvReader::new(b.clone());
+    let (typ, inner) = r.read_tlv().map_err(|_| MsgError::Malformed)?;
+    if typ != TLV_NAME {
+        return Err(MsgError::Malformed);
+    }
+    Name::decode(inner).map_err(|_| MsgError::Malformed)
+}
+
 /// Phase 1 — a user's service request.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RequestMessage {
@@ -83,6 +162,15 @@ pub struct RequestMessage {
     pub user_token: String,
     /// The request payload.
     pub payload: Bytes,
+    /// Provider-selection strategy the user requests.
+    pub strategy: Strategy,
+    /// Whether this is the full four-phase exchange or a Targeted fast path.
+    pub request_mode: RequestMode,
+    /// For a Targeted request, the intended provider.
+    pub target_provider: Option<Name>,
+    /// For a Targeted request, the pre-issued provider token presented directly
+    /// (empty in NormalRequest).
+    pub provider_token: String,
 }
 
 impl RequestMessage {
@@ -93,6 +181,12 @@ impl RequestMessage {
             put_str(i, REQUEST_ID, &self.request_id);
             put_str(i, USER_TOKEN, &self.user_token);
             put_bytes(i, PAYLOAD, &self.payload);
+            put_u8(i, STRATEGY, self.strategy.to_u8());
+            put_u8(i, REQUEST_MODE, self.request_mode.to_u8());
+            if let Some(tp) = &self.target_provider {
+                put_name(i, TARGET_IDENTITY, tp);
+            }
+            put_str(i, PROVIDER_TOKEN, &self.provider_token);
         });
         w.finish()
     }
@@ -104,6 +198,12 @@ impl RequestMessage {
                 REQUEST_ID => m.request_id = as_str(&val)?,
                 USER_TOKEN => m.user_token = as_str(&val)?,
                 PAYLOAD => m.payload = val,
+                STRATEGY => m.strategy = Strategy::from_u8(val.first().copied().unwrap_or(0)),
+                REQUEST_MODE => {
+                    m.request_mode = RequestMode::from_u8(val.first().copied().unwrap_or(0))
+                }
+                TARGET_IDENTITY => m.target_provider = Some(as_name(&val)?),
+                PROVIDER_TOKEN => m.provider_token = as_str(&val)?,
                 _ => {} // ignore unknown/optional fields
             }
         }
@@ -232,6 +332,25 @@ mod tests {
             request_id: "r1".into(),
             user_token: "utok".into(),
             payload: Bytes::from_static(b"do the thing"),
+            ..Default::default()
+        };
+        let decoded = RequestMessage::decode(m.encode()).unwrap();
+        assert_eq!(decoded, m);
+        // defaults are faithful: FirstResponding / Normal.
+        assert_eq!(decoded.strategy, Strategy::FirstResponding);
+        assert_eq!(decoded.request_mode, RequestMode::Normal);
+    }
+
+    #[test]
+    fn request_strategy_mode_target_round_trip() {
+        let m = RequestMessage {
+            request_id: "r2".into(),
+            user_token: "utok".into(),
+            payload: Bytes::new(),
+            strategy: Strategy::RandomSelection,
+            request_mode: RequestMode::Targeted,
+            target_provider: Some("/muas/bob".parse().unwrap()),
+            provider_token: "ptok".into(),
         };
         assert_eq!(RequestMessage::decode(m.encode()).unwrap(), m);
     }

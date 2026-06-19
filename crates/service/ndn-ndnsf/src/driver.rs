@@ -19,8 +19,10 @@ use ndn_packet::{Name, NameComponent};
 use ndn_sync::SvsPubSub;
 use tracing::instrument;
 
-use crate::flow::{ProviderEngine, make_request, make_selection};
-use crate::messages::{AckMessage, RequestMessage, ResponseMessage, SelectionMessage};
+use std::time::Duration;
+
+use crate::flow::{ProviderEngine, make_request, make_selection, select_providers};
+use crate::messages::{AckMessage, RequestMessage, ResponseMessage, SelectionMessage, Strategy};
 use crate::names;
 use crate::tokens::PendingCoordination;
 
@@ -177,4 +179,107 @@ pub async fn call(
             return ResponseMessage::decode(pubn.payload).ok().map(|r| r.payload);
         }
     }
+}
+
+/// Run the user side honoring a selection `strategy`: publish the REQUEST, gather
+/// ACKs (`FirstResponding` stops at the first; `RandomSelection`/`AllSelected`
+/// collect over `ack_window`), SELECT the chosen provider(s), and return each
+/// selected provider's `(name, response)`. The empty vec means no provider
+/// responded in time.
+#[allow(clippy::too_many_arguments)]
+#[instrument(skip(ps, payload), fields(requester = %requester, service = %service, strategy = ?strategy))]
+pub async fn select_and_call(
+    ps: &SvsPubSub,
+    requester: Name,
+    service: Name,
+    request_id: Name,
+    group_prefix: Name,
+    payload: Bytes,
+    user_token: &str,
+    strategy: Strategy,
+    ack_window: Duration,
+) -> Vec<(Name, Bytes)> {
+    let mut rx = ps.subscribe(group_prefix).await;
+
+    // Phase 1: REQUEST carrying the requested strategy.
+    let req = RequestMessage {
+        request_id: request_id.to_string(),
+        user_token: user_token.to_string(),
+        payload,
+        strategy,
+        ..Default::default()
+    };
+    if ps
+        .publish(names::request_name(&requester, &service, &request_id), req.encode().as_ref())
+        .await
+        .is_err()
+    {
+        return Vec::new();
+    }
+
+    // Phase 2: collect ACKs. FirstResponding stops at the first; the others
+    // gather every ACK that arrives within `ack_window`.
+    let mut acks: Vec<(Name, AckMessage)> = Vec::new();
+    let deadline = tokio::time::Instant::now() + ack_window;
+    loop {
+        if strategy == Strategy::FirstResponding && !acks.is_empty() {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Some(pubn)) => {
+                if phase_of(&pubn.name) == Some(Phase::Ack)
+                    && request_id_of(&pubn.name) == request_id
+                    && let Ok(ack) = AckMessage::decode(pubn.payload)
+                {
+                    acks.push((before_ndnsf(&pubn.name), ack));
+                }
+            }
+            _ => break, // window elapsed or group closed
+        }
+    }
+
+    // Phase 3: SELECT the provider(s) per strategy and send each a SELECTION.
+    let selected: Vec<(Name, AckMessage)> =
+        select_providers(strategy, &acks).into_iter().cloned().collect();
+    let want: Vec<Name> = selected.iter().map(|(p, _)| p.clone()).collect();
+    for (provider, ack) in &selected {
+        let sel = make_selection(ack, &request_id.to_string());
+        let _ = ps
+            .publish(
+                names::selection_name(&requester, provider, &service, &request_id),
+                sel.encode().as_ref(),
+            )
+            .await;
+    }
+
+    // Phase 4: collect one RESPONSE per selected provider, within the window.
+    let mut responses: Vec<(Name, Bytes)> = Vec::new();
+    let deadline = tokio::time::Instant::now() + ack_window;
+    while responses.len() < want.len() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Some(pubn)) => {
+                if phase_of(&pubn.name) == Some(Phase::Response)
+                    && request_id_of(&pubn.name) == request_id
+                {
+                    let provider = before_ndnsf(&pubn.name);
+                    if want.contains(&provider)
+                        && !responses.iter().any(|(p, _)| *p == provider)
+                        && let Ok(resp) = ResponseMessage::decode(pubn.payload)
+                    {
+                        responses.push((provider, resp.payload));
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+    responses
 }

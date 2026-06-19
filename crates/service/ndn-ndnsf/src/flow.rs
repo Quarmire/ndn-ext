@@ -16,9 +16,10 @@
 
 use bytes::Bytes;
 use ndn_packet::Name;
+use rand_core::{OsRng, RngCore};
 use tracing::instrument;
 
-use crate::messages::{AckMessage, RequestMessage, ResponseMessage, SelectionMessage};
+use crate::messages::{AckMessage, RequestMessage, ResponseMessage, SelectionMessage, Strategy};
 use crate::tokens::{PendingCoordination, PendingProviderTokens, ProviderToken, TokenError};
 
 /// A four-phase coordination failure on the provider side.
@@ -97,12 +98,35 @@ impl ProviderEngine {
     }
 }
 
+/// User-side provider selection (Phase 3 decision): given the providers that
+/// ACKed, pick which to SELECT per `strategy` — the first, a random one, or all.
+/// Pure (modulo the RNG for `RandomSelection`); the driver applies it after its
+/// ACK-collection window.
+pub fn select_providers(
+    strategy: Strategy,
+    acks: &[(Name, AckMessage)],
+) -> Vec<&(Name, AckMessage)> {
+    match strategy {
+        Strategy::FirstResponding => acks.first().into_iter().collect(),
+        Strategy::AllSelected => acks.iter().collect(),
+        Strategy::RandomSelection => {
+            if acks.is_empty() {
+                Vec::new()
+            } else {
+                let idx = (OsRng.next_u32() as usize) % acks.len();
+                vec![&acks[idx]]
+            }
+        }
+    }
+}
+
 /// Phase 1 — build a service request carrying a one-time user token.
 pub fn make_request(request_id: &str, user_token: &str, payload: Bytes) -> RequestMessage {
     RequestMessage {
         request_id: request_id.to_string(),
         user_token: user_token.to_string(),
         payload,
+        ..Default::default()
     }
 }
 
@@ -183,5 +207,45 @@ mod tests {
         });
         assert_eq!(result, Err(FlowError::TokenRejected(TokenError::Unknown)));
         assert!(!ran);
+    }
+
+    fn ack_from(provider: &str) -> (Name, AckMessage) {
+        (
+            name(provider),
+            AckMessage {
+                status: true,
+                provider_token: format!("tok{provider}"),
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn select_first_responding_picks_the_first() {
+        let acks = vec![ack_from("/p/a"), ack_from("/p/b")];
+        let sel = select_providers(Strategy::FirstResponding, &acks);
+        assert_eq!(sel.len(), 1);
+        assert_eq!(sel[0].0, name("/p/a"));
+    }
+
+    #[test]
+    fn select_all_picks_every_provider() {
+        let acks = vec![ack_from("/p/a"), ack_from("/p/b"), ack_from("/p/c")];
+        assert_eq!(select_providers(Strategy::AllSelected, &acks).len(), 3);
+    }
+
+    #[test]
+    fn select_random_picks_one_of_the_acks() {
+        let acks = vec![ack_from("/p/a"), ack_from("/p/b")];
+        let sel = select_providers(Strategy::RandomSelection, &acks);
+        assert_eq!(sel.len(), 1);
+        assert!(sel[0].0 == name("/p/a") || sel[0].0 == name("/p/b"));
+    }
+
+    #[test]
+    fn select_from_no_acks_is_empty() {
+        assert!(select_providers(Strategy::AllSelected, &[]).is_empty());
+        assert!(select_providers(Strategy::RandomSelection, &[]).is_empty());
+        assert!(select_providers(Strategy::FirstResponding, &[]).is_empty());
     }
 }

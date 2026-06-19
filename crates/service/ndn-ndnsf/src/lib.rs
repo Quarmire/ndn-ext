@@ -36,5 +36,7 @@ pub mod names;
 pub mod tokens;
 
 pub use flow::{FlowError, ProviderEngine, make_request, make_selection};
-pub use messages::{AckMessage, MsgError, RequestMessage, ResponseMessage, SelectionMessage};
+pub use messages::{
+    AckMessage, MsgError, RequestMessage, RequestMode, ResponseMessage, SelectionMessage, Strategy,
+};
 pub use tokens::{PendingCoordination, PendingProviderTokens, ProviderToken, TokenError};
