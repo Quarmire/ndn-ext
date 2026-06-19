@@ -26,9 +26,11 @@
 
 #![deny(missing_docs)]
 
+pub mod flow;
 pub mod messages;
 pub mod names;
 pub mod tokens;
 
+pub use flow::{FlowError, ProviderEngine, make_request, make_selection};
 pub use messages::{AckMessage, MsgError, RequestMessage, ResponseMessage, SelectionMessage};
 pub use tokens::{PendingCoordination, PendingProviderTokens, ProviderToken, TokenError};
