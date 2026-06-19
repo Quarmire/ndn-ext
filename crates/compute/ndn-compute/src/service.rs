@@ -28,7 +28,7 @@ use bytes::Bytes;
 use crate::codec::{ComputeArgs, ComputeValue};
 use crate::compute_face::ComputeFace;
 use crate::executor::ComputeExecutor;
-use crate::registry::{ComputeError, ComputeHandler, ComputeRegistry};
+use crate::{ComputeError, ComputeHandler, ComputeRegistry};
 use crate::thunk::Thunk;
 
 /// Freshness stamped on transparent function results, bounding how long the
@@ -102,10 +102,10 @@ impl ComputeContext {
         let data = consumer
             .fetch(name)
             .await
-            .map_err(|e| ComputeError::ComputeFailed(format!("parameter fetch: {e}")))?;
+            .map_err(|e| ComputeError::HandlerFailed(format!("parameter fetch: {e}")))?;
         data.content()
             .map(|b| Bytes::copy_from_slice(b))
-            .ok_or_else(|| ComputeError::ComputeFailed("parameter Data had no content".into()))
+            .ok_or_else(|| ComputeError::HandlerFailed("parameter Data had no content".into()))
     }
 
     /// Fetch `name` and return it only if its signature validates against
@@ -120,7 +120,7 @@ impl ComputeContext {
         consumer
             .fetch_verified(name, validator)
             .await
-            .map_err(|e| ComputeError::ComputeFailed(format!("parameter fetch/verify: {e}")))
+            .map_err(|e| ComputeError::HandlerFailed(format!("parameter fetch/verify: {e}")))
     }
 }
 
@@ -607,7 +607,7 @@ where
     F: Fn(A) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<O, ComputeError>> + Send,
 {
-    async fn compute(&self, interest: &Interest) -> Result<Data, ComputeError> {
+    async fn handle(&self, interest: &Interest) -> Result<Data, ComputeError> {
         let arg_comps = arg_components(
             interest.name.components(),
             self.prefix_len,
@@ -636,7 +636,7 @@ where
     F: Fn(A, ComputeContext) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<O, ComputeError>> + Send,
 {
-    async fn compute(&self, interest: &Interest) -> Result<Data, ComputeError> {
+    async fn handle(&self, interest: &Interest) -> Result<Data, ComputeError> {
         let arg_comps = arg_components(
             interest.name.components(),
             self.prefix_len,
@@ -662,9 +662,9 @@ where
     F: Fn(Bytes) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<O, ComputeError>> + Send,
 {
-    async fn compute(&self, interest: &Interest) -> Result<Data, ComputeError> {
+    async fn handle(&self, interest: &Interest) -> Result<Data, ComputeError> {
         let reflexive = interest.reflexive_name().ok_or_else(|| {
-            ComputeError::BadArguments("reflexive call missing reflexive name".into())
+            ComputeError::BadRequest("reflexive call missing reflexive name".into())
         })?;
         // Pull the parameters back along the reverse path the Interest arrived
         // on. The engine reverse-routes this to the consumer.
@@ -692,12 +692,12 @@ where
     F: Fn(Bytes) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<O, ComputeError>> + Send,
 {
-    async fn compute(&self, interest: &Interest) -> Result<Data, ComputeError> {
+    async fn handle(&self, interest: &Interest) -> Result<Data, ComputeError> {
         let reflexive = interest.reflexive_name().ok_or_else(|| {
-            ComputeError::BadArguments("reflexive call missing reflexive name".into())
+            ComputeError::BadRequest("reflexive call missing reflexive name".into())
         })?;
         let node = crate::sealed::NodeKeypair::generate()
-            .map_err(|e| ComputeError::ComputeFailed(e.to_string()))?;
+            .map_err(|e| ComputeError::HandlerFailed(e.to_string()))?;
         // Reverse Interest carries the node's ephemeral pubkey: R/params/<pubkey>.
         let param_name = (**reflexive)
             .clone()
@@ -706,7 +706,7 @@ where
         let blob = self.ctx.fetch(param_name).await?;
         let params = node
             .open(&blob)
-            .map_err(|e| ComputeError::ComputeFailed(format!("decrypt params: {e}")))?;
+            .map_err(|e| ComputeError::HandlerFailed(format!("decrypt params: {e}")))?;
         let out = (self.f)(Bytes::from(params)).await?;
         build_data((*interest.name).clone(), &out.encode(), None)
     }
@@ -729,12 +729,12 @@ where
     F: Fn(Bytes, Option<Name>) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<O, ComputeError>> + Send,
 {
-    async fn compute(&self, interest: &Interest) -> Result<Data, ComputeError> {
+    async fn handle(&self, interest: &Interest) -> Result<Data, ComputeError> {
         let reflexive = interest.reflexive_name().ok_or_else(|| {
-            ComputeError::BadArguments("reflexive call missing reflexive name".into())
+            ComputeError::BadRequest("reflexive call missing reflexive name".into())
         })?;
         let node = crate::sealed::NodeKeypair::generate()
-            .map_err(|e| ComputeError::ComputeFailed(e.to_string()))?;
+            .map_err(|e| ComputeError::HandlerFailed(e.to_string()))?;
         let param_name = (**reflexive)
             .clone()
             .append("params")
@@ -747,11 +747,11 @@ where
             _ => None,
         });
         let blob = safe.data().content().ok_or_else(|| {
-            ComputeError::ComputeFailed("sealed params Data had no content".into())
+            ComputeError::HandlerFailed("sealed params Data had no content".into())
         })?;
         let params = node
             .open(blob)
-            .map_err(|e| ComputeError::ComputeFailed(format!("decrypt params: {e}")))?;
+            .map_err(|e| ComputeError::HandlerFailed(format!("decrypt params: {e}")))?;
         let out = (self.f)(Bytes::from(params), signer).await?;
         build_data((*interest.name).clone(), &out.encode(), None)
     }
@@ -772,9 +772,9 @@ where
     F: Fn(Bytes, Option<Name>) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<O, ComputeError>> + Send,
 {
-    async fn compute(&self, interest: &Interest) -> Result<Data, ComputeError> {
+    async fn handle(&self, interest: &Interest) -> Result<Data, ComputeError> {
         let reflexive = interest.reflexive_name().ok_or_else(|| {
-            ComputeError::BadArguments("reflexive call missing reflexive name".into())
+            ComputeError::BadRequest("reflexive call missing reflexive name".into())
         })?;
         let param_name = (**reflexive).clone().append("params");
         // Validation gate: an unauthorized / unverifiable D2 fails here and the
@@ -788,7 +788,7 @@ where
             .data()
             .content()
             .map(|b| Bytes::copy_from_slice(b))
-            .ok_or_else(|| ComputeError::ComputeFailed("params Data had no content".into()))?;
+            .ok_or_else(|| ComputeError::HandlerFailed("params Data had no content".into()))?;
         let out = (self.f)(params, signer).await?;
         build_data((*interest.name).clone(), &out.encode(), None)
     }
@@ -802,7 +802,7 @@ fn arg_components(
     determinism: Determinism,
 ) -> Result<&[NameComponent], ComputeError> {
     if comps.len() < prefix_len {
-        return Err(ComputeError::BadArguments(
+        return Err(ComputeError::BadRequest(
             "name shorter than function prefix".into(),
         ));
     }
@@ -814,7 +814,7 @@ fn arg_components(
                 .checked_sub(1)
                 .filter(|end| *end >= prefix_len)
                 .ok_or_else(|| {
-                    ComputeError::BadArguments(
+                    ComputeError::BadRequest(
                         "opaque call missing trailing nonce component".into(),
                     )
                 })?;
@@ -833,7 +833,7 @@ fn build_data(
     if let Some(freshness) = freshness {
         builder = builder.freshness(freshness);
     }
-    Data::decode(builder.build()).map_err(|e| ComputeError::ComputeFailed(e.to_string()))
+    Data::decode(builder.build()).map_err(|e| ComputeError::HandlerFailed(e.to_string()))
 }
 
 /// Job invocation endpoint at `<prefix>`: starts the background computation on
@@ -855,7 +855,7 @@ where
     F: Fn(A) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<O, ComputeError>> + Send + 'static,
 {
-    async fn compute(&self, interest: &Interest) -> Result<Data, ComputeError> {
+    async fn handle(&self, interest: &Interest) -> Result<Data, ComputeError> {
         let comps = interest.name.components();
         let arg_comps = arg_components(comps, self.prefix_len, self.determinism)?;
         let args = A::from_components(arg_comps)?;
@@ -908,12 +908,12 @@ struct PollHandler {
 }
 
 impl ComputeHandler for PollHandler {
-    async fn compute(&self, interest: &Interest) -> Result<Data, ComputeError> {
+    async fn handle(&self, interest: &Interest) -> Result<Data, ComputeError> {
         let thunk_name = (*interest.name).clone();
         let state = self.jobs.lock().unwrap().get(&thunk_name).cloned();
         match state {
             Some(JobState::Done(bytes)) => build_data(thunk_name, &bytes, self.result_freshness),
-            Some(JobState::Failed(e)) => Err(ComputeError::ComputeFailed(e)),
+            Some(JobState::Failed(e)) => Err(ComputeError::HandlerFailed(e)),
             Some(JobState::Pending) => {
                 let thunk = Thunk {
                     thunk_name: thunk_name.clone(),

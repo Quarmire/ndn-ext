@@ -12,7 +12,7 @@
 use bytes::Bytes;
 use ndn_packet::NameComponent;
 
-use crate::registry::ComputeError;
+use crate::ComputeError;
 
 /// A single typed argument, carried as exactly one name component.
 pub trait ArgComponent: Sized {
@@ -43,7 +43,7 @@ fn parse_decimal<T: std::str::FromStr>(c: &NameComponent, what: &str) -> Result<
     std::str::from_utf8(&c.value)
         .ok()
         .and_then(|s| s.parse::<T>().ok())
-        .ok_or_else(|| ComputeError::BadArguments(format!("expected {what}")))
+        .ok_or_else(|| ComputeError::BadRequest(format!("expected {what}")))
 }
 
 macro_rules! impl_decimal_arg {
@@ -64,7 +64,7 @@ macro_rules! impl_decimal_arg {
                 std::str::from_utf8(bytes)
                     .ok()
                     .and_then(|s| s.parse::<$t>().ok())
-                    .ok_or_else(|| ComputeError::ComputeFailed(
+                    .ok_or_else(|| ComputeError::HandlerFailed(
                         concat!("result is not a ", stringify!($t)).into()))
             }
         }
@@ -79,7 +79,7 @@ impl ArgComponent for String {
     }
     fn from_component(c: &NameComponent) -> Result<Self, ComputeError> {
         String::from_utf8(c.value.to_vec())
-            .map_err(|_| ComputeError::BadArguments("argument is not UTF-8".into()))
+            .map_err(|_| ComputeError::BadRequest("argument is not UTF-8".into()))
     }
 }
 
@@ -89,7 +89,7 @@ impl ComputeValue for String {
     }
     fn decode(bytes: &[u8]) -> Result<Self, ComputeError> {
         String::from_utf8(bytes.to_vec())
-            .map_err(|_| ComputeError::ComputeFailed("result is not UTF-8".into()))
+            .map_err(|_| ComputeError::HandlerFailed("result is not UTF-8".into()))
     }
 }
 
@@ -139,7 +139,7 @@ impl<T: ArgComponent> ComputeArgs for T {
     fn from_components(comps: &[NameComponent]) -> Result<Self, ComputeError> {
         match comps {
             [only] => T::from_component(only),
-            _ => Err(ComputeError::BadArguments(format!(
+            _ => Err(ComputeError::BadRequest(format!(
                 "expected 1 argument component, got {}",
                 comps.len()
             ))),
@@ -154,7 +154,7 @@ impl<A: ArgComponent, B: ArgComponent> ComputeArgs for (A, B) {
     fn from_components(comps: &[NameComponent]) -> Result<Self, ComputeError> {
         match comps {
             [a, b] => Ok((A::from_component(a)?, B::from_component(b)?)),
-            _ => Err(ComputeError::BadArguments(format!(
+            _ => Err(ComputeError::BadRequest(format!(
                 "expected 2 argument components, got {}",
                 comps.len()
             ))),
@@ -177,7 +177,7 @@ impl<A: ArgComponent, B: ArgComponent, C: ArgComponent> ComputeArgs for (A, B, C
                 B::from_component(b)?,
                 C::from_component(c)?,
             )),
-            _ => Err(ComputeError::BadArguments(format!(
+            _ => Err(ComputeError::BadRequest(format!(
                 "expected 3 argument components, got {}",
                 comps.len()
             ))),

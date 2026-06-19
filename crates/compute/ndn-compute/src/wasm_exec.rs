@@ -13,7 +13,7 @@
 //! - `write_output(src_ptr: u32, len: u32)` — host copies `len` bytes of output
 //!   out of guest memory.
 //!
-//! A trap or fuel exhaustion surfaces as [`ComputeError::ComputeFailed`].
+//! A trap or fuel exhaustion surfaces as [`ComputeError::HandlerFailed`].
 
 use std::path::Path;
 
@@ -21,7 +21,7 @@ use anyhow::Result;
 use bytes::Bytes;
 
 use crate::executor::ComputeExecutor;
-use crate::registry::ComputeError;
+use crate::ComputeError;
 
 const ENTRY: &str = "compute";
 
@@ -88,23 +88,23 @@ impl ComputeExecutor for WasmExecutor {
         let mut store = wasmtime::Store::new(&self.engine, state);
         store
             .set_fuel(self.fuel)
-            .map_err(|e| ComputeError::ComputeFailed(format!("set_fuel: {e}")))?;
+            .map_err(|e| ComputeError::HandlerFailed(format!("set_fuel: {e}")))?;
 
         let instance = self
             .linker
             .instantiate(&mut store, &self.module)
-            .map_err(|e| ComputeError::ComputeFailed(format!("instantiate: {e}")))?;
+            .map_err(|e| ComputeError::HandlerFailed(format!("instantiate: {e}")))?;
         let func = instance
             .get_typed_func::<(), ()>(&mut store, ENTRY)
-            .map_err(|e| ComputeError::ComputeFailed(format!("export `{ENTRY}`: {e}")))?;
+            .map_err(|e| ComputeError::HandlerFailed(format!("export `{ENTRY}`: {e}")))?;
 
         func.call(&mut store, ())
-            .map_err(|e| ComputeError::ComputeFailed(format!("wasm trap: {e}")))?;
+            .map_err(|e| ComputeError::HandlerFailed(format!("wasm trap: {e}")))?;
 
         store
             .into_data()
             .output
-            .ok_or_else(|| ComputeError::ComputeFailed("guest produced no output".into()))
+            .ok_or_else(|| ComputeError::HandlerFailed("guest produced no output".into()))
     }
 }
 

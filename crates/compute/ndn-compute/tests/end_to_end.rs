@@ -361,7 +361,7 @@ async fn function_ref_pulls_parameter_by_reference() {
         |name: String, ctx: ComputeContext| async move {
             let pname: Name = name
                 .parse()
-                .map_err(|_| ComputeError::BadArguments("argument is not a name".into()))?;
+                .map_err(|_| ComputeError::BadRequest("argument is not a name".into()))?;
             let bytes = ctx.fetch(pname).await?;
             Ok::<u64, ComputeError>(bytes.iter().map(|&b| b as u64).sum())
         },

@@ -17,7 +17,7 @@ use ndn_packet::encode::InterestBuilder;
 use ndn_packet::{Name, NameComponent};
 
 use crate::codec::{ComputeArgs, ComputeValue};
-use crate::registry::ComputeError;
+use crate::ComputeError;
 use crate::thunk::Thunk;
 
 const CALL_LIFETIME: Duration = Duration::from_millis(4000);
@@ -162,7 +162,7 @@ impl ComputeClient {
             .map_err(ComputeClientError::App)?;
         let content = data.content().ok_or(ComputeClientError::NoContent)?;
         let thunk = Thunk::from_content(content).ok_or_else(|| {
-            ComputeClientError::Decode(ComputeError::ComputeFailed(
+            ComputeClientError::Decode(ComputeError::HandlerFailed(
                 "job invocation did not return a thunk".into(),
             ))
         })?;

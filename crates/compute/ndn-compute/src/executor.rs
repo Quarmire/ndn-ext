@@ -13,7 +13,7 @@
 
 use bytes::Bytes;
 
-use crate::registry::ComputeError;
+use crate::ComputeError;
 
 /// A bytes-in / bytes-out compute kernel.
 pub trait ComputeExecutor: Send + Sync + 'static {

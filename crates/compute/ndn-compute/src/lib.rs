@@ -28,7 +28,6 @@ pub mod client;
 pub mod codec;
 pub mod compute_face;
 pub mod executor;
-pub mod registry;
 #[cfg(feature = "sealed-params")]
 pub mod sealed;
 pub mod service;
@@ -40,7 +39,10 @@ pub use client::{ComputeClient, ComputeClientError};
 pub use codec::{ArgComponent, ComputeArgs, ComputeValue};
 pub use compute_face::ComputeFace;
 pub use executor::ComputeExecutor;
-pub use registry::{ComputeError, ComputeHandler, ComputeRegistry};
+// The generic invocation core now lives in `ndn-rpc`; compute is the
+// specialization (deterministic pure-function handlers + typed codec). These
+// aliases keep compute's public vocabulary stable over the shared primitive.
+pub use ndn_rpc::{RpcError as ComputeError, RpcHandler as ComputeHandler, RpcRegistry as ComputeRegistry};
 #[cfg(feature = "sealed-params")]
 pub use sealed::{NodeKeypair, SealError, seal};
 pub use service::{ComputeContext, ComputeService, Determinism};

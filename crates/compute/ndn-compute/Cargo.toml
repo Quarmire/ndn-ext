@@ -19,6 +19,7 @@ sealed-params = ["dep:ring", "dep:ndn-sealed-box"]
 
 [dependencies]
 ndn-packet    = { workspace = true, features = ["std"] }
+ndn-rpc       = { workspace = true }
 ndn-transport = { workspace = true }
 ndn-engine    = { workspace = true }
 ndn-store     = { workspace = true }

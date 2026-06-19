@@ -43,7 +43,7 @@ fn wasm_executor_traps_on_fuel_exhaustion() {
         .execute(b"")
         .expect_err("infinite loop must exhaust fuel");
     assert!(
-        matches!(err, ComputeError::ComputeFailed(_)),
-        "expected ComputeFailed, got {err:?}"
+        matches!(err, ComputeError::HandlerFailed(_)),
+        "expected HandlerFailed, got {err:?}"
     );
 }
