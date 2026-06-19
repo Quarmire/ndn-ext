@@ -40,6 +40,12 @@ pub use topic::{Subscription, Topic};
 pub mod discovery_carrier;
 pub use discovery_carrier::{DiscoveryCarrier, MemoryDirectory, ProviderDirectory, ProviderEntry};
 
+/// A production [`ProviderDirectory`] backed by `ndn-discovery` (feature `discovery`).
+#[cfg(feature = "discovery")]
+pub mod sd_directory;
+#[cfg(feature = "discovery")]
+pub use sd_directory::ServiceDiscoveryDirectory;
+
 /// The policy→issuance bridge (feature `issuance`): gate KP-ABE key issuance on
 /// the current [`PolicyAuthority`] grant.
 #[cfg(feature = "issuance")]

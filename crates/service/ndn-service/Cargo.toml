@@ -13,6 +13,10 @@ classification = "extension"
 ## PolicyAuthority grant (`issue_decryption_key`). Off by default so the
 ## authority/signed-policy core stays free of the ABE crypto dependency.
 issuance = ["dep:ndn-nacabe", "ndn-security/abe"]
+## A production ProviderDirectory backed by ndn-discovery's ServiceDiscoveryProtocol
+## (the Tier-1 DiscoveryCarrier's discovery seam). Off by default so the core
+## stays free of the discovery machinery.
+discovery = ["dep:ndn-discovery"]
 
 [dependencies]
 ndn-packet       = { workspace = true, features = ["std"] }
@@ -27,6 +31,8 @@ tokio            = { workspace = true, features = ["sync"] }
 async-trait      = { workspace = true }
 # KP-ABE key authority (issue_with_policy) for the policy→issuance bridge.
 ndn-nacabe       = { workspace = true, optional = true }
+# ServiceDiscoveryProtocol-backed ProviderDirectory (the `discovery` feature).
+ndn-discovery    = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
