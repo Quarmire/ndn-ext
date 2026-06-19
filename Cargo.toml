@@ -4,6 +4,8 @@ exclude = [
     "crates/faces/ndn-face-afxdp/bpf/redirect-ebpf",
 ]
 members = [
+    "crates/coding/ndn-coding",
+    "crates/ratelimit/ndn-ratelimit",
     "crates/compute/ndn-sealed-box",
     "crates/onboarding/ndn-trust-envelope",
     "crates/faces/ndn-face-serial",
@@ -41,6 +43,8 @@ members = [
     "examples/radio-ping",
 ]
 default-members = [
+    "crates/coding/ndn-coding",
+    "crates/ratelimit/ndn-ratelimit",
     "crates/compute/ndn-sealed-box",
     "crates/faces/ndn-face-serial",
     "crates/faces/ndn-face-websocket",
@@ -141,11 +145,11 @@ ndn-sim       = { path = "../ndn-sim/crates/ndn-sim" }
 ndn-wasm      = { path = "crates/bindings/ndn-wasm" }
 ndn-strategy-wasm = { path = "crates/strategies/ndn-strategy-wasm" }
 ndn-compute   = { path = "crates/compute/ndn-compute" }
-ndn-coding    = { path = "../ndn-rs/crates/protocols/ndn-coding" }
+ndn-coding    = { path = "crates/coding/ndn-coding" }
 ndn-radio-cognition = { path = "crates/faces/ndn-radio-cognition" }
 ndn-signal-sources = { path = "crates/faces/ndn-signal-sources" }
 ndn-strategy-cclf = { path = "crates/strategies/ndn-strategy-cclf", default-features = false }
-ndn-ratelimit = { path = "../ndn-rs/crates/forwarding/ndn-ratelimit" }
+ndn-ratelimit = { path = "crates/ratelimit/ndn-ratelimit" }
 ndn-embedded  = { path = "../ndn-embedded/crates/ndn-embedded" }
 ndn-mobile    = { path = "../ndn-mobile/crates/ndn-mobile" }
 ndn-tools-core = { path = "../ndn-fwd/crates/tooling/ndn-tools-core" }

@@ -12,7 +12,7 @@ classification = "extension"
 ndn-packet    = { workspace = true, features = ["std"] }
 ndn-app       = { workspace = true }
 # Default features (endpoint) for the coded bulk transfer (CodedFetcher/Producer).
-ndn-coding    = { path = "../../../../ndn-rs/crates/protocols/ndn-coding" }
+ndn-coding    = { path = "../../coding/ndn-coding" }
 # Tier-0 / NAC-baseline AEAD (ChaCha20-Poly1305, no_std) for encrypt-then-code.
 ndn-crypto-core = { workspace = true }
 # Handshake sealed box (X25519 ECDH + HKDF-SHA256 + AES-256-GCM): seals the pipe

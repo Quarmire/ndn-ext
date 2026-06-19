@@ -21,7 +21,7 @@ ndn-signals-core = { workspace = true }
 # The pure cross-layer cognitive control plane this face is the actuator/seam for.
 ndn-radio-cognition = { workspace = true }
 # Link-layer FEC: the systematic K-of-N codec only (no `endpoint` → no engine).
-ndn-coding       = { path = "../../../../ndn-rs/crates/protocols/ndn-coding", default-features = false }
+ndn-coding       = { path = "../../coding/ndn-coding", default-features = false }
 bytes            = { workspace = true, features = ["std"] }
 tracing          = { workspace = true }
 thiserror        = { workspace = true }
@@ -43,4 +43,4 @@ ndn-tlv = { workspace = true }
 # `segment_payload` / `CodedAssembler` byte-level API drives K-of-N recovery
 # over the raw Face directly. Declared by path (not inherited) so
 # `default-features = false` can drop the engine-pulling `endpoint` feature.
-ndn-coding = { path = "../../../../ndn-rs/crates/protocols/ndn-coding", default-features = false }
+ndn-coding = { path = "../../coding/ndn-coding", default-features = false }
