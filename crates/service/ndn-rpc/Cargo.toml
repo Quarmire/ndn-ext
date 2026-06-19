@@ -8,14 +8,28 @@ license.workspace = true
 [package.metadata.scope]
 classification = "extension"
 
+[features]
+default = []
+## The face-backed carrier: a `FaceRpcCarrier` that invokes over an `ndn-app`
+## Consumer and serves over a Producer (real engine/forwarder), vs the default
+## in-process loopback. Off by default so the core stays engine-agnostic.
+engine = ["dep:ndn-app", "dep:tokio"]
+
 [dependencies]
 ndn-packet       = { workspace = true, features = ["std"] }
 ndn-store        = { workspace = true }
 ndn-service-core = { workspace = true }
 bytes            = { workspace = true, features = ["std"] }
 async-trait      = { workspace = true }
+# Face-backed carrier (the `engine` feature): Consumer/Producer over a forwarder.
+ndn-app          = { workspace = true, optional = true }
+tokio            = { workspace = true, optional = true, features = ["sync"] }
 
 [dev-dependencies]
-tokio   = { workspace = true, features = ["rt", "macros"] }
+tokio   = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time"] }
 ndn-tlv = { workspace = true, features = ["std"] }
 ndn-service-macro = { workspace = true }
+# Engine-backed carrier witness: a two-face engine.
+ndn-engine    = { workspace = true }
+ndn-face      = { workspace = true }
+ndn-transport = { workspace = true }

@@ -28,6 +28,11 @@ use ndn_store::NameTrie;
 mod carrier;
 pub use carrier::RpcCarrier;
 
+#[cfg(feature = "engine")]
+mod face_carrier;
+#[cfg(feature = "engine")]
+pub use face_carrier::FaceRpcCarrier;
+
 /// A handler invoked for Interests whose name longest-prefix-matches a
 /// registered name. The returned Data is injected back into the pipeline and
 /// cached like any other Data.
