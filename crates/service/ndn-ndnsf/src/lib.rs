@@ -32,6 +32,8 @@ pub mod access;
 pub mod driver;
 #[cfg(feature = "driver")]
 pub mod policy;
+#[cfg(feature = "driver")]
+pub mod trust;
 pub mod flow;
 pub mod messages;
 pub mod names;
