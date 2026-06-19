@@ -1,0 +1,44 @@
+[package]
+name = "ndn-pipes"
+description = "NDN-Pipes v2 — two-band (common-channel SEEK + dedicated coded pipes) data transport on ndn-rs, faithful to the thesis protocol over a modern (reflexive + coded + named-radio) substrate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "extension"
+
+[dependencies]
+ndn-packet    = { workspace = true, features = ["std"] }
+ndn-app       = { workspace = true }
+# Default features (endpoint) for the coded bulk transfer (CodedFetcher/Producer).
+ndn-coding    = { path = "../../../../ndn-rs/crates/protocols/ndn-coding" }
+# Tier-0 / NAC-baseline AEAD (ChaCha20-Poly1305, no_std) for encrypt-then-code.
+ndn-crypto-core = { workspace = true }
+# Handshake sealed box (X25519 ECDH + HKDF-SHA256 + AES-256-GCM): seals the pipe
+# id + pipe key to the consumer pubkey. Shared with ndn-compute.
+ndn-sealed-box = { workspace = true }
+# Producer-identity signing of the SEEK reply (Ed25519), verified by the
+# consumer against a trust anchor — closes the bare-ECDH MITM gap.
+ed25519-dalek = { workspace = true }
+# Optional cert-chain trust: sign the SEEK reply with an ndn-security Signer and
+# validate it through a Validator (chain to a CA), beyond the pinned-key TOFU.
+ndn-security  = { workspace = true }
+ndn-transport = { workspace = true }
+# Read-only PIPES introspection module (`/localhost/nfd/pipes/list`).
+ndn-mgmt      = { workspace = true }
+ndn-config    = { workspace = true }
+async-trait   = { workspace = true }
+bytes         = { workspace = true, features = ["std"] }
+thiserror     = { workspace = true }
+tokio         = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+
+[dev-dependencies]
+ndn-engine      = { workspace = true }
+ndn-face = { workspace = true }
+ndn-sim         = { workspace = true }
+# Hardware-integration witness: run a real pipe over the 802.11 monitor-mode
+# named-radio bearer (LoopbackMonitorBus = hardware-free shared medium).
+ndn-face-monitor-wifi = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+tokio-util = { workspace = true }

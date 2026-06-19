@@ -1,0 +1,39 @@
+[package]
+name = "ndn-web-attach"
+description = "Engine-attachment seam for browser NDN apps — one Face-client API over in-page, SharedWorker, or external engines"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "extension"
+
+[lib]
+# `rlib` only for now: this is a scaffold with no wasm-bindgen exports yet.
+# Promote to `["cdylib", "rlib"]` once `attach()` is wired and a tab/worker
+# bundle needs to pull it through wasm-pack/dx.
+crate-type = ["rlib"]
+
+[dependencies]
+thiserror   = { workspace = true }
+# The in-page tier embeds a real engine and drives it through ndn-app's
+# EngineAppExt client surface (now wasm-ready). Same code on native and wasm32.
+ndn-app     = { workspace = true }
+ndn-engine  = { workspace = true }
+ndn-runtime = { workspace = true }
+tokio-util  = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ndn-packet  = { workspace = true, features = ["std"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+ndn-packet  = { workspace = true, features = ["std-wasm"] }
+# Secure-by-default NFD mgmt for the in-page engine (browser shared-engine).
+ndn-mgmt    = { workspace = true }
+ndn-config  = { workspace = true, features = ["mgmt"] }
+# Direct path + default-features = false (drop the SQLite PIB); see ndn-app's
+# Cargo.toml for why `workspace = true` can't carry default-features = false.
+ndn-security = { path = "../../../../ndn-rs/crates/security/ndn-security", default-features = false }
+
+# Still deferred (see lib.rs TODOs): ndn-face-shared-worker (SharedWorker tier),
+# WebTransport upstream dial for InPage, and a `web-sys` SharedWorker probe.

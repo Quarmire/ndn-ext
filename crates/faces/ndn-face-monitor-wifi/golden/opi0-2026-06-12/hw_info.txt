@@ -1,0 +1,1 @@
+RX FIFO full count: not check in watch dog

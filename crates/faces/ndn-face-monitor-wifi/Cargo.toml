@@ -1,0 +1,46 @@
+[package]
+name = "ndn-face-monitor-wifi"
+description = "802.11 monitor-mode injection face for ndn-rs — broadcasts NDN packets as raw WiFi frames at a chosen MCS (named-radio bearer, no association, no ARQ)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "extension"
+
+[features]
+# Userspace RTL8812AU/EU backend (devourer-style) via libusb — for hosts
+# without an AF_PACKET monitor interface (macOS / non-rtl8812au Linux). Pulls
+# rusb (needs libusb-1.0 at build time). Scaffold: see src/libusb_rtl88xx.rs.
+libusb-backend = ["dep:rusb", "dep:libusb1-sys"]
+
+[dependencies]
+ndn-transport    = { workspace = true }
+ndn-frame-io     = { workspace = true }
+ndn-signals-core = { workspace = true }
+# The pure cross-layer cognitive control plane this face is the actuator/seam for.
+ndn-radio-cognition = { workspace = true }
+# Link-layer FEC: the systematic K-of-N codec only (no `endpoint` → no engine).
+ndn-coding       = { path = "../../../../ndn-rs/crates/protocols/ndn-coding", default-features = false }
+bytes            = { workspace = true, features = ["std"] }
+tracing          = { workspace = true }
+thiserror        = { workspace = true }
+async-trait      = { workspace = true }
+tokio            = { workspace = true, features = ["sync", "rt", "macros", "net", "time"] }
+rusb             = { version = "0.9", optional = true }
+# rusb's own libusb backend, reused directly for the async URB ring (no new USB
+# lib). Linux-only TX-pipelining path; version matches rusb 0.9 → libusb1-sys 0.7.
+libusb1-sys      = { version = "0.7", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["sync", "rt", "macros", "rt-multi-thread", "time"] }
+ndn-packet = { workspace = true }
+ndn-tlv = { workspace = true }
+# Core FEC codec only (no `endpoint` → no engine/ndn-app pulled in): the
+# `segment_payload` / `CodedAssembler` byte-level API drives K-of-N recovery
+# over the raw Face directly. Declared by path (not inherited) so
+# `default-features = false` can drop the engine-pulling `endpoint` feature.
+ndn-coding = { path = "../../../../ndn-rs/crates/protocols/ndn-coding", default-features = false }

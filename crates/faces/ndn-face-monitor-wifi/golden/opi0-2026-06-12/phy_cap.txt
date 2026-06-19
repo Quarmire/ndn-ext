@@ -1,0 +1,53 @@
+
+ ======== PHY Capability ========
+[HAL] STBC Tx : Supported
+[HAL] STBC Rx : Supported
+
+[HAL] LDPC Tx : Supported
+[HAL] LDPC Rx : Supported
+
+[HAL] Beamformer: Supported
+[HAL] Beamformee: Supported
+[HAL] VHT MU Beamformer: Supported
+[HAL] VHT MU Beamformee: Supported
+
+ ======== DRV's configuration ========
+[DRV CAP] STBC Capability : 0x33
+[DRV CAP] VHT STBC Tx : V
+[DRV CAP] VHT STBC Rx : V
+[DRV CAP] HT STBC Tx : V
+[DRV CAP] HT STBC Rx : V
+
+[DRV CAP] LDPC Capability : 0x33
+[DRV CAP] VHT LDPC Tx : V
+[DRV CAP] VHT LDPC Rx : V
+[DRV CAP] HT LDPC Tx : V
+[DRV CAP] HT LDPC Rx : V
+
+[DRV CAP] TxBF Capability : 0x0a
+[DRV CAP] VHT MU Bfer : X
+[DRV CAP] VHT MU Bfee : V
+[DRV CAP] VHT SU Bfer : X
+[DRV CAP] VHT SU Bfee : V
+[DRV CAP] HT Bfer : X
+[DRV CAP] HT Bfee : X
+[DRV CAP] Tx Bfer rf_num : 0
+[DRV CAP] Tx Bfee rf_num : 0
+
+ ======== PHY CAP protocol ========
+[DFT CAP] VHT STBC Tx : V
+[DFT CAP] VHT STBC Rx : V
+[DFT CAP] HT STBC Tx : V
+[DFT CAP] HT STBC Rx : V
+
+[DFT CAP] VHT LDPC Tx : V
+[DFT CAP] VHT LDPC Rx : V
+[DFT CAP] HT LDPC Tx : V
+[DFT CAP] HT LDPC Rx : V
+
+[DFT CAP] VHT MU Bfer : X
+[DFT CAP] VHT MU Bfee : X
+[DFT CAP] VHT SU Bfer : X
+[DFT CAP] VHT SU Bfee : X
+[DFT CAP] HT Bfer : X
+[DFT CAP] HT Bfee : X

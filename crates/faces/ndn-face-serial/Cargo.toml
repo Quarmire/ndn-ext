@@ -1,0 +1,16 @@
+[package]
+name = "ndn-face-serial"
+description = "NDN face over serial/UART links with COBS framing — an extension transport (no NFD/ndnd analogue) for embedded and IoT peers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "extension"
+
+[dependencies]
+ndn-transport = { workspace = true }
+bytes         = { workspace = true, features = ["std"] }
+tokio         = { workspace = true, features = ["io-util", "rt"] }
+tokio-util    = { workspace = true, features = ["codec"] }
+tokio-serial  = { workspace = true }

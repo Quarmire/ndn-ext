@@ -1,0 +1,3 @@
+Monitor mode : Enable
+Device type  : 803
+ch=161, ch_offset=0, bw=0

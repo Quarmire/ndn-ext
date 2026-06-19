@@ -1,0 +1,22 @@
+[package]
+name = "ndn-face-afxdp"
+description = "AF_XDP kernel-bypass Ethernet I/O backend for ndn-rs (Linux only) — an extension transport; pure-Rust aya (XDP redirect program + XskMap) + xdpilone (UMEM/XSK rings), reusing ndn-face's EtherType 0x8624 framing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "extension"
+
+[dependencies]
+ndn-face      = { workspace = true }
+ndn-transport = { workspace = true }
+bytes         = { workspace = true, features = ["std"] }
+
+# AF_XDP is Linux-only: aya = XDP redirect prog + XskMap; xdpilone = UMEM/XSK
+# rings (deps libc/spin — no libbpf/clang). The crate is empty on other targets.
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio    = { workspace = true, features = ["net", "sync", "rt", "macros"] }
+aya      = "0.13"
+xdpilone = "1.3"
+libc     = { workspace = true }

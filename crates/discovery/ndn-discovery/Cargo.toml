@@ -1,0 +1,43 @@
+[package]
+name = "ndn-discovery"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Pluggable neighbor and service discovery for ndn-rs"
+
+[package.metadata.scope]
+classification = "extension"
+
+[features]
+# udp-hello enables UdpNeighborDiscovery, which requires UdpFace from ndn-face.
+# ether-nd enables EtherNeighborDiscovery, which requires NamedEtherFace from ndn-face::l2.
+# Both features require ndn-face as an optional dependency.
+# ndn-face does NOT depend on ndn-discovery, so there is no circular dep.
+default = ["udp-hello"]
+udp-hello = ["dep:ndn-face"]
+ether-nd  = ["dep:ndn-face", "ndn-face/l2"]
+# `mgmt` mounts the NFD-compatible discovery/service management modules
+# (`src/mgmt.rs`). Off by default so non-forwarder consumers (ndn-mobile,
+# ndn-routing) don't pull ndn-mgmt + ndn-engine. The forwarder binary enables it.
+mgmt = ["dep:ndn-mgmt", "dep:ndn-mgmt-wire", "dep:ndn-engine", "dep:async-trait"]
+
+[dependencies]
+ndn-discovery-core = { workspace = true }
+ndn-tlv       = { workspace = true }
+ndn-packet    = { workspace = true, features = ["std"] }
+ndn-transport = { workspace = true }
+ndn-face     = { workspace = true, optional = true }
+ndn-security  = { workspace = true }
+bytes         = { workspace = true, features = ["std"] }
+tokio         = { workspace = true, features = ["sync", "time", "net", "io-util"] }
+tracing       = { workspace = true }
+dashmap       = { workspace = true }
+ndn-sync      = { workspace = true }
+ring          = { workspace = true }
+# Management modules (feature `mgmt`): implement ndn-mgmt's MgmtModule here so
+# ndn-mgmt no longer depends on ndn-discovery (downstream→core direction).
+ndn-mgmt      = { workspace = true, optional = true }
+ndn-mgmt-wire = { workspace = true, optional = true }
+ndn-engine    = { workspace = true, optional = true }
+async-trait   = { workspace = true, optional = true }

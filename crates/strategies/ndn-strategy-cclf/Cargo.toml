@@ -1,0 +1,36 @@
+[package]
+name = "ndn-strategy-cclf"
+description = "CCLF — a cross-layer, link-quality-aware forwarding strategy (research-derived). One pure decision kernel shared by the native engine and the embedded forwarder."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "extension"
+
+[features]
+# The pure `cclf_decide` kernel + the embedded (sans-IO) adapter are always
+# available and no_std. The native `Strategy` adapter (async, registry-wired)
+# is behind `native`, which pulls the std engine crates.
+default = ["std", "native"]
+std = []
+native = [
+    "std",
+    "dep:ndn-strategy",
+    "dep:ndn-transport",
+    "dep:ndn-packet",
+    "dep:smallvec",
+    "dep:bytes",
+    "dep:linkme",
+]
+
+[dependencies]
+ndn-fwd-core     = { workspace = true }
+ndn-signals-core = { workspace = true }
+# native adapter only
+ndn-strategy  = { workspace = true, optional = true }
+ndn-transport = { workspace = true, optional = true }
+ndn-packet    = { workspace = true, optional = true, features = ["std"] }
+smallvec      = { workspace = true, optional = true }
+bytes         = { workspace = true, optional = true, features = ["std"] }
+linkme        = { workspace = true, optional = true }

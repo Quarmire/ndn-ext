@@ -1,0 +1,26 @@
+wmm_edca_vo, aifs = 38 us, cw_min = 3, cw_max = 1023, txop_limit = 1504 us
+wmm_edca_vi, aifs = 40 us, cw_min = 7, cw_max = 1023, txop_limit = 3008 us
+wmm_edca_be, aifs = 43 us, cw_min = 15, cw_max = 1023, txop_limit = 3008 us
+wmm_edca_bk, aifs = 79 us, cw_min = 15, cw_max = 1023, txop_limit = 0 us
+os_queue[0]:waked
+os_queue[1]:waked
+os_queue[2]:waked
+os_queue[3]:waked
+free_xmitbuf_cnt=4, free_xmitframe_cnt=256
+free_ext_xmitbuf_cnt=64, free_xframe_ext_cnt=64
+free_recvframe_cnt=256
+0, hwq.accnt=0
+1, hwq.accnt=0
+2, hwq.accnt=0
+3, hwq.accnt=0
+4, hw_mgmt_q.accnt=0
+Tx: available page num: HPQ: 64, LPQ: 64, NPQ: 64, EPQ: 0, PUBQ: 1753
+rx_urb_pending_cn=9
+rx_cloned_skb_pending_cn=0
+RX: Count of Packets dropped by Driver: 0
+Rx: Counts of Packets Whose Seq_Num Less Than Reorder Control Seq_Num: 0
+Rx: Reorder Time-out Trigger Counts: 0
+Rx: Packet Loss Counts: 0
+Rx: Duplicate Management Frame Drop Count: 0
+Rx: AMPDU BA window shift Count: 0
+Rx: Conflict MAC Address Frames Count: 0

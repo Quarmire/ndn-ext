@@ -1,0 +1,31 @@
+[package]
+name = "ndn-face-websocket"
+description = "NDN face over WebSocket (browser-reachable forwarder peering) — an extension transport (NFD has it, ndnd does not); optional TLS via the websocket-tls feature"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "extension"
+
+[features]
+default = []
+# Server-side TLS termination for the WS listener (self-signed via rcgen, or
+# PEM cert/key). Pulls rustls.
+websocket-tls = ["dep:tokio-rustls", "dep:rcgen", "dep:rustls-pemfile"]
+
+[dependencies]
+ndn-transport = { workspace = true }
+ndn-packet    = { workspace = true, features = ["std"] }
+bytes         = { workspace = true, features = ["std"] }
+futures       = { workspace = true }
+tokio         = { workspace = true, features = ["net", "sync", "rt"] }
+tokio-tungstenite = { workspace = true }
+tracing       = { workspace = true }
+tokio-rustls   = { workspace = true, optional = true }
+rcgen          = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }
+
+[dev-dependencies]
+ndn-tlv = { workspace = true, features = ["std"] }
+tokio   = { workspace = true, features = ["rt", "macros", "net", "io-util", "time"] }

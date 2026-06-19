@@ -1,0 +1,58 @@
+[package]
+name = "ndn-face-webble"
+description = "Browser-side Web Bluetooth central face for ndn-rs — connects to NDN-over-BLE GATT peripherals (macOS/Linux/ESP32)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "extension"
+
+# web_sys_unstable_apis is a cfg set via RUSTFLAGS to unlock web-sys's
+# Web Bluetooth bindings; declare it so check-cfg doesn't flag it.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(web_sys_unstable_apis)'] }
+
+[lib]
+# `cdylib` so wasm-pack / dx serve can produce a browser bundle.
+# `rlib` so the same crate can be linked from native test harnesses
+# (which only exercise the framing helpers / profile constants — the
+# central role itself only exists on wasm32).
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ndn-transport = { workspace = true }
+ndn-ble-framing = { workspace = true }
+ndn-runtime   = { workspace = true }
+ndn-packet    = { workspace = true }
+bytes         = { workspace = true, features = ["std"] }
+tracing       = { workspace = true }
+thiserror     = { workspace = true }
+# Channel actor bridges the !Send Web Bluetooth JS handles into a
+# `Send + Sync` `Face`, mirroring ndn-face-webtransport-wasm.
+tokio         = { workspace = true, features = ["sync"] }
+
+# ── Browser backend ───────────────────────────────────────────────────────────
+# Web Bluetooth types live behind web-sys's `web_sys_unstable_apis` cfg, so a
+# wasm build of this crate requires:
+#     RUSTFLAGS="--cfg=web_sys_unstable_apis"
+# (or the equivalent in `.cargo/config.toml`). Without it the central backend
+# compiles to a stub whose `connect` returns `WebBleError::Unsupported`.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen         = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys               = "0.3"
+web-sys = { version = "0.3", features = [
+    "console",
+    "Navigator",
+    "Window",
+    "Event",
+    "EventTarget",
+    "Bluetooth",
+    "BluetoothDevice",
+    "BluetoothRemoteGattServer",
+    "BluetoothRemoteGattService",
+    "BluetoothRemoteGattCharacteristic",
+    "RequestDeviceOptions",
+    "BluetoothLeScanFilterInit",
+] }

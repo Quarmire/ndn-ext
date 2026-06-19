@@ -1,0 +1,22 @@
+[package]
+name = "ndn-remote-signer-webrtc"
+version = "0.1.0"
+edition = "2024"
+
+# WebRTC binding for the remote-signer transport (ndn-custodian). Native-only:
+# the relay client (reqwest) and the native `WebRtcConnector` are not built for
+# wasm32, and the wasm `RtcChannel` is `?Send` (can't back a `Send + Sync`
+# `RemoteSignerTransport`). The wasm/PWA path is a later phase.
+
+[dependencies]
+ndn-security = { path = "../../../../ndn-rs/crates/security/ndn-security", default-features = false, features = ["custodian"] }
+ndn-face-webrtc        = { workspace = true }
+ndn-rtc-signaling-relay = { workspace = true }
+bytes                  = { workspace = true, features = ["std"] }
+async-trait            = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "sync"] }
+
+[package.metadata.scope]
+classification = "extension"

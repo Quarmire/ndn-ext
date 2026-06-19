@@ -1,0 +1,3 @@
+target_tx_power: from power by rate
+tx_power_by_rate: disabled, loaded, default
+tx_power_limit: disabled, unloaded, default

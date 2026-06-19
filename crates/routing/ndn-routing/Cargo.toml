@@ -1,0 +1,40 @@
+[package]
+name = "ndn-routing"
+description = "NDN routing protocol implementations: static routes, NLSR (link-state), and ndn-dv (scaffold for the spec-compliant distance-vector impl per ndnd/dv/SPEC.md)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "extension"
+
+[dependencies]
+ndn-runtime  = { workspace = true }
+ndn-packet    = { workspace = true, features = ["std"] }
+ndn-transport = { workspace = true }
+ndn-discovery = { workspace = true }
+ndn-engine    = { workspace = true }
+ndn-mgmt-wire = { workspace = true }
+# ndn-app pulls in Consumer/Producer — used by ndn-dv (Stage 6c+) for
+# Advertisement Data fetch/serve. ndn-face provides InProcHandle.
+ndn-app       = { workspace = true }
+ndn-face     = { workspace = true }
+bytes         = { workspace = true, features = ["std"] }
+dashmap       = { workspace = true }
+tokio         = { workspace = true, features = ["rt", "time", "macros", "test-util", "sync"] }
+tokio-util    = { workspace = true, features = ["rt"] }
+tracing       = { workspace = true }
+ndn-tlv       = { workspace = true, features = ["std"] }
+ndn-sync      = { workspace = true }
+# Stage 5 — pluggable `DvTrust` for DV's inner-Data signing and
+# receive-path verification. Defaults to `InsecureTrust` (wire-compat
+# with ndnd's insecure mode); operators can swap in `StaticTrust` (5b)
+# or `LvsTrust` (5c) via `with_trust`.
+ndn-security  = { workspace = true }
+# `futures::executor::block_on` used to call ndn-security's async
+# CPU-only verifiers from DV's sync receive paths.
+futures       = { workspace = true }
+
+[dev-dependencies]
+tokio         = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util", "sync"] }
+async-trait   = { workspace = true }

@@ -1,0 +1,45 @@
+RF_PATH_A registers that differ: our post-DACK userspace state vs the golden
+fully-calibrated (kernel) chip, ch161/BW20. Excludes RF reg 0x00 (not validly
+readable via the direct BB window) and 0x18/0x1a (channel/BW, which match).
+These 32 registers are the cumulative result of the unported IQK/LCK/DPK/TSSI
+calibrations — the remaining on-air gate. Most deltas are small (fine tuning);
+none is a single obvious TX-enable. Use as the per-register cross-check when
+porting the heavy cals.
+
+  RF 0x01: ours 64000 golden 60001
+  RF 0x03: ours 017fc golden 017ff
+  RF 0x1b: ours 03240 golden 02a40
+  RF 0x1c: ours fb008 golden fa808
+  RF 0x33: ours 0000b golden 0000e
+  RF 0x3f: ours 00040 golden 00003
+  RF 0x42: ours 08040 golden 05c2c
+  RF 0x43: ours 05000 golden 15000
+  RF 0x51: ours 18451 golden 18449
+  RF 0x55: ours 8004c golden 8404c
+  RF 0x56: ours 88000 golden 89027
+  RF 0x5d: ours 00002 golden 0000a
+  RF 0x5f: ours 00000 golden 00027
+  RF 0x60: ours 11000 golden 02000
+  RF 0x80: ours 00000 golden 000d0
+  RF 0x81: ours 38000 golden 3fc00
+  RF 0x82: ours 03300 golden 03330
+  RF 0x86: ours c3100 golden a8300
+  RF 0x87: ours 1b001 golden db001
+  RF 0x89: ours 0c5bc golden 00fb3
+  RF 0x8b: ours 6d901 golden 6d903
+  RF 0x92: ours 84800 golden 83700
+  RF 0x93: ours 8483f golden 8b6ff
+  RF 0x9e: ours 00020 golden 20020
+  RF 0xa0: ours 4000f golden c000f
+  RF 0xb2: ours 23db3 golden 23db6
+  RF 0xb9: ours 0a859 golden 0a461
+  RF 0xd0: ours 903b3 golden 903b6
+  RF 0xe1: ours 021ab golden 02263
+  RF 0xe4: ours ea002 golden e7802
+  RF 0xe6: ours 11ea9 golden 11eb9
+  RF 0xe9: ours 001b3 golden 001b6
+
+Also note RF reg 0x00 (RF mode/standby): golden reads 0x31d32 via the kernel's
+indirect RF read; our direct-window read returns 0x10000 (likely an invalid
+read of reg 0, not a true mismatch). Worth confirming with a proper indirect
+RF-reg-0 read when porting LCK/the RF mode setup.

@@ -1,0 +1,16 @@
+[package]
+name = "ndn-ipc-shm"
+description = "SHM (single-producer/single-consumer ring) data plane for ndn-ipc's ForwarderClient."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "extension"
+
+[dependencies]
+ndn-ipc        = { workspace = true }
+ndn-face-shm   = { workspace = true }
+async-trait    = { workspace = true }
+bytes          = { workspace = true, features = ["std"] }
+tokio-util     = { workspace = true }

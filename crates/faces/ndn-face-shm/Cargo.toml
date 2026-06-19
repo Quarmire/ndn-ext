@@ -1,0 +1,22 @@
+[package]
+name = "ndn-face-shm"
+description = "Zero-copy shared-memory (SPSC ring) NDN face for ndn-rs — unique to ndn-rs (no NFD/ndnd analogue); a desktop-Unix extension transport for the app<->engine IPC seam"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "extension"
+
+[dependencies]
+ndn-transport = { workspace = true }
+bytes         = { workspace = true, features = ["std"] }
+thiserror     = { workspace = true }
+tokio         = { workspace = true, features = ["net", "rt", "macros", "time"] }
+tokio-util    = { workspace = true, features = ["rt"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

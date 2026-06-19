@@ -1,0 +1,30 @@
+[package]
+name = "ndn-face-bluetooth"
+description = "NDN faces over Bluetooth LE (GATT peripheral + central) for ndn-rs — an extension transport (no NFD/ndnd analogue); bluer on Linux, btleplug on macOS/Windows, objc2 for the macOS peripheral"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "extension"
+
+[dependencies]
+ndn-transport = { workspace = true }
+ndn-packet    = { workspace = true, features = ["std"] }
+bytes         = { workspace = true, features = ["std"] }
+futures       = { workspace = true }
+tracing       = { workspace = true }
+ndn-ble-framing = { workspace = true }
+thiserror     = { workspace = true }
+tokio         = { workspace = true, features = ["sync", "time", "rt", "macros"] }
+uuid          = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+bluer = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2    = { workspace = true }
+btleplug = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+btleplug = { workspace = true }

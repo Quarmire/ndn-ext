@@ -1,0 +1,18 @@
+[package]
+name = "ndn-signal-sources"
+description = "Reusable cross-layer signal sources (radio metrics, location, …) with pluggable backends, pushing into any ndn-signals-core SignalStore"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "extension"
+
+[features]
+# The source framework + mock backends are always available. Concrete
+# hardware/JS backends are added behind their own features (gps-nmea,
+# gps-browser, radio-lora, …) so the dependency surface stays opt-in.
+default = []
+
+[dependencies]
+ndn-signals-core = { workspace = true }

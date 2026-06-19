@@ -1,0 +1,26 @@
+[2.4G][A]
+    CCK:    18
+   OFDM:    17
+ HT_1SS:    16
+ HT_2SS:    16
+VHT_1SS:    16
+VHT_2SS:    16
+[2.4G][B]
+    CCK:    18
+   OFDM:    17
+ HT_1SS:    16
+ HT_2SS:    16
+VHT_1SS:    16
+VHT_2SS:    16
+[5G][A]
+   OFDM:    17
+ HT_1SS:    16
+ HT_2SS:    16
+VHT_1SS:    16
+VHT_2SS:    16
+[5G][B]
+   OFDM:    17
+ HT_1SS:    16
+ HT_2SS:    16
+VHT_1SS:    16
+VHT_2SS:    16

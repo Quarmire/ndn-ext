@@ -1,0 +1,15 @@
+[package]
+name = "ndn-radio-cognition"
+description = "Cross-layer cognitive control plane for the named-data radio — the sense→decide→act loop (data-centric MAC) that drives the PHY/link actuators from names + medium state"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+# The integrating control plane for the named-data radio: a research/extension
+# layer (no adopted community spec). Pure, sans-IO, runtime-agnostic — the
+# face/engine I/O lives in the LinkServiceFeature seam, not here.
+classification = "extension"
+
+[dependencies]
+ndn-signals-core = { workspace = true }

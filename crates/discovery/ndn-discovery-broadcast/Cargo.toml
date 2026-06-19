@@ -1,0 +1,41 @@
+[package]
+name = "ndn-discovery-broadcast"
+description = "Browser-tier origin-scoped engine discovery via BroadcastChannel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "extension"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+ndn-discovery-core = { workspace = true }
+ndn-packet  = { workspace = true, default-features = false }
+ndn-runtime = { workspace = true }
+ndn-transport = { workspace = true }
+bytes      = { workspace = true, features = ["std"] }
+serde      = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio      = { workspace = true, features = ["sync"] }
+tracing    = { workspace = true }
+thiserror  = { workspace = true }
+# `web_time` so the `Instant`s we hand to the engine match
+# what RibRoute / Pit use on wasm32 (`performance.now()`),
+# identical to `std::time::Instant` on native.
+web-time   = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+ndn-packet           = { workspace = true, features = ["std-wasm"] }
+wasm-bindgen         = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys               = "0.3"
+web-sys = { version = "0.3", features = [
+    "BroadcastChannel",
+    "MessageEvent",
+] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ndn-packet = { workspace = true, features = ["std"] }

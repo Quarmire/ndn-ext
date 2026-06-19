@@ -1,0 +1,23 @@
+[package]
+name = "ndn-face-ble-adv"
+description = "Connectionless BLE advertising face for ndn-rs — broadcasts NDN packets as BLE advertisements (named-radio bearer, no pairing, no association)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "extension"
+
+[dependencies]
+ndn-transport    = { workspace = true }
+ndn-signals-core = { workspace = true }
+ndn-ble-framing  = { workspace = true }
+bytes            = { workspace = true, features = ["std"] }
+tracing          = { workspace = true }
+thiserror        = { workspace = true }
+async-trait      = { workspace = true }
+tokio            = { workspace = true, features = ["sync", "rt", "macros"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["sync", "rt", "macros", "rt-multi-thread", "time"] }
+ndn-packet = { workspace = true }

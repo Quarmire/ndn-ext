@@ -1,0 +1,31 @@
+[package]
+name = "ndn-face-wifi-aware"
+description = "Connectionless Wi-Fi Aware (NAN) coordination face for ndn-rs — NDN Interests/Data over NAN follow-up messages (named-radio bearer, AP-less, association-less)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "extension"
+
+[dependencies]
+ndn-transport    = { workspace = true }
+ndn-signals-core = { workspace = true }
+ndn-discovery-core = { workspace = true }
+ndn-packet       = { workspace = true, features = ["std"] }
+bytes            = { workspace = true, features = ["std"] }
+tracing          = { workspace = true }
+thiserror        = { workspace = true }
+async-trait      = { workspace = true }
+tokio            = { workspace = true, features = ["sync", "rt", "macros", "net"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["sync", "rt", "macros", "rt-multi-thread", "time"] }
+ndn-packet = { workspace = true }
+# Through-engine witness: two engines linked by a loopback NAN cluster.
+ndn-engine   = { workspace = true }
+ndn-app      = { workspace = true }
+ndn-security = { workspace = true }
+# Phase 2 NDP bulk witness: wrap the NDP socket in ndn-face's UdpFace.
+ndn-face = { workspace = true }
+tokio-util   = { workspace = true, features = ["rt"] }

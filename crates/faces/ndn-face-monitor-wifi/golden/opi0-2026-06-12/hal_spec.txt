@@ -1,0 +1,22 @@
+macid_num:128
+macid_cap:1
+sec_cap:0x03
+sec_cam_ent_num:64
+rfpath_num_2g:2
+rfpath_num_5g:2
+rf_reg_path_num:2
+rf_reg_path_avail_num:2
+rf_reg_trx_path_bmp:0x33
+max_tx_cnt:2
+tx_nss_num:2
+rx_nss_num:2
+band_cap:2G 5G 
+bw_cap:20M 40M 80M 
+proto_cap:b g n ac 
+txgi_max:127
+txgi_pdbm:4
+wl_func:P2P MIRACAST TDLS 
+tx_aclt_unit_factor:8 (unit:256us)
+rx_tsf_filter:1
+pg_txpwr_saddr:0x10
+pg_txgi_diff_factor:2

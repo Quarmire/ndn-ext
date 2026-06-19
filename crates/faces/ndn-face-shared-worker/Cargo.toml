@@ -1,0 +1,39 @@
+[package]
+name = "ndn-face-shared-worker"
+description = "SharedWorker face for ndn-rs — one engine per origin shared across browser tabs (Phase 6)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "extension"
+
+[lib]
+# `cdylib` so a tab-side bundle and a SharedWorker bootstrap can both
+# pull this crate into wasm-pack/dx output. `rlib` so native test
+# harnesses (which only exercise the framing helpers) can link it.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ndn-transport = { workspace = true }
+ndn-runtime   = { workspace = true }
+bytes         = { workspace = true, features = ["std"] }
+tracing       = { workspace = true }
+thiserror     = { workspace = true }
+# Channel actor bridges the !Send `MessagePort` into a `Send + Sync` `Face`,
+# mirroring the ndn-face-webtransport-wasm pattern.
+tokio         = { workspace = true, features = ["sync"] }
+
+# ── Browser backend ───────────────────────────────────────────────────────────
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen         = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys               = "0.3"
+web-sys = { version = "0.3", features = [
+    "console",
+    "MessageEvent",
+    "MessagePort",
+    "SharedWorker",
+    "SharedWorkerGlobalScope",
+    "Worker",
+] }

@@ -1,0 +1,2 @@
+cur_ch=161, cur_bw=0, cur_ch_offet=0
+oper_ch=161, oper_bw=0, oper_ch_offet=0

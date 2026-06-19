@@ -1,0 +1,69 @@
+[package]
+name = "ndn-face-webtransport-wasm"
+description = "Browser-side WebTransport client face for ndn-rs (Phase 3 of issue #14)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "extension"
+
+[lib]
+# `cdylib` so wasm-pack / dx serve can produce a browser bundle.
+# `rlib` so the same crate can be linked from native test harnesses.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ndn-transport = { workspace = true }
+ndn-runtime   = { workspace = true }
+bytes         = { workspace = true, features = ["std"] }
+tracing       = { workspace = true }
+thiserror     = { workspace = true }
+# Channel actor bridges the JS-handle-holding xwt session into a Send/Sync
+# `Face`. mpsc on tokio is target-agnostic.
+tokio         = { workspace = true, features = ["sync"] }
+# xwt-core trait surface: Session, Connect, Connecting, datagram::{Send,Receive}.
+xwt-core      = "0.9"
+# `futures::select_biased!` drives the send/recv pump in one task without
+# requiring `Send` futures (browser target is single-threaded).
+futures       = { workspace = true }
+
+# ── Browser backend ───────────────────────────────────────────────────────────
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# `std-wasm` enables the std-using NDN code paths without pulling `ring`,
+# which doesn't build on wasm32-unknown-unknown.
+ndn-packet = { workspace = true, features = ["std-wasm"] }
+# xwt-web: web-sys::WebTransport adapter implementing xwt-core traits. We use it
+# only to build the connection options (serverCertificateHashes); its `Session`
+# grabs a BYOB datagram reader, which Firefox's WebTransport (a non-byte
+# datagrams stream) rejects — so the datagram pump below talks to `web_wt_sys`
+# directly with a *default* reader, which both Chrome and Firefox accept.
+xwt-web              = "0.20"
+web-wt-sys           = "0.2"
+web-sys-stream-utils = "0.2"
+wasm-bindgen         = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys               = "0.3"
+web-sys              = { version = "0.3", features = [
+  "console",
+  "ReadableStream",
+  "ReadableStreamDefaultReader",
+  "WritableStream",
+  "WritableStreamDefaultWriter",
+] }
+
+# ── Native backend (for unit witnesses and Phase 4 host integration) ──────────
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ndn-packet = { workspace = true, features = ["std"] }
+# xwt-wtransport: same trait surface as xwt-web, backed by quinn/wtransport.
+# Pulls wtransport ^0.7 (matches workspace pin).
+xwt-wtransport = "0.19"
+wtransport     = { workspace = true }
+
+[dev-dependencies]
+ndn-face-webtransport = { path = "../ndn-face-webtransport" }
+ndn-tlv               = { workspace = true }
+tokio                 = { workspace = true, features = ["full"] }
+rcgen                 = { workspace = true }
+wtransport            = { workspace = true, features = ["dangerous-configuration"] }
+xwt-cert-fingerprint  = "0.1"
