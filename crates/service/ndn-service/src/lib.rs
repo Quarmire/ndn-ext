@@ -26,6 +26,13 @@
 
 #![deny(missing_docs)]
 
+/// The policy→issuance bridge (feature `issuance`): gate KP-ABE key issuance on
+/// the current [`PolicyAuthority`] grant.
+#[cfg(feature = "issuance")]
+pub mod issuance;
+#[cfg(feature = "issuance")]
+pub use issuance::{IssueError, issue_decryption_key};
+
 use std::collections::HashMap;
 use std::sync::Arc;
 

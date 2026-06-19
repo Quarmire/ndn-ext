@@ -109,7 +109,8 @@ impl KpAuthority {
     }
 
     /// Issue a policy key for an authenticated `requester`, sealed to its
-    /// advertised X25519 key. Fails closed if the requester has no grant.
+    /// advertised X25519 key, using this authority's **own grant table**. Fails
+    /// closed if the requester has no grant (the NDNSF-compat path).
     #[instrument(skip(self, recipient_public), fields(requester = %requester, scheme = "kp-abe"))]
     pub fn issue_dkey(
         &self,
@@ -117,6 +118,22 @@ impl KpAuthority {
         recipient_public: &[u8],
     ) -> Result<Bytes, NacError> {
         let policy = self.grants.get(requester).ok_or(NacError::Unauthorized)?;
+        self.issue_with_policy(requester, policy, recipient_public)
+    }
+
+    /// Issue a policy key for `requester` under an **explicit** key-`policy`,
+    /// sealed to its advertised X25519 key — the policy source is the caller's
+    /// (e.g. a v2 `PolicyAuthority`'s current signed grant), not this authority's
+    /// grant table. Keygen + seal only; authorization is the caller's
+    /// responsibility (the caller fails closed before calling this).
+    #[instrument(skip(self, policy, recipient_public), fields(requester = %requester, scheme = "kp-abe"))]
+    pub fn issue_with_policy(
+        &self,
+        requester: &Name,
+        policy: &PolicyExpr,
+        recipient_public: &[u8],
+    ) -> Result<Bytes, NacError> {
+        let _ = requester; // present for the tracing span
         let key = lsw_keygen(&self.params, &self.secret, policy)?;
         let sealed = seal(DKEY_SEAL_SALT, recipient_public, &key.key_bytes)
             .ok_or(NacError::SealFailed)?;

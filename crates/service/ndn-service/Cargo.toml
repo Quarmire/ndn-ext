@@ -8,12 +8,24 @@ license.workspace = true
 [package.metadata.scope]
 classification = "extension"
 
+[features]
+## The policy→issuance bridge: gate KP-ABE key issuance on the current
+## PolicyAuthority grant (`issue_decryption_key`). Off by default so the
+## authority/signed-policy core stays free of the ABE crypto dependency.
+issuance = ["dep:ndn-nacabe", "ndn-security/abe"]
+
 [dependencies]
 ndn-packet       = { workspace = true, features = ["std"] }
 ndn-security     = { workspace = true }
 ndn-service-core = { workspace = true }
 bytes            = { workspace = true, features = ["std"] }
 tracing          = { workspace = true }
+# KP-ABE key authority (issue_with_policy) for the policy→issuance bridge.
+ndn-nacabe       = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
+# End-to-end issuance-loop witness: master keys, content seal/open, recipient.
+ndn-nacabe = { workspace = true }
+ndn-sealed-box = { workspace = true }
+ndn-foundation-types = { workspace = true, features = ["std"] }
