@@ -24,9 +24,17 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use bytes::Bytes;
 use ndn_packet::Name;
+
+// Re-exports so `#[ndn_service]`-generated code can reference everything through
+// this crate, without the consumer needing these as direct dependencies.
+#[doc(hidden)]
+pub use async_trait;
+#[doc(hidden)]
+pub use bytes;
+#[doc(hidden)]
+pub use ndn_packet;
 
 /// A service identity: the name prefix the service is reached under
 /// (e.g. `/svc/echo`). Operations hang below it.
@@ -132,7 +140,7 @@ pub struct Invocation {
 /// A service's server side: route an [`Invocation`] to the matching typed handler
 /// and return the encoded response. The `#[ndn_service]` macro emits this; a
 /// carrier drives it from inbound requests.
-#[async_trait]
+#[async_trait::async_trait]
 pub trait Dispatch: Send + Sync + 'static {
     /// Handle one invocation, returning the [`Frame`]-encoded response bytes.
     async fn dispatch(&self, invocation: Invocation) -> Result<Bytes, ServiceError>;
@@ -141,7 +149,7 @@ pub trait Dispatch: Send + Sync + 'static {
 /// A pluggable backend: it names, transports, multiplexes, and secures service
 /// invocations. The macro-generated client is generic over `C: Carrier`, so one
 /// definition runs over any carrier.
-#[async_trait]
+#[async_trait::async_trait]
 pub trait Carrier: Send + Sync {
     /// Invoke `op` of `svc` with `request` bytes; return one provider's response.
     /// For multi-provider backends this applies the carrier's default selection;
@@ -175,7 +183,7 @@ pub enum Strategy {
 /// A [`Carrier`] refinement for backends that reach **many** providers: invoke and
 /// collect responses per a [`Strategy`]. The generated client exposes the
 /// `*_select` methods only where `C: SelectCarrier`.
-#[async_trait]
+#[async_trait::async_trait]
 pub trait SelectCarrier: Carrier {
     /// Invoke `op` of `svc`, gathering responses per `strategy`.
     async fn invoke_select(
@@ -185,4 +193,115 @@ pub trait SelectCarrier: Carrier {
         request: Bytes,
         strategy: Strategy,
     ) -> Result<Vec<Response>, ServiceError>;
+}
+
+/// Length-delimited field framing used by `#[ndn_service]`-generated message
+/// types: a request struct's fields are each encoded with their [`Frame`] and
+/// concatenated length-prefixed. Decoding reads its known fields in order and
+/// ignores any trailing bytes, so appending a field is forward-compatible (an
+/// older peer reads the fields it knows). Reordering/removing fields is a
+/// breaking change. (A tag-per-field TLV upgrade — full unordered skippability —
+/// is a later codec revision; it does not change the generated API.)
+pub mod framing {
+    use super::ServiceError;
+    use bytes::{BufMut, Bytes, BytesMut};
+
+    /// Concatenate already-encoded fields, each length-prefixed.
+    pub fn encode_fields(fields: &[Bytes]) -> Bytes {
+        let mut buf = BytesMut::new();
+        for field in fields {
+            buf.put_u32_le(field.len() as u32);
+            buf.put_slice(field);
+        }
+        buf.freeze()
+    }
+
+    /// Read the next length-delimited field from `bytes`, advancing `pos`.
+    pub fn read_field<'a>(bytes: &'a [u8], pos: &mut usize) -> Result<&'a [u8], ServiceError> {
+        let start = *pos;
+        let header_end = start
+            .checked_add(4)
+            .filter(|&e| e <= bytes.len())
+            .ok_or_else(|| ServiceError::Decode("truncated field length".into()))?;
+        let len = u32::from_le_bytes(bytes[start..header_end].try_into().unwrap()) as usize;
+        let field_end = header_end
+            .checked_add(len)
+            .filter(|&e| e <= bytes.len())
+            .ok_or_else(|| ServiceError::Decode("truncated field body".into()))?;
+        *pos = field_end;
+        Ok(&bytes[header_end..field_end])
+    }
+}
+
+/// `Frame` for the primitive argument/return types `#[ndn_service]` supports out
+/// of the box. Custom types implement [`Frame`] themselves.
+mod frame_impls {
+    use super::{Frame, ServiceError};
+    use bytes::Bytes;
+
+    impl Frame for () {
+        fn encode(&self) -> Bytes {
+            Bytes::new()
+        }
+        fn decode(_bytes: &[u8]) -> Result<Self, ServiceError> {
+            Ok(())
+        }
+    }
+
+    impl Frame for String {
+        fn encode(&self) -> Bytes {
+            Bytes::copy_from_slice(self.as_bytes())
+        }
+        fn decode(bytes: &[u8]) -> Result<Self, ServiceError> {
+            String::from_utf8(bytes.to_vec()).map_err(|e| ServiceError::Decode(e.to_string()))
+        }
+    }
+
+    impl Frame for Vec<u8> {
+        fn encode(&self) -> Bytes {
+            Bytes::copy_from_slice(self)
+        }
+        fn decode(bytes: &[u8]) -> Result<Self, ServiceError> {
+            Ok(bytes.to_vec())
+        }
+    }
+
+    impl Frame for Bytes {
+        fn encode(&self) -> Bytes {
+            self.clone()
+        }
+        fn decode(bytes: &[u8]) -> Result<Self, ServiceError> {
+            Ok(Bytes::copy_from_slice(bytes))
+        }
+    }
+
+    impl Frame for bool {
+        fn encode(&self) -> Bytes {
+            Bytes::copy_from_slice(&[*self as u8])
+        }
+        fn decode(bytes: &[u8]) -> Result<Self, ServiceError> {
+            match bytes.first() {
+                Some(0) => Ok(false),
+                Some(_) => Ok(true),
+                None => Err(ServiceError::Decode("empty bool".into())),
+            }
+        }
+    }
+
+    macro_rules! frame_int {
+        ($($t:ty),*) => {$(
+            impl Frame for $t {
+                fn encode(&self) -> Bytes {
+                    Bytes::copy_from_slice(&self.to_le_bytes())
+                }
+                fn decode(bytes: &[u8]) -> Result<Self, ServiceError> {
+                    let arr = bytes.try_into().map_err(|_| {
+                        ServiceError::Decode(concat!("expected ", stringify!($t)).into())
+                    })?;
+                    Ok(<$t>::from_le_bytes(arr))
+                }
+            }
+        )*};
+    }
+    frame_int!(u32, u64, i32, i64);
 }

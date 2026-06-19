@@ -44,3 +44,5 @@ tracing    = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
 # Real X25519 recipient keys for the policy/issuance witnesses.
 ndn-sealed-box = { workspace = true }
+# #[ndn_service] macro: prove a generated service runs over NdnsfCarrier + select.
+ndn-service-macro = { workspace = true }

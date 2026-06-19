@@ -18,3 +18,4 @@ async-trait      = { workspace = true }
 [dev-dependencies]
 tokio   = { workspace = true, features = ["rt", "macros"] }
 ndn-tlv = { workspace = true, features = ["std"] }
+ndn-service-macro = { workspace = true }

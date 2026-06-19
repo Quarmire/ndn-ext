@@ -1,0 +1,17 @@
+[package]
+name = "ndn-service-macro"
+description = "#[ndn_service]: a unary service trait → Frame messages + Dispatch + a carrier-generic client (service-layer.md §12)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "extension"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
