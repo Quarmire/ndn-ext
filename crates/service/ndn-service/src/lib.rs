@@ -31,6 +31,10 @@
 pub mod command;
 pub use command::{PolicyController, grant_command, revoke_command};
 
+/// Tier-2 typed pub/sub: [`topic::Topic<T>`], the feed primitive.
+pub mod topic;
+pub use topic::{Subscription, Topic};
+
 /// The policy→issuance bridge (feature `issuance`): gate KP-ABE key issuance on
 /// the current [`PolicyAuthority`] grant.
 #[cfg(feature = "issuance")]

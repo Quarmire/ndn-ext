@@ -20,11 +20,14 @@ ndn-security     = { workspace = true }
 ndn-service-core = { workspace = true }
 bytes            = { workspace = true, features = ["std"] }
 tracing          = { workspace = true }
+# Tier-2 typed pub/sub topics (Topic<T>) over the SVS data plane.
+ndn-sync         = { workspace = true }
+tokio            = { workspace = true, features = ["sync"] }
 # KP-ABE key authority (issue_with_policy) for the policy→issuance bridge.
 ndn-nacabe       = { workspace = true, optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
 # End-to-end issuance-loop witness: master keys, content seal/open, recipient.
 ndn-nacabe = { workspace = true }
 ndn-sealed-box = { workspace = true }
