@@ -60,6 +60,13 @@ pub mod sd_directory;
 #[cfg(feature = "discovery")]
 pub use sd_directory::ServiceDiscoveryDirectory;
 
+/// The declarative policy front-end (feature `config`): load a TOML policy file
+/// and reload it into a live [`PolicyAuthority`].
+#[cfg(feature = "config")]
+pub mod config;
+#[cfg(feature = "config")]
+pub use config::{ConfigError, ReloadReport, load_policy_toml, reload};
+
 /// The policy→issuance bridge (feature `issuance`): gate KP-ABE key issuance on
 /// the current [`PolicyAuthority`] grant.
 #[cfg(feature = "issuance")]
@@ -192,6 +199,13 @@ impl PolicyAuthority {
     /// The current [`Grant`] for `principal`, if any.
     pub fn grant_state(&self, principal: &Name) -> Option<&Grant> {
         self.grants.get(principal)
+    }
+
+    /// All current grants (principal → [`Grant`]), including revoked ones (their
+    /// `revoked` flag is set). Used by the config-reload front-end to diff the
+    /// authority against a desired policy file.
+    pub fn grants(&self) -> impl Iterator<Item = (&Name, &Grant)> {
+        self.grants.iter()
     }
 
     /// Produce the signed, named grant object for `principal` at its current

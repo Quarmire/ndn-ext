@@ -17,6 +17,10 @@ issuance = ["dep:ndn-nacabe", "ndn-security/abe"]
 ## (the Tier-1 DiscoveryCarrier's discovery seam). Off by default so the core
 ## stays free of the discovery machinery.
 discovery = ["dep:ndn-discovery"]
+## The declarative policy front-end: load a TOML policy file and reload it into a
+## live PolicyAuthority (diff → grant/revoke). The imperative twin of the signed
+## command front-end (always on). Off by default to keep toml/serde out of the core.
+config = ["dep:toml", "dep:serde"]
 
 [dependencies]
 ndn-packet       = { workspace = true, features = ["std"] }
@@ -35,6 +39,9 @@ ndn-sealed-box   = { workspace = true }
 ndn-nacabe       = { workspace = true, optional = true }
 # ServiceDiscoveryProtocol-backed ProviderDirectory (the `discovery` feature).
 ndn-discovery    = { workspace = true, optional = true }
+# Declarative policy front-end (the `config` feature).
+toml             = { version = "0.8", optional = true }
+serde            = { workspace = true, optional = true, features = ["derive"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
