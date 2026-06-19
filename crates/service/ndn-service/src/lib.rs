@@ -35,6 +35,10 @@ pub use command::{PolicyController, grant_command, revoke_command};
 pub mod topic;
 pub use topic::{Subscription, Topic};
 
+/// Tier-2 collaboration: scoped [`session::Session`]s with confidential typed topics.
+pub mod session;
+pub use session::{ScopedSubscription, ScopedTopic, Session};
+
 /// Tier-1 discovery-selection carrier: discover providers, select, invoke over an
 /// inner Tier-0 carrier.
 pub mod discovery_carrier;
