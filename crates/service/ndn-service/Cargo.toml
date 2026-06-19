@@ -12,7 +12,7 @@ classification = "extension"
 ## The policy→issuance bridge: gate KP-ABE key issuance on the current
 ## PolicyAuthority grant (`issue_decryption_key`). Off by default so the
 ## authority/signed-policy core stays free of the ABE crypto dependency.
-issuance = ["dep:ndn-nacabe", "ndn-security/abe"]
+issuance = ["dep:ndn-nacabe", "ndn-security/abe", "dep:ndn-foundation-types"]
 ## A production ProviderDirectory backed by ndn-discovery's ServiceDiscoveryProtocol
 ## (the Tier-1 DiscoveryCarrier's discovery seam). Off by default so the core
 ## stays free of the discovery machinery.
@@ -37,6 +37,8 @@ async-trait      = { workspace = true }
 ndn-sealed-box   = { workspace = true }
 # KP-ABE key authority (issue_with_policy) for the policy→issuance bridge.
 ndn-nacabe       = { workspace = true, optional = true }
+# KGC params hash for ABE-by-role key distribution (the `issuance` feature).
+ndn-foundation-types = { workspace = true, optional = true, features = ["std"] }
 # ServiceDiscoveryProtocol-backed ProviderDirectory (the `discovery` feature).
 ndn-discovery    = { workspace = true, optional = true }
 # Declarative policy front-end (the `config` feature).

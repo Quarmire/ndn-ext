@@ -239,6 +239,10 @@ impl ScopeKeyring {
     }
 }
 
+/// The ABE attribute prefix for a confidentiality scope. A scope key is wrapped
+/// under `scope:<name>` and a role's KP-ABE key-policy references the same.
+pub const SCOPE_ATTR: &str = "scope:";
+
 /// Which scopes each role may access — the role→scope access policy. A member's
 /// keyring is **derived from its role**: [`keyring_for`](Self::keyring_for) hands
 /// out exactly the keys for the scopes the role is granted (role-scoped keys), so
@@ -270,6 +274,20 @@ impl<R: Eq + Hash + Clone> RoleScopePolicy<R> {
     /// The scopes `role` may access.
     pub fn scopes_for(&self, role: &R) -> Option<&HashSet<String>> {
         self.grants.get(role)
+    }
+
+    /// The KP-ABE key-policy expression for `role`: the OR of its granted scope
+    /// attributes, e.g. `scope:control OR scope:telemetry`. A member issued a
+    /// KP-ABE key for this policy can ABE-decrypt exactly those scopes' wrapped
+    /// keys (see `key_dist`/`abe_dist`). `None` if the role grants nothing.
+    pub fn key_policy_for(&self, role: &R) -> Option<String> {
+        let scopes = self.grants.get(role)?;
+        if scopes.is_empty() {
+            return None;
+        }
+        let mut attrs: Vec<String> = scopes.iter().map(|s| format!("{SCOPE_ATTR}{s}")).collect();
+        attrs.sort(); // deterministic
+        Some(attrs.join(" OR "))
     }
 
     /// Derive the keyring for `role` from the full set of scope keys `all`: the

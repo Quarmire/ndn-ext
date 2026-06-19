@@ -74,6 +74,13 @@ pub mod issuance;
 #[cfg(feature = "issuance")]
 pub use issuance::{IssueError, issue_decryption_key};
 
+/// ABE-by-role key distribution (feature `issuance`): ABE-wrap scope keys by
+/// scope attribute; a member's role-derived KP-ABE key opens its granted scopes.
+#[cfg(feature = "issuance")]
+pub mod abe_dist;
+#[cfg(feature = "issuance")]
+pub use abe_dist::{WrappedScopeKey, unwrap_scope_keys, wrap_scope_keys};
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
