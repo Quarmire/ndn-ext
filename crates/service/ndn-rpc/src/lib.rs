@@ -25,6 +25,9 @@ use std::sync::Arc;
 use ndn_packet::{Data, Interest, Name};
 use ndn_store::NameTrie;
 
+mod carrier;
+pub use carrier::RpcCarrier;
+
 /// A handler invoked for Interests whose name longest-prefix-matches a
 /// registered name. The returned Data is injected back into the pipeline and
 /// cached like any other Data.

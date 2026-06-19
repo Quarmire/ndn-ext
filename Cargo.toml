@@ -8,6 +8,7 @@ members = [
     "crates/coding/ndn-coding",
     "crates/ratelimit/ndn-ratelimit",
     "crates/compute/ndn-sealed-box",
+    "crates/service/ndn-service-core",
     "crates/service/ndn-rpc",
     "crates/service/ndn-nacabe",
     "crates/service/ndn-ndnsf",
@@ -50,6 +51,7 @@ default-members = [
     "crates/coding/ndn-coding",
     "crates/ratelimit/ndn-ratelimit",
     "crates/compute/ndn-sealed-box",
+    "crates/service/ndn-service-core",
     "crates/service/ndn-rpc",
     "crates/service/ndn-nacabe",
     "crates/service/ndn-ndnsf",
@@ -127,6 +129,7 @@ ndn-mgmt     = { path = "../ndn-rs/crates/forwarding/ndn-mgmt" }
 ndn-sim       = { path = "../ndn-sim/crates/ndn-sim" }
 ndn-strategy-wasm = { path = "crates/strategies/ndn-strategy-wasm" }
 ndn-compute   = { path = "crates/compute/ndn-compute" }
+ndn-service-core = { path = "crates/service/ndn-service-core" }
 ndn-rpc       = { path = "crates/service/ndn-rpc" }
 ndn-nacabe    = { path = "crates/service/ndn-nacabe" }
 ndn-ndnsf     = { path = "crates/service/ndn-ndnsf" }
