@@ -1,0 +1,17 @@
+[package]
+name = "ndn-nacabe"
+description = "NAC protocol over ndn-rs: content-key indirection + attribute-authority key distribution (CP/KP-ABE)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "extension"
+
+[dependencies]
+ndn-packet           = { workspace = true, features = ["std"] }
+ndn-foundation-types = { workspace = true, features = ["std"] }
+# ABE crypto (CP/KP/MA) + the content-key (CK) confidentiality primitive.
+ndn-security         = { workspace = true, features = ["abe"] }
+bytes                = { workspace = true, features = ["std"] }
+thiserror            = { workspace = true }
