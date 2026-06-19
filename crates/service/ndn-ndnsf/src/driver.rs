@@ -13,6 +13,9 @@
 //! observability pipeline for per-leg latency.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use ndn_packet::{Name, NameComponent};
@@ -209,6 +212,90 @@ pub async fn serve_provider<H>(
                 }
             }
             _ => {} // ACK/RESPONSE: our own or others' — ignore
+        }
+    }
+}
+
+/// An async response producer for [`serve_provider_async`]: given the validated
+/// coordination and the (owned) request payload, yield the response payload.
+/// This is the seam a service `Carrier` plugs its async `Dispatch` into.
+pub type AsyncResponder = Arc<
+    dyn Fn(PendingCoordination, Bytes) -> Pin<Box<dyn Future<Output = Bytes> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Provider loop for the Normal four-phase path (REQUEST→ACK, SELECTION→RESPONSE)
+/// with an **async** `responder` run at the selection step — the bridge for a
+/// service `Carrier` whose `Dispatch` is async. Mirrors [`serve_provider`]'s
+/// Normal path (service-name routing, trust gating, token coordination) but
+/// awaits the responder; the token is consumed *before* the responder runs
+/// (fail-closed, NSF-T/F invariants preserved). Targeted modes are not handled
+/// here — the service carrier uses Normal/select only. Runs until the
+/// subscription closes.
+pub async fn serve_provider_async(
+    ps: &SvsPubSub,
+    node: Name,
+    service: Name,
+    group_prefix: Name,
+    ttl_secs: u64,
+    trust: &TrustCtx,
+    responder: AsyncResponder,
+) {
+    let mut engine = ProviderEngine::new(ttl_secs);
+    let mut pending_payloads: HashMap<String, Bytes> = HashMap::new();
+    let mut rx = ps.subscribe(group_prefix).await;
+
+    while let Some(pubn) = rx.recv().await {
+        match phase_of(&pubn.name) {
+            Some(Phase::Request) => {
+                if service_of(&pubn.name).as_ref() != Some(&service) {
+                    continue;
+                }
+                let requester = before_ndnsf(&pubn.name);
+                let Some(payload) = trust.unseal(pubn.payload, &requester).await else {
+                    continue;
+                };
+                let Ok(req) = RequestMessage::decode(payload) else {
+                    continue;
+                };
+                if req.request_mode != RequestMode::Normal {
+                    continue; // this serve path drives the Normal/select flow only
+                }
+                let reqid = request_id_of(&pubn.name);
+                pending_payloads.insert(reqid.to_string(), req.payload.clone());
+                let ack = engine.on_request(0, requester.clone(), service.clone(), &req);
+                let name = names::ack_name(&node, &requester, &service, &reqid);
+                let _ = ps.publish(name.clone(), trust.seal(name, ack.encode()).as_ref()).await;
+            }
+            Some(Phase::Selection) => {
+                if service_of(&pubn.name).as_ref() != Some(&service) {
+                    continue;
+                }
+                let requester = before_ndnsf(&pubn.name);
+                let Some(payload) = trust.unseal(pubn.payload, &requester).await else {
+                    continue;
+                };
+                let Ok(sel) = SelectionMessage::decode(payload) else {
+                    continue;
+                };
+                let reqid = request_id_of(&pubn.name);
+                let req_payload =
+                    pending_payloads.get(&reqid.to_string()).cloned().unwrap_or_default();
+                // Consume the token (fail-closed) before running the async responder.
+                if let Ok(coord) = engine.consume_selection(0, &sel) {
+                    pending_payloads.remove(&reqid.to_string());
+                    let out = responder(coord, req_payload).await;
+                    let resp = ResponseMessage {
+                        status: true,
+                        error_info: String::new(),
+                        payload: out,
+                    };
+                    let name = names::response_name(&node, &requester, &service, &reqid);
+                    let _ = ps.publish(name.clone(), trust.seal(name, resp.encode()).as_ref()).await;
+                }
+            }
+            _ => {}
         }
     }
 }

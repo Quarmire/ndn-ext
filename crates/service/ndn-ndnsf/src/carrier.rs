@@ -1,0 +1,273 @@
+//! `NdnsfCarrier` — the four-phase [`Carrier`] over the NDNSF `driver` (feature
+//! `driver`).
+//!
+//! Proves the service seam (service-layer §12) is transport-independent: the same
+//! `#[ndn_service]` definition that runs over Tier-0 `RpcCarrier` runs here over
+//! the NDNSF four-phase (REQUEST→ACK→SELECTION→RESPONSE on SVS pub/sub), with no
+//! change to the service. Because the four-phase reaches **many** providers and
+//! selects among them, this carrier also implements [`SelectCarrier`].
+//!
+//! Op routing: the four-phase service name is the [`ServiceId`] prefix; the `OpId`
+//! and request travel in the request payload envelope (the four-phase payload is
+//! opaque, so unlike `RpcCarrier`'s name-component op this carrier frames it),
+//! and the response payload carries a status byte so an unknown op / handler
+//! error round-trips as a typed [`ServiceError`] rather than a timeout.
+//!
+//! Trust: built unsigned by default; `.signed(signer, validator)` enables the
+//! NSF-A3 message trust the four-phase driver already enforces.
+
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use bytes::{BufMut, Bytes, BytesMut};
+use ndn_packet::Name;
+use ndn_security::{Signer, Validator};
+use ndn_service_core::{
+    Carrier, Dispatch, Invocation, OpId, Response, SelectCarrier, ServiceError, ServiceId,
+    Strategy as CoreStrategy,
+};
+use ndn_sync::SvsPubSub;
+use std::sync::Arc;
+use tokio::task::JoinHandle;
+
+use crate::driver::{self, AsyncResponder};
+use crate::messages::Strategy as NdnsfStrategy;
+use crate::trust::TrustCtx;
+
+const DEFAULT_TTL_SECS: u64 = 3600;
+const DEFAULT_ACK_WINDOW: Duration = Duration::from_secs(3);
+
+// Response status bytes in the payload envelope.
+const STATUS_OK: u8 = 0;
+const STATUS_NOT_FOUND: u8 = 1;
+const STATUS_ERROR: u8 = 2;
+
+/// A four-phase service carrier: a node that invokes (broadcast → select → fetch)
+/// and serves (REQUEST→ACK, SELECTION→RESPONSE) over one SVS group.
+pub struct NdnsfCarrier {
+    ps: Arc<SvsPubSub>,
+    node: Name,
+    group: Name,
+    ttl_secs: u64,
+    ack_window: Duration,
+    user_token: String,
+    trust: TrustCtx,
+    next_id: AtomicU64,
+    serving: Mutex<Vec<JoinHandle<()>>>,
+}
+
+impl NdnsfCarrier {
+    /// A carrier for `node` on sync `group`, owning `ps`. Unsigned, empty token,
+    /// default TTL / ACK window until configured.
+    pub fn new(ps: SvsPubSub, node: Name, group: Name) -> Self {
+        Self {
+            ps: Arc::new(ps),
+            node,
+            group,
+            ttl_secs: DEFAULT_TTL_SECS,
+            ack_window: DEFAULT_ACK_WINDOW,
+            user_token: String::new(),
+            trust: TrustCtx::default(),
+            next_id: AtomicU64::new(1),
+            serving: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Set the provider pending-token TTL (seconds).
+    pub fn ttl(mut self, secs: u64) -> Self {
+        self.ttl_secs = secs;
+        self
+    }
+
+    /// Set the ACK/response collection window for invocations.
+    pub fn ack_window(mut self, window: Duration) -> Self {
+        self.ack_window = window;
+        self
+    }
+
+    /// Set the user capability token presented on each request.
+    pub fn token(mut self, token: impl Into<String>) -> Self {
+        self.user_token = token.into();
+        self
+    }
+
+    /// Sign outbound messages and verify inbound ones (NSF-A3 trust half).
+    pub fn signed(mut self, signer: Arc<dyn Signer>, validator: Arc<Validator>) -> Self {
+        self.trust = TrustCtx::new(signer, validator);
+        self
+    }
+
+    fn next_request_id(&self) -> Name {
+        let n = self.next_id.fetch_add(1, Ordering::Relaxed);
+        format!("/r{n}").parse().expect("request id is a valid name")
+    }
+}
+
+impl Drop for NdnsfCarrier {
+    fn drop(&mut self) {
+        if let Ok(mut tasks) = self.serving.lock() {
+            for handle in tasks.drain(..) {
+                handle.abort();
+            }
+        }
+    }
+}
+
+/// Frame `op` + `payload` into the four-phase request payload.
+fn encode_request(op: &OpId, payload: &[u8]) -> Bytes {
+    let op = op.as_str().as_bytes();
+    let mut buf = BytesMut::with_capacity(4 + op.len() + payload.len());
+    buf.put_u32_le(op.len() as u32);
+    buf.put_slice(op);
+    buf.put_slice(payload);
+    buf.freeze()
+}
+
+/// Inverse of [`encode_request`]; `None` on a malformed envelope.
+fn decode_request(bytes: &[u8]) -> Option<(OpId, Bytes)> {
+    if bytes.len() < 4 {
+        return None;
+    }
+    let n = u32::from_le_bytes(bytes[0..4].try_into().ok()?) as usize;
+    if bytes.len() < 4 + n {
+        return None;
+    }
+    let op = OpId::new(String::from_utf8_lossy(&bytes[4..4 + n]).into_owned());
+    Some((op, Bytes::copy_from_slice(&bytes[4 + n..])))
+}
+
+/// Frame a response with its status byte.
+fn encode_response(status: u8, payload: &[u8]) -> Bytes {
+    let mut buf = BytesMut::with_capacity(1 + payload.len());
+    buf.put_u8(status);
+    buf.put_slice(payload);
+    buf.freeze()
+}
+
+/// Decode a four-phase response payload into a [`Response`] (status `OK`) or the
+/// corresponding [`ServiceError`].
+fn decode_response(producer: Name, bytes: Bytes) -> Result<Response, ServiceError> {
+    let Some((&status, payload)) = bytes.split_first() else {
+        return Err(ServiceError::Transport("empty response payload".into()));
+    };
+    match status {
+        STATUS_OK => Ok(Response {
+            producer,
+            payload: bytes.slice(1..),
+        }),
+        STATUS_NOT_FOUND => Err(ServiceError::NotFound),
+        _ => Err(ServiceError::Handler(
+            String::from_utf8_lossy(payload).into_owned(),
+        )),
+    }
+}
+
+/// Wrap a [`Dispatch`] as the four-phase async responder: decode the op envelope,
+/// dispatch, and frame the reply with its status byte.
+fn responder_for(dispatch: Arc<dyn Dispatch>) -> AsyncResponder {
+    Arc::new(move |_coord, payload: Bytes| {
+        let dispatch = dispatch.clone();
+        Box::pin(async move {
+            let Some((op, request)) = decode_request(&payload) else {
+                return encode_response(STATUS_ERROR, b"malformed request envelope");
+            };
+            let inv = Invocation {
+                op,
+                request,
+                requester: None, // a secure carrier fills this from the verified signer
+            };
+            match dispatch.dispatch(inv).await {
+                Ok(reply) => encode_response(STATUS_OK, &reply),
+                Err(ServiceError::NotFound) => encode_response(STATUS_NOT_FOUND, b""),
+                Err(e) => encode_response(STATUS_ERROR, e.to_string().as_bytes()),
+            }
+        })
+    })
+}
+
+fn map_strategy(s: CoreStrategy) -> NdnsfStrategy {
+    match s {
+        CoreStrategy::FirstResponding => NdnsfStrategy::FirstResponding,
+        CoreStrategy::Random => NdnsfStrategy::RandomSelection,
+        CoreStrategy::All => NdnsfStrategy::AllSelected,
+    }
+}
+
+#[async_trait]
+impl Carrier for NdnsfCarrier {
+    async fn invoke(
+        &self,
+        svc: &ServiceId,
+        op: &OpId,
+        request: Bytes,
+    ) -> Result<Response, ServiceError> {
+        let payload = encode_request(op, &request);
+        let raw = driver::select_and_call(
+            self.ps.as_ref(),
+            self.node.clone(),
+            svc.name().clone(),
+            self.next_request_id(),
+            self.group.clone(),
+            payload,
+            &self.user_token,
+            NdnsfStrategy::FirstResponding,
+            self.ack_window,
+            &self.trust,
+        )
+        .await;
+        match raw.into_iter().next() {
+            Some((producer, bytes)) => decode_response(producer, bytes),
+            None => Err(ServiceError::NotFound),
+        }
+    }
+
+    async fn serve(&self, svc: &ServiceId, dispatch: Arc<dyn Dispatch>) -> Result<(), ServiceError> {
+        let ps = self.ps.clone();
+        let node = self.node.clone();
+        let service = svc.name().clone();
+        let group = self.group.clone();
+        let ttl = self.ttl_secs;
+        let trust = self.trust.clone();
+        let responder = responder_for(dispatch);
+        let handle = tokio::spawn(async move {
+            driver::serve_provider_async(ps.as_ref(), node, service, group, ttl, &trust, responder)
+                .await;
+        });
+        self.serving.lock().expect("serve lock").push(handle);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl SelectCarrier for NdnsfCarrier {
+    async fn invoke_select(
+        &self,
+        svc: &ServiceId,
+        op: &OpId,
+        request: Bytes,
+        strategy: CoreStrategy,
+    ) -> Result<Vec<Response>, ServiceError> {
+        let payload = encode_request(op, &request);
+        let raw = driver::select_and_call(
+            self.ps.as_ref(),
+            self.node.clone(),
+            svc.name().clone(),
+            self.next_request_id(),
+            self.group.clone(),
+            payload,
+            &self.user_token,
+            map_strategy(strategy),
+            self.ack_window,
+            &self.trust,
+        )
+        .await;
+        // Keep the successful responses; a provider that can't serve the op
+        // contributes an error envelope, which is dropped from the selection set.
+        Ok(raw
+            .into_iter()
+            .filter_map(|(producer, bytes)| decode_response(producer, bytes).ok())
+            .collect())
+    }
+}

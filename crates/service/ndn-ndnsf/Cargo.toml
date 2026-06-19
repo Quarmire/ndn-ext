@@ -12,7 +12,7 @@ classification = "extension"
 ## The over-SVS four-phase driver (ServiceProvider/ServiceUser loops over
 ## ndn-sync's SvsPubSub) + KP-ABE access control (NAC-sealed payloads). Off by
 ## default so the sans-IO core (tokens, messages, flow) stays light.
-driver = ["dep:ndn-sync", "dep:ndn-nacabe", "dep:ndn-security", "dep:ndn-foundation-types", "dep:tokio", "dep:serde", "dep:toml"]
+driver = ["dep:ndn-sync", "dep:ndn-nacabe", "dep:ndn-security", "dep:ndn-foundation-types", "dep:tokio", "dep:serde", "dep:toml", "dep:ndn-service-core", "dep:async-trait"]
 
 [dependencies]
 ndn-packet = { workspace = true, features = ["std"] }
@@ -23,6 +23,10 @@ ndn-sync   = { workspace = true, optional = true }
 ndn-nacabe = { workspace = true, optional = true }
 ndn-security = { workspace = true, optional = true, features = ["abe"] }
 ndn-foundation-types = { workspace = true, optional = true, features = ["std"] }
+# The transport-independent service seam (Carrier/Dispatch/Frame) this crate
+# provides the NdnsfCarrier for (§12).
+ndn-service-core = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
 # ACK-collection window for the selection strategies.
 tokio      = { workspace = true, optional = true, features = ["time"] }
 # Policy-file model (ServiceController access policy → KP-ABE grants).

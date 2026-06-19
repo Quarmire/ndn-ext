@@ -89,16 +89,29 @@ impl ProviderEngine {
     where
         H: FnOnce(&PendingCoordination) -> Bytes,
     {
-        let token = ProviderToken::from_wire(sel.provider_token.clone());
-        let coord = self.tokens.consume(now_secs, &token).map_err(|e| {
-            tracing::warn!(error = %e, "selection rejected — fail closed (no response)");
-            FlowError::TokenRejected(e)
-        })?;
+        let coord = self.consume_selection(now_secs, sel)?;
         let payload = handler(&coord);
         Ok(ResponseMessage {
             status: true,
             error_info: String::new(),
             payload,
+        })
+    }
+
+    /// Validate and consume the selection's provider token, returning the
+    /// coordination (fail-closed on an invalid/spent token). The caller runs the
+    /// handler — sync via [`on_selection`](Self::on_selection), or async (e.g. a
+    /// [`Carrier`](crate) dispatch) — and builds the [`ResponseMessage`]. Consuming
+    /// the token here, before any handler runs, preserves NSF-T/F invariants.
+    pub fn consume_selection(
+        &mut self,
+        now_secs: u64,
+        sel: &SelectionMessage,
+    ) -> Result<PendingCoordination, FlowError> {
+        let token = ProviderToken::from_wire(sel.provider_token.clone());
+        self.tokens.consume(now_secs, &token).map_err(|e| {
+            tracing::warn!(error = %e, "selection rejected — fail closed (no response)");
+            FlowError::TokenRejected(e)
         })
     }
 
