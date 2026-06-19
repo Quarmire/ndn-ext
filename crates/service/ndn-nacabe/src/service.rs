@@ -19,11 +19,16 @@ use ndn_packet::encode::{DataBuilder, InterestBuilder};
 use ndn_packet::{Name, NameComponent};
 use ndn_security::validator::InterestValidationOutcome;
 use ndn_security::{SignWith, Signer, Validator};
+use tracing::warn;
 
 use crate::authority::CpAuthority;
 use crate::names::{self, DKEY};
 
 const DKEY_FETCH_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// A consumer validation-failure hook (NSF-F1): invoked exactly once per failed
+/// authority response, with the failed Data name and a human-readable reason.
+pub type ValidationFailureHook = Arc<dyn Fn(&Name, &str) + Send + Sync>;
 
 /// Derive the signing identity from a key name `/<id>/KEY/<keyid>` → `/<id>`.
 fn identity_of(key_name: &Name) -> Option<Name> {
@@ -167,6 +172,7 @@ pub struct ParamFetcher {
     consumer: Consumer,
     aa_prefix: Name,
     aa_validator: Arc<Validator>,
+    on_failure: Option<ValidationFailureHook>,
 }
 
 impl ParamFetcher {
@@ -176,7 +182,16 @@ impl ParamFetcher {
             consumer,
             aa_prefix,
             aa_validator,
+            on_failure: None,
         }
+    }
+
+    /// Register a validation-failure callback (NSF-F1). It fires exactly once for
+    /// each authority response that fails validation, receiving the Data name and
+    /// the failure reason. Independent of the always-on `tracing` log (NSF-F2).
+    pub fn with_failure_callback(mut self, on_failure: ValidationFailureHook) -> Self {
+        self.on_failure = Some(on_failure);
+        self
     }
 
     /// Fetch and verify the authority's public parameters.
@@ -209,13 +224,28 @@ impl ParamFetcher {
     }
 
     async fn verified_content(&self, data: ndn_packet::Data) -> Result<Bytes, AppError> {
+        use ndn_security::validator::ValidationResult;
         match self.aa_validator.validate(&data).await {
-            ndn_security::validator::ValidationResult::Valid(safe) => {
-                Ok(safe.data().content().cloned().unwrap_or_default())
+            ValidationResult::Valid(safe) => Ok(safe.data().content().cloned().unwrap_or_default()),
+            other => {
+                // NSF-F2: log the failed name and reason; NSF-F1: invoke the
+                // failure callback exactly once. Then fail closed.
+                let name: Name = (*data.name).clone();
+                let reason = match other {
+                    ValidationResult::Invalid(err) => err.to_string(),
+                    ValidationResult::Pending => {
+                        "certificate chain unresolved (validation pending)".to_string()
+                    }
+                    ValidationResult::Valid(_) => unreachable!(),
+                };
+                warn!(name = %name, reason = %reason, "attribute-authority response failed validation");
+                if let Some(cb) = &self.on_failure {
+                    cb(&name, &reason);
+                }
+                Err(AppError::Unverified(format!(
+                    "attribute-authority response failed validation: {reason}"
+                )))
             }
-            _ => Err(AppError::Unverified(
-                "attribute-authority response failed validation".into(),
-            )),
         }
     }
 }
