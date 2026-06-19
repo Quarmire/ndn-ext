@@ -22,9 +22,14 @@ use tracing::instrument;
 use std::time::Duration;
 
 use crate::flow::{ProviderEngine, make_request, make_selection, select_providers};
-use crate::messages::{AckMessage, RequestMessage, ResponseMessage, SelectionMessage, Strategy};
+use crate::messages::{
+    AckMessage, RequestMessage, RequestMode, ResponseMessage, SelectionMessage, Strategy,
+};
 use crate::names;
 use crate::tokens::PendingCoordination;
+
+/// How many single-use tokens a TargetedBootstrap issues to a requester.
+const TARGETED_BATCH: usize = 4;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
@@ -101,11 +106,63 @@ pub async fn serve_provider<H>(
                 };
                 let requester = before_ndnsf(&pubn.name);
                 let reqid = request_id_of(&pubn.name);
-                pending_payloads.insert(reqid.to_string(), req.payload.clone());
-                let ack = engine.on_request(0, requester.clone(), service.clone(), &req);
-                let _ = ps
-                    .publish(names::ack_name(&node, &requester, &service, &reqid), ack.encode().as_ref())
-                    .await;
+                match req.request_mode {
+                    RequestMode::Normal => {
+                        pending_payloads.insert(reqid.to_string(), req.payload.clone());
+                        let ack = engine.on_request(0, requester.clone(), service.clone(), &req);
+                        let _ = ps
+                            .publish(
+                                names::ack_name(&node, &requester, &service, &reqid),
+                                ack.encode().as_ref(),
+                            )
+                            .await;
+                    }
+                    RequestMode::TargetedBootstrap => {
+                        // Pre-issue a token batch and return it in the RESPONSE.
+                        let toks: Vec<String> = (0..TARGETED_BATCH)
+                            .map(|_| {
+                                engine
+                                    .issue_token(
+                                        0,
+                                        requester.clone(),
+                                        service.clone(),
+                                        req.user_token.clone(),
+                                    )
+                                    .as_str()
+                                    .to_string()
+                            })
+                            .collect();
+                        let resp = ResponseMessage {
+                            status: true,
+                            error_info: String::new(),
+                            payload: Bytes::from(toks.join("\n").into_bytes()),
+                        };
+                        let _ = ps
+                            .publish(
+                                names::response_name(&node, &requester, &service, &reqid),
+                                resp.encode().as_ref(),
+                            )
+                            .await;
+                    }
+                    RequestMode::Targeted => {
+                        // Consume the pre-issued token and respond directly — no
+                        // ACK/SELECTION. Fails closed on an invalid/spent token.
+                        let sel = SelectionMessage {
+                            provider_token: req.provider_token.clone(),
+                            request_id: reqid.to_string(),
+                        };
+                        if let Ok(resp) =
+                            engine.on_selection(0, &sel, |coord| handler(coord, &req.payload))
+                        {
+                            let _ = ps
+                                .publish(
+                                    names::response_name(&node, &requester, &service, &reqid),
+                                    resp.encode().as_ref(),
+                                )
+                                .await;
+                        }
+                    }
+                }
             }
             Some(Phase::Selection) => {
                 let Ok(sel) = SelectionMessage::decode(pubn.payload) else {
@@ -282,4 +339,84 @@ pub async fn select_and_call(
         }
     }
     responses
+}
+
+/// Targeted bootstrap (NDNSF `TargetedBootstrapRequest`): ask `provider` for a
+/// batch of single-use tokens for `service`, returning the token pool. Empty on
+/// failure/close.
+pub async fn bootstrap_targeted(
+    ps: &SvsPubSub,
+    requester: Name,
+    provider: Name,
+    service: Name,
+    request_id: Name,
+    group_prefix: Name,
+    user_token: &str,
+) -> Vec<String> {
+    let mut rx = ps.subscribe(group_prefix).await;
+    let req = RequestMessage {
+        request_id: request_id.to_string(),
+        user_token: user_token.to_string(),
+        request_mode: RequestMode::TargetedBootstrap,
+        target_provider: Some(provider),
+        ..Default::default()
+    };
+    if ps
+        .publish(names::request_name(&requester, &service, &request_id), req.encode().as_ref())
+        .await
+        .is_err()
+    {
+        return Vec::new();
+    }
+    loop {
+        let Some(pubn) = rx.recv().await else {
+            return Vec::new();
+        };
+        if phase_of(&pubn.name) == Some(Phase::Response) && request_id_of(&pubn.name) == request_id {
+            return match ResponseMessage::decode(pubn.payload) {
+                Ok(resp) => String::from_utf8_lossy(&resp.payload)
+                    .split('\n')
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
+        }
+    }
+}
+
+/// Targeted call (NDNSF `TargetedRequest`): invoke `provider` directly with a
+/// pre-issued `provider_token`, skipping ACK/SELECTION. `None` if no valid
+/// response arrives (an invalid/spent token yields none — fail closed).
+#[allow(clippy::too_many_arguments)]
+pub async fn call_targeted(
+    ps: &SvsPubSub,
+    requester: Name,
+    provider: Name,
+    service: Name,
+    request_id: Name,
+    group_prefix: Name,
+    payload: Bytes,
+    user_token: &str,
+    provider_token: &str,
+) -> Option<Bytes> {
+    let mut rx = ps.subscribe(group_prefix).await;
+    let req = RequestMessage {
+        request_id: request_id.to_string(),
+        user_token: user_token.to_string(),
+        payload,
+        request_mode: RequestMode::Targeted,
+        target_provider: Some(provider),
+        provider_token: provider_token.to_string(),
+        ..Default::default()
+    };
+    ps.publish(names::request_name(&requester, &service, &request_id), req.encode().as_ref())
+        .await
+        .ok()?;
+    loop {
+        let pubn = rx.recv().await?;
+        if phase_of(&pubn.name) == Some(Phase::Response) && request_id_of(&pubn.name) == request_id {
+            return ResponseMessage::decode(pubn.payload).ok().map(|r| r.payload);
+        }
+    }
 }

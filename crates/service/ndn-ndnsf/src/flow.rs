@@ -45,6 +45,18 @@ impl ProviderEngine {
         }
     }
 
+    /// Issue a single-use provider token bound to a coordination, without
+    /// building an ACK — used to pre-issue a Targeted-mode token batch.
+    pub fn issue_token(
+        &mut self,
+        now_secs: u64,
+        requester: Name,
+        service: Name,
+        user_token: String,
+    ) -> crate::tokens::ProviderToken {
+        self.tokens.issue(now_secs, requester, service, user_token)
+    }
+
     /// Phase 2 — acknowledge a request, issuing a single-use provider token the
     /// user must present in its SELECTION.
     #[instrument(skip(self, req), fields(requester = %requester, service = %service, phase = "ack"))]
@@ -55,9 +67,7 @@ impl ProviderEngine {
         service: Name,
         req: &RequestMessage,
     ) -> AckMessage {
-        let token = self
-            .tokens
-            .issue(now_secs, requester, service, req.user_token.clone());
+        let token = self.issue_token(now_secs, requester, service, req.user_token.clone());
         AckMessage {
             status: true,
             user_token: req.user_token.clone(),
