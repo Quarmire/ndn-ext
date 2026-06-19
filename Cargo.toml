@@ -10,6 +10,7 @@ members = [
     "crates/compute/ndn-sealed-box",
     "crates/service/ndn-rpc",
     "crates/service/ndn-nacabe",
+    "crates/service/ndn-ndnsf",
     "crates/onboarding/ndn-trust-envelope",
     "crates/faces/ndn-face-serial",
     "crates/faces/ndn-face-websocket",
@@ -51,6 +52,7 @@ default-members = [
     "crates/compute/ndn-sealed-box",
     "crates/service/ndn-rpc",
     "crates/service/ndn-nacabe",
+    "crates/service/ndn-ndnsf",
     "crates/faces/ndn-face-serial",
     "crates/faces/ndn-face-websocket",
     "crates/faces/ndn-face-shm",
@@ -127,6 +129,7 @@ ndn-strategy-wasm = { path = "crates/strategies/ndn-strategy-wasm" }
 ndn-compute   = { path = "crates/compute/ndn-compute" }
 ndn-rpc       = { path = "crates/service/ndn-rpc" }
 ndn-nacabe    = { path = "crates/service/ndn-nacabe" }
+ndn-ndnsf     = { path = "crates/service/ndn-ndnsf" }
 ndn-radio-cognition = { path = "crates/faces/ndn-radio-cognition" }
 
 # Core async runtime — individual crates enable only the features they need

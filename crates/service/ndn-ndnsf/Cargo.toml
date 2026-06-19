@@ -1,0 +1,14 @@
+[package]
+name = "ndn-ndnsf"
+description = "Faithful NDN Service Framework (NDNSF) compat: four-phase service RPC over SVS, on the ndn-rs substrate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "extension"
+
+[dependencies]
+ndn-packet = { workspace = true, features = ["std"] }
+rand_core  = { version = "0.6", default-features = false, features = ["getrandom"] }
+thiserror  = { workspace = true }
