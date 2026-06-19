@@ -35,6 +35,11 @@ pub use command::{PolicyController, grant_command, revoke_command};
 pub mod topic;
 pub use topic::{Subscription, Topic};
 
+/// Tier-1 discovery-selection carrier: discover providers, select, invoke over an
+/// inner Tier-0 carrier.
+pub mod discovery_carrier;
+pub use discovery_carrier::{DiscoveryCarrier, MemoryDirectory, ProviderDirectory, ProviderEntry};
+
 /// The policy→issuance bridge (feature `issuance`): gate KP-ABE key issuance on
 /// the current [`PolicyAuthority`] grant.
 #[cfg(feature = "issuance")]

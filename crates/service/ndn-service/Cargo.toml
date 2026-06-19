@@ -23,6 +23,8 @@ tracing          = { workspace = true }
 # Tier-2 typed pub/sub topics (Topic<T>) over the SVS data plane.
 ndn-sync         = { workspace = true }
 tokio            = { workspace = true, features = ["sync"] }
+# Tier-1 discovery-selection carrier (Carrier/SelectCarrier impls).
+async-trait      = { workspace = true }
 # KP-ABE key authority (issue_with_policy) for the policy→issuance bridge.
 ndn-nacabe       = { workspace = true, optional = true }
 
@@ -32,3 +34,6 @@ tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time
 ndn-nacabe = { workspace = true }
 ndn-sealed-box = { workspace = true }
 ndn-foundation-types = { workspace = true, features = ["std"] }
+# Discovery-carrier witness: inner Tier-0 carrier + a macro-defined service.
+ndn-rpc = { workspace = true }
+ndn-service-macro = { workspace = true }
