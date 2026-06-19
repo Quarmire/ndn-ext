@@ -8,7 +8,15 @@ license.workspace = true
 [package.metadata.scope]
 classification = "extension"
 
+[features]
+## The over-NDN service surface: the attribute authority serving PUBPARAMS +
+## DKEY over an ndn-app Producer, and the consumer-side ParamFetcher. Off by
+## default so the sans-IO CK-data + issuance core stays light for embedded/wasm
+## consumers that only need the crypto.
+service = ["dep:ndn-app"]
+
 [dependencies]
+ndn-app              = { workspace = true, optional = true }
 ndn-packet           = { workspace = true, features = ["std"] }
 ndn-foundation-types = { workspace = true, features = ["std"] }
 # ABE crypto (CP/KP/MA) + the content-key (CK) confidentiality primitive.
@@ -18,3 +26,11 @@ ndn-security         = { workspace = true, features = ["abe"] }
 ndn-sealed-box       = { workspace = true }
 bytes                = { workspace = true, features = ["std"] }
 thiserror            = { workspace = true }
+
+[dev-dependencies]
+# In-proc engine + faces for the end-to-end serve/fetch witness.
+ndn-app       = { workspace = true }
+ndn-engine    = { workspace = true }
+ndn-face      = { workspace = true }
+ndn-transport = { workspace = true }
+tokio         = { workspace = true, features = ["rt", "macros"] }
