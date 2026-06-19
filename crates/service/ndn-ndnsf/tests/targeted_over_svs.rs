@@ -8,6 +8,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use ndn_ndnsf::driver::{bootstrap_targeted, call_targeted, serve_provider};
 use ndn_ndnsf::tokens::PendingCoordination;
+use ndn_ndnsf::trust::TrustCtx;
 use ndn_packet::Name;
 use ndn_sync::{SvSyncConfig, SvsConfig, SvsPubSub};
 use tokio::sync::mpsc;
@@ -46,6 +47,7 @@ async fn targeted_fast_path_over_svs() {
     });
     let provider_ps = SvsPubSub::join(group.clone(), n("/muas/bob"), a_out_tx, a_in_rx, cfg());
     let user_ps = SvsPubSub::join(group.clone(), n("/muas/alice"), b_out_tx, b_in_rx, cfg());
+    let trust = TrustCtx::default();
 
     let handler =
         |_c: &PendingCoordination, _req: &Bytes| -> Bytes { Bytes::from_static(b"pong") };
@@ -60,6 +62,7 @@ async fn targeted_fast_path_over_svs() {
             n("/r0"),
             group.clone(),
             "utok",
+            &trust,
         )
         .await;
         // Targeted call with a pooled token: direct REQUEST→RESPONSE.
@@ -74,6 +77,7 @@ async fn targeted_fast_path_over_svs() {
                 Bytes::from_static(b"ping"),
                 "utok",
                 tok,
+                &trust,
             )
             .await
         } else {
@@ -92,6 +96,7 @@ async fn targeted_fast_path_over_svs() {
                 Bytes::from_static(b"ping"),
                 "utok",
                 "bogus-token",
+                &trust,
             ),
         )
         .await
@@ -101,7 +106,7 @@ async fn targeted_fast_path_over_svs() {
     };
 
     let (ntokens, good, bad) = tokio::select! {
-        _ = serve_provider(&provider_ps, n("/muas/bob"), n("/svc/echo"), group.clone(), 3600, handler) => (0, None, None),
+        _ = serve_provider(&provider_ps, n("/muas/bob"), n("/svc/echo"), group.clone(), 3600, &trust, handler) => (0, None, None),
         r = tokio::time::timeout(Duration::from_secs(10), user_flow) => r.unwrap_or((0, None, None)),
     };
 

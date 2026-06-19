@@ -27,6 +27,7 @@ use crate::messages::{
 };
 use crate::names;
 use crate::tokens::PendingCoordination;
+use crate::trust::TrustCtx;
 
 /// How many single-use tokens a TargetedBootstrap issues to a requester.
 const TARGETED_BATCH: usize = 4;
@@ -89,6 +90,7 @@ pub async fn serve_provider<H>(
     service: Name,
     group_prefix: Name,
     ttl_secs: u64,
+    trust: &TrustCtx,
     handler: H,
 ) where
     H: Fn(&PendingCoordination, &Bytes) -> Bytes,
@@ -101,21 +103,21 @@ pub async fn serve_provider<H>(
     while let Some(pubn) = rx.recv().await {
         match phase_of(&pubn.name) {
             Some(Phase::Request) => {
-                let Ok(req) = RequestMessage::decode(pubn.payload) else {
+                let requester = before_ndnsf(&pubn.name);
+                // Trust gate: a REQUEST must be signed by its claimed requester.
+                let Some(payload) = trust.unseal(pubn.payload, &requester).await else {
                     continue;
                 };
-                let requester = before_ndnsf(&pubn.name);
+                let Ok(req) = RequestMessage::decode(payload) else {
+                    continue;
+                };
                 let reqid = request_id_of(&pubn.name);
                 match req.request_mode {
                     RequestMode::Normal => {
                         pending_payloads.insert(reqid.to_string(), req.payload.clone());
                         let ack = engine.on_request(0, requester.clone(), service.clone(), &req);
-                        let _ = ps
-                            .publish(
-                                names::ack_name(&node, &requester, &service, &reqid),
-                                ack.encode().as_ref(),
-                            )
-                            .await;
+                        let name = names::ack_name(&node, &requester, &service, &reqid);
+                        let _ = ps.publish(name.clone(), trust.seal(name, ack.encode()).as_ref()).await;
                     }
                     RequestMode::TargetedBootstrap => {
                         // Pre-issue a token batch and return it in the RESPONSE.
@@ -137,12 +139,8 @@ pub async fn serve_provider<H>(
                             error_info: String::new(),
                             payload: Bytes::from(toks.join("\n").into_bytes()),
                         };
-                        let _ = ps
-                            .publish(
-                                names::response_name(&node, &requester, &service, &reqid),
-                                resp.encode().as_ref(),
-                            )
-                            .await;
+                        let name = names::response_name(&node, &requester, &service, &reqid);
+                        let _ = ps.publish(name.clone(), trust.seal(name, resp.encode()).as_ref()).await;
                     }
                     RequestMode::Targeted => {
                         // Consume the pre-issued token and respond directly — no
@@ -154,32 +152,28 @@ pub async fn serve_provider<H>(
                         if let Ok(resp) =
                             engine.on_selection(0, &sel, |coord| handler(coord, &req.payload))
                         {
-                            let _ = ps
-                                .publish(
-                                    names::response_name(&node, &requester, &service, &reqid),
-                                    resp.encode().as_ref(),
-                                )
-                                .await;
+                            let name = names::response_name(&node, &requester, &service, &reqid);
+                            let _ = ps.publish(name.clone(), trust.seal(name, resp.encode()).as_ref()).await;
                         }
                     }
                 }
             }
             Some(Phase::Selection) => {
-                let Ok(sel) = SelectionMessage::decode(pubn.payload) else {
+                let requester = before_ndnsf(&pubn.name);
+                // Trust gate: a SELECTION must be signed by its claimed requester.
+                let Some(payload) = trust.unseal(pubn.payload, &requester).await else {
                     continue;
                 };
-                let requester = before_ndnsf(&pubn.name);
+                let Ok(sel) = SelectionMessage::decode(payload) else {
+                    continue;
+                };
                 let reqid = request_id_of(&pubn.name);
                 let payload = pending_payloads.get(&reqid.to_string()).cloned().unwrap_or_default();
                 // on_selection fails closed for a token this provider did not issue.
                 if let Ok(resp) = engine.on_selection(0, &sel, |coord| handler(coord, &payload)) {
                     pending_payloads.remove(&reqid.to_string());
-                    let _ = ps
-                        .publish(
-                            names::response_name(&node, &requester, &service, &reqid),
-                            resp.encode().as_ref(),
-                        )
-                        .await;
+                    let name = names::response_name(&node, &requester, &service, &reqid);
+                    let _ = ps.publish(name.clone(), trust.seal(name, resp.encode()).as_ref()).await;
                 }
             }
             _ => {} // ACK/RESPONSE: our own or others' — ignore
@@ -193,7 +187,7 @@ pub async fn serve_provider<H>(
 // Raw driver entry point; the ergonomic `ServiceUser`/`ServiceProvider` role
 // wrappers (spec §11) bundle the stable fields and come with that phase.
 #[allow(clippy::too_many_arguments)]
-#[instrument(skip(ps, payload), fields(requester = %requester, provider = %provider, service = %service))]
+#[instrument(skip(ps, payload, trust), fields(requester = %requester, provider = %provider, service = %service))]
 pub async fn call(
     ps: &SvsPubSub,
     requester: Name,
@@ -203,37 +197,39 @@ pub async fn call(
     group_prefix: Name,
     payload: Bytes,
     user_token: &str,
+    trust: &TrustCtx,
 ) -> Option<Bytes> {
     let mut rx = ps.subscribe(group_prefix).await;
 
-    // Phase 1: REQUEST.
+    // Phase 1: REQUEST (signed as the requester).
     let req = make_request(&request_id.to_string(), user_token, payload);
-    ps.publish(names::request_name(&requester, &service, &request_id), req.encode().as_ref())
+    let req_name = names::request_name(&requester, &service, &request_id);
+    ps.publish(req_name.clone(), trust.seal(req_name, req.encode()).as_ref())
         .await
         .ok()?;
 
-    // Await our provider's ACK (Phase 2).
+    // Await our provider's ACK (Phase 2), verified to come from `provider`.
     let ack = loop {
         let pubn = rx.recv().await?;
         if phase_of(&pubn.name) == Some(Phase::Ack) && request_id_of(&pubn.name) == request_id {
-            break AckMessage::decode(pubn.payload).ok()?;
+            let payload = trust.unseal(pubn.payload, &provider).await?;
+            break AckMessage::decode(payload).ok()?;
         }
     };
 
-    // Phase 3: SELECTION, echoing the provider token.
+    // Phase 3: SELECTION, echoing the provider token (signed as the requester).
     let sel = make_selection(&ack, &request_id.to_string());
-    ps.publish(
-        names::selection_name(&requester, &provider, &service, &request_id),
-        sel.encode().as_ref(),
-    )
-    .await
-    .ok()?;
+    let sel_name = names::selection_name(&requester, &provider, &service, &request_id);
+    ps.publish(sel_name.clone(), trust.seal(sel_name, sel.encode()).as_ref())
+        .await
+        .ok()?;
 
-    // Await the RESPONSE (Phase 4).
+    // Await the RESPONSE (Phase 4), verified to come from `provider`.
     loop {
         let pubn = rx.recv().await?;
         if phase_of(&pubn.name) == Some(Phase::Response) && request_id_of(&pubn.name) == request_id {
-            return ResponseMessage::decode(pubn.payload).ok().map(|r| r.payload);
+            let payload = trust.unseal(pubn.payload, &provider).await?;
+            return ResponseMessage::decode(payload).ok().map(|r| r.payload);
         }
     }
 }
@@ -244,7 +240,7 @@ pub async fn call(
 /// selected provider's `(name, response)`. The empty vec means no provider
 /// responded in time.
 #[allow(clippy::too_many_arguments)]
-#[instrument(skip(ps, payload), fields(requester = %requester, service = %service, strategy = ?strategy))]
+#[instrument(skip(ps, payload, trust), fields(requester = %requester, service = %service, strategy = ?strategy))]
 pub async fn select_and_call(
     ps: &SvsPubSub,
     requester: Name,
@@ -255,10 +251,11 @@ pub async fn select_and_call(
     user_token: &str,
     strategy: Strategy,
     ack_window: Duration,
+    trust: &TrustCtx,
 ) -> Vec<(Name, Bytes)> {
     let mut rx = ps.subscribe(group_prefix).await;
 
-    // Phase 1: REQUEST carrying the requested strategy.
+    // Phase 1: REQUEST carrying the requested strategy (signed as the requester).
     let req = RequestMessage {
         request_id: request_id.to_string(),
         user_token: user_token.to_string(),
@@ -266,8 +263,9 @@ pub async fn select_and_call(
         strategy,
         ..Default::default()
     };
+    let req_name = names::request_name(&requester, &service, &request_id);
     if ps
-        .publish(names::request_name(&requester, &service, &request_id), req.encode().as_ref())
+        .publish(req_name.clone(), trust.seal(req_name, req.encode()).as_ref())
         .await
         .is_err()
     {
@@ -288,11 +286,13 @@ pub async fn select_and_call(
         }
         match tokio::time::timeout(remaining, rx.recv()).await {
             Ok(Some(pubn)) => {
+                let provider = before_ndnsf(&pubn.name);
                 if phase_of(&pubn.name) == Some(Phase::Ack)
                     && request_id_of(&pubn.name) == request_id
-                    && let Ok(ack) = AckMessage::decode(pubn.payload)
+                    && let Some(payload) = trust.unseal(pubn.payload, &provider).await
+                    && let Ok(ack) = AckMessage::decode(payload)
                 {
-                    acks.push((before_ndnsf(&pubn.name), ack));
+                    acks.push((provider, ack));
                 }
             }
             _ => break, // window elapsed or group closed
@@ -305,12 +305,8 @@ pub async fn select_and_call(
     let want: Vec<Name> = selected.iter().map(|(p, _)| p.clone()).collect();
     for (provider, ack) in &selected {
         let sel = make_selection(ack, &request_id.to_string());
-        let _ = ps
-            .publish(
-                names::selection_name(&requester, provider, &service, &request_id),
-                sel.encode().as_ref(),
-            )
-            .await;
+        let sel_name = names::selection_name(&requester, provider, &service, &request_id);
+        let _ = ps.publish(sel_name.clone(), trust.seal(sel_name, sel.encode()).as_ref()).await;
     }
 
     // Phase 4: collect one RESPONSE per selected provider, within the window.
@@ -329,7 +325,8 @@ pub async fn select_and_call(
                     let provider = before_ndnsf(&pubn.name);
                     if want.contains(&provider)
                         && !responses.iter().any(|(p, _)| *p == provider)
-                        && let Ok(resp) = ResponseMessage::decode(pubn.payload)
+                        && let Some(payload) = trust.unseal(pubn.payload, &provider).await
+                        && let Ok(resp) = ResponseMessage::decode(payload)
                     {
                         responses.push((provider, resp.payload));
                     }
@@ -344,6 +341,7 @@ pub async fn select_and_call(
 /// Targeted bootstrap (NDNSF `TargetedBootstrapRequest`): ask `provider` for a
 /// batch of single-use tokens for `service`, returning the token pool. Empty on
 /// failure/close.
+#[allow(clippy::too_many_arguments)]
 pub async fn bootstrap_targeted(
     ps: &SvsPubSub,
     requester: Name,
@@ -352,17 +350,19 @@ pub async fn bootstrap_targeted(
     request_id: Name,
     group_prefix: Name,
     user_token: &str,
+    trust: &TrustCtx,
 ) -> Vec<String> {
     let mut rx = ps.subscribe(group_prefix).await;
     let req = RequestMessage {
         request_id: request_id.to_string(),
         user_token: user_token.to_string(),
         request_mode: RequestMode::TargetedBootstrap,
-        target_provider: Some(provider),
+        target_provider: Some(provider.clone()),
         ..Default::default()
     };
+    let req_name = names::request_name(&requester, &service, &request_id);
     if ps
-        .publish(names::request_name(&requester, &service, &request_id), req.encode().as_ref())
+        .publish(req_name.clone(), trust.seal(req_name, req.encode()).as_ref())
         .await
         .is_err()
     {
@@ -373,7 +373,10 @@ pub async fn bootstrap_targeted(
             return Vec::new();
         };
         if phase_of(&pubn.name) == Some(Phase::Response) && request_id_of(&pubn.name) == request_id {
-            return match ResponseMessage::decode(pubn.payload) {
+            let Some(payload) = trust.unseal(pubn.payload, &provider).await else {
+                return Vec::new();
+            };
+            return match ResponseMessage::decode(payload) {
                 Ok(resp) => String::from_utf8_lossy(&resp.payload)
                     .split('\n')
                     .filter(|s| !s.is_empty())
@@ -399,6 +402,7 @@ pub async fn call_targeted(
     payload: Bytes,
     user_token: &str,
     provider_token: &str,
+    trust: &TrustCtx,
 ) -> Option<Bytes> {
     let mut rx = ps.subscribe(group_prefix).await;
     let req = RequestMessage {
@@ -406,17 +410,19 @@ pub async fn call_targeted(
         user_token: user_token.to_string(),
         payload,
         request_mode: RequestMode::Targeted,
-        target_provider: Some(provider),
+        target_provider: Some(provider.clone()),
         provider_token: provider_token.to_string(),
         ..Default::default()
     };
-    ps.publish(names::request_name(&requester, &service, &request_id), req.encode().as_ref())
+    let req_name = names::request_name(&requester, &service, &request_id);
+    ps.publish(req_name.clone(), trust.seal(req_name, req.encode()).as_ref())
         .await
         .ok()?;
     loop {
         let pubn = rx.recv().await?;
         if phase_of(&pubn.name) == Some(Phase::Response) && request_id_of(&pubn.name) == request_id {
-            return ResponseMessage::decode(pubn.payload).ok().map(|r| r.payload);
+            let payload = trust.unseal(pubn.payload, &provider).await?;
+            return ResponseMessage::decode(payload).ok().map(|r| r.payload);
         }
     }
 }

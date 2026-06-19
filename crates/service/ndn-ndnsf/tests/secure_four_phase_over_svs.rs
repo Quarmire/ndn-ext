@@ -12,6 +12,7 @@ use ndn_foundation_types::Hash;
 use ndn_ndnsf::access::{open_with, seal_for};
 use ndn_ndnsf::driver::{call, serve_provider};
 use ndn_ndnsf::tokens::PendingCoordination;
+use ndn_ndnsf::trust::TrustCtx;
 use ndn_packet::Name;
 use ndn_security::abe::{PolicyExpr, lsw_keygen, lsw_setup};
 use ndn_sync::{SvSyncConfig, SvsConfig, SvsPubSub};
@@ -64,6 +65,7 @@ async fn secure_four_phase_access_controlled() {
     });
     let provider_ps = SvsPubSub::join(group.clone(), n("/muas/bob"), a_out_tx, a_in_rx, cfg());
     let user_ps = SvsPubSub::join(group.clone(), n("/muas/alice"), b_out_tx, b_in_rx, cfg());
+    let trust = TrustCtx::default();
 
     // The provider seals its echoed response under the service attribute.
     let handler = move |_c: &PendingCoordination, req: &Bytes| -> Bytes {
@@ -78,7 +80,7 @@ async fn secure_four_phase_access_controlled() {
     };
 
     let sealed = tokio::select! {
-        _ = serve_provider(&provider_ps, n("/muas/bob"), n("/svc/echo"), group.clone(), 3600, handler) => None,
+        _ = serve_provider(&provider_ps, n("/muas/bob"), n("/svc/echo"), group.clone(), 3600, &trust, handler) => None,
         r = tokio::time::timeout(
             Duration::from_secs(10),
             call(
@@ -90,6 +92,7 @@ async fn secure_four_phase_access_controlled() {
                 group.clone(),
                 Bytes::from_static(b"ping"),
                 "utok",
+                &trust,
             ),
         ) => r.ok().flatten(),
     };

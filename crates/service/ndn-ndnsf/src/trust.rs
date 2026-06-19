@@ -8,6 +8,13 @@
 //! sender (so a node cannot publish a `/<provider>/NDNSF/ACK/…` it did not sign).
 //! Either failure rejects the message (fail closed) — its payload never affects
 //! state. Reuses `ndn_security`'s real `Signer`/`Validator`, not new crypto.
+//!
+//! [`TrustCtx`] bundles a node's outbound signer and inbound validator and is
+//! threaded through the [`crate::driver`] flow, so every REQUEST/ACK/SELECTION/
+//! RESPONSE is sealed on publish and verified on receipt. An empty `TrustCtx`
+//! (the default) is the unsigned fast path — backward compatible.
+
+use std::sync::Arc;
 
 use bytes::Bytes;
 use ndn_packet::Name;
@@ -15,11 +22,102 @@ use ndn_packet::encode::DataBuilder;
 use ndn_packet::Data;
 use ndn_security::validator::ValidationResult;
 use ndn_security::{SignWith, Signer, Validator};
+use ndn_sync::{IngestValidator, PublisherSigner};
 
 /// Sign `payload` as a Data named `name`, producing the wire blob a four-phase
 /// publisher puts on the group. The Data's `KeyLocator` records the signer.
 pub fn sign_message(signer: &dyn Signer, name: Name, payload: &[u8]) -> Option<Bytes> {
     DataBuilder::new(name, payload).sign_with_sync(signer).ok()
+}
+
+/// Per-node trust for the four-phase driver: an optional `signer` (this node
+/// signs every message it publishes) and `validator` (this node verifies every
+/// message it consumes, against the phase's expected sender). The default
+/// (`TrustCtx::default`) is empty — the unsigned fast path, fully backward
+/// compatible: publications go out raw and inbound messages are accepted as-is.
+///
+/// This is the faithful NSF `MessageValidator` placement: trust is enforced
+/// per-message in the flow (a `/<sender>/NDNSF/<phase>/…` message whose
+/// signature does not validate against the configured anchors, or whose signer
+/// is not under the phase's expected sender, never affects state) — *not* at the
+/// sync substrate, whose `IngestValidator` gates durable storage, a separate
+/// concern.
+#[derive(Clone, Default)]
+pub struct TrustCtx {
+    /// Signs this node's outbound four-phase messages. `None` ⇒ publish raw.
+    pub signer: Option<Arc<dyn Signer>>,
+    /// Verifies inbound four-phase messages. `None` ⇒ accept without checking.
+    pub validator: Option<Arc<Validator>>,
+}
+
+impl TrustCtx {
+    /// A node that both signs its messages and validates the ones it receives.
+    pub fn new(signer: Arc<dyn Signer>, validator: Arc<Validator>) -> Self {
+        Self {
+            signer: Some(signer),
+            validator: Some(validator),
+        }
+    }
+
+    /// Wrap `msg` as a signed Data named `name` when a signer is set, returning
+    /// the wire blob to publish; otherwise return `msg` unchanged (raw).
+    pub fn seal(&self, name: Name, msg: Bytes) -> Bytes {
+        match &self.signer {
+            Some(s) => sign_message(&**s, name, &msg).unwrap_or(msg),
+            None => msg,
+        }
+    }
+
+    /// Recover the inner message bytes from an inbound publication `payload`.
+    /// With a validator set, `payload` must be a signed Data that validates and
+    /// whose signer is under `expected_sender` (else `None` — fail closed).
+    /// Without a validator, `payload` is returned as-is.
+    pub async fn unseal(&self, payload: Bytes, expected_sender: &Name) -> Option<Bytes> {
+        match &self.validator {
+            Some(v) => verify_message(v, payload, expected_sender).await,
+            None => Some(payload),
+        }
+    }
+}
+
+/// Bridge an `ndn_security` signer into an `ndn-sync` [`PublisherSigner`], so a
+/// `SvsPubSub` built with `join_secured` signs every publication with the node's
+/// key (substrate-level publisher authentication). CPU-only signing.
+///
+/// Note: four-phase **message** trust is enforced in the flow via [`TrustCtx`]
+/// (the faithful NSF `MessageValidator` placement). This substrate signer is the
+/// orthogonal *durable-store* path — sign publications so a repo/ingest peer can
+/// validate before persisting them (see [`ingest_validator`]).
+pub fn publisher_signer(signer: Arc<dyn Signer>) -> PublisherSigner {
+    let sig_type = signer.sig_type();
+    let key_locator = signer.key_name().clone();
+    PublisherSigner {
+        sig_type,
+        key_locator,
+        sign: Arc::new(move |region| signer.sign_sync(region).expect("CPU-only signer")),
+    }
+}
+
+/// Bridge an `ndn_security::Validator` into an `ndn-sync` [`IngestValidator`]: a
+/// fetched publication is **stored** only if its Data signature validates against
+/// the validator's trust anchors (fail closed). Hand the result to
+/// `SvsPubSub::join_secured`.
+///
+/// Scope: this gates the sync substrate's **durable-store / ingest** path, not
+/// pub/sub *delivery* — `SvsPubSub::fetch_publication` (the subscriber-delivery
+/// path) is not gated by it. Four-phase message trust is therefore enforced in
+/// the flow by [`TrustCtx`] (per-message, against each phase's expected sender),
+/// and this validator additionally protects what a repo/ingest peer persists.
+pub fn ingest_validator(validator: Arc<Validator>) -> IngestValidator {
+    Arc::new(move |wire: Bytes| {
+        let validator = validator.clone();
+        Box::pin(async move {
+            match Data::decode(wire) {
+                Ok(data) => matches!(validator.validate(&data).await, ValidationResult::Valid(_)),
+                Err(_) => false,
+            }
+        })
+    })
 }
 
 /// Validate a signed-message blob before acting on it. Returns the inner payload
