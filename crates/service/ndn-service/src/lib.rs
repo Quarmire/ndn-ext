@@ -39,7 +39,8 @@ pub use topic::{Subscription, Topic};
 /// topics, plus role-scoped keys ([`session::RoleScopePolicy`] / [`session::ScopedSession`]).
 pub mod session;
 pub use session::{
-    RoleScopePolicy, ScopeKeyring, ScopedSession, ScopedSubscription, ScopedTopic, Session,
+    ArtifactShare, RoleScopePolicy, ScopeKeyring, ScopedSession, ScopedSubscription, ScopedTopic,
+    Session,
 };
 
 /// Key distribution: seal a member's role-scoped keyring to its X25519 key.

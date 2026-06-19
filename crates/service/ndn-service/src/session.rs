@@ -89,6 +89,54 @@ impl<R> Session<R> {
         let name = self.name.clone().append(sub.as_bytes());
         build_scoped_topic(self.ps.clone(), name, self.scope_key.clone())
     }
+
+    /// Named-artifact provisioning within this session — confidential objects
+    /// under the session scope key (see [`ArtifactShare`]).
+    pub fn artifacts(&self) -> ArtifactShare {
+        ArtifactShare {
+            ps: self.ps.clone(),
+            base: self.name.clone().append(ARTIFACTS),
+            key: self.scope_key.clone(),
+        }
+    }
+}
+
+/// The `artifacts` name component under which a session's artifacts live.
+const ARTIFACTS: &str = "artifacts";
+
+/// Named-artifact provisioning within a session scope: a member **provisions**
+/// (publishes) a named object and others **fetch** it by name. Each artifact is a
+/// one-shot confidential object sealed under the scope key — a member without the
+/// key cannot open it. Large artifacts ride `SvsPubSub`'s segmentation.
+///
+/// An artifact is modelled as a confidential typed object of bytes
+/// ([`ScopedTopic<Bytes>`]) fetched once, so it reuses the same sealing path.
+pub struct ArtifactShare {
+    ps: Arc<SvsPubSub>,
+    base: Name,
+    key: Arc<ContentKey>,
+}
+
+impl ArtifactShare {
+    fn object(&self, name: &str) -> ScopedTopic<Bytes> {
+        build_scoped_topic(
+            self.ps.clone(),
+            self.base.clone().append(name.as_bytes()),
+            self.key.clone(),
+        )
+    }
+
+    /// Provision (publish) the artifact `name` with `content`, sealed under the
+    /// scope key. Returns the publication sequence number.
+    pub async fn provision(&self, name: &str, content: &[u8]) -> Result<u64, ServiceError> {
+        self.object(name).publish(&Bytes::copy_from_slice(content)).await
+    }
+
+    /// Fetch the artifact `name`: await its publication and return the opened
+    /// content. `None` if the session closes before it arrives.
+    pub async fn fetch(&self, name: &str) -> Option<Bytes> {
+        self.object(name).subscribe().await.recv().await
+    }
 }
 
 /// A confidential typed topic within a [`Session`]: a feed of `T` sealed under the
@@ -270,5 +318,16 @@ impl ScopedSession {
         let key = self.keyring.get(scope)?;
         let name = self.name.clone().append(scope.as_bytes()).append(sub.as_bytes());
         Some(build_scoped_topic(self.ps.clone(), name, key))
+    }
+
+    /// Named-artifact provisioning within `scope` (confidential under the scope
+    /// key). `None` if this member's keyring lacks `scope` — the role gate.
+    pub fn artifacts(&self, scope: &str) -> Option<ArtifactShare> {
+        let key = self.keyring.get(scope)?;
+        Some(ArtifactShare {
+            ps: self.ps.clone(),
+            base: self.name.clone().append(scope.as_bytes()).append(ARTIFACTS),
+            key,
+        })
     }
 }
