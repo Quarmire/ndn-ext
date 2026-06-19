@@ -46,3 +46,10 @@ tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time
 ndn-sealed-box = { workspace = true }
 # #[ndn_service] macro: prove a generated service runs over NdnsfCarrier + select.
 ndn-service-macro = { workspace = true }
+# Weather example: the same service definition over the Tier-0 carrier too.
+ndn-rpc = { workspace = true }
+
+# `cargo run -p ndn-ndnsf --example weather --features driver`
+[[example]]
+name = "weather"
+required-features = ["driver"]

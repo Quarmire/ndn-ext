@@ -24,7 +24,56 @@
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
-use syn::{FnArg, Ident, ItemTrait, Pat, ReturnType, TraitItem, Type, parse_macro_input};
+use syn::{
+    Data, DeriveInput, Fields, FnArg, Ident, ItemTrait, Pat, ReturnType, TraitItem, Type,
+    parse_macro_input,
+};
+
+/// `#[derive(Frame)]` — derive `ndn_service_core::Frame` for a named-field struct,
+/// composing each field's `Frame` (length-delimited, forward-compatible by
+/// append). This is what makes a structured request **or response** type ergonomic
+/// (e.g. a `Forecast { city, high_c, low_c, summary }` returned by a service op).
+/// Every field type must itself implement `Frame`.
+#[proc_macro_derive(Frame)]
+pub fn derive_frame(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    let ident = &input.ident;
+    let fields = match &input.data {
+        Data::Struct(s) => match &s.fields {
+            Fields::Named(named) => &named.named,
+            _ => {
+                return syn::Error::new_spanned(ident, "Frame derive requires named fields")
+                    .to_compile_error()
+                    .into();
+            }
+        },
+        _ => {
+            return syn::Error::new_spanned(ident, "Frame derive requires a struct")
+                .to_compile_error()
+                .into();
+        }
+    };
+    let names: Vec<&Ident> = fields.iter().map(|f| f.ident.as_ref().unwrap()).collect();
+    let types: Vec<&Type> = fields.iter().map(|f| &f.ty).collect();
+    quote! {
+        impl ::ndn_service_core::Frame for #ident {
+            fn encode(&self) -> ::ndn_service_core::bytes::Bytes {
+                ::ndn_service_core::framing::encode_fields(&[
+                    #( ::ndn_service_core::Frame::encode(&self.#names) ),*
+                ])
+            }
+            fn decode(__bytes: &[u8]) -> ::core::result::Result<Self, ::ndn_service_core::ServiceError> {
+                let mut __pos = 0usize;
+                ::core::result::Result::Ok(Self {
+                    #( #names: <#types as ::ndn_service_core::Frame>::decode(
+                        ::ndn_service_core::framing::read_field(__bytes, &mut __pos)?
+                    )? ),*
+                })
+            }
+        }
+    }
+    .into()
+}
 
 struct Method {
     name: Ident,
