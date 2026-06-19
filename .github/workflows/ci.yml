@@ -1,0 +1,90 @@
+name: CI — ndn-ext
+
+# ndn-ext crates depend on ndn-rs via ../ path deps, so CI checks out ndn-rs as a
+# sibling. Once cross-repo deps become { git, tag }, drop the extra checkout and
+# the `path:`/`working-directory:` indirection.
+
+on:
+  push:
+    branches: [main]
+    paths: ["crates/**", "Cargo.toml", ".github/workflows/ci.yml"]
+  pull_request:
+    branches: [main]
+    paths: ["crates/**", "Cargo.toml", ".github/workflows/ci.yml"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  core:
+    name: ext (clippy / test / doc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: ndn-ext }
+      - uses: actions/checkout@v4
+        with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: main, path: ndn-rs }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: rustfmt, clippy }
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ndn-ext/target
+          key: ${{ runner.os }}-cargo-ext-${{ hashFiles('ndn-ext/**/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-ext-
+      # bluetooth (libdbus), monitor-wifi (libusb) host builds need these.
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev libusb-1.0-0-dev libpcap-dev pkg-config
+      # default-members excludes wasm/python/mobile/afxdp crates (own jobs below).
+      - name: Format
+        working-directory: ndn-ext
+        run: cargo fmt --all -- --check
+      - name: Lint
+        working-directory: ndn-ext
+        run: cargo clippy -- -D warnings
+      - name: Test
+        working-directory: ndn-ext
+        run: cargo test
+      - name: Doc build
+        working-directory: ndn-ext
+        run: cargo doc --no-deps
+
+  wasm32:
+    name: WASM crates (wasm32-unknown-unknown)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: ndn-ext }
+      - uses: actions/checkout@v4
+        with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: main, path: ndn-rs }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: wasm32-unknown-unknown }
+      - name: Check wasm crates
+        working-directory: ndn-ext
+        run: |
+          for p in ndn-wasm ndn-web-attach ndn-face-webtransport-wasm ndn-face-shared-worker ndn-face-webble ndn-strategy-wasm; do
+            cargo check -p "$p" --target wasm32-unknown-unknown
+          done
+
+  python:
+    name: Python bindings (maturin)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: ndn-ext }
+      - uses: actions/checkout@v4
+        with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: main, path: ndn-rs }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Install maturin
+        run: pip install maturin
+      - name: Lint + build wheel
+        working-directory: ndn-ext
+        run: |
+          cargo clippy -p ndn-python -- -D warnings
+          maturin build -m crates/bindings/ndn-python/Cargo.toml
