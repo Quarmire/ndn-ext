@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use ndn_packet::Name;
 use ndn_rpc::{RpcCarrier, RpcRegistry};
-use ndn_service::{DiscoveryCarrier, MemoryDirectory};
+use ndn_service::{DiscoveryCarrier, MemoryDirectory, NamingConvention, ProviderDirectory};
 use ndn_service_core::{Carrier, ServiceId, Strategy};
 use ndn_service_macro::ndn_service;
 
@@ -64,6 +64,30 @@ async fn discovery_selects_among_providers_over_tier0() {
     let texts: HashSet<String> = many.into_iter().map(|(_, t)| t).collect();
     assert!(texts.contains("p1:hi"), "p1 missing: {texts:?}");
     assert!(texts.contains("p2:hi"), "p2 missing: {texts:?}");
+}
+
+#[tokio::test]
+async fn forwarding_hint_convention_shares_name_with_per_node_hints() {
+    // The data-centric convention: all providers share the content name; the
+    // selected provider is reached via a forwarding hint (= its node).
+    let dir = MemoryDirectory::with_convention(NamingConvention::ForwardingHint);
+    let svc = ServiceId::new(n("/svc/echo"));
+
+    let serve = dir.advertise(&svc, &n("/p1")).await;
+    dir.advertise(&svc, &n("/p2")).await;
+    assert_eq!(serve, n("/svc/echo"), "providers serve the shared content name");
+
+    let entries = dir.providers(&svc).await;
+    assert_eq!(entries.len(), 2);
+    assert!(
+        entries.iter().all(|e| e.callable == n("/svc/echo")),
+        "all providers share one content name"
+    );
+    let hints: HashSet<String> = entries
+        .iter()
+        .filter_map(|e| e.forwarding_hint.as_ref().map(|h| h.to_string()))
+        .collect();
+    assert!(hints.contains("/p1") && hints.contains("/p2"), "per-node hints: {hints:?}");
 }
 
 #[tokio::test]

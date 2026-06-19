@@ -42,7 +42,9 @@ pub use session::{ScopedSubscription, ScopedTopic, Session};
 /// Tier-1 discovery-selection carrier: discover providers, select, invoke over an
 /// inner Tier-0 carrier.
 pub mod discovery_carrier;
-pub use discovery_carrier::{DiscoveryCarrier, MemoryDirectory, ProviderDirectory, ProviderEntry};
+pub use discovery_carrier::{
+    DiscoveryCarrier, MemoryDirectory, NamingConvention, ProviderDirectory, ProviderEntry,
+};
 
 /// A production [`ProviderDirectory`] backed by `ndn-discovery` (feature `discovery`).
 #[cfg(feature = "discovery")]

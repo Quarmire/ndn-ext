@@ -24,9 +24,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use ndn_packet::encode::{DataBuilder, InterestBuilder};
-use ndn_packet::{Data, Interest};
+use ndn_packet::{Data, Interest, Name};
 use ndn_service_core::{
-    Carrier, Dispatch, Invocation, OpId, Response, ServiceError, ServiceId,
+    Carrier, Dispatch, HintedCarrier, Invocation, OpId, Response, ServiceError, ServiceId,
 };
 
 use crate::{RpcError, RpcHandler, RpcRegistry};
@@ -102,10 +102,36 @@ impl Carrier for RpcCarrier {
         op: &OpId,
         request: Bytes,
     ) -> Result<Response, ServiceError> {
+        self.invoke_hinted(svc, op, request, None).await
+    }
+
+    async fn serve(&self, svc: &ServiceId, dispatch: Arc<dyn Dispatch>) -> Result<(), ServiceError> {
+        let handler = CarrierHandler {
+            service_len: svc.name().len(),
+            dispatch,
+        };
+        self.registry.register(svc.name(), handler);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl HintedCarrier for RpcCarrier {
+    async fn invoke_hinted(
+        &self,
+        svc: &ServiceId,
+        op: &OpId,
+        request: Bytes,
+        hint: Option<&Name>,
+    ) -> Result<Response, ServiceError> {
         let name = svc.name().clone().append(op.as_str());
-        let wire = InterestBuilder::new(name)
-            .app_parameters(request.to_vec())
-            .build();
+        let mut builder = InterestBuilder::new(name).app_parameters(request.to_vec());
+        if let Some(h) = hint {
+            // Steer the forwarder toward the selected provider while the content
+            // name stays shared across providers (the data-centric convention).
+            builder = builder.forwarding_hint(vec![h.clone()]);
+        }
+        let wire = builder.build();
         let interest =
             Interest::decode(wire).map_err(|e| ServiceError::Transport(e.to_string()))?;
         match self.registry.dispatch(&interest).await {
@@ -117,14 +143,5 @@ impl Carrier for RpcCarrier {
             Some(Err(RpcError::BadRequest(e))) => Err(ServiceError::Decode(e)),
             Some(Err(RpcError::HandlerFailed(e))) => Err(ServiceError::Handler(e)),
         }
-    }
-
-    async fn serve(&self, svc: &ServiceId, dispatch: Arc<dyn Dispatch>) -> Result<(), ServiceError> {
-        let handler = CarrierHandler {
-            service_len: svc.name().len(),
-            dispatch,
-        };
-        self.registry.register(svc.name(), handler);
-        Ok(())
     }
 }

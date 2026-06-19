@@ -195,6 +195,24 @@ pub trait SelectCarrier: Carrier {
     ) -> Result<Vec<Response>, ServiceError>;
 }
 
+/// A [`Carrier`] refinement for backends that can steer an invocation toward a
+/// specific provider via a **routing hint** (an NDN forwarding hint naming the
+/// target node) while keeping a single shared content name — the data-centric
+/// alternative to a per-provider name. Carriers without hint support (or non-NDN
+/// transports) simply do not implement it; like [`SelectCarrier`], it is opt-in.
+#[async_trait::async_trait]
+pub trait HintedCarrier: Carrier {
+    /// Invoke `op` of `svc` with `request`, steering toward `hint` when given
+    /// (`None` is identical to [`Carrier::invoke`]).
+    async fn invoke_hinted(
+        &self,
+        svc: &ServiceId,
+        op: &OpId,
+        request: Bytes,
+        hint: Option<&Name>,
+    ) -> Result<Response, ServiceError>;
+}
+
 /// Length-delimited field framing used by `#[ndn_service]`-generated message
 /// types: a request struct's fields are each encoded with their [`Frame`] and
 /// concatenated length-prefixed. Decoding reads its known fields in order and

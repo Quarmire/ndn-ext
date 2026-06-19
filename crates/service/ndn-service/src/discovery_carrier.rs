@@ -5,13 +5,16 @@
 //! them, and invokes the chosen provider(s) over an **inner Tier-0 carrier** `C`
 //! (e.g. `ndn-rpc`'s `RpcCarrier`) — "selection yields a provider set; the call
 //! drops to Tier-0". The discovery layer therefore *adds* multi-provider
-//! [`SelectCarrier`] on top of a plain unary inner [`Carrier`].
+//! [`SelectCarrier`] on top of a plain inner [`Carrier`].
 //!
-//! The directory is a seam: [`MemoryDirectory`] is the in-process implementation
-//! used to prove the carrier; a production directory wraps
-//! `ndn-discovery::service_discovery::ServiceDiscoveryProtocol` (its `all_records`
-//! for the set and `measurements` for RTT-ranking), with its own service↔provider
-//! naming convention. The carrier is agnostic to which directory backs it.
+//! Two [naming conventions](NamingConvention) for addressing a selected provider,
+//! both behind the same [`ProviderDirectory`] seam (the carrier is agnostic):
+//! - [`NamingConvention::NodeScoped`]: each provider has a distinct callable name
+//!   `<node>/<service>`; the name itself addresses the provider (no hint).
+//! - [`NamingConvention::ForwardingHint`]: all providers share the content name
+//!   `<service>`; a selected provider is reached via an NDN **forwarding hint**
+//!   (= its node), the more data-centric model (one content name, the network
+//!   routes). Requires the inner carrier to honour hints ([`HintedCarrier`]).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -22,42 +25,74 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use ndn_packet::Name;
-use ndn_service_core::{Carrier, OpId, Response, SelectCarrier, ServiceError, ServiceId, Strategy};
+use ndn_service_core::{
+    Carrier, HintedCarrier, OpId, Response, SelectCarrier, ServiceError, ServiceId, Strategy,
+};
+
+/// How a provider of a logical service is named and addressed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NamingConvention {
+    /// Each provider serves a distinct callable `<node>/<service>`; the name
+    /// addresses the provider directly (no forwarding hint).
+    NodeScoped,
+    /// All providers share the content name `<service>`; a selected provider is
+    /// reached via a forwarding hint (= its node). The data-centric convention.
+    ForwardingHint,
+}
+
+/// The names a convention assigns for `service` at `node`:
+/// `(serve_name, callable, forwarding_hint)`.
+fn names_for(conv: NamingConvention, service: &Name, node: &Name) -> (Name, Name, Option<Name>) {
+    match conv {
+        NamingConvention::NodeScoped => {
+            let mut callable = node.clone();
+            for c in service.components() {
+                callable = callable.append_component(c.clone());
+            }
+            (callable.clone(), callable, None)
+        }
+        NamingConvention::ForwardingHint => (service.clone(), service.clone(), Some(node.clone())),
+    }
+}
 
 /// A discovered provider of a service: the Tier-0 callable name to invoke it at,
-/// and an optional round-trip estimate for ranking (lower is better).
+/// an optional forwarding hint steering to it (the data-centric convention), and
+/// an optional round-trip estimate for ranking (lower is better).
 #[derive(Clone, Debug)]
 pub struct ProviderEntry {
-    /// The provider's callable service prefix (the inner carrier's target).
+    /// The provider's callable name (the inner carrier's target).
     pub callable: Name,
+    /// A forwarding hint to steer to this provider, when the shared-name
+    /// convention is used; `None` when the callable itself addresses it.
+    pub forwarding_hint: Option<Name>,
     /// Round-trip estimate for fastest-first ranking, if known.
     pub rtt: Option<Duration>,
 }
 
 /// Tier-1 provider discovery: the set of providers offering a service, and the
-/// advertisement of a local offering. Implementations rank `providers` best-first
-/// (e.g. lowest RTT). A production impl reads
-/// `ServiceDiscoveryProtocol::{all_records, measurements}`; [`MemoryDirectory`] is
-/// the in-process one used in tests.
+/// advertisement of a local offering. `advertise` returns the name the caller
+/// should **serve** under (the directory owns the naming convention, so serve and
+/// invoke agree). Implementations rank `providers` best-first.
 #[async_trait]
 pub trait ProviderDirectory: Send + Sync {
     /// Providers offering `service`, best-first.
     async fn providers(&self, service: &ServiceId) -> Vec<ProviderEntry>;
-    /// Advertise that this node offers `service` at the Tier-0 `callable` prefix.
-    async fn advertise(&self, service: &ServiceId, callable: &Name);
+    /// Advertise that `node` offers `service`; returns the name to serve under.
+    async fn advertise(&self, service: &ServiceId, node: &Name) -> Name;
 }
 
 /// A discovery-selection carrier: discover → select → invoke over the inner
-/// Tier-0 carrier `C`. `node` is this node's prefix; the callable it advertises
-/// for a service is `<node>/<service>`.
-pub struct DiscoveryCarrier<C: Carrier> {
+/// Tier-0 carrier `C`. `node` is this node's identity (used when advertising). The
+/// inner carrier must honour forwarding hints ([`HintedCarrier`]) so both naming
+/// conventions work (a `None` hint is the node-scoped case).
+pub struct DiscoveryCarrier<C: HintedCarrier> {
     directory: Arc<dyn ProviderDirectory>,
     inner: C,
     node: Name,
     round_robin: AtomicUsize,
 }
 
-impl<C: Carrier> DiscoveryCarrier<C> {
+impl<C: HintedCarrier> DiscoveryCarrier<C> {
     /// A carrier for `node` that discovers via `directory` and invokes over `inner`.
     pub fn new(directory: Arc<dyn ProviderDirectory>, inner: C, node: Name) -> Self {
         Self {
@@ -67,26 +102,18 @@ impl<C: Carrier> DiscoveryCarrier<C> {
             round_robin: AtomicUsize::new(0),
         }
     }
-
-    /// The callable prefix this node advertises for `svc`: `<node>/<service>`.
-    fn callable(&self, svc: &ServiceId) -> Name {
-        let mut name = self.node.clone();
-        for c in svc.name().components() {
-            name = name.append_component(c.clone());
-        }
-        name
-    }
 }
 
 #[async_trait]
-impl<C: Carrier> Carrier for DiscoveryCarrier<C> {
+impl<C: HintedCarrier> Carrier for DiscoveryCarrier<C> {
     async fn invoke(
         &self,
         svc: &ServiceId,
         op: &OpId,
         request: Bytes,
     ) -> Result<Response, ServiceError> {
-        // Best-first: invoke the top-ranked discovered provider over Tier-0.
+        // Best-first: invoke the top-ranked discovered provider over Tier-0,
+        // steering with its forwarding hint when the shared-name convention applies.
         let provider = self
             .directory
             .providers(svc)
@@ -95,20 +122,24 @@ impl<C: Carrier> Carrier for DiscoveryCarrier<C> {
             .next()
             .ok_or(ServiceError::NotFound)?;
         self.inner
-            .invoke(&ServiceId::new(provider.callable), op, request)
+            .invoke_hinted(
+                &ServiceId::new(provider.callable),
+                op,
+                request,
+                provider.forwarding_hint.as_ref(),
+            )
             .await
     }
 
     async fn serve(&self, svc: &ServiceId, dispatch: Arc<dyn ndn_service_core::Dispatch>) -> Result<(), ServiceError> {
-        // Advertise this node's offering, then serve it on the inner Tier-0 carrier.
-        let callable = self.callable(svc);
-        self.directory.advertise(svc, &callable).await;
-        self.inner.serve(&ServiceId::new(callable), dispatch).await
+        // The directory (owner of the naming convention) returns the serve name.
+        let serve_name = self.directory.advertise(svc, &self.node).await;
+        self.inner.serve(&ServiceId::new(serve_name), dispatch).await
     }
 }
 
 #[async_trait]
-impl<C: Carrier> SelectCarrier for DiscoveryCarrier<C> {
+impl<C: HintedCarrier> SelectCarrier for DiscoveryCarrier<C> {
     async fn invoke_select(
         &self,
         svc: &ServiceId,
@@ -134,7 +165,12 @@ impl<C: Carrier> SelectCarrier for DiscoveryCarrier<C> {
         for p in chosen {
             if let Ok(r) = self
                 .inner
-                .invoke(&ServiceId::new(p.callable), op, request.clone())
+                .invoke_hinted(
+                    &ServiceId::new(p.callable),
+                    op,
+                    request.clone(),
+                    p.forwarding_hint.as_ref(),
+                )
                 .await
             {
                 responses.push(r);
@@ -144,17 +180,31 @@ impl<C: Carrier> SelectCarrier for DiscoveryCarrier<C> {
     }
 }
 
-/// An in-process [`ProviderDirectory`] — the seam used to prove the carrier. A
-/// production directory wraps `ServiceDiscoveryProtocol`.
-#[derive(Default)]
+/// An in-process [`ProviderDirectory`] — the seam used to prove the carrier.
+/// Honours a [`NamingConvention`] (default [`NodeScoped`](NamingConvention::NodeScoped)).
 pub struct MemoryDirectory {
+    convention: NamingConvention,
     table: Mutex<HashMap<Name, Vec<ProviderEntry>>>,
 }
 
 impl MemoryDirectory {
-    /// An empty directory.
+    /// An empty directory using the node-scoped convention.
     pub fn new() -> Self {
-        Self::default()
+        Self::with_convention(NamingConvention::NodeScoped)
+    }
+
+    /// An empty directory using `convention`.
+    pub fn with_convention(convention: NamingConvention) -> Self {
+        Self {
+            convention,
+            table: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl Default for MemoryDirectory {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -169,15 +219,19 @@ impl ProviderDirectory for MemoryDirectory {
             .unwrap_or_default()
     }
 
-    async fn advertise(&self, service: &ServiceId, callable: &Name) {
+    async fn advertise(&self, service: &ServiceId, node: &Name) -> Name {
+        let (serve, callable, forwarding_hint) =
+            names_for(self.convention, service.name(), node);
         self.table
             .lock()
             .expect("directory lock")
             .entry(service.name().clone())
             .or_default()
             .push(ProviderEntry {
-                callable: callable.clone(),
+                callable,
+                forwarding_hint,
                 rtt: None,
             });
+        serve
     }
 }
