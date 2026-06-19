@@ -14,7 +14,8 @@
 //! distribution to members (e.g. via `ndn-sealed-box` per member, or ABE by role)
 //! is out of band here — a `Session` is given its scope key.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -24,6 +25,22 @@ use ndn_security::confidentiality::{ContentKey, Sealed};
 use ndn_service_core::{Frame, ServiceError};
 use ndn_sync::{Publication, SvsPubSub};
 use tokio::sync::mpsc;
+
+/// Build a [`ScopedTopic`] for `name` sealed under `key` (AAD = the topic name).
+fn build_scoped_topic<T: Frame>(
+    ps: Arc<SvsPubSub>,
+    name: Name,
+    key: Arc<ContentKey>,
+) -> ScopedTopic<T> {
+    let aad = Bytes::copy_from_slice(name.to_string().as_bytes());
+    ScopedTopic {
+        ps,
+        name,
+        key,
+        aad,
+        _marker: PhantomData,
+    }
+}
 
 /// A scoped collaboration session. `R` is the application's role type (typed, not
 /// string-keyed).
@@ -70,14 +87,7 @@ impl<R> Session<R> {
     /// session scope key, so only members (key holders) can read the feed.
     pub fn scoped_topic<T: Frame>(&self, sub: &str) -> ScopedTopic<T> {
         let name = self.name.clone().append(sub.as_bytes());
-        let aad = Bytes::copy_from_slice(name.to_string().as_bytes());
-        ScopedTopic {
-            ps: self.ps.clone(),
-            key: self.scope_key.clone(),
-            aad,
-            name,
-            _marker: PhantomData,
-        }
+        build_scoped_topic(self.ps.clone(), name, self.scope_key.clone())
     }
 }
 
@@ -145,5 +155,120 @@ impl<T: Frame> ScopedSubscription<T> {
             }
         }
         None
+    }
+}
+
+// --- Role-scoped keys: per-scope confidentiality, granted by role ---
+
+/// The scope keys a member holds. A member can participate in a topic only in a
+/// scope whose key is in its keyring — so confidentiality is *per scope*, not one
+/// session-wide key. Build one per role with [`RoleScopePolicy::keyring_for`].
+#[derive(Clone, Default)]
+pub struct ScopeKeyring {
+    keys: HashMap<String, Arc<ContentKey>>,
+}
+
+impl ScopeKeyring {
+    /// An empty keyring.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add the key for `scope` (builder style).
+    pub fn with(mut self, scope: impl Into<String>, key: ContentKey) -> Self {
+        self.keys.insert(scope.into(), Arc::new(key));
+        self
+    }
+
+    /// The key for `scope`, if held.
+    pub fn get(&self, scope: &str) -> Option<Arc<ContentKey>> {
+        self.keys.get(scope).cloned()
+    }
+
+    /// The scopes this keyring grants access to.
+    pub fn scopes(&self) -> impl Iterator<Item = &str> {
+        self.keys.keys().map(String::as_str)
+    }
+}
+
+/// Which scopes each role may access — the role→scope access policy. A member's
+/// keyring is **derived from its role**: [`keyring_for`](Self::keyring_for) hands
+/// out exactly the keys for the scopes the role is granted (role-scoped keys), so
+/// a role gates which topics a member can read.
+pub struct RoleScopePolicy<R> {
+    grants: HashMap<R, HashSet<String>>,
+}
+
+impl<R> Default for RoleScopePolicy<R> {
+    fn default() -> Self {
+        Self {
+            grants: HashMap::new(),
+        }
+    }
+}
+
+impl<R: Eq + Hash + Clone> RoleScopePolicy<R> {
+    /// An empty policy.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Grant `role` access to `scope` (builder style).
+    pub fn grant(mut self, role: R, scope: impl Into<String>) -> Self {
+        self.grants.entry(role).or_default().insert(scope.into());
+        self
+    }
+
+    /// The scopes `role` may access.
+    pub fn scopes_for(&self, role: &R) -> Option<&HashSet<String>> {
+        self.grants.get(role)
+    }
+
+    /// Derive the keyring for `role` from the full set of scope keys `all`: the
+    /// keys for exactly the scopes this role is granted. A member is provisioned
+    /// with the result; how the keys reach the member (sealed-box / ABE by role)
+    /// is the key-distribution concern, separate from this access derivation.
+    pub fn keyring_for(&self, role: &R, all: &ScopeKeyring) -> ScopeKeyring {
+        let mut keyring = ScopeKeyring::new();
+        if let Some(scopes) = self.grants.get(role) {
+            for scope in scopes {
+                if let Some(key) = all.keys.get(scope) {
+                    keyring.keys.insert(scope.clone(), key.clone());
+                }
+            }
+        }
+        keyring
+    }
+}
+
+/// A collaboration session keyed **per scope** (role-scoped keys): a member holds
+/// only the scope keys its role grants, so it can participate only in topics
+/// within those scopes. A topic in a scope the member's keyring lacks is
+/// unavailable ([`topic`](Self::topic) returns `None`) — the role gate is enforced
+/// by key possession (a capability), backed by the per-scope sealing.
+pub struct ScopedSession {
+    name: Name,
+    ps: Arc<SvsPubSub>,
+    keyring: ScopeKeyring,
+}
+
+impl ScopedSession {
+    /// A session named `name` over `ps`, with the member's per-scope `keyring`.
+    pub fn new(name: Name, ps: Arc<SvsPubSub>, keyring: ScopeKeyring) -> Self {
+        Self { name, ps, keyring }
+    }
+
+    /// The session name.
+    pub fn name(&self) -> &Name {
+        &self.name
+    }
+
+    /// A confidential topic `<session>/<scope>/<sub>`, sealed under the `scope`
+    /// key. `None` if this member's keyring lacks `scope` — i.e. its role does not
+    /// grant the scope, so it cannot publish to or read the topic.
+    pub fn topic<T: Frame>(&self, scope: &str, sub: &str) -> Option<ScopedTopic<T>> {
+        let key = self.keyring.get(scope)?;
+        let name = self.name.clone().append(scope.as_bytes()).append(sub.as_bytes());
+        Some(build_scoped_topic(self.ps.clone(), name, key))
     }
 }
