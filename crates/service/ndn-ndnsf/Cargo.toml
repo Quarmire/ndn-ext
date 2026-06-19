@@ -10,13 +10,19 @@ classification = "extension"
 
 [features]
 ## The over-SVS four-phase driver (ServiceProvider/ServiceUser loops over
-## ndn-sync's SvsPubSub). Off by default so the sans-IO core (tokens, messages,
-## flow) stays light.
-driver = ["dep:ndn-sync"]
+## ndn-sync's SvsPubSub) + KP-ABE access control (NAC-sealed payloads). Off by
+## default so the sans-IO core (tokens, messages, flow) stays light.
+driver = ["dep:ndn-sync", "dep:ndn-nacabe", "dep:ndn-security", "dep:ndn-foundation-types"]
 
 [dependencies]
 ndn-packet = { workspace = true, features = ["std"] }
 ndn-sync   = { workspace = true, optional = true }
+# KP-ABE access control for the four-phase payloads (NSF-A3): NAC-seal under
+# service attributes so only a holder of a satisfying ServiceController-issued
+# key can read them.
+ndn-nacabe = { workspace = true, optional = true }
+ndn-security = { workspace = true, optional = true, features = ["abe"] }
+ndn-foundation-types = { workspace = true, optional = true, features = ["std"] }
 ndn-tlv    = { workspace = true, features = ["std"] }
 bytes      = { workspace = true, features = ["std"] }
 rand_core  = { version = "0.6", default-features = false, features = ["getrandom"] }

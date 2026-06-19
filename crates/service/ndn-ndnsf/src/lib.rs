@@ -27,6 +27,8 @@
 #![deny(missing_docs)]
 
 #[cfg(feature = "driver")]
+pub mod access;
+#[cfg(feature = "driver")]
 pub mod driver;
 pub mod flow;
 pub mod messages;
