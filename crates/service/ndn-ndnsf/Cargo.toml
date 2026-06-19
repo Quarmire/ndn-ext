@@ -8,11 +8,22 @@ license.workspace = true
 [package.metadata.scope]
 classification = "extension"
 
+[features]
+## The over-SVS four-phase driver (ServiceProvider/ServiceUser loops over
+## ndn-sync's SvsPubSub). Off by default so the sans-IO core (tokens, messages,
+## flow) stays light.
+driver = ["dep:ndn-sync"]
+
 [dependencies]
 ndn-packet = { workspace = true, features = ["std"] }
+ndn-sync   = { workspace = true, optional = true }
 ndn-tlv    = { workspace = true, features = ["std"] }
 bytes      = { workspace = true, features = ["std"] }
 rand_core  = { version = "0.6", default-features = false, features = ["getrandom"] }
 thiserror  = { workspace = true }
 # Per-phase latency tracing; spans flow into ndn-observability's OTLP-over-NDN.
 tracing    = { workspace = true }
+
+[dev-dependencies]
+# Two-node SVS convergence witness for the driver.
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
