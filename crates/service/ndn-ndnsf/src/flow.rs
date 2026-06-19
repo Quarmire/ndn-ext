@@ -16,6 +16,7 @@
 
 use bytes::Bytes;
 use ndn_packet::Name;
+use tracing::instrument;
 
 use crate::messages::{AckMessage, RequestMessage, ResponseMessage, SelectionMessage};
 use crate::tokens::{PendingCoordination, PendingProviderTokens, ProviderToken, TokenError};
@@ -45,6 +46,7 @@ impl ProviderEngine {
 
     /// Phase 2 — acknowledge a request, issuing a single-use provider token the
     /// user must present in its SELECTION.
+    #[instrument(skip(self, req), fields(requester = %requester, service = %service, phase = "ack"))]
     pub fn on_request(
         &mut self,
         now_secs: u64,
@@ -66,6 +68,7 @@ impl ProviderEngine {
     /// Phase 4 — consume the selection's provider token (fails closed on an
     /// invalid one), run `handler` over the unlocked coordination, and build the
     /// RESPONSE. On rejection no response is produced (NSF-F5).
+    #[instrument(skip(self, sel, handler), fields(phase = "response"))]
     pub fn on_selection<H>(
         &mut self,
         now_secs: u64,
@@ -76,10 +79,10 @@ impl ProviderEngine {
         H: FnOnce(&PendingCoordination) -> Bytes,
     {
         let token = ProviderToken::from_wire(sel.provider_token.clone());
-        let coord = self
-            .tokens
-            .consume(now_secs, &token)
-            .map_err(FlowError::TokenRejected)?;
+        let coord = self.tokens.consume(now_secs, &token).map_err(|e| {
+            tracing::warn!(error = %e, "selection rejected — fail closed (no response)");
+            FlowError::TokenRejected(e)
+        })?;
         let payload = handler(&coord);
         Ok(ResponseMessage {
             status: true,

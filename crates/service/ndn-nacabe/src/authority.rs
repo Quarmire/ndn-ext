@@ -28,6 +28,8 @@ use ndn_security::abe::{
     KpPolicyKey, PolicyExpr, bsw_keygen, lsw_keygen,
 };
 
+use tracing::instrument;
+
 use crate::ckdata::NacError;
 
 /// Domain-separation salt binding a sealed blob to the NAC DKEY context.
@@ -64,6 +66,7 @@ impl CpAuthority {
     /// Issue an attribute key for an **already-authenticated** `requester`,
     /// sealed to its advertised X25519 `recipient_public`. Fails closed
     /// ([`NacError::Unauthorized`]) if the requester has no grant.
+    #[instrument(skip(self, recipient_public), fields(requester = %requester, scheme = "cp-abe"))]
     pub fn issue_dkey(
         &self,
         requester: &Name,
@@ -107,6 +110,7 @@ impl KpAuthority {
 
     /// Issue a policy key for an authenticated `requester`, sealed to its
     /// advertised X25519 key. Fails closed if the requester has no grant.
+    #[instrument(skip(self, recipient_public), fields(requester = %requester, scheme = "kp-abe"))]
     pub fn issue_dkey(
         &self,
         requester: &Name,

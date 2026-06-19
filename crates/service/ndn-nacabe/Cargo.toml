@@ -26,6 +26,9 @@ ndn-security         = { workspace = true, features = ["abe"] }
 ndn-sealed-box       = { workspace = true }
 bytes                = { workspace = true, features = ["std"] }
 thiserror            = { workspace = true }
+# Latency/coordination tracing. Spans flow into ndn-observability's OTLP-over-NDN
+# pipeline for OpenTelemetry-style waterfalls of issuance + the over-NDN legs.
+tracing              = { workspace = true }
 
 [dev-dependencies]
 # In-proc engine + faces for the end-to-end serve/fetch witness.
