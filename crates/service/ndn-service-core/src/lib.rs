@@ -146,6 +146,48 @@ pub trait Dispatch: Send + Sync + 'static {
     async fn dispatch(&self, invocation: Invocation) -> Result<Bytes, ServiceError>;
 }
 
+/// An untyped op handler: `bytes -> bytes` (or an error). This is what a
+/// *dynamic* front-end registers — a Python function, a Kotlin/Swift callback —
+/// instead of the macro's generated typed methods.
+pub type ScriptHandler = Arc<dyn Fn(Bytes) -> Result<Bytes, ServiceError> + Send + Sync>;
+
+/// A type-erased, **untyped** [`Dispatch`] for dynamic/scripting front-ends (PyO3,
+/// boltffi): handlers are registered by op name as [`ScriptHandler`]s. This is the
+/// single seam a non-Rust language binds — it trades the `#[ndn_service]` macro's
+/// compile-time typing for runtime, op-keyed dispatch, exactly as a scripting
+/// layer must. The same `ScriptDispatch` serves over any [`Carrier`].
+#[derive(Default)]
+pub struct ScriptDispatch {
+    handlers: std::collections::HashMap<String, ScriptHandler>,
+}
+
+impl ScriptDispatch {
+    /// An empty dispatch.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register `handler` for operation `op` (replacing any existing one).
+    pub fn on(&mut self, op: impl Into<String>, handler: ScriptHandler) {
+        self.handlers.insert(op.into(), handler);
+    }
+
+    /// The operations this dispatch handles.
+    pub fn ops(&self) -> impl Iterator<Item = &str> {
+        self.handlers.keys().map(String::as_str)
+    }
+}
+
+#[async_trait::async_trait]
+impl Dispatch for ScriptDispatch {
+    async fn dispatch(&self, invocation: Invocation) -> Result<Bytes, ServiceError> {
+        match self.handlers.get(invocation.op.as_str()) {
+            Some(handler) => handler(invocation.request),
+            None => Err(ServiceError::NotFound),
+        }
+    }
+}
+
 /// A pluggable backend: it names, transports, multiplexes, and secures service
 /// invocations. The macro-generated client is generic over `C: Carrier`, so one
 /// definition runs over any carrier.

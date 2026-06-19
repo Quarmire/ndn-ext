@@ -25,3 +25,8 @@ ndn-app    = { workspace = true, features = ["blocking"] }
 ndn-packet = { workspace = true, features = ["std"] }
 bytes      = { workspace = true, features = ["std"] }
 pyo3       = { version = "0.22", features = ["macros"] }
+# Service-layer scripting front-end (mode 3): the untyped ScriptDispatch seam +
+# the Tier-0 carrier, driven by a small blocking runtime.
+ndn-service-core = { workspace = true }
+ndn-rpc          = { workspace = true }
+tokio            = { workspace = true, features = ["rt"] }

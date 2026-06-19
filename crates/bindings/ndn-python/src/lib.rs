@@ -137,10 +137,159 @@ impl Producer {
     }
 }
 
+// --- Service-layer scripting front-end (§11 mode 3) ---
+//
+// The dynamic counterpart to the typed `#[ndn_service]` macro: a Python developer
+// registers `bytes -> bytes` handlers by op name (the untyped `ScriptDispatch`
+// seam) and calls ops by name. Carriers and op-dispatch carry over from Rust; the
+// compile-time typing does not (Python is dynamic). A `ServiceNode` shares one
+// Tier-0 carrier between a provider and a client in-process — real cross-process
+// networking awaits the face-backed carrier (the registry here is in-process).
+
+use std::collections::HashMap;
+
+use ndn_packet::Name;
+use ndn_rpc::{RpcCarrier, RpcRegistry};
+use ndn_service_core::{Carrier, OpId, ScriptDispatch, ScriptHandler, ServiceError, ServiceId};
+use pyo3::exceptions::PyValueError;
+use pyo3::types::PyBytes;
+
+fn parse_service(service: &str) -> PyResult<Name> {
+    service
+        .parse::<Name>()
+        .map_err(|_| PyValueError::new_err(format!("invalid service name: {service}")))
+}
+
+fn svc_err(e: ServiceError) -> PyErr {
+    PyRuntimeError::new_err(e.to_string())
+}
+
+/// A node sharing one Tier-0 carrier between its providers and clients. Build it,
+/// then vend a :class:`ServiceProvider` and/or :class:`ServiceClient`.
+#[pyclass]
+struct ServiceNode {
+    registry: Arc<RpcRegistry>,
+    rt: Arc<tokio::runtime::Runtime>,
+}
+
+#[pymethods]
+impl ServiceNode {
+    #[new]
+    fn new() -> PyResult<Self> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(Self {
+            registry: Arc::new(RpcRegistry::new()),
+            rt: Arc::new(rt),
+        })
+    }
+
+    /// A provider for `service` (register handlers, then :meth:`ServiceProvider.serve`).
+    fn provider(&self, service: &str) -> PyResult<ServiceProvider> {
+        Ok(ServiceProvider {
+            registry: Arc::clone(&self.registry),
+            rt: Arc::clone(&self.rt),
+            service: parse_service(service)?,
+            handlers: HashMap::new(),
+        })
+    }
+
+    /// A client for `service` (call ops by name).
+    fn client(&self, service: &str) -> PyResult<ServiceClient> {
+        Ok(ServiceClient {
+            registry: Arc::clone(&self.registry),
+            rt: Arc::clone(&self.rt),
+            service: parse_service(service)?,
+        })
+    }
+}
+
+/// Serves a set of `bytes -> bytes` op handlers for one service.
+#[pyclass]
+struct ServiceProvider {
+    registry: Arc<RpcRegistry>,
+    rt: Arc<tokio::runtime::Runtime>,
+    service: Name,
+    handlers: HashMap<String, Py<PyAny>>,
+}
+
+#[pymethods]
+impl ServiceProvider {
+    /// Register `func(req: bytes) -> bytes` as the handler for operation `op`.
+    fn handler(&mut self, op: &str, func: Py<PyAny>) {
+        self.handlers.insert(op.to_string(), func);
+    }
+
+    /// Mount the registered handlers on the shared carrier. (In-process; returns
+    /// once mounted — a face-backed carrier would run a serve loop instead.)
+    fn serve(&self, py: Python<'_>) -> PyResult<()> {
+        let mut dispatch = ScriptDispatch::new();
+        for (op, func) in &self.handlers {
+            let func = func.clone_ref(py);
+            let handler: ScriptHandler = Arc::new(move |req: Bytes| {
+                Python::with_gil(|py| {
+                    let arg = PyBytes::new_bound(py, &req);
+                    let result = func
+                        .bind(py)
+                        .call1((arg,))
+                        .map_err(|e| ServiceError::Handler(e.to_string()))?;
+                    let out: Vec<u8> = result
+                        .extract()
+                        .map_err(|e| ServiceError::Decode(e.to_string()))?;
+                    Ok(Bytes::from(out))
+                })
+            });
+            dispatch.on(op.clone(), handler);
+        }
+
+        let svc = ServiceId::new(self.service.clone());
+        let registry = Arc::clone(&self.registry);
+        let rt = Arc::clone(&self.rt);
+        py.allow_threads(|| {
+            let carrier = RpcCarrier::with_registry(registry);
+            rt.block_on(carrier.serve(&svc, Arc::new(dispatch)))
+        })
+        .map_err(svc_err)
+    }
+}
+
+/// Invokes service operations by name (`bytes -> bytes`).
+#[pyclass]
+struct ServiceClient {
+    registry: Arc<RpcRegistry>,
+    rt: Arc<tokio::runtime::Runtime>,
+    service: Name,
+}
+
+#[pymethods]
+impl ServiceClient {
+    /// Call operation `op` with `request` bytes; returns the response bytes.
+    /// Raises `RuntimeError` if the op is unknown or the handler failed.
+    fn call(&self, py: Python<'_>, op: &str, request: &[u8]) -> PyResult<Vec<u8>> {
+        let svc = ServiceId::new(self.service.clone());
+        let op = OpId::new(op);
+        let req = Bytes::copy_from_slice(request);
+        let registry = Arc::clone(&self.registry);
+        let rt = Arc::clone(&self.rt);
+        let response = py
+            .allow_threads(|| {
+                let carrier = RpcCarrier::with_registry(registry);
+                rt.block_on(carrier.invoke(&svc, &op, req))
+            })
+            .map_err(svc_err)?;
+        Ok(response.payload.to_vec())
+    }
+}
+
 #[pymodule]
 fn ndn_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Data>()?;
     m.add_class::<Consumer>()?;
     m.add_class::<Producer>()?;
+    m.add_class::<ServiceNode>()?;
+    m.add_class::<ServiceProvider>()?;
+    m.add_class::<ServiceClient>()?;
     Ok(())
 }
