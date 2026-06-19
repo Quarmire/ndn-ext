@@ -4,6 +4,7 @@ exclude = [
     "crates/faces/ndn-face-afxdp/bpf/redirect-ebpf",
 ]
 members = [
+    "crates/dashboard/ndn-dashboard-core",
     "crates/coding/ndn-coding",
     "crates/ratelimit/ndn-ratelimit",
     "crates/compute/ndn-sealed-box",
@@ -37,12 +38,12 @@ members = [
     "crates/faces/ndn-rtc-signaling-relay",
     "crates/faces/ndn-remote-signer-webrtc",
     "crates/bindings/ndn-python",
-    "crates/bindings/ndn-boltffi",
     "examples/wasm-strategy",
     "examples/ble/macos",
     "examples/radio-ping",
 ]
 default-members = [
+    "crates/dashboard/ndn-dashboard-core",
     "crates/coding/ndn-coding",
     "crates/ratelimit/ndn-ratelimit",
     "crates/compute/ndn-sealed-box",
@@ -129,7 +130,7 @@ ndn-web-attach = { path = "crates/bindings/ndn-web-attach" }
 ndn-ipc       = { path = "../ndn-rs/crates/forwarding/ndn-ipc" }
 ndn-ipc-shm   = { path = "crates/faces/ndn-ipc-shm" }
 ndn-config    = { path = "../ndn-rs/crates/platform/ndn-config" }
-ndn-dashboard-core = { path = "../ndn-fwd/crates/tooling/ndn-dashboard-core", default-features = false }
+ndn-dashboard-core = { path = "crates/dashboard/ndn-dashboard-core", default-features = false }
 ndn-discovery = { path = "crates/discovery/ndn-discovery",     default-features = false }
 ndn-discovery-core = { path = "../ndn-rs/crates/forwarding/ndn-discovery-core" }
 ndn-discovery-broadcast = { path = "crates/discovery/ndn-discovery-broadcast" }

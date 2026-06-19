@@ -1,0 +1,96 @@
+[package]
+name = "ndn-dashboard-core"
+description = "UI-agnostic core for ndn-dashboard: data models, operator keyring/custodian, trust/audit chains, forwarder profile — the headless layer any UI (Dioxus, native Swift/Kotlin via FFI) builds on. Deliberately Dioxus-free."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "tooling"
+
+[lib]
+crate-type = ["rlib"]
+
+[features]
+default = []
+# Mirror the dashboard's platform features so the moved modules' existing
+# `cfg(feature = "desktop"/"web")` gates resolve against this crate.
+desktop = ["dep:keyring", "dep:dirs-next", "dep:ndn-cert", "ndn-packet/std", "ndn-tlv/std"]
+web = [
+  "dep:web-sys",
+  "dep:js-sys",
+  "dep:wasm-bindgen",
+  "dep:wasm-bindgen-futures",
+  "dep:gloo-storage",
+  "getrandom/js",
+  "ndn-packet/std-wasm",
+  "ndn-tlv/std",
+]
+
+[dependencies]
+async-trait   = { workspace = true }
+ndn-config    = { workspace = true }
+ndn-mgmt-wire = { workspace = true }
+# default-features = false drops sqlite-pib so the web target stays wasm-safe.
+ndn-security  = { path = "../../../../ndn-rs/crates/security/ndn-security", default-features = false, features = ["custodian"] }
+ndn-packet    = { workspace = true }
+ndn-tlv       = { workspace = true }
+# Native token-join (NDNCERT enrollment). Desktop/native only — pulled by the
+# `desktop` feature so the wasm build never compiles it.
+ndn-cert      = { workspace = true, optional = true }
+bytes         = { workspace = true, features = ["std"] }
+base64        = { workspace = true }
+getrandom     = "0.2"
+serde         = { workspace = true, features = ["derive"] }
+serde_json    = { workspace = true }
+sha2          = { workspace = true }
+thiserror     = { workspace = true }
+tracing       = { workspace = true }
+# Signs every audit/schema chain entry (DashboardSigner). Same crate on every
+# target — wasm uses getrandom/js for RNG.
+ed25519-dalek = { workspace = true }
+
+# Desktop OS keychain (Touch ID / Windows Hello / Secret Service) second factor.
+keyring = { version = "3", optional = true, features = ["apple-native", "windows-native", "sync-secret-service"] }
+# Desktop config-dir paths (~/.config/ndn-dashboard) for keyring + cert export.
+dirs-next = { version = "2", optional = true }
+
+# Web: localStorage (operator keyring persistence) + IndexedDB (audit/schema chains).
+gloo-storage         = { version = "0.3", optional = true }
+js-sys               = { version = "0.3", optional = true }
+wasm-bindgen         = { version = "0.2", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+
+[dependencies.web-sys]
+version = "0.3"
+optional = true
+features = [
+  "Window",
+  "Storage",
+  "Navigator",
+  "IdbDatabase",
+  "IdbFactory",
+  "IdbObjectStore",
+  "IdbObjectStoreParameters",
+  "IdbOpenDbRequest",
+  "IdbRequest",
+  "IdbRequestReadyState",
+  "IdbTransaction",
+  "IdbTransactionMode",
+  "IdbVersionChangeEvent",
+  "WorkerGlobalScope",
+  "DomException",
+  "Event",
+]
+
+# macOS gets the real per-use Touch ID path via Security.framework directly.
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+
+[dev-dependencies]
+ed25519-dalek = { workspace = true }
+async-trait   = { workspace = true }
+tokio         = { workspace = true, features = ["rt", "macros", "sync"] }
+# Live smoke test only (tests/smoke_engine.rs): drives the engine over a real
+# Unix-socket MgmtClient against a running forwarder. Native/test-only.
+ndn-ipc       = { workspace = true }
