@@ -1,0 +1,18 @@
+[package]
+name = "ndn-rpc"
+description = "Tier-0 NDN RPC: route Interests to handlers, return Data (one signed Interest -> Data exchange)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "extension"
+
+[dependencies]
+ndn-packet = { workspace = true, features = ["std"] }
+ndn-store  = { workspace = true }
+
+[dev-dependencies]
+tokio   = { workspace = true, features = ["rt", "macros"] }
+bytes   = { workspace = true, features = ["std"] }
+ndn-tlv = { workspace = true, features = ["std"] }

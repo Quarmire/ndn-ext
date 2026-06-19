@@ -8,6 +8,7 @@ members = [
     "crates/coding/ndn-coding",
     "crates/ratelimit/ndn-ratelimit",
     "crates/compute/ndn-sealed-box",
+    "crates/service/ndn-rpc",
     "crates/onboarding/ndn-trust-envelope",
     "crates/faces/ndn-face-serial",
     "crates/faces/ndn-face-websocket",
@@ -47,6 +48,7 @@ default-members = [
     "crates/coding/ndn-coding",
     "crates/ratelimit/ndn-ratelimit",
     "crates/compute/ndn-sealed-box",
+    "crates/service/ndn-rpc",
     "crates/faces/ndn-face-serial",
     "crates/faces/ndn-face-websocket",
     "crates/faces/ndn-face-shm",
@@ -87,40 +89,41 @@ name = "ndn-rs"
 
 [workspace.dependencies]
 # NDN workspace crates — grouped by subdirectory layer
-ndn-foundation-types = { git = "https://github.com/Quarmire/ndn-rs", tag = "v0.1.0-alpha.1", default-features = false }
-ndn-tlv       = { git = "https://github.com/Quarmire/ndn-rs", tag = "v0.1.0-alpha.1", default-features = false }
-ndn-packet    = { git = "https://github.com/Quarmire/ndn-rs", tag = "v0.1.0-alpha.1", default-features = false }
-ndn-fwd-core  = { git = "https://github.com/Quarmire/ndn-rs", tag = "v0.1.0-alpha.1", default-features = false }
-ndn-crypto-core = { git = "https://github.com/Quarmire/ndn-rs", tag = "v0.1.0-alpha.1" }
+ndn-foundation-types = { path = "../ndn-rs/crates/core/ndn-foundation-types", default-features = false }
+ndn-tlv       = { path = "../ndn-rs/crates/core/ndn-tlv", default-features = false }
+ndn-packet    = { path = "../ndn-rs/crates/core/ndn-packet", default-features = false }
+ndn-fwd-core  = { path = "../ndn-rs/crates/forwarding/ndn-fwd-core", default-features = false }
+ndn-crypto-core = { path = "../ndn-rs/crates/core/ndn-crypto-core" }
 ndn-sealed-box  = { path = "crates/compute/ndn-sealed-box" }
-ndn-signals-core = { git = "https://github.com/Quarmire/ndn-rs", tag = "v0.1.0-alpha.1", default-features = false }
-ndn-ble-framing = { git = "https://github.com/Quarmire/ndn-rs", tag = "v0.1.0-alpha.1" }
-ndn-mgmt-wire = { git = "https://github.com/Quarmire/ndn-rs", tag = "v0.1.0-alpha.1" }
-ndn-transport = { git = "https://github.com/Quarmire/ndn-rs", tag = "v0.1.0-alpha.1" }
-ndn-store     = { git = "https://github.com/Quarmire/ndn-rs", tag = "v0.1.0-alpha.1" }
-ndn-runtime   = { git = "https://github.com/Quarmire/ndn-rs", tag = "v0.1.0-alpha.1" }
-ndn-face-local        = { git = "https://github.com/Quarmire/ndn-rs", tag = "v0.1.0-alpha.1" }
-ndn-face             = { git = "https://github.com/Quarmire/ndn-rs", tag = "v0.1.0-alpha.1" }
+ndn-signals-core = { path = "../ndn-rs/crates/core/ndn-signals-core", default-features = false }
+ndn-ble-framing = { path = "../ndn-rs/crates/core/ndn-ble-framing" }
+ndn-mgmt-wire = { path = "../ndn-rs/crates/core/ndn-mgmt-wire" }
+ndn-transport = { path = "../ndn-rs/crates/core/ndn-transport" }
+ndn-store     = { path = "../ndn-rs/crates/forwarding/ndn-store" }
+ndn-runtime   = { path = "../ndn-rs/crates/core/ndn-runtime" }
+ndn-face-local        = { path = "../ndn-rs/crates/faces/ndn-face-local" }
+ndn-face             = { path = "../ndn-rs/crates/faces/ndn-face" }
 ndn-face-shm         = { path = "crates/faces/ndn-face-shm" }
 ndn-face-bluetooth   = { path = "crates/faces/ndn-face-bluetooth" }
 ndn-face-webrtc       = { path = "crates/faces/ndn-face-webrtc" }
-ndn-frame-io          = { git = "https://github.com/Quarmire/ndn-rs", tag = "v0.1.0-alpha.1" }
+ndn-frame-io          = { path = "../ndn-rs/crates/core/ndn-frame-io" }
 ndn-face-monitor-wifi = { path = "crates/faces/ndn-face-monitor-wifi" }
 ndn-rtc-signaling-relay = { path = "crates/faces/ndn-rtc-signaling-relay" }
-ndn-strategy  = { git = "https://github.com/Quarmire/ndn-rs", tag = "v0.1.0-alpha.1" }
-ndn-security  = { git = "https://github.com/Quarmire/ndn-rs", tag = "v0.1.0-alpha.1" }
-ndn-engine    = { git = "https://github.com/Quarmire/ndn-rs", tag = "v0.1.0-alpha.1" }
-ndn-app       = { git = "https://github.com/Quarmire/ndn-rs", tag = "v0.1.0-alpha.1" }
-ndn-ipc       = { git = "https://github.com/Quarmire/ndn-rs", tag = "v0.1.0-alpha.1" }
-ndn-config    = { git = "https://github.com/Quarmire/ndn-rs", tag = "v0.1.0-alpha.1" }
+ndn-strategy  = { path = "../ndn-rs/crates/forwarding/ndn-strategy" }
+ndn-security  = { path = "../ndn-rs/crates/security/ndn-security" }
+ndn-engine    = { path = "../ndn-rs/crates/forwarding/ndn-engine" }
+ndn-app       = { path = "../ndn-rs/crates/app/ndn-app" }
+ndn-ipc       = { path = "../ndn-rs/crates/forwarding/ndn-ipc" }
+ndn-config    = { path = "../ndn-rs/crates/platform/ndn-config" }
 ndn-discovery = { path = "crates/discovery/ndn-discovery",     default-features = false }
-ndn-discovery-core = { git = "https://github.com/Quarmire/ndn-rs", tag = "v0.1.0-alpha.1" }
-ndn-sync      = { git = "https://github.com/Quarmire/ndn-rs", tag = "v0.1.0-alpha.1" }
-ndn-cert     = { git = "https://github.com/Quarmire/ndn-rs", tag = "v0.1.0-alpha.1" }
-ndn-mgmt     = { git = "https://github.com/Quarmire/ndn-rs", tag = "v0.1.0-alpha.1" }
-ndn-sim       = { git = "https://github.com/Quarmire/ndn-sim", tag = "v0.1.0-alpha.1" }
+ndn-discovery-core = { path = "../ndn-rs/crates/forwarding/ndn-discovery-core" }
+ndn-sync      = { path = "../ndn-rs/crates/protocols/ndn-sync" }
+ndn-cert     = { path = "../ndn-rs/crates/security/ndn-cert" }
+ndn-mgmt     = { path = "../ndn-rs/crates/forwarding/ndn-mgmt" }
+ndn-sim       = { path = "../ndn-sim/crates/ndn-sim" }
 ndn-strategy-wasm = { path = "crates/strategies/ndn-strategy-wasm" }
 ndn-compute   = { path = "crates/compute/ndn-compute" }
+ndn-rpc       = { path = "crates/service/ndn-rpc" }
 ndn-radio-cognition = { path = "crates/faces/ndn-radio-cognition" }
 
 # Core async runtime — individual crates enable only the features they need
