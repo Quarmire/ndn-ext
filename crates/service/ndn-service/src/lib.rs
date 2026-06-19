@@ -26,6 +26,11 @@
 
 #![deny(missing_docs)]
 
+/// The operator→authority command front-end: signed grant/revoke commands that
+/// drive a live [`PolicyAuthority`].
+pub mod command;
+pub use command::{PolicyController, grant_command, revoke_command};
+
 /// The policy→issuance bridge (feature `issuance`): gate KP-ABE key issuance on
 /// the current [`PolicyAuthority`] grant.
 #[cfg(feature = "issuance")]
