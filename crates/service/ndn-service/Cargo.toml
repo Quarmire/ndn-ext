@@ -51,3 +51,5 @@ ndn-foundation-types = { workspace = true, features = ["std"] }
 # Discovery-carrier witness: inner Tier-0 carrier + a macro-defined service.
 ndn-rpc = { workspace = true }
 ndn-service-macro = { workspace = true }
+# Engine-wired cross-node discovery witness (FaceId/Face for the host harness).
+ndn-transport = { workspace = true }
