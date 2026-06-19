@@ -39,6 +39,16 @@ pub enum NacError {
     /// CK-data content bytes were not a valid ABE ciphertext container.
     #[error("malformed CK-data")]
     MalformedCkData,
+    /// The requester has no attribute/policy grant at this authority — the
+    /// authority refuses to issue (fail closed; NSF-A2/F5).
+    #[error("requester is not authorized by this attribute authority")]
+    Unauthorized,
+    /// Sealing the issued key to the requester's public key failed.
+    #[error("failed to seal the decryption key to the requester")]
+    SealFailed,
+    /// Opening the sealed decryption key failed (wrong recipient key or tamper).
+    #[error("failed to open the sealed decryption key")]
+    UnsealFailed,
 }
 
 /// A named, ABE-wrapped content key — the CK-data object. On the wire it is a

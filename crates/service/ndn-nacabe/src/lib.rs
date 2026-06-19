@@ -27,7 +27,9 @@
 
 #![deny(missing_docs)]
 
+pub mod authority;
 pub mod ckdata;
 pub mod names;
 
+pub use authority::{CpAuthority, KpAuthority, open_cp_dkey, open_kp_dkey};
 pub use ckdata::{CkData, NacError, open_cp, open_kp, seal_cp, seal_kp};

@@ -13,5 +13,8 @@ ndn-packet           = { workspace = true, features = ["std"] }
 ndn-foundation-types = { workspace = true, features = ["std"] }
 # ABE crypto (CP/KP/MA) + the content-key (CK) confidentiality primitive.
 ndn-security         = { workspace = true, features = ["abe"] }
+# Confidential DKEY delivery: seal the issued key to the requester's ephemeral
+# X25519 public key (ECDH + HKDF-SHA256 + AES-256-GCM).
+ndn-sealed-box       = { workspace = true }
 bytes                = { workspace = true, features = ["std"] }
 thiserror            = { workspace = true }
