@@ -11,18 +11,21 @@
 //! Held to NDNSF's audited security properties via the O4 invariant catalogue
 //! (`docs/specs/ndnsf-invariants.md`).
 //!
-//! ## Status
+//! ## Layout
 //!
-//! This crate currently lands the **sans-IO core**:
-//! - [`tokens`] — the provider-token lifecycle and pending-state machine, the
-//!   coordination guard carrying the O4 token/state invariants (NSF-T1/T3/T4/T5/T6,
-//!   NSF-S1–S5).
+//! - [`tokens`] — provider-token lifecycle + pending-state machine (O4
+//!   token/state invariants NSF-T1/T3/T4/T5/T6, NSF-S1–S5).
 //! - [`names`] — the V2 four-phase name builders.
-//!
-//! Still to land: the message TLV taxonomy (Request/Ack/Selection/Response,
-//! type numbers 128–131), and the four-phase flow over SVS pub/sub (the
-//! `ServiceProvider`/`ServiceUser` roles), wiring `ndn-nacabe`'s KP-ABE
-//! `ServiceController` for access control.
+//! - [`messages`] — the message TLV taxonomy (Request/Ack/Selection/Response,
+//!   type numbers 128–131) + [`Strategy`]/[`RequestMode`].
+//! - [`flow`] — the sans-IO orchestration ([`ProviderEngine`]).
+//! - [`driver`] — the four-phase flow over `ndn-sync` SVS pub/sub (feature
+//!   `driver`).
+//! - [`roles`] — ergonomic [`ServiceProvider`]/[`ServiceUser`] wrappers over the
+//!   driver (spec §11.2 mode 1).
+//! - [`trust`] / [`access`] — per-message trust ([`TrustCtx`], NSF-A3 trust half)
+//!   and KP-ABE access control (NSF-A3 authorization).
+//! - [`policy`] — TOML/`PolicyBuilder` → `ndn-nacabe` `KpAuthority` grants.
 
 #![deny(missing_docs)]
 
@@ -32,6 +35,8 @@ pub mod access;
 pub mod driver;
 #[cfg(feature = "driver")]
 pub mod policy;
+#[cfg(feature = "driver")]
+pub mod roles;
 #[cfg(feature = "driver")]
 pub mod trust;
 pub mod flow;
@@ -44,3 +49,8 @@ pub use messages::{
     AckMessage, MsgError, RequestMessage, RequestMode, ResponseMessage, SelectionMessage, Strategy,
 };
 pub use tokens::{PendingCoordination, PendingProviderTokens, ProviderToken, TokenError};
+
+#[cfg(feature = "driver")]
+pub use roles::{ServiceProvider, ServiceUser};
+#[cfg(feature = "driver")]
+pub use trust::TrustCtx;
