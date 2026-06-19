@@ -81,6 +81,30 @@ fn request_id_of(name: &Name) -> Name {
     }
 }
 
+/// The `serviceName` path embedded in a REQUEST or SELECTION name (between the
+/// phase prefix and the trailing single-component request id). `None` if the name
+/// is not a REQUEST/SELECTION or is malformed. Used to route a publication to the
+/// provider serving that service when several share one node/group.
+fn service_of(name: &Name) -> Option<Name> {
+    let comps = name.components();
+    let idx = comps.iter().position(|c| *c == comp(names::NDNSF))?;
+    let phase = comps.get(idx + 1)?;
+    // REQUEST: `..NDNSF/REQUEST/<service...>/<reqid>`.
+    // SELECTION: `..NDNSF/SELECTION/<provider-uri>/<service...>/<reqid>` (skip 1).
+    let start = if *phase == comp(names::REQUEST) {
+        idx + 2
+    } else if *phase == comp(names::SELECTION) {
+        idx + 3
+    } else {
+        return None;
+    };
+    let end = comps.len().checked_sub(1)?; // drop the trailing request id
+    if start > end {
+        return None;
+    }
+    Some(Name::from_components(comps[start..end].iter().cloned()))
+}
+
 /// Run the provider side: serve `service` in `group`, ACKing requests and, on a
 /// valid SELECTION, running `handler(coordination, request_payload)` and
 /// publishing the RESPONSE. Loops until the subscription closes.
@@ -103,6 +127,11 @@ pub async fn serve_provider<H>(
     while let Some(pubn) = rx.recv().await {
         match phase_of(&pubn.name) {
             Some(Phase::Request) => {
+                // Route by service: ignore requests for a service we don't serve
+                // (several providers may share one node/group).
+                if service_of(&pubn.name).as_ref() != Some(&service) {
+                    continue;
+                }
                 let requester = before_ndnsf(&pubn.name);
                 // Trust gate: a REQUEST must be signed by its claimed requester.
                 let Some(payload) = trust.unseal(pubn.payload, &requester).await else {
@@ -159,6 +188,9 @@ pub async fn serve_provider<H>(
                 }
             }
             Some(Phase::Selection) => {
+                if service_of(&pubn.name).as_ref() != Some(&service) {
+                    continue;
+                }
                 let requester = before_ndnsf(&pubn.name);
                 // Trust gate: a SELECTION must be signed by its claimed requester.
                 let Some(payload) = trust.unseal(pubn.payload, &requester).await else {

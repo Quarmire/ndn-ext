@@ -51,6 +51,6 @@ pub use messages::{
 pub use tokens::{PendingCoordination, PendingProviderTokens, ProviderToken, TokenError};
 
 #[cfg(feature = "driver")]
-pub use roles::{ServiceProvider, ServiceUser};
+pub use roles::{ServiceNode, ServiceProvider, ServiceUser};
 #[cfg(feature = "driver")]
 pub use trust::TrustCtx;
