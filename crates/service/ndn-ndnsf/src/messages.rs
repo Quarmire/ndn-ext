@@ -158,7 +158,10 @@ fn as_name(b: &Bytes) -> Result<Name, MsgError> {
 pub struct RequestMessage {
     /// Unique request identifier.
     pub request_id: String,
-    /// One-time user token authorizing this request.
+    /// An opaque capability token the user presents and the provider echoes. NOTE:
+    /// the four-phase flow does **not** validate it — it is carried, not load-bearing
+    /// (red-team SEC-30). Payload authorization is the caller's job, via KP-ABE
+    /// access control (`access::seal_for` / `open_with`), not this field.
     pub user_token: String,
     /// The request payload.
     pub payload: Bytes,

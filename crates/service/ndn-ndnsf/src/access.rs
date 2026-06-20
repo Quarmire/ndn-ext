@@ -27,6 +27,12 @@ use ndn_security::abe::{KpMasterParams, KpPolicyKey};
 /// `ck_name` names the content-key object; `kgc` is the controller's
 /// `(name, master_params_hash, KpMasterParams)`. Returns the bundled payload the
 /// four-phase driver carries as-is.
+///
+/// `aad` MUST uniquely bind this sealed object's context — derive it from the full
+/// response/request name with [`context_aad`], **never** a constant or coarse
+/// value. ABE attests *who* may read, not *which* object: with a reused AAD a
+/// sealed response for one request opens as the answer to another with the same
+/// attributes (red-team SEC-20). The matching [`open_with`] must pass the same AAD.
 pub fn seal_for(
     ck_name: Name,
     attributes: &[String],
@@ -62,6 +68,15 @@ pub fn open_with(key: &KpPolicyKey, blob: &[u8], aad: &[u8]) -> Result<Vec<u8>, 
     let ck_data = CkData::from_parts(Name::from_components(core::iter::empty()), ck_content)?;
     let sealed = Sealed::from_bytes(sealed_bytes).map_err(|_| NacError::MalformedCkData)?;
     open_kp(&ck_data, key, &sealed, aad)
+}
+
+/// The canonical AAD binding a sealed payload to its `name` context — the TLV
+/// encoding of the full response/request name (provider ‖ service ‖ request-id ‖
+/// segment…). Pass the same value to [`seal_for`] and [`open_with`] so a sealed
+/// payload cannot be replayed under a different name (red-team SEC-20); injective,
+/// unlike a hand-built string.
+pub fn context_aad(name: &Name) -> Bytes {
+    name.encode_to_tlv()
 }
 
 #[cfg(test)]
