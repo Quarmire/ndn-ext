@@ -28,7 +28,9 @@ impl ProviderToken {
         OsRng.fill_bytes(&mut raw);
         let mut s = String::with_capacity(32);
         for b in raw {
-            s.push_str(&format!("{b:02x}"));
+            // Hex without a per-byte `format!` allocation (SEC-34, the flood path).
+            s.push(char::from_digit((b >> 4) as u32, 16).unwrap());
+            s.push(char::from_digit((b & 0x0f) as u32, 16).unwrap());
         }
         Self(s)
     }

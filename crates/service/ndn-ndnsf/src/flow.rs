@@ -143,9 +143,22 @@ pub fn select_providers(
             if acks.is_empty() {
                 Vec::new()
             } else {
-                let idx = (OsRng.next_u32() as usize) % acks.len();
-                vec![&acks[idx]]
+                vec![&acks[uniform_index(acks.len())]]
             }
+        }
+    }
+}
+
+/// A uniform index in `[0, n)` from the CSPRNG, **without modulo bias** (rejection
+/// sampling — red-team SEC-31). `n` must be non-zero.
+fn uniform_index(n: usize) -> usize {
+    let n = n as u64;
+    // Reject the incomplete final block so every index is equiprobable.
+    let limit = (1u64 << 32) / n * n; // largest multiple of n within [0, 2^32)
+    loop {
+        let r = OsRng.next_u32() as u64;
+        if r < limit {
+            return (r % n) as usize;
         }
     }
 }
