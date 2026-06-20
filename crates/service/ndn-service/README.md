@@ -53,13 +53,23 @@ It is one part of a small stack:
   role-derived KP-ABE key — scalable, data-centric; feature `issuance`).
 - `ArtifactShare` — named confidential objects provisioned/fetched in a session.
 
-## Example
+## Examples
 
-The same `#[ndn_service]` definition over both Tier-0 and the NDNSF four-phase:
+The same weather domain, two ways — so the differences are visible side by side:
 
 ```bash
+# v2: discovery-based reach (Tier-1), a typed feed (Topic<T>), and a
+# confidential role-gated channel (ScopedSession + role-scoped keys).
+cargo run -p ndn-service --example weather
+
+# compat: the same #[ndn_service] call over Tier-0 and the NDNSF four-phase.
 cargo run -p ndn-ndnsf --example weather --features driver
 ```
+
+The Tier-0/NDNSF example is *call-only* (reach a known provider, or broadcast to a
+group); the v2 example adds what those can't express — **discovering** the service,
+a **feed** (publish/subscribe, not request/response), and a **confidential
+channel** only members holding the scope key can read.
 
 ## Features
 
