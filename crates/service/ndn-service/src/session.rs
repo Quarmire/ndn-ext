@@ -239,10 +239,28 @@ impl ScopeKeyring {
         Self::default()
     }
 
-    /// Add the key for `scope` (builder style).
+    /// Add the key for `scope` (builder style). The caller is trusted to supply a
+    /// *distinct* key per scope; prefer [`derive`](Self::derive), which guarantees it.
     pub fn with(mut self, scope: impl Into<String>, key: ContentKey) -> Self {
         self.keys.insert(scope.into(), Arc::new(key));
         self
+    }
+
+    /// Derive a keyring whose scope keys are each cryptographically bound to their
+    /// scope name, via HKDF-SHA256 from one high-entropy `master` secret — so
+    /// distinct scopes ALWAYS get distinct keys and one scope's key can never open
+    /// another scope's content, even by misconfiguration (red-team SEC-19). Prefer
+    /// this over [`with`](Self::with), which trusts the caller to supply distinct keys.
+    pub fn derive(master: &[u8; 32], scopes: &[&str]) -> Self {
+        let hk = hkdf::Hkdf::<sha2::Sha256>::new(Some(SCOPE_KDF_SALT), master);
+        let mut keys = HashMap::new();
+        for scope in scopes {
+            let mut okm = [0u8; 32];
+            hk.expand(scope.as_bytes(), &mut okm)
+                .expect("32 bytes is a valid HKDF-SHA256 output length");
+            keys.insert((*scope).to_string(), Arc::new(ContentKey::from_bytes(okm)));
+        }
+        Self { keys }
     }
 
     /// The key for `scope`, if held.
@@ -259,6 +277,9 @@ impl ScopeKeyring {
 /// The ABE attribute prefix for a confidentiality scope. A scope key is wrapped
 /// under `scope:<name>` and a role's KP-ABE key-policy references the same.
 pub const SCOPE_ATTR: &str = "scope:";
+
+/// HKDF domain-separation salt for [`ScopeKeyring::derive`] (SEC-19).
+const SCOPE_KDF_SALT: &[u8] = b"ndn-service/scope-key/v1";
 
 /// Which scopes each role may access — the role→scope access policy. A member's
 /// keyring is **derived from its role**: [`keyring_for`](Self::keyring_for) hands

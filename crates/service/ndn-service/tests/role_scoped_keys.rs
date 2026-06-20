@@ -150,3 +150,27 @@ async fn roles_grant_scopes_and_gate_topics() {
         .expect("session closed");
     assert_eq!(reading, Reading { celsius: 21 }, "an observer reads the telemetry scope");
 }
+
+#[test]
+fn derived_scope_keys_are_distinct_and_deterministic() {
+    // SEC-19: HKDF-derived scope keys are bound to their scope name — distinct
+    // scopes get distinct keys (one scope's key cannot open another's), and the
+    // derivation is deterministic for the same master.
+    let master = [7u8; 32];
+    let kr = ScopeKeyring::derive(&master, &["control", "telemetry"]);
+    let control = kr.get("control").unwrap();
+    let telemetry = kr.get("telemetry").unwrap();
+
+    let aad = b"/sess/topic";
+    let sealed = control.seal(b"secret", aad);
+    assert!(
+        telemetry.open(&sealed, aad).is_err(),
+        "a different scope's key must not open it (SEC-19)"
+    );
+    assert_eq!(control.open(&sealed, aad).unwrap(), b"secret");
+
+    // Same master + scope re-derives the same key.
+    let kr2 = ScopeKeyring::derive(&master, &["control"]);
+    let sealed2 = kr2.get("control").unwrap().seal(b"x", aad);
+    assert_eq!(control.open(&sealed2, aad).unwrap(), b"x", "same master+scope -> same key");
+}

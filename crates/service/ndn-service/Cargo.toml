@@ -35,6 +35,9 @@ tokio            = { workspace = true, features = ["sync"] }
 async-trait      = { workspace = true }
 # Key distribution: seal a member's role-scoped keyring to its X25519 key.
 ndn-sealed-box   = { workspace = true }
+# HKDF-derived, scope-bound keyrings (ScopeKeyring::derive, SEC-19).
+hkdf             = "0.12"
+sha2             = "0.10"
 # KP-ABE key authority (issue_with_policy) for the policy→issuance bridge.
 ndn-nacabe       = { workspace = true, optional = true }
 # KGC params hash for ABE-by-role key distribution (the `issuance` feature).
