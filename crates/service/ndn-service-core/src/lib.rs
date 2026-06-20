@@ -21,7 +21,24 @@
 //!   idempotent (multi-provider carriers additionally enforce once-only).
 
 #![deny(missing_docs)]
+#![cfg_attr(not(feature = "std"), no_std)]
+//! ## `no_std`
+//!
+//! The message layer — [`Frame`], [`framing`], [`ServiceError`], and the
+//! `ServiceId` / `OpId` / [`Invocation`] / [`Response`] vocabulary — is
+//! `no_std + alloc`, so a constrained leaf (an embedded `ndn-publish` producer)
+//! can frame typed messages with no runtime. The async carrier traits
+//! ([`Carrier`], [`Dispatch`], [`SelectCarrier`], [`HintedCarrier`]) and
+//! [`ScriptDispatch`] need the default **`std`** feature (they assume an
+//! executor and a hash map); a `default-features = false` consumer gets only the
+//! portable message layer.
 
+extern crate alloc;
+
+#[cfg(not(feature = "std"))]
+use alloc::string::String;
+
+#[cfg(feature = "std")]
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -29,6 +46,7 @@ use ndn_packet::Name;
 
 // Re-exports so `#[ndn_service]`-generated code can reference everything through
 // this crate, without the consumer needing these as direct dependencies.
+#[cfg(feature = "std")]
 #[doc(hidden)]
 pub use async_trait;
 #[doc(hidden)]
@@ -101,8 +119,8 @@ pub enum ServiceError {
     Unauthorized(String),
 }
 
-impl std::fmt::Display for ServiceError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for ServiceError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             ServiceError::Decode(e) => write!(f, "service payload decode failed: {e}"),
             ServiceError::NotFound => write!(f, "no such operation or no provider answered"),
@@ -113,7 +131,7 @@ impl std::fmt::Display for ServiceError {
     }
 }
 
-impl std::error::Error for ServiceError {}
+impl core::error::Error for ServiceError {}
 
 /// A single provider's response to an invocation.
 #[derive(Clone, Debug)]
@@ -140,6 +158,7 @@ pub struct Invocation {
 /// A service's server side: route an [`Invocation`] to the matching typed handler
 /// and return the encoded response. The `#[ndn_service]` macro emits this; a
 /// carrier drives it from inbound requests.
+#[cfg(feature = "std")]
 #[async_trait::async_trait]
 pub trait Dispatch: Send + Sync + 'static {
     /// Handle one invocation, returning the [`Frame`]-encoded response bytes.
@@ -149,6 +168,7 @@ pub trait Dispatch: Send + Sync + 'static {
 /// An untyped op handler: `bytes -> bytes` (or an error). This is what a
 /// *dynamic* front-end registers — a Python function, a Kotlin/Swift callback —
 /// instead of the macro's generated typed methods.
+#[cfg(feature = "std")]
 pub type ScriptHandler = Arc<dyn Fn(Bytes) -> Result<Bytes, ServiceError> + Send + Sync>;
 
 /// A type-erased, **untyped** [`Dispatch`] for dynamic/scripting front-ends (PyO3,
@@ -156,11 +176,13 @@ pub type ScriptHandler = Arc<dyn Fn(Bytes) -> Result<Bytes, ServiceError> + Send
 /// single seam a non-Rust language binds — it trades the `#[ndn_service]` macro's
 /// compile-time typing for runtime, op-keyed dispatch, exactly as a scripting
 /// layer must. The same `ScriptDispatch` serves over any [`Carrier`].
+#[cfg(feature = "std")]
 #[derive(Default)]
 pub struct ScriptDispatch {
     handlers: std::collections::HashMap<String, ScriptHandler>,
 }
 
+#[cfg(feature = "std")]
 impl ScriptDispatch {
     /// An empty dispatch.
     pub fn new() -> Self {
@@ -178,6 +200,7 @@ impl ScriptDispatch {
     }
 }
 
+#[cfg(feature = "std")]
 #[async_trait::async_trait]
 impl Dispatch for ScriptDispatch {
     async fn dispatch(&self, invocation: Invocation) -> Result<Bytes, ServiceError> {
@@ -191,6 +214,7 @@ impl Dispatch for ScriptDispatch {
 /// A pluggable backend: it names, transports, multiplexes, and secures service
 /// invocations. The macro-generated client is generic over `C: Carrier`, so one
 /// definition runs over any carrier.
+#[cfg(feature = "std")]
 #[async_trait::async_trait]
 pub trait Carrier: Send + Sync {
     /// Invoke `op` of `svc` with `request` bytes; return one provider's response.
@@ -225,6 +249,7 @@ pub enum Strategy {
 /// A [`Carrier`] refinement for backends that reach **many** providers: invoke and
 /// collect responses per a [`Strategy`]. The generated client exposes the
 /// `*_select` methods only where `C: SelectCarrier`.
+#[cfg(feature = "std")]
 #[async_trait::async_trait]
 pub trait SelectCarrier: Carrier {
     /// Invoke `op` of `svc`, gathering responses per `strategy`.
@@ -242,6 +267,7 @@ pub trait SelectCarrier: Carrier {
 /// target node) while keeping a single shared content name — the data-centric
 /// alternative to a per-provider name. Carriers without hint support (or non-NDN
 /// transports) simply do not implement it; like [`SelectCarrier`], it is opt-in.
+#[cfg(feature = "std")]
 #[async_trait::async_trait]
 pub trait HintedCarrier: Carrier {
     /// Invoke `op` of `svc` with `request`, steering toward `hint` when given
@@ -293,9 +319,16 @@ pub mod framing {
     }
 }
 
+pub mod publish;
+
 /// `Frame` for the primitive argument/return types `#[ndn_service]` supports out
 /// of the box. Custom types implement [`Frame`] themselves.
 mod frame_impls {
+    #[cfg(not(feature = "std"))]
+    use alloc::string::{String, ToString};
+    #[cfg(not(feature = "std"))]
+    use alloc::vec::Vec;
+
     use super::{Frame, ServiceError};
     use bytes::Bytes;
 

@@ -8,7 +8,28 @@ license.workspace = true
 [package.metadata.scope]
 classification = "extension"
 
+[features]
+# `std` (default) brings the async carrier traits (Carrier/Dispatch/Select/
+# Hinted), ScriptDispatch, and a hash-map-backed runtime. With
+# `default-features = false` the crate is `no_std + alloc` and exposes only the
+# portable message layer (Frame/framing/ServiceError + the id/context types) —
+# what an embedded leaf (ndn-publish) needs to frame typed messages.
+default = ["std"]
+std = ["ndn-packet/std", "bytes/std", "dep:async-trait"]
+# `seal` adds the leaf producer's symmetric confidentiality (`publish::ScopeKey`),
+# reusing the stack's own no_std ChaCha20-Poly1305 primitive. no_std-safe.
+seal = ["dep:ndn-crypto-core"]
+
 [dependencies]
-ndn-packet  = { workspace = true, features = ["std"] }
-bytes       = { workspace = true, features = ["std"] }
-async-trait = { workspace = true }
+ndn-packet      = { workspace = true }
+bytes           = { workspace = true }
+async-trait     = { workspace = true, optional = true }
+ndn-crypto-core = { workspace = true, optional = true }
+
+[dev-dependencies]
+# For the embedded-sensor example's `#[derive(Frame)]` (a dev-dep cycle, allowed).
+ndn-service-macro = { workspace = true }
+
+[[example]]
+name = "embedded_sensor"
+required-features = ["seal"]
