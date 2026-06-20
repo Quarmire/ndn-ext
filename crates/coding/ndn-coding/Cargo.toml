@@ -96,3 +96,13 @@ ndn-config   = { workspace = true }
 ndn-engine   = { workspace = true }
 ndn-face    = { workspace = true }
 ndn-transport = { workspace = true }
+criterion     = { workspace = true }
+ed25519-dalek = { workspace = true }
+
+# Authenticated-network-coding benchmarks (fingerprint filter vs Ed25519,
+# FingerprintSet scaling, verify-on-decode commitment cost). Needs `f2-recode`
+# for the `recode` module.
+[[bench]]
+name = "recode_auth"
+harness = false
+required-features = ["f2-recode"]

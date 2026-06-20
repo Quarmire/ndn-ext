@@ -261,6 +261,101 @@ impl LinearFingerprint {
     }
 }
 
+/// A set of `m` independent [`LinearFingerprint`] projections over one
+/// generation.
+///
+/// A single projection is one GF(2⁸) equation, so a polluted packet slips past
+/// it with probability ≈ 2⁻⁸ (one byte of agreement). `m` *independent*
+/// projections (distinct random seeds) must all agree, so the per-packet
+/// false-accept bound for an unforged packet is ≈ 2⁻⁸ᵐ. This is the knob that
+/// turns the cheap in-flight filter into a cryptographically meaningful one
+/// without leaving GF(2⁸): pick `m` for the strength you want (e.g. `m = 4`
+/// ⇒ 2⁻³², `m = 8` ⇒ 2⁻⁶⁴).
+///
+/// **Wire-additive.** Each projection encodes as a standard `Fingerprint` TLV
+/// (`0xE8`, wire spec §3.3), so a set is a sequence of them and `m = 1` is
+/// byte-identical to a lone [`LinearFingerprint`]. The single-projection
+/// [`GenerationDescriptor::fingerprint`] field is left unchanged (interop-v1 is
+/// frozen); a descriptor revision can adopt a set once the codepoints are
+/// registered. Until then this is a standalone primitive.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FingerprintSet {
+    /// The independent projections; all must pass for a packet to pass.
+    pub projections: Vec<LinearFingerprint>,
+}
+
+impl FingerprintSet {
+    /// Immediate mode: one public projection per `seed` in `seeds` (each an
+    /// independent random `r` of length = symbol size). Coders filter pollution
+    /// in-flight against all `m`.
+    pub fn for_sources(seeds: &[Vec<u8>], sources: &[Vec<u8>]) -> Self {
+        Self {
+            projections: seeds
+                .iter()
+                .map(|r| LinearFingerprint::for_sources(r.clone(), sources))
+                .collect(),
+        }
+    }
+
+    /// Delayed mode: `m` adaptive-resistant projections — publishes each `h`
+    /// and commits `SHA-256(r)` while withholding every `r` until reveal.
+    pub fn delayed(seeds: &[Vec<u8>], sources: &[Vec<u8>]) -> Self {
+        Self {
+            projections: seeds
+                .iter()
+                .map(|r| LinearFingerprint::delayed(r, sources))
+                .collect(),
+        }
+    }
+
+    /// Number of projections `m`.
+    pub fn len(&self) -> usize {
+        self.projections.len()
+    }
+
+    /// `true` if the set carries no projections (never passes [`check`](Self::check)).
+    pub fn is_empty(&self) -> bool {
+        self.projections.is_empty()
+    }
+
+    /// Pass iff the packet passes **every** projection. An empty set never
+    /// passes — callers must not treat "no projections" as a pass (mirrors
+    /// [`LinearFingerprint::check`] on an unavailable seed).
+    pub fn check(&self, vector: &CodingVector, payload: &[u8]) -> bool {
+        !self.projections.is_empty() && self.projections.iter().all(|p| p.check(vector, payload))
+    }
+
+    /// `-log₂` of the per-packet false-accept bound for an unforged (random)
+    /// polluted packet: `8 · m` bits over GF(2⁸). Returns `0` for an empty set.
+    pub fn false_accept_bits(&self) -> u32 {
+        (self.projections.len() as u32) * 8
+    }
+
+    /// Encode as a sequence of `Fingerprint` TLVs (§3.3) — `m = 1` is identical
+    /// to [`LinearFingerprint::to_tlv`].
+    pub fn to_tlv(&self) -> Bytes {
+        let mut buf = Vec::new();
+        for p in &self.projections {
+            buf.extend_from_slice(&p.to_tlv());
+        }
+        Bytes::from(buf)
+    }
+
+    /// Decode a sequence of `Fingerprint` TLVs back into a set.
+    pub fn from_tlv(bytes: &[u8]) -> Result<Self> {
+        let mut r = TlvReader::new(Bytes::copy_from_slice(bytes));
+        let mut projections = Vec::new();
+        while !r.is_empty() {
+            let (typ, value) = r.read_tlv().map_err(|_| CodingError::MalformedMetadata)?;
+            if typ != TYPE_FINGERPRINT {
+                return Err(CodingError::MalformedMetadata);
+            }
+            projections.push(decode_fingerprint(value)?);
+        }
+        Ok(Self { projections })
+    }
+}
+
 /// The producer-signed generation descriptor (wire spec §3) — the trust
 /// anchor every combination of the generation verifies against. Carried as
 /// the `Content` of an ordinary signed Data at `<object>/<GEN>=<id>/_desc`.
@@ -1550,6 +1645,120 @@ mod tests {
         assert_eq!(
             buf.absorb(&wrong, Bytes::from_static(&[1, 2])),
             Err(DecodeError::Mismatch)
+        );
+    }
+
+    // --- multi-projection fingerprint (FingerprintSet) -------------------
+
+    /// Tiny deterministic xorshift64 PRNG — reproducible test/bench inputs
+    /// without pulling a `rand` dependency.
+    struct XorShift(u64);
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn byte(&mut self) -> u8 {
+            (self.next() & 0xff) as u8
+        }
+        fn bytes(&mut self, n: usize) -> Vec<u8> {
+            (0..n).map(|_| self.byte()).collect()
+        }
+    }
+
+    /// Build a valid coded payload `y = Σ c[s]·source[s]` over GF(2⁸).
+    fn combine(coeffs: &[u8], sources: &[Vec<u8>]) -> Vec<u8> {
+        let sym = sources[0].len();
+        let mut y = vec![0u8; sym];
+        for (s, &c) in coeffs.iter().enumerate() {
+            for j in 0..sym {
+                y[j] ^= field::mul(c, sources[s][j]);
+            }
+        }
+        y
+    }
+
+    #[test]
+    fn fingerprint_set_passes_valid_combinations_any_m() {
+        let mut rng = XorShift(0x1234_5678);
+        let k = 4;
+        let sym = 64;
+        let sources: Vec<Vec<u8>> = (0..k).map(|_| rng.bytes(sym)).collect();
+        let seeds: Vec<Vec<u8>> = (0..3).map(|_| rng.bytes(sym)).collect();
+        let set = FingerprintSet::for_sources(&seeds, &sources);
+        assert_eq!(set.len(), 3);
+        assert_eq!(set.false_accept_bits(), 24);
+        // A genuine random linear combination passes every projection.
+        for _ in 0..50 {
+            let c: Vec<u8> = (0..k).map(|_| rng.byte()).collect();
+            let y = combine(&c, &sources);
+            assert!(set.check(&CodingVector(c), &y));
+        }
+    }
+
+    #[test]
+    fn fingerprint_set_empty_never_passes() {
+        let set = FingerprintSet::default();
+        assert!(set.is_empty());
+        assert!(!set.check(&CodingVector(vec![1, 0]), &[0u8; 4]));
+        assert_eq!(set.false_accept_bits(), 0);
+    }
+
+    #[test]
+    fn fingerprint_set_tlv_round_trips() {
+        let mut rng = XorShift(0xdead_beef);
+        let sources: Vec<Vec<u8>> = (0..3).map(|_| rng.bytes(8)).collect();
+        let seeds: Vec<Vec<u8>> = (0..2).map(|_| rng.bytes(8)).collect();
+        let set = FingerprintSet::for_sources(&seeds, &sources);
+        let decoded = FingerprintSet::from_tlv(&set.to_tlv()).unwrap();
+        assert_eq!(set, decoded);
+        // m = 1 is byte-identical to a lone LinearFingerprint TLV.
+        let single = FingerprintSet::for_sources(&seeds[..1], &sources);
+        assert_eq!(single.to_tlv(), single.projections[0].to_tlv());
+    }
+
+    /// Empirically validate the per-packet false-accept bound: random pollution
+    /// slips past `m` independent GF(2⁸) projections at ≈ 2⁻⁸ᵐ. With m=1 we
+    /// expect ~N/256; with m=2, essentially none.
+    #[test]
+    fn fingerprint_set_false_accept_matches_bound() {
+        let mut rng = XorShift(0xc0ff_ee00);
+        let k = 4;
+        let sym = 64;
+        let sources: Vec<Vec<u8>> = (0..k).map(|_| rng.bytes(sym)).collect();
+
+        let seeds3: Vec<Vec<u8>> = (0..3).map(|_| rng.bytes(sym)).collect();
+        let m1 = FingerprintSet::for_sources(&seeds3[..1], &sources);
+        let m2 = FingerprintSet::for_sources(&seeds3[..2], &sources);
+
+        const N: usize = 40_000;
+        let (mut pass1, mut pass2) = (0usize, 0usize);
+        for _ in 0..N {
+            // A *polluted* packet: a random vector with a random payload that is
+            // NOT the matching combination (overwhelmingly not, for random y).
+            let c = CodingVector((0..k).map(|_| rng.byte()).collect());
+            let y = rng.bytes(sym);
+            if m1.check(&c, &y) {
+                pass1 += 1;
+            }
+            if m2.check(&c, &y) {
+                pass2 += 1;
+            }
+        }
+        // m=1 expected ≈ N/256 ≈ 156; allow a wide Poisson band.
+        let expect1 = N / 256;
+        assert!(
+            pass1 > expect1 / 3 && pass1 < expect1 * 3,
+            "m=1 false-accepts {pass1} not within ~3x of expected {expect1} (2^-8)"
+        );
+        // m=2 expected ≈ N/65536 < 1; almost always 0, allow a tiny slack.
+        assert!(
+            pass2 <= 3,
+            "m=2 false-accepts {pass2} far exceeds the 2^-16 bound"
         );
     }
 }
