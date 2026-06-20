@@ -241,6 +241,21 @@ mod tests {
         ServiceDiscoveryProtocol::with_defaults(name("/ndn/test/node"))
     }
 
+    /// A test verifier that returns an AUTHENTIC verdict naming `identity` for any
+    /// Data — exercises the auto-FIB gate's authenticity + name-binding logic
+    /// (SEC-11/12) without standing up real Ed25519 keys (that is `auth.rs`'s job).
+    struct TrustAllAuthentic {
+        identity: Name,
+    }
+    impl crate::RecordVerifier for TrustAllAuthentic {
+        fn verify(&self, _data: &ndn_packet::Data) -> crate::VerifyVerdict {
+            crate::VerifyVerdict::Verified {
+                identity: self.identity.clone(),
+                authentic: true,
+            }
+        }
+    }
+
     #[test]
     fn publish_and_withdraw() {
         let sd = make_sd();
@@ -442,9 +457,29 @@ mod tests {
     }
 
     #[test]
-    fn verified_record_installs_fib() {
-        // With a DigestVerifier configured, the (DigestSha256-signed)
-        // record verifies and DOES auto-install a FIB route.
+    fn authentic_record_under_signer_namespace_installs_fib() {
+        // SEC-11 + SEC-12: an AUTHENTIC (keyed) record whose announced prefix is
+        // under the signer's own namespace installs a FIB route.
+        let cfg = ServiceDiscoveryConfig {
+            record_verifier: Some(StdArc::new(TrustAllAuthentic {
+                identity: name("/ndn/svc/KEY/k1"), // signing namespace = /ndn/svc
+            })),
+            ..ServiceDiscoveryConfig::default()
+        };
+        let sd = ServiceDiscoveryProtocol::new(name("/ndn/test/node"), sd_root().clone(), cfg);
+        let ctx = FibCtx::at(Instant::now());
+        let pkt = inbound_record("/ndn/svc/x", "/ndn/peer/n", 30_000, 1);
+        sd.on_inbound(&pkt, FaceId(10), &crate::InboundMeta::none(), &ctx);
+
+        let added = ctx.added.lock().unwrap();
+        assert_eq!(added.len(), 1, "authentic, name-bound record installs FIB");
+        assert_eq!(added[0].0, name("/ndn/svc/x"));
+    }
+
+    #[test]
+    fn digest_record_browses_but_does_not_fib() {
+        // SEC-11: a DigestSha256 verdict is integrity-only (anyone can compute one),
+        // so it must NOT drive FIB — though the record is still browseable.
         let cfg = ServiceDiscoveryConfig {
             record_verifier: Some(StdArc::new(crate::DigestVerifier)),
             ..ServiceDiscoveryConfig::default()
@@ -454,16 +489,44 @@ mod tests {
         let pkt = inbound_record("/ndn/svc/x", "/ndn/peer/n", 30_000, 1);
         sd.on_inbound(&pkt, FaceId(10), &crate::InboundMeta::none(), &ctx);
 
-        let added = ctx.added.lock().unwrap();
-        assert_eq!(added.len(), 1, "verified record installs FIB");
-        assert_eq!(added[0].0, name("/ndn/svc/x"));
+        assert_eq!(sd.peer_records.lock().unwrap().len(), 1, "browseable");
+        assert!(
+            ctx.added.lock().unwrap().is_empty(),
+            "a digest-only (non-authentic) record must not install FIB (SEC-11)"
+        );
+    }
+
+    #[test]
+    fn authentic_signer_cannot_fib_foreign_prefix() {
+        // SEC-12: a trusted key may announce only under its own namespace — it
+        // cannot install a route for an arbitrary service name (route hijack).
+        let cfg = ServiceDiscoveryConfig {
+            record_verifier: Some(StdArc::new(TrustAllAuthentic {
+                identity: name("/ndn/peerB/KEY/k"), // signing namespace = /ndn/peerB
+            })),
+            ..ServiceDiscoveryConfig::default()
+        };
+        let sd = ServiceDiscoveryProtocol::new(name("/ndn/test/node"), sd_root().clone(), cfg);
+        let ctx = FibCtx::at(Instant::now());
+        // peerB (validly signing) tries to announce /ndn/bank/api — not under /ndn/peerB.
+        let pkt = inbound_record("/ndn/bank/api", "/ndn/peerB", 30_000, 1);
+        sd.on_inbound(&pkt, FaceId(10), &crate::InboundMeta::none(), &ctx);
+
+        assert_eq!(sd.peer_records.lock().unwrap().len(), 1, "still browseable");
+        assert!(
+            ctx.added.lock().unwrap().is_empty(),
+            "a signer cannot FIB a prefix outside its own namespace (SEC-12)"
+        );
     }
 
     #[test]
     fn fib_ttl_is_clamped() {
         // A forged huge freshness_ms cannot pin a route past max_ttl (#2).
         let cfg = ServiceDiscoveryConfig {
-            record_verifier: Some(StdArc::new(crate::DigestVerifier)),
+            // Authentic + name-bound, so the route installs (then assert it's clamped).
+            record_verifier: Some(StdArc::new(TrustAllAuthentic {
+                identity: name("/ndn/svc/KEY/k1"),
+            })),
             auto_fib_max_ttl: Duration::from_secs(300),
             ..ServiceDiscoveryConfig::default()
         };

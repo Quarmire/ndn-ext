@@ -20,6 +20,17 @@ use crate::wire::{parse_raw_data, parse_raw_interest, write_name_tlv};
 use super::ServiceDiscoveryProtocol;
 use super::records::prefix_hash_hex;
 
+/// The signing identity namespace from a KeyLocator name `/<identity>/KEY/<keyid>`
+/// → `/<identity>`, used for the SEC-12 name→authority binding. `None` if the name
+/// has no `KEY` component (then the binding check fails closed). A DigestSha256
+/// verdict's identity is the Data name (no `KEY`), but that path is already blocked
+/// by the authenticity gate (SEC-11).
+fn signer_namespace(key_name: &Name) -> Option<Name> {
+    let comps = key_name.components();
+    let idx = comps.iter().position(|c| c.value.as_ref() == b"KEY")?;
+    Some(Name::from_components(comps[..idx].iter().cloned()))
+}
+
 const T_PEER_ENTRY: u64 = 0xE0;
 
 impl ServiceDiscoveryProtocol {
@@ -43,7 +54,11 @@ impl ServiceDiscoveryProtocol {
         match &self.config.record_verifier {
             Some(v) => match Data::decode(raw.clone()) {
                 Ok(data) => match v.verify(&data) {
-                    VerifyVerdict::Verified { identity } => (true, Some(identity)),
+                    // The bool is *authenticity* (keyed), not mere verification: a
+                    // DigestSha256 verdict is integrity-only and must not drive FIB
+                    // (SEC-11). The identity is still returned (for rate-limiting and
+                    // the SEC-12 name-binding check).
+                    VerifyVerdict::Verified { identity, authentic } => (authentic, Some(identity)),
                     _ => (false, None),
                 },
                 Err(_) => (false, None),
@@ -215,7 +230,7 @@ impl ServiceDiscoveryProtocol {
         // fail-closed: the record is still browseable below, but never
         // auto-installs a FIB route. Scope filtering is the explicit
         // prefix allow-list (the old `is_in_scope` no-op was removed, #6).
-        let (verified, identity) = self.verify_data(raw);
+        let (authentic, identity) = self.verify_data(raw);
         let rate_key = identity.clone().unwrap_or_else(|| record.node_name.clone());
 
         if !self.config.auto_populate_prefix_filter.is_empty() {
@@ -260,8 +275,24 @@ impl ServiceDiscoveryProtocol {
             }
         }
 
-        if self.config.auto_populate_fib && verified {
+        // Auto-FIB is gated on (a) authenticity — only a keyed signature, never a
+        // bare DigestSha256, may install a route (SEC-11); and (b) name→authority
+        // binding — the announced prefix must lie under the *signer's own* namespace,
+        // so a trusted key cannot install a route for an arbitrary service name it
+        // was never authorized for (SEC-12).
+        if self.config.auto_populate_fib
+            && authentic
+            && identity
+                .as_ref()
+                .and_then(signer_namespace)
+                .is_some_and(|ns| record.announced_prefix.has_prefix(&ns))
+        {
             self.auto_populate_fib(&record, incoming_face, ctx);
+        } else if self.config.auto_populate_fib && authentic {
+            debug!(
+                "ServiceDiscovery: refusing auto-FIB for {:?} — not under signer {:?}'s namespace (SEC-12)",
+                record.announced_prefix, identity
+            );
         }
 
         if self.config.relay_records {

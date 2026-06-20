@@ -30,9 +30,12 @@ use ndn_security::{Ed25519Verifier, Signer, VerifyOutcome, Verifier};
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)] // transient verdict; not stored in bulk
 pub enum VerifyVerdict {
-    /// Signature checks out; `identity` is the trusted signer name
-    /// (KeyLocator for asymmetric, the Data name for DigestSha256).
-    Verified { identity: Name },
+    /// Signature checks out; `identity` is the trusted signer name (KeyLocator for
+    /// asymmetric, the Data name for DigestSha256). `authentic` is `true` only for
+    /// **keyed** (asymmetric) verification — a `DigestSha256` digest proves
+    /// integrity, not authorship (anyone can compute one), so it is `false`. Only an
+    /// authentic verdict may drive FIB auto-population (red-team SEC-11).
+    Verified { identity: Name, authentic: bool },
     /// Well-formed but not trusted (bad signature / unknown key).
     Untrusted,
     /// Could not be parsed / no signature.
@@ -121,8 +124,11 @@ impl RecordVerifier for DigestVerifier {
             return VerifyVerdict::Untrusted;
         }
         if sha256(data.signed_region()).as_slice() == data.sig_value() {
+            // Integrity only — a digest proves no authorship, so it is NOT authentic
+            // and must never drive FIB (SEC-11).
             VerifyVerdict::Verified {
                 identity: (*data.name).clone(),
+                authentic: false,
             }
         } else {
             VerifyVerdict::Untrusted
@@ -167,6 +173,7 @@ impl RecordVerifier for KeyedVerifier {
         match poll_once(Ed25519Verifier.verify(data.signed_region(), data.sig_value(), pk)) {
             Some(Ok(VerifyOutcome::Valid)) => VerifyVerdict::Verified {
                 identity: (*kl).clone(),
+                authentic: true,
             },
             _ => VerifyVerdict::Untrusted,
         }
@@ -220,7 +227,8 @@ mod tests {
             assert_ne!(
                 DigestVerifier.verify(&data),
                 VerifyVerdict::Verified {
-                    identity: "/sd/x".parse().unwrap()
+                    identity: "/sd/x".parse().unwrap(),
+                    authentic: false,
                 }
             );
         }
