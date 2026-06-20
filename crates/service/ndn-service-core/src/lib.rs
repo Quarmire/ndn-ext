@@ -205,7 +205,17 @@ impl ScriptDispatch {
 impl Dispatch for ScriptDispatch {
     async fn dispatch(&self, invocation: Invocation) -> Result<Bytes, ServiceError> {
         match self.handlers.get(invocation.op.as_str()) {
-            Some(handler) => handler(invocation.request),
+            // A scripting front-end (PyO3/boltffi) handler runs on attacker-supplied
+            // bytes; isolate a panic so it becomes an error, not a worker crash
+            // (red-team SEC-24). `AssertUnwindSafe` is sound here: on a panic we
+            // discard the handler's partial state and return an error.
+            Some(handler) => {
+                let request = invocation.request;
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(request)))
+                    .unwrap_or_else(|_| {
+                        Err(ServiceError::Handler("script handler panicked".into()))
+                    })
+            }
             None => Err(ServiceError::NotFound),
         }
     }

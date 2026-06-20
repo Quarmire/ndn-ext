@@ -38,3 +38,24 @@ async fn untyped_script_service_round_trips_over_a_carrier() {
     // An unknown op fails closed (ScriptDispatch returns NotFound).
     assert!(carrier.invoke(&svc, &OpId::new("nope"), Bytes::new()).await.is_err());
 }
+
+#[tokio::test]
+async fn panicking_script_handler_is_isolated() {
+    // SEC-24: a script handler that panics on attacker-supplied bytes must become an
+    // error — not unwind the serving task — and other ops keep working afterward.
+    let mut dispatch = ScriptDispatch::new();
+    let boom: ScriptHandler = Arc::new(|_req: Bytes| panic!("handler blew up"));
+    let echo: ScriptHandler = Arc::new(|req: Bytes| Ok(req));
+    dispatch.on("boom", boom);
+    dispatch.on("echo", echo);
+
+    let carrier = RpcCarrier::new();
+    let svc = ServiceId::new(n("/svc/x"));
+    carrier.serve(&svc, Arc::new(dispatch)).await.unwrap();
+
+    // The panicking op returns an error (caught by catch_unwind), not a crash.
+    assert!(carrier.invoke(&svc, &OpId::new("boom"), Bytes::from_static(b"x")).await.is_err());
+    // A subsequent op still works — the service survived the panic.
+    let r = carrier.invoke(&svc, &OpId::new("echo"), Bytes::from_static(b"ok")).await.unwrap();
+    assert_eq!(r.payload.as_ref(), b"ok");
+}
