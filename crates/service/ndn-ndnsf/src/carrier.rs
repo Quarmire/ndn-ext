@@ -252,8 +252,7 @@ impl Carrier for NdnsfCarrier {
         let trust = self.trust.clone();
         let responder = responder_for(dispatch);
         let handle = tokio::spawn(async move {
-            driver::serve_provider_async(ps.as_ref(), node, service, group, ttl, &trust, responder)
-                .await;
+            driver::serve_provider_async(ps, node, service, group, ttl, &trust, responder).await;
         });
         self.serving.lock().expect("serve lock").push(handle);
         Ok(())

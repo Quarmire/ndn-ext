@@ -41,6 +41,11 @@ const TARGETED_BATCH: usize = 4;
 /// (red-team SEC-07). At the cap the provider sheds new requests.
 const MAX_PENDING_PAYLOADS: usize = 1024;
 
+/// Max wall-clock a single async handler may run before the provider gives up on
+/// it and answers with an error — so one slow/hung handler neither blocks the
+/// receive loop (it runs off-loop) nor leaves the client waiting forever (SEC-23).
+const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Per-requester admission control (red-team SEC-25): requests/sec and burst per
 /// requester identity, and a cap on how many identities to track.
 const RL_REQUESTS_PER_SEC: u32 = 50;
@@ -308,7 +313,7 @@ pub type AsyncResponder = Arc<
 /// here — the service carrier uses Normal/select only. Runs until the
 /// subscription closes.
 pub async fn serve_provider_async(
-    ps: &SvsPubSub,
+    ps: Arc<SvsPubSub>,
     node: Name,
     service: Name,
     group_prefix: Name,
@@ -373,17 +378,37 @@ pub async fn serve_provider_async(
                     .get(&reqid.to_string())
                     .map(|(p, _)| p.clone())
                     .unwrap_or_default();
-                // Consume the token (fail-closed) before running the async responder.
+                // Consume the token (fail-closed) ON the loop, then run the handler
+                // OFF the loop with a timeout, so a slow/hung responder neither blocks
+                // other coordinations (head-of-line) nor strands the client (SEC-23).
                 if let Ok(coord) = engine.consume_selection(now, &sel) {
                     pending_payloads.remove(&reqid.to_string());
-                    let out = responder(coord, req_payload).await;
-                    let resp = ResponseMessage {
-                        status: true,
-                        error_info: String::new(),
-                        payload: out,
-                    };
-                    let name = names::response_name(&node, &requester, &service, &reqid);
-                    let _ = ps.publish(name.clone(), trust.seal(name, resp.encode()).as_ref()).await;
+                    let resp_name = names::response_name(&node, &requester, &service, &reqid);
+                    let responder = responder.clone();
+                    let ps = ps.clone();
+                    let trust = trust.clone();
+                    tokio::spawn(async move {
+                        let resp = match tokio::time::timeout(
+                            HANDLER_TIMEOUT,
+                            responder(coord, req_payload),
+                        )
+                        .await
+                        {
+                            Ok(payload) => ResponseMessage {
+                                status: true,
+                                error_info: String::new(),
+                                payload,
+                            },
+                            Err(_) => ResponseMessage {
+                                status: false,
+                                error_info: "handler timed out".into(),
+                                payload: Bytes::new(),
+                            },
+                        };
+                        let _ = ps
+                            .publish(resp_name.clone(), trust.seal(resp_name, resp.encode()).as_ref())
+                            .await;
+                    });
                 }
             }
             _ => {}

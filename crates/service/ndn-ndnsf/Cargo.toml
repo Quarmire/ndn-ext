@@ -30,7 +30,7 @@ async-trait = { workspace = true, optional = true }
 # Per-requester admission control (token bucket) on the four-phase request path.
 ndn-ratelimit = { workspace = true, optional = true }
 # ACK-collection window for the selection strategies.
-tokio      = { workspace = true, optional = true, features = ["time"] }
+tokio      = { workspace = true, optional = true, features = ["time", "rt"] }
 # Policy-file model (ServiceController access policy → KP-ABE grants).
 serde      = { workspace = true, optional = true, features = ["derive"] }
 toml       = { version = "0.8", optional = true }

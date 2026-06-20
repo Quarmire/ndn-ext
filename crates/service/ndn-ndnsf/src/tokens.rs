@@ -66,6 +66,12 @@ pub enum TokenError {
     Expired,
 }
 
+/// Hard cap on outstanding pending tokens — a memory backstop under a sustained
+/// request/bootstrap flood (TTL reaping is the primary bound; this stops the table
+/// growing without limit between reaps). At the cap, issuing sheds one entry
+/// (red-team SEC-22).
+const MAX_PENDING_TOKENS: usize = 8192;
+
 /// A provider's pending-token table: issue on ACK, consume once on SELECTION,
 /// expire/clean up by TTL.
 pub struct PendingProviderTokens {
@@ -90,6 +96,13 @@ impl PendingProviderTokens {
         service: Name,
         user_token: String,
     ) -> ProviderToken {
+        // Backstop the table size (SEC-22): shed an arbitrary entry at the cap so a
+        // bootstrap/request flood can't grow it without bound between TTL reaps.
+        if self.entries.len() >= MAX_PENDING_TOKENS
+            && let Some(victim) = self.entries.keys().next().cloned()
+        {
+            self.entries.remove(&victim);
+        }
         let token = ProviderToken::random();
         self.entries.insert(
             token.clone(),
@@ -160,6 +173,17 @@ mod tests {
 
     fn issue(t: &mut PendingProviderTokens, now: u64) -> ProviderToken {
         t.issue(now, name("/muas/alice"), name("/svc/mavlink"), "utok".into())
+    }
+
+    /// SEC-22 — the pending-token table is hard-capped, so a flood of issuance
+    /// (e.g. TargetedBootstrap minting batches) cannot grow it without bound.
+    #[test]
+    fn token_table_is_capped() {
+        let mut t = store();
+        for i in 0..(MAX_PENDING_TOKENS + 500) {
+            t.issue(0, name(&format!("/muas/u{i}")), name("/svc/x"), String::new());
+        }
+        assert!(t.pending_count() <= MAX_PENDING_TOKENS);
     }
 
     /// NSF-T1 / NSF-T3 — a token is single-use; consuming it again (replay,
