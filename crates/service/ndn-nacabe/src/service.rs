@@ -26,6 +26,12 @@ use crate::names::{self, DKEY};
 
 const DKEY_FETCH_TIMEOUT: Duration = Duration::from_secs(4);
 
+/// FreshnessPeriod on an issued DKEY Data — short, so a cache can't keep serving a
+/// key issued before a revocation, and a re-fetch re-runs the (live) issuance gate
+/// (red-team SEC-21). The seal is to a per-request ephemeral recipient anyway, so a
+/// cached copy is opener-bound; this bounds the revocation-blind window.
+const DKEY_FRESHNESS: Duration = Duration::from_secs(1);
+
 /// A consumer validation-failure hook (NSF-F1): invoked exactly once per failed
 /// authority response, with the failed Data name and a human-readable reason.
 pub type ValidationFailureHook = Arc<dyn Fn(&Name, &str) + Send + Sync>;
@@ -112,8 +118,9 @@ pub async fn serve_cp(
                 // live policy, so a revoked requester is refused here even if it
                 // still has a stale entry in the authority's grant table (SEC-06).
                 if let Some(sealed) = issue(&identity, recipient_public)
-                    && let Ok(wire) =
-                        DataBuilder::new(name, sealed.as_ref()).sign_with_sync(&*aa_signer)
+                    && let Ok(wire) = DataBuilder::new(name, sealed.as_ref())
+                        .freshness(DKEY_FRESHNESS)
+                        .sign_with_sync(&*aa_signer)
                 {
                     responder.respond_bytes(wire).await.ok();
                 }
@@ -172,8 +179,9 @@ pub async fn serve_kp(
                     return;
                 };
                 if let Some(sealed) = issue(&identity, recipient_public)
-                    && let Ok(wire) =
-                        DataBuilder::new(name, sealed.as_ref()).sign_with_sync(&*aa_signer)
+                    && let Ok(wire) = DataBuilder::new(name, sealed.as_ref())
+                        .freshness(DKEY_FRESHNESS)
+                        .sign_with_sync(&*aa_signer)
                 {
                     responder.respond_bytes(wire).await.ok();
                 }
