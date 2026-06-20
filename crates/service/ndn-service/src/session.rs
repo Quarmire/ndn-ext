@@ -185,6 +185,19 @@ impl<T: Frame> ScopedTopic<T> {
 /// entry that cannot be opened with the scope key (a non-member's view, or a
 /// foreign/malformed publication) is skipped — a node without the key sees no
 /// plaintext.
+///
+/// ## Replay protection (SEC-13)
+///
+/// Stale-publication replay is prevented by the **sync layer's per-publisher
+/// sequence numbers**, not a clock: `SvsPubSub` assigns each publisher a monotonic
+/// sequence and a consumer fetches/delivers each `(publisher, seq)` at most once, in
+/// order (it never goes backward over its state-vector high-water), so re-injecting
+/// an old sealed Data on the wire does not cause re-delivery. This is the
+/// sequence-based mechanism NDNSF patched SVS to guarantee (nodes can't be assumed
+/// to share a trusted clock). A *leaf* producer (`ndn_service_core::publish`) that
+/// emits to a raw sink instead of SVS names each publication `<topic>/seq=N`; a
+/// gateway that ingests those raw publications MUST itself reject `seq ≤ last-seen`
+/// per publisher to get the same guarantee.
 pub struct ScopedSubscription<T> {
     rx: mpsc::Receiver<Publication>,
     key: Arc<ContentKey>,
