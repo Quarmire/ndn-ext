@@ -171,8 +171,15 @@ fn command_verb(name: &Name, scope: &Name) -> Option<String> {
         return None;
     }
     let comps = name.components();
-    let idx = comps.iter().position(|c| c.value.as_ref() == POLICY.as_bytes())?;
-    let verb = comps.get(idx + 1)?;
+    // The layout is exactly `<scope>/policy/<verb>[/params-digest]`: anchor `policy`
+    // to the component right after the scope rather than searching for the first
+    // `policy` literal, so a scope that itself contains a `policy` component can't
+    // shift the verb position (red-team SEC-33).
+    let policy_idx = scope.components().len();
+    if comps.get(policy_idx).map(|c| c.value.as_ref()) != Some(POLICY.as_bytes()) {
+        return None;
+    }
+    let verb = comps.get(policy_idx + 1)?;
     Some(String::from_utf8_lossy(verb.value.as_ref()).into_owned())
 }
 
