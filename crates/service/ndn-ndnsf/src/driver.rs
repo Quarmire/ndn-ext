@@ -22,7 +22,7 @@ use ndn_packet::{Name, NameComponent};
 use ndn_sync::SvsPubSub;
 use tracing::instrument;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::flow::{ProviderEngine, make_request, make_selection, select_providers};
 use crate::messages::{
@@ -34,6 +34,11 @@ use crate::trust::TrustCtx;
 
 /// How many single-use tokens a TargetedBootstrap issues to a requester.
 const TARGETED_BATCH: usize = 4;
+
+/// Cap on a provider's in-flight unselected request payloads. A SELECTION may
+/// never arrive, so without a ceiling (plus the TTL reap) the map grows unbounded
+/// (red-team SEC-07). At the cap the provider sheds new requests.
+const MAX_PENDING_PAYLOADS: usize = 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
@@ -123,11 +128,19 @@ pub async fn serve_provider<H>(
     H: Fn(&PendingCoordination, &Bytes) -> Bytes,
 {
     let mut engine = ProviderEngine::new(ttl_secs);
-    // The provider holds each pending request's payload until its SELECTION.
-    let mut pending_payloads: HashMap<String, Bytes> = HashMap::new();
+    // The provider holds each pending request's payload until its SELECTION, with
+    // the insertion time so stale entries (whose SELECTION never comes) are reaped.
+    let mut pending_payloads: HashMap<String, (Bytes, u64)> = HashMap::new();
     let mut rx = ps.subscribe(group_prefix).await;
+    let start = Instant::now();
 
     while let Some(pubn) = rx.recv().await {
+        // Monotonic clock for token/pending TTL — without this the expiry is inert
+        // and both maps grow unbounded (red-team SEC-08).
+        let now = start.elapsed().as_secs();
+        engine.cleanup_expired(now);
+        pending_payloads.retain(|_, (_, created)| now.saturating_sub(*created) < ttl_secs);
+
         match phase_of(&pubn.name) {
             Some(Phase::Request) => {
                 // Route by service: ignore requests for a service we don't serve
@@ -146,8 +159,12 @@ pub async fn serve_provider<H>(
                 let reqid = request_id_of(&pubn.name);
                 match req.request_mode {
                     RequestMode::Normal => {
-                        pending_payloads.insert(reqid.to_string(), req.payload.clone());
-                        let ack = engine.on_request(0, requester.clone(), service.clone(), &req);
+                        // Shed new requests at the cap rather than grow unbounded.
+                        if pending_payloads.len() >= MAX_PENDING_PAYLOADS {
+                            continue;
+                        }
+                        pending_payloads.insert(reqid.to_string(), (req.payload.clone(), now));
+                        let ack = engine.on_request(now, requester.clone(), service.clone(), &req);
                         let name = names::ack_name(&node, &requester, &service, &reqid);
                         let _ = ps.publish(name.clone(), trust.seal(name, ack.encode()).as_ref()).await;
                     }
@@ -157,7 +174,7 @@ pub async fn serve_provider<H>(
                             .map(|_| {
                                 engine
                                     .issue_token(
-                                        0,
+                                        now,
                                         requester.clone(),
                                         service.clone(),
                                         req.user_token.clone(),
@@ -182,7 +199,7 @@ pub async fn serve_provider<H>(
                             request_id: reqid.to_string(),
                         };
                         if let Ok(resp) =
-                            engine.on_selection(0, &sel, |coord| handler(coord, &req.payload))
+                            engine.on_selection(now, &sel, |coord| handler(coord, &req.payload))
                         {
                             let name = names::response_name(&node, &requester, &service, &reqid);
                             let _ = ps.publish(name.clone(), trust.seal(name, resp.encode()).as_ref()).await;
@@ -203,9 +220,12 @@ pub async fn serve_provider<H>(
                     continue;
                 };
                 let reqid = request_id_of(&pubn.name);
-                let payload = pending_payloads.get(&reqid.to_string()).cloned().unwrap_or_default();
+                let payload = pending_payloads
+                    .get(&reqid.to_string())
+                    .map(|(p, _)| p.clone())
+                    .unwrap_or_default();
                 // on_selection fails closed for a token this provider did not issue.
-                if let Ok(resp) = engine.on_selection(0, &sel, |coord| handler(coord, &payload)) {
+                if let Ok(resp) = engine.on_selection(now, &sel, |coord| handler(coord, &payload)) {
                     pending_payloads.remove(&reqid.to_string());
                     let name = names::response_name(&node, &requester, &service, &reqid);
                     let _ = ps.publish(name.clone(), trust.seal(name, resp.encode()).as_ref()).await;
@@ -243,10 +263,16 @@ pub async fn serve_provider_async(
     responder: AsyncResponder,
 ) {
     let mut engine = ProviderEngine::new(ttl_secs);
-    let mut pending_payloads: HashMap<String, Bytes> = HashMap::new();
+    let mut pending_payloads: HashMap<String, (Bytes, u64)> = HashMap::new();
     let mut rx = ps.subscribe(group_prefix).await;
+    let start = Instant::now();
 
     while let Some(pubn) = rx.recv().await {
+        // Monotonic clock for token/pending TTL (red-team SEC-07/SEC-08).
+        let now = start.elapsed().as_secs();
+        engine.cleanup_expired(now);
+        pending_payloads.retain(|_, (_, created)| now.saturating_sub(*created) < ttl_secs);
+
         match phase_of(&pubn.name) {
             Some(Phase::Request) => {
                 if service_of(&pubn.name).as_ref() != Some(&service) {
@@ -263,8 +289,12 @@ pub async fn serve_provider_async(
                     continue; // this serve path drives the Normal/select flow only
                 }
                 let reqid = request_id_of(&pubn.name);
-                pending_payloads.insert(reqid.to_string(), req.payload.clone());
-                let ack = engine.on_request(0, requester.clone(), service.clone(), &req);
+                // Shed new requests at the cap rather than grow unbounded.
+                if pending_payloads.len() >= MAX_PENDING_PAYLOADS {
+                    continue;
+                }
+                pending_payloads.insert(reqid.to_string(), (req.payload.clone(), now));
+                let ack = engine.on_request(now, requester.clone(), service.clone(), &req);
                 let name = names::ack_name(&node, &requester, &service, &reqid);
                 let _ = ps.publish(name.clone(), trust.seal(name, ack.encode()).as_ref()).await;
             }
@@ -280,10 +310,12 @@ pub async fn serve_provider_async(
                     continue;
                 };
                 let reqid = request_id_of(&pubn.name);
-                let req_payload =
-                    pending_payloads.get(&reqid.to_string()).cloned().unwrap_or_default();
+                let req_payload = pending_payloads
+                    .get(&reqid.to_string())
+                    .map(|(p, _)| p.clone())
+                    .unwrap_or_default();
                 // Consume the token (fail-closed) before running the async responder.
-                if let Ok(coord) = engine.consume_selection(0, &sel) {
+                if let Ok(coord) = engine.consume_selection(now, &sel) {
                     pending_payloads.remove(&reqid.to_string());
                     let out = responder(coord, req_payload).await;
                     let resp = ResponseMessage {

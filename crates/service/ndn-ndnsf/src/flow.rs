@@ -119,6 +119,13 @@ impl ProviderEngine {
     pub fn pending_count(&self) -> usize {
         self.tokens.pending_count()
     }
+
+    /// Drop all tokens older than the TTL as of `now_secs`; returns how many were
+    /// reaped. A serve loop MUST call this periodically with a real monotonic clock,
+    /// or the token table grows unbounded (the TTL is otherwise inert).
+    pub fn cleanup_expired(&mut self, now_secs: u64) -> usize {
+        self.tokens.cleanup_expired(now_secs)
+    }
 }
 
 /// User-side provider selection (Phase 3 decision): given the providers that
@@ -168,6 +175,22 @@ mod tests {
 
     fn name(s: &str) -> Name {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn cleanup_expired_reaps_unselected_tokens() {
+        // SEC-08 regression: a token issued at t=0 under a 10s TTL is reaped by a
+        // later `cleanup_expired` even if its SELECTION never comes — the serve loop
+        // now drives this with a real monotonic clock.
+        let mut provider = ProviderEngine::new(10);
+        let req = make_request("r1", "", Bytes::new());
+        provider.on_request(0, name("/muas/alice"), name("/svc/x"), &req);
+        assert_eq!(provider.pending_count(), 1);
+
+        assert_eq!(provider.cleanup_expired(5), 0); // within TTL — nothing reaped
+        assert_eq!(provider.pending_count(), 1);
+        assert_eq!(provider.cleanup_expired(10), 1); // at TTL — reaped
+        assert_eq!(provider.pending_count(), 0);
     }
 
     #[test]
