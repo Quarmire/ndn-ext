@@ -94,6 +94,18 @@ impl ReloadReport {
 /// Reload `desired` grants into the live `authority`: (re)grant new/changed
 /// principals, revoke principals no longer present. Each change bumps the version
 /// and re-signs (no restart). Idempotent for an unchanged file.
+///
+/// ## Trust boundary (SEC-26)
+///
+/// The config file is a **full-state source of truth**, not a delta: a reload
+/// revokes any active principal absent from the file and (re)grants those present —
+/// so it *will* re-grant a principal that the signed-command channel
+/// ([`crate::command`]) previously revoked, if the file still lists it. Its
+/// authorization is therefore **filesystem write-access** to the file, which MUST be
+/// operator-controlled (not a networked/shared path). Do not drive one authority
+/// from both the file and the command channel — pick a single source of truth, or a
+/// file edit and a command revoke will fight. (A signed-config object validated
+/// against the admin anchor would let the file be delivered untrusted; not built.)
 pub fn reload(authority: &mut PolicyAuthority, desired: &[(Name, String)]) -> ReloadReport {
     let desired_map: HashMap<&Name, &String> = desired.iter().map(|(n, p)| (n, p)).collect();
     let mut report = ReloadReport::default();

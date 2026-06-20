@@ -176,6 +176,13 @@ impl PolicyAuthority {
 
     /// Grant (or re-grant) `principal` the KP-ABE key-`policy`. Takes effect live
     /// and returns the new policy version.
+    ///
+    /// `principal` is an **arbitrary** identity — it need not lie under this
+    /// authority's `scope` (an authority commonly grants identities from elsewhere).
+    /// The grant only attests "*this authority* says `principal` has `policy`"; a
+    /// relying party MUST therefore check that this authority is trust-rooted for the
+    /// `principal`'s namespace before acting on the grant — the signature alone does
+    /// not bind the subject to the authority's scope (red-team SEC-32).
     pub fn grant(&mut self, principal: Name, policy: impl Into<String>) -> u64 {
         self.version += 1;
         let version = self.version;
