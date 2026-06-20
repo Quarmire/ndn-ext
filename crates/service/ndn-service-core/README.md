@@ -64,7 +64,9 @@ Confidential publishing is a one-line change — a `ScopeKey` the gateway handed
 
 ```rust
 let key = ScopeKey::from_bytes(scope_key_bytes);          // delivered out of band
-let mut secure = Publisher::<Reading>::sealed("/sensor/lab-3/secure".parse()?, key.clone());
+// `publisher_id` (here 1) must be unique among leaves sharing the scope key — it is
+// the high 4 bytes of the AEAD nonce (the seq is the low 8), so leaves never collide.
+let mut secure = Publisher::<Reading>::sealed("/sensor/lab-3/secure".parse()?, key.clone(), 1);
 secure.publish(&reading, &mut radio)?;                    // payload is now AEAD ciphertext
 let aad = sealed.name.encode_to_tlv();                    // the leaf bound the name as AAD
 let opened = key.open(&aad, &sealed.payload).unwrap();    // a member gateway reads it
