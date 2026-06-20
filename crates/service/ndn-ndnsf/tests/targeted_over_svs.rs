@@ -47,7 +47,7 @@ async fn targeted_fast_path_over_svs() {
     });
     let provider_ps = SvsPubSub::join(group.clone(), n("/muas/bob"), a_out_tx, a_in_rx, cfg());
     let user_ps = SvsPubSub::join(group.clone(), n("/muas/alice"), b_out_tx, b_in_rx, cfg());
-    let trust = TrustCtx::default();
+    let trust = TrustCtx::insecure();
 
     let handler =
         |_c: &PendingCoordination, _req: &Bytes| -> Bytes { Bytes::from_static(b"pong") };

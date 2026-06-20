@@ -86,12 +86,12 @@ async fn macro_service_over_ndnsf_and_select() {
     let carol_ps = pss.next().unwrap();
     let alice_ps = pss.next().unwrap();
 
-    let bob = NdnsfCarrier::new(bob_ps, name("/muas/bob"), group.clone());
+    let bob = NdnsfCarrier::new(bob_ps, name("/muas/bob"), group.clone()).insecure();
     bob.serve(&svc, greeter("bob")).await.unwrap();
-    let carol = NdnsfCarrier::new(carol_ps, name("/muas/carol"), group.clone());
+    let carol = NdnsfCarrier::new(carol_ps, name("/muas/carol"), group.clone()).insecure();
     carol.serve(&svc, greeter("carol")).await.unwrap();
 
-    let alice = NdnsfCarrier::new(alice_ps, name("/muas/alice"), group.clone()).token("utok");
+    let alice = NdnsfCarrier::new(alice_ps, name("/muas/alice"), group.clone()).insecure().token("utok");
     let client = GreeterClient::new(alice, svc);
 
     // Unary (FirstResponding) — one provider answers.

@@ -65,7 +65,7 @@ async fn secure_four_phase_access_controlled() {
     });
     let provider_ps = SvsPubSub::join(group.clone(), n("/muas/bob"), a_out_tx, a_in_rx, cfg());
     let user_ps = SvsPubSub::join(group.clone(), n("/muas/alice"), b_out_tx, b_in_rx, cfg());
-    let trust = TrustCtx::default();
+    let trust = TrustCtx::insecure();
 
     // The provider seals its echoed response under the service attribute.
     let handler = move |_c: &PendingCoordination, req: &Bytes| -> Bytes {

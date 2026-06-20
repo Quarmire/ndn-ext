@@ -32,9 +32,15 @@ pub fn sign_message(signer: &dyn Signer, name: Name, payload: &[u8]) -> Option<B
 
 /// Per-node trust for the four-phase driver: an optional `signer` (this node
 /// signs every message it publishes) and `validator` (this node verifies every
-/// message it consumes, against the phase's expected sender). The default
-/// (`TrustCtx::default`) is empty — the unsigned fast path, fully backward
-/// compatible: publications go out raw and inbound messages are accepted as-is.
+/// message it consumes, against the phase's expected sender).
+///
+/// **Secure by default (fail closed).** With no validator, inbound messages are
+/// *rejected* — `TrustCtx::default()` accepts nothing, so a carrier/role that
+/// never calls [`signed`](Self::new) or [`insecure`](Self::insecure) serves no
+/// one rather than silently trusting forged, unauthenticated input (red-team
+/// SEC-02). Running unauthenticated is a deliberate, explicit choice via
+/// [`insecure`](Self::insecure) (e.g. a genuinely public, unsigned-broadcast
+/// deployment) — never an accident.
 ///
 /// This is the faithful NSF `MessageValidator` placement: trust is enforced
 /// per-message in the flow (a `/<sender>/NDNSF/<phase>/…` message whose
@@ -46,8 +52,12 @@ pub fn sign_message(signer: &dyn Signer, name: Name, payload: &[u8]) -> Option<B
 pub struct TrustCtx {
     /// Signs this node's outbound four-phase messages. `None` ⇒ publish raw.
     pub signer: Option<Arc<dyn Signer>>,
-    /// Verifies inbound four-phase messages. `None` ⇒ accept without checking.
+    /// Verifies inbound four-phase messages. `None` ⇒ reject (unless
+    /// [`allow_unsigned`](Self::insecure) was explicitly set).
     pub validator: Option<Arc<Validator>>,
+    /// Explicit opt-in to accepting unsigned inbound messages when no validator is
+    /// configured. `false` by default (fail closed); set only via [`insecure`](Self::insecure).
+    pub allow_unsigned: bool,
 }
 
 impl TrustCtx {
@@ -56,7 +66,26 @@ impl TrustCtx {
         Self {
             signer: Some(signer),
             validator: Some(validator),
+            allow_unsigned: false,
         }
+    }
+
+    /// The **explicit** unsigned/unauthenticated posture: publish raw and accept
+    /// inbound without verifying. Use only for a genuinely public, unsigned
+    /// deployment — every participant on the shared medium can then impersonate any
+    /// requester (red-team SEC-02). Prefer [`new`](Self::new).
+    pub fn insecure() -> Self {
+        Self {
+            signer: None,
+            validator: None,
+            allow_unsigned: true,
+        }
+    }
+
+    /// Whether this context will accept unauthenticated inbound messages (no
+    /// validator, unsigned explicitly allowed) — used to warn at serve time.
+    pub fn is_insecure(&self) -> bool {
+        self.validator.is_none() && self.allow_unsigned
     }
 
     /// Wrap `msg` as a signed Data named `name` when a signer is set, returning
@@ -70,12 +99,14 @@ impl TrustCtx {
 
     /// Recover the inner message bytes from an inbound publication `payload`.
     /// With a validator set, `payload` must be a signed Data that validates and
-    /// whose signer is under `expected_sender` (else `None` — fail closed).
-    /// Without a validator, `payload` is returned as-is.
+    /// whose signer is under `expected_sender` (else `None` — fail closed). With no
+    /// validator, the message is **rejected** (`None`) unless [`insecure`](Self::insecure)
+    /// was chosen, in which case `payload` is returned as-is.
     pub async fn unseal(&self, payload: Bytes, expected_sender: &Name) -> Option<Bytes> {
         match &self.validator {
             Some(v) => verify_message(v, payload, expected_sender).await,
-            None => Some(payload),
+            None if self.allow_unsigned => Some(payload),
+            None => None, // fail closed: no validator and not explicitly insecure
         }
     }
 }

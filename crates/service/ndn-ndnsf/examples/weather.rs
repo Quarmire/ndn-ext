@@ -94,13 +94,13 @@ async fn ndnsf() {
 
     // `serve` spawns the four-phase loop and returns; the station carriers must
     // stay alive for their loops to run (held in this scope below).
-    let a = NdnsfCarrier::new(pss.next().unwrap(), n("/met/stationA"), group.clone());
+    let a = NdnsfCarrier::new(pss.next().unwrap(), n("/met/stationA"), group.clone()).insecure();
     a.serve(&svc, station("station-A", 0)).await.unwrap();
-    let b = NdnsfCarrier::new(pss.next().unwrap(), n("/met/stationB"), group.clone());
+    let b = NdnsfCarrier::new(pss.next().unwrap(), n("/met/stationB"), group.clone()).insecure();
     b.serve(&svc, station("station-B", 2)).await.unwrap();
 
     // The app holds a user capability token and speaks the same generated client.
-    let app = NdnsfCarrier::new(pss.next().unwrap(), n("/met/app"), group).token("forecast-cap");
+    let app = NdnsfCarrier::new(pss.next().unwrap(), n("/met/app"), group).insecure().token("forecast-cap");
     let client = WeatherClient::new(app, svc);
 
     // A normal call: one station is selected (first to respond) and answers.

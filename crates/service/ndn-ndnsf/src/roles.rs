@@ -90,10 +90,18 @@ impl ServiceProvider {
     }
 
     /// Sign outbound messages with `signer` and verify inbound ones against
-    /// `validator` (the trust half of NSF-A3). Without this, the provider runs
-    /// the unsigned fast path.
+    /// `validator` (the trust half of NSF-A3). Secure by default: without this (or
+    /// an explicit [`insecure`](Self::insecure)) the provider rejects inbound
+    /// messages rather than trusting them unverified (red-team SEC-02).
     pub fn signed(mut self, signer: Arc<dyn Signer>, validator: Arc<Validator>) -> Self {
         self.trust = TrustCtx::new(signer, validator);
+        self
+    }
+
+    /// **Explicitly** run unauthenticated (a public, unsigned deployment) — any
+    /// participant can then impersonate any requester. Prefer [`signed`](Self::signed).
+    pub fn insecure(mut self) -> Self {
+        self.trust = TrustCtx::insecure();
         self
     }
 
@@ -162,9 +170,17 @@ impl ServiceUser {
     }
 
     /// Sign outbound messages with `signer` and verify inbound ones against
-    /// `validator` (the trust half of NSF-A3).
+    /// `validator` (the trust half of NSF-A3). Secure by default: without this (or
+    /// an explicit [`insecure`](Self::insecure)) inbound messages are rejected.
     pub fn signed(mut self, signer: Arc<dyn Signer>, validator: Arc<Validator>) -> Self {
         self.trust = TrustCtx::new(signer, validator);
+        self
+    }
+
+    /// **Explicitly** run unauthenticated (a public, unsigned deployment) — any
+    /// participant can then impersonate any requester. Prefer [`signed`](Self::signed).
+    pub fn insecure(mut self) -> Self {
+        self.trust = TrustCtx::insecure();
         self
     }
 
@@ -312,9 +328,18 @@ impl ServiceNode {
         self
     }
 
-    /// Sign/verify all minted roles' messages (NSF-A3 trust half).
+    /// Sign/verify all minted roles' messages (NSF-A3 trust half). Secure by
+    /// default: without this (or [`insecure`](Self::insecure)) minted roles reject
+    /// inbound messages (red-team SEC-02).
     pub fn signed(mut self, signer: Arc<dyn Signer>, validator: Arc<Validator>) -> Self {
         self.trust = TrustCtx::new(signer, validator);
+        self
+    }
+
+    /// **Explicitly** run all minted roles unauthenticated (a public, unsigned
+    /// deployment). Prefer [`signed`](Self::signed).
+    pub fn insecure(mut self) -> Self {
+        self.trust = TrustCtx::insecure();
         self
     }
 

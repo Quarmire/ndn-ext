@@ -59,8 +59,13 @@ pub struct NdnsfCarrier {
 }
 
 impl NdnsfCarrier {
-    /// A carrier for `node` on sync `group`, owning `ps`. Unsigned, empty token,
-    /// default TTL / ACK window until configured.
+    /// A carrier for `node` on sync `group`, owning `ps`. Empty token, default TTL
+    /// / ACK window until configured.
+    ///
+    /// **Secure by default:** until [`signed`](Self::signed) is called the carrier
+    /// has no validator and *rejects* inbound four-phase messages (fail closed). To
+    /// run an explicitly unauthenticated, public deployment, call
+    /// [`insecure`](Self::insecure) (red-team SEC-02).
     pub fn new(ps: SvsPubSub, node: Name, group: Name) -> Self {
         Self {
             ps: Arc::new(ps),
@@ -96,6 +101,15 @@ impl NdnsfCarrier {
     /// Sign outbound messages and verify inbound ones (NSF-A3 trust half).
     pub fn signed(mut self, signer: Arc<dyn Signer>, validator: Arc<Validator>) -> Self {
         self.trust = TrustCtx::new(signer, validator);
+        self
+    }
+
+    /// **Explicitly** run unauthenticated: publish raw and accept inbound without
+    /// verifying. Only for a genuinely public, unsigned deployment — any
+    /// participant on the shared medium can then impersonate any requester
+    /// (red-team SEC-02). Prefer [`signed`](Self::signed).
+    pub fn insecure(mut self) -> Self {
+        self.trust = TrustCtx::insecure();
         self
     }
 

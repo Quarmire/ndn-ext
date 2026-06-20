@@ -169,10 +169,10 @@ async fn echo_round_trips_over_ndnsf_carrier() {
     let bob_ps = pss.next().unwrap();
     let alice_ps = pss.next().unwrap();
 
-    let bob = NdnsfCarrier::new(bob_ps, name("/muas/bob"), group.clone());
+    let bob = NdnsfCarrier::new(bob_ps, name("/muas/bob"), group.clone()).insecure();
     bob.serve(&svc, dispatch_for("bob")).await.unwrap();
 
-    let alice = NdnsfCarrier::new(alice_ps, name("/muas/alice"), group.clone()).token("utok");
+    let alice = NdnsfCarrier::new(alice_ps, name("/muas/alice"), group.clone()).insecure().token("utok");
     let client = EchoClient { carrier: alice, svc: svc.clone() };
 
     let reply = tokio::time::timeout(Duration::from_secs(10), client.echo("ping".into()))
@@ -193,12 +193,12 @@ async fn invoke_select_all_gathers_every_provider() {
     let carol_ps = pss.next().unwrap();
     let alice_ps = pss.next().unwrap();
 
-    let bob = NdnsfCarrier::new(bob_ps, name("/muas/bob"), group.clone());
+    let bob = NdnsfCarrier::new(bob_ps, name("/muas/bob"), group.clone()).insecure();
     bob.serve(&svc, dispatch_for("bob")).await.unwrap();
-    let carol = NdnsfCarrier::new(carol_ps, name("/muas/carol"), group.clone());
+    let carol = NdnsfCarrier::new(carol_ps, name("/muas/carol"), group.clone()).insecure();
     carol.serve(&svc, dispatch_for("carol")).await.unwrap();
 
-    let alice = NdnsfCarrier::new(alice_ps, name("/muas/alice"), group.clone()).token("utok");
+    let alice = NdnsfCarrier::new(alice_ps, name("/muas/alice"), group.clone()).insecure().token("utok");
     let client = EchoClient { carrier: alice, svc };
 
     let resps = tokio::time::timeout(

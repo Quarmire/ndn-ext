@@ -54,7 +54,7 @@ async fn four_phase_over_svs_round_trip() {
 
     let provider_ps = SvsPubSub::join(group.clone(), n("/muas/bob"), a_out_tx, a_in_rx, cfg());
     let user_ps = SvsPubSub::join(group.clone(), n("/muas/alice"), b_out_tx, b_in_rx, cfg());
-    let trust = TrustCtx::default();
+    let trust = TrustCtx::insecure();
 
     let handler = |_coord: &PendingCoordination, req: &Bytes| -> Bytes {
         assert_eq!(req.as_ref(), b"ping");
