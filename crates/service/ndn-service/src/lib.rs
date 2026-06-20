@@ -242,3 +242,62 @@ pub async fn verify_grant(validator: &Validator, wire: Bytes) -> Option<Grant> {
         _ => None,
     }
 }
+
+/// The per-principal key a [`GrantCache`] tracks: the grant name without its
+/// trailing `v=<version>` component (so all versions of one principal's grant
+/// share a key). `None` for a name too short to be a grant name.
+fn grant_principal_key(name: &Name) -> Option<Name> {
+    let comps = name.components();
+    if comps.len() < 2 {
+        return None;
+    }
+    Some(Name::from_components(comps[..comps.len() - 1].iter().cloned()))
+}
+
+/// A stateful, **anti-rollback** verifier over [`verify_grant`]: it remembers the
+/// highest grant version it has accepted per principal and rejects any signed grant
+/// whose version is strictly older (red-team SEC-10).
+///
+/// Bare `verify_grant` returns whatever validly-signed version it is handed, so a
+/// remote consumer fetching "a principal's grant" could be served a **cached
+/// pre-revocation** version by an on-path cache and act on a stale `revoked: false`.
+/// A consumer that makes allow decisions on *fetched* grants MUST route them through
+/// a `GrantCache` (the in-process authority path, `issue_decryption_key`, is already
+/// safe — it reads live state). ABE keys already issued are separately
+/// non-revocable; this guards the *policy object* against rollback.
+#[derive(Default)]
+pub struct GrantCache {
+    seen: std::collections::HashMap<Name, u64>,
+}
+
+impl GrantCache {
+    /// An empty cache.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Verify `wire` against `validator` and accept it only if its version is not
+    /// older than the newest already accepted for its principal. Returns the
+    /// verified [`Grant`], or `None` if invalid, malformed, or a stale rollback.
+    pub async fn accept(&mut self, validator: &Validator, wire: Bytes) -> Option<Grant> {
+        let data = Data::decode(wire).ok()?;
+        let key = grant_principal_key(&data.name)?;
+        let grant = match validator.validate(&data).await {
+            ValidationResult::Valid(safe) => Grant::decode(safe.data().content()?).ok()?,
+            _ => return None,
+        };
+        if let Some(&last) = self.seen.get(&key)
+            && grant.version < last
+        {
+            return None; // rollback / replay of an older signed grant
+        }
+        self.seen.insert(key, grant.version);
+        Some(grant)
+    }
+
+    /// The highest grant version accepted for `principal` under `scope`, if any.
+    pub fn latest_version(&self, scope: &Name, principal: &Name) -> Option<u64> {
+        let key = scope.clone().append("policy").append(principal.to_string().as_bytes());
+        self.seen.get(&key).copied()
+    }
+}

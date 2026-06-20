@@ -3,7 +3,7 @@
 
 use ndn_packet::Name;
 use ndn_security::KeyChain;
-use ndn_service::{PolicyAuthority, verify_grant};
+use ndn_service::{GrantCache, PolicyAuthority, verify_grant};
 
 fn n(s: &str) -> Name {
     s.parse().unwrap()
@@ -63,4 +63,32 @@ async fn grant_and_revoke_are_dynamic_without_restart() {
 
     // No grant for an unknown principal.
     assert!(authority.signed_grant(&n("/muas/ghost")).is_none());
+}
+
+#[tokio::test]
+async fn grant_cache_rejects_rollback() {
+    // SEC-10: an on-path cache serving an OLD validly-signed grant must not
+    // resurrect a revoked permission — GrantCache enforces monotonic versions.
+    let kc = KeyChain::ephemeral("/muas/group").unwrap();
+    let validator = kc.validator();
+    let alice = n("/muas/alice");
+    let mut authority = PolicyAuthority::new(n("/muas/group"), kc.signer().unwrap());
+
+    // The pre-revocation grant (not revoked), captured by an attacker/cache.
+    authority.grant(alice.clone(), "service:echo");
+    let stale = authority.signed_grant(&alice).unwrap();
+
+    // Then alice is revoked → a newer signed object is the truth.
+    authority.revoke(&alice);
+    let current = authority.signed_grant(&alice).unwrap();
+
+    let mut cache = GrantCache::new();
+    let g = cache.accept(&validator, current).await.expect("current grant verifies");
+    assert!(g.revoked, "the consumer first sees the revocation");
+
+    // The attacker replays the stale (older-version) but validly-signed grant.
+    assert!(
+        cache.accept(&validator, stale).await.is_none(),
+        "a rolled-back grant must be rejected even though its signature is valid"
+    );
 }
