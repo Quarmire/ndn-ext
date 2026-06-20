@@ -66,8 +66,14 @@ Confidential publishing is a one-line change — a `ScopeKey` the gateway handed
 let key = ScopeKey::from_bytes(scope_key_bytes);          // delivered out of band
 let mut secure = Publisher::<Reading>::sealed("/sensor/lab-3/secure".parse()?, key.clone());
 secure.publish(&reading, &mut radio)?;                    // payload is now AEAD ciphertext
-let opened = key.open(0, &sealed.payload).unwrap();       // a member gateway reads it
+let aad = sealed.name.encode_to_tlv();                    // the leaf bound the name as AAD
+let opened = key.open(&aad, &sealed.payload).unwrap();    // a member gateway reads it
 ```
+
+The sealed payload is byte-aligned with `ndn-security`'s `ContentKey`
+(`nonce ‖ tag ‖ ciphertext`), so a capable node opens a leaf's publication directly
+with `Sealed::from_bytes` + `ContentKey::open` — proven bidirectionally in
+[`ndn-service/tests/leaf_seal_interop.rs`](../ndn-service/tests/leaf_seal_interop.rs).
 
 Output:
 
@@ -77,7 +83,7 @@ Output:
   gateway decodes the feed:
     /sensor/lab-3/temp/seq=0 -> 21.3 °C, 41% RH
 == leaf publishes a CONFIDENTIAL feed (symmetric scope key) ==
-    on air: /sensor/lab-3/secure/seq=0  (32 payload bytes)
+    on air: /sensor/lab-3/secure/seq=0  (44 payload bytes)
   member gateway (has key) reads: 22.1 °C, 39% RH
   outsider (wrong key) is denied — AEAD authentication fails
 ```
@@ -92,8 +98,10 @@ Output:
   a `critical-section` impl the firmware crate (esp-hal) supplies, standard for
   every `no_std` crate on that target. Our code, `ndn-packet`, and `ndn-crypto-core`
   all compile for it; `bytes` is the gate.
-- The `ScopeKey` seal envelope is minimal today; byte-aligning it with
-  `ndn-security`'s `ContentKey` (and binding the publication name as AAD) is a
-  tracked hardening step.
+- The `ScopeKey` seal envelope is byte-aligned with `ndn-security`'s `ContentKey`
+  (`nonce ‖ tag ‖ ciphertext`, name bound as AAD), so leaf seals and native opens
+  interoperate both directions (`leaf_seal_interop.rs`). The only leaf-specific
+  choice is nonce *derivation* (sequence, not RNG), which the wire format is
+  agnostic to.
 
 See `docs/specs/service-layer.md` §12 (the seam) and §13 (the embedded leaf).
