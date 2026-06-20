@@ -209,7 +209,7 @@ pub async fn serve_provider<H>(
                     continue;
                 }
                 // Trust gate: a REQUEST must be signed by its claimed requester.
-                let Some(payload) = trust.unseal(pubn.payload, &requester).await else {
+                let Some(payload) = trust.unseal(pubn.payload, &requester, &pubn.name).await else {
                     continue;
                 };
                 let Ok(req) = RequestMessage::decode(payload) else {
@@ -272,7 +272,7 @@ pub async fn serve_provider<H>(
                 }
                 let requester = before_ndnsf(&pubn.name);
                 // Trust gate: a SELECTION must be signed by its claimed requester.
-                let Some(payload) = trust.unseal(pubn.payload, &requester).await else {
+                let Some(payload) = trust.unseal(pubn.payload, &requester, &pubn.name).await else {
                     continue;
                 };
                 let Ok(sel) = SelectionMessage::decode(payload) else {
@@ -343,7 +343,7 @@ pub async fn serve_provider_async(
                 if !limiter.admit(&requester) {
                     continue;
                 }
-                let Some(payload) = trust.unseal(pubn.payload, &requester).await else {
+                let Some(payload) = trust.unseal(pubn.payload, &requester, &pubn.name).await else {
                     continue;
                 };
                 let Ok(req) = RequestMessage::decode(payload) else {
@@ -367,7 +367,7 @@ pub async fn serve_provider_async(
                     continue;
                 }
                 let requester = before_ndnsf(&pubn.name);
-                let Some(payload) = trust.unseal(pubn.payload, &requester).await else {
+                let Some(payload) = trust.unseal(pubn.payload, &requester, &pubn.name).await else {
                     continue;
                 };
                 let Ok(sel) = SelectionMessage::decode(payload) else {
@@ -447,7 +447,7 @@ pub async fn call(
     let ack = loop {
         let pubn = rx.recv().await?;
         if phase_of(&pubn.name) == Some(Phase::Ack) && request_id_of(&pubn.name) == request_id {
-            let payload = trust.unseal(pubn.payload, &provider).await?;
+            let payload = trust.unseal(pubn.payload, &provider, &pubn.name).await?;
             break AckMessage::decode(payload).ok()?;
         }
     };
@@ -463,7 +463,7 @@ pub async fn call(
     loop {
         let pubn = rx.recv().await?;
         if phase_of(&pubn.name) == Some(Phase::Response) && request_id_of(&pubn.name) == request_id {
-            let payload = trust.unseal(pubn.payload, &provider).await?;
+            let payload = trust.unseal(pubn.payload, &provider, &pubn.name).await?;
             return ResponseMessage::decode(payload).ok().map(|r| r.payload);
         }
     }
@@ -524,7 +524,7 @@ pub async fn select_and_call(
                 let provider = before_ndnsf(&pubn.name);
                 if phase_of(&pubn.name) == Some(Phase::Ack)
                     && request_id_of(&pubn.name) == request_id
-                    && let Some(payload) = trust.unseal(pubn.payload, &provider).await
+                    && let Some(payload) = trust.unseal(pubn.payload, &provider, &pubn.name).await
                     && let Ok(ack) = AckMessage::decode(payload)
                 {
                     acks.push((provider, ack));
@@ -560,7 +560,7 @@ pub async fn select_and_call(
                     let provider = before_ndnsf(&pubn.name);
                     if want.contains(&provider)
                         && !responses.iter().any(|(p, _)| *p == provider)
-                        && let Some(payload) = trust.unseal(pubn.payload, &provider).await
+                        && let Some(payload) = trust.unseal(pubn.payload, &provider, &pubn.name).await
                         && let Ok(resp) = ResponseMessage::decode(payload)
                     {
                         responses.push((provider, resp.payload));
@@ -608,7 +608,7 @@ pub async fn bootstrap_targeted(
             return Vec::new();
         };
         if phase_of(&pubn.name) == Some(Phase::Response) && request_id_of(&pubn.name) == request_id {
-            let Some(payload) = trust.unseal(pubn.payload, &provider).await else {
+            let Some(payload) = trust.unseal(pubn.payload, &provider, &pubn.name).await else {
                 return Vec::new();
             };
             return match ResponseMessage::decode(payload) {
@@ -656,7 +656,7 @@ pub async fn call_targeted(
     loop {
         let pubn = rx.recv().await?;
         if phase_of(&pubn.name) == Some(Phase::Response) && request_id_of(&pubn.name) == request_id {
-            let payload = trust.unseal(pubn.payload, &provider).await?;
+            let payload = trust.unseal(pubn.payload, &provider, &pubn.name).await?;
             return ResponseMessage::decode(payload).ok().map(|r| r.payload);
         }
     }

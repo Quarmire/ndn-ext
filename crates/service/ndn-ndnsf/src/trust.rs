@@ -98,13 +98,20 @@ impl TrustCtx {
     }
 
     /// Recover the inner message bytes from an inbound publication `payload`.
-    /// With a validator set, `payload` must be a signed Data that validates and
-    /// whose signer is under `expected_sender` (else `None` — fail closed). With no
-    /// validator, the message is **rejected** (`None`) unless [`insecure`](Self::insecure)
-    /// was chosen, in which case `payload` is returned as-is.
-    pub async fn unseal(&self, payload: Bytes, expected_sender: &Name) -> Option<Bytes> {
+    /// With a validator set, `payload` must be a signed Data that validates, whose
+    /// signer is under `expected_sender`, **and whose own name equals
+    /// `expected_name`** (the outer publication name the flow routes on) — else
+    /// `None` (fail closed). With no validator, the message is rejected unless
+    /// [`insecure`](Self::insecure) was chosen, in which case `payload` is returned
+    /// as-is.
+    pub async fn unseal(
+        &self,
+        payload: Bytes,
+        expected_sender: &Name,
+        expected_name: &Name,
+    ) -> Option<Bytes> {
         match &self.validator {
-            Some(v) => verify_message(v, payload, expected_sender).await,
+            Some(v) => verify_message(v, payload, expected_sender, expected_name).await,
             None if self.allow_unsigned => Some(payload),
             None => None, // fail closed: no validator and not explicitly insecure
         }
@@ -152,14 +159,23 @@ pub fn ingest_validator(validator: Arc<Validator>) -> IngestValidator {
 }
 
 /// Validate a signed-message blob before acting on it. Returns the inner payload
-/// only if (a) the signature validates against `validator`'s anchors and (b) the
-/// signer identity is under `expected_sender`. `None` (fail closed) otherwise.
+/// only if (a) the signature validates against `validator`'s anchors, (b) the
+/// signer identity is under `expected_sender`, and (c) the signed Data's own name
+/// equals `expected_name`. `None` (fail closed) otherwise.
 pub async fn verify_message(
     validator: &Validator,
     blob: Bytes,
     expected_sender: &Name,
+    expected_name: &Name,
 ) -> Option<Bytes> {
     let data = Data::decode(blob).ok()?;
+    // Bind the message to its protocol coordinate: the signed Data's own name must
+    // equal the publication name the four-phase logic routes on. Without this, a
+    // validly-signed message could be replayed under a different outer name — a
+    // different phase, request-id, or service (red-team SEC-04).
+    if &*data.name != expected_name {
+        return None;
+    }
     // The signer (KeyLocator) must be under the expected sender identity — a
     // provider cannot answer "as" another, even with a valid key of its own.
     let signer = data.sig_info()?.key_locator_name()?;
@@ -186,7 +202,13 @@ mod tests {
         let kc = KeyChain::ephemeral("/muas/alice").unwrap();
         let blob = sign_message(&*kc.signer().unwrap(), n("/muas/alice/NDNSF/REQUEST/x/r1"), b"hi")
             .unwrap();
-        let got = verify_message(&kc.validator(), blob, &n("/muas/alice")).await;
+        let got = verify_message(
+            &kc.validator(),
+            blob,
+            &n("/muas/alice"),
+            &n("/muas/alice/NDNSF/REQUEST/x/r1"),
+        )
+        .await;
         assert_eq!(got.as_deref(), Some(b"hi".as_slice()));
     }
 
@@ -196,7 +218,16 @@ mod tests {
         let blob =
             sign_message(&*kc.signer().unwrap(), n("/muas/alice/NDNSF/REQUEST/x/r1"), b"hi").unwrap();
         // The message claims to be from /muas/bob, but alice signed it.
-        assert!(verify_message(&kc.validator(), blob, &n("/muas/bob")).await.is_none());
+        assert!(
+            verify_message(
+                &kc.validator(),
+                blob,
+                &n("/muas/bob"),
+                &n("/muas/alice/NDNSF/REQUEST/x/r1"),
+            )
+            .await
+            .is_none()
+        );
     }
 
     #[tokio::test]
@@ -210,7 +241,16 @@ mod tests {
         )
         .unwrap();
         // alice's validator does not trust mallory's anchor.
-        assert!(verify_message(&alice.validator(), blob, &n("/muas/mallory")).await.is_none());
+        assert!(
+            verify_message(
+                &alice.validator(),
+                blob,
+                &n("/muas/mallory"),
+                &n("/muas/mallory/NDNSF/ACK/x/r1"),
+            )
+            .await
+            .is_none()
+        );
     }
 
     #[tokio::test]
@@ -222,9 +262,32 @@ mod tests {
         let last = bad.len() - 1;
         bad[last] ^= 0xff;
         assert!(
-            verify_message(&kc.validator(), Bytes::from(bad), &n("/muas/alice"))
-                .await
-                .is_none()
+            verify_message(
+                &kc.validator(),
+                Bytes::from(bad),
+                &n("/muas/alice"),
+                &n("/muas/alice/NDNSF/REQUEST/x/r1"),
+            )
+            .await
+            .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn replayed_under_a_different_coordinate_rejected() {
+        // SEC-04: a message alice validly signed for one coordinate must not verify
+        // when the flow presents it under a different outer publication name (a
+        // different request-id / phase / service).
+        let kc = KeyChain::ephemeral("/muas/alice").unwrap();
+        let blob =
+            sign_message(&*kc.signer().unwrap(), n("/muas/alice/NDNSF/REQUEST/x/r1"), b"hi").unwrap();
+        let got = verify_message(
+            &kc.validator(),
+            blob,
+            &n("/muas/alice"),
+            &n("/muas/alice/NDNSF/REQUEST/x/r2"), // routed as r2 — must be rejected
+        )
+        .await;
+        assert!(got.is_none(), "a message must not verify under a coordinate it wasn't signed for");
     }
 }
