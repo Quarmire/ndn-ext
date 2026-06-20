@@ -71,6 +71,93 @@ group); the v2 example adds what those can't express — **discovering** the ser
 a **feed** (publish/subscribe, not request/response), and a **confidential
 channel** only members holding the scope key can read.
 
+### Walkthrough: `examples/weather.rs`
+
+One service definition — a *parameterized request*, a *structured response*:
+
+```rust
+#[derive(Frame, Clone)]                 // structured "response with data"
+struct Forecast { city: String, day: u32, high_c: i32, low_c: i32, summary: String }
+
+#[ndn_service]
+trait Weather {
+    async fn forecast(&self, city: String, day: u32) -> Forecast;
+}
+
+struct Station { name: String, bias_c: i32 }
+impl Weather for Station {              // a plain async impl — no macros
+    async fn forecast(&self, city: String, day: u32) -> Forecast { /* … */ }
+}
+```
+
+**1. Tier-1 discovery** — the client is given only the *service* name; it
+discovers the providers and selects among them:
+
+```rust
+let registry = Arc::new(RpcRegistry::new());
+let dir = Arc::new(MemoryDirectory::new());
+let svc = ServiceId::new("/weather".parse()?);
+
+// Two stations advertise + serve over a shared Tier-0 carrier.
+DiscoveryCarrier::new(dir.clone(), RpcCarrier::with_registry(registry.clone()), "/met/s1".parse()?)
+    .serve(&svc, station("station-1", 0)).await?;
+DiscoveryCarrier::new(dir.clone(), RpcCarrier::with_registry(registry.clone()), "/met/s2".parse()?)
+    .serve(&svc, station("station-2", 2)).await?;
+
+// The client discovers them; `forecast_select(All)` gathers every station.
+let app = DiscoveryCarrier::new(dir, RpcCarrier::with_registry(registry), "/met/app".parse()?);
+let client = WeatherClient::new(app, svc);
+let one = client.forecast("Berlin".into(), 1).await?;
+let all = client.forecast_select("Berlin".into(), 1, Strategy::All).await?;
+```
+
+**2. Tier-2 feed** — weather as a *stream*, not a call: a sensor publishes, a
+dashboard subscribes:
+
+```rust
+let sensor: Topic<Observation> = Topic::new(sensor_ps, "/met/observations".parse()?);
+let dashboard: Topic<Observation> = Topic::new(dash_ps, "/met/observations".parse()?);
+let mut feed = dashboard.subscribe().await;
+
+sensor.publish(&Observation { city: "Berlin".into(), temp_c: 20 }).await?;
+let obs = feed.recv().await;             // the dashboard receives the stream
+```
+
+**3. Tier-2 confidential channel** — a premium topic gated by a role-scoped key;
+only members holding the scope key can read it:
+
+```rust
+let all_keys = ScopeKeyring::new().with("premium", ContentKey::from_bytes([42u8; 32]));
+let policy = RoleScopePolicy::new().grant(Role::Premium, "premium");
+let member  = ScopedSession::new(session.clone(), member_ps, policy.keyring_for(&Role::Premium, &all_keys));
+let outsider = ScopedSession::new(session, outsider_ps, policy.keyring_for(&Role::Free, &all_keys));
+
+assert!(outsider.topic::<Forecast>("premium", "forecasts").is_none()); // no key ⇒ no access
+let mut feed = member.topic::<Forecast>("premium", "forecasts").unwrap().subscribe().await;
+// a forecaster member publishes; only the member's feed can open it
+```
+
+Output:
+
+```
+== v2 Tier-1 (DiscoveryCarrier): discover the service, then call ==
+  discovered + forecast(Berlin, 1) -> high 28C  [station-1: partly cloudy]
+  forecast_select(All) across discovered stations:
+    /met/s1/weather -> high 28C  [station-1: partly cloudy]
+    /met/s2/weather -> high 30C  [station-2: partly cloudy]
+
+== v2 Tier-2 (Topic<T>): a live observation FEED (not a call) ==
+  dashboard receives the stream:
+    Berlin = 19C / 20C / 21C
+
+== v2 Tier-2 (ScopedSession + role-scoped keys): a PREMIUM channel ==
+  outsider can access the premium channel: false
+  member reads the premium forecast: high 31C  [premium model: clear skies]
+```
+
+(`Carrier`, `ServiceId`, and `Strategy` come from [`ndn-service-core`](../ndn-service-core);
+the rest from this crate. See `examples/weather.rs` for the full, runnable source.)
+
 ## Features
 
 `discovery` (real `ServiceDiscoveryProtocol` directory), `issuance` (KP-ABE
