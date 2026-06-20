@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use ndn_packet::{Name, NameComponent};
+use ndn_ratelimit::{BucketOutcome, BucketSpec, TokenBucket};
 use ndn_sync::SvsPubSub;
 use tracing::instrument;
 
@@ -39,6 +40,52 @@ const TARGETED_BATCH: usize = 4;
 /// never arrive, so without a ceiling (plus the TTL reap) the map grows unbounded
 /// (red-team SEC-07). At the cap the provider sheds new requests.
 const MAX_PENDING_PAYLOADS: usize = 1024;
+
+/// Per-requester admission control (red-team SEC-25): requests/sec and burst per
+/// requester identity, and a cap on how many identities to track.
+const RL_REQUESTS_PER_SEC: u32 = 50;
+const RL_BURST: u32 = 100;
+const RL_MAX_IDENTITIES: usize = 4096;
+
+/// One token bucket per requester identity, in a bounded map. Bounds a single
+/// (authenticated) requester's request rate on the four-phase REQUEST path. Under
+/// the explicit `.insecure()` posture identities are spoofable, so this is
+/// best-effort there — but the map cap still bounds memory, and the check runs
+/// *before* the signature verify, so it also caps verify amplification.
+struct RequesterLimiter {
+    buckets: HashMap<Name, TokenBucket>,
+}
+
+impl RequesterLimiter {
+    fn new() -> Self {
+        Self {
+            buckets: HashMap::new(),
+        }
+    }
+
+    /// Admit one request from `who`; `false` ⇒ over the per-requester rate (drop).
+    fn admit(&mut self, who: &Name) -> bool {
+        if !self.buckets.contains_key(who) {
+            if self.buckets.len() >= RL_MAX_IDENTITIES {
+                // Evict an arbitrary entry to admit the newcomer — bounds memory
+                // without letting an identity flood lock everyone else out.
+                if let Some(victim) = self.buckets.keys().next().cloned() {
+                    self.buckets.remove(&victim);
+                }
+            }
+            match TokenBucket::from_spec(&BucketSpec::pps(RL_REQUESTS_PER_SEC, RL_BURST)) {
+                Ok(bucket) => {
+                    self.buckets.insert(who.clone(), bucket);
+                }
+                Err(_) => return true, // misconfigured limiter must not block traffic
+            }
+        }
+        matches!(
+            self.buckets.get(who).map(|b| b.try_consume(1, 0)),
+            Some(BucketOutcome::Permit)
+        )
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
@@ -131,6 +178,7 @@ pub async fn serve_provider<H>(
     // The provider holds each pending request's payload until its SELECTION, with
     // the insertion time so stale entries (whose SELECTION never comes) are reaped.
     let mut pending_payloads: HashMap<String, (Bytes, u64)> = HashMap::new();
+    let mut limiter = RequesterLimiter::new();
     let mut rx = ps.subscribe(group_prefix).await;
     let start = Instant::now();
 
@@ -149,6 +197,12 @@ pub async fn serve_provider<H>(
                     continue;
                 }
                 let requester = before_ndnsf(&pubn.name);
+                // Admission control: cap requests per requester *before* the verify,
+                // so a flood neither monopolizes the provider nor amplifies signature
+                // work (red-team SEC-25).
+                if !limiter.admit(&requester) {
+                    continue;
+                }
                 // Trust gate: a REQUEST must be signed by its claimed requester.
                 let Some(payload) = trust.unseal(pubn.payload, &requester).await else {
                     continue;
@@ -264,6 +318,7 @@ pub async fn serve_provider_async(
 ) {
     let mut engine = ProviderEngine::new(ttl_secs);
     let mut pending_payloads: HashMap<String, (Bytes, u64)> = HashMap::new();
+    let mut limiter = RequesterLimiter::new();
     let mut rx = ps.subscribe(group_prefix).await;
     let start = Instant::now();
 
@@ -279,6 +334,10 @@ pub async fn serve_provider_async(
                     continue;
                 }
                 let requester = before_ndnsf(&pubn.name);
+                // Admission control before the verify (red-team SEC-25).
+                if !limiter.admit(&requester) {
+                    continue;
+                }
                 let Some(payload) = trust.unseal(pubn.payload, &requester).await else {
                     continue;
                 };
@@ -575,5 +634,38 @@ pub async fn call_targeted(
             let payload = trust.unseal(pubn.payload, &provider).await?;
             return ResponseMessage::decode(payload).ok().map(|r| r.payload);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn n(s: &str) -> Name {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn rate_limiter_caps_a_flood_and_isolates_identities() {
+        // SEC-25: a tight flood from one requester is rate-limited, while a distinct
+        // requester keeps its own (undrained) bucket.
+        let mut limiter = RequesterLimiter::new();
+        let alice = n("/muas/alice");
+        let permitted = (0..1000).filter(|_| limiter.admit(&alice)).count();
+        assert!(permitted > 0, "the burst allowance must let an initial run through");
+        assert!(permitted < 1000, "a tight flood from one requester must be rate-limited");
+
+        let bob = n("/muas/bob");
+        assert!(limiter.admit(&bob), "a distinct requester must not be starved by another's flood");
+    }
+
+    #[test]
+    fn rate_limiter_bounds_tracked_identities() {
+        // The identity map is memory-bounded even under identity churn.
+        let mut limiter = RequesterLimiter::new();
+        for i in 0..(RL_MAX_IDENTITIES + 500) {
+            limiter.admit(&n(&format!("/muas/u{i}")));
+        }
+        assert!(limiter.buckets.len() <= RL_MAX_IDENTITIES);
     }
 }

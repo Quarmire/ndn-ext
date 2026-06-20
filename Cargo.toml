@@ -139,6 +139,7 @@ ndn-service   = { path = "crates/service/ndn-service" }
 ndn-rpc       = { path = "crates/service/ndn-rpc" }
 ndn-nacabe    = { path = "crates/service/ndn-nacabe" }
 ndn-ndnsf     = { path = "crates/service/ndn-ndnsf" }
+ndn-ratelimit = { path = "crates/ratelimit/ndn-ratelimit" }
 ndn-radio-cognition = { path = "crates/faces/ndn-radio-cognition" }
 
 # Core async runtime — individual crates enable only the features they need
