@@ -100,16 +100,22 @@ fn main() {
         .publish(&Reading { decicelsius: 221, humidity_pct: 39 }, &mut secure_radio)
         .unwrap();
 
-    // On air the payload is opaque AEAD ciphertext — anyone without the key sees bytes.
+    // On air the payload is the `ContentKey` wire layout: nonce ‖ tag ‖ ciphertext.
+    // The ciphertext is opaque without the key.
     let sealed = &secure_radio.on_air[0];
+    let ciphertext = &sealed.payload[28..]; // skip nonce(12) + tag(16)
     println!(
-        "  raw on-air payload is ciphertext (undecodable without the key): {:02x?}…",
-        &sealed.payload[..sealed.payload.len().min(8)]
+        "  on-air payload = nonce ‖ tag ‖ ciphertext ({} B); ciphertext head: {:02x?}…",
+        sealed.payload.len(),
+        &ciphertext[..ciphertext.len().min(8)]
     );
 
-    // A member gateway holding the scope key opens it (seq 0 = the AEAD nonce), then
-    // decodes the same `Frame`.
-    let opened = scope_key.open(0, &sealed.payload).expect("scope key opens it");
+    // A member gateway holding the scope key opens it — the AAD is the publication
+    // name (the leaf bound it automatically), the nonce rides on the wire — then
+    // decodes the same `Frame`. (A capable node would open with `ContentKey`
+    // directly; the bytes are identical.)
+    let aad = sealed.name.encode_to_tlv();
+    let opened = scope_key.open(&aad, &sealed.payload).expect("scope key opens it");
     let reading = Reading::decode(&opened).unwrap();
     println!(
         "  member gateway (has key) reads: {:.1} °C, {}% RH",
@@ -119,7 +125,7 @@ fn main() {
 
     // An outsider with the wrong key gets nothing — fail closed.
     let outsider = ScopeKey::from_bytes([0u8; 32]);
-    match outsider.open(0, &sealed.payload) {
+    match outsider.open(&aad, &sealed.payload) {
         Some(_) => println!("  outsider read it?!  (must not happen)"),
         None => println!("  outsider (wrong key) is denied — AEAD authentication fails"),
     }

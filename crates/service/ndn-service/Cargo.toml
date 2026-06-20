@@ -55,3 +55,5 @@ ndn-rpc = { workspace = true }
 ndn-service-macro = { workspace = true }
 # Engine-wired cross-node discovery witness (FaceId/Face for the host harness).
 ndn-transport = { workspace = true }
+# Leaf-seal ⇄ ContentKey interop witness: ScopeKey needs the `seal` feature.
+ndn-service-core = { workspace = true, features = ["seal"] }

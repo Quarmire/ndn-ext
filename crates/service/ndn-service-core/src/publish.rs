@@ -152,9 +152,12 @@ impl<T: Frame> Publisher<T> {
     pub fn build(&self, value: &T) -> Publication {
         let frame = value.encode();
         let name = self.topic.clone().append_sequence_num(self.seq);
+        // When sealing, bind the publication name as AAD (the same discipline
+        // `ContentKey` callers follow), so name and ciphertext are tamper-evident
+        // together and a native open agrees on the bound bytes.
         #[cfg(feature = "seal")]
         let payload = match &self.key {
-            Some(k) => k.seal(self.seq, &frame),
+            Some(k) => k.seal(self.seq, &name.encode_to_tlv(), &frame),
             None => frame.to_vec(),
         };
         #[cfg(not(feature = "seal"))]
@@ -201,17 +204,34 @@ impl<T: Frame> Publisher<T> {
 /// [`Publisher::starting_at`]) or take a fresh key, or a nonce repeats and
 /// ChaCha20-Poly1305's guarantees collapse.
 ///
-/// ## Faithfulness
+/// ## Wire envelope (aligned with `ndn-security`'s `ContentKey`)
 ///
-/// The cipher core is shared with the stack; the *envelope* here is minimal
-/// (`ciphertext || 16-byte tag`, empty AAD). Aligning the envelope byte-for-byte
-/// with `ndn-security`'s `ContentKey` — and binding the publication name as AAD —
-/// is a tracked hardening step (see the spec, `docs/specs/service-layer.md` §13).
+/// A sealed payload is `nonce ‖ tag ‖ ciphertext` — byte-for-byte the layout of
+/// `ndn-security`'s [`Sealed::to_bytes`], so a gateway opens a leaf's publication
+/// directly with `Sealed::from_bytes(payload)` + `ContentKey::open` (the two share
+/// the ChaCha20-Poly1305 cipher core via `ndn-crypto-core`). The nonce is
+/// *derived from the sequence* on the leaf — no RNG on the device — but **carried
+/// on the wire**, so the reader is agnostic to how it was chosen: [`open`](Self::open)
+/// reads the nonce from the payload and therefore opens both leaf-sealed
+/// (seq-derived nonce) and `ContentKey`-sealed (random nonce) payloads.
+///
+/// The AAD is the publication's name ([`Name::encode_to_tlv`](ndn_packet::Name)),
+/// which [`Publisher`] binds automatically — the same name-binding discipline
+/// `ContentKey` callers follow, so a leaf seal and a native open agree on it.
+///
+/// [`Sealed::to_bytes`]: https://docs.rs/ndn-security
 #[cfg(feature = "seal")]
 #[derive(Clone)]
 pub struct ScopeKey {
     key: [u8; 32],
 }
+
+/// AEAD nonce length — matches `ndn-security`'s `NONCE_LEN`.
+#[cfg(feature = "seal")]
+const NONCE_LEN: usize = 12;
+/// AEAD tag length — matches `ndn-security`'s `TAG_LEN`.
+#[cfg(feature = "seal")]
+const TAG_LEN: usize = 16;
 
 #[cfg(feature = "seal")]
 impl ScopeKey {
@@ -220,29 +240,37 @@ impl ScopeKey {
         Self { key }
     }
 
-    /// Seal `plaintext` for sequence `seq`. Output is `ciphertext || 16-byte tag`.
-    /// See the type docs for the sequence/nonce requirement.
-    pub fn seal(&self, seq: u64, plaintext: &[u8]) -> Vec<u8> {
-        let mut buf = plaintext.to_vec();
+    /// Seal `plaintext` for sequence `seq`, binding `aad`. Output is the
+    /// `ContentKey` wire layout — `nonce ‖ tag ‖ ciphertext` — openable by
+    /// `ndn-security`'s `ContentKey::open` after `Sealed::from_bytes`. The nonce is
+    /// derived from `seq` (see the type docs' sequence requirement) but written to
+    /// the wire, so the reader needs no out-of-band sequence.
+    pub fn seal(&self, seq: u64, aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
         let nonce = nonce_for(seq);
-        let tag = ndn_crypto_core::seal_in_place(&self.key, &nonce, &[], &mut buf)
+        let mut buf = plaintext.to_vec();
+        let tag = ndn_crypto_core::seal_in_place(&self.key, &nonce, aad, &mut buf)
             .expect("scope key is 32 bytes");
-        buf.extend_from_slice(&tag);
-        buf
+        let mut out = Vec::with_capacity(NONCE_LEN + TAG_LEN + buf.len());
+        out.extend_from_slice(&nonce);
+        out.extend_from_slice(&tag);
+        out.extend_from_slice(&buf);
+        out
     }
 
-    /// Open a [`seal`](Self::seal)ed payload for sequence `seq`. Returns `None` if
-    /// authentication fails (wrong key, wrong sequence, or tampering).
-    pub fn open(&self, seq: u64, sealed: &[u8]) -> Option<Vec<u8>> {
-        if sealed.len() < 16 {
+    /// Open a payload in the `nonce ‖ tag ‖ ciphertext` layout, verifying `aad`.
+    /// Reads the nonce from the wire, so it opens both leaf-sealed and
+    /// `ContentKey`-sealed payloads. `None` if authentication fails (wrong key,
+    /// wrong AAD, or tampering).
+    pub fn open(&self, aad: &[u8], sealed: &[u8]) -> Option<Vec<u8>> {
+        if sealed.len() < NONCE_LEN + TAG_LEN {
             return None;
         }
-        let (body, tag) = sealed.split_at(sealed.len() - 16);
-        let mut buf = body.to_vec();
-        let mut t = [0u8; 16];
-        t.copy_from_slice(tag);
-        let nonce = nonce_for(seq);
-        if ndn_crypto_core::open_in_place(&self.key, &nonce, &[], &mut buf, &t) {
+        let mut nonce = [0u8; NONCE_LEN];
+        nonce.copy_from_slice(&sealed[..NONCE_LEN]);
+        let mut tag = [0u8; TAG_LEN];
+        tag.copy_from_slice(&sealed[NONCE_LEN..NONCE_LEN + TAG_LEN]);
+        let mut buf = sealed[NONCE_LEN + TAG_LEN..].to_vec();
+        if ndn_crypto_core::open_in_place(&self.key, &nonce, aad, &mut buf, &tag) {
             Some(buf)
         } else {
             None
@@ -253,8 +281,8 @@ impl ScopeKey {
 /// Derive a 12-byte AEAD nonce from a sequence number (big-endian in the low 8
 /// bytes). Unique per sequence ⇒ unique per message under one key.
 #[cfg(feature = "seal")]
-fn nonce_for(seq: u64) -> [u8; 12] {
-    let mut nonce = [0u8; 12];
-    nonce[4..].copy_from_slice(&seq.to_be_bytes());
+fn nonce_for(seq: u64) -> [u8; NONCE_LEN] {
+    let mut nonce = [0u8; NONCE_LEN];
+    nonce[NONCE_LEN - 8..].copy_from_slice(&seq.to_be_bytes());
     nonce
 }
