@@ -29,17 +29,26 @@ const POLICY: &str = "policy";
 const GRANT: &str = "grant";
 const REVOKE: &str = "revoke";
 
-/// Build a signed `grant` command: `<scope>/policy/grant` carrying `(principal,
-/// policy)`, signed by an authorized operator's `signer`. `None` on signing
-/// failure.
+/// Build a signed `grant` command: `<scope>/policy/grant` carrying `(seq,
+/// principal, policy)`, signed by an authorized operator's `signer`.
+///
+/// `seq` is a per-operator **sequence number** — strictly increasing across the
+/// commands that operator issues, **not** a timestamp. Nodes are not assumed to
+/// share a synchronized (or trustworthy) clock, so replay protection rides a
+/// monotonic counter rather than wall-clock time — the same reason NDNSF sequences
+/// its messages (and patches SVS). The operator MUST persist its counter across
+/// restarts; the controller keeps the per-operator high-water mark and rejects any
+/// command not newer (SEC-09). `None` on signing failure.
 pub fn grant_command(
     scope: &Name,
     signer: &dyn Signer,
     principal: &Name,
     policy: &str,
+    seq: u64,
 ) -> Option<Bytes> {
     let name = scope.clone().append(POLICY).append(GRANT);
     let params = encode_fields(&[
+        Frame::encode(&seq),
         Frame::encode(&principal.to_string()),
         Frame::encode(&policy.to_string()),
     ]);
@@ -50,11 +59,17 @@ pub fn grant_command(
         .ok()
 }
 
-/// Build a signed `revoke` command: `<scope>/policy/revoke` carrying `principal`,
-/// signed by an authorized operator's `signer`.
-pub fn revoke_command(scope: &Name, signer: &dyn Signer, principal: &Name) -> Option<Bytes> {
+/// Build a signed `revoke` command: `<scope>/policy/revoke` carrying `(seq,
+/// principal)`, signed by an authorized operator's `signer`. `seq` is a per-operator
+/// strictly-increasing sequence number (see [`grant_command`]).
+pub fn revoke_command(
+    scope: &Name,
+    signer: &dyn Signer,
+    principal: &Name,
+    seq: u64,
+) -> Option<Bytes> {
     let name = scope.clone().append(POLICY).append(REVOKE);
-    let params = encode_fields(&[Frame::encode(&principal.to_string())]);
+    let params = encode_fields(&[Frame::encode(&seq), Frame::encode(&principal.to_string())]);
     InterestBuilder::new(name)
         .must_be_fresh()
         .app_parameters(params.to_vec())
@@ -69,6 +84,9 @@ pub struct PolicyController {
     authority: PolicyAuthority,
     admin: Arc<Validator>,
     admin_prefix: Name,
+    /// Highest command sequence number accepted per operator (signer) — the
+    /// anti-replay high-water mark (a monotonic counter, not a clock; SEC-09).
+    seen: std::collections::HashMap<Name, u64>,
 }
 
 impl PolicyController {
@@ -79,6 +97,7 @@ impl PolicyController {
             authority,
             admin,
             admin_prefix,
+            seen: std::collections::HashMap::new(),
         }
     }
 
@@ -107,21 +126,40 @@ impl PolicyController {
         if !signer.has_prefix(&self.admin_prefix) {
             return None;
         }
+        let signer_name = signer.as_ref().clone();
 
+        // Anti-replay: every command carries a per-operator strictly-increasing
+        // *sequence number* (not a timestamp — clocks aren't synced or trusted across
+        // nodes, the reason NDNSF sequences instead). Reject one not newer than the
+        // last accepted from this signer, so a captured grant/revoke can't be
+        // replayed to undo a later mutation (SEC-09).
         let params = interest.app_parameters()?;
-        match verb.as_str() {
+        let mut pos = 0usize;
+        let seq = u64::decode(read_field(params, &mut pos).ok()?).ok()?;
+        if let Some(&last) = self.seen.get(&signer_name)
+            && seq <= last
+        {
+            return None;
+        }
+
+        let result = match verb.as_str() {
             GRANT => {
-                let (principal, policy) = decode_grant(params)?;
+                let (principal, policy) = decode_grant(params, &mut pos)?;
                 self.authority.grant(principal.clone(), policy);
                 self.authority.signed_grant(&principal)
             }
             REVOKE => {
-                let principal = decode_revoke(params)?;
+                let principal = decode_revoke(params, &mut pos)?;
                 self.authority.revoke(&principal);
                 self.authority.signed_grant(&principal)
             }
-            _ => None,
+            _ => return None,
+        };
+        // Record the high-water mark only after a well-formed, applied command.
+        if result.is_some() {
+            self.seen.insert(signer_name, seq);
         }
+        result
     }
 }
 
@@ -138,15 +176,13 @@ fn command_verb(name: &Name, scope: &Name) -> Option<String> {
     Some(String::from_utf8_lossy(verb.value.as_ref()).into_owned())
 }
 
-fn decode_grant(params: &[u8]) -> Option<(Name, String)> {
-    let mut pos = 0usize;
-    let principal = String::decode(read_field(params, &mut pos).ok()?).ok()?;
-    let policy = String::decode(read_field(params, &mut pos).ok()?).ok()?;
+fn decode_grant(params: &[u8], pos: &mut usize) -> Option<(Name, String)> {
+    let principal = String::decode(read_field(params, pos).ok()?).ok()?;
+    let policy = String::decode(read_field(params, pos).ok()?).ok()?;
     Some((principal.parse().ok()?, policy))
 }
 
-fn decode_revoke(params: &[u8]) -> Option<Name> {
-    let mut pos = 0usize;
-    let principal = String::decode(read_field(params, &mut pos).ok()?).ok()?;
+fn decode_revoke(params: &[u8], pos: &mut usize) -> Option<Name> {
+    let principal = String::decode(read_field(params, pos).ok()?).ok()?;
     principal.parse().ok()
 }
