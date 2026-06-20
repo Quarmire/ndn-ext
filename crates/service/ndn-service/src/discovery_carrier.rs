@@ -180,6 +180,11 @@ impl<C: HintedCarrier> SelectCarrier for DiscoveryCarrier<C> {
     }
 }
 
+/// Cap on tracked providers per service, so a flood of advertisements (or one
+/// node re-advertising) can't grow the directory — or its O(n log n) ranked read —
+/// without bound (red-team SEC-27).
+const MAX_PROVIDERS_PER_SERVICE: usize = 256;
+
 /// An in-process [`ProviderDirectory`] — the seam used to prove the carrier.
 /// Honours a [`NamingConvention`] (default [`NodeScoped`](NamingConvention::NodeScoped)).
 pub struct MemoryDirectory {
@@ -222,16 +227,24 @@ impl ProviderDirectory for MemoryDirectory {
     async fn advertise(&self, service: &ServiceId, node: &Name) -> Name {
         let (serve, callable, forwarding_hint) =
             names_for(self.convention, service.name(), node);
-        self.table
-            .lock()
-            .expect("directory lock")
-            .entry(service.name().clone())
-            .or_default()
-            .push(ProviderEntry {
+        let mut table = self.table.lock().expect("directory lock");
+        let entries = table.entry(service.name().clone()).or_default();
+        // Re-advertising the same provider refreshes rather than duplicates, and the
+        // per-service set is capped (drop oldest) so growth and ranked-read cost stay
+        // bounded (red-team SEC-27).
+        let dup = entries
+            .iter()
+            .any(|e| e.callable == callable && e.forwarding_hint == forwarding_hint);
+        if !dup {
+            if entries.len() >= MAX_PROVIDERS_PER_SERVICE {
+                entries.remove(0);
+            }
+            entries.push(ProviderEntry {
                 callable,
                 forwarding_hint,
                 rtt: None,
             });
+        }
         serve
     }
 }

@@ -100,3 +100,22 @@ async fn no_provider_discovered_fails_closed() {
     let client = EchoClient::new(consumer, ServiceId::new(n("/svc/ghost")));
     assert!(client.echo("hi".into()).await.is_err(), "no discovered provider → fail closed");
 }
+
+#[tokio::test]
+async fn directory_dedups_and_caps_advertisements() {
+    // SEC-27: re-advertising the same node refreshes rather than duplicates, and the
+    // per-service provider set is bounded (memory + ranked-read cost).
+    let dir = MemoryDirectory::new();
+    let svc = ServiceId::new(n("/svc/echo"));
+
+    for _ in 0..5 {
+        dir.advertise(&svc, &n("/node/a")).await;
+    }
+    assert_eq!(dir.providers(&svc).await.len(), 1, "re-advertising must not duplicate");
+
+    for i in 0..1000 {
+        dir.advertise(&svc, &n(&format!("/node/n{i}"))).await;
+    }
+    let count = dir.providers(&svc).await.len();
+    assert!(count <= 256, "per-service providers must be capped (got {count})");
+}
