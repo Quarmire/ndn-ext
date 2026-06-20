@@ -77,12 +77,15 @@ let svc = ServiceId::new("/weather".parse()?);
 
 // `serve` spawns the four-phase loop and returns, so the station carriers must
 // stay alive in scope (don't move them into a spawned task that then drops them).
-let a = NdnsfCarrier::new(a_ps, "/met/stationA".parse()?, group.clone());
+// Carriers are SECURE BY DEFAULT: without `.signed(signer, validator)` a carrier
+// rejects inbound messages. This example is a public demo, so it opts in to the
+// unauthenticated path explicitly with `.insecure()` (production should `.signed(..)`).
+let a = NdnsfCarrier::new(a_ps, "/met/stationA".parse()?, group.clone()).insecure();
 a.serve(&svc, station("station-A", 0)).await?;
-let b = NdnsfCarrier::new(b_ps, "/met/stationB".parse()?, group.clone());
+let b = NdnsfCarrier::new(b_ps, "/met/stationB".parse()?, group.clone()).insecure();
 b.serve(&svc, station("station-B", 2)).await?;
 
-let app = NdnsfCarrier::new(app_ps, "/met/app".parse()?, group).token("forecast-cap");
+let app = NdnsfCarrier::new(app_ps, "/met/app".parse()?, group).insecure().token("forecast-cap");
 let client = WeatherClient::new(app, svc);
 
 let one = client.forecast("Paris".into(), 2).await?;                   // first to respond
