@@ -58,6 +58,18 @@ pub struct Session<R> {
 impl<R> Session<R> {
     /// A session named `name` over `ps`, confidential under `scope_key` (shared by
     /// members). Starts with an empty roster.
+    ///
+    /// ## Inject-resistance (red-team SEC-15)
+    ///
+    /// `scope_key` provides *confidentiality* among key-holders, not an *integrity
+    /// boundary* on the group: by itself it does not stop a non-member from
+    /// publishing into the session's prefix. For a confidential session, `ps` MUST
+    /// be built (`SvsPubSub::join_secured`) with a **`PublisherSigner`** and an
+    /// **`IngestValidator`** bound to the session's trust anchor, so only authorized
+    /// members can publish and a forged/replayed publication is rejected at ingest.
+    /// The default (unsecured) pub/sub is accept-all — acceptable only for a public
+    /// session. (`ndn-ndnsf::trust::{publisher_signer, ingest_validator}` adapt an
+    /// `ndn-security` signer/validator into those hooks.)
     pub fn new(name: Name, ps: Arc<SvsPubSub>, scope_key: ContentKey) -> Self {
         Self {
             name,
@@ -198,6 +210,19 @@ impl<T: Frame> ScopedTopic<T> {
 /// emits to a raw sink instead of SVS names each publication `<topic>/seq=N`; a
 /// gateway that ingests those raw publications MUST itself reject `seq ≤ last-seen`
 /// per publisher to get the same guarantee.
+///
+/// ## No downgrade to plaintext (SEC-14)
+///
+/// This subscription only ever yields a value that was a **well-formed `Sealed`
+/// opened under the scope key** (`Sealed::from_bytes` then `key.open`) — an injected
+/// *plaintext* (or anything not sealed under the key) fails to open and is skipped.
+/// So the confidential property is enforced by *using* a `ScopedTopic`/
+/// `ScopedSubscription` (which require the key), not by a flag on the wire. The
+/// corollary: do **not** also subscribe to the same name with a plain
+/// [`Topic<T>`](crate::Topic) (which decodes bytes without a key) — that consumer
+/// would accept attacker plaintext. A confidential topic is read only through this
+/// type; combined with publisher-authenticated ingest (SEC-15) an attacker cannot
+/// inject at all.
 pub struct ScopedSubscription<T> {
     rx: mpsc::Receiver<Publication>,
     key: Arc<ContentKey>,
