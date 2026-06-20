@@ -47,12 +47,15 @@ async fn aa_serves_params_and_issues_sealed_dkey_over_ndn() {
     let consumer = Consumer::from_handle(c_handle);
 
     // AA serve loop: validates DKEY requests against alice's anchor, signs responses.
+    let issue_authority = authority.clone();
     let serve = tokio::spawn(serve_cp(
         producer,
         aa_prefix.clone(),
         authority.clone(),
         aa_kc.signer().unwrap(),
         Arc::new(alice_kc.validator()),
+        // Compat issuance: defer to the authority's own grant table.
+        Arc::new(move |id, recip| issue_authority.issue_dkey(id, recip).ok()),
     ));
 
     // alice's ParamFetcher verifies AA responses against the AA's anchor.

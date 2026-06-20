@@ -10,7 +10,8 @@ use ndn_packet::Name;
 use ndn_sealed_box::Recipient;
 use ndn_security::KeyChain;
 use ndn_security::abe::lsw_setup;
-use ndn_service::{IssueError, PolicyAuthority, issue_decryption_key};
+use ndn_service::{IssueError, PolicyAuthority, issue_decryption_key, policy_gated_issue};
+use std::sync::{Arc, RwLock};
 
 fn n(s: &str) -> Name {
     s.parse().unwrap()
@@ -61,4 +62,38 @@ fn policy_gates_issuance_live() {
         ),
         "after a live revoke, the same authority issues no key — no restart"
     );
+}
+
+#[test]
+fn network_issuance_seam_refuses_revoked() {
+    // SEC-06 regression: the `IssueFn` the four-phase serve loop now calls
+    // (`policy_gated_issue`) issues for a granted requester and refuses once
+    // revoked — proving the live policy gates the *network* DKEY path, not just the
+    // standalone helper.
+    let (mp, ms) = lsw_setup().unwrap();
+    let kp = Arc::new(KpAuthority::new(mp, ms));
+    let kc = KeyChain::ephemeral("/muas/group").unwrap();
+    let mut pa = PolicyAuthority::new(n("/muas/group"), kc.signer().unwrap());
+    let alice = n("/muas/alice");
+    pa.grant(alice.clone(), "service:echo");
+    let policy = Arc::new(RwLock::new(pa));
+
+    let issue = policy_gated_issue(policy.clone(), kp);
+    let recipient = Recipient::generate().unwrap();
+
+    // Granted → the seam issues a sealed key.
+    assert!(
+        issue(&alice, &recipient.public).is_some(),
+        "a granted requester must be issued a key over the network seam"
+    );
+
+    // Revoke live → the very next call through the same seam is refused.
+    policy.write().unwrap().revoke(&alice);
+    assert!(
+        issue(&alice, &recipient.public).is_none(),
+        "a revoked requester must be refused at the network seam (SEC-06)"
+    );
+
+    // An ungranted requester is refused too (fail closed).
+    assert!(issue(&n("/muas/mallory"), &recipient.public).is_none());
 }

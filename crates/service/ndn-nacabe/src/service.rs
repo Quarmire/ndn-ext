@@ -30,6 +30,17 @@ const DKEY_FETCH_TIMEOUT: Duration = Duration::from_secs(4);
 /// authority response, with the failed Data name and a human-readable reason.
 pub type ValidationFailureHook = Arc<dyn Fn(&Name, &str) + Send + Sync>;
 
+/// A live, fail-closed **issuance gate** for the network `DKEY` path: given the
+/// already-authenticated requester identity and its advertised X25519 recipient
+/// key, produce the sealed decryption key — or `None` to refuse.
+///
+/// This is the seam that lets a caller gate issuance on a **live** policy (the v2
+/// `issue_decryption_key` over a `PolicyAuthority`), so a *revoked* requester is
+/// refused even though it still has a stale entry in the authority's own grant
+/// table (red-team SEC-06). The NDNSF-compat caller passes a closure that defers to
+/// the authority's grant table, e.g. `move |id, recip| authority.issue_dkey(id, recip).ok()`.
+pub type IssueFn = Arc<dyn Fn(&Name, &[u8]) -> Option<Bytes> + Send + Sync>;
+
 /// Derive the signing identity from a key name `/<id>/KEY/<keyid>` → `/<id>`.
 fn identity_of(key_name: &Name) -> Option<Name> {
     let key_comp = NameComponent::generic(Bytes::from_static(b"KEY"));
@@ -48,6 +59,7 @@ pub async fn serve_cp(
     authority: Arc<CpAuthority>,
     aa_signer: Arc<dyn Signer>,
     request_validator: Arc<Validator>,
+    issue: IssueFn,
 ) -> Result<(), AppError> {
     let pubparams = names::pubparams_name(&aa_prefix);
     let dkey_prefix = aa_prefix.append(DKEY);
@@ -56,6 +68,7 @@ pub async fn serve_cp(
             let authority = authority.clone();
             let aa_signer = aa_signer.clone();
             let request_validator = request_validator.clone();
+            let issue = issue.clone();
             let pubparams = pubparams.clone();
             let dkey_prefix = dkey_prefix.clone();
             async move {
@@ -95,8 +108,10 @@ pub async fn serve_cp(
                 let Some(recipient_public) = interest.app_parameters() else {
                     return;
                 };
-                // issue_dkey fails closed for an unauthorized requester.
-                if let Ok(sealed) = authority.issue_dkey(&identity, recipient_public)
+                // The issuance gate fails closed; for the v2 path it consults the
+                // live policy, so a revoked requester is refused here even if it
+                // still has a stale entry in the authority's grant table (SEC-06).
+                if let Some(sealed) = issue(&identity, recipient_public)
                     && let Ok(wire) =
                         DataBuilder::new(name, sealed.as_ref()).sign_with_sync(&*aa_signer)
                 {
@@ -115,6 +130,7 @@ pub async fn serve_kp(
     authority: Arc<crate::authority::KpAuthority>,
     aa_signer: Arc<dyn Signer>,
     request_validator: Arc<Validator>,
+    issue: IssueFn,
 ) -> Result<(), AppError> {
     let pubparams = names::pubparams_name(&aa_prefix);
     let dkey_prefix = aa_prefix.append(DKEY);
@@ -123,6 +139,7 @@ pub async fn serve_kp(
             let authority = authority.clone();
             let aa_signer = aa_signer.clone();
             let request_validator = request_validator.clone();
+            let issue = issue.clone();
             let pubparams = pubparams.clone();
             let dkey_prefix = dkey_prefix.clone();
             async move {
@@ -154,7 +171,7 @@ pub async fn serve_kp(
                 let Some(recipient_public) = interest.app_parameters() else {
                     return;
                 };
-                if let Ok(sealed) = authority.issue_dkey(&identity, recipient_public)
+                if let Some(sealed) = issue(&identity, recipient_public)
                     && let Ok(wire) =
                         DataBuilder::new(name, sealed.as_ref()).sign_with_sync(&*aa_signer)
                 {

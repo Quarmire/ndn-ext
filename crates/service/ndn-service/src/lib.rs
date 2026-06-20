@@ -72,7 +72,7 @@ pub use config::{ConfigError, ReloadReport, load_policy_toml, reload};
 #[cfg(feature = "issuance")]
 pub mod issuance;
 #[cfg(feature = "issuance")]
-pub use issuance::{IssueError, issue_decryption_key};
+pub use issuance::{IssueError, issue_decryption_key, policy_gated_issue};
 
 /// ABE-by-role key distribution (feature `issuance`): ABE-wrap scope keys by
 /// scope attribute; a member's role-derived KP-ABE key opens its granted scopes.

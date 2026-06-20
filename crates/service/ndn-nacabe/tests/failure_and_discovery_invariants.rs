@@ -51,12 +51,14 @@ async fn aa_harness(
     let producer = Producer::from_handle(p_handle, aa_prefix.clone());
     let consumer = Consumer::from_handle(c_handle);
     // Request-validator is irrelevant here (no DKEY); trust the AA's own anchor.
+    let issue_authority = authority.clone();
     let serve = tokio::spawn(serve_cp(
         producer,
         aa_prefix.clone(),
         authority,
         aa_kc.signer().unwrap(),
         Arc::new(aa_kc.validator()),
+        Arc::new(move |id, recip| issue_authority.issue_dkey(id, recip).ok()),
     ));
     (consumer, serve, shutdown, engine)
 }

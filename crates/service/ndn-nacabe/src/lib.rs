@@ -36,4 +36,4 @@ pub mod service;
 pub use authority::{CpAuthority, KpAuthority, open_cp_dkey, open_kp_dkey};
 pub use ckdata::{CkData, NacError, open_cp, open_kp, seal_cp, seal_kp};
 #[cfg(feature = "service")]
-pub use service::{ParamFetcher, ValidationFailureHook, serve_cp, serve_kp};
+pub use service::{IssueFn, ParamFetcher, ValidationFailureHook, serve_cp, serve_kp};

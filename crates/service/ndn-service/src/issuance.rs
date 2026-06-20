@@ -4,6 +4,8 @@
 //! `KpAuthority` is the key authority (keygen + sealing). Issuance reads policy
 //! live, so a grant/revoke takes effect with no restart.
 
+use std::sync::{Arc, RwLock};
+
 use bytes::Bytes;
 use ndn_nacabe::KpAuthority;
 use ndn_packet::Name;
@@ -58,4 +60,34 @@ pub fn issue_decryption_key(
     let expr = PolicyExpr::parse(&grant.policy).map_err(|e| IssueError::BadPolicy(format!("{e:?}")))?;
     kp.issue_with_policy(requester, &expr, recipient_public)
         .map_err(|e| IssueError::Issue(e.to_string()))
+}
+
+/// A fail-closed network `DKEY` issuance gate (structurally an
+/// `ndn_nacabe::IssueFn`). Named here so callers can name the return of
+/// [`policy_gated_issue`] without depending on nacabe's `service` feature.
+pub type IssueFn = Arc<dyn Fn(&Name, &[u8]) -> Option<Bytes> + Send + Sync>;
+
+/// Build an `ndn_nacabe::IssueFn`-compatible issuance gate over a **live**
+/// [`PolicyAuthority`]: each network `DKEY` request is authorized against the
+/// current (signed, versioned) grant via [`issue_decryption_key`], so a revoked
+/// requester is refused at the serve loop even though it may still have a stale
+/// entry in the `KpAuthority`'s own grant table (red-team SEC-06). This is the
+/// production wiring the audit found missing — compose it with the four-phase
+/// authority serve loop: `ndn_nacabe::serve_kp(.., policy_gated_issue(policy, kp))`.
+///
+/// Fail-closed: any refusal (no grant, revoked, unparseable policy, keygen
+/// failure) yields `None`, so the serve loop emits no key. The `policy` is held
+/// behind an `RwLock` so the operator's `grant`/`revoke` take effect live, between
+/// requests, with no restart.
+pub fn policy_gated_issue(policy: Arc<RwLock<PolicyAuthority>>, kp: Arc<KpAuthority>) -> IssueFn {
+    Arc::new(move |requester: &Name, recipient_public: &[u8]| {
+        let policy = policy.read().ok()?;
+        match issue_decryption_key(&policy, &kp, requester, recipient_public) {
+            Ok(bytes) => Some(bytes),
+            Err(e) => {
+                tracing::warn!(%requester, error = %e, "policy-gated DKEY issuance refused");
+                None
+            }
+        }
+    })
 }

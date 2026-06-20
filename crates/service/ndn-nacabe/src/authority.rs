@@ -58,6 +58,15 @@ impl CpAuthority {
         self.grants.insert(identity, attributes);
     }
 
+    /// Revoke `identity`'s grant; a subsequent [`issue_dkey`](Self::issue_dkey)
+    /// fails closed. Already-issued ABE keys cannot be recalled (ABE has no key
+    /// revocation) — pair with short-lived content keys / epoch rotation, and gate
+    /// the *network* issuance path with a live authorizer (see SEC-06 / the v2
+    /// `issue_decryption_key`).
+    pub fn revoke(&mut self, identity: &Name) {
+        self.grants.remove(identity);
+    }
+
     /// The `PUBPARAMS` payload — the public encryption parameters producers fetch.
     pub fn public_params(&self) -> Bytes {
         self.params.public_key_bytes.clone()
@@ -101,6 +110,14 @@ impl KpAuthority {
     /// Enroll a requester: grant a key-`policy` to `identity`.
     pub fn grant(&mut self, identity: Name, policy: PolicyExpr) {
         self.grants.insert(identity, policy);
+    }
+
+    /// Revoke `identity`'s grant; a subsequent [`issue_dkey`](Self::issue_dkey)
+    /// fails closed. Already-issued ABE keys cannot be recalled — gate the network
+    /// issuance path with a live authorizer (the v2 `issue_decryption_key`) and use
+    /// short-lived content keys (see SEC-06).
+    pub fn revoke(&mut self, identity: &Name) {
+        self.grants.remove(identity);
     }
 
     /// The `PUBPARAMS` payload.

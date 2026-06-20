@@ -167,8 +167,14 @@ fn decode_response(producer: Name, bytes: Bytes) -> Result<Response, ServiceErro
 /// Wrap a [`Dispatch`] as the four-phase async responder: decode the op envelope,
 /// dispatch, and frame the reply with its status byte.
 fn responder_for(dispatch: Arc<dyn Dispatch>) -> AsyncResponder {
-    Arc::new(move |_coord, payload: Bytes| {
+    Arc::new(move |coord, payload: Bytes| {
         let dispatch = dispatch.clone();
+        // The four-phase flow already verified the requester (the trust gate checks
+        // the signer against the coordination's requester before the token is
+        // consumed), so hand the handler that identity for its access decisions.
+        // NOTE: meaningful only when the carrier has a validator configured; with a
+        // default-open `TrustCtx` this identity is unauthenticated (red-team SEC-02).
+        let requester = Some(coord.requester.clone());
         Box::pin(async move {
             let Some((op, request)) = decode_request(&payload) else {
                 return encode_response(STATUS_ERROR, b"malformed request envelope");
@@ -176,7 +182,7 @@ fn responder_for(dispatch: Arc<dyn Dispatch>) -> AsyncResponder {
             let inv = Invocation {
                 op,
                 request,
-                requester: None, // a secure carrier fills this from the verified signer
+                requester,
             };
             match dispatch.dispatch(inv).await {
                 Ok(reply) => encode_response(STATUS_OK, &reply),
