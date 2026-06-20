@@ -32,15 +32,80 @@ properties via the O4 invariant catalogue (`docs/specs/ndnsf-invariants.md`).
 ## Example
 
 A weather service run over both the NDNSF four-phase and Tier-0, with a
-parameterized request and a structured response:
+*parameterized request* and a *structured response*:
 
 ```bash
 cargo run -p ndn-ndnsf --example weather --features driver
 ```
 
-The `NdnsfCarrier` path exercises the full four-phase including NDNSF-style
-multi-provider selection (`forecast_select(.., Strategy::All)` gathers a forecast
-from every station).
+### Walkthrough: `examples/weather.rs`
+
+One service definition, used unchanged over both carriers:
+
+```rust
+#[derive(Frame, Clone)]                 // structured "response with data"
+struct Forecast { city: String, day: u32, high_c: i32, low_c: i32, summary: String }
+
+#[ndn_service]
+trait Weather {
+    async fn forecast(&self, city: String, day: u32) -> Forecast;
+}
+
+struct Station { name: String, bias_c: i32 }
+impl Weather for Station {              // a plain async impl — no macros
+    async fn forecast(&self, city: String, day: u32) -> Forecast { /* … */ }
+}
+```
+
+**Tier-0** — a direct call to a *known* provider (one signed Interest → Data):
+
+```rust
+let carrier = RpcCarrier::new();
+let svc = ServiceId::new("/weather".parse()?);
+carrier.serve(&svc, station("metoffice", 0)).await?;
+
+let client = WeatherClient::new(carrier, svc);
+let f = client.forecast("London".into(), 1).await?;   // -> Forecast { high_c: 28, … }
+```
+
+**NDNSF four-phase** — two stations offer the service in a sync group; the app
+discovers/selects among them (`REQUEST → ACK → SELECTION → RESPONSE`), exactly as
+NDNSF does. `forecast_select(All)` gathers a forecast from *every* station:
+
+```rust
+let svc = ServiceId::new("/weather".parse()?);
+
+// `serve` spawns the four-phase loop and returns, so the station carriers must
+// stay alive in scope (don't move them into a spawned task that then drops them).
+let a = NdnsfCarrier::new(a_ps, "/met/stationA".parse()?, group.clone());
+a.serve(&svc, station("station-A", 0)).await?;
+let b = NdnsfCarrier::new(b_ps, "/met/stationB".parse()?, group.clone());
+b.serve(&svc, station("station-B", 2)).await?;
+
+let app = NdnsfCarrier::new(app_ps, "/met/app".parse()?, group).token("forecast-cap");
+let client = WeatherClient::new(app, svc);
+
+let one = client.forecast("Paris".into(), 2).await?;                   // first to respond
+let all = client.forecast_select("Paris".into(), 2, Strategy::All).await?; // every station
+```
+
+Output:
+
+```
+== Tier-0 (RpcCarrier): a direct call to a known service ==
+  forecast(London, day 1) -> high 28C / low 21C  [metoffice: partly cloudy]
+
+== NDNSF four-phase (NdnsfCarrier): REQUEST -> ACK -> SELECTION -> RESPONSE ==
+  forecast(Paris, day 2) -> high 28C / low 21C  [station-A: partly cloudy]
+  forecast_select(Paris, day 2, All) — every station responds:
+    /met/stationA -> high 28C / low 21C  [station-A: partly cloudy]
+    /met/stationB -> high 30C / low 23C  [station-B: partly cloudy]
+```
+
+The *same* `#[ndn_service]` client and `WeatherDispatch` run over Tier-0 and the
+NDNSF four-phase — only the carrier differs. (`Carrier`, `ServiceId`, and
+`Strategy` come from [`ndn-service-core`](../ndn-service-core).) See
+`examples/weather.rs` for the full, runnable source.
 
 ## Faithfulness
 
