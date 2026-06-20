@@ -84,12 +84,13 @@ impl ProviderEngine {
         &mut self,
         now_secs: u64,
         sel: &SelectionMessage,
+        requester: &Name,
         handler: H,
     ) -> Result<ResponseMessage, FlowError>
     where
         H: FnOnce(&PendingCoordination) -> Bytes,
     {
-        let coord = self.consume_selection(now_secs, sel)?;
+        let coord = self.consume_selection(now_secs, sel, requester)?;
         let payload = handler(&coord);
         Ok(ResponseMessage {
             status: true,
@@ -98,18 +99,20 @@ impl ProviderEngine {
         })
     }
 
-    /// Validate and consume the selection's provider token, returning the
-    /// coordination (fail-closed on an invalid/spent token). The caller runs the
-    /// handler — sync via [`on_selection`](Self::on_selection), or async (e.g. a
-    /// [`Carrier`](crate) dispatch) — and builds the [`ResponseMessage`]. Consuming
-    /// the token here, before any handler runs, preserves NSF-T/F invariants.
+    /// Validate and consume the selection's provider token for its **verified**
+    /// `requester`, returning the coordination (fail-closed on an invalid/spent/
+    /// stolen token — SEC-03). The caller runs the handler — sync via
+    /// [`on_selection`](Self::on_selection), or async (e.g. a [`Carrier`](crate)
+    /// dispatch) — and builds the [`ResponseMessage`]. Consuming the token here,
+    /// before any handler runs, preserves NSF-T/F invariants.
     pub fn consume_selection(
         &mut self,
         now_secs: u64,
         sel: &SelectionMessage,
+        requester: &Name,
     ) -> Result<PendingCoordination, FlowError> {
         let token = ProviderToken::from_wire(sel.provider_token.clone());
-        self.tokens.consume(now_secs, &token).map_err(|e| {
+        self.tokens.consume(now_secs, &token, requester).map_err(|e| {
             tracing::warn!(error = %e, "selection rejected — fail closed (no response)");
             FlowError::TokenRejected(e)
         })
@@ -221,7 +224,7 @@ mod tests {
         let sel = make_selection(&ack, "r1");
         // Phase 4: provider consumes the token, runs the handler, responds.
         let resp = provider
-            .on_selection(1, &sel, |coord| {
+            .on_selection(1, &sel, &name("/muas/alice"), |coord| {
                 // the unlocked coordination carries the request context
                 assert_eq!(coord.requester, name("/muas/alice"));
                 assert_eq!(coord.user_token, "utok");
@@ -241,10 +244,10 @@ mod tests {
         let ack = provider.on_request(0, name("/muas/alice"), name("/svc/x"), &req);
         let sel = make_selection(&ack, "r1");
 
-        assert!(provider.on_selection(0, &sel, |_| Bytes::new()).is_ok());
+        assert!(provider.on_selection(0, &sel, &name("/muas/alice"), |_| Bytes::new()).is_ok());
         // A replayed SELECTION coordinates nothing (token already consumed).
         let mut ran = false;
-        let result = provider.on_selection(0, &sel, |_| {
+        let result = provider.on_selection(0, &sel, &name("/muas/alice"), |_| {
             ran = true;
             Bytes::new()
         });
@@ -260,7 +263,7 @@ mod tests {
             request_id: "r1".into(),
         };
         let mut ran = false;
-        let result = provider.on_selection(0, &sel, |_| {
+        let result = provider.on_selection(0, &sel, &name("/muas/alice"), |_| {
             ran = true;
             Bytes::new()
         });

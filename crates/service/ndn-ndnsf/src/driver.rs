@@ -258,7 +258,9 @@ pub async fn serve_provider<H>(
                             request_id: reqid.to_string(),
                         };
                         if let Ok(resp) =
-                            engine.on_selection(now, &sel, |coord| handler(coord, &req.payload))
+                            engine.on_selection(now, &sel, &requester, |coord| {
+                                handler(coord, &req.payload)
+                            })
                         {
                             let name = names::response_name(&node, &requester, &service, &reqid);
                             let _ = ps.publish(name.clone(), trust.seal(name, resp.encode()).as_ref()).await;
@@ -284,7 +286,9 @@ pub async fn serve_provider<H>(
                     .map(|(p, _)| p.clone())
                     .unwrap_or_default();
                 // on_selection fails closed for a token this provider did not issue.
-                if let Ok(resp) = engine.on_selection(now, &sel, |coord| handler(coord, &payload)) {
+                if let Ok(resp) =
+                    engine.on_selection(now, &sel, &requester, |coord| handler(coord, &payload))
+                {
                     pending_payloads.remove(&reqid.to_string());
                     let name = names::response_name(&node, &requester, &service, &reqid);
                     let _ = ps.publish(name.clone(), trust.seal(name, resp.encode()).as_ref()).await;
@@ -381,7 +385,7 @@ pub async fn serve_provider_async(
                 // Consume the token (fail-closed) ON the loop, then run the handler
                 // OFF the loop with a timeout, so a slow/hung responder neither blocks
                 // other coordinations (head-of-line) nor strands the client (SEC-23).
-                if let Ok(coord) = engine.consume_selection(now, &sel) {
+                if let Ok(coord) = engine.consume_selection(now, &sel, &requester) {
                     pending_payloads.remove(&reqid.to_string());
                     let resp_name = names::response_name(&node, &requester, &service, &reqid);
                     let responder = responder.clone();

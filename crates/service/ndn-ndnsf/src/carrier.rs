@@ -46,6 +46,21 @@ const STATUS_ERROR: u8 = 2;
 
 /// A four-phase service carrier: a node that invokes (broadcast → select → fetch)
 /// and serves (REQUEST→ACK, SELECTION→RESPONSE) over one SVS group.
+///
+/// ## Provider authorization (red-team SEC-05)
+///
+/// With a validator configured, an inbound ACK/RESPONSE is verified to be **signed
+/// by the provider that claims it** — a member cannot answer "as" another. But the
+/// flow does **not** check whether that provider is *authorized to serve this
+/// service*: any trusted group member can ACK, and the client may select it
+/// (`FirstResponding` takes whoever ACKs first). In the current TrustContext model
+/// **group membership is the provider authorization** — every member is a peer that
+/// may serve. A finer per-service allow-list exists in `policy::ServicePolicy`
+/// (its `providers` set) but is **not yet enforced** on the client's ACK-acceptance
+/// path; wiring it there (reject an ACK whose signer isn't in the service's
+/// allowed-providers set, before selecting) is the place to add per-service
+/// provider authorization. Until then, do not run mutually-distrusting providers in
+/// one group expecting service-level isolation.
 pub struct NdnsfCarrier {
     ps: Arc<SvsPubSub>,
     node: Name,

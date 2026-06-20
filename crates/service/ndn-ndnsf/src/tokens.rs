@@ -66,6 +66,10 @@ pub enum TokenError {
     /// The token's pending TTL has elapsed.
     #[error("provider token has expired")]
     Expired,
+    /// The redeeming SELECTION's verified requester is not the token's issuee — a
+    /// stolen-token attempt on the broadcast medium (NSF-T / SEC-03).
+    #[error("provider token redeemed by the wrong requester")]
+    Unauthorized,
 }
 
 /// Hard cap on outstanding pending tokens — a memory backstop under a sustained
@@ -125,20 +129,29 @@ impl PendingProviderTokens {
         now_secs.saturating_sub(created_at_secs) >= self.ttl_secs
     }
 
-    /// Consume `token` **once** (called when the SELECTION arrives). Returns the
-    /// unlocked coordination, removing the token so a replay fails. An expired
-    /// token is rejected (and removed); an unknown/already-consumed one is
-    /// rejected.
+    /// Consume `token` **once** (called when the SELECTION arrives), for the
+    /// SELECTION's **verified** `requester`. Returns the unlocked coordination,
+    /// removing the token so a replay fails. Rejected (without consuming) if the
+    /// requester is not the token's issuee — so a participant who read the token off
+    /// another's broadcast ACK cannot redeem it (SEC-03). Unknown/expired are
+    /// likewise rejected.
     pub fn consume(
         &mut self,
         now_secs: u64,
         token: &ProviderToken,
+        requester: &Name,
     ) -> Result<PendingCoordination, TokenError> {
-        let Some((coord, created)) = self.entries.remove(token) else {
-            return Err(TokenError::Unknown);
-        };
+        // Peek before removing: a mismatched (stolen-token) SELECTION must not burn
+        // the legitimate issuee's pending token.
+        match self.entries.get(token) {
+            None => return Err(TokenError::Unknown),
+            Some((coord, _)) if coord.requester != *requester => {
+                return Err(TokenError::Unauthorized);
+            }
+            Some(_) => {}
+        }
+        let (coord, created) = self.entries.remove(token).expect("present per the peek above");
         if self.is_expired(created, now_secs) {
-            // already removed above; expired tokens never coordinate
             return Err(TokenError::Expired);
         }
         Ok(coord)
@@ -188,14 +201,27 @@ mod tests {
         assert!(t.pending_count() <= MAX_PENDING_TOKENS);
     }
 
+    #[test]
+    fn stolen_token_by_wrong_requester_is_rejected_without_burning_it() {
+        // SEC-03: a token issued to alice cannot be redeemed by mallory (who read it
+        // off the broadcast ACK) — and the failed attempt does NOT consume it.
+        let mut t = store();
+        let tok = issue(&mut t, 0);
+        assert_eq!(
+            t.consume(0, &tok, &name("/muas/mallory")),
+            Err(TokenError::Unauthorized)
+        );
+        assert!(t.consume(0, &tok, &name("/muas/alice")).is_ok(), "alice can still redeem it");
+    }
+
     /// NSF-T1 / NSF-T3 — a token is single-use; consuming it again (replay,
     /// including after successful coordination) fails.
     #[test]
     fn nsf_t1_t3_token_is_single_use() {
         let mut t = store();
         let tok = issue(&mut t, 0);
-        assert!(t.consume(10, &tok).is_ok());
-        assert_eq!(t.consume(10, &tok), Err(TokenError::Unknown));
+        assert!(t.consume(10, &tok, &name("/muas/alice")).is_ok());
+        assert_eq!(t.consume(10, &tok, &name("/muas/alice")), Err(TokenError::Unknown));
     }
 
     /// NSF-T4 — an expired token cannot coordinate.
@@ -203,7 +229,7 @@ mod tests {
     fn nsf_t4_expired_token_rejected() {
         let mut t = store();
         let tok = issue(&mut t, 0);
-        assert_eq!(t.consume(60, &tok), Err(TokenError::Expired));
+        assert_eq!(t.consume(60, &tok, &name("/muas/alice")), Err(TokenError::Expired));
     }
 
     /// NSF-T5 — an unknown/random token is rejected.
@@ -211,7 +237,7 @@ mod tests {
     fn nsf_t5_unknown_token_rejected() {
         let mut t = store();
         assert_eq!(
-            t.consume(0, &ProviderToken::from_wire("deadbeef")),
+            t.consume(0, &ProviderToken::from_wire("deadbeef"), &name("/muas/alice")),
             Err(TokenError::Unknown)
         );
     }
@@ -226,7 +252,7 @@ mod tests {
         assert_eq!(fresh.pending_count(), 0);
         assert_eq!(
             // the old token does not coordinate against a fresh table
-            store().consume(10, &tok),
+            store().consume(10, &tok, &name("/muas/alice")),
             Err(TokenError::Unknown)
         );
     }
@@ -237,7 +263,7 @@ mod tests {
         let mut t = store();
         let tok = issue(&mut t, 0);
         assert_eq!(t.pending_count(), 1);
-        t.consume(10, &tok).unwrap();
+        t.consume(10, &tok, &name("/muas/alice")).unwrap();
         assert_eq!(t.pending_count(), 0);
     }
 
@@ -249,7 +275,7 @@ mod tests {
         let tok = issue(&mut t, 0);
         assert_eq!(t.cleanup_expired(59), 0); // still within TTL
         assert_eq!(t.pending_count(), 1);
-        assert!(t.consume(59, &tok).is_ok());
+        assert!(t.consume(59, &tok, &name("/muas/alice")).is_ok());
     }
 
     /// NSF-S1 — pending state is eventually cleaned by TTL.
@@ -268,7 +294,7 @@ mod tests {
     fn nsf_s4_s5_cleanup_idempotent_and_bounded() {
         let mut t = store();
         let tok = issue(&mut t, 0);
-        t.consume(10, &tok).unwrap(); // completed; pending now empty
+        t.consume(10, &tok, &name("/muas/alice")).unwrap(); // completed; pending now empty
         assert_eq!(t.cleanup_expired(10), 0); // no-op after completion
         assert_eq!(t.cleanup_expired(100), 0); // repeated cleanup: still no growth
         assert_eq!(t.pending_count(), 0);
