@@ -16,6 +16,14 @@ fn name(s: &str) -> Name {
     s.parse().unwrap()
 }
 
+/// The leaf nonce construction: `publisher_id ‖ seq` (what `Publisher` builds).
+fn nonce(publisher_id: u32, seq: u64) -> [u8; 12] {
+    let mut n = [0u8; 12];
+    n[..4].copy_from_slice(&publisher_id.to_be_bytes());
+    n[4..].copy_from_slice(&seq.to_be_bytes());
+    n
+}
+
 #[test]
 fn leaf_scopekey_seal_opens_under_contentkey() {
     let raw = [9u8; 32];
@@ -24,8 +32,8 @@ fn leaf_scopekey_seal_opens_under_contentkey() {
     let n = name("/sensor/lab-3/secure").append_sequence_num(7);
     let aad = n.encode_to_tlv();
 
-    // Leaf seals (seq 7 -> derived nonce, no RNG).
-    let on_air = leaf.seal(7, &aad, b"telemetry frame 42");
+    // Leaf seals (publisher 3, seq 7 -> nonce, no RNG).
+    let on_air = leaf.seal(nonce(3, 7), &aad, b"telemetry frame 42");
 
     // The gateway parses the leaf bytes as ndn-security's `Sealed` and opens with
     // `ContentKey` — proving the envelope is byte-identical.
@@ -55,6 +63,25 @@ fn contentkey_seal_opens_under_leaf_scopekey() {
 }
 
 #[test]
+fn distinct_publishers_never_collide_nonces() {
+    // SEC-01 regression: two leaves sharing one scope key but with distinct
+    // `publisher_id`s must never produce the same nonce (the first 12 payload bytes
+    // are `nonce`), even at the same sequence number — and one leaf advancing its
+    // sequence must change the nonce too.
+    let raw = [5u8; 32];
+    let mut a = Publisher::<u32>::sealed(name("/sensor/x"), ScopeKey::from_bytes(raw), 1);
+    let b = Publisher::<u32>::sealed(name("/sensor/x"), ScopeKey::from_bytes(raw), 2);
+
+    let a0 = a.build(&1);
+    let b0 = b.build(&1);
+    assert_ne!(a0.payload[..12], b0.payload[..12], "distinct publisher ids ⇒ distinct nonces");
+
+    a.advance();
+    let a1 = a.build(&1);
+    assert_ne!(a0.payload[..12], a1.payload[..12], "advancing seq ⇒ distinct nonce");
+}
+
+#[test]
 fn end_to_end_publisher_to_contentkey() {
     // The full leaf path: a `Publisher` (which binds the name as AAD itself) emits a
     // sealed publication; a gateway reconstructs the AAD from the name and opens it.
@@ -70,7 +97,7 @@ fn end_to_end_publisher_to_contentkey() {
     }
 
     let raw = [42u8; 32];
-    let mut sensor = Publisher::<Reading>::sealed(name("/sensor/x"), ScopeKey::from_bytes(raw));
+    let sensor = Publisher::<Reading>::sealed(name("/sensor/x"), ScopeKey::from_bytes(raw), 1);
     let pubn = sensor.build(&Reading(213));
 
     // Gateway side: AAD is the publication's own name; open with ContentKey, decode.

@@ -99,13 +99,23 @@ pub trait PublicationSink {
 /// Frames each value with its [`Frame`](crate::Frame), names it `<topic>/seq=N`
 /// (the NDN sequence-number naming convention), and hands the [`Publication`] to a
 /// [`PublicationSink`]. Holds only the topic name, the next sequence number, and
-/// (with `seal`) an optional scope key — no buffers, no runtime.
+/// (with `seal`) an optional seal context (scope key + publisher id) — no buffers,
+/// no runtime.
 pub struct Publisher<T> {
     topic: Name,
     seq: u64,
     #[cfg(feature = "seal")]
-    key: Option<ScopeKey>,
+    seal: Option<SealCtx>,
     _marker: PhantomData<fn() -> T>,
+}
+
+/// A confidential publisher's seal state: the scope key plus this publisher's
+/// unique id (the AEAD nonce prefix, so two leaves sharing a scope key never
+/// collide nonces).
+#[cfg(feature = "seal")]
+struct SealCtx {
+    key: ScopeKey,
+    publisher_id: [u8; 4],
 }
 
 impl<T: Frame> Publisher<T> {
@@ -116,26 +126,38 @@ impl<T: Frame> Publisher<T> {
             topic,
             seq: 0,
             #[cfg(feature = "seal")]
-            key: None,
+            seal: None,
             _marker: PhantomData,
         }
     }
 
     /// A confidential publisher: each publication is sealed under `key` before it
-    /// reaches the sink (see [`ScopeKey`] for the nonce/sequence caveat).
+    /// reaches the sink.
+    ///
+    /// `publisher_id` MUST be **unique among every leaf that shares this scope
+    /// key** (the gateway assigns it at provisioning, e.g. a small per-device
+    /// index). It forms the high 4 bytes of the AEAD nonce; the sequence forms the
+    /// low 8. Distinct ids guarantee distinct nonces across the fleet, and a
+    /// monotonic sequence guarantees distinct nonces within one leaf — together the
+    /// nonce-uniqueness ChaCha20-Poly1305 requires. See [`ScopeKey`] for the
+    /// across-reboot sequence requirement.
     #[cfg(feature = "seal")]
-    pub fn sealed(topic: Name, key: ScopeKey) -> Self {
+    pub fn sealed(topic: Name, key: ScopeKey, publisher_id: u32) -> Self {
         Self {
             topic,
             seq: 0,
-            key: Some(key),
+            seal: Some(SealCtx { key, publisher_id: publisher_id.to_be_bytes() }),
             _marker: PhantomData,
         }
     }
 
-    /// Resume the sequence at `seq` (e.g. restored from persistent storage on
-    /// boot). With `seal` this matters: the sequence is the AEAD nonce, so it MUST
-    /// be monotonic across reboots when a key is reused — persist it, or rekey.
+    /// Resume the sequence at `seq` (restored from persistent storage on boot).
+    ///
+    /// With `seal` this is **load-bearing, not advisory**: the sequence is the low
+    /// 8 bytes of the AEAD nonce, so it MUST be strictly monotonic across reboots
+    /// under a reused key. A leaf without reliable non-volatile storage MUST take a
+    /// fresh scope key (or a fresh `publisher_id`) each boot instead — otherwise a
+    /// reboot replays nonces and ChaCha20-Poly1305's guarantees collapse.
     pub fn starting_at(mut self, seq: u64) -> Self {
         self.seq = seq;
         self
@@ -154,10 +176,17 @@ impl<T: Frame> Publisher<T> {
         let name = self.topic.clone().append_sequence_num(self.seq);
         // When sealing, bind the publication name as AAD (the same discipline
         // `ContentKey` callers follow), so name and ciphertext are tamper-evident
-        // together and a native open agrees on the bound bytes.
+        // together and a native open agrees on the bound bytes. The nonce is
+        // `publisher_id ‖ seq` — unique across leaves (distinct id) and across this
+        // leaf's messages (monotonic seq).
         #[cfg(feature = "seal")]
-        let payload = match &self.key {
-            Some(k) => k.seal(self.seq, &name.encode_to_tlv(), &frame),
+        let payload = match &self.seal {
+            Some(ctx) => {
+                let mut nonce = [0u8; 12];
+                nonce[..4].copy_from_slice(&ctx.publisher_id);
+                nonce[4..].copy_from_slice(&self.seq.to_be_bytes());
+                ctx.key.seal(nonce, &name.encode_to_tlv(), &frame)
+            }
             None => frame.to_vec(),
         };
         #[cfg(not(feature = "seal"))]
@@ -195,33 +224,35 @@ impl<T: Frame> Publisher<T> {
 /// finished 32-byte scope key; the *leaf* holds that key and seals with it. No
 /// pairings, no asymmetric crypto, no key exchange on the device.
 ///
-/// ## Nonce / sequence caveat
+/// ## Nonce discipline (the caller's responsibility)
 ///
-/// The AEAD nonce is derived from the publication's sequence number, so **no RNG is
-/// needed on the leaf** — but the sequence MUST be unique per message under one
-/// key. An append-only feed satisfies this naturally *within a boot*; across
-/// reboots, either persist the sequence (and resume with
-/// [`Publisher::starting_at`]) or take a fresh key, or a nonce repeats and
-/// ChaCha20-Poly1305's guarantees collapse.
+/// [`seal`](Self::seal) takes the 12-byte nonce explicitly — like `ContentKey`,
+/// `ScopeKey` is the cipher primitive and does **not** choose nonces. [`Publisher`]
+/// builds the nonce as `publisher_id ‖ seq` (no RNG on the leaf): a per-leaf id
+/// (unique across leaves sharing the key) over a monotonic sequence (unique within
+/// a leaf). The sequence MUST stay monotonic across reboots under a reused key — or
+/// rekey on boot — exactly the ChaCha20-Poly1305 nonce-uniqueness requirement. A
+/// caller using `ScopeKey` directly owns this discipline.
 ///
 /// ## Wire envelope (aligned with `ndn-security`'s `ContentKey`)
 ///
 /// A sealed payload is `nonce ‖ tag ‖ ciphertext` — byte-for-byte the layout of
 /// `ndn-security`'s [`Sealed::to_bytes`], so a gateway opens a leaf's publication
 /// directly with `Sealed::from_bytes(payload)` + `ContentKey::open` (the two share
-/// the ChaCha20-Poly1305 cipher core via `ndn-crypto-core`). The nonce is
-/// *derived from the sequence* on the leaf — no RNG on the device — but **carried
+/// the ChaCha20-Poly1305 cipher core via `ndn-crypto-core`). The nonce is **carried
 /// on the wire**, so the reader is agnostic to how it was chosen: [`open`](Self::open)
 /// reads the nonce from the payload and therefore opens both leaf-sealed
-/// (seq-derived nonce) and `ContentKey`-sealed (random nonce) payloads.
+/// (`publisher_id ‖ seq` nonce) and `ContentKey`-sealed (random nonce) payloads.
 ///
 /// The AAD is the publication's name ([`Name::encode_to_tlv`](ndn_packet::Name)),
 /// which [`Publisher`] binds automatically — the same name-binding discipline
 /// `ContentKey` callers follow, so a leaf seal and a native open agree on it.
 ///
+/// The raw key is zeroized on drop ([`zeroize::ZeroizeOnDrop`]).
+///
 /// [`Sealed::to_bytes`]: https://docs.rs/ndn-security
 #[cfg(feature = "seal")]
-#[derive(Clone)]
+#[derive(Clone, zeroize::ZeroizeOnDrop)]
 pub struct ScopeKey {
     key: [u8; 32],
 }
@@ -240,13 +271,13 @@ impl ScopeKey {
         Self { key }
     }
 
-    /// Seal `plaintext` for sequence `seq`, binding `aad`. Output is the
-    /// `ContentKey` wire layout — `nonce ‖ tag ‖ ciphertext` — openable by
-    /// `ndn-security`'s `ContentKey::open` after `Sealed::from_bytes`. The nonce is
-    /// derived from `seq` (see the type docs' sequence requirement) but written to
-    /// the wire, so the reader needs no out-of-band sequence.
-    pub fn seal(&self, seq: u64, aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
-        let nonce = nonce_for(seq);
+    /// Seal `plaintext` under the explicit 12-byte `nonce`, binding `aad`. Output is
+    /// the `ContentKey` wire layout — `nonce ‖ tag ‖ ciphertext` — openable by
+    /// `ndn-security`'s `ContentKey::open` after `Sealed::from_bytes`.
+    ///
+    /// The caller MUST ensure `nonce` is unique per message under this key (see the
+    /// type docs); reusing a nonce breaks ChaCha20-Poly1305 catastrophically.
+    pub fn seal(&self, nonce: [u8; NONCE_LEN], aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
         let mut buf = plaintext.to_vec();
         let tag = ndn_crypto_core::seal_in_place(&self.key, &nonce, aad, &mut buf)
             .expect("scope key is 32 bytes");
@@ -276,13 +307,4 @@ impl ScopeKey {
             None
         }
     }
-}
-
-/// Derive a 12-byte AEAD nonce from a sequence number (big-endian in the low 8
-/// bytes). Unique per sequence ⇒ unique per message under one key.
-#[cfg(feature = "seal")]
-fn nonce_for(seq: u64) -> [u8; NONCE_LEN] {
-    let mut nonce = [0u8; NONCE_LEN];
-    nonce[NONCE_LEN - 8..].copy_from_slice(&seq.to_be_bytes());
-    nonce
 }

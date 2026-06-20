@@ -32,7 +32,11 @@ fn build_scoped_topic<T: Frame>(
     name: Name,
     key: Arc<ContentKey>,
 ) -> ScopedTopic<T> {
-    let aad = Bytes::copy_from_slice(name.to_string().as_bytes());
+    // AAD = the canonical TLV name encoding (injective, lossless) — the same
+    // binding the embedded leaf (`ndn_service_core::publish`) uses, so leaf seals
+    // and `ScopedSession` opens agree. (Was `name.to_string()`, which is lossy and
+    // diverged from the leaf — see the service-layer red-team SEC-17.)
+    let aad = name.encode_to_tlv();
     ScopedTopic {
         ps,
         name,

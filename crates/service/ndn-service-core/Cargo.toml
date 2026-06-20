@@ -18,13 +18,15 @@ default = ["std"]
 std = ["ndn-packet/std", "bytes/std", "dep:async-trait"]
 # `seal` adds the leaf producer's symmetric confidentiality (`publish::ScopeKey`),
 # reusing the stack's own no_std ChaCha20-Poly1305 primitive. no_std-safe.
-seal = ["dep:ndn-crypto-core"]
+seal = ["dep:ndn-crypto-core", "dep:zeroize"]
 
 [dependencies]
 ndn-packet      = { workspace = true }
 bytes           = { workspace = true }
 async-trait     = { workspace = true, optional = true }
 ndn-crypto-core = { workspace = true, optional = true }
+# Zeroize the ScopeKey on drop (no_std: default-features off). `derive` for the macro.
+zeroize         = { version = "1", default-features = false, features = ["derive"], optional = true }
 
 [dev-dependencies]
 # For the embedded-sensor example's `#[derive(Frame)]` (a dev-dep cycle, allowed).

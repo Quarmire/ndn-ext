@@ -92,8 +92,10 @@ fn main() {
     // heavy ABE-by-role / sealed-box distribution; the leaf just holds the key).
     println!("\n== leaf publishes a CONFIDENTIAL feed (symmetric scope key) ==");
     let scope_key = ScopeKey::from_bytes([7u8; 32]);
+    // `publisher_id` (here 1) must be unique among leaves sharing the scope key —
+    // it is the high 4 bytes of the AEAD nonce, so two leaves never collide.
     let mut secure_sensor =
-        Publisher::<Reading>::sealed("/sensor/lab-3/secure".parse().unwrap(), scope_key.clone());
+        Publisher::<Reading>::sealed("/sensor/lab-3/secure".parse().unwrap(), scope_key.clone(), 1);
     let mut secure_radio = RadioSink::default();
 
     secure_sensor
