@@ -41,3 +41,10 @@ pub type ShmFace = spsc::SpscFace;
 
 #[cfg(unix)]
 pub type ShmHandle = spsc::SpscHandle;
+
+/// Capability-scoped (fd-passed) control-socket handshake — the G11 "Option A"
+/// path that replaces named SHM objects/FIFOs. [`mint_token`] mints the
+/// one-time capability; the engine serves the face's fds with [`serve_fd_handoff`];
+/// the client receives them with [`connect_fd_handoff`].
+#[cfg(unix)]
+pub use spsc::{ShmToken, connect_fd_handoff, mint_token, serve_fd_handoff};

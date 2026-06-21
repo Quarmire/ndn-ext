@@ -472,7 +472,6 @@ unsafe fn ring_peek_consume<R>(
 /// ride with ≥1 data byte). Up to 8 fds in one message. This is how an
 /// anonymous ([`ShmRegion::create_anon`]) region + its wakeup channels are
 /// handed to the peer **without ever appearing in a shared namespace**.
-#[allow(dead_code)] // used by tests now; wired into the control-socket handshake + ndn-ipc-shm in G11 2b-tail
 fn send_fds(sock: RawFd, fds: &[RawFd]) -> std::io::Result<()> {
     if fds.is_empty() || fds.len() > 8 {
         return Err(std::io::Error::other("send_fds: 1..=8 fds required"));
@@ -512,7 +511,6 @@ fn send_fds(sock: RawFd, fds: &[RawFd]) -> std::io::Result<()> {
 /// Receive up to `max` file descriptors from a Unix-socket peer (`SCM_RIGHTS`),
 /// as `OwnedFd`s. Errors if the peer closed without sending, or if the control
 /// buffer was truncated (which would silently leak the in-flight fds).
-#[allow(dead_code)] // used by tests now; wired into the control-socket handshake + ndn-ipc-shm in G11 2b-tail
 fn recv_fds(sock: RawFd, max: usize) -> std::io::Result<Vec<OwnedFd>> {
     let mut dummy = [0u8; 1];
     let mut iov = libc::iovec {
@@ -570,6 +568,85 @@ fn recv_fds(sock: RawFd, max: usize) -> std::io::Result<Vec<OwnedFd>> {
         }
     }
     Ok(fds)
+}
+
+/// A 32-byte one-time capability token gating the SHM control-socket fd handoff.
+pub type ShmToken = [u8; 32];
+
+/// Mint a high-entropy capability token. Uses `getentropy(2)` (kernel CSPRNG,
+/// no file descriptor — present on both Linux and macOS), so it can't fail under
+/// fd pressure the way opening `/dev/urandom` would.
+pub fn mint_token() -> std::io::Result<ShmToken> {
+    let mut t = [0u8; 32];
+    let r = unsafe { libc::getentropy(t.as_mut_ptr() as *mut libc::c_void, t.len()) };
+    if r != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(t)
+}
+
+/// Constant-time equality — no early-out timing leak when comparing the token.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// **Engine side of the Option-A handshake:** accept ONE client on `listener`,
+/// require it to present `token`, then hand it the face's three fds
+/// (`[region, a2e_write, e2a_read]` from [`SpscFace::create_anon_with`]) via
+/// `SCM_RIGHTS`. The socket may be world-connectable — **the token is the
+/// capability** (constant-time compared), so an unauthorized connector receives
+/// nothing. Async accept; the brief blocking `SCM_RIGHTS` exchange runs on a
+/// blocking task so it never stalls the runtime.
+pub async fn serve_fd_handoff(
+    listener: &tokio::net::UnixListener,
+    token: ShmToken,
+    fds: [OwnedFd; 3],
+) -> std::io::Result<()> {
+    let (stream, _addr) = listener.accept().await?;
+    let std_stream = stream.into_std()?;
+    std_stream.set_nonblocking(false)?;
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        use std::io::Read;
+        let mut s = std_stream;
+        let mut tok = [0u8; 32];
+        s.read_exact(&mut tok)?;
+        if !ct_eq(&tok, &token) {
+            return Err(std::io::Error::other("shm control: token mismatch"));
+        }
+        send_fds(
+            s.as_raw_fd(),
+            &[fds[0].as_raw_fd(), fds[1].as_raw_fd(), fds[2].as_raw_fd()],
+        )
+    })
+    .await
+    .map_err(|e| std::io::Error::other(format!("shm control handoff task: {e}")))?
+}
+
+/// **Client side of the Option-A handshake:** connect to the control socket at
+/// `path`, present `token`, receive the face's three fds, and build the
+/// [`SpscHandle`]. Blocking — call via `spawn_blocking` from async code.
+pub fn connect_fd_handoff(path: &std::path::Path, token: &ShmToken) -> Result<SpscHandle, ShmError> {
+    use std::io::Write;
+    let mut s = std::os::unix::net::UnixStream::connect(path).map_err(ShmError::Io)?;
+    s.write_all(token).map_err(ShmError::Io)?;
+    let mut fds = recv_fds(s.as_raw_fd(), 3).map_err(ShmError::Io)?;
+    if fds.len() != 3 {
+        return Err(ShmError::Io(std::io::Error::other(
+            "shm control: expected 3 fds",
+        )));
+    }
+    // order: [region, a2e_write, e2a_read]
+    let e2a_read = fds.pop().unwrap();
+    let a2e_write = fds.pop().unwrap();
+    let region = fds.pop().unwrap();
+    SpscHandle::from_fds(region, a2e_write, e2a_read)
 }
 
 fn set_nonblock_cloexec(fd: RawFd) -> Result<(), ShmError> {
@@ -1672,6 +1749,63 @@ mod tests {
         assert_eq!(&down[..], b"down");
 
         drop((a, b));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn control_socket_handshake_round_trip() {
+        use std::time::Duration;
+
+        let path = std::env::temp_dir().join(format!("ndn-shm-ctl-rt-{}.sock", test_name()));
+        let _ = std::fs::remove_file(&path);
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let token = mint_token().unwrap();
+
+        let (face, fds) =
+            SpscFace::create_anon_with(FaceId(88), DEFAULT_CAPACITY, DEFAULT_SLOT_SIZE).unwrap();
+
+        // Engine serves the fds to the first client presenting the token.
+        let server = tokio::spawn(async move { serve_fd_handoff(&listener, token, fds).await });
+
+        // Client connects + presents the token (blocking helper on a blocking task).
+        let cpath = path.clone();
+        let handle = tokio::task::spawn_blocking(move || connect_fd_handoff(&cpath, &token))
+            .await
+            .unwrap()
+            .expect("handshake");
+        server.await.unwrap().expect("server handoff");
+
+        // The handed-off ring works end to end.
+        handle.send_bytes(Bytes::from_static(b"hi")).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(2), face.recv_bytes())
+            .await
+            .expect("timed out")
+            .unwrap();
+        assert_eq!(&got[..], b"hi");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn control_socket_rejects_wrong_token() {
+        let path = std::env::temp_dir().join(format!("ndn-shm-ctl-wt-{}.sock", test_name()));
+        let _ = std::fs::remove_file(&path);
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let token = mint_token().unwrap();
+
+        let (_face, fds) =
+            SpscFace::create_anon_with(FaceId(89), DEFAULT_CAPACITY, DEFAULT_SLOT_SIZE).unwrap();
+        let server = tokio::spawn(async move { serve_fd_handoff(&listener, token, fds).await });
+
+        // A client presenting the WRONG token gets no fds.
+        let wrong = [0xAAu8; 32];
+        let cpath = path.clone();
+        let res = tokio::task::spawn_blocking(move || connect_fd_handoff(&cpath, &wrong))
+            .await
+            .unwrap();
+        assert!(res.is_err(), "wrong token must be refused the fds");
+        assert!(server.await.unwrap().is_err(), "server must reject a bad token");
+
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
