@@ -22,8 +22,9 @@
 //! check. The total order prevents the producer from missing a sleeping
 //! consumer.
 use std::ffi::CString;
+use std::os::unix::io::{FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use bytes::Bytes;
 
@@ -170,6 +171,101 @@ impl ShmRegion {
                 0,
             );
             libc::close(fd);
+            if p == libc::MAP_FAILED {
+                return Err(ShmError::Io(std::io::Error::last_os_error()));
+            }
+            p as *mut u8
+        };
+        Ok(ShmRegion {
+            ptr,
+            size,
+            shm_name: None,
+        })
+    }
+
+    /// Create an **anonymous**, capability-scoped SHM region: `shm_open` a
+    /// high-entropy `O_EXCL` name at `0o600`, map it, then `shm_unlink` the name
+    /// *immediately* so the region survives only through the returned fd — it
+    /// never lingers in `/dev/shm` for another process to list/open. The fd is
+    /// then handed to the peer out-of-band via `SCM_RIGHTS` ([`send_fds`]).
+    ///
+    /// This is the portable stand-in for Linux `memfd_create` (which is absent on
+    /// macOS, the dev target): `O_CREAT|O_EXCL` + a retry loop defeats name
+    /// pre-creation, and the immediate unlink + `0o600` close the `/dev/shm`
+    /// listing leak the named-region path has.
+    // Wired into the SpscFace/SpscHandle control-socket handshake in G11
+    // increment 2b; proven now by `anon_region_fd_passing_shares_memory`.
+    #[allow(dead_code)]
+    fn create_anon(size: usize) -> Result<(Self, OwnedFd), ShmError> {
+        static ANON_CTR: AtomicU64 = AtomicU64::new(0);
+        let pid = unsafe { libc::getpid() };
+        for _ in 0..64 {
+            let n = ANON_CTR.fetch_add(1, Ordering::Relaxed);
+            let name = format!("/ndnshm-{pid}-{n}");
+            let cname = CString::new(name).map_err(|_| ShmError::InvalidName)?;
+            let fd = unsafe {
+                libc::shm_open(
+                    cname.as_ptr(),
+                    libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+                    0o600 as libc::mode_t as libc::c_uint,
+                )
+            };
+            if fd == -1 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EEXIST) {
+                    continue; // name collision (or squatting) — pick another
+                }
+                return Err(ShmError::Io(err));
+            }
+            // Unlink the name now: the region lives on via `fd` + our mapping.
+            unsafe { libc::shm_unlink(cname.as_ptr()) };
+            let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+            let ptr = unsafe {
+                if libc::ftruncate(fd, size as libc::off_t) == -1 {
+                    return Err(ShmError::Io(std::io::Error::last_os_error()));
+                }
+                let p = libc::mmap(
+                    std::ptr::null_mut(),
+                    size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    fd,
+                    0,
+                );
+                if p == libc::MAP_FAILED {
+                    return Err(ShmError::Io(std::io::Error::last_os_error()));
+                }
+                p as *mut u8
+            };
+            return Ok((
+                ShmRegion {
+                    ptr,
+                    size,
+                    shm_name: None, // already unlinked — nothing to clean on drop
+                },
+                owned,
+            ));
+        }
+        Err(ShmError::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not allocate an anonymous SHM name after 64 tries",
+        )))
+    }
+
+    /// Map a region received as an fd (via [`recv_fds`]). The caller owns `fd`'s
+    /// lifetime; this only mmaps it (and `munmap`s on drop). No name is involved,
+    /// so nothing is unlinked on drop.
+    #[allow(dead_code)] // wired in G11 increment 2b
+    fn from_fd(fd: RawFd, size: usize) -> Result<Self, ShmError> {
+        let ptr = unsafe {
+            let p = libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            );
             if p == libc::MAP_FAILED {
                 return Err(ShmError::Io(std::io::Error::last_os_error()));
             }
@@ -373,6 +469,111 @@ unsafe fn ring_peek_consume<R>(
     };
     head_a.store(h.wrapping_add(1), Ordering::Release);
     Some(out)
+}
+
+/// Send file descriptors to a connected Unix-socket peer via `SCM_RIGHTS`,
+/// alongside one byte of normal data (the kernel requires ancillary data to
+/// ride with ≥1 data byte). Up to 8 fds in one message. This is how an
+/// anonymous ([`ShmRegion::create_anon`]) region + its wakeup channels are
+/// handed to the peer **without ever appearing in a shared namespace**.
+#[allow(dead_code)] // wired into the control-socket handshake in G11 increment 2b
+fn send_fds(sock: RawFd, fds: &[RawFd]) -> std::io::Result<()> {
+    if fds.is_empty() || fds.len() > 8 {
+        return Err(std::io::Error::other("send_fds: 1..=8 fds required"));
+    }
+    let mut dummy: [u8; 1] = [0xED];
+    let mut iov = libc::iovec {
+        iov_base: dummy.as_mut_ptr() as *mut libc::c_void,
+        iov_len: 1,
+    };
+    let fds_bytes = std::mem::size_of_val(fds);
+    let mut cbuf = [0u8; 128]; // > CMSG_SPACE(8 * size_of::<RawFd>())
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov as *mut libc::iovec;
+    msg.msg_iovlen = 1 as _;
+    msg.msg_control = cbuf.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_controllen = unsafe { libc::CMSG_SPACE(fds_bytes as libc::c_uint) } as _;
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(fds_bytes as libc::c_uint) as _;
+        std::ptr::copy_nonoverlapping(fds.as_ptr(), libc::CMSG_DATA(cmsg) as *mut RawFd, fds.len());
+        loop {
+            let n = libc::sendmsg(sock, &msg, 0);
+            if n < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(e);
+            }
+            return Ok(());
+        }
+    }
+}
+
+/// Receive up to `max` file descriptors from a Unix-socket peer (`SCM_RIGHTS`),
+/// as `OwnedFd`s. Errors if the peer closed without sending, or if the control
+/// buffer was truncated (which would silently leak the in-flight fds).
+#[allow(dead_code)] // wired into the control-socket handshake in G11 increment 2b
+fn recv_fds(sock: RawFd, max: usize) -> std::io::Result<Vec<OwnedFd>> {
+    let mut dummy = [0u8; 1];
+    let mut iov = libc::iovec {
+        iov_base: dummy.as_mut_ptr() as *mut libc::c_void,
+        iov_len: 1,
+    };
+    let mut cbuf = [0u8; 128];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov as *mut libc::iovec;
+    msg.msg_iovlen = 1 as _;
+    msg.msg_control = cbuf.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_controllen = cbuf.len() as _;
+    let n = unsafe {
+        loop {
+            let r = libc::recvmsg(sock, &mut msg, 0);
+            if r < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(e);
+            }
+            break r;
+        }
+    };
+    if n == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "peer closed before sending fds",
+        ));
+    }
+    if msg.msg_flags & libc::MSG_CTRUNC != 0 {
+        return Err(std::io::Error::other("fd control message truncated"));
+    }
+    let mut fds = Vec::new();
+    unsafe {
+        let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+        while !cmsg.is_null() {
+            if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
+                let data = libc::CMSG_DATA(cmsg);
+                let payload = (*cmsg).cmsg_len as usize - (data as usize - cmsg as usize);
+                let count = payload / std::mem::size_of::<RawFd>();
+                for i in 0..count {
+                    if fds.len() >= max {
+                        // Close any fds beyond the cap so they don't leak.
+                        let raw = (data as *const RawFd).add(i).read_unaligned();
+                        libc::close(raw);
+                        continue;
+                    }
+                    let raw = (data as *const RawFd).add(i).read_unaligned();
+                    fds.push(OwnedFd::from_raw_fd(raw));
+                }
+            }
+            cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+        }
+    }
+    Ok(fds)
 }
 
 /// `O_RDWR` avoids the blocking-open problem where `open` blocks until the
@@ -1255,5 +1456,52 @@ mod tests {
         .unwrap();
         assert_eq!(&a, b"first");
         assert_eq!(&b, b"second");
+    }
+
+    // --- capability-scoped anonymous region via fd-passing (G11 incr. 2) ---
+
+    #[test]
+    fn anon_region_fd_passing_shares_memory() {
+        use std::os::unix::io::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        // Anonymous region (name unlinked immediately) + a marker written in.
+        let (region, fd) = ShmRegion::create_anon(4096).unwrap();
+        unsafe {
+            (region.as_ptr() as *mut u64).write_unaligned(0xFEED_FACE_DEAD_BEEF);
+        }
+
+        // Hand the fd to the "peer" over a socketpair via SCM_RIGHTS.
+        let (a, b) = UnixStream::pair().unwrap();
+        send_fds(a.as_raw_fd(), &[fd.as_raw_fd()]).unwrap();
+        let received = recv_fds(b.as_raw_fd(), 1).unwrap();
+        assert_eq!(received.len(), 1);
+
+        // The received fd maps the SAME physical region — the marker is visible
+        // without any shared name (proves the capability is the fd, not a path).
+        let mapped = ShmRegion::from_fd(received[0].as_raw_fd(), 4096).unwrap();
+        let seen = unsafe { (mapped.as_ptr() as *const u64).read_unaligned() };
+        assert_eq!(seen, 0xFEED_FACE_DEAD_BEEF, "fd-passed region must share memory");
+
+        // Write through the peer mapping, read through the original → truly shared.
+        unsafe {
+            (mapped.as_ptr().add(8) as *mut u32).write_unaligned(0x1234_5678);
+        }
+        let back = unsafe { (region.as_ptr().add(8) as *const u32).read_unaligned() };
+        assert_eq!(back, 0x1234_5678, "writes through the fd mapping must be shared");
+    }
+
+    #[test]
+    fn anon_region_names_do_not_collide() {
+        // Two anonymous regions are independent (distinct mappings), and neither
+        // lingers in the namespace (created O_EXCL + unlinked).
+        let (r1, _f1) = ShmRegion::create_anon(4096).unwrap();
+        let (r2, _f2) = ShmRegion::create_anon(4096).unwrap();
+        unsafe {
+            (r1.as_ptr() as *mut u32).write_unaligned(11);
+            (r2.as_ptr() as *mut u32).write_unaligned(22);
+            assert_eq!((r1.as_ptr() as *const u32).read_unaligned(), 11);
+            assert_eq!((r2.as_ptr() as *const u32).read_unaligned(), 22);
+        }
     }
 }
