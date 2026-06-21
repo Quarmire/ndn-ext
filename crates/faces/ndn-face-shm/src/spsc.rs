@@ -22,7 +22,7 @@
 //! check. The total order prevents the producer from missing a sleeping
 //! consumer.
 use std::ffi::CString;
-use std::os::unix::io::{FromRawFd, OwnedFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -193,9 +193,6 @@ impl ShmRegion {
     /// macOS, the dev target): `O_CREAT|O_EXCL` + a retry loop defeats name
     /// pre-creation, and the immediate unlink + `0o600` close the `/dev/shm`
     /// listing leak the named-region path has.
-    // Wired into the SpscFace/SpscHandle control-socket handshake in G11
-    // increment 2b; proven now by `anon_region_fd_passing_shares_memory`.
-    #[allow(dead_code)]
     fn create_anon(size: usize) -> Result<(Self, OwnedFd), ShmError> {
         static ANON_CTR: AtomicU64 = AtomicU64::new(0);
         let pid = unsafe { libc::getpid() };
@@ -255,7 +252,6 @@ impl ShmRegion {
     /// Map a region received as an fd (via [`recv_fds`]). The caller owns `fd`'s
     /// lifetime; this only mmaps it (and `munmap`s on drop). No name is involved,
     /// so nothing is unlinked on drop.
-    #[allow(dead_code)] // wired in G11 increment 2b
     fn from_fd(fd: RawFd, size: usize) -> Result<Self, ShmError> {
         let ptr = unsafe {
             let p = libc::mmap(
@@ -476,7 +472,7 @@ unsafe fn ring_peek_consume<R>(
 /// ride with ≥1 data byte). Up to 8 fds in one message. This is how an
 /// anonymous ([`ShmRegion::create_anon`]) region + its wakeup channels are
 /// handed to the peer **without ever appearing in a shared namespace**.
-#[allow(dead_code)] // wired into the control-socket handshake in G11 increment 2b
+#[allow(dead_code)] // used by tests now; wired into the control-socket handshake + ndn-ipc-shm in G11 2b-tail
 fn send_fds(sock: RawFd, fds: &[RawFd]) -> std::io::Result<()> {
     if fds.is_empty() || fds.len() > 8 {
         return Err(std::io::Error::other("send_fds: 1..=8 fds required"));
@@ -516,7 +512,7 @@ fn send_fds(sock: RawFd, fds: &[RawFd]) -> std::io::Result<()> {
 /// Receive up to `max` file descriptors from a Unix-socket peer (`SCM_RIGHTS`),
 /// as `OwnedFd`s. Errors if the peer closed without sending, or if the control
 /// buffer was truncated (which would silently leak the in-flight fds).
-#[allow(dead_code)] // wired into the control-socket handshake in G11 increment 2b
+#[allow(dead_code)] // used by tests now; wired into the control-socket handshake + ndn-ipc-shm in G11 2b-tail
 fn recv_fds(sock: RawFd, max: usize) -> std::io::Result<Vec<OwnedFd>> {
     let mut dummy = [0u8; 1];
     let mut iov = libc::iovec {
@@ -574,6 +570,35 @@ fn recv_fds(sock: RawFd, max: usize) -> std::io::Result<Vec<OwnedFd>> {
         }
     }
     Ok(fds)
+}
+
+fn set_nonblock_cloexec(fd: RawFd) -> Result<(), ShmError> {
+    unsafe {
+        let fl = libc::fcntl(fd, libc::F_GETFL);
+        if fl == -1 || libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK) == -1 {
+            return Err(ShmError::Io(std::io::Error::last_os_error()));
+        }
+        let fdfl = libc::fcntl(fd, libc::F_GETFD);
+        if fdfl == -1 || libc::fcntl(fd, libc::F_SETFD, fdfl | libc::FD_CLOEXEC) == -1 {
+            return Err(ShmError::Io(std::io::Error::last_os_error()));
+        }
+    }
+    Ok(())
+}
+
+/// An anonymous wakeup pipe `(read_end, write_end)`, both non-blocking +
+/// close-on-exec. Replaces the named-FIFO wakeup for fd-passed faces — `pipe`
+/// + `fcntl` rather than Linux-only `pipe2`, so it builds on macOS too.
+fn anon_pipe() -> Result<(OwnedFd, OwnedFd), ShmError> {
+    let mut fds = [0 as RawFd; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } == -1 {
+        return Err(ShmError::Io(std::io::Error::last_os_error()));
+    }
+    let r = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    let w = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    set_nonblock_cloexec(r.as_raw_fd())?;
+    set_nonblock_cloexec(w.as_raw_fd())?;
+    Ok((r, w))
 }
 
 /// `O_RDWR` avoids the blocking-open problem where `open` blocks until the
@@ -636,8 +661,10 @@ pub struct SpscFace {
     e2a_off: usize,
     a2e_rx: tokio::io::unix::AsyncFd<std::os::unix::io::OwnedFd>,
     e2a_tx: std::os::unix::io::OwnedFd,
-    a2e_pipe_path: PathBuf,
-    e2a_pipe_path: PathBuf,
+    // `None` for an anonymous (fd-passed) face: it has no named FIFOs to unlink —
+    // its wakeup channels are anonymous pipes received over the control socket.
+    a2e_pipe_path: Option<PathBuf>,
+    e2a_pipe_path: Option<PathBuf>,
 }
 
 impl SpscFace {
@@ -695,9 +722,51 @@ impl SpscFace {
             e2a_off,
             a2e_rx,
             e2a_tx,
-            a2e_pipe_path: a2e_path,
-            e2a_pipe_path: e2a_path,
+            a2e_pipe_path: Some(a2e_path),
+            e2a_pipe_path: Some(e2a_path),
         })
+    }
+
+    /// Create an **anonymous, capability-scoped** face: an fd-only SHM region
+    /// ([`ShmRegion::create_anon`]) + two anonymous wakeup pipes — **no named SHM
+    /// object, no named FIFOs**, so nothing appears in any shared namespace.
+    /// Returns the engine-side face plus the three fds to hand the peer via
+    /// [`send_fds`], in the fixed order **`[region, a2e_write, e2a_read]`**; the
+    /// peer rebuilds with [`SpscHandle::from_fds`]. This is the G11 capability-
+    /// scoped data plane: the fds *are* the capability.
+    pub fn create_anon_with(
+        id: FaceId,
+        capacity: u32,
+        slot_size: u32,
+    ) -> Result<(Self, [OwnedFd; 3]), ShmError> {
+        use tokio::io::unix::AsyncFd;
+
+        let size = shm_total_size(capacity, slot_size);
+        let (shm, region_fd) = ShmRegion::create_anon(size)?;
+        unsafe {
+            shm.write_header(capacity, slot_size);
+        }
+        let a2e_off = a2e_ring_offset();
+        let e2a_off = e2a_ring_offset(capacity, slot_size);
+
+        // a2e wakeup: face reads, peer writes. e2a wakeup: face writes, peer reads.
+        let (a2e_r, a2e_w) = anon_pipe()?;
+        let (e2a_r, e2a_w) = anon_pipe()?;
+        let a2e_rx = AsyncFd::new(a2e_r).map_err(ShmError::Io)?;
+
+        let face = SpscFace {
+            id,
+            shm,
+            capacity,
+            slot_size,
+            a2e_off,
+            e2a_off,
+            a2e_rx,
+            e2a_tx: e2a_w,
+            a2e_pipe_path: None,
+            e2a_pipe_path: None,
+        };
+        Ok((face, [region_fd, a2e_w, e2a_r]))
     }
 
     fn try_pop_a2e(&self) -> Option<Bytes> {
@@ -833,8 +902,12 @@ impl SpscFace {
 
 impl Drop for SpscFace {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.a2e_pipe_path);
-        let _ = std::fs::remove_file(&self.e2a_pipe_path);
+        if let Some(p) = &self.a2e_pipe_path {
+            let _ = std::fs::remove_file(p);
+        }
+        if let Some(p) = &self.e2a_pipe_path {
+            let _ = std::fs::remove_file(p);
+        }
     }
 }
 
@@ -982,6 +1055,71 @@ impl SpscHandle {
             e2a_off,
             e2a_rx,
             a2e_tx,
+            cancel: tokio_util::sync::CancellationToken::new(),
+        })
+    }
+
+    /// Rebuild a handle from the three fds received via [`recv_fds`], in the
+    /// order produced by [`SpscFace::create_anon_with`]:
+    /// **`[region, a2e_write, e2a_read]`**. The region's capacity/slot size are
+    /// read from its header after mapping (the fds are the only handle — no name).
+    pub fn from_fds(
+        region_fd: OwnedFd,
+        a2e_write: OwnedFd,
+        e2a_read: OwnedFd,
+    ) -> Result<Self, ShmError> {
+        use tokio::io::unix::AsyncFd;
+
+        // Read the header from the fd to learn the geometry, then map the full
+        // region. (O_NONBLOCK on the pipe ends rides the open-file-description
+        // across SCM_RIGHTS, so the received fds are already non-blocking.)
+        let (capacity, slot_size) = unsafe {
+            let p = libc::mmap(
+                std::ptr::null_mut(),
+                HEADER_SIZE,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                region_fd.as_raw_fd(),
+                0,
+            );
+            if p == libc::MAP_FAILED {
+                return Err(ShmError::Io(std::io::Error::last_os_error()));
+            }
+            let base = p as *const u8;
+            let magic = (base as *const u64).read_unaligned();
+            if magic != MAGIC {
+                libc::munmap(p, HEADER_SIZE);
+                return Err(ShmError::InvalidMagic);
+            }
+            let cap = (base.add(8) as *const u32).read_unaligned();
+            let slen = (base.add(12) as *const u32).read_unaligned();
+            libc::munmap(p, HEADER_SIZE);
+            (cap, slen)
+        };
+
+        let size = shm_total_size(capacity, slot_size);
+        // Defensive bound: even though the region is handed by a trusted (token-
+        // gated) peer, refuse an absurd geometry rather than mmap gigabytes.
+        if size > 256 * 1024 * 1024 {
+            return Err(ShmError::InvalidMagic);
+        }
+        let shm = ShmRegion::from_fd(region_fd.as_raw_fd(), size)?;
+        // region_fd may now be dropped — the mapping persists. The pipe fds are
+        // retained (they carry the wakeups).
+        drop(region_fd);
+
+        let a2e_off = a2e_ring_offset();
+        let e2a_off = e2a_ring_offset(capacity, slot_size);
+        let e2a_rx = AsyncFd::new(e2a_read).map_err(ShmError::Io)?;
+
+        Ok(SpscHandle {
+            shm,
+            capacity,
+            slot_size,
+            a2e_off,
+            e2a_off,
+            e2a_rx,
+            a2e_tx: a2e_write,
             cancel: tokio_util::sync::CancellationToken::new(),
         })
     }
@@ -1462,7 +1600,6 @@ mod tests {
 
     #[test]
     fn anon_region_fd_passing_shares_memory() {
-        use std::os::unix::io::AsRawFd;
         use std::os::unix::net::UnixStream;
 
         // Anonymous region (name unlinked immediately) + a marker written in.
@@ -1489,6 +1626,52 @@ mod tests {
         }
         let back = unsafe { (region.as_ptr().add(8) as *const u32).read_unaligned() };
         assert_eq!(back, 0x1234_5678, "writes through the fd mapping must be shared");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn anon_face_handle_exchange_over_passed_fds() {
+        use std::os::unix::net::UnixStream;
+        use std::time::Duration;
+
+        // Engine creates an anonymous, capability-scoped face + the 3 fds to hand
+        // the peer. No named SHM object, no named FIFOs.
+        let (face, fds) =
+            SpscFace::create_anon_with(FaceId(77), DEFAULT_CAPACITY, DEFAULT_SLOT_SIZE).unwrap();
+
+        // Pass the fds over a socketpair (stands in for the control socket the
+        // mgmt bootstrap sets up in 2b-tail), then rebuild the handle from them.
+        let (a, b) = UnixStream::pair().unwrap();
+        send_fds(
+            a.as_raw_fd(),
+            &[fds[0].as_raw_fd(), fds[1].as_raw_fd(), fds[2].as_raw_fd()],
+        )
+        .unwrap();
+        drop(fds); // release the sender-side copies; the peer holds the dups
+        let mut recvd = recv_fds(b.as_raw_fd(), 3).unwrap();
+        assert_eq!(recvd.len(), 3);
+        // order: [region, a2e_write, e2a_read]
+        let e2a_read = recvd.pop().unwrap();
+        let a2e_write = recvd.pop().unwrap();
+        let region = recvd.pop().unwrap();
+        let handle = SpscHandle::from_fds(region, a2e_write, e2a_read).unwrap();
+
+        // a2e ring: handle → face.
+        handle.send_bytes(Bytes::from_static(b"up")).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(2), face.recv_bytes())
+            .await
+            .expect("timed out")
+            .unwrap();
+        assert_eq!(&got[..], b"up");
+
+        // e2a ring: face → handle, consumed in place (exercises both new paths).
+        face.send_bytes(Bytes::from_static(b"down")).await.unwrap();
+        let down = tokio::time::timeout(Duration::from_secs(2), handle.recv_with(|s| s.to_vec()))
+            .await
+            .expect("timed out")
+            .expect("closed");
+        assert_eq!(&down[..], b"down");
+
+        drop((a, b));
     }
 
     #[test]
