@@ -332,6 +332,49 @@ unsafe fn ring_pop(
     Some(data)
 }
 
+/// **Zero-copy consume:** borrow the head slot's payload in place, run `f` on it,
+/// then advance head — no intermediate `Bytes` allocation/`memcpy` (unlike
+/// [`ring_pop`]). The borrow is confined to `f`'s execution and head is advanced
+/// only after `f` returns, so the single producer cannot overwrite the slot
+/// mid-read (it cannot reuse this index until head passes it). `None` if empty.
+///
+/// For a consumer that processes-and-discards within `f` (e.g. a renderer, a
+/// digest, or a streaming sink) this removes the slot→heap copy. It is NOT for a
+/// consumer that must *retain* the bytes past `f` (e.g. forwarding into a PIT/CS,
+/// which must own the Data beyond the transient slot) — use [`ring_pop`] there.
+///
+/// # Safety
+/// Same as [`ring_pop`].
+unsafe fn ring_peek_consume<R>(
+    base: *mut u8,
+    ring_off: usize,
+    tail_off: usize,
+    head_off: usize,
+    capacity: u32,
+    slot_size: u32,
+    f: impl FnOnce(&[u8]) -> R,
+) -> Option<R> {
+    let tail_a = unsafe { AtomicU32::from_ptr(base.add(tail_off) as *mut u32) };
+    let head_a = unsafe { AtomicU32::from_ptr(base.add(head_off) as *mut u32) };
+
+    let h = head_a.load(Ordering::Relaxed);
+    let t = tail_a.load(Ordering::Acquire);
+    if h == t {
+        return None;
+    }
+
+    let idx = (h % capacity) as usize;
+    let slot = unsafe { base.add(ring_off + idx * slot_stride(slot_size)) };
+    let len = unsafe { (slot as *const u32).read_unaligned() as usize };
+    let len = len.min(slot_size as usize);
+    let out = {
+        let view = unsafe { std::slice::from_raw_parts(slot.add(4), len) };
+        f(view)
+    };
+    head_a.store(h.wrapping_add(1), Ordering::Release);
+    Some(out)
+}
+
 /// `O_RDWR` avoids the blocking-open problem where `open` blocks until the
 /// other end has also opened the FIFO.
 fn open_fifo_rdwr(path: &std::path::Path) -> Result<std::os::unix::io::OwnedFd, ShmError> {
@@ -469,6 +512,32 @@ impl SpscFace {
         }
     }
 
+    /// Cheap, allocation-free check: is there a packet waiting in the a2e ring?
+    /// Sole-consumer invariant: if this returns `true`, a following
+    /// [`Self::try_peek_consume_a2e`] is guaranteed to find the packet (only we
+    /// remove from this ring; the producer can only add).
+    fn a2e_has_data(&self) -> bool {
+        let tail =
+            unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_A2E_TAIL) as *mut u32) };
+        let head =
+            unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_A2E_HEAD) as *mut u32) };
+        head.load(Ordering::Relaxed) != tail.load(Ordering::Acquire)
+    }
+
+    fn try_peek_consume_a2e<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        unsafe {
+            ring_peek_consume(
+                self.shm.as_ptr(),
+                self.a2e_off,
+                OFF_A2E_TAIL,
+                OFF_A2E_HEAD,
+                self.capacity,
+                self.slot_size,
+                f,
+            )
+        }
+    }
+
     fn try_push_e2a(&self, data: &[u8]) -> bool {
         unsafe {
             ring_push(
@@ -526,6 +595,38 @@ impl SpscFace {
             }
         }
         Ok(())
+    }
+}
+
+impl SpscFace {
+    /// **Zero-copy receive** from the a2e ring: wait for a packet, then run `f`
+    /// on the payload **borrowed in place** in the shared slot (no
+    /// `Bytes`/`memcpy`), returning `f`'s result. Same spin→park→FIFO-wakeup
+    /// wait as [`recv_bytes`](Self::recv_bytes), but for a consumer that
+    /// processes-and-discards within `f` (renderer / digest / streaming sink).
+    /// Use `recv_bytes` when the bytes must be *retained* past `f`.
+    pub async fn recv_with<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Result<R, FaceError> {
+        let parked =
+            unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_A2E_PARKED) as *mut u32) };
+        let mut f = Some(f);
+        loop {
+            if self.a2e_has_data() {
+                return Ok(self.try_peek_consume_a2e(f.take().unwrap()).expect("data present"));
+            }
+            for _ in 0..SPIN_ITERS {
+                std::hint::spin_loop();
+                if self.a2e_has_data() {
+                    return Ok(self.try_peek_consume_a2e(f.take().unwrap()).expect("data present"));
+                }
+            }
+            parked.store(1, Ordering::SeqCst);
+            if self.a2e_has_data() {
+                parked.store(0, Ordering::Relaxed);
+                return Ok(self.try_peek_consume_a2e(f.take().unwrap()).expect("data present"));
+            }
+            pipe_await(&self.a2e_rx).await.map_err(|_| FaceError::Closed)?;
+            parked.store(0, Ordering::Relaxed);
+        }
     }
 }
 
@@ -834,6 +935,70 @@ impl SpscHandle {
             }
         }
     }
+
+    fn e2a_has_data(&self) -> bool {
+        let tail =
+            unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_E2A_TAIL) as *mut u32) };
+        let head =
+            unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_E2A_HEAD) as *mut u32) };
+        head.load(Ordering::Relaxed) != tail.load(Ordering::Acquire)
+    }
+
+    fn try_peek_consume_e2a<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        unsafe {
+            ring_peek_consume(
+                self.shm.as_ptr(),
+                self.e2a_off,
+                OFF_E2A_TAIL,
+                OFF_E2A_HEAD,
+                self.capacity,
+                self.slot_size,
+                f,
+            )
+        }
+    }
+
+    /// **Zero-copy receive** from the e2a ring: wait for a packet, then run `f`
+    /// on the payload **borrowed in place** in the shared slot (no
+    /// `Bytes`/`memcpy`), returning `Some(f(..))`. `None` on close/cancel. This
+    /// is the app/renderer-side counterpart to [`SpscFace::recv_with`] — the
+    /// common consume-in-place case (a local renderer reading Data the forwarder
+    /// hands it). Use [`recv_bytes`](Self::recv_bytes) when the bytes must be
+    /// retained past `f`.
+    pub async fn recv_with<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        if self.cancel.is_cancelled() {
+            return None;
+        }
+        let parked =
+            unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_E2A_PARKED) as *mut u32) };
+        let mut f = Some(f);
+        loop {
+            if self.e2a_has_data() {
+                return self.try_peek_consume_e2a(f.take().unwrap());
+            }
+            for _ in 0..SPIN_ITERS {
+                std::hint::spin_loop();
+                if self.e2a_has_data() {
+                    return self.try_peek_consume_e2a(f.take().unwrap());
+                }
+            }
+            parked.store(1, Ordering::SeqCst);
+            if self.e2a_has_data() {
+                parked.store(0, Ordering::Relaxed);
+                return self.try_peek_consume_e2a(f.take().unwrap());
+            }
+            tokio::select! {
+                result = pipe_await(&self.e2a_rx) => {
+                    parked.store(0, Ordering::Relaxed);
+                    if result.is_err() { return None; }
+                }
+                _ = self.cancel.cancelled() => {
+                    parked.store(0, Ordering::Relaxed);
+                    return None;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1031,5 +1196,64 @@ mod tests {
             let pkt = handle.recv_bytes().await.unwrap();
             assert_eq!(&pkt[..], &vec![i + 10; 128][..]);
         }
+    }
+
+    // --- zero-copy consume-in-place (recv_with) -------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recv_with_handle_consumes_in_place() {
+        // App/renderer side: face sends, handle consumes the slot in place via a
+        // closure that derives a value (a checksum) without allocating a Bytes.
+        let name = format!("{}-rwh", test_name());
+        let face = SpscFace::create(FaceId(30), &name).unwrap();
+        let handle = SpscHandle::connect(&name).unwrap();
+
+        let payload = Bytes::from((0u8..200).collect::<Vec<_>>());
+        let expected: u64 = payload.iter().map(|&b| b as u64).sum();
+        face.send_bytes(payload.clone()).await.unwrap();
+
+        // The closure sees the bytes borrowed from the shared slot and returns a
+        // derived result; no slot→heap copy on this path.
+        let sum = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            handle.recv_with(|slot| {
+                assert_eq!(slot.len(), payload.len());
+                slot.iter().map(|&b| b as u64).sum::<u64>()
+            }),
+        )
+        .await
+        .expect("timed out")
+        .expect("closed");
+        assert_eq!(sum, expected);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recv_with_face_consumes_in_place_and_advances() {
+        // Engine side: handle sends two packets, face consumes both via recv_with;
+        // verify the head advances (second recv sees the second packet, not a
+        // re-read of the first).
+        let name = format!("{}-rwf", test_name());
+        let face = SpscFace::create(FaceId(31), &name).unwrap();
+        let handle = SpscHandle::connect(&name).unwrap();
+
+        handle.send_bytes(Bytes::from_static(b"first")).await.unwrap();
+        handle.send_bytes(Bytes::from_static(b"second")).await.unwrap();
+
+        let a = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            face.recv_with(|slot| slot.to_vec()),
+        )
+        .await
+        .expect("timed out")
+        .unwrap();
+        let b = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            face.recv_with(|slot| slot.to_vec()),
+        )
+        .await
+        .expect("timed out")
+        .unwrap();
+        assert_eq!(&a, b"first");
+        assert_eq!(&b, b"second");
     }
 }
