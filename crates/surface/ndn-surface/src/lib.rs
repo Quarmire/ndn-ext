@@ -1074,6 +1074,144 @@ impl ClientSurface {
     }
 }
 
+// ---- last-value / state surface ----------------------------------------------
+//
+// A streaming surface only carries frames published *after* a subscriber attaches.
+// A state surface keeps the current value and hands it to a late subscriber on
+// attach, then streams subsequent updates. Implemented as a single-writer actor —
+// the actor is the *sole* writer to every subscriber's ring (so SPSC holds): it
+// broadcasts each new value and, when a new subscriber folds in, sends it the
+// retained value immediately (no wait for the next update).
+
+async fn send_state_frame(
+    face: &ShmFace,
+    surface: &Name,
+    seq: u64,
+    value: &[u8],
+) -> Result<(), SurfaceError> {
+    let b = DataBuilder::new(surface.clone().append_version(seq), value);
+    let len = b.encoded_len_digest_sha256();
+    face.send_with(len, |slot| {
+        b.encode_digest_sha256_into(slot);
+    })
+    .await
+    .map_err(|e| SurfaceError::Face(e.to_string()))
+}
+
+async fn state_actor(
+    mut values: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    mut faces_rx: tokio::sync::mpsc::UnboundedReceiver<ShmFace>,
+    surface: Name,
+) {
+    let mut faces: Vec<ShmFace> = Vec::new();
+    let mut retained: Option<Vec<u8>> = None;
+    let mut seq = 0u64;
+    loop {
+        tokio::select! {
+            v = values.recv() => match v {
+                Some(v) => {
+                    seq += 1;
+                    for face in &faces {
+                        let _ = send_state_frame(face, &surface, seq, &v).await;
+                    }
+                    retained = Some(v);
+                }
+                None => {
+                    // all publishers gone — signal EOS to every subscriber, then stop.
+                    for face in &faces {
+                        let _ = face.send_with(1, |s| s[0] = EOS_MARKER).await;
+                    }
+                    break;
+                }
+            },
+            face = faces_rx.recv() => if let Some(face) = face {
+                if let Some(v) = &retained {
+                    let _ = send_state_frame(&face, &surface, seq, v).await;
+                }
+                faces.push(face);
+            },
+        }
+    }
+}
+
+/// Publishes a **named state value** (a register): the current value is retained
+/// and delivered to every subscriber on attach, with subsequent `set`s streamed as
+/// updates. Many subscribers; the publisher is the single writer.
+pub struct StatePublisher {
+    values: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    path: PathBuf,
+    serve: tokio::task::JoinHandle<()>,
+}
+
+impl StatePublisher {
+    /// Open a state surface named `name`.
+    pub async fn open(name: impl Into<Name>) -> Result<Self, SurfaceError> {
+        let name = name.into();
+        let cap = rendezvous_token(&name);
+        let path = control_socket_path(&rendezvous_token(&name));
+        let _ = std::fs::remove_file(&path);
+        let listener = tokio::net::UnixListener::bind(&path)?;
+        let (faces_tx, faces_rx) = tokio::sync::mpsc::unbounded_channel::<ShmFace>();
+        let serve = tokio::spawn(async move {
+            let _ = serve_fd_handoff_loop(listener, cap, move || {
+                let (face, fds) = ShmFace::create_anon_for_mtu(FaceId(0), DEFAULT_MAX_FRAME)
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                let _ = faces_tx.send(face);
+                Ok(fds)
+            })
+            .await;
+        });
+        let (values, values_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        // Detached: when `values` drops (publisher gone) the actor sends EOS + exits.
+        tokio::spawn(state_actor(values_rx, faces_rx, name));
+        Ok(Self {
+            values,
+            path,
+            serve,
+        })
+    }
+
+    /// Set the current value: delivered to every attached subscriber and retained
+    /// for those that attach later.
+    pub fn set(&self, value: &[u8]) -> Result<(), SurfaceError> {
+        self.values
+            .send(value.to_vec())
+            .map_err(|_| SurfaceError::Face("state surface closed".into()))
+    }
+}
+
+impl Drop for StatePublisher {
+    fn drop(&mut self) {
+        // Abort only the accept task; the actor is detached and self-terminates
+        // (sends EOS to subscribers) once `values` drops with this struct.
+        self.serve.abort();
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Reads a [`StatePublisher`] state surface: the first [`next`](Self::next) returns
+/// the current value (sent on attach); subsequent calls return updates; `None` when
+/// the publisher closes.
+pub struct StateSubscriber {
+    inner: NamedSubscriber,
+}
+
+impl StateSubscriber {
+    /// Attach to the state surface named `name`.
+    pub async fn connect(name: impl Into<Name>) -> Result<Self, SurfaceError> {
+        Ok(Self {
+            inner: NamedSubscriber::connect(name).await?,
+        })
+    }
+
+    /// The next value — current-on-attach, then each update.
+    pub async fn next(&mut self) -> Option<Bytes> {
+        self.inner
+            .next_frame(|f| Bytes::copy_from_slice(f.content))
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1278,6 +1416,48 @@ mod tests {
             }
             assert_eq!(complete, Some(true), "clean close reaches every subscriber");
         }
+    }
+
+    // ---- phase-2: last-value / state surface -----------------------------
+
+    /// A subscriber that attaches AFTER a value was set still receives the current
+    /// value on attach, then sees the next update. (Streaming surfaces only deliver
+    /// post-attach frames; the state surface retains the last value.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn state_late_subscriber_gets_current_then_updates() {
+        let pubr = StatePublisher::open("/state/cfg").await.unwrap();
+        pubr.set(b"v1").unwrap();
+        // No subscriber existed when v1 was set.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut late = StateSubscriber::connect("/state/cfg").await.unwrap();
+        let cur = timeout(Duration::from_secs(2), late.next())
+            .await
+            .expect("no stall")
+            .expect("current value on attach");
+        assert_eq!(&cur[..], b"v1", "late subscriber gets the retained value");
+
+        pubr.set(b"v2").unwrap();
+        let upd = timeout(Duration::from_secs(2), late.next())
+            .await
+            .expect("no stall")
+            .expect("update");
+        assert_eq!(&upd[..], b"v2", "subsequent set streamed as an update");
+    }
+
+    /// Two subscribers attached at different times both converge on the latest value.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn state_multi_subscriber_converges() {
+        let pubr = StatePublisher::open("/state/multi").await.unwrap();
+        let mut a = StateSubscriber::connect("/state/multi").await.unwrap();
+        pubr.set(b"x").unwrap();
+        let va = timeout(Duration::from_secs(2), a.next()).await.unwrap().unwrap();
+        assert_eq!(&va[..], b"x");
+
+        // b attaches late, still gets the current value.
+        let mut b = StateSubscriber::connect("/state/multi").await.unwrap();
+        let vb = timeout(Duration::from_secs(2), b.next()).await.unwrap().unwrap();
+        assert_eq!(&vb[..], b"x", "late subscriber b also sees current value");
     }
 
     // ---- phase-2: duplex request/reply -----------------------------------
