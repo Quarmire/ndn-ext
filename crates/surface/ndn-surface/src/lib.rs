@@ -54,9 +54,10 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use ndn_app::{Consumer, Producer};
 use ndn_face_shm::{
-    SealedReader, SealedWriter, SharedBuffer, SharedBufferReader, ShmFace, ShmHandle, ShmToken,
-    connect_fd_handoff, connect_sealed_handoff, control_socket_path, mutual_auth_client,
-    mutual_auth_server, recv_fds, send_fds, serve_fd_handoff, serve_fd_handoff_loop,
+    BroadcastReader, BroadcastWriter, SealedReader, SealedWriter, SharedBuffer, SharedBufferReader,
+    ShmFace, ShmHandle, ShmToken, connect_broadcast_handoff, connect_fd_handoff,
+    connect_sealed_handoff, control_socket_path, mutual_auth_client, mutual_auth_server, recv_fds,
+    send_fds, serve_broadcast_handoff, serve_fd_handoff, serve_fd_handoff_loop,
     serve_sealed_handoff,
 };
 use ndn_foundation_types::Name;
@@ -153,6 +154,11 @@ enum Sink {
     /// maps read-only — kernel-enforced single-writer, so a consumer cannot forge,
     /// without a per-frame signature. Host-local (cannot leave the host unsigned). 1:1.
     Sealed(SealedWriter),
+    /// **Broadcast (sealed lossy SPMC) surface**: one ring, N read-only consumers
+    /// each with its own cursor; the producer is never paced by a slow reader (it is
+    /// lapped — DropOld). Hash-free + forge-proof like `Sealed`. The fan-out *live*
+    /// path (e.g. NDF Spark) where keeping up matters more than losslessness.
+    Broadcast(std::sync::Arc<BroadcastWriter>),
 }
 
 /// Bind a producer's control socket **exclusively**: refuse to hijack a live owner.
@@ -221,7 +227,7 @@ async fn send_wire_to_sink(sink: &mut Sink, wire: &[u8]) -> Result<(), SurfaceEr
             }
             Ok(())
         }
-        Sink::Large { .. } | Sink::LargeFanout { .. } | Sink::Sealed(_) => Err(SurfaceError::Face(
+        Sink::Large { .. } | Sink::LargeFanout { .. } | Sink::Sealed(_) | Sink::Broadcast(_) => Err(SurfaceError::Face(
             "serve_on_forwarder is for signed streaming surfaces".into(),
         )),
     }
@@ -386,6 +392,72 @@ impl NamedPublisher {
         });
         Ok(Self {
             sink: Sink::Sealed(writer),
+            name,
+            seq: 0,
+            path,
+            serve,
+            window: None,
+            prefix_components: None,
+            retain_tx: None,
+            retain_writer: None,
+        })
+    }
+
+    /// Default ceiling on broadcast subscribers (registry slots). Generous; tune via
+    /// [`open_broadcast_with`](Self::open_broadcast_with).
+    pub const DEFAULT_BROADCAST_CONSUMERS: u32 = 64;
+
+    /// Open an **ungated broadcast** surface (default 64 KiB max frame, up to
+    /// [`DEFAULT_BROADCAST_CONSUMERS`](Self::DEFAULT_BROADCAST_CONSUMERS) readers):
+    /// one sealed ring fanned out to N read-only subscribers, each with its own
+    /// cursor. **Lossy** — a subscriber that can't keep up is lapped (DropOld) and the
+    /// producer is never blocked. The live fan-out path (vs the reliable, back-pressured
+    /// [`open_fanout`](Self::open_fanout)); forge-proof and hash-free like a local
+    /// surface, so host-local. Use [`open_broadcast_gated`](Self::open_broadcast_gated)
+    /// for access control.
+    pub async fn open_broadcast(name: impl Into<Name>) -> Result<Self, SurfaceError> {
+        let name = name.into();
+        let cap = rendezvous_token(&name);
+        Self::open_broadcast_inner(name, 64 * 1024, Self::DEFAULT_BROADCAST_CONSUMERS, cap).await
+    }
+
+    /// Broadcast surface with tuned `max_frame` and `max_consumers`.
+    pub async fn open_broadcast_with(
+        name: impl Into<Name>,
+        max_frame: usize,
+        max_consumers: u32,
+    ) -> Result<Self, SurfaceError> {
+        let name = name.into();
+        let cap = rendezvous_token(&name);
+        Self::open_broadcast_inner(name, max_frame, max_consumers, cap).await
+    }
+
+    /// Capability-gated broadcast surface (see [`open_gated`](Self::open_gated)).
+    pub async fn open_broadcast_gated(
+        name: impl Into<Name>,
+        secret: &[u8],
+    ) -> Result<Self, SurfaceError> {
+        let name = name.into();
+        let cap = capability_token(&name, secret);
+        Self::open_broadcast_inner(name, 64 * 1024, Self::DEFAULT_BROADCAST_CONSUMERS, cap).await
+    }
+
+    async fn open_broadcast_inner(
+        name: Name,
+        max_frame: usize,
+        max_consumers: u32,
+        capability: ShmToken,
+    ) -> Result<Self, SurfaceError> {
+        let (capacity, slot_size) = sealed_geometry(max_frame);
+        let writer = std::sync::Arc::new(BroadcastWriter::create(capacity, slot_size, max_consumers)?);
+        let path = control_socket_path(&rendezvous_token(&name));
+        let listener = bind_exclusive(&path)?;
+        let serve_writer = writer.clone();
+        let serve = tokio::spawn(async move {
+            let _ = serve_broadcast_handoff(listener, capability, serve_writer).await;
+        });
+        Ok(Self {
+            sink: Sink::Broadcast(writer),
             name,
             seq: 0,
             path,
@@ -657,9 +729,9 @@ impl NamedPublisher {
     /// copied into each subscriber's ring. Returns the frame's full name.
     pub async fn publish(&mut self, content: &[u8]) -> Result<Name, SurfaceError> {
         let frame_name = self.name.clone().append_version(self.seq);
-        // Local (sealed) surface: a hash-free DATA{NAME,CONTENT} frame — forge-proof
-        // by the sealed ring's read-only data mapping, so no per-frame signature.
-        if matches!(self.sink, Sink::Sealed(_)) {
+        // Sealed / broadcast surface: a hash-free DATA{NAME,CONTENT} frame — forge-proof
+        // by the ring's read-only data mapping, so no per-frame signature.
+        if matches!(self.sink, Sink::Sealed(_) | Sink::Broadcast(_)) {
             if self.prefix_components.is_none() {
                 self.prefix_components = Some(name_components_tlv(&self.name));
             }
@@ -667,15 +739,30 @@ impl NamedPublisher {
             let mut vbuf = [0u8; 10];
             let vlen = encode_version_component(self.seq, &mut vbuf);
             let l = fast_inline_len(comps.len(), vlen, content.len());
-            let Sink::Sealed(writer) = &self.sink else {
-                unreachable!()
-            };
-            writer
-                .send_with(l, |slot| {
-                    encode_fast_inline(&comps, &vbuf[..vlen], content, slot)
-                })
-                .await
-                .map_err(|e| SurfaceError::Face(e.to_string()))?;
+            match &self.sink {
+                Sink::Sealed(writer) => {
+                    // Reliable 1:1: blocking backpressure (a slow consumer paces us).
+                    writer
+                        .send_with(l, |slot| {
+                            encode_fast_inline(&comps, &vbuf[..vlen], content, slot)
+                        })
+                        .await
+                        .map_err(|e| SurfaceError::Face(e.to_string()))?;
+                }
+                Sink::Broadcast(writer) => {
+                    // Lossy SPMC: never blocks; only fails if the frame exceeds the slot.
+                    if !writer
+                        .publish_with(l, |slot| {
+                            encode_fast_inline(&comps, &vbuf[..vlen], content, slot)
+                        })
+                    {
+                        return Err(SurfaceError::Face(
+                            "broadcast frame exceeds the surface slot size".into(),
+                        ));
+                    }
+                }
+                _ => unreachable!(),
+            }
             self.seq += 1;
             return Ok(frame_name);
         }
@@ -723,7 +810,9 @@ impl NamedPublisher {
                         "use publish_large on a surface opened with open_large[_fanout]".into(),
                     ));
                 }
-                Sink::Sealed(_) => unreachable!("sealed handled before encoding the signed frame"),
+                Sink::Sealed(_) | Sink::Broadcast(_) => {
+                    unreachable!("sealed/broadcast handled before encoding the signed frame")
+                }
             }
         }
         self.seq += 1;
@@ -836,6 +925,9 @@ impl NamedPublisher {
             Sink::Sealed(_) => Err(SurfaceError::Face(
                 "sealed (local) surfaces are ephemeral and cannot be retained — use open() for durable, signed data".into(),
             )),
+            Sink::Broadcast(_) => Err(SurfaceError::Face(
+                "broadcast surfaces are lossy + hash-free and cannot be retained — use open() for durable, signed data".into(),
+            )),
             Sink::Large { .. } | Sink::LargeFanout { .. } => Err(SurfaceError::Face(
                 "retain is for streaming surfaces (large-object persistence is a separate path)".into(),
             )),
@@ -915,6 +1007,12 @@ impl NamedPublisher {
                     .await
                     .map_err(|e| SurfaceError::Face(e.to_string()))?;
             }
+            Sink::Broadcast(writer) => {
+                // Broadcast the 1-byte EOS to all readers (clean close). Lossy: a
+                // lapped reader may miss it and end as an abort instead — acceptable
+                // for a best-effort live stream.
+                writer.publish(&[EOS_MARKER]);
+            }
         }
         // Flush the durable write-behind: drop the sender so the writer drains, then
         // await it — so close() guarantees everything published is persisted.
@@ -960,6 +1058,9 @@ enum Source {
     /// Local (sealed) surface: read frames from the sealed ring (data mapped
     /// read-only — the producer is provably the sole writer).
     Sealed(SealedReader),
+    /// Broadcast (sealed lossy SPMC) surface: read frames from the shared ring with
+    /// this consumer's own cursor; lapped frames are skipped (and counted).
+    Broadcast(BroadcastReader),
     /// Durable replay: read retained frames `<surface>/v=<next>` from a store, in
     /// order, until a version is missing (end of what was retained).
     Replay {
@@ -1108,6 +1209,65 @@ impl NamedSubscriber {
             surface,
             complete: None,
         })
+    }
+
+    /// Attach to an **ungated broadcast** surface ([`open_broadcast`](NamedPublisher::open_broadcast)):
+    /// join the live ring as one of N independent read-only readers. **Lossy** — if the
+    /// producer outruns this reader by more than the ring capacity, the overrun frames
+    /// are skipped (see [`dropped`](Self::dropped)); the producer is never blocked.
+    /// Starts at the live edge (new frames only). Retries briefly until the publisher
+    /// is serving.
+    pub async fn connect_broadcast(name: impl Into<Name>) -> Result<Self, SurfaceError> {
+        let surface = name.into();
+        let cap = rendezvous_token(&surface);
+        Self::connect_broadcast_inner(surface, cap).await
+    }
+
+    /// Capability-gated broadcast attach.
+    pub async fn connect_broadcast_gated(
+        name: impl Into<Name>,
+        secret: &[u8],
+    ) -> Result<Self, SurfaceError> {
+        let surface = name.into();
+        let cap = capability_token(&surface, secret);
+        Self::connect_broadcast_inner(surface, cap).await
+    }
+
+    async fn connect_broadcast_inner(
+        surface: Name,
+        capability: ShmToken,
+    ) -> Result<Self, SurfaceError> {
+        let path = control_socket_path(&rendezvous_token(&surface));
+        let mut tried = 0u32;
+        let (data, reg, wake, idx) = loop {
+            let p = path.clone();
+            let r = tokio::task::spawn_blocking(move || connect_broadcast_handoff(&p, &capability))
+                .await
+                .map_err(|e| SurfaceError::Face(format!("join: {e}")))?;
+            match r {
+                Ok(parts) => break parts,
+                Err(_) if tried + 1 < 100 => {
+                    tried += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        };
+        let reader = BroadcastReader::from_fds(data, reg, wake, idx)?;
+        Ok(Self {
+            source: Source::Broadcast(reader),
+            surface,
+            complete: None,
+        })
+    }
+
+    /// Frames this subscriber lost to lapping on a broadcast surface (0 for any other
+    /// surface kind). A non-zero value means it isn't keeping up with the producer.
+    pub fn dropped(&self) -> u64 {
+        match &self.source {
+            Source::Broadcast(r) => r.dropped(),
+            _ => 0,
+        }
     }
 
     async fn connect_local_inner(
@@ -1319,6 +1479,31 @@ impl NamedSubscriber {
                     }
                     None => {
                         self.complete = Some(false);
+                        None
+                    }
+                }
+            }
+            Source::Broadcast(reader) => {
+                // Broadcast: a copied frame off the lossy ring (zero-copy borrow is
+                // unsound when the producer overwrites). Same frame shape + EOS/abort
+                // semantics; lapped frames were already skipped (see `dropped`).
+                match reader.recv().await {
+                    Some(wire) => {
+                        if is_eos(&wire) {
+                            self.complete = Some(true);
+                            None
+                        } else {
+                            match parse_frame(&wire) {
+                                Ok((name, content)) => Some(f(FrameRef { name, content })),
+                                Err(_) => {
+                                    self.complete = Some(false);
+                                    None
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        self.complete = Some(false); // producer gone
                         None
                     }
                 }
@@ -2295,6 +2480,78 @@ mod tests {
             }
             assert_eq!(complete, Some(true), "clean close reaches every subscriber");
         }
+    }
+
+    /// Broadcast surface: one producer fans out to N read-only subscribers that keep
+    /// up; each sees every frame, in order, and the clean close reaches all of them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn broadcast_one_to_many_live() {
+        const SUBS: usize = 3;
+        const FRAMES: u64 = 8;
+        let name = "/broadcast/live";
+        let pubr = NamedPublisher::open_broadcast(name).await.unwrap();
+
+        let mut readers = Vec::new();
+        for _ in 0..SUBS {
+            let mut sub = NamedSubscriber::connect_broadcast(name).await.unwrap();
+            readers.push(tokio::spawn(async move {
+                let mut got = Vec::new();
+                while let Some(frame) =
+                    timeout(Duration::from_secs(5), sub.next_frame(|f| f.content.to_vec()))
+                        .await
+                        .expect("no stall")
+                {
+                    got.push(frame);
+                }
+                (got, sub.is_complete(), sub.dropped())
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut pubr = pubr;
+        for i in 0..FRAMES {
+            pubr.publish(&[(i & 0xff) as u8; 500]).await.unwrap();
+        }
+        pubr.close().await.unwrap();
+
+        for r in readers {
+            let (frames, complete, dropped) = r.await.unwrap();
+            assert_eq!(frames.len() as u64, FRAMES, "keeping-up subscriber gets all frames");
+            for (i, frame) in frames.iter().enumerate() {
+                assert_eq!(frame, &vec![i as u8; 500], "frame {i} in order");
+            }
+            assert_eq!(complete, Some(true), "clean close reaches every subscriber");
+            assert_eq!(dropped, 0, "no drops when keeping up");
+        }
+    }
+
+    /// Broadcast is **lossy**: a subscriber that doesn't keep up is lapped — it loses
+    /// the overrun frames (counted in `dropped`) and resumes at the oldest retained
+    /// one, while the producer is never blocked. Forced deterministically with a tiny
+    /// ring (large `max_frame` ⇒ capacity 4) and a publish-then-read ordering.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn broadcast_lossy_laps_a_slow_subscriber() {
+        let name = "/broadcast/lossy";
+        // 1 MiB max frame ⇒ sealed_geometry capacity == 4 slots.
+        let mut pubr = NamedPublisher::open_broadcast_with(name, 1 << 20, 4).await.unwrap();
+        let mut sub = NamedSubscriber::connect_broadcast(name).await.unwrap();
+
+        // Publish 10 frames before reading any: the producer never blocks, so the
+        // 4-slot ring laps the idle subscriber.
+        for i in 0u32..10 {
+            pubr.publish(&i.to_le_bytes()).await.unwrap();
+        }
+        let mut got = Vec::new();
+        while let Some(v) = timeout(Duration::from_millis(200), sub.next_frame(|f| {
+            u32::from_le_bytes(f.content.try_into().unwrap())
+        }))
+        .await
+        .unwrap_or(None)
+        {
+            got.push(v);
+        }
+        assert_eq!(got, vec![6, 7, 8, 9], "only the last capacity-worth survive");
+        assert_eq!(sub.dropped(), 6, "the lapped frames are counted");
     }
 
     // ---- phase-2: symmetric forwarder-serve ------------------------------
