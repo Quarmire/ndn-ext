@@ -51,6 +51,7 @@ use bytes::Bytes;
 use ndn_app::Consumer;
 use ndn_face_shm::{
     ShmFace, ShmHandle, ShmToken, connect_fd_handoff, control_socket_path, serve_fd_handoff,
+    serve_fd_handoff_loop,
 };
 use ndn_foundation_types::Name;
 use ndn_packet::encode::DataBuilder;
@@ -111,11 +112,27 @@ fn sha256_parts(parts: &[&[u8]]) -> ShmToken {
     t
 }
 
-/// Publishes a stream of named frames that a local consumer can attach to by
-/// name and read zero-copy. SPSC: one subscriber per surface (a fan-out variant
-/// is future work).
+/// How a publisher delivers frames.
+enum Sink {
+    /// Reliable 1:1 — exactly one subscriber, zero-copy in-place encode, blocking
+    /// backpressure (no frame is lost; a slow consumer paces the producer).
+    Single(ShmFace),
+    /// Reliable 1→N broadcast — each subscriber gets its own ring (the SHM ring is
+    /// single-consumer). New subscribers arrive over `incoming` and are folded into
+    /// `faces` on the next `publish`. Each frame is encoded once then copied into
+    /// every ring. Lossless, but the *slowest* attached subscriber paces the rest
+    /// (a best-effort/lossy variant is a future refinement — `try_send_with`).
+    Fanout {
+        faces: Vec<ShmFace>,
+        incoming: std::sync::mpsc::Receiver<ShmFace>,
+    },
+}
+
+/// Publishes a stream of named frames a consumer attaches to **by name**. Default
+/// ([`open`](Self::open)) is reliable 1:1 zero-copy; [`open_fanout`](Self::open_fanout)
+/// broadcasts to many subscribers.
 pub struct NamedPublisher {
-    face: ShmFace,
+    sink: Sink,
     name: Name,
     seq: u64,
     path: PathBuf,
@@ -157,6 +174,26 @@ impl NamedPublisher {
         Self::open_inner(name, DEFAULT_MAX_FRAME, cap).await
     }
 
+    /// Open an **ungated fan-out** surface (default 1 MiB max frame): every
+    /// subscriber that attaches by name receives every frame, each over its own
+    /// ring. Use [`open_fanout_gated`](Self::open_fanout_gated) for access control.
+    pub async fn open_fanout(name: impl Into<Name>) -> Result<Self, SurfaceError> {
+        let name = name.into();
+        let cap = rendezvous_token(&name);
+        Self::open_fanout_inner(name, DEFAULT_MAX_FRAME, cap).await
+    }
+
+    /// Capability-gated fan-out: like [`open_fanout`](Self::open_fanout) but each
+    /// subscriber must present `secret` (see [`open_gated`](Self::open_gated)).
+    pub async fn open_fanout_gated(
+        name: impl Into<Name>,
+        secret: &[u8],
+    ) -> Result<Self, SurfaceError> {
+        let name = name.into();
+        let cap = capability_token(&name, secret);
+        Self::open_fanout_inner(name, DEFAULT_MAX_FRAME, cap).await
+    }
+
     async fn open_inner(
         name: Name,
         max_frame: usize,
@@ -171,7 +208,39 @@ impl NamedPublisher {
             let _ = serve_fd_handoff(listener, capability, fds).await;
         });
         Ok(Self {
-            face,
+            sink: Sink::Single(face),
+            name,
+            seq: 0,
+            path,
+            serve,
+        })
+    }
+
+    async fn open_fanout_inner(
+        name: Name,
+        max_frame: usize,
+        capability: ShmToken,
+    ) -> Result<Self, SurfaceError> {
+        let path = control_socket_path(&rendezvous_token(&name));
+        let _ = std::fs::remove_file(&path);
+        let listener = tokio::net::UnixListener::bind(&path)?;
+        // Each authorized attach mints a fresh ring; the face is handed to `publish`
+        // over this channel (so no lock is held across the send loop's awaits).
+        let (tx, incoming) = std::sync::mpsc::channel::<ShmFace>();
+        let serve = tokio::spawn(async move {
+            let _ = serve_fd_handoff_loop(listener, capability, move || {
+                let (face, fds) = ShmFace::create_anon_for_mtu(FaceId(0), max_frame)
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                let _ = tx.send(face); // receiver gone ⇒ shutting down
+                Ok(fds)
+            })
+            .await;
+        });
+        Ok(Self {
+            sink: Sink::Fanout {
+                faces: Vec::new(),
+                incoming,
+            },
             name,
             seq: 0,
             path,
@@ -180,35 +249,65 @@ impl NamedPublisher {
     }
 
     /// Publish the next frame: a signed NDN Data named `<surface>/v=<seq>` whose
-    /// content is `content`, encoded **directly into the shared ring slot** (no
-    /// socket transfer). Returns the frame's full name.
+    /// content is `content`. On the 1:1 path it is encoded **directly into the
+    /// shared ring slot** (zero-copy); on the fan-out path it is encoded once then
+    /// copied into each subscriber's ring. Returns the frame's full name.
     pub async fn publish(&mut self, content: &[u8]) -> Result<Name, SurfaceError> {
         let frame_name = self.name.clone().append_version(self.seq);
         let b = DataBuilder::new(frame_name.clone(), content);
         let len = b.encoded_len_digest_sha256();
-        self.face
-            .send_with(len, |slot| {
-                b.encode_digest_sha256_into(slot);
-            })
-            .await
-            .map_err(|e| SurfaceError::Face(e.to_string()))?;
+        match &mut self.sink {
+            Sink::Single(face) => {
+                face.send_with(len, |slot| {
+                    b.encode_digest_sha256_into(slot);
+                })
+                .await
+                .map_err(|e| SurfaceError::Face(e.to_string()))?;
+            }
+            Sink::Fanout { faces, incoming } => {
+                while let Ok(face) = incoming.try_recv() {
+                    faces.push(face);
+                }
+                // Encode once; broadcast the same wire into every ring.
+                let mut wire = vec![0u8; len];
+                b.encode_digest_sha256_into(&mut wire);
+                for face in faces.iter() {
+                    face.send_with(wire.len(), |slot| slot.copy_from_slice(&wire))
+                        .await
+                        .map_err(|e| SurfaceError::Face(e.to_string()))?;
+                }
+            }
+        }
         self.seq += 1;
         Ok(frame_name)
     }
 
-    /// Cleanly close the surface: emit an end-of-stream marker so a subscriber's
+    /// Cleanly close the surface: emit an end-of-stream marker so subscribers'
     /// [`next_frame`](NamedSubscriber::next_frame) returns `None` with
     /// [`is_complete`](NamedSubscriber::is_complete) `== Some(true)` — a *clean*
     /// end, distinguishable from a crash (dropping the publisher without `close`
-    /// also ends the stream, but as `Some(false)`). Consumes the publisher.
+    /// ends the stream too, but as `Some(false)`). Consumes the publisher.
     ///
     /// Local path only; remote clean-completion (NDN `FinalBlockId`) is a separate
     /// seam — see the generality note.
-    pub async fn close(self) -> Result<(), SurfaceError> {
-        self.face
-            .send_with(1, |slot| slot[0] = EOS_MARKER)
-            .await
-            .map_err(|e| SurfaceError::Face(e.to_string()))?;
+    pub async fn close(mut self) -> Result<(), SurfaceError> {
+        match &mut self.sink {
+            Sink::Single(face) => {
+                face.send_with(1, |slot| slot[0] = EOS_MARKER)
+                    .await
+                    .map_err(|e| SurfaceError::Face(e.to_string()))?;
+            }
+            Sink::Fanout { faces, incoming } => {
+                while let Ok(face) = incoming.try_recv() {
+                    faces.push(face);
+                }
+                for face in faces.iter() {
+                    face.send_with(1, |slot| slot[0] = EOS_MARKER)
+                        .await
+                        .map_err(|e| SurfaceError::Face(e.to_string()))?;
+                }
+            }
+        }
         Ok(()) // self drops here: serve task aborted, socket removed
     }
 
@@ -597,6 +696,53 @@ mod tests {
             assert_eq!(body, expected, "remote frame {i} content");
         }
         serve.abort();
+    }
+
+    // ---- phase-2: fan-out 1→N --------------------------------------------
+
+    /// One fan-out publisher feeds N subscribers, each attaching by the same name;
+    /// every subscriber receives every frame, in order, over its own ring. Proves
+    /// the 1→N broadcast shape (gap g) end-to-end through the facade.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fanout_one_to_many() {
+        const SUBS: usize = 3;
+        const FRAMES: u64 = 8;
+        let name = "/fanout/surface";
+        let mut pubr = NamedPublisher::open_fanout(name).await.unwrap();
+
+        // Attach N subscribers, each reading on its own task.
+        let mut readers = Vec::new();
+        for _ in 0..SUBS {
+            let mut sub = NamedSubscriber::connect(name).await.unwrap();
+            readers.push(tokio::spawn(async move {
+                let mut got = Vec::new();
+                while let Some(frame) =
+                    timeout(Duration::from_secs(5), sub.next_frame(|f| f.content.to_vec()))
+                        .await
+                        .expect("no stall")
+                {
+                    got.push(frame);
+                }
+                (got, sub.is_complete())
+            }));
+        }
+        // Let all subscribers register before the first publish (they fold in on
+        // publish; publish before they connect would be missed — attach-and-follow).
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        for i in 0..FRAMES {
+            pubr.publish(&[(i & 0xff) as u8; 1000]).await.unwrap();
+        }
+        pubr.close().await.unwrap();
+
+        for r in readers {
+            let (frames, complete) = r.await.unwrap();
+            assert_eq!(frames.len() as u64, FRAMES, "every subscriber gets every frame");
+            for (i, frame) in frames.iter().enumerate() {
+                assert_eq!(frame, &vec![i as u8; 1000], "frame {i} in order");
+            }
+            assert_eq!(complete, Some(true), "clean close reaches every subscriber");
+        }
     }
 
     // ---- phase-2: capability auth ----------------------------------------

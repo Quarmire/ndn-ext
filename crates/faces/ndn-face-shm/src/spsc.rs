@@ -717,6 +717,53 @@ pub async fn serve_fd_handoff(
     }
 }
 
+/// **Multi-peer variant of [`serve_fd_handoff`]** for fan-out (1→N): keep
+/// listening and, for *each* authorized connection, call `mint` to produce a fresh
+/// set of three fds (a freshly-created ring pair) and hand them to that peer. The
+/// caller's `mint` typically creates a new [`SpscFace`] and stashes it so it can
+/// broadcast to every attached peer. Unauthorized connectors are rejected and the
+/// loop continues. Returns only on accept error (socket closed).
+#[cfg(unix)]
+pub async fn serve_fd_handoff_loop<F>(
+    listener: tokio::net::UnixListener,
+    token: ShmToken,
+    mut mint: F,
+) -> std::io::Result<()>
+where
+    F: FnMut() -> std::io::Result<[OwnedFd; 3]>,
+{
+    loop {
+        let (stream, _addr) = listener.accept().await?;
+        let std_stream = stream.into_std()?;
+        std_stream.set_nonblocking(false)?;
+        let authorized = tokio::task::spawn_blocking(
+            move || -> std::io::Result<Option<std::os::unix::net::UnixStream>> {
+                use std::io::Read;
+                let mut s = std_stream;
+                let mut tok = [0u8; 32];
+                s.read_exact(&mut tok)?;
+                Ok(if ct_eq(&tok, &token) { Some(s) } else { None })
+            },
+        )
+        .await
+        .map_err(|e| std::io::Error::other(format!("shm control token task: {e}")))??;
+
+        let Some(s) = authorized else {
+            continue; // unauthorized — drop and keep listening
+        };
+        // Mint a fresh ring for this peer; on failure, drop the peer and continue.
+        let fds = match mint() {
+            Ok(fds) => fds,
+            Err(_) => continue,
+        };
+        let raw = [fds[0].as_raw_fd(), fds[1].as_raw_fd(), fds[2].as_raw_fd()];
+        tokio::task::spawn_blocking(move || send_fds(s.as_raw_fd(), &raw))
+            .await
+            .map_err(|e| std::io::Error::other(format!("shm control send task: {e}")))??;
+        // `fds` (our copies) drop here; the peer holds its dup'd set.
+    }
+}
+
 /// **Client side of the Option-A handshake:** connect to the control socket at
 /// `path`, present `token`, receive the face's three fds, and build the
 /// [`SpscHandle`]. Blocking — call via `spawn_blocking` from async code.

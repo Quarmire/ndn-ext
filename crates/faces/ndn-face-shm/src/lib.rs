@@ -49,6 +49,7 @@ pub type ShmHandle = spsc::SpscHandle;
 #[cfg(unix)]
 pub use spsc::{
     ShmToken, connect_fd_handoff, control_socket_path, mint_token, serve_fd_handoff,
+    serve_fd_handoff_loop,
 };
 
 /// Zero-copy large-buffer passing (G11 increment 3): a [`SharedBuffer`] holds a
