@@ -15,6 +15,7 @@ ndn-foundation-types = { workspace = true, features = ["std"] }
 ndn-tlv              = { workspace = true, features = ["std"] }
 ndn-packet           = { workspace = true, features = ["std"] }
 ndn-app              = { workspace = true }
+ndn-storage          = { workspace = true, features = ["named"] }
 bytes                = { workspace = true, features = ["std"] }
 sha2                 = { workspace = true }
 thiserror            = { workspace = true }

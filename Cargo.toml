@@ -103,6 +103,7 @@ name = "ndn-rs"
 ndn-foundation-types = { path = "../ndn-rs/crates/core/ndn-foundation-types", default-features = false }
 ndn-tlv       = { path = "../ndn-rs/crates/core/ndn-tlv", default-features = false }
 ndn-packet    = { path = "../ndn-rs/crates/core/ndn-packet", default-features = false }
+ndn-storage   = { path = "../ndn-rs/crates/core/ndn-storage" }
 ndn-fwd-core  = { path = "../ndn-rs/crates/forwarding/ndn-fwd-core", default-features = false }
 ndn-crypto-core = { path = "../ndn-rs/crates/core/ndn-crypto-core" }
 ndn-sealed-box  = { path = "crates/compute/ndn-sealed-box" }

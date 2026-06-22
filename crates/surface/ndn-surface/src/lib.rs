@@ -60,6 +60,7 @@ use ndn_face_shm::{
     serve_sealed_handoff,
 };
 use ndn_foundation_types::Name;
+use ndn_storage::{NamedReadStore, NamedWriteStore};
 use ndn_packet::encode::DataBuilder;
 use ndn_packet::tlv_type;
 use ndn_transport::FaceId;
@@ -268,8 +269,10 @@ pub struct NamedPublisher {
     serve: tokio::task::JoinHandle<()>,
     /// When serving remotely: the recent-frame window the forwarder loop reads.
     window: Option<Arc<Mutex<FrameWindow>>>,
-    /// Cached surface-name component TLVs for the zero-alloc `publish_fast` path.
+    /// Cached surface-name component TLVs for the inline sealed-frame encode path.
     prefix_components: Option<Bytes>,
+    /// When durable: write-behind each published frame to this store (signed only).
+    retain: Option<Arc<dyn NamedWriteStore>>,
 }
 
 impl NamedPublisher {
@@ -357,6 +360,7 @@ impl NamedPublisher {
             serve,
             window: None,
             prefix_components: None,
+            retain: None,
         })
     }
 
@@ -439,6 +443,7 @@ impl NamedPublisher {
             serve,
             window: None,
             prefix_components: None,
+            retain: None,
         })
     }
 
@@ -462,6 +467,7 @@ impl NamedPublisher {
             serve,
             window: None,
             prefix_components: None,
+            retain: None,
         })
     }
 
@@ -570,6 +576,7 @@ impl NamedPublisher {
             serve,
             window: None,
             prefix_components: None,
+            retain: None,
         })
     }
 
@@ -603,6 +610,7 @@ impl NamedPublisher {
             serve,
             window: None,
             prefix_components: None,
+            retain: None,
         })
     }
 
@@ -636,14 +644,18 @@ impl NamedPublisher {
         }
         let b = DataBuilder::new(frame_name.clone(), content);
         let len = b.encoded_len_digest_sha256();
-        if self.window.is_some() {
-            // Serving remotely too: materialize the wire once, feed sink + window.
+        if self.window.is_some() || self.retain.is_some() {
+            // Serving remotely and/or retaining: materialize the wire once, feed the
+            // local sink + the remote window + the durable store.
             let mut wire = vec![0u8; len];
             b.encode_digest_sha256_into(&mut wire);
             let wire = Bytes::from(wire);
             send_wire_to_sink(&mut self.sink, &wire).await?;
             if let Some(window) = &self.window {
-                window.lock().unwrap().insert(self.seq, wire);
+                window.lock().unwrap().insert(self.seq, wire.clone());
+            }
+            if let Some(store) = &self.retain {
+                store.insert(&frame_name, wire);
             }
         } else {
             match &mut self.sink {
@@ -709,6 +721,29 @@ impl NamedPublisher {
         });
         self.window = Some(window);
         self
+    }
+
+    /// **Durably retain** each published frame by writing it (write-through) to
+    /// `store` under its name `<surface>/v=<seq>` — so late joiners, fallen-behind
+    /// consumers, and post-restart fetches can get frames the ring has overwritten
+    /// (replay via [`NamedSubscriber::connect_replay`], or the tier cascade). The
+    /// store is a pluggable `ndn-storage` `NamedWriteStore` (in-memory / fjall /
+    /// object-store). **Signed surfaces only** — a sealed (local) frame has no
+    /// signature, so on disk it would outlive the kernel seal and lose its trust
+    /// root; sealed surfaces are ephemeral by design. Streaming surfaces only.
+    pub fn retain(mut self, store: Arc<dyn NamedWriteStore>) -> Result<Self, SurfaceError> {
+        match self.sink {
+            Sink::Single(_) | Sink::Fanout { .. } => {
+                self.retain = Some(store);
+                Ok(self)
+            }
+            Sink::Sealed(_) => Err(SurfaceError::Face(
+                "sealed (local) surfaces are ephemeral and cannot be retained — use open() for durable, signed data".into(),
+            )),
+            Sink::Large { .. } | Sink::LargeFanout { .. } => Err(SurfaceError::Face(
+                "retain is for streaming surfaces (large-object persistence is a separate path)".into(),
+            )),
+        }
     }
 
     /// Cleanly close the surface: emit an end-of-stream marker so subscribers'
@@ -811,6 +846,12 @@ enum Source {
     /// Local (sealed) surface: read frames from the sealed ring (data mapped
     /// read-only — the producer is provably the sole writer).
     Sealed(SealedReader),
+    /// Durable replay: read retained frames `<surface>/v=<next>` from a store, in
+    /// order, until a version is missing (end of what was retained).
+    Replay {
+        store: Arc<dyn NamedReadStore>,
+        next: u64,
+    },
 }
 
 /// Attaches to a named surface and reads its frames by name — zero-copy when the
@@ -875,6 +916,24 @@ impl NamedSubscriber {
             surface,
             complete: None,
         })
+    }
+
+    /// Replay a surface's **retained** frames from a durable `store` (an
+    /// `ndn-storage` `NamedReadStore`), starting at version `from`. `next_frame`
+    /// yields `<surface>/v=from`, `v=from+1`, … until a version is missing (the end
+    /// of what was retained), then reports clean completion. Works even after the
+    /// producer and its ring are gone — the durable-tier read path. Start at 0 to
+    /// catch up from the beginning, or at a known version to fill a gap.
+    pub fn connect_replay(
+        name: impl Into<Name>,
+        store: Arc<dyn NamedReadStore>,
+        from: u64,
+    ) -> Self {
+        Self {
+            source: Source::Replay { store, next: from },
+            surface: name.into(),
+            complete: None,
+        }
     }
 
     /// Attach to a **local (sealed) surface** ([`NamedPublisher::open_local`]): the
@@ -1133,6 +1192,26 @@ impl NamedSubscriber {
                     }
                     None => {
                         self.complete = Some(false);
+                        None
+                    }
+                }
+            }
+            Source::Replay { store, next } => {
+                let frame_name = self.surface.clone().append_version(*next);
+                match store.get(&frame_name) {
+                    Some(wire) => {
+                        *next += 1;
+                        match parse_frame(&wire) {
+                            Ok((name, content)) => Some(f(FrameRef { name, content })),
+                            Err(_) => {
+                                self.complete = Some(false);
+                                None
+                            }
+                        }
+                    }
+                    None => {
+                        // no more retained versions ⇒ clean end of the replay
+                        self.complete = Some(true);
                         None
                     }
                 }
@@ -2069,6 +2148,73 @@ mod tests {
         let mut b = StateSubscriber::connect("/state/multi").await.unwrap();
         let vb = timeout(Duration::from_secs(2), b.next()).await.unwrap().unwrap();
         assert_eq!(&vb[..], b"x", "late subscriber b also sees current value");
+    }
+
+    // ---- durable tier: retain + replay -----------------------------------
+
+    /// A signed surface with `retain` writes each frame through to a store; a replay
+    /// reader then reads them back BY NAME — even after the producer/ring are gone
+    /// (durability + late-join + random-access-by-version). Sealed surfaces refuse
+    /// retention (ephemeral by design).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retain_then_replay_from_store() {
+        use ndn_storage::{MemoryBackend, NamedStore, NamedWriteStore};
+        let store: Arc<dyn NamedWriteStore> = Arc::new(NamedStore::new(MemoryBackend::new()));
+
+        {
+            let mut pubr = NamedPublisher::open("/durable/surface")
+                .await
+                .unwrap()
+                .retain(store.clone())
+                .unwrap();
+            for i in 0..5u64 {
+                pubr.publish(&[(i as u8) + 1; 200]).await.unwrap();
+            }
+            // producer (and its ring) drop here.
+        }
+
+        // Replay from the store from the beginning — no producer, no ring.
+        let read: Arc<dyn ndn_storage::NamedReadStore> = store;
+        let mut replay = NamedSubscriber::connect_replay("/durable/surface", read, 0);
+        for i in 0..5u64 {
+            let (name, body) = replay
+                .next_frame(|f| (f.name.clone(), f.content.to_vec()))
+                .await
+                .expect("retained frame");
+            assert_eq!(name.to_string(), format!("/durable/surface/v={i}"));
+            assert_eq!(body, vec![(i as u8) + 1; 200], "retained frame {i}");
+        }
+        // past the end → clean completion.
+        assert!(replay.next_frame(|_| ()).await.is_none());
+        assert_eq!(replay.is_complete(), Some(true));
+    }
+
+    /// Random access: replay from a specific version (fill a gap).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replay_from_specific_version() {
+        use ndn_storage::{MemoryBackend, NamedStore, NamedReadStore, NamedWriteStore};
+        let store: Arc<dyn NamedWriteStore> = Arc::new(NamedStore::new(MemoryBackend::new()));
+        let mut pubr = NamedPublisher::open("/durable/seek")
+            .await
+            .unwrap()
+            .retain(store.clone())
+            .unwrap();
+        for i in 0..6u64 {
+            pubr.publish(&[i as u8; 50]).await.unwrap();
+        }
+        let read: Arc<dyn NamedReadStore> = store;
+        let mut replay = NamedSubscriber::connect_replay("/durable/seek", read, 3);
+        let first = replay.next_frame(|f| f.name.to_string()).await.unwrap();
+        assert_eq!(first, "/durable/seek/v=3", "replay starts at the requested version");
+    }
+
+    /// Sealed surfaces cannot be retained.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sealed_surface_refuses_retain() {
+        use ndn_storage::{MemoryBackend, NamedStore, NamedWriteStore};
+        let store: Arc<dyn NamedWriteStore> = Arc::new(NamedStore::new(MemoryBackend::new()));
+        let sealed = NamedPublisher::open_local("/durable/nope").await.unwrap();
+        assert!(sealed.retain(store).is_err(), "sealed is ephemeral; retain refused");
     }
 
     // ---- exclusive producer ownership ------------------------------------
