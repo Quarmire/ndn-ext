@@ -424,4 +424,176 @@ mod tests {
         }
         serve.abort();
     }
+
+    // ---- #5 failure / chaos / soak ---------------------------------------
+    // The findings are the deliverable: what the surface does when things go
+    // wrong, and whether any of it leaks or hangs.
+
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    /// Spin a signed remote surface behind an in-proc engine; returns a Consumer
+    /// reaching it plus the serve task + engine guard (keep alive for the test).
+    async fn spawn_remote_surface(
+        surface: &Name,
+    ) -> (Consumer, tokio::task::JoinHandle<()>, impl Sized) {
+        let (cf, ch) = InProcFace::new(FaceId(1), 256);
+        let (pf, ph) = InProcFace::new(FaceId(2), 256);
+        let (engine, shutdown) = EngineBuilder::new(EngineConfig::default())
+            .face(cf)
+            .face(pf)
+            .build()
+            .await
+            .expect("engine build");
+        engine.fib().add_nexthop(surface, FaceId(2), 0);
+        let kc = KeyChain::ephemeral(surface.to_string()).expect("keychain");
+        let signer = kc.signer().expect("signer");
+        let producer = Producer::from_handle(ph, surface.clone()).with_signer(signer);
+        let serve = tokio::spawn(async move {
+            let _ = producer
+                .serve(|interest, responder| async move {
+                    let n = interest.name.to_string();
+                    if let Some(v) = n.rsplit("v=").next().and_then(|s| s.parse::<u64>().ok()) {
+                        let frame = vec![(v as u8).wrapping_add(1); 2000];
+                        let _ = responder.respond((*interest.name).clone(), frame).await;
+                    }
+                })
+                .await;
+        });
+        (Consumer::from_handle(ch), serve, (engine, shutdown))
+    }
+
+    /// CHAOS: publisher vanishes mid-stream. The consumer must (a) still drain the
+    /// frames already buffered in the ring, then (b) see a clean **end-of-stream**
+    /// (`None`) — not hang. (Pins the dogfood's FRICTION #11 as actually handled:
+    /// the SHM wakeup-pipe EOF surfaces as `None`.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn publisher_drop_ends_stream_cleanly() {
+        let mut pubr = NamedPublisher::open("/chaos/drop").await.unwrap();
+        let mut sub = NamedSubscriber::connect("/chaos/drop").await.unwrap();
+        for i in 0..3u64 {
+            pubr.publish(&[i as u8; 100]).await.unwrap();
+        }
+        // Producer gone: aborts serve, removes socket, drops the ShmFace → the
+        // consumer's wakeup pipe write end closes.
+        drop(pubr);
+
+        // (a) buffered frames survive the producer's exit (shared pages outlive it).
+        for i in 0..3u64 {
+            let body = timeout(Duration::from_secs(2), sub.next_frame(|f| f.content.to_vec()))
+                .await
+                .expect("must not hang on buffered frame")
+                .expect("buffered frame still readable");
+            assert_eq!(body, vec![i as u8; 100], "buffered frame {i}");
+        }
+        // (b) then clean end-of-stream, within a bound (proves no infinite park).
+        let end = timeout(Duration::from_secs(2), sub.next_frame(|f| f.content.to_vec())).await;
+        assert!(
+            matches!(end, Ok(None)),
+            "publisher gone ⇒ end-of-stream None, got {end:?}"
+        );
+    }
+
+    /// CHAOS: a crashed publisher left a stale control socket. `connect_via` must
+    /// not get stuck on the dead local path — it probes, the handshake fails, and
+    /// it transparently falls back to the remote forwarder fetch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_socket_falls_back_to_remote() {
+        let surface: Name = "/chaos/stale".parse().unwrap();
+        // Simulate the crash residue: bind then drop a listener — the socket file
+        // remains (Unix doesn't unlink on close) but connects are refused.
+        let path = control_socket_path(&surface_token(&surface));
+        let _ = std::fs::remove_file(&path);
+        drop(tokio::net::UnixListener::bind(&path).expect("bind stale socket"));
+        assert!(path.exists(), "stale socket should be present for the probe");
+
+        let (consumer, serve, _engine) = spawn_remote_surface(&surface).await;
+        let mut sub = NamedSubscriber::connect_via(surface.clone(), consumer)
+            .await
+            .unwrap();
+        assert!(
+            !sub.is_local(),
+            "stale local socket must not be taken — should fall back to remote"
+        );
+        let name = sub.next_frame(|f| f.name.clone()).await.expect("remote frame");
+        assert_eq!(name.to_string(), "/chaos/stale/v=0");
+        serve.abort();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// CHAOS: a slow consumer with a tiny ring (1 MiB slots ⇒ ~2 frames buffered).
+    /// The producer must block on a full ring (backpressure) rather than drop or
+    /// corrupt — every frame arrives, in order, intact.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slow_consumer_backpressure_no_loss() {
+        const N: u64 = 64;
+        let mut pubr = NamedPublisher::open("/chaos/backpressure").await.unwrap();
+        let mut sub = NamedSubscriber::connect("/chaos/backpressure").await.unwrap();
+
+        // Producer races ahead; send_with parks when the ring is full.
+        let prod = tokio::spawn(async move {
+            for i in 0..N {
+                pubr.publish(&[(i & 0xff) as u8; 1000]).await.unwrap();
+            }
+            pubr // keep alive until the consumer is done
+        });
+
+        for i in 0..N {
+            let body = timeout(Duration::from_secs(5), sub.next_frame(|f| f.content.to_vec()))
+                .await
+                .expect("no stall under backpressure")
+                .expect("frame");
+            assert_eq!(
+                body,
+                vec![(i & 0xff) as u8; 1000],
+                "frame {i} order/integrity under backpressure"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await; // be slow on purpose
+        }
+        let _pubr = prod.await.unwrap();
+    }
+
+    /// SOAK: many open→publish→read→drop cycles. Asserts each cycle's control
+    /// socket is cleaned up on publisher drop, and the process fd count does not
+    /// grow per cycle (a leak would add ~fds-per-face × cycles).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn soak_no_socket_or_fd_leak() {
+        // macOS/Linux: /dev/fd lists this process's open fds.
+        let fd_count = || std::fs::read_dir("/dev/fd").map(|d| d.count()).unwrap_or(0);
+        const CYCLES: u64 = 40;
+        const FRAMES: u64 = 10;
+
+        // Warm up one cycle so first-touch allocations don't count as "growth".
+        let baseline_after_warmup;
+        {
+            let mut p = NamedPublisher::open("/soak/warmup").await.unwrap();
+            let mut s = NamedSubscriber::connect("/soak/warmup").await.unwrap();
+            p.publish(b"x").await.unwrap();
+            s.next_frame(|_| ()).await.unwrap();
+            drop(p);
+            drop(s);
+            baseline_after_warmup = fd_count();
+        }
+
+        for cycle in 0..CYCLES {
+            let name = format!("/soak/{cycle}");
+            let mut pubr = NamedPublisher::open(name.as_str()).await.unwrap();
+            let mut sub = NamedSubscriber::connect(name.as_str()).await.unwrap();
+            for i in 0..FRAMES {
+                pubr.publish(&[i as u8; 500]).await.unwrap();
+                let body = sub.next_frame(|f| f.content.to_vec()).await.expect("frame");
+                assert_eq!(body, vec![i as u8; 500]);
+            }
+            let path = control_socket_path(&surface_token(&name.parse::<Name>().unwrap()));
+            drop(pubr);
+            drop(sub);
+            assert!(!path.exists(), "cycle {cycle}: control socket left behind");
+        }
+
+        let after = fd_count();
+        assert!(
+            after <= baseline_after_warmup + 8,
+            "fd leak across {CYCLES} cycles: warmup={baseline_after_warmup} after={after}"
+        );
+    }
 }
