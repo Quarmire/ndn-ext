@@ -60,7 +60,7 @@ use ndn_face_shm::{
     serve_sealed_handoff,
 };
 use ndn_foundation_types::Name;
-use ndn_storage::{NamedReadStore, NamedWriteStore};
+use ndn_storage::{NamedOp, NamedReadStore, NamedWriteStore};
 use ndn_packet::encode::DataBuilder;
 use ndn_packet::tlv_type;
 use ndn_transport::FaceId;
@@ -784,24 +784,48 @@ impl NamedPublisher {
             Sink::Single(_) | Sink::Fanout { .. } => {
                 let (tx, mut rx) = tokio::sync::mpsc::channel::<RetainMsg>(1024);
                 let surface = self.name.clone();
-                // Writer: drains until the publisher closes (tx dropped), applying
-                // retention; a Flush barrier acks once prior frames are written.
+                // Writer: drains until the publisher closes (tx dropped). Frames that
+                // are already queued are **coalesced into one `write_batch`** (one
+                // engine transaction per drain) so a burst costs one disk commit, not
+                // N — the producer hot path stays ring-fast. Retention evictions ride
+                // the same batch; a Flush barrier acks only after the batch commits.
                 let writer = tokio::spawn(async move {
-                    while let Some(msg) = rx.recv().await {
-                        match msg {
-                            RetainMsg::Frame(name, wire) => {
-                                store.insert(&name, wire).await;
-                                if let Some(keep) = policy.max_versions
-                                    && let Some(v) = version_of(&name)
-                                    && v >= keep
-                                {
-                                    let old = surface.clone().append_version(v - keep);
-                                    store.remove(&old).await;
+                    const MAX_BATCH: usize = 256;
+                    while let Some(first) = rx.recv().await {
+                        let mut ops: Vec<NamedOp> = Vec::new();
+                        let mut acks: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
+                        let mut next = Some(first);
+                        loop {
+                            match next.take() {
+                                Some(RetainMsg::Frame(name, wire)) => {
+                                    // Insert before the matching evict so that if both
+                                    // fall in one batch the evict still wins (ordered).
+                                    let evict = policy.max_versions.and_then(|keep| {
+                                        version_of(&name)
+                                            .filter(|&v| v >= keep)
+                                            .map(|v| surface.clone().append_version(v - keep))
+                                    });
+                                    ops.push(NamedOp::Insert(name, wire));
+                                    if let Some(old) = evict {
+                                        ops.push(NamedOp::Remove(old));
+                                    }
                                 }
+                                Some(RetainMsg::Flush(ack)) => acks.push(ack),
+                                None => {}
                             }
-                            RetainMsg::Flush(ack) => {
-                                let _ = ack.send(());
+                            if ops.len() >= MAX_BATCH {
+                                break;
                             }
+                            match rx.try_recv() {
+                                Ok(m) => next = Some(m),
+                                Err(_) => break,
+                            }
+                        }
+                        if !ops.is_empty() {
+                            store.write_batch(ops).await;
+                        }
+                        for ack in acks {
+                            let _ = ack.send(()); // durability barrier satisfied
                         }
                     }
                 });
