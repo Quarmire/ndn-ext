@@ -1933,7 +1933,7 @@ impl SharedBufferReader {
 const SEALED_OFF_TAIL: usize = 64; // in DATA region (own cache line)
 const SEALED_DATA_HEADER: usize = 128; // slots start here in DATA
 const SEALED_OFF_HEAD: usize = 0; // in CTRL region
-// CTRL offset 64 is reserved for a future `parked` wakeup flag.
+const SEALED_OFF_PARKED: usize = 64; // in CTRL region (own cache line)
 const SEALED_CTRL_SIZE: usize = 128;
 
 fn sealed_data_size(capacity: u32, slot_size: u32) -> usize {
@@ -1941,22 +1941,28 @@ fn sealed_data_size(capacity: u32, slot_size: u32) -> usize {
 }
 
 /// Producer end of a sealed ring: writes frames into the data region (which it
-/// alone can write) and hands consumers a **read-only** data fd plus a read-write
-/// control fd.
+/// alone can write) and hands consumers a **read-only** data fd, a read-write
+/// control fd, and a wakeup-pipe read end.
 pub struct SealedWriter {
     data: ShmRegion, // read-write mapping
-    ctrl: ShmRegion, // read-write mapping (reads the consumer's head)
+    ctrl: ShmRegion, // read-write mapping (reads the consumer's head + parked)
     capacity: u32,
     slot_size: u32,
+    wake_tx: OwnedFd, // write end of the consumer wakeup pipe
 }
 
 impl SealedWriter {
-    /// Create a sealed ring. Returns the writer plus `(data_ro_fd, ctrl_rw_fd)` to
-    /// hand the consumer; `capacity`/`slot_size` travel out-of-band (the consumer
-    /// needs them to size its mappings).
-    pub fn create(capacity: u32, slot_size: u32) -> Result<(Self, OwnedFd, OwnedFd), ShmError> {
+    /// Create a sealed ring. Returns the writer plus `(data_ro_fd, ctrl_rw_fd,
+    /// wake_pipe_read_fd)` to hand the consumer; `capacity`/`slot_size` travel
+    /// out-of-band (the consumer needs them to size its mappings). Dropping the
+    /// writer closes `wake_tx`, which the consumer sees as end-of-stream.
+    pub fn create(
+        capacity: u32,
+        slot_size: u32,
+    ) -> Result<(Self, OwnedFd, OwnedFd, OwnedFd), ShmError> {
         let (data, data_ro_fd) = ShmRegion::create_anon_ro(sealed_data_size(capacity, slot_size))?;
         let (ctrl, ctrl_rw_fd) = ShmRegion::create_anon(SEALED_CTRL_SIZE)?;
+        let (wake_r, wake_w) = anon_pipe()?; // consumer reads wake_r, producer writes wake_w
         unsafe {
             (data.as_ptr() as *mut u64).write_unaligned(MAGIC);
             (data.as_ptr().add(8) as *mut u32).write_unaligned(capacity);
@@ -1969,9 +1975,11 @@ impl SealedWriter {
                 ctrl,
                 capacity,
                 slot_size,
+                wake_tx: wake_w,
             },
             data_ro_fd,
             ctrl_rw_fd,
+            wake_r,
         ))
     }
 
@@ -1980,6 +1988,9 @@ impl SealedWriter {
     }
     fn head(&self) -> &AtomicU32 {
         unsafe { AtomicU32::from_ptr(self.ctrl.as_ptr().add(SEALED_OFF_HEAD) as *mut u32) }
+    }
+    fn parked(&self) -> &AtomicU32 {
+        unsafe { AtomicU32::from_ptr(self.ctrl.as_ptr().add(SEALED_OFF_PARKED) as *mut u32) }
     }
 
     /// True if the ring currently has space (consumer head bounds-checked).
@@ -1991,13 +2002,9 @@ impl SealedWriter {
         t.wrapping_sub(h) < self.capacity
     }
 
-    /// Non-blocking zero-copy send: reserve the next slot and write `len` bytes in
-    /// place via `fill`. Returns `false` (without calling `fill`) if full — for
-    /// fan-out, where a stuck consumer must not block the others.
-    pub fn try_send_with(&self, len: usize, fill: impl FnOnce(&mut [u8])) -> bool {
-        if len > self.slot_size as usize || !self.has_space() {
-            return false;
-        }
+    // Commit one slot at the current tail (caller guaranteed space) + wake a parked
+    // consumer.
+    fn commit(&self, len: usize, fill: impl FnOnce(&mut [u8])) {
         let t = self.tail().load(Ordering::Relaxed);
         let idx = (t % self.capacity) as usize;
         let slot = unsafe {
@@ -2011,6 +2018,19 @@ impl SealedWriter {
             fill(payload);
         }
         self.tail().store(t.wrapping_add(1), Ordering::Release);
+        if self.parked().load(Ordering::SeqCst) != 0 {
+            pipe_write(&self.wake_tx);
+        }
+    }
+
+    /// Non-blocking zero-copy send: reserve the next slot and write `len` bytes in
+    /// place via `fill`. Returns `false` (without calling `fill`) if full — for
+    /// fan-out, where a stuck consumer must not block the others.
+    pub fn try_send_with(&self, len: usize, fill: impl FnOnce(&mut [u8])) -> bool {
+        if len > self.slot_size as usize || !self.has_space() {
+            return false;
+        }
+        self.commit(len, fill);
         true
     }
 
@@ -2018,37 +2038,69 @@ impl SealedWriter {
     pub fn try_send(&self, data: &[u8]) -> bool {
         self.try_send_with(data.len(), |slot| slot.copy_from_slice(data))
     }
+
+    /// Blocking (async) zero-copy send: yields until the ring has space, then writes
+    /// `len` bytes in place via `fill`. Reliable backpressure for the 1:1 path (a
+    /// slow consumer paces the producer). Errors if `len` exceeds the slot.
+    pub async fn send_with(
+        &self,
+        len: usize,
+        fill: impl FnOnce(&mut [u8]),
+    ) -> Result<(), ShmError> {
+        if len > self.slot_size as usize {
+            return Err(ShmError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "payload exceeds sealed slot size",
+            )));
+        }
+        let mut fill = Some(fill);
+        loop {
+            if self.has_space() {
+                self.commit(len, fill.take().unwrap());
+                return Ok(());
+            }
+            tokio::task::yield_now().await;
+        }
+    }
 }
 
 /// Consumer end of a sealed ring: maps the data region **read-only** (cannot
-/// forge) and the control region read-write (writes its read cursor).
+/// forge), the control region read-write (writes its read cursor + parked flag),
+/// and owns the wakeup-pipe read end (its EOF = the producer is gone).
 pub struct SealedReader {
     data: ShmRegion, // read-only mapping
     ctrl: ShmRegion, // read-write mapping
     capacity: u32,
     slot_size: u32,
+    wake_rx: tokio::io::unix::AsyncFd<OwnedFd>,
 }
 
 impl SealedReader {
     /// Map the fds handed by [`SealedWriter::create`]: `data_fd` read-only,
-    /// `ctrl_fd` read-write. `capacity`/`slot_size` come from the handshake.
+    /// `ctrl_fd` read-write, `wake_fd` the wakeup pipe read end (kept). Must be
+    /// called within a Tokio runtime (for the wakeup `AsyncFd`).
     pub fn from_fds(
-        data_fd: RawFd,
-        ctrl_fd: RawFd,
+        data_fd: OwnedFd,
+        ctrl_fd: OwnedFd,
+        wake_fd: OwnedFd,
         capacity: u32,
         slot_size: u32,
     ) -> Result<Self, ShmError> {
-        let data = ShmRegion::from_fd_ro(data_fd, sealed_data_size(capacity, slot_size))?;
-        let ctrl = ShmRegion::from_fd(ctrl_fd, SEALED_CTRL_SIZE)?;
+        let data = ShmRegion::from_fd_ro(data_fd.as_raw_fd(), sealed_data_size(capacity, slot_size))?;
+        let ctrl = ShmRegion::from_fd(ctrl_fd.as_raw_fd(), SEALED_CTRL_SIZE)?;
+        // data_fd / ctrl_fd may now drop — the mappings persist.
         let magic = unsafe { (data.as_ptr() as *const u64).read_unaligned() };
         if magic != MAGIC {
             return Err(ShmError::InvalidMagic);
         }
+        set_nonblock_cloexec(wake_fd.as_raw_fd())?;
+        let wake_rx = tokio::io::unix::AsyncFd::new(wake_fd).map_err(ShmError::Io)?;
         Ok(Self {
             data,
             ctrl,
             capacity,
             slot_size,
+            wake_rx,
         })
     }
 
@@ -2058,10 +2110,11 @@ impl SealedReader {
     fn head(&self) -> &AtomicU32 {
         unsafe { AtomicU32::from_ptr(self.ctrl.as_ptr().add(SEALED_OFF_HEAD) as *mut u32) }
     }
+    fn parked(&self) -> &AtomicU32 {
+        unsafe { AtomicU32::from_ptr(self.ctrl.as_ptr().add(SEALED_OFF_PARKED) as *mut u32) }
+    }
 
-    /// Non-blocking zero-copy receive: borrow the next frame in place (read-only)
-    /// and pass it to `f`. `None` if empty.
-    pub fn try_recv_with<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+    fn peek_consume<R, F: FnOnce(&[u8]) -> R>(&self, f: &mut Option<F>) -> Option<R> {
         let h = self.head().load(Ordering::Relaxed);
         let t = self.tail().load(Ordering::Acquire);
         if h == t {
@@ -2073,18 +2126,56 @@ impl SealedReader {
                 .as_ptr()
                 .add(SEALED_DATA_HEADER + idx * slot_stride(self.slot_size))
         };
-        let len = unsafe { (slot as *const u32).read_unaligned() as usize }.min(self.slot_size as usize);
+        let len =
+            unsafe { (slot as *const u32).read_unaligned() as usize }.min(self.slot_size as usize);
         let out = {
             let view = unsafe { std::slice::from_raw_parts(slot.add(4), len) };
-            f(view)
+            (f.take().unwrap())(view)
         };
         self.head().store(h.wrapping_add(1), Ordering::Release);
         Some(out)
     }
 
+    /// Non-blocking zero-copy receive: borrow the next frame in place (read-only)
+    /// and pass it to `f`. `None` if empty.
+    pub fn try_recv_with<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        let mut f = Some(f);
+        self.peek_consume(&mut f)
+    }
+
     /// Non-blocking copy receive.
     pub fn try_recv(&self) -> Option<Vec<u8>> {
         self.try_recv_with(|s| s.to_vec())
+    }
+
+    /// Blocking (async) zero-copy receive: spin → park on the wakeup pipe → read the
+    /// next frame in place. `None` when the producer is gone (wakeup pipe EOF) —
+    /// the sealed-ring end-of-stream signal.
+    pub async fn recv_with<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        let mut f = Some(f);
+        loop {
+            if let Some(out) = self.peek_consume(&mut f) {
+                return Some(out);
+            }
+            for _ in 0..SPIN_ITERS {
+                std::hint::spin_loop();
+                if let Some(out) = self.peek_consume(&mut f) {
+                    return Some(out);
+                }
+            }
+            self.parked().store(1, Ordering::SeqCst);
+            if let Some(out) = self.peek_consume(&mut f) {
+                self.parked().store(0, Ordering::Relaxed);
+                return Some(out);
+            }
+            match pipe_await(&self.wake_rx).await {
+                Ok(()) => self.parked().store(0, Ordering::Relaxed),
+                Err(_) => {
+                    self.parked().store(0, Ordering::Relaxed);
+                    return None; // producer gone ⇒ end of stream
+                }
+            }
+        }
     }
 }
 
@@ -2154,11 +2245,12 @@ mod tests {
     /// SEALED RING: frames flow producer→consumer over the data region the consumer
     /// maps read-only; the consumer reads in place but the data fd cannot be mapped
     /// writable. FIFO order + empty detection verified.
-    #[test]
-    fn sealed_ring_flows_and_is_unforgeable() {
-        let (writer, data_fd, ctrl_fd) = SealedWriter::create(8, 256).unwrap();
-        let reader =
-            SealedReader::from_fds(data_fd.as_raw_fd(), ctrl_fd.as_raw_fd(), 8, 256).unwrap();
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sealed_ring_flows_and_is_unforgeable() {
+        let (writer, data_fd, ctrl_fd, wake_fd) = SealedWriter::create(8, 256).unwrap();
+        // Keep a probe handle on the data fd to test the write-refusal after handoff.
+        let data_probe = data_fd.try_clone().unwrap();
+        let reader = SealedReader::from_fds(data_fd, ctrl_fd, wake_fd, 8, 256).unwrap();
 
         // Producer writes 5 frames; consumer reads them in order.
         for i in 0..5u8 {
@@ -2182,7 +2274,7 @@ mod tests {
                 4096,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_SHARED,
-                data_fd.as_raw_fd(),
+                data_probe.as_raw_fd(),
                 0,
             )
         };
@@ -2195,11 +2287,10 @@ mod tests {
 
     /// Backpressure: a full ring refuses further sends (no overwrite), and a bogus
     /// consumer head can never drive an out-of-bounds or an overwrite-forge.
-    #[test]
-    fn sealed_ring_full_refuses_send() {
-        let (writer, data_fd, ctrl_fd) = SealedWriter::create(4, 64).unwrap();
-        let reader =
-            SealedReader::from_fds(data_fd.as_raw_fd(), ctrl_fd.as_raw_fd(), 4, 64).unwrap();
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sealed_ring_full_refuses_send() {
+        let (writer, data_fd, ctrl_fd, wake_fd) = SealedWriter::create(4, 64).unwrap();
+        let reader = SealedReader::from_fds(data_fd, ctrl_fd, wake_fd, 4, 64).unwrap();
         for i in 0..4u8 {
             assert!(writer.try_send(&[i; 8]), "fill slot {i}");
         }
@@ -2207,6 +2298,39 @@ mod tests {
         // Drain one, then one more send fits.
         assert_eq!(reader.try_recv().unwrap(), &[0u8; 8]);
         assert!(writer.try_send(b"now-fits"));
+    }
+
+    /// Async wakeup: a parked consumer is woken by a later send, and sees
+    /// end-of-stream (None) when the producer drops (wakeup pipe EOF).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sealed_ring_async_wakeup_and_eos() {
+        let (writer, data_fd, ctrl_fd, wake_fd) = SealedWriter::create(8, 256).unwrap();
+        let reader = SealedReader::from_fds(data_fd, ctrl_fd, wake_fd, 8, 256).unwrap();
+
+        let producer = tokio::spawn(async move {
+            for i in 0..4u8 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                writer.send_with(50, |s| s.fill(i)).await.unwrap();
+            }
+            // drop writer → wakeup pipe closes → consumer sees EOS
+        });
+
+        for i in 0..4u8 {
+            let v = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                reader.recv_with(|s| (s.len(), s[0])),
+            )
+            .await
+            .expect("no stall")
+            .expect("frame");
+            assert_eq!(v, (50, i), "frame {i}");
+        }
+        // Producer drops → next recv parks then wakes on pipe EOF → None.
+        let end = tokio::time::timeout(std::time::Duration::from_secs(2), reader.recv_with(|_| ()))
+            .await
+            .expect("no stall");
+        assert!(end.is_none(), "producer gone ⇒ end of stream");
+        producer.await.unwrap();
     }
 
     /// The producer's writable mapping survives closing the RW fd (the mapping, not
