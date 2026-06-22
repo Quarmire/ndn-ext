@@ -45,12 +45,14 @@
 //! Scope: the large-frame `SharedBuffer` path and 1:N fan-out remain seams for the
 //! next phase.
 
+use std::collections::BTreeMap;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
-use ndn_app::Consumer;
+use ndn_app::{Consumer, Producer};
 use ndn_face_shm::{
     SharedBuffer, ShmFace, ShmHandle, ShmToken, connect_fd_handoff, control_socket_path, recv_fds,
     send_fds, serve_fd_handoff, serve_fd_handoff_loop,
@@ -161,15 +163,74 @@ fn large_frame_header(payload_len: usize, name_wire: &[u8]) -> Vec<u8> {
     header
 }
 
+/// Send a pre-encoded frame wire to a streaming sink (used by the symmetric-serve
+/// path, where the wire is materialized once for both the local sink and the
+/// remote window).
+async fn send_wire_to_sink(sink: &mut Sink, wire: &[u8]) -> Result<(), SurfaceError> {
+    match sink {
+        Sink::Single(face) => face
+            .send_with(wire.len(), |slot| slot.copy_from_slice(wire))
+            .await
+            .map_err(|e| SurfaceError::Face(e.to_string())),
+        Sink::Fanout { faces, incoming } => {
+            while let Ok(face) = incoming.try_recv() {
+                faces.push(face);
+            }
+            for face in faces.iter() {
+                face.send_with(wire.len(), |slot| slot.copy_from_slice(wire))
+                    .await
+                    .map_err(|e| SurfaceError::Face(e.to_string()))?;
+            }
+            Ok(())
+        }
+        Sink::Large { .. } | Sink::LargeFanout { .. } => Err(SurfaceError::Face(
+            "serve_on_forwarder is for streaming surfaces".into(),
+        )),
+    }
+}
+
+/// A bounded window of recently-published frame wires, keyed by version, that a
+/// forwarder serve loop answers remote Interests from (symmetric serve).
+struct FrameWindow {
+    frames: BTreeMap<u64, Bytes>,
+    cap: usize,
+}
+
+impl FrameWindow {
+    fn new(cap: usize) -> Self {
+        Self {
+            frames: BTreeMap::new(),
+            cap,
+        }
+    }
+    fn insert(&mut self, seq: u64, wire: Bytes) {
+        self.frames.insert(seq, wire);
+        while self.frames.len() > self.cap {
+            let oldest = *self.frames.keys().next().unwrap();
+            self.frames.remove(&oldest);
+        }
+    }
+    fn get(&self, seq: u64) -> Option<Bytes> {
+        self.frames.get(&seq).cloned()
+    }
+}
+
+/// Recent frames a remote forwarder serve loop can answer.
+const DEFAULT_SERVE_WINDOW: usize = 1024;
+
 /// Publishes a stream of named frames a consumer attaches to **by name**. Default
 /// ([`open`](Self::open)) is reliable 1:1 zero-copy; [`open_fanout`](Self::open_fanout)
-/// broadcasts to many subscribers.
+/// broadcasts to many subscribers; [`serve_on_forwarder`](Self::serve_on_forwarder)
+/// additionally answers remote Interests so off-host subscribers fetch the same
+/// frames by name.
 pub struct NamedPublisher {
     sink: Sink,
     name: Name,
     seq: u64,
     path: PathBuf,
     serve: tokio::task::JoinHandle<()>,
+    /// When serving remotely: the recent-frame window the forwarder loop reads.
+    window: Option<Arc<Mutex<FrameWindow>>>,
 }
 
 impl NamedPublisher {
@@ -285,6 +346,7 @@ impl NamedPublisher {
             seq: 0,
             path,
             serve,
+            window: None,
         })
     }
 
@@ -307,6 +369,7 @@ impl NamedPublisher {
             seq: 0,
             path,
             serve,
+            window: None,
         })
     }
 
@@ -411,6 +474,7 @@ impl NamedPublisher {
             seq: 0,
             path,
             serve,
+            window: None,
         })
     }
 
@@ -443,6 +507,7 @@ impl NamedPublisher {
             seq: 0,
             path,
             serve,
+            window: None,
         })
     }
 
@@ -454,35 +519,78 @@ impl NamedPublisher {
         let frame_name = self.name.clone().append_version(self.seq);
         let b = DataBuilder::new(frame_name.clone(), content);
         let len = b.encoded_len_digest_sha256();
-        match &mut self.sink {
-            Sink::Single(face) => {
-                face.send_with(len, |slot| {
-                    b.encode_digest_sha256_into(slot);
-                })
-                .await
-                .map_err(|e| SurfaceError::Face(e.to_string()))?;
+        if self.window.is_some() {
+            // Serving remotely too: materialize the wire once, feed sink + window.
+            let mut wire = vec![0u8; len];
+            b.encode_digest_sha256_into(&mut wire);
+            let wire = Bytes::from(wire);
+            send_wire_to_sink(&mut self.sink, &wire).await?;
+            if let Some(window) = &self.window {
+                window.lock().unwrap().insert(self.seq, wire);
             }
-            Sink::Fanout { faces, incoming } => {
-                while let Ok(face) = incoming.try_recv() {
-                    faces.push(face);
+        } else {
+            match &mut self.sink {
+                Sink::Single(face) => {
+                    face.send_with(len, |slot| {
+                        b.encode_digest_sha256_into(slot);
+                    })
+                    .await
+                    .map_err(|e| SurfaceError::Face(e.to_string()))?;
                 }
-                // Encode once; broadcast the same wire into every ring.
-                let mut wire = vec![0u8; len];
-                b.encode_digest_sha256_into(&mut wire);
-                for face in faces.iter() {
-                    face.send_with(wire.len(), |slot| slot.copy_from_slice(&wire))
-                        .await
-                        .map_err(|e| SurfaceError::Face(e.to_string()))?;
+                Sink::Fanout { faces, incoming } => {
+                    while let Ok(face) = incoming.try_recv() {
+                        faces.push(face);
+                    }
+                    // Encode once; broadcast the same wire into every ring.
+                    let mut wire = vec![0u8; len];
+                    b.encode_digest_sha256_into(&mut wire);
+                    for face in faces.iter() {
+                        face.send_with(wire.len(), |slot| slot.copy_from_slice(&wire))
+                            .await
+                            .map_err(|e| SurfaceError::Face(e.to_string()))?;
+                    }
                 }
-            }
-            Sink::Large { .. } | Sink::LargeFanout { .. } => {
-                return Err(SurfaceError::Face(
-                    "use publish_large on a surface opened with open_large[_fanout]".into(),
-                ));
+                Sink::Large { .. } | Sink::LargeFanout { .. } => {
+                    return Err(SurfaceError::Face(
+                        "use publish_large on a surface opened with open_large[_fanout]".into(),
+                    ));
+                }
             }
         }
         self.seq += 1;
         Ok(frame_name)
+    }
+
+    /// Also answer remote Interests for this surface's frames over a forwarder, so
+    /// off-host subscribers ([`NamedSubscriber::connect_via`]) fetch the *same*
+    /// frames by name while local subscribers still get them zero-copy over SHM —
+    /// one producer, local + remote readers. `producer` is an [`ndn_app::Producer`]
+    /// bound to this surface's prefix (in-proc or over a forwarder socket). Streaming
+    /// surfaces only; recent frames are retained in a bounded window.
+    pub fn serve_on_forwarder(mut self, producer: Producer) -> Self {
+        let window = Arc::new(Mutex::new(FrameWindow::new(DEFAULT_SERVE_WINDOW)));
+        let w = window.clone();
+        tokio::spawn(async move {
+            let _ = producer
+                .serve(move |interest, responder| {
+                    let w = w.clone();
+                    async move {
+                        let n = interest.name.to_string();
+                        if let Some(seq) =
+                            n.rsplit("v=").next().and_then(|s| s.parse::<u64>().ok())
+                        {
+                            let hit = w.lock().unwrap().get(seq);
+                            if let Some(wire) = hit {
+                                let _ = responder.respond_bytes(wire).await;
+                            }
+                            // miss ⇒ no response (consumer has caught up / past window)
+                        }
+                    }
+                })
+                .await;
+        });
+        self.window = Some(window);
+        self
     }
 
     /// Cleanly close the surface: emit an end-of-stream marker so subscribers'
@@ -1582,6 +1690,66 @@ mod tests {
                 assert_eq!(frame, &vec![i as u8; 1000], "frame {i} in order");
             }
             assert_eq!(complete, Some(true), "clean close reaches every subscriber");
+        }
+    }
+
+    // ---- phase-2: symmetric forwarder-serve ------------------------------
+
+    /// One producer feeds BOTH a local SHM subscriber (zero-copy) AND a remote
+    /// subscriber over the forwarder (fetch-by-name from the retained window) —
+    /// the same frames, by the same names, two transports.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn symmetric_local_and_remote_readers() {
+        let surface: Name = "/sym/surface".parse().unwrap();
+        let (cf, ch) = InProcFace::new(FaceId(1), 256);
+        let (pf, ph) = InProcFace::new(FaceId(2), 256);
+        let (engine, _sd) = EngineBuilder::new(EngineConfig::default())
+            .face(cf)
+            .face(pf)
+            .build()
+            .await
+            .expect("engine build");
+        engine.fib().add_nexthop(&surface, FaceId(2), 0);
+        let producer = Producer::from_handle(ph, surface.clone());
+
+        // Local SHM publisher + remote forwarder serve.
+        let mut pubr = NamedPublisher::open("/sym/surface")
+            .await
+            .unwrap()
+            .serve_on_forwarder(producer);
+        let mut local = NamedSubscriber::connect("/sym/surface").await.unwrap();
+
+        for i in 0..4u64 {
+            pubr.publish(&[(i as u8) + 1; 500]).await.unwrap();
+        }
+
+        // Local subscriber reads over SHM (zero-copy).
+        for i in 0..4u64 {
+            let body = timeout(Duration::from_secs(2), local.next_frame(|f| f.content.to_vec()))
+                .await
+                .expect("no stall")
+                .expect("local frame");
+            assert_eq!(body, vec![(i as u8) + 1; 500], "local frame {i}");
+        }
+
+        // Remote subscriber fetches the same frames by name over the forwarder.
+        // (The local handshake was consumed by `local`, so connect_via falls back
+        // to the remote path.)
+        let consumer = Consumer::from_handle(ch);
+        let mut remote = NamedSubscriber::connect_via(surface.clone(), consumer)
+            .await
+            .unwrap();
+        assert!(!remote.is_local(), "second reader resolves to the remote path");
+        for i in 0..4u64 {
+            let (name, body) = timeout(
+                Duration::from_secs(5),
+                remote.next_frame(|f| (f.name.clone(), f.content.to_vec())),
+            )
+            .await
+            .expect("no stall")
+            .expect("remote frame");
+            assert_eq!(name.to_string(), format!("/sym/surface/v={i}"));
+            assert_eq!(body, vec![(i as u8) + 1; 500], "remote frame {i}");
         }
     }
 
