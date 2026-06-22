@@ -4,6 +4,7 @@ exclude = [
     "crates/faces/ndn-face-afxdp/bpf/redirect-ebpf",
 ]
 members = [
+    "crates/surface/ndn-surface",
     "crates/dashboard/ndn-dashboard-core",
     "crates/coding/ndn-coding",
     "crates/ratelimit/ndn-ratelimit",

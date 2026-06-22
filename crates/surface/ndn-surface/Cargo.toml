@@ -1,0 +1,23 @@
+[package]
+name = "ndn-surface"
+description = "Named, zero-copy surfaces over the SHM face — the ergonomic NamedPublisher/NamedSubscriber layer (G11)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "extension"
+
+[dependencies]
+ndn-face-shm         = { workspace = true }
+ndn-transport        = { workspace = true }
+ndn-foundation-types = { workspace = true, features = ["std"] }
+ndn-tlv              = { workspace = true, features = ["std"] }
+ndn-packet           = { workspace = true, features = ["std"] }
+bytes                = { workspace = true, features = ["std"] }
+sha2                 = { workspace = true }
+thiserror            = { workspace = true }
+tokio                = { workspace = true, features = ["rt", "net", "time", "macros"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
