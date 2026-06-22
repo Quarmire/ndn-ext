@@ -54,8 +54,8 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use ndn_app::{Consumer, Producer};
 use ndn_face_shm::{
-    SharedBuffer, ShmFace, ShmHandle, ShmToken, connect_fd_handoff, control_socket_path, recv_fds,
-    send_fds, serve_fd_handoff, serve_fd_handoff_loop,
+    SharedBuffer, SharedBufferReader, ShmFace, ShmHandle, ShmToken, connect_fd_handoff,
+    control_socket_path, recv_fds, send_fds, serve_fd_handoff, serve_fd_handoff_loop,
 };
 use ndn_foundation_types::Name;
 use ndn_packet::encode::DataBuilder;
@@ -399,8 +399,11 @@ impl NamedPublisher {
     ) -> Result<Name, SurfaceError> {
         let frame_name = self.name.clone().append_version(self.seq);
         let name_wire = frame_name.encode_to_tlv();
-        // Reserve the SharedBuffer and write the payload in place (no copy).
-        let (mut buf, fd) = SharedBuffer::create(len)?;
+        // Reserve the SharedBuffer and write the payload in place (no copy). The
+        // producer keeps the only writable mapping; consumers get a read-only fd —
+        // kernel-enforced, so a consumer (or any process that obtains the fd) cannot
+        // forge a large frame. "Signatures without signatures" for the large path.
+        let (mut buf, fd) = SharedBuffer::create_ro(len)?;
         fill(buf.as_mut_slice());
         let header = large_frame_header(len, &name_wire);
 
@@ -1141,7 +1144,7 @@ fn decode_name_tlv(full: &[u8]) -> Option<Name> {
 }
 
 enum LargeOutcome {
-    Frame { name: Vec<u8>, buf: SharedBuffer },
+    Frame { name: Vec<u8>, buf: SharedBufferReader },
     Eos,
     Aborted,
 }
@@ -1175,8 +1178,10 @@ fn read_large_frame(mut s: UnixStream) -> (Option<UnixStream>, LargeOutcome) {
             let Some(fd) = fds.into_iter().next() else {
                 return (None, LargeOutcome::Aborted);
             };
-            // mmap retains the mapping after the fd closes, so `fd` may drop here.
-            match SharedBuffer::from_fd(fd.as_raw_fd(), payload_len) {
+            // Map the handed fd READ-ONLY: the consumer reads in place but cannot
+            // write the producer's data region. mmap retains the mapping after the
+            // fd closes, so `fd` may drop here.
+            match SharedBufferReader::from_fd(fd.as_raw_fd(), payload_len) {
                 Ok(buf) => (Some(s), LargeOutcome::Frame { name, buf }),
                 Err(_) => (None, LargeOutcome::Aborted),
             }
