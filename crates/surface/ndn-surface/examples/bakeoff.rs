@@ -14,8 +14,51 @@
 
 use std::time::{Duration, Instant};
 
+use iceoryx2::prelude::*;
 use ndn_surface::{NamedPublisher, NamedSubscriber};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// iceoryx2: the flagship Rust zero-copy shared-memory IPC. Typed publish/subscribe
+/// over a preallocated SHM pool; the subscriber reads samples in place (zero-copy).
+/// Its ports are `!Send` (single-threaded arc policy), so this drives publish +
+/// receive on one thread, keeping in-flight within the buffer (paced, lossless) —
+/// a measure of iceoryx2's per-operation send+receive cost.
+fn bench_iox(service_name: String, frame: usize, n: usize) -> Duration {
+    const BUF: usize = 64;
+    let node = NodeBuilder::new().create::<ipc::Service>().unwrap();
+    let service = node
+        .service_builder(&service_name.as_str().try_into().unwrap())
+        .publish_subscribe::<[u8]>()
+        .max_publishers(1)
+        .max_subscribers(1)
+        .subscriber_max_buffer_size(BUF)
+        .create()
+        .unwrap();
+    let publisher = service
+        .publisher_builder()
+        .initial_max_slice_len(frame)
+        .create()
+        .unwrap();
+    let subscriber = service.subscriber_builder().create().unwrap();
+
+    let start = Instant::now();
+    let mut sent = 0usize;
+    let mut got = 0usize;
+    while got < n {
+        // Send a burst up to BUF ahead of what's been received (no overflow).
+        while sent < n && sent - got < BUF {
+            let sample = publisher.loan_slice_uninit(frame).unwrap();
+            let sample = sample.write_from_fn(|_| 0xAB);
+            sample.send().unwrap();
+            sent += 1;
+        }
+        // Drain everything available, reading each sample in place (zero-copy).
+        while subscriber.receive().unwrap().is_some() {
+            got += 1;
+        }
+    }
+    start.elapsed()
+}
 
 /// Incumbent: a Unix-domain socket with a 4-byte LE length prefix. Raw bytes,
 /// copied into the kernel on send and out into a Vec on receive. No names.
@@ -94,9 +137,6 @@ async fn bench_surface_large(name: &str, frame: usize, n: usize) -> Duration {
 fn mbps(frame: usize, n: usize, d: Duration) -> f64 {
     (frame as f64 * n as f64) / d.as_secs_f64() / 1e6
 }
-fn per_frame_us(n: usize, d: Duration) -> f64 {
-    d.as_secs_f64() * 1e6 / n as f64
-}
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
@@ -104,62 +144,59 @@ async fn main() {
     let target_bytes = 256usize << 20;
     let sizes = [1024usize, 65_536, 1_048_576, 4_194_304];
 
-    // Warm up paths (alloc, first-touch, socket setup) off the clock.
+    // Warm up paths (alloc, first-touch, socket/shm setup) off the clock.
     let _ = bench_socket(4096, 200).await;
     let _ = bench_surface_stream("/bench/warm", 4096, 200).await;
     let _ = bench_surface_large("/bench/warmlarge", 1 << 20, 8).await;
+    let _ =
+        tokio::task::spawn_blocking(|| bench_iox("bench/warm/iox".into(), 4096, 200)).await;
 
+    println!("\n  throughput, MB/s (higher is better)\n");
     println!(
-        "\n  {:>9} | {:>6} | {:>12} {:>10} | {:>12} {:>10} | {:>12} {:>10}",
-        "frame", "N", "socket MB/s", "us/frame", "surf MB/s", "us/frame", "surf-lg MB/s", "us/frame"
+        "  {:>9} | {:>7} | {:>10} | {:>10} | {:>10} | {:>10}",
+        "frame", "N", "socket", "surf", "surf-lg", "iceoryx2"
     );
-    println!("  {}", "-".repeat(96));
+    println!("  {}", "-".repeat(72));
 
     for (i, &frame) in sizes.iter().enumerate() {
         let n = (target_bytes / frame).clamp(50, 200_000);
 
         let d_sock = bench_socket(frame, n).await;
         let d_surf = bench_surface_stream(&format!("/bench/s/{i}"), frame, n).await;
-        // The large path is for big payloads; only meaningful from ~64 KiB up.
         let d_large = if frame >= 65_536 {
             Some(bench_surface_large(&format!("/bench/l/{i}"), frame, n).await)
         } else {
             None
         };
+        let iox_name = format!("bench/iox/{i}");
+        let d_iox = tokio::task::spawn_blocking(move || bench_iox(iox_name, frame, n))
+            .await
+            .unwrap();
 
         let fr = if frame >= 1 << 20 {
             format!("{} MiB", frame >> 20)
         } else {
             format!("{} KiB", frame >> 10)
         };
-        match d_large {
-            Some(d_large) => println!(
-                "  {:>9} | {:>6} | {:>12.0} {:>10.2} | {:>12.0} {:>10.2} | {:>12.0} {:>10.2}",
-                fr,
-                n,
-                mbps(frame, n, d_sock),
-                per_frame_us(n, d_sock),
-                mbps(frame, n, d_surf),
-                per_frame_us(n, d_surf),
-                mbps(frame, n, d_large),
-                per_frame_us(n, d_large),
-            ),
-            None => println!(
-                "  {:>9} | {:>6} | {:>12.0} {:>10.2} | {:>12.0} {:>10.2} | {:>12} {:>10}",
-                fr,
-                n,
-                mbps(frame, n, d_sock),
-                per_frame_us(n, d_sock),
-                mbps(frame, n, d_surf),
-                per_frame_us(n, d_surf),
-                "-",
-                "-",
-            ),
-        }
+        let large_cell = match d_large {
+            Some(d) => format!("{:.0}", mbps(frame, n, d)),
+            None => "-".to_string(),
+        };
+        println!(
+            "  {:>9} | {:>7} | {:>10.0} | {:>10.0} | {:>10} | {:>10.0}",
+            fr,
+            n,
+            mbps(frame, n, d_sock),
+            mbps(frame, n, d_surf),
+            large_cell,
+            mbps(frame, n, d_iox),
+        );
     }
     println!(
-        "\n  socket = Unix stream + 4B length prefix (raw bytes, no names, copy both ends)\n  \
-         surf   = NamedPublisher/NamedSubscriber streaming (named Data, zero-copy read)\n  \
-         surf-lg= open_large/publish_large (SharedBuffer fd, payload skips the kernel)\n"
+        "\n  socket   = Unix stream + 4B length prefix (raw bytes, no names, copy both ends)\n  \
+         surf     = NamedPublisher/NamedSubscriber streaming (named NDN Data, zero-copy read)\n  \
+         surf-lg  = open_large/publish_large (SharedBuffer fd, payload skips the kernel)\n  \
+         iceoryx2 = typed zero-copy pub/sub over a preallocated SHM pool (no names, paced lossless)\n  \
+         (per-frame latency for 1 KiB ≈ us/frame = 1000/MB/s × KiB; see the bake-off note)\n"
     );
 }
