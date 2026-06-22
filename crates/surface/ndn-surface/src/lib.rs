@@ -14,20 +14,33 @@
 //! let mut pubr = NamedPublisher::open("/app/surface").await?;
 //! pubr.publish(b"frame-0").await?;                 // publishes /app/surface/v=0
 //!
-//! let sub = NamedSubscriber::connect("/app/surface").await?;
+//! let mut sub = NamedSubscriber::connect("/app/surface").await?;
 //! sub.next_frame(|f| println!("{} = {} bytes", f.name, f.content.len())).await;
 //! # Ok(()) }
 //! ```
 //!
-//! Scope (G11 increment-4 facade, first cut): the **local** zero-copy path,
-//! framed NDN Data over the ring (consumer content is borrowed in place). The
-//! remote-transparent fallback (`connect` → forwarder fetch when the producer is
-//! not on this host) and the large-frame `SharedBuffer` path are seams for the
-//! next phase; the API is shaped so they slot in behind the same calls.
+//! ## Named-data transparency
+//!
+//! [`NamedSubscriber`] reads frames **by name** regardless of where the producer
+//! lives. The *same* `next_frame()` call resolves two ways:
+//!
+//! - **Local** — a [`NamedPublisher`] is serving on this host → frames stream over
+//!   the SHM ring and content is **borrowed in place** (zero-copy).
+//! - **Remote** — no local producer → frames are fetched **over the forwarder**
+//!   by Interest/Data (`<surface>/v=<seq>`), content owned from the network.
+//!
+//! [`NamedSubscriber::connect_via`] picks: it probes the name's local rendezvous
+//! and, finding none, falls back to a forwarder fetch through a caller-supplied
+//! [`Consumer`]. The consumer code is identical either way — *fetch by name; get
+//! zero-copy if it's local, the network if it isn't.*
+//!
+//! Scope: the large-frame `SharedBuffer` path, capability auth over name
+//! resolution, and 1:N fan-out remain seams for the next phase.
 
 use std::path::PathBuf;
 
 use bytes::Bytes;
+use ndn_app::Consumer;
 use ndn_face_shm::{
     ShmFace, ShmHandle, ShmToken, connect_fd_handoff, control_socket_path, serve_fd_handoff,
 };
@@ -143,56 +156,127 @@ pub struct FrameRef<'a> {
     pub content: &'a [u8],
 }
 
-/// Attaches to a named surface and reads its frames; gets local zero-copy when
-/// the producer is on this host.
+/// Where a [`NamedSubscriber`]'s frames come from — chosen by name, hidden from
+/// the consumer. Local is zero-copy over SHM; Remote pulls each frame by name
+/// over the forwarder.
+enum Source {
+    /// A local publisher is serving — frames stream over the SHM ring.
+    Local(ShmHandle),
+    /// No local producer — fetch `<surface>/v=<seq>` over the forwarder.
+    Remote { consumer: Consumer, seq: u64 },
+}
+
+/// Attaches to a named surface and reads its frames by name — zero-copy when the
+/// producer is local, over the forwarder when it is remote, same call either way.
 pub struct NamedSubscriber {
-    handle: ShmHandle,
+    source: Source,
     surface: Name,
 }
 
 impl NamedSubscriber {
-    /// Attach to the surface named `name`. Locally this establishes the
-    /// zero-copy SHM channel (retrying briefly until the publisher is serving).
+    /// Attach to a **local** surface named `name`, establishing the zero-copy SHM
+    /// channel (retrying briefly until the publisher is serving). Errors if no
+    /// local publisher appears — use [`connect_via`](Self::connect_via) for the
+    /// location-transparent path that also covers remote producers.
     pub async fn connect(name: impl Into<Name>) -> Result<Self, SurfaceError> {
         let surface = name.into();
         let token = surface_token(&surface);
         let path = control_socket_path(&token);
-        let handle = {
-            let mut attempt = 0u32;
-            loop {
-                let p = path.clone();
-                let r = tokio::task::spawn_blocking(move || connect_fd_handoff(&p, &token))
-                    .await
-                    .map_err(|e| SurfaceError::Face(format!("join: {e}")))?;
-                match r {
-                    Ok(h) => break h,
-                    Err(_) if attempt < 100 => {
-                        attempt += 1;
-                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                    }
-                    Err(e) => return Err(e.into()),
-                }
-            }
-        };
-        Ok(Self { handle, surface })
+        let handle = local_connect(&path, token, 100).await?;
+        Ok(Self {
+            source: Source::Local(handle),
+            surface,
+        })
     }
 
-    /// Await the next frame and hand it to `f` as a borrowed [`FrameRef`] — its
-    /// NDN name and a zero-copy view of its content. `None` when the surface
-    /// closes (or a malformed frame is seen).
-    pub async fn next_frame<R>(&self, f: impl FnOnce(FrameRef<'_>) -> R) -> Option<R> {
-        self.handle
-            .recv_with(|wire| match parse_frame(wire) {
-                Ok((name, content)) => Some(f(FrameRef { name, content })),
-                Err(_) => None,
-            })
-            .await
-            .flatten()
+    /// Attach to the surface named `name`, **wherever the producer is**: probe the
+    /// name's local rendezvous and, if a publisher is serving here, take the
+    /// zero-copy SHM path; otherwise fall back to fetching frames by name over the
+    /// forwarder behind `consumer`. The returned subscriber is read identically in
+    /// both cases — *that* is the transparency.
+    pub async fn connect_via(
+        name: impl Into<Name>,
+        consumer: Consumer,
+    ) -> Result<Self, SurfaceError> {
+        let surface = name.into();
+        let token = surface_token(&surface);
+        let path = control_socket_path(&token);
+        // A local publisher creates the control socket in `open`; its absence is
+        // the cheap, race-free signal that the producer is not on this host.
+        if path.exists() {
+            // Short probe: tolerate the publisher-still-starting handshake race,
+            // but don't stall a genuinely-remote attach on a stale socket.
+            if let Ok(handle) = local_connect(&path, token, 10).await {
+                return Ok(Self {
+                    source: Source::Local(handle),
+                    surface,
+                });
+            }
+        }
+        Ok(Self {
+            source: Source::Remote { consumer, seq: 0 },
+            surface,
+        })
+    }
+
+    /// Await the next frame and hand it to `f` as a [`FrameRef`] — its NDN name and
+    /// its content. Local: content is **borrowed in place** (zero-copy). Remote:
+    /// content is owned network bytes (still borrowed for the closure's duration).
+    /// `None` when the surface closes (or a frame can't be fetched/parsed).
+    pub async fn next_frame<R>(&mut self, f: impl FnOnce(FrameRef<'_>) -> R) -> Option<R> {
+        match &mut self.source {
+            Source::Local(handle) => handle
+                .recv_with(|wire| match parse_frame(wire) {
+                    Ok((name, content)) => Some(f(FrameRef { name, content })),
+                    Err(_) => None,
+                })
+                .await
+                .flatten(),
+            Source::Remote { consumer, seq } => {
+                let frame_name = self.surface.clone().append_version(*seq);
+                let data = consumer.fetch(frame_name).await.ok()?;
+                *seq += 1;
+                let content = data.content().map(|b| b.as_ref()).unwrap_or(&[]);
+                Some(f(FrameRef {
+                    name: (*data.name).clone(),
+                    content,
+                }))
+            }
+        }
     }
 
     /// The surface prefix this subscriber is attached to.
     pub fn surface(&self) -> &Name {
         &self.surface
+    }
+
+    /// True if this subscriber resolved to the local zero-copy path.
+    pub fn is_local(&self) -> bool {
+        matches!(self.source, Source::Local(_))
+    }
+}
+
+/// Establish the local zero-copy channel, retrying the (blocking) handshake up to
+/// `attempts` times to absorb the publisher-still-starting race.
+async fn local_connect(
+    path: &std::path::Path,
+    token: ShmToken,
+    attempts: u32,
+) -> Result<ShmHandle, SurfaceError> {
+    let mut tried = 0u32;
+    loop {
+        let p = path.to_path_buf();
+        let r = tokio::task::spawn_blocking(move || connect_fd_handoff(&p, &token))
+            .await
+            .map_err(|e| SurfaceError::Face(format!("join: {e}")))?;
+        match r {
+            Ok(h) => return Ok(h),
+            Err(_) if tried + 1 < attempts => {
+                tried += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            Err(e) => return Err(e.into()),
+        }
     }
 }
 
@@ -239,6 +323,11 @@ fn parse_frame(wire: &[u8]) -> Result<(Name, &[u8]), SurfaceError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ndn_app::{EngineBuilder, Producer};
+    use ndn_engine::EngineConfig;
+    use ndn_face_local::InProcFace;
+    use ndn_security::KeyChain;
+    use ndn_transport::FaceId;
 
     /// #4 (named-data transparency, local half): publish frames by name; a
     /// subscriber attaches by the SAME name and reads each frame zero-copy, with
@@ -248,7 +337,7 @@ mod tests {
     async fn named_surface_local_zero_copy_round_trip() {
         let surface = "/app/surface";
         let mut pubr = NamedPublisher::open(surface).await.unwrap();
-        let sub = NamedSubscriber::connect(surface).await.unwrap();
+        let mut sub = NamedSubscriber::connect(surface).await.unwrap();
 
         for i in 0..5u64 {
             let frame = vec![(i as u8).wrapping_add(1); 2000];
@@ -270,9 +359,69 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn empty_content_frame() {
         let mut pubr = NamedPublisher::open("/s/empty").await.unwrap();
-        let sub = NamedSubscriber::connect("/s/empty").await.unwrap();
+        let mut sub = NamedSubscriber::connect("/s/empty").await.unwrap();
         let published = pubr.publish(b"").await.unwrap();
         let name = sub.next_frame(|f| f.name.clone()).await.expect("frame");
         assert_eq!(name, published);
+    }
+
+    /// #4 (named-data transparency, REMOTE half): a producer lives across the
+    /// forwarder (no local SHM publisher). `connect_via` finds no local rendezvous
+    /// and transparently fetches frames by name over the engine — the *same*
+    /// `next_frame()` consumer code as the local path, just not zero-copy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn named_surface_remote_fetch_by_name() {
+        // Two-face in-proc engine routing the surface prefix to the producer.
+        let surface_str = "/remote/surface";
+        let surface: Name = surface_str.parse().unwrap();
+        let (consumer_face, consumer_handle) = InProcFace::new(FaceId(1), 256);
+        let (producer_face, producer_handle) = InProcFace::new(FaceId(2), 256);
+        let (engine, _shutdown) = EngineBuilder::new(EngineConfig::default())
+            .face(consumer_face)
+            .face(producer_face)
+            .build()
+            .await
+            .expect("engine build");
+        engine.fib().add_nexthop(&surface, FaceId(2), 0);
+
+        // Remote producer: signs frames under the surface name, answers each
+        // `<surface>/v=<seq>` Interest with that frame's content.
+        let kc = KeyChain::ephemeral(surface_str).expect("keychain");
+        let signer = kc.signer().expect("signer");
+        let producer =
+            Producer::from_handle(producer_handle, surface.clone()).with_signer(signer);
+        let serve = tokio::spawn(async move {
+            producer
+                .serve(|interest, responder| async move {
+                    // content keyed off the requested version so the test can check it
+                    let n = interest.name.to_string();
+                    let v = n.rsplit("v=").next().and_then(|s| s.parse::<u64>().ok());
+                    if let Some(v) = v {
+                        let frame = vec![(v as u8).wrapping_add(1); 2000];
+                        let _ = responder.respond((*interest.name).clone(), frame).await;
+                    }
+                })
+                .await
+        });
+
+        // No NamedPublisher::open for this name → the local rendezvous is absent,
+        // so connect_via must take the remote path.
+        let consumer = Consumer::from_handle(consumer_handle);
+        let mut sub = NamedSubscriber::connect_via(surface.clone(), consumer)
+            .await
+            .unwrap();
+        assert!(!sub.is_local(), "should have resolved to the remote path");
+
+        for i in 0..5u64 {
+            let expected = vec![(i as u8).wrapping_add(1); 2000];
+            let (name, body) = sub
+                .next_frame(|f| (f.name.clone(), f.content.to_vec()))
+                .await
+                .expect("remote frame");
+            // Same by-name guarantee as local: the frame's name is /remote/surface/v=i.
+            assert_eq!(name.to_string(), format!("/remote/surface/v={i}"));
+            assert_eq!(body, expected, "remote frame {i} content");
+        }
+        serve.abort();
     }
 }

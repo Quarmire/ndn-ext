@@ -14,10 +14,14 @@ ndn-transport        = { workspace = true }
 ndn-foundation-types = { workspace = true, features = ["std"] }
 ndn-tlv              = { workspace = true, features = ["std"] }
 ndn-packet           = { workspace = true, features = ["std"] }
+ndn-app              = { workspace = true }
 bytes                = { workspace = true, features = ["std"] }
 sha2                 = { workspace = true }
 thiserror            = { workspace = true }
 tokio                = { workspace = true, features = ["rt", "net", "time", "macros"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tokio          = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+ndn-engine     = { workspace = true }
+ndn-face-local = { workspace = true }
+ndn-security   = { workspace = true }
