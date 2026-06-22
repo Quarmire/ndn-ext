@@ -350,6 +350,45 @@ unsafe fn ring_push(
     true
 }
 
+/// **Zero-copy produce:** reserve the next slot, write the `len` prefix, run
+/// `fill` to write the payload **in place** (no `memcpy` from a source buffer —
+/// the producer counterpart of [`ring_peek_consume`]), then advance tail.
+/// Returns `false` (without calling `fill`) if the ring is full. `fill` receives
+/// exactly `len` bytes of slot payload.
+///
+/// # Safety
+/// Same as [`ring_push`]; `len <= slot_size`.
+#[allow(clippy::too_many_arguments)] // positional ring params, like the other ring_* helpers
+unsafe fn ring_reserve_commit(
+    base: *mut u8,
+    ring_off: usize,
+    tail_off: usize,
+    head_off: usize,
+    capacity: u32,
+    slot_size: u32,
+    len: usize,
+    fill: impl FnOnce(&mut [u8]),
+) -> bool {
+    debug_assert!(len <= slot_size as usize);
+    let tail_a = unsafe { AtomicU32::from_ptr(base.add(tail_off) as *mut u32) };
+    let head_a = unsafe { AtomicU32::from_ptr(base.add(head_off) as *mut u32) };
+
+    let t = tail_a.load(Ordering::Relaxed);
+    let h = head_a.load(Ordering::Acquire);
+    if t.wrapping_sub(h) >= capacity {
+        return false;
+    }
+    let idx = (t % capacity) as usize;
+    let slot = unsafe { base.add(ring_off + idx * slot_stride(slot_size)) };
+    unsafe {
+        (slot as *mut u32).write_unaligned(len as u32);
+        let payload = std::slice::from_raw_parts_mut(slot.add(4), len);
+        fill(payload);
+    }
+    tail_a.store(t.wrapping_add(1), Ordering::Release);
+    true
+}
+
 /// One Acquire load + one Release store per batch. Returns the number
 /// pushed.
 ///
@@ -967,6 +1006,61 @@ impl SpscFace {
         self.try_peek_consume_a2e(f)
     }
 
+    fn e2a_has_space(&self) -> bool {
+        let tail =
+            unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_E2A_TAIL) as *mut u32) };
+        let head =
+            unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_E2A_HEAD) as *mut u32) };
+        tail.load(Ordering::Relaxed)
+            .wrapping_sub(head.load(Ordering::Acquire))
+            < self.capacity
+    }
+
+    /// **Zero-copy send** to the e2a ring (increment 4): reserve a slot and write
+    /// `len` bytes into it **in place** via `f` — serialize/encode straight into
+    /// shared memory, no intermediate buffer or memcpy (the producer mirror of
+    /// [`recv_with`](Self::recv_with)). Same yield-until-space backpressure +
+    /// parked-peer wakeup as [`send_bytes`](Self::send_bytes).
+    pub async fn send_with(
+        &self,
+        len: usize,
+        f: impl FnOnce(&mut [u8]),
+    ) -> Result<(), FaceError> {
+        if len > self.slot_size as usize {
+            return Err(FaceError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "payload exceeds SHM slot size",
+            )));
+        }
+        let parked =
+            unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_E2A_PARKED) as *mut u32) };
+        let mut f = Some(f);
+        loop {
+            if self.e2a_has_space() {
+                // Sole producer: space can't vanish, so the commit succeeds.
+                let committed = unsafe {
+                    ring_reserve_commit(
+                        self.shm.as_ptr(),
+                        self.e2a_off,
+                        OFF_E2A_TAIL,
+                        OFF_E2A_HEAD,
+                        self.capacity,
+                        self.slot_size,
+                        len,
+                        f.take().unwrap(),
+                    )
+                };
+                debug_assert!(committed);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        if parked.load(Ordering::SeqCst) != 0 {
+            pipe_write(&self.e2a_tx);
+        }
+        Ok(())
+    }
+
     fn try_push_e2a(&self, data: &[u8]) -> bool {
         unsafe {
             ring_push(
@@ -1468,6 +1562,66 @@ impl SpscHandle {
     /// packet in place via `f` if waiting, else `None`.
     pub fn try_recv_with<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
         self.try_peek_consume_e2a(f)
+    }
+
+    fn a2e_has_space(&self) -> bool {
+        let tail =
+            unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_A2E_TAIL) as *mut u32) };
+        let head =
+            unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_A2E_HEAD) as *mut u32) };
+        tail.load(Ordering::Relaxed)
+            .wrapping_sub(head.load(Ordering::Acquire))
+            < self.capacity
+    }
+
+    /// **Zero-copy send** to the a2e ring (increment 4): reserve a slot and write
+    /// `len` bytes into it **in place** via `f` — encode straight into shared
+    /// memory, no intermediate buffer or memcpy. Same wall-clock-deadline
+    /// backpressure + cancel handling as [`send_bytes`](Self::send_bytes).
+    pub async fn send_with(
+        &self,
+        len: usize,
+        f: impl FnOnce(&mut [u8]),
+    ) -> Result<(), ShmError> {
+        if self.cancel.is_cancelled() {
+            return Err(ShmError::Closed);
+        }
+        if len > self.slot_size as usize {
+            return Err(ShmError::PacketTooLarge);
+        }
+        let parked =
+            unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_A2E_PARKED) as *mut u32) };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut f = Some(f);
+        loop {
+            if self.a2e_has_space() {
+                let committed = unsafe {
+                    ring_reserve_commit(
+                        self.shm.as_ptr(),
+                        self.a2e_off,
+                        OFF_A2E_TAIL,
+                        OFF_A2E_HEAD,
+                        self.capacity,
+                        self.slot_size,
+                        len,
+                        f.take().unwrap(),
+                    )
+                };
+                debug_assert!(committed);
+                break;
+            }
+            if self.cancel.is_cancelled() {
+                return Err(ShmError::Closed);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(ShmError::Closed);
+            }
+            tokio::task::yield_now().await;
+        }
+        if parked.load(Ordering::SeqCst) != 0 {
+            pipe_write(&self.a2e_tx);
+        }
+        Ok(())
     }
 
     /// **Zero-copy receive** from the e2a ring: wait for a packet, then run `f`
@@ -2051,6 +2205,40 @@ mod tests {
             std::hint::spin_loop();
         };
         assert_eq!(n, 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_with_zero_copy_produce() {
+        use std::time::Duration;
+        let name = format!("{}-swith", test_name());
+        let face = SpscFace::create(FaceId(51), &name).unwrap();
+        let handle = SpscHandle::connect(&name).unwrap();
+
+        // Producer writes the payload directly into the a2e slot — no source
+        // buffer, no memcpy.
+        handle
+            .send_with(5, |slot| slot.copy_from_slice(b"hello"))
+            .await
+            .unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(2), face.recv_bytes())
+            .await
+            .expect("timed out")
+            .unwrap();
+        assert_eq!(&got[..], b"hello");
+
+        // e2a direction: produce in place, consume in place (fully zero-copy).
+        face.send_with(3, |slot| {
+            slot[0] = 1;
+            slot[1] = 2;
+            slot[2] = 3;
+        })
+        .await
+        .unwrap();
+        let v = tokio::time::timeout(Duration::from_secs(2), handle.recv_with(|s| s.to_vec()))
+            .await
+            .expect("timed out")
+            .expect("closed");
+        assert_eq!(v, vec![1, 2, 3]);
     }
 
     #[test]
