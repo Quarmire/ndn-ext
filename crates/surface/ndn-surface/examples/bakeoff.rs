@@ -73,11 +73,11 @@ async fn bench_surface_stream(name: &str, frame: usize, n: usize) -> Duration {
 async fn bench_surface_large(name: &str, frame: usize, n: usize) -> Duration {
     let mut pubr = NamedPublisher::open_large(name).await.unwrap();
     let mut sub = NamedSubscriber::connect_large(name).await.unwrap();
-    let payload = vec![0xABu8; frame];
     let start = Instant::now();
     let prod = tokio::spawn(async move {
         for _ in 0..n {
-            pubr.publish_large(&payload).await.unwrap();
+            // Write-in-place: no producer-side copy — fill the SharedBuffer directly.
+            pubr.publish_large_with(frame, |slot| slot.fill(0xAB)).await.unwrap();
         }
         pubr.close().await.unwrap();
     });

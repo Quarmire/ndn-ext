@@ -258,6 +258,20 @@ impl NamedPublisher {
     /// valid on a surface opened with [`open_large`](Self::open_large); errors
     /// otherwise. Blocks on the first call until a subscriber has attached.
     pub async fn publish_large(&mut self, content: &[u8]) -> Result<Name, SurfaceError> {
+        self.publish_large_with(content.len(), |slot| slot.copy_from_slice(content))
+            .await
+    }
+
+    /// Write-in-place large publish: reserve a `len`-byte [`SharedBuffer`] and let
+    /// `fill` write the payload **directly into shared memory** — no intermediate
+    /// buffer, no producer-side copy (the large-frame mirror of
+    /// [`send_with`](ShmFace) / encode-into). The fd is then handed to the
+    /// subscriber. Same surface/blocking rules as [`publish_large`](Self::publish_large).
+    pub async fn publish_large_with(
+        &mut self,
+        len: usize,
+        fill: impl FnOnce(&mut [u8]),
+    ) -> Result<Name, SurfaceError> {
         let frame_name = self.name.clone().append_version(self.seq);
         let name_wire = frame_name.encode_to_tlv();
         let Sink::Large { stream, pending } = &mut self.sink else {
@@ -272,10 +286,10 @@ impl NamedPublisher {
             *stream = Some(s);
         }
         let s = stream.take().unwrap();
-        // Build the SharedBuffer (zero-copy write), then ship fd + header off-thread.
-        let (mut buf, fd) = SharedBuffer::create(content.len())?;
-        buf.as_mut_slice().copy_from_slice(content);
-        let payload_len = content.len();
+        // Reserve the SharedBuffer and write the payload in place, then ship the fd.
+        let (mut buf, fd) = SharedBuffer::create(len)?;
+        fill(buf.as_mut_slice());
+        let payload_len = len;
         let s = tokio::task::spawn_blocking(move || -> std::io::Result<UnixStream> {
             use std::io::Write;
             let mut s = s;
@@ -604,6 +618,11 @@ impl NamedSubscriber {
     /// content is owned network bytes (still borrowed for the closure's duration).
     /// `None` when the surface closes (or a frame can't be fetched/parsed).
     pub async fn next_frame<R>(&mut self, f: impl FnOnce(FrameRef<'_>) -> R) -> Option<R> {
+        // Once the stream has ended (clean or aborted), stay ended — no re-read, no
+        // doomed re-fetch.
+        if self.complete.is_some() {
+            return None;
+        }
         // Each frame either yields a value, is the EOS marker, or is malformed —
         // kept distinct so the local arm can record *why* the stream ended.
         enum Outcome<R> {
@@ -648,15 +667,26 @@ impl NamedSubscriber {
                 match consumer.fetch(frame_name).await {
                     Ok(data) => {
                         *seq += 1;
+                        // Clean remote completion: a Data whose FinalBlockId equals
+                        // its own last name component is the last frame of the object.
+                        let is_final = data
+                            .meta_info()
+                            .and_then(|m| m.final_block_component())
+                            .and_then(|r| r.ok())
+                            .is_some_and(|fbc| Some(&fbc) == data.name.components().last());
                         let content = data.content().map(|b| b.as_ref()).unwrap_or(&[]);
-                        Some(f(FrameRef {
+                        let r = f(FrameRef {
                             name: (*data.name).clone(),
                             content,
-                        }))
+                        });
+                        if is_final {
+                            self.complete = Some(true); // clean end on the next call
+                        }
+                        Some(r)
                     }
                     Err(_) => {
-                        // Remote end: a timeout/Nack ends the stream. Clean-vs-abort
-                        // isn't distinguishable without NDN FinalBlockId (future seam).
+                        // No FinalBlockId and the producer stopped: a timeout/Nack ends
+                        // the stream as an abort (clean end is signalled via FinalBlockId).
                         self.complete = Some(false);
                         None
                     }
@@ -1218,6 +1248,104 @@ mod tests {
                 .await;
         });
         (Consumer::from_handle(ch), serve, (engine, shutdown))
+    }
+
+    /// TLV-encode one NameComponent (type + length + value) — the form
+    /// `MetaInfo::final_block_id` wraps.
+    fn component_tlv(c: &ndn_foundation_types::NameComponent) -> Bytes {
+        fn put_var(out: &mut Vec<u8>, v: u64) {
+            if v < 253 {
+                out.push(v as u8);
+            } else if v <= 0xFFFF {
+                out.push(253);
+                out.extend_from_slice(&(v as u16).to_be_bytes());
+            } else if v <= 0xFFFF_FFFF {
+                out.push(254);
+                out.extend_from_slice(&(v as u32).to_be_bytes());
+            } else {
+                out.push(255);
+                out.extend_from_slice(&v.to_be_bytes());
+            }
+        }
+        let mut b = Vec::new();
+        put_var(&mut b, c.typ);
+        put_var(&mut b, c.value.len() as u64);
+        b.extend_from_slice(&c.value);
+        Bytes::from(b)
+    }
+
+    /// A finite remote object: serves `<surface>/v=0..count`, with `FinalBlockId`
+    /// set to its own version component on the last frame.
+    async fn spawn_remote_finite(
+        surface: &Name,
+        count: u64,
+    ) -> (Consumer, tokio::task::JoinHandle<()>, impl Sized) {
+        use ndn_packet::encode::DataBuilder;
+        let (cf, ch) = InProcFace::new(FaceId(1), 256);
+        let (pf, ph) = InProcFace::new(FaceId(2), 256);
+        let (engine, shutdown) = EngineBuilder::new(EngineConfig::default())
+            .face(cf)
+            .face(pf)
+            .build()
+            .await
+            .expect("engine build");
+        engine.fib().add_nexthop(surface, FaceId(2), 0);
+        let producer = Producer::from_handle(ph, surface.clone());
+        let surface_owned = surface.clone();
+        let serve = tokio::spawn(async move {
+            let _ = producer
+                .serve(move |interest, responder| {
+                    let surface = surface_owned.clone();
+                    async move {
+                        let n = interest.name.to_string();
+                        let Some(v) = n.rsplit("v=").next().and_then(|s| s.parse::<u64>().ok())
+                        else {
+                            return;
+                        };
+                        if v >= count {
+                            return; // past the end — no response
+                        }
+                        let fname = surface.append_version(v);
+                        let content = vec![(v as u8).wrapping_add(1); 100];
+                        let mut b = DataBuilder::new(fname.clone(), &content);
+                        if v + 1 == count {
+                            let last = fname.components().last().unwrap();
+                            b = b.final_block_id(component_tlv(last));
+                        }
+                        let _ = responder.respond_bytes(b.sign_digest_sha256()).await;
+                    }
+                })
+                .await;
+        });
+        (Consumer::from_handle(ch), serve, (engine, shutdown))
+    }
+
+    /// #4 phase-2: remote clean-completion via NDN FinalBlockId. A finite remote
+    /// object marks its last frame; the consumer yields every frame then reports
+    /// `is_complete() == Some(true)` — the remote analogue of close().
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_finalblockid_clean_completion() {
+        let surface: Name = "/remote/finite".parse().unwrap();
+        let (consumer, serve, _engine) = spawn_remote_finite(&surface, 4).await;
+        let mut sub = NamedSubscriber::connect_via(surface.clone(), consumer)
+            .await
+            .unwrap();
+        assert!(!sub.is_local());
+
+        let mut got = 0u64;
+        while let Some(()) = timeout(Duration::from_secs(5), sub.next_frame(|_| ()))
+            .await
+            .expect("no stall")
+        {
+            got += 1;
+        }
+        assert_eq!(got, 4, "every frame of the finite object delivered");
+        assert_eq!(
+            sub.is_complete(),
+            Some(true),
+            "FinalBlockId ⇒ clean remote completion"
+        );
+        serve.abort();
     }
 
     /// CHAOS: publisher vanishes mid-stream. The consumer must (a) still drain the
