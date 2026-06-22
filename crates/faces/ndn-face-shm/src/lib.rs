@@ -66,3 +66,12 @@ pub use spsc::{
     SealedReader, SealedWriter, connect_sealed_handoff, mutual_auth_client, mutual_auth_server,
     serve_sealed_handoff,
 };
+
+/// Broadcast ring (sealed, **lossy SPMC**): one producer, N read-only consumers, each
+/// with its own cursor; a reader that lags by more than the ring capacity is lapped
+/// (DropOld) and never blocks the producer or its peers. The SHM transport for
+/// fan-out live streams (e.g. NDF Spark) — kernel-RO data + per-consumer registry.
+#[cfg(unix)]
+pub use spsc::{
+    BroadcastReader, BroadcastWriter, connect_broadcast_handoff, serve_broadcast_handoff,
+};

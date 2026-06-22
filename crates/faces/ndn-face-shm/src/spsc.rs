@@ -2363,6 +2363,489 @@ impl SealedReader {
     }
 }
 
+// ===========================================================================
+// Broadcast ring (sealed, lossy SPMC) — one producer, N read-only consumers, each
+// with its own cursor; a consumer that falls behind by more than the ring capacity
+// is *lapped* (DropOld) and never blocks the producer or its peers. The SHM
+// transport for fan-out live streams (NDF Spark): the producer is the sole writer
+// of the data region (kernel-RO to consumers — integrity + origin without a
+// per-frame signature), and each consumer owns one slot in a shared registry where
+// it writes only its own parked flag/cursor (a corrupt entry harms only that
+// consumer). Validated shape: iceoryx2 safe-overflow, Aeron positions, LMAX
+// Disruptor, Kafka consumer offsets.
+//
+// Two regions:
+//   * DATA (producer RW, consumers RO): magic | capacity | slot_size | tail (u64
+//     absolute publish count) | slots. Each slot = seq:u64 | len:u32 | payload.
+//     `seq` is the absolute sequence of the frame in that slot, written *after* the
+//     payload (Release) and read on both sides (Acquire) as a **seqlock**: a reader
+//     copies under it and rejects a frame the producer overwrote mid-read. Because
+//     the producer never blocks (lossy), zero-copy borrows are unsound here — the
+//     reader copies into its own buffer, unlike the reliable SPSC sealed ring.
+//   * REG (RW to all): magic | max_consumers | per-consumer entries (parked u32 |
+//     cursor u64). The producer wakes only parked consumers; it never reads a
+//     consumer cursor for flow control (it can't be stalled).
+// ===========================================================================
+
+const BCAST_MAGIC: u64 = 0x4E44_4E5F_4243_5354; // b"NDN_BCST"
+const BCAST_OFF_TAIL: usize = 64; // in DATA (own cache line)
+const BCAST_DATA_HEADER: usize = 128; // slots start here in DATA
+const BCAST_SLOT_HDR: usize = 16; // seq:u64 | len:u32 | pad, per slot
+const BCAST_REG_HEADER: usize = 64; // entries start here in REG
+const BCAST_REG_STRIDE: usize = 64; // one cache line per consumer entry
+const BCAST_OFF_PARKED: usize = 0; // within a REG entry
+const BCAST_OFF_CURSOR: usize = 8; // within a REG entry (diagnostic)
+const BCAST_WRITING: u64 = u64::MAX; // slot seq sentinel: producer is mid-write
+const BCAST_MAX_MAP: usize = 256 * 1024 * 1024; // anti-SIGBUS clamp
+
+fn bcast_slot_stride(slot_size: u32) -> usize {
+    (BCAST_SLOT_HDR + slot_size as usize).next_multiple_of(8)
+}
+fn bcast_data_size(capacity: u32, slot_size: u32) -> usize {
+    BCAST_DATA_HEADER + capacity as usize * bcast_slot_stride(slot_size)
+}
+fn bcast_reg_size(max_consumers: u32) -> usize {
+    BCAST_REG_HEADER + max_consumers as usize * BCAST_REG_STRIDE
+}
+
+/// Producer end of a broadcast ring. Writes frames into the data region (which it
+/// alone can write) and serves each consumer a **read-only** data fd, the shared
+/// **read-write** registry fd, a private wakeup pipe, and its registry index.
+pub struct BroadcastWriter {
+    data: ShmRegion, // read-write mapping (consumers map the same region read-only)
+    reg: ShmRegion,  // read-write mapping (shared consumer registry)
+    data_ro_fd: OwnedFd, // the read-only data fd, cloned per consumer
+    reg_rw_fd: OwnedFd,  // the registry fd, cloned per consumer
+    capacity: u32,
+    slot_size: u32,
+    max_consumers: u32,
+    consumers: std::sync::Mutex<Vec<(u32, OwnedFd)>>, // (registry idx, wake write end)
+    next_idx: AtomicU32,
+}
+
+impl BroadcastWriter {
+    /// Create a broadcast ring sized for `capacity` slots of `slot_size` bytes and up
+    /// to `max_consumers` readers. The producer holds the writable mappings; consumers
+    /// are added later with [`register_consumer`](Self::register_consumer).
+    pub fn create(
+        capacity: u32,
+        slot_size: u32,
+        max_consumers: u32,
+    ) -> Result<Self, ShmError> {
+        if capacity == 0 || slot_size == 0 || max_consumers == 0 {
+            return Err(ShmError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "broadcast ring: capacity/slot_size/max_consumers must be non-zero",
+            )));
+        }
+        let (data, data_ro_fd) = ShmRegion::create_anon_ro(bcast_data_size(capacity, slot_size))?;
+        let (reg, reg_rw_fd) = ShmRegion::create_anon(bcast_reg_size(max_consumers))?;
+        unsafe {
+            (data.as_ptr() as *mut u64).write_unaligned(BCAST_MAGIC);
+            (data.as_ptr().add(8) as *mut u32).write_unaligned(capacity);
+            (data.as_ptr().add(12) as *mut u32).write_unaligned(slot_size);
+            (reg.as_ptr() as *mut u64).write_unaligned(BCAST_MAGIC);
+            (reg.as_ptr().add(8) as *mut u32).write_unaligned(max_consumers);
+            // tail, parked flags, cursors are zero from ftruncate.
+        }
+        Ok(Self {
+            data,
+            reg,
+            data_ro_fd,
+            reg_rw_fd,
+            capacity,
+            slot_size,
+            max_consumers,
+            consumers: std::sync::Mutex::new(Vec::new()),
+            next_idx: AtomicU32::new(0),
+        })
+    }
+
+    fn tail(&self) -> &AtomicU64 {
+        unsafe { AtomicU64::from_ptr(self.data.as_ptr().add(BCAST_OFF_TAIL) as *mut u64) }
+    }
+    fn entry_parked(&self, idx: u32) -> &AtomicU32 {
+        let off = BCAST_REG_HEADER + idx as usize * BCAST_REG_STRIDE + BCAST_OFF_PARKED;
+        unsafe { AtomicU32::from_ptr(self.reg.as_ptr().add(off) as *mut u32) }
+    }
+
+    /// Allocate a registry slot and a private wakeup pipe for a new consumer; returns
+    /// `(data_ro_fd, reg_rw_fd, wake_read_fd, idx)` to hand it. Errors once
+    /// `max_consumers` is reached.
+    pub fn register_consumer(&self) -> Result<(OwnedFd, OwnedFd, OwnedFd, u32), ShmError> {
+        let idx = self.next_idx.fetch_add(1, Ordering::Relaxed);
+        if idx >= self.max_consumers {
+            return Err(ShmError::Io(std::io::Error::other(
+                "broadcast ring: max consumers reached",
+            )));
+        }
+        let (wake_r, wake_w) = anon_pipe()?;
+        let data_ro = self.data_ro_fd.try_clone().map_err(ShmError::Io)?;
+        let reg_rw = self.reg_rw_fd.try_clone().map_err(ShmError::Io)?;
+        self.consumers.lock().unwrap().push((idx, wake_w));
+        Ok((data_ro, reg_rw, wake_r, idx))
+    }
+
+    /// Number of consumers registered so far.
+    pub fn consumer_count(&self) -> usize {
+        self.consumers.lock().unwrap().len()
+    }
+
+    /// Total frames published (the absolute tail).
+    pub fn published(&self) -> u64 {
+        self.tail().load(Ordering::Acquire)
+    }
+
+    fn commit(&self, len: usize, fill: impl FnOnce(&mut [u8])) {
+        let t = self.tail().load(Ordering::Relaxed);
+        let slot = unsafe {
+            self.data
+                .as_ptr()
+                .add(BCAST_DATA_HEADER + (t % self.capacity as u64) as usize * bcast_slot_stride(self.slot_size))
+        };
+        let seq = unsafe { AtomicU64::from_ptr(slot as *mut u64) };
+        // Mark the slot "being written" so a reader mid-overwrite rejects it, then
+        // fill, then publish the slot's sequence (Release) and advance tail.
+        seq.store(BCAST_WRITING, Ordering::Release);
+        unsafe {
+            (slot.add(8) as *mut u32).write_unaligned(len as u32);
+            let payload = std::slice::from_raw_parts_mut(slot.add(BCAST_SLOT_HDR), len);
+            fill(payload);
+        }
+        seq.store(t, Ordering::Release);
+        self.tail().store(t.wrapping_add(1), Ordering::Release);
+        // Wake every parked consumer; the producer is never paced by them.
+        for (idx, wake) in self.consumers.lock().unwrap().iter() {
+            if self.entry_parked(*idx).load(Ordering::SeqCst) != 0 {
+                pipe_write(wake);
+            }
+        }
+    }
+
+    /// Publish one frame in place (zero-copy on the *write* side): `fill` writes up to
+    /// `len` bytes into the slot. Returns `false` (frame dropped) if `len` exceeds the
+    /// slot size. Never blocks on consumers — a lagging reader is lapped, not waited on.
+    pub fn publish_with(&self, len: usize, fill: impl FnOnce(&mut [u8])) -> bool {
+        if len > self.slot_size as usize {
+            return false;
+        }
+        self.commit(len, fill);
+        true
+    }
+
+    /// Publish one frame (copying `data` into the slot).
+    pub fn publish(&self, data: &[u8]) -> bool {
+        self.publish_with(data.len(), |slot| slot.copy_from_slice(data))
+    }
+}
+
+/// Outcome of a single non-blocking peek at the broadcast ring.
+enum BcastPeek {
+    Got(Vec<u8>),
+    Empty,
+    Retry, // slot was being written / overwritten — re-read tail and try again
+}
+
+/// Consumer end of a broadcast ring: maps the data region **read-only** (cannot
+/// forge), the registry **read-write** (writes only its own parked flag + cursor),
+/// owns a private wakeup-pipe read end (EOF = producer gone), and tracks its own
+/// absolute cursor. Starts at the live tail (new frames only). Lossy: if the
+/// producer laps the cursor, frames are counted in [`dropped`](Self::dropped) and
+/// the cursor jumps to the oldest still-available frame.
+pub struct BroadcastReader {
+    data: ShmRegion, // read-only mapping
+    reg: ShmRegion,  // read-write mapping
+    capacity: u32,
+    slot_size: u32,
+    idx: u32,
+    next: AtomicU64,    // reader-local absolute cursor (next seq wanted)
+    dropped: AtomicU64, // frames lost to lapping
+    wake_rx: tokio::io::unix::AsyncFd<OwnedFd>,
+}
+
+impl BroadcastReader {
+    /// Build a reader from the fds + index handed by the producer
+    /// ([`BroadcastWriter::register_consumer`] / [`connect_broadcast_handoff`]):
+    /// `data_fd` read-only, `reg_fd` read-write, `wake_fd` the wakeup pipe read end.
+    /// Geometry is read from the (producer-written, read-only) data header and
+    /// **bounded** so a bogus size can never drive an over-map. Must run within a
+    /// Tokio runtime (for the wakeup `AsyncFd`).
+    pub fn from_fds(
+        data_fd: OwnedFd,
+        reg_fd: OwnedFd,
+        wake_fd: OwnedFd,
+        idx: u32,
+    ) -> Result<Self, ShmError> {
+        // DATA header: magic + capacity + slot_size.
+        let (capacity, slot_size) = unsafe {
+            let p = libc::mmap(
+                std::ptr::null_mut(),
+                BCAST_DATA_HEADER,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                data_fd.as_raw_fd(),
+                0,
+            );
+            if p == libc::MAP_FAILED {
+                return Err(ShmError::Io(std::io::Error::last_os_error()));
+            }
+            let base = p as *const u8;
+            let magic = (base as *const u64).read_unaligned();
+            let cap = (base.add(8) as *const u32).read_unaligned();
+            let slen = (base.add(12) as *const u32).read_unaligned();
+            libc::munmap(p, BCAST_DATA_HEADER);
+            if magic != BCAST_MAGIC {
+                return Err(ShmError::InvalidMagic);
+            }
+            (cap, slen)
+        };
+        if capacity == 0 || slot_size == 0 || bcast_data_size(capacity, slot_size) > BCAST_MAX_MAP {
+            return Err(ShmError::InvalidMagic);
+        }
+        // REG header: magic + max_consumers (to size the mapping + bound idx).
+        let max_consumers = unsafe {
+            let p = libc::mmap(
+                std::ptr::null_mut(),
+                BCAST_REG_HEADER,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                reg_fd.as_raw_fd(),
+                0,
+            );
+            if p == libc::MAP_FAILED {
+                return Err(ShmError::Io(std::io::Error::last_os_error()));
+            }
+            let base = p as *const u8;
+            let magic = (base as *const u64).read_unaligned();
+            let mc = (base.add(8) as *const u32).read_unaligned();
+            libc::munmap(p, BCAST_REG_HEADER);
+            if magic != BCAST_MAGIC {
+                return Err(ShmError::InvalidMagic);
+            }
+            mc
+        };
+        if idx >= max_consumers || bcast_reg_size(max_consumers) > BCAST_MAX_MAP {
+            return Err(ShmError::InvalidMagic);
+        }
+
+        let data = ShmRegion::from_fd_ro(data_fd.as_raw_fd(), bcast_data_size(capacity, slot_size))?;
+        let reg = ShmRegion::from_fd(reg_fd.as_raw_fd(), bcast_reg_size(max_consumers))?;
+        set_nonblock_cloexec(wake_fd.as_raw_fd())?;
+        let wake_rx = tokio::io::unix::AsyncFd::new(wake_fd).map_err(ShmError::Io)?;
+
+        // Start at the live tail — a new subscriber sees new frames, not the buffered
+        // backlog (matches Aeron/Spark "join the live stream").
+        let tail = unsafe {
+            AtomicU64::from_ptr(data.as_ptr().add(BCAST_OFF_TAIL) as *mut u64)
+                .load(Ordering::Acquire)
+        };
+        Ok(Self {
+            data,
+            reg,
+            capacity,
+            slot_size,
+            idx,
+            next: AtomicU64::new(tail),
+            dropped: AtomicU64::new(0),
+            wake_rx,
+        })
+    }
+
+    fn tail(&self) -> &AtomicU64 {
+        unsafe { AtomicU64::from_ptr(self.data.as_ptr().add(BCAST_OFF_TAIL) as *mut u64) }
+    }
+    fn parked(&self) -> &AtomicU32 {
+        let off = BCAST_REG_HEADER + self.idx as usize * BCAST_REG_STRIDE + BCAST_OFF_PARKED;
+        unsafe { AtomicU32::from_ptr(self.reg.as_ptr().add(off) as *mut u32) }
+    }
+    fn write_cursor(&self, v: u64) {
+        let off = BCAST_REG_HEADER + self.idx as usize * BCAST_REG_STRIDE + BCAST_OFF_CURSOR;
+        unsafe {
+            AtomicU64::from_ptr(self.reg.as_ptr().add(off) as *mut u64).store(v, Ordering::Relaxed);
+        }
+    }
+
+    /// Frames lost to lapping (producer overwrote them before this reader caught up).
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+    /// This reader's registry index.
+    pub fn index(&self) -> u32 {
+        self.idx
+    }
+
+    fn peek(&self) -> BcastPeek {
+        let t = self.tail().load(Ordering::Acquire);
+        let mut next = self.next.load(Ordering::Relaxed);
+        if next >= t {
+            return BcastPeek::Empty;
+        }
+        // DropOld: if the cursor is older than the oldest retained frame, jump forward.
+        let oldest = t.saturating_sub(self.capacity as u64);
+        if next < oldest {
+            self.dropped.fetch_add(oldest - next, Ordering::Relaxed);
+            next = oldest;
+            self.next.store(next, Ordering::Relaxed);
+        }
+        let slot = unsafe {
+            self.data
+                .as_ptr()
+                .add(BCAST_DATA_HEADER + (next % self.capacity as u64) as usize * bcast_slot_stride(self.slot_size))
+        };
+        let seq = unsafe { AtomicU64::from_ptr(slot as *mut u64) };
+        let s1 = seq.load(Ordering::Acquire);
+        if s1 != next {
+            // s1 == BCAST_WRITING (mid-write) or s1 > next (already lapped) → retry.
+            return BcastPeek::Retry;
+        }
+        let len = unsafe { (slot.add(8) as *const u32).read_unaligned() as usize }
+            .min(self.slot_size as usize);
+        let mut buf = vec![0u8; len];
+        unsafe {
+            std::ptr::copy_nonoverlapping(slot.add(BCAST_SLOT_HDR), buf.as_mut_ptr(), len);
+        }
+        // Seqlock check: reject if the producer overwrote the slot during the copy.
+        if seq.load(Ordering::Acquire) != next {
+            return BcastPeek::Retry;
+        }
+        self.next.store(next + 1, Ordering::Release);
+        self.write_cursor(next + 1);
+        BcastPeek::Got(buf)
+    }
+
+    /// Non-blocking receive of the next frame (a copy). `None` if no new frame is
+    /// available right now (lapped frames are skipped and counted in `dropped`).
+    pub fn try_recv(&self) -> Option<Vec<u8>> {
+        // Bound the retry budget so a hot producer lapping the exact slot can't spin
+        // us forever — on exhaustion we report "nothing this poll" (lossy by design).
+        let budget = 4 * self.capacity as u64 + 16;
+        for _ in 0..budget {
+            match self.peek() {
+                BcastPeek::Got(b) => return Some(b),
+                BcastPeek::Empty => return None,
+                BcastPeek::Retry => std::hint::spin_loop(),
+            }
+        }
+        None
+    }
+
+    /// Blocking (async) receive: spin → park on the wakeup pipe → read the next frame.
+    /// `None` when the producer is gone (wakeup pipe EOF) — end of stream.
+    pub async fn recv(&self) -> Option<Vec<u8>> {
+        loop {
+            if let Some(b) = self.try_recv() {
+                return Some(b);
+            }
+            for _ in 0..SPIN_ITERS {
+                std::hint::spin_loop();
+                if let Some(b) = self.try_recv() {
+                    return Some(b);
+                }
+            }
+            self.parked().store(1, Ordering::SeqCst);
+            if let Some(b) = self.try_recv() {
+                self.parked().store(0, Ordering::Relaxed);
+                return Some(b);
+            }
+            match pipe_await(&self.wake_rx).await {
+                Ok(()) => self.parked().store(0, Ordering::Relaxed),
+                Err(_) => {
+                    self.parked().store(0, Ordering::Relaxed);
+                    return None; // producer gone ⇒ end of stream
+                }
+            }
+        }
+    }
+}
+
+/// **Broadcast handoff (producer side):** serve the ring fds to **every** authorized
+/// consumer that connects (unlike the 1:1 sealed handoff, this loops). Each consumer
+/// gets a fresh registry slot + wakeup pipe via [`BroadcastWriter::register_consumer`];
+/// the three fds ride one `SCM_RIGHTS` message and the registry index follows as four
+/// bytes. Runs until the listener errors or is dropped (spawn it and hold the handle).
+#[cfg(unix)]
+pub async fn serve_broadcast_handoff(
+    listener: tokio::net::UnixListener,
+    token: ShmToken,
+    writer: std::sync::Arc<BroadcastWriter>,
+) -> std::io::Result<()> {
+    let mut rejects = 0u32;
+    loop {
+        let (stream, _addr) = listener.accept().await?;
+        let std_stream = stream.into_std()?;
+        std_stream.set_nonblocking(false)?;
+        let authorized = tokio::task::spawn_blocking(
+            move || -> std::io::Result<Option<std::os::unix::net::UnixStream>> {
+                let mut s = std_stream;
+                Ok(if mutual_auth_server(&mut s, &token).unwrap_or(false) {
+                    Some(s)
+                } else {
+                    None
+                })
+            },
+        )
+        .await
+        .map_err(|e| std::io::Error::other(format!("broadcast handoff token task: {e}")))??;
+
+        let Some(s) = authorized else {
+            rejects += 1;
+            if rejects >= HANDOFF_MAX_REJECTS {
+                return Err(std::io::Error::other(
+                    "broadcast handoff: too many unauthorized connections",
+                ));
+            }
+            continue;
+        };
+        let (data_ro, reg_rw, wake_r, idx) = writer
+            .register_consumer()
+            .map_err(|e| std::io::Error::other(format!("broadcast register: {e}")))?;
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            use std::io::Write;
+            send_fds(
+                s.as_raw_fd(),
+                &[data_ro.as_raw_fd(), reg_rw.as_raw_fd(), wake_r.as_raw_fd()],
+            )?;
+            // The registry index follows the fd message as four bytes.
+            let mut s = s;
+            s.write_all(&idx.to_le_bytes())?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| std::io::Error::other(format!("broadcast handoff send task: {e}")))??;
+        // Keep serving the next consumer.
+    }
+}
+
+/// **Broadcast handoff (consumer side):** connect, mutually authenticate, and receive
+/// the three ring fds `[data_ro, reg_rw, wake_r]` plus this consumer's registry index.
+/// Blocking — call via `spawn_blocking`, then build the reader in async context.
+#[cfg(unix)]
+pub fn connect_broadcast_handoff(
+    path: &std::path::Path,
+    token: &ShmToken,
+) -> Result<(OwnedFd, OwnedFd, OwnedFd, u32), ShmError> {
+    use std::io::Read;
+    let mut s = std::os::unix::net::UnixStream::connect(path).map_err(ShmError::Io)?;
+    if !mutual_auth_client(&mut s, token).map_err(ShmError::Io)? {
+        return Err(ShmError::Io(std::io::Error::other(
+            "broadcast handoff: producer failed authentication (possible name squatter)",
+        )));
+    }
+    let fds = recv_fds(s.as_raw_fd(), 3).map_err(ShmError::Io)?;
+    if fds.len() != 3 {
+        return Err(ShmError::Io(std::io::Error::other(
+            "broadcast handoff: expected 3 ring fds",
+        )));
+    }
+    let mut idx_buf = [0u8; 4];
+    s.read_exact(&mut idx_buf).map_err(ShmError::Io)?;
+    let mut it = fds.into_iter();
+    let data = it.next().unwrap();
+    let reg = it.next().unwrap();
+    let wake = it.next().unwrap();
+    Ok((data, reg, wake, u32::from_le_bytes(idx_buf)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3069,5 +3552,132 @@ mod tests {
             assert_eq!((r1.as_ptr() as *const u32).read_unaligned(), 11);
             assert_eq!((r2.as_ptr() as *const u32).read_unaligned(), 22);
         }
+    }
+
+    // ---- Broadcast ring (lossy SPMC) ----
+
+    fn reader_from(writer: &BroadcastWriter) -> BroadcastReader {
+        let (data, reg, wake, idx) = writer.register_consumer().unwrap();
+        BroadcastReader::from_fds(data, reg, wake, idx).unwrap()
+    }
+
+    /// One producer fans out to N readers, each with an independent cursor; within
+    /// the ring capacity every reader sees every frame, in order.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn broadcast_fans_out_to_all_readers() {
+        let writer = BroadcastWriter::create(8, 64, 4).unwrap();
+        let r0 = reader_from(&writer);
+        let r1 = reader_from(&writer);
+        let r2 = reader_from(&writer);
+        assert_eq!(writer.consumer_count(), 3);
+
+        for i in 0u32..5 {
+            assert!(writer.publish(&i.to_le_bytes()));
+        }
+        for r in [&r0, &r1, &r2] {
+            for i in 0u32..5 {
+                let f = r.recv().await.unwrap();
+                assert_eq!(u32::from_le_bytes(f.try_into().unwrap()), i);
+            }
+            assert_eq!(r.dropped(), 0);
+        }
+    }
+
+    /// A reader that never keeps up is *lapped*: it loses the overrun frames (counted
+    /// in `dropped`) and resumes at the oldest still-retained frame — the producer is
+    /// never blocked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn broadcast_drops_old_for_lagging_reader() {
+        let writer = BroadcastWriter::create(4, 64, 1).unwrap();
+        let r = reader_from(&writer); // cursor starts at 0
+
+        for i in 0u32..10 {
+            assert!(writer.publish(&i.to_le_bytes())); // never blocks; laps the reader
+        }
+        // Capacity 4 ⇒ only frames 6..10 remain; 0..6 were dropped.
+        let mut got = Vec::new();
+        while let Some(f) = r.try_recv() {
+            got.push(u32::from_le_bytes(f.try_into().unwrap()));
+        }
+        assert_eq!(got, vec![6, 7, 8, 9]);
+        assert_eq!(r.dropped(), 6);
+    }
+
+    /// Kernel-enforced single-writer: a consumer's data fd cannot be escalated to a
+    /// writable mapping — it can read the producer's frames but never forge one.
+    #[test]
+    fn broadcast_consumer_cannot_write_data_region() {
+        let writer = BroadcastWriter::create(4, 64, 1).unwrap();
+        let (data_ro, _reg, _wake, _idx) = writer.register_consumer().unwrap();
+        let attempt = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                bcast_data_size(4, 64),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                data_ro.as_raw_fd(),
+                0,
+            )
+        };
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        assert_eq!(attempt, libc::MAP_FAILED, "writable mapping must be refused");
+        assert!(matches!(errno, Some(libc::EACCES) | Some(libc::EPERM)));
+    }
+
+    /// When the producer goes away, a parked reader's blocking `recv` returns `None`
+    /// (wakeup-pipe EOF) — the broadcast end-of-stream signal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn broadcast_end_of_stream_on_producer_drop() {
+        let writer = BroadcastWriter::create(4, 64, 1).unwrap();
+        let r = reader_from(&writer);
+        writer.publish(&7u32.to_le_bytes());
+        assert_eq!(u32::from_le_bytes(r.recv().await.unwrap().try_into().unwrap()), 7);
+        drop(writer); // closes the wake pipe write end
+        assert!(r.recv().await.is_none(), "producer gone ⇒ end of stream");
+    }
+
+    /// The full socket handoff path: serve to two consumers over a control socket
+    /// with mutual auth, then broadcast to both.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn broadcast_handoff_round_trip() {
+        let token = mint_token().unwrap();
+        let path = control_socket_path(&token);
+        let _ = std::fs::remove_file(&path);
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let writer = std::sync::Arc::new(BroadcastWriter::create(8, 64, 4).unwrap());
+        let serve = tokio::spawn(serve_broadcast_handoff(listener, token, writer.clone()));
+
+        let mut readers = Vec::new();
+        for _ in 0..2 {
+            let p = path.clone();
+            let (d, rg, w, idx) =
+                tokio::task::spawn_blocking(move || connect_broadcast_handoff(&p, &token))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            readers.push(BroadcastReader::from_fds(d, rg, w, idx).unwrap());
+        }
+        // Give the serve loop a moment to register both before publishing.
+        for _ in 0..1000 {
+            if writer.consumer_count() == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(writer.consumer_count(), 2);
+
+        for i in 0u32..3 {
+            writer.publish(&i.to_le_bytes());
+        }
+        for r in &readers {
+            for i in 0u32..3 {
+                assert_eq!(
+                    u32::from_le_bytes(r.recv().await.unwrap().try_into().unwrap()),
+                    i
+                );
+            }
+        }
+        serve.abort();
+        let _ = std::fs::remove_file(&path);
     }
 }
