@@ -1915,6 +1915,179 @@ impl SharedBufferReader {
     }
 }
 
+// ===========================================================================
+// Sealed ring (kernel-enforced single-writer streaming) — the "local surface"
+// substrate. Two regions:
+//   * DATA  (producer read-write, consumer READ-ONLY): magic | capacity |
+//     slot_size | tail (producer cursor) | slots. The producer is the sole writer
+//     — a consumer physically cannot forge a frame (kernel-enforced via the
+//     read-only fd). Integrity + origin without a per-frame signature.
+//   * CTRL  (read-write to both): head (consumer cursor) | parked. The consumer
+//     writes its read cursor here; corrupting it only harms that consumer's own
+//     channel (it cannot reach another consumer's ring, and the producer
+//     bounds-checks the gap so a bogus head can never cause an out-of-bounds or an
+//     overwrite-driven forge — at worst the consumer loses/stalls its own frames).
+// One-way; a duplex sealed channel is two of these. SPSC.
+// ===========================================================================
+
+const SEALED_OFF_TAIL: usize = 64; // in DATA region (own cache line)
+const SEALED_DATA_HEADER: usize = 128; // slots start here in DATA
+const SEALED_OFF_HEAD: usize = 0; // in CTRL region
+// CTRL offset 64 is reserved for a future `parked` wakeup flag.
+const SEALED_CTRL_SIZE: usize = 128;
+
+fn sealed_data_size(capacity: u32, slot_size: u32) -> usize {
+    SEALED_DATA_HEADER + capacity as usize * slot_stride(slot_size)
+}
+
+/// Producer end of a sealed ring: writes frames into the data region (which it
+/// alone can write) and hands consumers a **read-only** data fd plus a read-write
+/// control fd.
+pub struct SealedWriter {
+    data: ShmRegion, // read-write mapping
+    ctrl: ShmRegion, // read-write mapping (reads the consumer's head)
+    capacity: u32,
+    slot_size: u32,
+}
+
+impl SealedWriter {
+    /// Create a sealed ring. Returns the writer plus `(data_ro_fd, ctrl_rw_fd)` to
+    /// hand the consumer; `capacity`/`slot_size` travel out-of-band (the consumer
+    /// needs them to size its mappings).
+    pub fn create(capacity: u32, slot_size: u32) -> Result<(Self, OwnedFd, OwnedFd), ShmError> {
+        let (data, data_ro_fd) = ShmRegion::create_anon_ro(sealed_data_size(capacity, slot_size))?;
+        let (ctrl, ctrl_rw_fd) = ShmRegion::create_anon(SEALED_CTRL_SIZE)?;
+        unsafe {
+            (data.as_ptr() as *mut u64).write_unaligned(MAGIC);
+            (data.as_ptr().add(8) as *mut u32).write_unaligned(capacity);
+            (data.as_ptr().add(12) as *mut u32).write_unaligned(slot_size);
+            // tail / head / parked are zero from ftruncate.
+        }
+        Ok((
+            Self {
+                data,
+                ctrl,
+                capacity,
+                slot_size,
+            },
+            data_ro_fd,
+            ctrl_rw_fd,
+        ))
+    }
+
+    fn tail(&self) -> &AtomicU32 {
+        unsafe { AtomicU32::from_ptr(self.data.as_ptr().add(SEALED_OFF_TAIL) as *mut u32) }
+    }
+    fn head(&self) -> &AtomicU32 {
+        unsafe { AtomicU32::from_ptr(self.ctrl.as_ptr().add(SEALED_OFF_HEAD) as *mut u32) }
+    }
+
+    /// True if the ring currently has space (consumer head bounds-checked).
+    pub fn has_space(&self) -> bool {
+        let t = self.tail().load(Ordering::Relaxed);
+        let h = self.head().load(Ordering::Acquire);
+        // A bogus head (consumer-controlled) only ever makes the gap look >= capacity
+        // ⇒ "full" ⇒ we refuse to write. Never an overwrite, never out-of-bounds.
+        t.wrapping_sub(h) < self.capacity
+    }
+
+    /// Non-blocking zero-copy send: reserve the next slot and write `len` bytes in
+    /// place via `fill`. Returns `false` (without calling `fill`) if full — for
+    /// fan-out, where a stuck consumer must not block the others.
+    pub fn try_send_with(&self, len: usize, fill: impl FnOnce(&mut [u8])) -> bool {
+        if len > self.slot_size as usize || !self.has_space() {
+            return false;
+        }
+        let t = self.tail().load(Ordering::Relaxed);
+        let idx = (t % self.capacity) as usize;
+        let slot = unsafe {
+            self.data
+                .as_ptr()
+                .add(SEALED_DATA_HEADER + idx * slot_stride(self.slot_size))
+        };
+        unsafe {
+            (slot as *mut u32).write_unaligned(len as u32);
+            let payload = std::slice::from_raw_parts_mut(slot.add(4), len);
+            fill(payload);
+        }
+        self.tail().store(t.wrapping_add(1), Ordering::Release);
+        true
+    }
+
+    /// Non-blocking copy send.
+    pub fn try_send(&self, data: &[u8]) -> bool {
+        self.try_send_with(data.len(), |slot| slot.copy_from_slice(data))
+    }
+}
+
+/// Consumer end of a sealed ring: maps the data region **read-only** (cannot
+/// forge) and the control region read-write (writes its read cursor).
+pub struct SealedReader {
+    data: ShmRegion, // read-only mapping
+    ctrl: ShmRegion, // read-write mapping
+    capacity: u32,
+    slot_size: u32,
+}
+
+impl SealedReader {
+    /// Map the fds handed by [`SealedWriter::create`]: `data_fd` read-only,
+    /// `ctrl_fd` read-write. `capacity`/`slot_size` come from the handshake.
+    pub fn from_fds(
+        data_fd: RawFd,
+        ctrl_fd: RawFd,
+        capacity: u32,
+        slot_size: u32,
+    ) -> Result<Self, ShmError> {
+        let data = ShmRegion::from_fd_ro(data_fd, sealed_data_size(capacity, slot_size))?;
+        let ctrl = ShmRegion::from_fd(ctrl_fd, SEALED_CTRL_SIZE)?;
+        let magic = unsafe { (data.as_ptr() as *const u64).read_unaligned() };
+        if magic != MAGIC {
+            return Err(ShmError::InvalidMagic);
+        }
+        Ok(Self {
+            data,
+            ctrl,
+            capacity,
+            slot_size,
+        })
+    }
+
+    fn tail(&self) -> &AtomicU32 {
+        unsafe { AtomicU32::from_ptr(self.data.as_ptr().add(SEALED_OFF_TAIL) as *mut u32) }
+    }
+    fn head(&self) -> &AtomicU32 {
+        unsafe { AtomicU32::from_ptr(self.ctrl.as_ptr().add(SEALED_OFF_HEAD) as *mut u32) }
+    }
+
+    /// Non-blocking zero-copy receive: borrow the next frame in place (read-only)
+    /// and pass it to `f`. `None` if empty.
+    pub fn try_recv_with<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        let h = self.head().load(Ordering::Relaxed);
+        let t = self.tail().load(Ordering::Acquire);
+        if h == t {
+            return None;
+        }
+        let idx = (h % self.capacity) as usize;
+        let slot = unsafe {
+            self.data
+                .as_ptr()
+                .add(SEALED_DATA_HEADER + idx * slot_stride(self.slot_size))
+        };
+        let len = unsafe { (slot as *const u32).read_unaligned() as usize }.min(self.slot_size as usize);
+        let out = {
+            let view = unsafe { std::slice::from_raw_parts(slot.add(4), len) };
+            f(view)
+        };
+        self.head().store(h.wrapping_add(1), Ordering::Release);
+        Some(out)
+    }
+
+    /// Non-blocking copy receive.
+    pub fn try_recv(&self) -> Option<Vec<u8>> {
+        self.try_recv_with(|s| s.to_vec())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1976,6 +2149,64 @@ mod tests {
             matches!(errno, Some(libc::EACCES) | Some(libc::EPERM)),
             "expected a permission-denial errno, got {errno:?}"
         );
+    }
+
+    /// SEALED RING: frames flow producer→consumer over the data region the consumer
+    /// maps read-only; the consumer reads in place but the data fd cannot be mapped
+    /// writable. FIFO order + empty detection verified.
+    #[test]
+    fn sealed_ring_flows_and_is_unforgeable() {
+        let (writer, data_fd, ctrl_fd) = SealedWriter::create(8, 256).unwrap();
+        let reader =
+            SealedReader::from_fds(data_fd.as_raw_fd(), ctrl_fd.as_raw_fd(), 8, 256).unwrap();
+
+        // Producer writes 5 frames; consumer reads them in order.
+        for i in 0..5u8 {
+            assert!(writer.try_send(&[i; 100]), "send {i}");
+        }
+        for i in 0..5u8 {
+            let v = reader.try_recv_with(|s| (s.len(), s[0])).expect("frame");
+            assert_eq!(v, (100, i), "frame {i} in order");
+        }
+        assert!(reader.try_recv().is_none(), "empty after draining");
+
+        // A late frame is seen (genuinely shared, zero-copy).
+        assert!(writer.try_send(b"late"));
+        assert_eq!(reader.try_recv().unwrap(), b"late");
+
+        // PROOF: the data fd cannot be escalated to a writable mapping — a consumer
+        // (or any fd holder) physically cannot forge a frame.
+        let attempt = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                data_fd.as_raw_fd(),
+                0,
+            )
+        };
+        assert_eq!(
+            attempt,
+            libc::MAP_FAILED,
+            "kernel must refuse a writable mapping of the sealed data region"
+        );
+    }
+
+    /// Backpressure: a full ring refuses further sends (no overwrite), and a bogus
+    /// consumer head can never drive an out-of-bounds or an overwrite-forge.
+    #[test]
+    fn sealed_ring_full_refuses_send() {
+        let (writer, data_fd, ctrl_fd) = SealedWriter::create(4, 64).unwrap();
+        let reader =
+            SealedReader::from_fds(data_fd.as_raw_fd(), ctrl_fd.as_raw_fd(), 4, 64).unwrap();
+        for i in 0..4u8 {
+            assert!(writer.try_send(&[i; 8]), "fill slot {i}");
+        }
+        assert!(!writer.try_send(b"overflow"), "full ring must refuse");
+        // Drain one, then one more send fits.
+        assert_eq!(reader.try_recv().unwrap(), &[0u8; 8]);
+        assert!(writer.try_send(b"now-fits"));
     }
 
     /// The producer's writable mapping survives closing the RW fd (the mapping, not

@@ -57,3 +57,9 @@ pub use spsc::{
 /// hand its fd between processes for in-place (no-copy) consumption.
 #[cfg(unix)]
 pub use spsc::{SharedBuffer, SharedBufferReader, recv_fds, send_fds};
+
+/// Sealed streaming ring (kernel-enforced single-writer): the producer writes the
+/// data region and consumers map it read-only, so a consumer cannot forge a frame.
+/// The "local surface" substrate — integrity + origin without a per-frame signature.
+#[cfg(unix)]
+pub use spsc::{SealedReader, SealedWriter};
