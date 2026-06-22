@@ -153,6 +153,29 @@ enum Sink {
     Sealed(SealedWriter),
 }
 
+/// Bind a producer's control socket **exclusively**: refuse to hijack a live owner.
+/// If the path is in use, probe it — a live listener ⇒ error (the name is already
+/// served), a stale socket (no listener, e.g. a crashed producer) ⇒ reclaim it.
+/// Closes the silent `remove_file`+rebind hijack where any process could displace a
+/// live producer of a name.
+fn bind_exclusive(path: &Path) -> Result<tokio::net::UnixListener, SurfaceError> {
+    match tokio::net::UnixListener::bind(path) {
+        Ok(l) => Ok(l),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            if std::os::unix::net::UnixStream::connect(path).is_ok() {
+                return Err(SurfaceError::Face(format!(
+                    "surface name already served by another producer ({})",
+                    path.display()
+                )));
+            }
+            // No listener answered — a stale socket from a crashed producer. Reclaim.
+            let _ = std::fs::remove_file(path);
+            tokio::net::UnixListener::bind(path).map_err(SurfaceError::Io)
+        }
+        Err(e) => Err(SurfaceError::Io(e)),
+    }
+}
+
 /// Sealed-ring geometry for a given max frame size: a slot big enough for the
 /// frame + Data overhead, and a capacity that keeps the data region within ~4 MiB.
 fn sealed_geometry(max_frame: usize) -> (u32, u32) {
@@ -321,8 +344,7 @@ impl NamedPublisher {
         let (capacity, slot_size) = sealed_geometry(max_frame);
         let (writer, data_fd, ctrl_fd, wake_fd) = SealedWriter::create(capacity, slot_size)?;
         let path = control_socket_path(&rendezvous_token(&name));
-        let _ = std::fs::remove_file(&path);
-        let listener = tokio::net::UnixListener::bind(&path)?;
+        let listener = bind_exclusive(&path)?;
         let serve = tokio::spawn(async move {
             let _ = serve_sealed_handoff(
                 listener,
@@ -409,8 +431,7 @@ impl NamedPublisher {
         capability: ShmToken,
     ) -> Result<Self, SurfaceError> {
         let path = control_socket_path(&rendezvous_token(&name));
-        let _ = std::fs::remove_file(&path);
-        let listener = tokio::net::UnixListener::bind(&path)?;
+        let listener = bind_exclusive(&path)?;
         let (tx, incoming) = std::sync::mpsc::channel::<UnixStream>();
         let serve = tokio::spawn(accept_authorized_loop(listener, capability, tx));
         Ok(Self {
@@ -429,8 +450,7 @@ impl NamedPublisher {
 
     async fn open_large_inner(name: Name, capability: ShmToken) -> Result<Self, SurfaceError> {
         let path = control_socket_path(&rendezvous_token(&name));
-        let _ = std::fs::remove_file(&path);
-        let listener = tokio::net::UnixListener::bind(&path)?;
+        let listener = bind_exclusive(&path)?;
         let (tx, pending) = tokio::sync::oneshot::channel::<UnixStream>();
         let serve = tokio::spawn(async move {
             if let Ok(stream) = accept_authorized(listener, capability).await {
@@ -544,8 +564,7 @@ impl NamedPublisher {
         // FaceId is irrelevant for a standalone surface — the facade picks one.
         let (face, fds) = ShmFace::create_anon_for_mtu(FaceId(0), max_frame)?;
         let path = control_socket_path(&rendezvous_token(&name));
-        let _ = std::fs::remove_file(&path);
-        let listener = tokio::net::UnixListener::bind(&path)?;
+        let listener = bind_exclusive(&path)?;
         let serve = tokio::spawn(async move {
             let _ = serve_fd_handoff(listener, capability, fds).await;
         });
@@ -566,8 +585,7 @@ impl NamedPublisher {
         capability: ShmToken,
     ) -> Result<Self, SurfaceError> {
         let path = control_socket_path(&rendezvous_token(&name));
-        let _ = std::fs::remove_file(&path);
-        let listener = tokio::net::UnixListener::bind(&path)?;
+        let listener = bind_exclusive(&path)?;
         // Each authorized attach mints a fresh ring; the face is handed to `publish`
         // over this channel (so no lock is held across the send loop's awaits).
         let (tx, incoming) = std::sync::mpsc::channel::<ShmFace>();
@@ -1475,8 +1493,7 @@ impl ServiceSurface {
     async fn open_inner(name: Name, capability: ShmToken) -> Result<Self, SurfaceError> {
         let (face, fds) = ShmFace::create_anon_for_mtu(FaceId(0), DEFAULT_MAX_FRAME)?;
         let path = control_socket_path(&rendezvous_token(&name));
-        let _ = std::fs::remove_file(&path);
-        let listener = tokio::net::UnixListener::bind(&path)?;
+        let listener = bind_exclusive(&path)?;
         let serve = tokio::spawn(async move {
             let _ = serve_fd_handoff(listener, capability, fds).await;
         });
@@ -1651,8 +1668,7 @@ impl StatePublisher {
         let name = name.into();
         let cap = rendezvous_token(&name);
         let path = control_socket_path(&rendezvous_token(&name));
-        let _ = std::fs::remove_file(&path);
-        let listener = tokio::net::UnixListener::bind(&path)?;
+        let listener = bind_exclusive(&path)?;
         let (faces_tx, faces_rx) = tokio::sync::mpsc::unbounded_channel::<ShmFace>();
         let serve = tokio::spawn(async move {
             let _ = serve_fd_handoff_loop(listener, cap, move || {
@@ -2065,6 +2081,31 @@ mod tests {
         let mut b = StateSubscriber::connect("/state/multi").await.unwrap();
         let vb = timeout(Duration::from_secs(2), b.next()).await.unwrap().unwrap();
         assert_eq!(&vb[..], b"x", "late subscriber b also sees current value");
+    }
+
+    // ---- exclusive producer ownership ------------------------------------
+
+    /// A second producer cannot hijack a live name (no silent remove_file+rebind).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exclusive_ownership_refuses_hijack() {
+        let _a = NamedPublisher::open("/excl/live").await.unwrap();
+        let b = NamedPublisher::open("/excl/live").await;
+        assert!(b.is_err(), "must not hijack a live surface");
+        // Different surface types contend on the same rendezvous too.
+        let c = NamedPublisher::open_local("/excl/live").await;
+        assert!(c.is_err(), "sealed open also refused on a live name");
+    }
+
+    /// A stale socket (crashed producer, no listener) is reclaimed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exclusive_ownership_reclaims_stale() {
+        let surface: Name = "/excl/stale".parse().unwrap();
+        let path = control_socket_path(&rendezvous_token(&surface));
+        let _ = std::fs::remove_file(&path);
+        // Leave a stale socket file with no listener.
+        drop(tokio::net::UnixListener::bind(&path).unwrap());
+        // Open reclaims it (connect probe finds no listener).
+        let _p = NamedPublisher::open(surface.clone()).await.unwrap();
     }
 
     // ---- ring split: local (sealed) surfaces -----------------------------
