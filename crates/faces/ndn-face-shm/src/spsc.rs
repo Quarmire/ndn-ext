@@ -885,6 +885,90 @@ pub fn connect_fd_handoff(path: &std::path::Path, token: &ShmToken) -> Result<Sp
     SpscHandle::from_fds(region, a2e_write, e2a_read)
 }
 
+/// **Sealed handoff (producer side):** hand one authorized consumer the three
+/// sealed-ring fds `[data_ro, ctrl_rw, wake_r]` plus `capacity`/`slot_size` (8
+/// bytes) so it can size its mappings. Like [`serve_fd_handoff`] but for the
+/// sealed ring. One consumer (1:1); unauthorized connectors are rejected.
+#[cfg(unix)]
+pub async fn serve_sealed_handoff(
+    listener: tokio::net::UnixListener,
+    token: ShmToken,
+    fds: [OwnedFd; 3],
+    capacity: u32,
+    slot_size: u32,
+) -> std::io::Result<()> {
+    let mut rejects = 0u32;
+    loop {
+        let (stream, _addr) = listener.accept().await?;
+        let std_stream = stream.into_std()?;
+        std_stream.set_nonblocking(false)?;
+        let authorized = tokio::task::spawn_blocking(
+            move || -> std::io::Result<Option<std::os::unix::net::UnixStream>> {
+                use std::io::Read;
+                let mut s = std_stream;
+                let mut tok = [0u8; 32];
+                s.read_exact(&mut tok)?;
+                Ok(if ct_eq(&tok, &token) { Some(s) } else { None })
+            },
+        )
+        .await
+        .map_err(|e| std::io::Error::other(format!("shm control token task: {e}")))??;
+
+        let Some(s) = authorized else {
+            rejects += 1;
+            if rejects >= HANDOFF_MAX_REJECTS {
+                return Err(std::io::Error::other(
+                    "shm control: too many unauthorized connections",
+                ));
+            }
+            continue;
+        };
+        let raw = [fds[0].as_raw_fd(), fds[1].as_raw_fd(), fds[2].as_raw_fd()];
+        let mut meta = [0u8; 8];
+        meta[0..4].copy_from_slice(&capacity.to_le_bytes());
+        meta[4..8].copy_from_slice(&slot_size.to_le_bytes());
+        return tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            use std::io::Write;
+            send_fds(s.as_raw_fd(), &raw)?;
+            let mut s = s;
+            s.write_all(&meta)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| std::io::Error::other(format!("shm control send task: {e}")))?;
+    }
+}
+
+/// **Sealed handoff (consumer side):** connect, present `token`, receive the three
+/// sealed-ring fds + `(capacity, slot_size)`, and build the [`SealedReader`].
+/// Blocking — call via `spawn_blocking`, then construct the reader in async context
+/// (it needs a Tokio runtime for the wakeup `AsyncFd`). Returns the raw parts so the
+/// caller builds the reader where a runtime is active.
+#[cfg(unix)]
+pub fn connect_sealed_handoff(
+    path: &std::path::Path,
+    token: &ShmToken,
+) -> Result<(OwnedFd, OwnedFd, OwnedFd, u32, u32), ShmError> {
+    use std::io::{Read, Write};
+    let mut s = std::os::unix::net::UnixStream::connect(path).map_err(ShmError::Io)?;
+    s.write_all(token).map_err(ShmError::Io)?;
+    let fds = recv_fds(s.as_raw_fd(), 3).map_err(ShmError::Io)?;
+    if fds.len() != 3 {
+        return Err(ShmError::Io(std::io::Error::other(
+            "shm control: expected 3 sealed fds",
+        )));
+    }
+    let mut it = fds.into_iter();
+    let data = it.next().unwrap();
+    let ctrl = it.next().unwrap();
+    let wake = it.next().unwrap();
+    let mut meta = [0u8; 8];
+    s.read_exact(&mut meta).map_err(ShmError::Io)?;
+    let capacity = u32::from_le_bytes([meta[0], meta[1], meta[2], meta[3]]);
+    let slot_size = u32::from_le_bytes([meta[4], meta[5], meta[6], meta[7]]);
+    Ok((data, ctrl, wake, capacity, slot_size))
+}
+
 fn set_nonblock_cloexec(fd: RawFd) -> Result<(), ShmError> {
     unsafe {
         let fl = libc::fcntl(fd, libc::F_GETFL);

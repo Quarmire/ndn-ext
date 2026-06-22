@@ -110,17 +110,16 @@ async fn bench_surface_stream(name: &str, frame: usize, n: usize) -> Duration {
     elapsed
 }
 
-/// Surface, fast streaming path: frames carry name + content but no per-frame hash
-/// (publish_fast) — for local same-trust-domain IPC. Same ring, no SHA-256.
-async fn bench_surface_fast(name: &str, frame: usize, n: usize) -> Duration {
-    let slot = (frame + 256).max(2048);
-    let mut pubr = NamedPublisher::open_with_max_frame(name, slot).await.unwrap();
-    let mut sub = NamedSubscriber::connect(name).await.unwrap();
+/// Surface, local (sealed) path: hash-free frames over the sealed ring (data mapped
+/// read-only — forge-proof). Uniform `publish`; for in-host same-trust-domain IPC.
+async fn bench_surface_local(name: &str, frame: usize, n: usize) -> Duration {
+    let mut pubr = NamedPublisher::open_local_with_max_frame(name, frame).await.unwrap();
+    let mut sub = NamedSubscriber::connect_local(name).await.unwrap();
     let payload = vec![0xABu8; frame];
     let start = Instant::now();
     let prod = tokio::spawn(async move {
         for _ in 0..n {
-            pubr.publish_fast(&payload).await.unwrap();
+            pubr.publish(&payload).await.unwrap();
         }
         pubr.close().await.unwrap();
     });
@@ -227,13 +226,13 @@ async fn main() {
     let _ =
         tokio::task::spawn_blocking(|| bench_iox("bench/warm/iox".into(), 4096, 200)).await;
 
-    let _ = bench_surface_fast("/bench/warmfast", 4096, 200).await;
+    let _ = bench_surface_local("/bench/warmlocal", 4096, 200).await;
     let _ = bench_surface_raw(4096, 200).await;
 
     println!("\n  throughput, MB/s (higher is better)\n");
     println!(
         "  {:>9} | {:>7} | {:>9} | {:>9} | {:>9} | {:>9} | {:>9} | {:>9}",
-        "frame", "N", "socket", "surf", "surf-fast", "surf-raw", "surf-lg", "iceoryx2"
+        "frame", "N", "socket", "surf", "surf-local", "surf-raw", "surf-lg", "iceoryx2"
     );
     println!("  {}", "-".repeat(96));
 
@@ -242,7 +241,7 @@ async fn main() {
 
         let d_sock = bench_socket(frame, n).await;
         let d_surf = bench_surface_stream(&format!("/bench/s/{i}"), frame, n).await;
-        let d_fast = bench_surface_fast(&format!("/bench/f/{i}"), frame, n).await;
+        let d_fast = bench_surface_local(&format!("/bench/f/{i}"), frame, n).await;
         let d_raw = bench_surface_raw(frame, n).await;
         let d_large = if frame >= 65_536 {
             Some(bench_surface_large(&format!("/bench/l/{i}"), frame, n).await)
@@ -278,7 +277,7 @@ async fn main() {
     println!(
         "\n  socket   = Unix stream + 4B length prefix (raw bytes, no names, copy both ends)\n  \
          surf     = streaming, signed NDN Data (name + SHA-256 per frame, zero-copy read)\n  \
-         surf-fast= streaming, name+content frame, NO per-frame hash (local trust domain)\n  \
+         surf-local= sealed ring, hash-free frame, forge-proof (consumer maps data read-only)\n  \
          surf-raw = the bare ring, no Data encode at all (attribution upper bound)\n  \
          surf-lg  = open_large/publish_large (SharedBuffer fd, payload skips the kernel)\n  \
          iceoryx2 = typed zero-copy pub/sub over a preallocated SHM pool (no names, paced lossless)\n"

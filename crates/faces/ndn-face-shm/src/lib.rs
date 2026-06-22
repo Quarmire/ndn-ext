@@ -62,4 +62,4 @@ pub use spsc::{SharedBuffer, SharedBufferReader, recv_fds, send_fds};
 /// data region and consumers map it read-only, so a consumer cannot forge a frame.
 /// The "local surface" substrate — integrity + origin without a per-frame signature.
 #[cfg(unix)]
-pub use spsc::{SealedReader, SealedWriter};
+pub use spsc::{SealedReader, SealedWriter, connect_sealed_handoff, serve_sealed_handoff};

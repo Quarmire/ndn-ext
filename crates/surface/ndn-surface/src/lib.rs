@@ -54,8 +54,9 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use ndn_app::{Consumer, Producer};
 use ndn_face_shm::{
-    SharedBuffer, SharedBufferReader, ShmFace, ShmHandle, ShmToken, connect_fd_handoff,
-    control_socket_path, recv_fds, send_fds, serve_fd_handoff, serve_fd_handoff_loop,
+    SealedReader, SealedWriter, SharedBuffer, SharedBufferReader, ShmFace, ShmHandle, ShmToken,
+    connect_fd_handoff, connect_sealed_handoff, control_socket_path, recv_fds, send_fds,
+    serve_fd_handoff, serve_fd_handoff_loop, serve_sealed_handoff,
 };
 use ndn_foundation_types::Name;
 use ndn_packet::encode::DataBuilder;
@@ -146,6 +147,18 @@ enum Sink {
         streams: Vec<UnixStream>,
         incoming: std::sync::mpsc::Receiver<UnixStream>,
     },
+    /// **Local (sealed) surface**: hash-free frames over a sealed ring the consumer
+    /// maps read-only — kernel-enforced single-writer, so a consumer cannot forge,
+    /// without a per-frame signature. Host-local (cannot leave the host unsigned). 1:1.
+    Sealed(SealedWriter),
+}
+
+/// Sealed-ring geometry for a given max frame size: a slot big enough for the
+/// frame + Data overhead, and a capacity that keeps the data region within ~4 MiB.
+fn sealed_geometry(max_frame: usize) -> (u32, u32) {
+    let slot_size = (max_frame + 256).max(256) as u32;
+    let capacity = ((4 << 20) / slot_size as usize).clamp(4, 4096) as u32;
+    (capacity, slot_size)
 }
 
 /// Side-channel frame tags (1 byte, written before the payload header).
@@ -183,8 +196,8 @@ async fn send_wire_to_sink(sink: &mut Sink, wire: &[u8]) -> Result<(), SurfaceEr
             }
             Ok(())
         }
-        Sink::Large { .. } | Sink::LargeFanout { .. } => Err(SurfaceError::Face(
-            "serve_on_forwarder is for streaming surfaces".into(),
+        Sink::Large { .. } | Sink::LargeFanout { .. } | Sink::Sealed(_) => Err(SurfaceError::Face(
+            "serve_on_forwarder is for signed streaming surfaces".into(),
         )),
     }
 }
@@ -268,6 +281,67 @@ impl NamedPublisher {
         let name = name.into();
         let cap = capability_token(&name, secret);
         Self::open_inner(name, DEFAULT_MAX_FRAME, cap).await
+    }
+
+    /// Open a **local (sealed) surface**: frames are hash-free but **forge-proof** —
+    /// they ride a sealed ring whose data region the consumer maps read-only, so the
+    /// kernel guarantees the producer is the sole writer (integrity + origin without
+    /// a per-frame signature). Host-local by construction: a sealed surface cannot
+    /// be served to the network (use [`open`](Self::open) for portable, signed data).
+    /// Read with [`NamedSubscriber::connect_local`]. Default frame size 64 KiB.
+    pub async fn open_local(name: impl Into<Name>) -> Result<Self, SurfaceError> {
+        Self::open_local_with_max_frame(name, 64 * 1024).await
+    }
+
+    /// Local surface sized for frames up to `max_frame` bytes.
+    pub async fn open_local_with_max_frame(
+        name: impl Into<Name>,
+        max_frame: usize,
+    ) -> Result<Self, SurfaceError> {
+        let name = name.into();
+        let cap = rendezvous_token(&name);
+        Self::open_local_inner(name, max_frame, cap).await
+    }
+
+    /// Capability-gated local surface (see [`open_gated`](Self::open_gated)).
+    pub async fn open_local_gated(
+        name: impl Into<Name>,
+        secret: &[u8],
+    ) -> Result<Self, SurfaceError> {
+        let name = name.into();
+        let cap = capability_token(&name, secret);
+        Self::open_local_inner(name, 64 * 1024, cap).await
+    }
+
+    async fn open_local_inner(
+        name: Name,
+        max_frame: usize,
+        capability: ShmToken,
+    ) -> Result<Self, SurfaceError> {
+        let (capacity, slot_size) = sealed_geometry(max_frame);
+        let (writer, data_fd, ctrl_fd, wake_fd) = SealedWriter::create(capacity, slot_size)?;
+        let path = control_socket_path(&rendezvous_token(&name));
+        let _ = std::fs::remove_file(&path);
+        let listener = tokio::net::UnixListener::bind(&path)?;
+        let serve = tokio::spawn(async move {
+            let _ = serve_sealed_handoff(
+                listener,
+                capability,
+                [data_fd, ctrl_fd, wake_fd],
+                capacity,
+                slot_size,
+            )
+            .await;
+        });
+        Ok(Self {
+            sink: Sink::Sealed(writer),
+            name,
+            seq: 0,
+            path,
+            serve,
+            window: None,
+            prefix_components: None,
+        })
     }
 
     /// Open an **ungated fan-out** surface (default 1 MiB max frame): every
@@ -526,6 +600,28 @@ impl NamedPublisher {
     /// copied into each subscriber's ring. Returns the frame's full name.
     pub async fn publish(&mut self, content: &[u8]) -> Result<Name, SurfaceError> {
         let frame_name = self.name.clone().append_version(self.seq);
+        // Local (sealed) surface: a hash-free DATA{NAME,CONTENT} frame — forge-proof
+        // by the sealed ring's read-only data mapping, so no per-frame signature.
+        if matches!(self.sink, Sink::Sealed(_)) {
+            if self.prefix_components.is_none() {
+                self.prefix_components = Some(name_components_tlv(&self.name));
+            }
+            let comps = self.prefix_components.clone().unwrap();
+            let mut vbuf = [0u8; 10];
+            let vlen = encode_version_component(self.seq, &mut vbuf);
+            let l = fast_inline_len(comps.len(), vlen, content.len());
+            let Sink::Sealed(writer) = &self.sink else {
+                unreachable!()
+            };
+            writer
+                .send_with(l, |slot| {
+                    encode_fast_inline(&comps, &vbuf[..vlen], content, slot)
+                })
+                .await
+                .map_err(|e| SurfaceError::Face(e.to_string()))?;
+            self.seq += 1;
+            return Ok(frame_name);
+        }
         let b = DataBuilder::new(frame_name.clone(), content);
         let len = b.encoded_len_digest_sha256();
         if self.window.is_some() {
@@ -564,59 +660,11 @@ impl NamedPublisher {
                         "use publish_large on a surface opened with open_large[_fanout]".into(),
                     ));
                 }
+                Sink::Sealed(_) => unreachable!("sealed handled before encoding the signed frame"),
             }
         }
         self.seq += 1;
         Ok(frame_name)
-    }
-
-    /// Publish a frame **without a per-frame hash** — a `DATA { NAME ; CONTENT }`
-    /// frame, no SignatureInfo/SignatureValue. For local, same-trust-domain IPC
-    /// where integrity is the channel's (the SHM region is private to the
-    /// capability holders), this skips the SHA-256 that dominates small-frame
-    /// encoding cost — the streaming throughput then tracks the raw ring (faster
-    /// than a typed zero-copy bus while still carrying the NDN name). Consumers read
-    /// it with the same [`next_frame`](NamedSubscriber::next_frame) (which recovers
-    /// the full name `<surface>/v=<seq>` from the wire); the frame is not a verifiable
-    /// NDN Data, so use [`publish`](Self::publish) when it leaves the trust domain.
-    /// Returns the frame's version (no per-frame `Name` allocation on this path).
-    /// Streaming surfaces only.
-    pub async fn publish_fast(&mut self, content: &[u8]) -> Result<u64, SurfaceError> {
-        let seq = self.seq;
-        if self.prefix_components.is_none() {
-            self.prefix_components = Some(name_components_tlv(&self.name));
-        }
-        let comps = self.prefix_components.clone().unwrap(); // Bytes: refcount bump, no alloc
-        let mut vbuf = [0u8; 10];
-        let vlen = encode_version_component(seq, &mut vbuf);
-        let vcomp = &vbuf[..vlen];
-        let len = fast_inline_len(comps.len(), vcomp.len(), content.len());
-        match &mut self.sink {
-            Sink::Single(face) => {
-                face.send_with(len, |slot| encode_fast_inline(&comps, vcomp, content, slot))
-                    .await
-                    .map_err(|e| SurfaceError::Face(e.to_string()))?;
-            }
-            Sink::Fanout { faces, incoming } => {
-                while let Ok(face) = incoming.try_recv() {
-                    faces.push(face);
-                }
-                let mut wire = vec![0u8; len];
-                encode_fast_inline(&comps, vcomp, content, &mut wire);
-                for face in faces.iter() {
-                    face.send_with(wire.len(), |slot| slot.copy_from_slice(&wire))
-                        .await
-                        .map_err(|e| SurfaceError::Face(e.to_string()))?;
-                }
-            }
-            _ => {
-                return Err(SurfaceError::Face(
-                    "publish_fast is for streaming surfaces (open/open_fanout)".into(),
-                ));
-            }
-        }
-        self.seq += 1;
-        Ok(seq)
     }
 
     /// Also answer remote Interests for this surface's frames over a forwarder, so
@@ -704,6 +752,14 @@ impl NamedPublisher {
                 .await
                 .map_err(|e| SurfaceError::Face(format!("join: {e}")))?;
             }
+            Sink::Sealed(writer) => {
+                // 1-byte EOS sentinel on the sealed ring (clean close); dropping the
+                // writer without it ends the stream too, but as an abort.
+                writer
+                    .send_with(1, |slot| slot[0] = EOS_MARKER)
+                    .await
+                    .map_err(|e| SurfaceError::Face(e.to_string()))?;
+            }
         }
         Ok(()) // self drops here: serve task aborted, socket removed
     }
@@ -740,6 +796,9 @@ enum Source {
     /// Large-frame side channel: each frame's [`SharedBuffer`] fd arrives here.
     /// `None` once the stream has ended.
     Large(Option<UnixStream>),
+    /// Local (sealed) surface: read frames from the sealed ring (data mapped
+    /// read-only — the producer is provably the sole writer).
+    Sealed(SealedReader),
 }
 
 /// Attaches to a named surface and reads its frames by name — zero-copy when the
@@ -801,6 +860,52 @@ impl NamedSubscriber {
         let stream = connect_authorized(&path, capability, 100).await?;
         Ok(Self {
             source: Source::Large(Some(stream)),
+            surface,
+            complete: None,
+        })
+    }
+
+    /// Attach to a **local (sealed) surface** ([`NamedPublisher::open_local`]): the
+    /// data region is mapped **read-only**, so the producer is provably the sole
+    /// writer — frames are forge-proof with no per-frame signature. Pass `secret`
+    /// via [`connect_local_gated`](Self::connect_local_gated) for a gated surface.
+    pub async fn connect_local(name: impl Into<Name>) -> Result<Self, SurfaceError> {
+        let surface = name.into();
+        let cap = rendezvous_token(&surface);
+        Self::connect_sealed_inner(surface, cap).await
+    }
+
+    /// Capability-gated local (sealed) attach.
+    pub async fn connect_local_gated(
+        name: impl Into<Name>,
+        secret: &[u8],
+    ) -> Result<Self, SurfaceError> {
+        let surface = name.into();
+        let cap = capability_token(&surface, secret);
+        Self::connect_sealed_inner(surface, cap).await
+    }
+
+    async fn connect_sealed_inner(surface: Name, capability: ShmToken) -> Result<Self, SurfaceError> {
+        let path = control_socket_path(&rendezvous_token(&surface));
+        let mut tried = 0u32;
+        let (data, ctrl, wake, cap, slot) = loop {
+            let p = path.clone();
+            let r = tokio::task::spawn_blocking(move || connect_sealed_handoff(&p, &capability))
+                .await
+                .map_err(|e| SurfaceError::Face(format!("join: {e}")))?;
+            match r {
+                Ok(parts) => break parts,
+                Err(_) if tried + 1 < 100 => {
+                    tried += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        };
+        // Build the reader here (async context) — it needs a runtime for the wakeup.
+        let reader = SealedReader::from_fds(data, ctrl, wake, cap, slot)?;
+        Ok(Self {
+            source: Source::Sealed(reader),
             surface,
             complete: None,
         })
@@ -981,6 +1086,39 @@ impl NamedSubscriber {
                         None
                     }
                     LargeOutcome::Aborted => {
+                        self.complete = Some(false);
+                        None
+                    }
+                }
+            }
+            Source::Sealed(reader) => {
+                // Sealed local: read off the read-only ring (forge-proof), same frame
+                // shape + EOS/abort semantics as the Local arm.
+                let outcome = reader
+                    .recv_with(|wire| {
+                        if is_eos(wire) {
+                            Outcome::Eos
+                        } else {
+                            match parse_frame(wire) {
+                                Ok((name, content)) => {
+                                    Outcome::Frame(f(FrameRef { name, content }))
+                                }
+                                Err(_) => Outcome::Bad,
+                            }
+                        }
+                    })
+                    .await;
+                match outcome {
+                    Some(Outcome::Frame(r)) => Some(r),
+                    Some(Outcome::Eos) => {
+                        self.complete = Some(true);
+                        None
+                    }
+                    Some(Outcome::Bad) => {
+                        self.complete = Some(false);
+                        None
+                    }
+                    None => {
                         self.complete = Some(false);
                         None
                     }
@@ -1929,34 +2067,57 @@ mod tests {
         assert_eq!(&vb[..], b"x", "late subscriber b also sees current value");
     }
 
-    // ---- fast (no-hash) frames -------------------------------------------
+    // ---- ring split: local (sealed) surfaces -----------------------------
 
-    /// A fast frame (no per-frame SHA-256) still round-trips by name + content
-    /// through the same next_frame path; it just skips the signature.
+    /// A local (sealed) surface: uniform `publish` writes hash-free frames over the
+    /// sealed ring; the consumer reads them by name via the same `next_frame`. The
+    /// frames carry no per-frame signature but are forge-proof (data region is mapped
+    /// read-only — proven at the ndn-face-shm layer). Clean close → is_complete.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn fast_frame_round_trip() {
-        let name = "/fast/surface";
-        let mut pubr = NamedPublisher::open(name).await.unwrap();
-        let mut sub = NamedSubscriber::connect(name).await.unwrap();
+    async fn local_sealed_surface_round_trip() {
+        let name = "/local/surface";
+        let mut pubr = NamedPublisher::open_local(name).await.unwrap();
+        let mut sub = NamedSubscriber::connect_local(name).await.unwrap();
         for i in 0..5u64 {
             let frame = vec![(i as u8).wrapping_add(7); 1500];
-            let version = pubr.publish_fast(&frame).await.unwrap();
-            assert_eq!(version, i, "publish_fast returns the version");
-            let (rxname, body) = sub
-                .next_frame(|f| (f.name.clone(), f.content.to_vec()))
-                .await
-                .expect("frame");
-            // Full name recovered from the wire even without a signature.
-            assert_eq!(rxname.to_string(), format!("/fast/surface/v={i}"));
-            assert_eq!(body, frame, "fast frame {i} content");
+            let published = pubr.publish(&frame).await.unwrap();
+            let (rxname, body) = timeout(
+                Duration::from_secs(2),
+                sub.next_frame(|f| (f.name.clone(), f.content.to_vec())),
+            )
+            .await
+            .expect("no stall")
+            .expect("frame");
+            assert_eq!(rxname, published, "sealed frame {i} name round-trips");
+            assert_eq!(rxname.to_string(), format!("/local/surface/v={i}"));
+            assert_eq!(body, frame, "sealed frame {i} content");
         }
+        pubr.close().await.unwrap();
+        assert!(sub.next_frame(|_| ()).await.is_none());
+        assert_eq!(sub.is_complete(), Some(true), "sealed clean close");
     }
 
-    /// publish_fast is rejected on non-streaming surfaces.
+    /// A gated local surface admits the right secret; publish_large is rejected on a
+    /// sealed surface (mode is explicit).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn fast_frame_rejected_on_large_surface() {
-        let mut large = NamedPublisher::open_large("/fast/nope").await.unwrap();
-        assert!(large.publish_fast(b"x").await.is_err());
+    async fn local_sealed_gated_and_mode_distinct() {
+        let secret = b"sealed-secret";
+        let mut pubr = NamedPublisher::open_local_gated("/local/gated", secret)
+            .await
+            .unwrap();
+        let mut sub = NamedSubscriber::connect_local_gated("/local/gated", secret)
+            .await
+            .unwrap();
+        pubr.publish(b"sealed+gated").await.unwrap();
+        let body = timeout(Duration::from_secs(2), sub.next_frame(|f| f.content.to_vec()))
+            .await
+            .expect("no stall")
+            .expect("frame");
+        assert_eq!(&body[..], b"sealed+gated");
+        assert!(
+            pubr.publish_large(b"x").await.is_err(),
+            "publish_large rejected on a sealed surface"
+        );
     }
 
     // ---- phase-2: duplex request/reply -----------------------------------
