@@ -14,6 +14,9 @@ bytes         = { workspace = true, features = ["std"] }
 thiserror     = { workspace = true }
 tokio         = { workspace = true, features = ["net", "rt", "macros", "time"] }
 tokio-util    = { workspace = true, features = ["rt"] }
+# One-way hash for the control-socket path derivation (hash(token)) so the
+# visible filename never reveals the capability token.
+sha2          = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

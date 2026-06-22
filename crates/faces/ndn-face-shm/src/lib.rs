@@ -47,4 +47,6 @@ pub type ShmHandle = spsc::SpscHandle;
 /// one-time capability; the engine serves the face's fds with [`serve_fd_handoff`];
 /// the client receives them with [`connect_fd_handoff`].
 #[cfg(unix)]
-pub use spsc::{ShmToken, connect_fd_handoff, mint_token, serve_fd_handoff};
+pub use spsc::{
+    ShmToken, connect_fd_handoff, control_socket_path, mint_token, serve_fd_handoff,
+};

@@ -585,6 +585,27 @@ pub fn mint_token() -> std::io::Result<ShmToken> {
     Ok(t)
 }
 
+/// The control-socket path for a capability `token` (Option-A bootstrap): under
+/// the temp dir, named by **SHA-256(token)** (hex). One-way, so the visible
+/// filename never reveals the token; **unguessable without the token**, so no
+/// path needs to cross the wire and an outsider can neither find nor squat the
+/// socket. The router and client derive the same path from the token that rides
+/// the (signed) face-create command.
+pub fn control_socket_path(token: &ShmToken) -> std::path::PathBuf {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(token);
+    let mut hex = String::with_capacity(16);
+    // 8 hash bytes (64 bits) — unguessable without the token, collision-safe for
+    // random tokens, and short enough to keep the whole socket path under the
+    // Unix `SUN_LEN` limit (~104 on macOS). Under `/tmp` (short on every Unix,
+    // matching the wakeup-FIFO convention) rather than the long macOS temp dir.
+    for b in &digest[..8] {
+        use std::fmt::Write;
+        let _ = write!(hex, "{b:02x}");
+    }
+    std::path::PathBuf::from("/tmp").join(format!(".ndn-shm-ctl-{hex}.sock"))
+}
+
 /// Constant-time equality — no early-out timing leak when comparing the token.
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -597,36 +618,61 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// **Engine side of the Option-A handshake:** accept ONE client on `listener`,
-/// require it to present `token`, then hand it the face's three fds
-/// (`[region, a2e_write, e2a_read]` from [`SpscFace::create_anon_with`]) via
-/// `SCM_RIGHTS`. The socket may be world-connectable — **the token is the
-/// capability** (constant-time compared), so an unauthorized connector receives
-/// nothing. Async accept; the brief blocking `SCM_RIGHTS` exchange runs on a
+/// Reject this many unauthorized connections before giving up — a backstop in
+/// case the (unguessable) socket path ever leaks and is flooded.
+const HANDOFF_MAX_REJECTS: u32 = 16;
+
+/// **Engine side of the Option-A handshake:** serve the face's three fds
+/// (`[region, a2e_write, e2a_read]` from [`SpscFace::create_anon_with`]) to the
+/// first client that presents `token`, via `SCM_RIGHTS`, then return. Takes
+/// ownership of `listener` (unbinds on drop). **The token is the capability**
+/// (constant-time compared), so the socket may be world-connectable; an
+/// unauthorized connector is **rejected and the loop keeps listening** — a bad
+/// connector can't consume the one-shot handoff (the accept-until-authorized
+/// hardening). Async accept; the brief blocking `SCM_RIGHTS` exchange runs on a
 /// blocking task so it never stalls the runtime.
 pub async fn serve_fd_handoff(
-    listener: &tokio::net::UnixListener,
+    listener: tokio::net::UnixListener,
     token: ShmToken,
     fds: [OwnedFd; 3],
 ) -> std::io::Result<()> {
-    let (stream, _addr) = listener.accept().await?;
-    let std_stream = stream.into_std()?;
-    std_stream.set_nonblocking(false)?;
-    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-        use std::io::Read;
-        let mut s = std_stream;
-        let mut tok = [0u8; 32];
-        s.read_exact(&mut tok)?;
-        if !ct_eq(&tok, &token) {
-            return Err(std::io::Error::other("shm control: token mismatch"));
-        }
-        send_fds(
-            s.as_raw_fd(),
-            &[fds[0].as_raw_fd(), fds[1].as_raw_fd(), fds[2].as_raw_fd()],
+    let mut rejects = 0u32;
+    loop {
+        let (stream, _addr) = listener.accept().await?;
+        let std_stream = stream.into_std()?;
+        std_stream.set_nonblocking(false)?;
+        // Read + check the token on a blocking task; hand back the stream if it
+        // matched (so the fd send happens only for an authorized client).
+        let authorized = tokio::task::spawn_blocking(
+            move || -> std::io::Result<Option<std::os::unix::net::UnixStream>> {
+                use std::io::Read;
+                let mut s = std_stream;
+                let mut tok = [0u8; 32];
+                s.read_exact(&mut tok)?;
+                Ok(if ct_eq(&tok, &token) { Some(s) } else { None })
+            },
         )
-    })
-    .await
-    .map_err(|e| std::io::Error::other(format!("shm control handoff task: {e}")))?
+        .await
+        .map_err(|e| std::io::Error::other(format!("shm control token task: {e}")))??;
+
+        match authorized {
+            Some(s) => {
+                let raw = [fds[0].as_raw_fd(), fds[1].as_raw_fd(), fds[2].as_raw_fd()];
+                return tokio::task::spawn_blocking(move || send_fds(s.as_raw_fd(), &raw))
+                    .await
+                    .map_err(|e| std::io::Error::other(format!("shm control send task: {e}")))?;
+            }
+            None => {
+                rejects += 1;
+                if rejects >= HANDOFF_MAX_REJECTS {
+                    return Err(std::io::Error::other(
+                        "shm control: too many unauthorized connections",
+                    ));
+                }
+                // keep listening — an unauthorized connector must not consume the handoff
+            }
+        }
+    }
 }
 
 /// **Client side of the Option-A handshake:** connect to the control socket at
@@ -1755,18 +1801,18 @@ mod tests {
     async fn control_socket_handshake_round_trip() {
         use std::time::Duration;
 
-        let path = std::env::temp_dir().join(format!("ndn-shm-ctl-rt-{}.sock", test_name()));
+        let token = mint_token().unwrap();
+        let path = control_socket_path(&token); // derived from the token (Option A)
         let _ = std::fs::remove_file(&path);
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
-        let token = mint_token().unwrap();
 
         let (face, fds) =
             SpscFace::create_anon_with(FaceId(88), DEFAULT_CAPACITY, DEFAULT_SLOT_SIZE).unwrap();
 
         // Engine serves the fds to the first client presenting the token.
-        let server = tokio::spawn(async move { serve_fd_handoff(&listener, token, fds).await });
+        let server = tokio::spawn(serve_fd_handoff(listener, token, fds));
 
-        // Client connects + presents the token (blocking helper on a blocking task).
+        // Client derives the same path from its token and connects.
         let cpath = path.clone();
         let handle = tokio::task::spawn_blocking(move || connect_fd_handoff(&cpath, &token))
             .await
@@ -1786,26 +1832,54 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn control_socket_rejects_wrong_token() {
-        let path = std::env::temp_dir().join(format!("ndn-shm-ctl-wt-{}.sock", test_name()));
+    async fn control_socket_survives_bad_then_serves_good() {
+        use std::time::Duration;
+
+        let token = mint_token().unwrap();
+        let path = control_socket_path(&token);
         let _ = std::fs::remove_file(&path);
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
-        let token = mint_token().unwrap();
 
-        let (_face, fds) =
+        let (face, fds) =
             SpscFace::create_anon_with(FaceId(89), DEFAULT_CAPACITY, DEFAULT_SLOT_SIZE).unwrap();
-        let server = tokio::spawn(async move { serve_fd_handoff(&listener, token, fds).await });
+        let server = tokio::spawn(serve_fd_handoff(listener, token, fds));
 
-        // A client presenting the WRONG token gets no fds.
-        let wrong = [0xAAu8; 32];
-        let cpath = path.clone();
-        let res = tokio::task::spawn_blocking(move || connect_fd_handoff(&cpath, &wrong))
+        // 1) A WRONG-token connector is rejected — but the loop keeps listening,
+        //    so it does NOT consume the one-shot handoff.
+        let bad_path = path.clone();
+        let bad = tokio::task::spawn_blocking(move || connect_fd_handoff(&bad_path, &[0xAAu8; 32]))
             .await
             .unwrap();
-        assert!(res.is_err(), "wrong token must be refused the fds");
-        assert!(server.await.unwrap().is_err(), "server must reject a bad token");
+        assert!(bad.is_err(), "wrong token must be refused the fds");
+
+        // 2) The correct client is still served after the bad attempt.
+        let good_path = path.clone();
+        let handle = tokio::task::spawn_blocking(move || connect_fd_handoff(&good_path, &token))
+            .await
+            .unwrap()
+            .expect("authorized client must still be served");
+        server.await.unwrap().expect("server handoff");
+
+        handle.send_bytes(Bytes::from_static(b"ok")).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(2), face.recv_bytes())
+            .await
+            .expect("timed out")
+            .unwrap();
+        assert_eq!(&got[..], b"ok");
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn control_socket_path_is_derived_and_hides_token() {
+        let token = mint_token().unwrap();
+        // Deterministic for a given token; different tokens → different paths.
+        assert_eq!(control_socket_path(&token), control_socket_path(&token));
+        assert_ne!(control_socket_path(&token), control_socket_path(&[0u8; 32]));
+        // The visible filename must NOT contain the token (one-way hash).
+        let name = control_socket_path(&token).to_string_lossy().to_string();
+        let tok_hex: String = token.iter().map(|b| format!("{b:02x}")).collect();
+        assert!(!name.contains(&tok_hex), "path must not leak the token");
     }
 
     #[test]
