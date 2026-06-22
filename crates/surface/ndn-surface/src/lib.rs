@@ -55,8 +55,9 @@ use bytes::Bytes;
 use ndn_app::{Consumer, Producer};
 use ndn_face_shm::{
     SealedReader, SealedWriter, SharedBuffer, SharedBufferReader, ShmFace, ShmHandle, ShmToken,
-    connect_fd_handoff, connect_sealed_handoff, control_socket_path, recv_fds, send_fds,
-    serve_fd_handoff, serve_fd_handoff_loop, serve_sealed_handoff,
+    connect_fd_handoff, connect_sealed_handoff, control_socket_path, mutual_auth_client,
+    mutual_auth_server, recv_fds, send_fds, serve_fd_handoff, serve_fd_handoff_loop,
+    serve_sealed_handoff,
 };
 use ndn_foundation_types::Name;
 use ndn_packet::encode::DataBuilder;
@@ -1190,18 +1191,6 @@ async fn local_connect(
 
 // ---- large-frame side channel ------------------------------------------------
 
-/// Constant-time token compare (local secret; avoids a timing side channel).
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
 /// Accept one connection and check its capability token: `Some` if authorized,
 /// `None` if not (caller keeps listening).
 async fn authorize_one(
@@ -1212,11 +1201,13 @@ async fn authorize_one(
     let std_stream = stream.into_std()?;
     std_stream.set_nonblocking(false)?;
     tokio::task::spawn_blocking(move || -> std::io::Result<Option<UnixStream>> {
-        use std::io::Read;
         let mut s = std_stream;
-        let mut tok = [0u8; 32];
-        s.read_exact(&mut tok)?;
-        Ok(if ct_eq(&tok, &token) { Some(s) } else { None })
+        // Mutual auth; an IO error during the handshake counts as rejected.
+        Ok(if mutual_auth_server(&mut s, &token).unwrap_or(false) {
+            Some(s)
+        } else {
+            None
+        })
     })
     .await
     .map_err(|e| std::io::Error::other(format!("token task: {e}")))?
@@ -1267,9 +1258,12 @@ async fn connect_authorized(
     loop {
         let p = path.to_path_buf();
         let r = tokio::task::spawn_blocking(move || -> std::io::Result<UnixStream> {
-            use std::io::Write;
             let mut s = UnixStream::connect(&p)?;
-            s.write_all(&token)?;
+            if !mutual_auth_client(&mut s, &token)? {
+                return Err(std::io::Error::other(
+                    "producer failed authentication (possible name squatter)",
+                ));
+            }
             Ok(s)
         })
         .await

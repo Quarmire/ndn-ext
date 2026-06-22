@@ -761,6 +761,74 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+const AUTH_TAG_SERVER: u8 = b'S';
+const AUTH_TAG_CLIENT: u8 = b'C';
+
+/// Handshake MAC over the capability: `SHA-256(K ++ tag ++ Nc ++ Ns)`. `K` is a
+/// 32-byte uniformly-random secret and the message is fixed-length, so this is a
+/// sound MAC here — length-extension doesn't apply to a fixed-format message, and
+/// the `S`/`C` tag domain-separates the two directions (defeats reflection).
+fn auth_mac(k: &ShmToken, tag: u8, nc: &[u8; 32], ns: &[u8; 32]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(k);
+    h.update([tag]);
+    h.update(nc);
+    h.update(ns);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&h.finalize());
+    out
+}
+
+fn nonce() -> std::io::Result<[u8; 32]> {
+    let mut n = [0u8; 32];
+    if unsafe { libc::getentropy(n.as_mut_ptr() as *mut libc::c_void, n.len()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(n)
+}
+
+/// **Producer-side mutual auth** over a connected blocking stream: prove knowledge
+/// of capability `k` to the consumer and verify the consumer's proof — the raw `k`
+/// never crosses the wire. Returns `Ok(true)` iff the consumer proved `k`. Because
+/// the consumer independently verifies the producer, a squatter that doesn't know
+/// `k` is rejected by the consumer and never harvests the secret.
+pub fn mutual_auth_server(
+    s: &mut std::os::unix::net::UnixStream,
+    k: &ShmToken,
+) -> std::io::Result<bool> {
+    use std::io::{Read, Write};
+    let mut nc = [0u8; 32];
+    s.read_exact(&mut nc)?;
+    let ns = nonce()?;
+    s.write_all(&ns)?;
+    s.write_all(&auth_mac(k, AUTH_TAG_SERVER, &nc, &ns))?;
+    let mut proof_c = [0u8; 32];
+    s.read_exact(&mut proof_c)?;
+    Ok(ct_eq(&proof_c, &auth_mac(k, AUTH_TAG_CLIENT, &nc, &ns)))
+}
+
+/// **Consumer-side mutual auth**: send a nonce, verify the producer proved `k`
+/// (reject a squatter, revealing nothing), then send our own proof. Returns
+/// `Ok(true)` iff the producer is authentic; the caller must abort on `false`.
+pub fn mutual_auth_client(
+    s: &mut std::os::unix::net::UnixStream,
+    k: &ShmToken,
+) -> std::io::Result<bool> {
+    use std::io::{Read, Write};
+    let nc = nonce()?;
+    s.write_all(&nc)?;
+    let mut ns = [0u8; 32];
+    s.read_exact(&mut ns)?;
+    let mut proof_s = [0u8; 32];
+    s.read_exact(&mut proof_s)?;
+    if !ct_eq(&proof_s, &auth_mac(k, AUTH_TAG_SERVER, &nc, &ns)) {
+        return Ok(false); // producer can't prove k — squatter; abort, leak nothing
+    }
+    s.write_all(&auth_mac(k, AUTH_TAG_CLIENT, &nc, &ns))?;
+    Ok(true)
+}
+
 /// Reject this many unauthorized connections before giving up — a backstop in
 /// case the (unguessable) socket path ever leaks and is flooded.
 const HANDOFF_MAX_REJECTS: u32 = 16;
@@ -788,11 +856,15 @@ pub async fn serve_fd_handoff(
         // matched (so the fd send happens only for an authorized client).
         let authorized = tokio::task::spawn_blocking(
             move || -> std::io::Result<Option<std::os::unix::net::UnixStream>> {
-                use std::io::Read;
                 let mut s = std_stream;
-                let mut tok = [0u8; 32];
-                s.read_exact(&mut tok)?;
-                Ok(if ct_eq(&tok, &token) { Some(s) } else { None })
+                // Mutual challenge-response: prove the capability without sending it.
+                // An auth IO error (peer aborted) counts as "rejected", not fatal —
+                // a failed/squatter handshake must not kill the serve loop.
+                Ok(if mutual_auth_server(&mut s, &token).unwrap_or(false) {
+                    Some(s)
+                } else {
+                    None
+                })
             },
         )
         .await
@@ -839,11 +911,15 @@ where
         std_stream.set_nonblocking(false)?;
         let authorized = tokio::task::spawn_blocking(
             move || -> std::io::Result<Option<std::os::unix::net::UnixStream>> {
-                use std::io::Read;
                 let mut s = std_stream;
-                let mut tok = [0u8; 32];
-                s.read_exact(&mut tok)?;
-                Ok(if ct_eq(&tok, &token) { Some(s) } else { None })
+                // Mutual challenge-response: prove the capability without sending it.
+                // An auth IO error (peer aborted) counts as "rejected", not fatal —
+                // a failed/squatter handshake must not kill the serve loop.
+                Ok(if mutual_auth_server(&mut s, &token).unwrap_or(false) {
+                    Some(s)
+                } else {
+                    None
+                })
             },
         )
         .await
@@ -869,9 +945,12 @@ where
 /// `path`, present `token`, receive the face's three fds, and build the
 /// [`SpscHandle`]. Blocking — call via `spawn_blocking` from async code.
 pub fn connect_fd_handoff(path: &std::path::Path, token: &ShmToken) -> Result<SpscHandle, ShmError> {
-    use std::io::Write;
     let mut s = std::os::unix::net::UnixStream::connect(path).map_err(ShmError::Io)?;
-    s.write_all(token).map_err(ShmError::Io)?;
+    if !mutual_auth_client(&mut s, token).map_err(ShmError::Io)? {
+        return Err(ShmError::Io(std::io::Error::other(
+            "shm control: producer failed authentication (possible name squatter)",
+        )));
+    }
     let mut fds = recv_fds(s.as_raw_fd(), 3).map_err(ShmError::Io)?;
     if fds.len() != 3 {
         return Err(ShmError::Io(std::io::Error::other(
@@ -904,11 +983,15 @@ pub async fn serve_sealed_handoff(
         std_stream.set_nonblocking(false)?;
         let authorized = tokio::task::spawn_blocking(
             move || -> std::io::Result<Option<std::os::unix::net::UnixStream>> {
-                use std::io::Read;
                 let mut s = std_stream;
-                let mut tok = [0u8; 32];
-                s.read_exact(&mut tok)?;
-                Ok(if ct_eq(&tok, &token) { Some(s) } else { None })
+                // Mutual challenge-response: prove the capability without sending it.
+                // An auth IO error (peer aborted) counts as "rejected", not fatal —
+                // a failed/squatter handshake must not kill the serve loop.
+                Ok(if mutual_auth_server(&mut s, &token).unwrap_or(false) {
+                    Some(s)
+                } else {
+                    None
+                })
             },
         )
         .await
@@ -949,9 +1032,13 @@ pub fn connect_sealed_handoff(
     path: &std::path::Path,
     token: &ShmToken,
 ) -> Result<(OwnedFd, OwnedFd, OwnedFd, u32, u32), ShmError> {
-    use std::io::{Read, Write};
+    use std::io::Read;
     let mut s = std::os::unix::net::UnixStream::connect(path).map_err(ShmError::Io)?;
-    s.write_all(token).map_err(ShmError::Io)?;
+    if !mutual_auth_client(&mut s, token).map_err(ShmError::Io)? {
+        return Err(ShmError::Io(std::io::Error::other(
+            "shm control: producer failed authentication (possible name squatter)",
+        )));
+    }
     let fds = recv_fds(s.as_raw_fd(), 3).map_err(ShmError::Io)?;
     if fds.len() != 3 {
         return Err(ShmError::Io(std::io::Error::other(
@@ -2324,6 +2411,34 @@ mod tests {
             matches!(errno, Some(libc::EACCES) | Some(libc::EPERM)),
             "expected a permission-denial errno, got {errno:?}"
         );
+    }
+
+    /// MUTUAL AUTH: a producer that knows the capability authenticates to the
+    /// consumer AND verifies the consumer — both directions, no secret on the wire.
+    #[test]
+    fn mutual_auth_accepts_matching_key() {
+        let (mut c, mut s) = std::os::unix::net::UnixStream::pair().unwrap();
+        let k = [0x33u8; 32];
+        let server = std::thread::spawn(move || mutual_auth_server(&mut s, &k));
+        let client = mutual_auth_client(&mut c, &k).unwrap();
+        assert!(client, "consumer authenticates the producer");
+        assert!(server.join().unwrap().unwrap(), "producer authenticates the consumer");
+    }
+
+    /// A squatter that does NOT know the capability cannot fool the consumer (its
+    /// proof fails) — and the consumer never reveals the secret (it sends no proof
+    /// once it detects the bad producer).
+    #[test]
+    fn mutual_auth_rejects_squatter() {
+        let (mut c, mut s) = std::os::unix::net::UnixStream::pair().unwrap();
+        let real = [0x11u8; 32];
+        let wrong = [0x22u8; 32]; // squatter's guess
+        let server = std::thread::spawn(move || mutual_auth_server(&mut s, &wrong));
+        let client = mutual_auth_client(&mut c, &real).unwrap();
+        drop(c); // closing lets the squatter's pending read see EOF (no deadlock)
+        assert!(!client, "consumer must reject a producer that can't prove the capability");
+        // The squatter never gets a valid client proof (EOF or mismatch).
+        assert!(matches!(server.join().unwrap(), Ok(false) | Err(_)));
     }
 
     /// SEALED RING: frames flow producer→consumer over the data region the consumer
