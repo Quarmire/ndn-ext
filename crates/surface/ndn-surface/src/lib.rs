@@ -854,6 +854,19 @@ enum Source {
     },
 }
 
+/// The version (`v=<n>`) of a frame name, if its last component is a VERSION (0x36).
+fn version_of(name: &Name) -> Option<u64> {
+    let c = name.components().last()?;
+    if c.typ != 0x36 {
+        return None;
+    }
+    let v = c.value.as_ref();
+    if v.is_empty() || v.len() > 8 {
+        return None;
+    }
+    Some(v.iter().fold(0u64, |acc, &b| (acc << 8) | b as u64))
+}
+
 /// Attaches to a named surface and reads its frames by name — zero-copy when the
 /// producer is local, over the forwarder when it is remote, same call either way.
 pub struct NamedSubscriber {
@@ -1235,6 +1248,128 @@ impl NamedSubscriber {
     /// = the stream is still live. Lets a finite transfer tell *done* from *crashed*.
     pub fn is_complete(&self) -> Option<bool> {
         self.complete
+    }
+}
+
+/// **Catch-up-then-follow** reader: replay a surface's retained history from a
+/// durable `store`, then seamlessly continue on a live [`NamedSubscriber`] — one
+/// stream, history then live, **gap-free and duplicate-free**. Composes a store + an
+/// already-connected live reader (ring or remote); connect the live reader *first*,
+/// then wrap, so no live frame is missed during replay (any frame the bounded ring
+/// drops mid-replay is recovered from the write-through store). This is the
+/// late-joiner / resume / reconnect path.
+///
+/// (A live frame is copied once to make the ordering decision — the durable
+/// convenience path, not the sealed zero-copy hot path.)
+pub struct CatchUpFollow {
+    store: Arc<dyn NamedReadStore>,
+    surface: Name,
+    live: NamedSubscriber,
+    next: u64,
+    caught_up: bool,
+    held: Option<(Name, Bytes)>,
+    complete: Option<bool>,
+}
+
+impl CatchUpFollow {
+    /// Replay `live`'s surface from version `from` out of `store`, then follow `live`.
+    pub fn new(store: Arc<dyn NamedReadStore>, from: u64, live: NamedSubscriber) -> Self {
+        let surface = live.surface().clone();
+        Self {
+            store,
+            surface,
+            live,
+            next: from,
+            caught_up: false,
+            held: None,
+            complete: None,
+        }
+    }
+
+    /// Why the stream ended, once [`next_frame`](Self::next_frame) returns `None` —
+    /// mirrors the live source's completion.
+    pub fn is_complete(&self) -> Option<bool> {
+        self.complete
+    }
+
+    /// Next frame: history from the store, then the live edge — in order, no gaps,
+    /// no duplicates. `f` borrows the frame for its duration.
+    pub async fn next_frame<R>(&mut self, f: impl FnOnce(FrameRef<'_>) -> R) -> Option<R> {
+        if self.complete.is_some() {
+            return None;
+        }
+        let mut f = Some(f);
+        loop {
+            // (1) A live frame is parked ahead of the cursor → back-fill the gap from
+            // the store, then deliver the parked frame.
+            if self.held.is_some() {
+                let hv = version_of(&self.held.as_ref().unwrap().0).unwrap_or(self.next);
+                if self.next < hv {
+                    let key = self.surface.clone().append_version(self.next);
+                    if let Some(wire) = self.store.get(&key) {
+                        self.next += 1;
+                        return deliver(&mut f, &wire, &mut self.complete);
+                    }
+                    self.next = hv; // unexpected store gap (write-through should fill)
+                }
+                let (hname, hbytes) = self.held.take().unwrap();
+                self.next = hv + 1;
+                return Some((f.take().unwrap())(FrameRef {
+                    name: hname,
+                    content: &hbytes,
+                }));
+            }
+            // (2) Replay history until a version is missing, then follow live.
+            if !self.caught_up {
+                let key = self.surface.clone().append_version(self.next);
+                if let Some(wire) = self.store.get(&key) {
+                    self.next += 1;
+                    return deliver(&mut f, &wire, &mut self.complete);
+                }
+                self.caught_up = true;
+            }
+            // (3) Live edge: read (copied to decide order), dedup, detect gaps.
+            match self
+                .live
+                .next_frame(|fr| (fr.name.clone(), Bytes::copy_from_slice(fr.content)))
+                .await
+            {
+                None => {
+                    self.complete = self.live.is_complete();
+                    return None;
+                }
+                Some((lname, lbytes)) => {
+                    let lv = version_of(&lname).unwrap_or(self.next);
+                    if lv < self.next {
+                        continue; // already delivered (dup/old) — skip
+                    }
+                    if lv == self.next {
+                        self.next += 1;
+                        return Some((f.take().unwrap())(FrameRef {
+                            name: lname,
+                            content: &lbytes,
+                        }));
+                    }
+                    self.held = Some((lname, lbytes)); // gap → park, back-fill next pass
+                }
+            }
+        }
+    }
+}
+
+/// Parse a stored frame wire and deliver it via `f`; marks `complete = Some(false)`
+/// on a malformed entry.
+fn deliver<R, F: FnOnce(FrameRef<'_>) -> R>(
+    f: &mut Option<F>,
+    wire: &[u8],
+    complete: &mut Option<bool>,
+) -> Option<R> {
+    match parse_frame(wire) {
+        Ok((name, content)) => Some((f.take().unwrap())(FrameRef { name, content })),
+        Err(_) => {
+            *complete = Some(false);
+            None
+        }
     }
 }
 
@@ -2206,6 +2341,54 @@ mod tests {
         let mut replay = NamedSubscriber::connect_replay("/durable/seek", read, 3);
         let first = replay.next_frame(|f| f.name.to_string()).await.unwrap();
         assert_eq!(first, "/durable/seek/v=3", "replay starts at the requested version");
+    }
+
+    /// Catch-up-then-follow: a late joiner replays history from the store and then
+    /// follows the live edge — one reader, in order, no gaps, no duplicates.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cascade_catch_up_then_follow() {
+        use ndn_storage::{MemoryBackend, NamedReadStore, NamedStore, NamedWriteStore};
+        let store: Arc<dyn NamedWriteStore> = Arc::new(NamedStore::new(MemoryBackend::new()));
+        let mut pubr = NamedPublisher::open("/cascade/s")
+            .await
+            .unwrap()
+            .retain(store.clone())
+            .unwrap();
+
+        // History published before the late joiner attaches.
+        for i in 0..3u64 {
+            pubr.publish(&[i as u8; 100]).await.unwrap();
+        }
+
+        // Late joiner: connect the live ring, then wrap with catch-up-from-store.
+        let live = NamedSubscriber::connect("/cascade/s").await.unwrap();
+        let read: Arc<dyn NamedReadStore> = store;
+        let mut cu = CatchUpFollow::new(read, 0, live);
+
+        // Producer keeps publishing live (after a beat so the cascade replays first).
+        let prod = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            for i in 3..5u64 {
+                pubr.publish(&[i as u8; 100]).await.unwrap();
+            }
+            pubr.close().await.unwrap();
+        });
+
+        // One seamless stream: 0,1,2 (history) then 3,4 (live), in order, no dups.
+        for i in 0..5u64 {
+            let (name, body) = timeout(
+                Duration::from_secs(5),
+                cu.next_frame(|f| (f.name.clone(), f.content.to_vec())),
+            )
+            .await
+            .expect("no stall")
+            .expect("frame");
+            assert_eq!(name.to_string(), format!("/cascade/s/v={i}"), "in-order, no gaps/dups");
+            assert_eq!(body, vec![i as u8; 100]);
+        }
+        assert!(cu.next_frame(|_| ()).await.is_none());
+        assert_eq!(cu.is_complete(), Some(true), "clean end after the live close");
+        prod.await.unwrap();
     }
 
     /// Sealed surfaces cannot be retained.
