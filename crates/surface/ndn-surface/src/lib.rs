@@ -61,6 +61,16 @@ use ndn_transport::FaceId;
 /// [`NamedPublisher::open_with_max_frame`].
 const DEFAULT_MAX_FRAME: usize = 1 << 20;
 
+/// End-of-stream sentinel: a 1-byte ring frame. Unambiguous — every real frame is
+/// a whole NDN Data (≥ several bytes, first byte `tlv_type::DATA` = 0x06), so a
+/// 1-byte message is never a frame. Lets a consumer tell a clean
+/// [`NamedPublisher::close`] from a crash (bare pipe EOF).
+const EOS_MARKER: u8 = 0x00;
+
+fn is_eos(wire: &[u8]) -> bool {
+    wire.len() == 1 && wire[0] == EOS_MARKER
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SurfaceError {
     #[error("shm: {0}")]
@@ -186,6 +196,22 @@ impl NamedPublisher {
         Ok(frame_name)
     }
 
+    /// Cleanly close the surface: emit an end-of-stream marker so a subscriber's
+    /// [`next_frame`](NamedSubscriber::next_frame) returns `None` with
+    /// [`is_complete`](NamedSubscriber::is_complete) `== Some(true)` — a *clean*
+    /// end, distinguishable from a crash (dropping the publisher without `close`
+    /// also ends the stream, but as `Some(false)`). Consumes the publisher.
+    ///
+    /// Local path only; remote clean-completion (NDN `FinalBlockId`) is a separate
+    /// seam — see the generality note.
+    pub async fn close(self) -> Result<(), SurfaceError> {
+        self.face
+            .send_with(1, |slot| slot[0] = EOS_MARKER)
+            .await
+            .map_err(|e| SurfaceError::Face(e.to_string()))?;
+        Ok(()) // self drops here: serve task aborted, socket removed
+    }
+
     /// The surface's name.
     pub fn name(&self) -> &Name {
         &self.name
@@ -222,6 +248,9 @@ enum Source {
 pub struct NamedSubscriber {
     source: Source,
     surface: Name,
+    /// Why the stream ended: `None` while running, `Some(true)` after a clean
+    /// [`NamedPublisher::close`], `Some(false)` after an abort (publisher gone).
+    complete: Option<bool>,
 }
 
 impl NamedSubscriber {
@@ -258,6 +287,7 @@ impl NamedSubscriber {
         Ok(Self {
             source: Source::Local(handle),
             surface,
+            complete: None,
         })
     }
 
@@ -304,12 +334,14 @@ impl NamedSubscriber {
                 return Ok(Self {
                     source: Source::Local(handle),
                     surface,
+                    complete: None,
                 });
             }
         }
         Ok(Self {
             source: Source::Remote { consumer, seq: 0 },
             surface,
+            complete: None,
         })
     }
 
@@ -318,23 +350,63 @@ impl NamedSubscriber {
     /// content is owned network bytes (still borrowed for the closure's duration).
     /// `None` when the surface closes (or a frame can't be fetched/parsed).
     pub async fn next_frame<R>(&mut self, f: impl FnOnce(FrameRef<'_>) -> R) -> Option<R> {
+        // Each frame either yields a value, is the EOS marker, or is malformed —
+        // kept distinct so the local arm can record *why* the stream ended.
+        enum Outcome<R> {
+            Frame(R),
+            Eos,
+            Bad,
+        }
         match &mut self.source {
-            Source::Local(handle) => handle
-                .recv_with(|wire| match parse_frame(wire) {
-                    Ok((name, content)) => Some(f(FrameRef { name, content })),
-                    Err(_) => None,
-                })
-                .await
-                .flatten(),
+            Source::Local(handle) => {
+                let outcome = handle
+                    .recv_with(|wire| {
+                        if is_eos(wire) {
+                            Outcome::Eos
+                        } else {
+                            match parse_frame(wire) {
+                                Ok((name, content)) => {
+                                    Outcome::Frame(f(FrameRef { name, content }))
+                                }
+                                Err(_) => Outcome::Bad,
+                            }
+                        }
+                    })
+                    .await;
+                match outcome {
+                    Some(Outcome::Frame(r)) => Some(r),
+                    Some(Outcome::Eos) => {
+                        self.complete = Some(true); // clean close
+                        None
+                    }
+                    Some(Outcome::Bad) => {
+                        self.complete = Some(false); // garbled frame ⇒ treat as abort
+                        None
+                    }
+                    None => {
+                        self.complete = Some(false); // pipe EOF, no close ⇒ aborted
+                        None
+                    }
+                }
+            }
             Source::Remote { consumer, seq } => {
                 let frame_name = self.surface.clone().append_version(*seq);
-                let data = consumer.fetch(frame_name).await.ok()?;
-                *seq += 1;
-                let content = data.content().map(|b| b.as_ref()).unwrap_or(&[]);
-                Some(f(FrameRef {
-                    name: (*data.name).clone(),
-                    content,
-                }))
+                match consumer.fetch(frame_name).await {
+                    Ok(data) => {
+                        *seq += 1;
+                        let content = data.content().map(|b| b.as_ref()).unwrap_or(&[]);
+                        Some(f(FrameRef {
+                            name: (*data.name).clone(),
+                            content,
+                        }))
+                    }
+                    Err(_) => {
+                        // Remote end: a timeout/Nack ends the stream. Clean-vs-abort
+                        // isn't distinguishable without NDN FinalBlockId (future seam).
+                        self.complete = Some(false);
+                        None
+                    }
+                }
             }
         }
     }
@@ -347,6 +419,14 @@ impl NamedSubscriber {
     /// True if this subscriber resolved to the local zero-copy path.
     pub fn is_local(&self) -> bool {
         matches!(self.source, Source::Local(_))
+    }
+
+    /// Why the stream ended, once [`next_frame`](Self::next_frame) has returned
+    /// `None`: `Some(true)` = the producer called [`NamedPublisher::close`] (clean),
+    /// `Some(false)` = the producer vanished / a frame was garbled (aborted), `None`
+    /// = the stream is still live. Lets a finite transfer tell *done* from *crashed*.
+    pub fn is_complete(&self) -> Option<bool> {
+        self.complete
     }
 }
 
@@ -787,22 +867,53 @@ mod tests {
             for chunk in data.chunks(CHUNK) {
                 pubr.publish(chunk).await.unwrap();
             }
-            drop(pubr); // EOF = drop — the only completion signal the API offers.
+            pubr.close().await.unwrap(); // clean completion marker (phase-2)
         });
 
-        // The consumer does NOT know the length or chunk count.
-        let reassembled = timeout(Duration::from_secs(10), async move {
+        // The consumer reads until the stream ends, then checks it ended cleanly.
+        let (reassembled, sub) = timeout(Duration::from_secs(10), async move {
             let mut r = Vec::new();
             while let Some(chunk) = sub.next_frame(|f| f.content.to_vec()).await {
                 r.extend_from_slice(&chunk);
             }
-            r
+            (r, sub)
         })
         .await
-        .expect("bulk transfer must terminate (drop ⇒ None)");
+        .expect("bulk transfer must terminate");
         prod.await.unwrap();
 
         assert_eq!(reassembled.len(), original.len(), "bulk length");
         assert_eq!(reassembled, original, "bulk object reassembles byte-identical");
+        assert_eq!(
+            sub.is_complete(),
+            Some(true),
+            "close() ⇒ clean completion, not an abort"
+        );
+    }
+
+    /// The completion signal distinguishes a clean close from a crash: same frames,
+    /// but one path calls close() and the other drops — is_complete() differs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_vs_drop_completion_signal() {
+        // Clean close.
+        {
+            let mut pubr = NamedPublisher::open("/complete/clean").await.unwrap();
+            let mut sub = NamedSubscriber::connect("/complete/clean").await.unwrap();
+            pubr.publish(b"a").await.unwrap();
+            assert!(sub.next_frame(|f| f.content.to_vec()).await.is_some());
+            pubr.close().await.unwrap();
+            assert!(sub.next_frame(|_| ()).await.is_none(), "ended");
+            assert_eq!(sub.is_complete(), Some(true), "close ⇒ clean");
+        }
+        // Crash (drop without close).
+        {
+            let mut pubr = NamedPublisher::open("/complete/crash").await.unwrap();
+            let mut sub = NamedSubscriber::connect("/complete/crash").await.unwrap();
+            pubr.publish(b"a").await.unwrap();
+            assert!(sub.next_frame(|f| f.content.to_vec()).await.is_some());
+            drop(pubr);
+            assert!(sub.next_frame(|_| ()).await.is_none(), "ended");
+            assert_eq!(sub.is_complete(), Some(false), "drop ⇒ aborted");
+        }
     }
 }
