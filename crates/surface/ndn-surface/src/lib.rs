@@ -271,8 +271,40 @@ pub struct NamedPublisher {
     window: Option<Arc<Mutex<FrameWindow>>>,
     /// Cached surface-name component TLVs for the inline sealed-frame encode path.
     prefix_components: Option<Bytes>,
-    /// When durable: write-behind each published frame to this store (signed only).
-    retain: Option<Arc<dyn NamedWriteStore>>,
+    /// When durable: hand each published frame to a background write-behind task
+    /// (signed surfaces only). Off the producer hot path; bounded for backpressure.
+    retain_tx: Option<tokio::sync::mpsc::Sender<RetainMsg>>,
+    /// The write-behind task — awaited on `close` to flush before returning.
+    retain_writer: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// Message to the write-behind task: a frame to persist, or a flush barrier (the
+/// task acks once everything queued before it has been written).
+#[allow(clippy::large_enum_variant)] // Frame is the common case; channel-passed, short-lived
+enum RetainMsg {
+    Frame(Name, Bytes),
+    Flush(tokio::sync::oneshot::Sender<()>),
+}
+
+/// How long retained frames live in the durable store. Applied by the write-behind
+/// task as it persists each frame.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RetentionPolicy {
+    /// Keep at most the last `n` versions (older are evicted). `None` = unbounded.
+    pub max_versions: Option<u64>,
+}
+
+impl RetentionPolicy {
+    /// Keep everything (unbounded).
+    pub fn unlimited() -> Self {
+        Self { max_versions: None }
+    }
+    /// Keep only the last `n` versions.
+    pub fn keep_last(n: u64) -> Self {
+        Self {
+            max_versions: Some(n),
+        }
+    }
 }
 
 impl NamedPublisher {
@@ -360,7 +392,8 @@ impl NamedPublisher {
             serve,
             window: None,
             prefix_components: None,
-            retain: None,
+            retain_tx: None,
+            retain_writer: None,
         })
     }
 
@@ -443,7 +476,8 @@ impl NamedPublisher {
             serve,
             window: None,
             prefix_components: None,
-            retain: None,
+            retain_tx: None,
+            retain_writer: None,
         })
     }
 
@@ -467,7 +501,8 @@ impl NamedPublisher {
             serve,
             window: None,
             prefix_components: None,
-            retain: None,
+            retain_tx: None,
+            retain_writer: None,
         })
     }
 
@@ -576,7 +611,8 @@ impl NamedPublisher {
             serve,
             window: None,
             prefix_components: None,
-            retain: None,
+            retain_tx: None,
+            retain_writer: None,
         })
     }
 
@@ -610,7 +646,8 @@ impl NamedPublisher {
             serve,
             window: None,
             prefix_components: None,
-            retain: None,
+            retain_tx: None,
+            retain_writer: None,
         })
     }
 
@@ -644,9 +681,9 @@ impl NamedPublisher {
         }
         let b = DataBuilder::new(frame_name.clone(), content);
         let len = b.encoded_len_digest_sha256();
-        if self.window.is_some() || self.retain.is_some() {
+        if self.window.is_some() || self.retain_tx.is_some() {
             // Serving remotely and/or retaining: materialize the wire once, feed the
-            // local sink + the remote window + the durable store.
+            // local sink + the remote window + the durable write-behind task.
             let mut wire = vec![0u8; len];
             b.encode_digest_sha256_into(&mut wire);
             let wire = Bytes::from(wire);
@@ -654,8 +691,10 @@ impl NamedPublisher {
             if let Some(window) = &self.window {
                 window.lock().unwrap().insert(self.seq, wire.clone());
             }
-            if let Some(store) = &self.retain {
-                store.insert(&frame_name, wire);
+            if let Some(tx) = &self.retain_tx {
+                // Hand off to the background writer (awaits only if the disk is far
+                // behind — bounded backpressure, never a synchronous disk write here).
+                let _ = tx.send(RetainMsg::Frame(frame_name.clone(), wire)).await;
             }
         } else {
             match &mut self.sink {
@@ -723,18 +762,51 @@ impl NamedPublisher {
         self
     }
 
-    /// **Durably retain** each published frame by writing it (write-through) to
-    /// `store` under its name `<surface>/v=<seq>` — so late joiners, fallen-behind
-    /// consumers, and post-restart fetches can get frames the ring has overwritten
-    /// (replay via [`NamedSubscriber::connect_replay`], or the tier cascade). The
-    /// store is a pluggable `ndn-storage` `NamedWriteStore` (in-memory / fjall /
-    /// object-store). **Signed surfaces only** — a sealed (local) frame has no
-    /// signature, so on disk it would outlive the kernel seal and lose its trust
-    /// root; sealed surfaces are ephemeral by design. Streaming surfaces only.
-    pub fn retain(mut self, store: Arc<dyn NamedWriteStore>) -> Result<Self, SurfaceError> {
+    /// **Durably retain** each published frame via a background **write-behind** task
+    /// that persists it to `store` under `<surface>/v=<seq>` — so late joiners,
+    /// fallen-behind consumers, and post-restart fetches can get frames the ring has
+    /// overwritten (replay via [`NamedSubscriber::connect_replay`] or
+    /// [`CatchUpFollow`]). `policy` bounds the durable tier (e.g.
+    /// [`RetentionPolicy::keep_last`]). The disk write is **off the producer hot
+    /// path**: `publish` hands the frame to the writer over a bounded channel and only
+    /// blocks if the store falls far behind (backpressure). The store is a pluggable
+    /// `ndn-storage` `NamedWriteStore` (in-memory / fjall / object-store).
+    ///
+    /// **Signed surfaces only** — a sealed (local) frame has no signature, so on disk
+    /// it would outlive the kernel seal and lose its trust root; sealed surfaces are
+    /// ephemeral by design. Streaming surfaces only.
+    pub fn retain(
+        mut self,
+        store: Arc<dyn NamedWriteStore>,
+        policy: RetentionPolicy,
+    ) -> Result<Self, SurfaceError> {
         match self.sink {
             Sink::Single(_) | Sink::Fanout { .. } => {
-                self.retain = Some(store);
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<RetainMsg>(1024);
+                let surface = self.name.clone();
+                // Writer: drains until the publisher closes (tx dropped), applying
+                // retention; a Flush barrier acks once prior frames are written.
+                let writer = tokio::spawn(async move {
+                    while let Some(msg) = rx.recv().await {
+                        match msg {
+                            RetainMsg::Frame(name, wire) => {
+                                store.insert(&name, wire).await;
+                                if let Some(keep) = policy.max_versions
+                                    && let Some(v) = version_of(&name)
+                                    && v >= keep
+                                {
+                                    let old = surface.clone().append_version(v - keep);
+                                    store.remove(&old).await;
+                                }
+                            }
+                            RetainMsg::Flush(ack) => {
+                                let _ = ack.send(());
+                            }
+                        }
+                    }
+                });
+                self.retain_tx = Some(tx);
+                self.retain_writer = Some(writer);
                 Ok(self)
             }
             Sink::Sealed(_) => Err(SurfaceError::Face(
@@ -743,6 +815,18 @@ impl NamedPublisher {
             Sink::Large { .. } | Sink::LargeFanout { .. } => Err(SurfaceError::Face(
                 "retain is for streaming surfaces (large-object persistence is a separate path)".into(),
             )),
+        }
+    }
+
+    /// Wait until every frame published so far has been durably written by the
+    /// write-behind task — a durability checkpoint ("persist up to here", e.g. before
+    /// acking a unit of work). No-op if the surface isn't retained.
+    pub async fn flush_retained(&self) {
+        if let Some(tx) = &self.retain_tx {
+            let (ack, done) = tokio::sync::oneshot::channel();
+            if tx.send(RetainMsg::Flush(ack)).await.is_ok() {
+                let _ = done.await;
+            }
         }
     }
 
@@ -807,6 +891,12 @@ impl NamedPublisher {
                     .await
                     .map_err(|e| SurfaceError::Face(e.to_string()))?;
             }
+        }
+        // Flush the durable write-behind: drop the sender so the writer drains, then
+        // await it — so close() guarantees everything published is persisted.
+        self.retain_tx.take();
+        if let Some(writer) = self.retain_writer.take() {
+            let _ = writer.await;
         }
         Ok(()) // self drops here: serve task aborted, socket removed
     }
@@ -1211,7 +1301,7 @@ impl NamedSubscriber {
             }
             Source::Replay { store, next } => {
                 let frame_name = self.surface.clone().append_version(*next);
-                match store.get(&frame_name) {
+                match store.get(&frame_name).await {
                     Some(wire) => {
                         *next += 1;
                         match parse_frame(&wire) {
@@ -1306,7 +1396,7 @@ impl CatchUpFollow {
                 let hv = version_of(&self.held.as_ref().unwrap().0).unwrap_or(self.next);
                 if self.next < hv {
                     let key = self.surface.clone().append_version(self.next);
-                    if let Some(wire) = self.store.get(&key) {
+                    if let Some(wire) = self.store.get(&key).await {
                         self.next += 1;
                         return deliver(&mut f, &wire, &mut self.complete);
                     }
@@ -1322,7 +1412,7 @@ impl CatchUpFollow {
             // (2) Replay history until a version is missing, then follow live.
             if !self.caught_up {
                 let key = self.surface.clone().append_version(self.next);
-                if let Some(wire) = self.store.get(&key) {
+                if let Some(wire) = self.store.get(&key).await {
                     self.next += 1;
                     return deliver(&mut f, &wire, &mut self.complete);
                 }
@@ -2300,12 +2390,13 @@ mod tests {
             let mut pubr = NamedPublisher::open("/durable/surface")
                 .await
                 .unwrap()
-                .retain(store.clone())
+                .retain(store.clone(), RetentionPolicy::unlimited())
                 .unwrap();
             for i in 0..5u64 {
                 pubr.publish(&[(i as u8) + 1; 200]).await.unwrap();
             }
-            // producer (and its ring) drop here.
+            // close() flushes the write-behind, then the producer + ring drop.
+            pubr.close().await.unwrap();
         }
 
         // Replay from the store from the beginning — no producer, no ring.
@@ -2324,6 +2415,41 @@ mod tests {
         assert_eq!(replay.is_complete(), Some(true));
     }
 
+    /// Retention policy: keep_last(k) evicts versions older than the last k.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retention_keep_last_evicts_old() {
+        use ndn_storage::{MemoryBackend, NamedReadStore, NamedStore, NamedWriteStore};
+        let store: Arc<dyn NamedWriteStore> = Arc::new(NamedStore::new(MemoryBackend::new()));
+        let mut pubr = NamedPublisher::open("/durable/bounded")
+            .await
+            .unwrap()
+            .retain(store.clone(), RetentionPolicy::keep_last(3))
+            .unwrap();
+        for i in 0..6u64 {
+            pubr.publish(&[i as u8; 20]).await.unwrap();
+        }
+        pubr.flush_retained().await;
+
+        let read: Arc<dyn NamedReadStore> = store;
+        // Only the last 3 versions (3,4,5) survive; 0,1,2 evicted.
+        for v in 0..3u64 {
+            assert!(
+                read.get(&format!("/durable/bounded/v={v}").parse::<Name>().unwrap())
+                    .await
+                    .is_none(),
+                "v={v} should be evicted"
+            );
+        }
+        for v in 3..6u64 {
+            assert!(
+                read.get(&format!("/durable/bounded/v={v}").parse::<Name>().unwrap())
+                    .await
+                    .is_some(),
+                "v={v} should be retained"
+            );
+        }
+    }
+
     /// Random access: replay from a specific version (fill a gap).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn replay_from_specific_version() {
@@ -2332,11 +2458,12 @@ mod tests {
         let mut pubr = NamedPublisher::open("/durable/seek")
             .await
             .unwrap()
-            .retain(store.clone())
+            .retain(store.clone(), RetentionPolicy::unlimited())
             .unwrap();
         for i in 0..6u64 {
             pubr.publish(&[i as u8; 50]).await.unwrap();
         }
+        pubr.flush_retained().await; // ensure write-behind has persisted all 6
         let read: Arc<dyn NamedReadStore> = store;
         let mut replay = NamedSubscriber::connect_replay("/durable/seek", read, 3);
         let first = replay.next_frame(|f| f.name.to_string()).await.unwrap();
@@ -2352,13 +2479,14 @@ mod tests {
         let mut pubr = NamedPublisher::open("/cascade/s")
             .await
             .unwrap()
-            .retain(store.clone())
+            .retain(store.clone(), RetentionPolicy::unlimited())
             .unwrap();
 
         // History published before the late joiner attaches.
         for i in 0..3u64 {
             pubr.publish(&[i as u8; 100]).await.unwrap();
         }
+        pubr.flush_retained().await; // history durable before the late joiner reads it
 
         // Late joiner: connect the live ring, then wrap with catch-up-from-store.
         let live = NamedSubscriber::connect("/cascade/s").await.unwrap();
@@ -2397,7 +2525,7 @@ mod tests {
         use ndn_storage::{MemoryBackend, NamedStore, NamedWriteStore};
         let store: Arc<dyn NamedWriteStore> = Arc::new(NamedStore::new(MemoryBackend::new()));
         let sealed = NamedPublisher::open_local("/durable/nope").await.unwrap();
-        assert!(sealed.retain(store).is_err(), "sealed is ephemeral; retain refused");
+        assert!(sealed.retain(store, RetentionPolicy::unlimited()).is_err(), "sealed is ephemeral; retain refused");
     }
 
     // ---- exclusive producer ownership ------------------------------------
