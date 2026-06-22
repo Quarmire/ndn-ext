@@ -18,7 +18,7 @@ ndn-app              = { workspace = true }
 bytes                = { workspace = true, features = ["std"] }
 sha2                 = { workspace = true }
 thiserror            = { workspace = true }
-tokio                = { workspace = true, features = ["rt", "net", "time", "macros"] }
+tokio                = { workspace = true, features = ["rt", "net", "time", "macros", "sync"] }
 
 [dev-dependencies]
 tokio          = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

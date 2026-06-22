@@ -45,13 +45,15 @@
 //! Scope: the large-frame `SharedBuffer` path and 1:N fan-out remain seams for the
 //! next phase.
 
-use std::path::PathBuf;
+use std::os::unix::io::AsRawFd;
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
 use ndn_app::Consumer;
 use ndn_face_shm::{
-    ShmFace, ShmHandle, ShmToken, connect_fd_handoff, control_socket_path, serve_fd_handoff,
-    serve_fd_handoff_loop,
+    SharedBuffer, ShmFace, ShmHandle, ShmToken, connect_fd_handoff, control_socket_path, recv_fds,
+    send_fds, serve_fd_handoff, serve_fd_handoff_loop,
 };
 use ndn_foundation_types::Name;
 use ndn_packet::encode::DataBuilder;
@@ -126,7 +128,20 @@ enum Sink {
         faces: Vec<ShmFace>,
         incoming: std::sync::mpsc::Receiver<ShmFace>,
     },
+    /// Large frames (bigger than a ring slot): each frame is an anonymous-shm
+    /// [`SharedBuffer`] whose fd is passed over a persistent side channel — written
+    /// in place by the producer, mapped + read in place by the consumer (no copy,
+    /// no slot cap). 1:1. `stream` is the connected subscriber (arrives over
+    /// `pending` on the first publish — attach-and-follow).
+    Large {
+        stream: Option<UnixStream>,
+        pending: tokio::sync::oneshot::Receiver<UnixStream>,
+    },
 }
+
+/// Side-channel frame tags (1 byte, written before the payload header).
+const LARGE_TAG_FRAME: u8 = 0x01;
+const LARGE_TAG_EOS: u8 = 0x00;
 
 /// Publishes a stream of named frames a consumer attaches to **by name**. Default
 /// ([`open`](Self::open)) is reliable 1:1 zero-copy; [`open_fanout`](Self::open_fanout)
@@ -192,6 +207,94 @@ impl NamedPublisher {
         let name = name.into();
         let cap = capability_token(&name, secret);
         Self::open_fanout_inner(name, DEFAULT_MAX_FRAME, cap).await
+    }
+
+    /// Open a **large-frame** surface (1:1): frames carry payloads of *any* size
+    /// via per-frame [`SharedBuffer`]s passed over a side channel — zero-copy on
+    /// both ends, no ring-slot cap. For multi-MB payloads (video frames, tensors,
+    /// big chunks). Use [`open_large_gated`](Self::open_large_gated) for access
+    /// control. Read with [`NamedSubscriber::connect_large`].
+    pub async fn open_large(name: impl Into<Name>) -> Result<Self, SurfaceError> {
+        let name = name.into();
+        let cap = rendezvous_token(&name);
+        Self::open_large_inner(name, cap).await
+    }
+
+    /// Capability-gated large-frame surface (see [`open_gated`](Self::open_gated)).
+    pub async fn open_large_gated(
+        name: impl Into<Name>,
+        secret: &[u8],
+    ) -> Result<Self, SurfaceError> {
+        let name = name.into();
+        let cap = capability_token(&name, secret);
+        Self::open_large_inner(name, cap).await
+    }
+
+    async fn open_large_inner(name: Name, capability: ShmToken) -> Result<Self, SurfaceError> {
+        let path = control_socket_path(&rendezvous_token(&name));
+        let _ = std::fs::remove_file(&path);
+        let listener = tokio::net::UnixListener::bind(&path)?;
+        let (tx, pending) = tokio::sync::oneshot::channel::<UnixStream>();
+        let serve = tokio::spawn(async move {
+            if let Ok(stream) = accept_authorized(listener, capability).await {
+                let _ = tx.send(stream);
+            }
+        });
+        Ok(Self {
+            sink: Sink::Large {
+                stream: None,
+                pending,
+            },
+            name,
+            seq: 0,
+            path,
+            serve,
+        })
+    }
+
+    /// Publish a large frame (any size) under `<surface>/v=<seq>`: write `content`
+    /// into a fresh [`SharedBuffer`] in place and hand its fd to the subscriber over
+    /// the side channel — no ring, no slot cap, no copy on the producer side. Only
+    /// valid on a surface opened with [`open_large`](Self::open_large); errors
+    /// otherwise. Blocks on the first call until a subscriber has attached.
+    pub async fn publish_large(&mut self, content: &[u8]) -> Result<Name, SurfaceError> {
+        let frame_name = self.name.clone().append_version(self.seq);
+        let name_wire = frame_name.encode_to_tlv();
+        let Sink::Large { stream, pending } = &mut self.sink else {
+            return Err(SurfaceError::Face(
+                "publish_large requires a surface opened with open_large".into(),
+            ));
+        };
+        if stream.is_none() {
+            let s = pending
+                .await
+                .map_err(|_| SurfaceError::Face("no subscriber attached".into()))?;
+            *stream = Some(s);
+        }
+        let s = stream.take().unwrap();
+        // Build the SharedBuffer (zero-copy write), then ship fd + header off-thread.
+        let (mut buf, fd) = SharedBuffer::create(content.len())?;
+        buf.as_mut_slice().copy_from_slice(content);
+        let payload_len = content.len();
+        let s = tokio::task::spawn_blocking(move || -> std::io::Result<UnixStream> {
+            use std::io::Write;
+            let mut s = s;
+            let mut header = Vec::with_capacity(13 + name_wire.len());
+            header.push(LARGE_TAG_FRAME);
+            header.extend_from_slice(&(payload_len as u64).to_le_bytes());
+            header.extend_from_slice(&(name_wire.len() as u32).to_le_bytes());
+            header.extend_from_slice(&name_wire);
+            s.write_all(&header)?;
+            send_fds(s.as_raw_fd(), &[fd.as_raw_fd()])?;
+            Ok(s)
+        })
+        .await
+        .map_err(|e| SurfaceError::Face(format!("join: {e}")))?
+        .map_err(SurfaceError::Io)?;
+        drop(buf); // producer's mapping; the peer maps its own via the fd
+        *stream = Some(s);
+        self.seq += 1;
+        Ok(frame_name)
     }
 
     async fn open_inner(
@@ -277,6 +380,11 @@ impl NamedPublisher {
                         .map_err(|e| SurfaceError::Face(e.to_string()))?;
                 }
             }
+            Sink::Large { .. } => {
+                return Err(SurfaceError::Face(
+                    "use publish_large on a surface opened with open_large".into(),
+                ));
+            }
         }
         self.seq += 1;
         Ok(frame_name)
@@ -305,6 +413,20 @@ impl NamedPublisher {
                     face.send_with(1, |slot| slot[0] = EOS_MARKER)
                         .await
                         .map_err(|e| SurfaceError::Face(e.to_string()))?;
+                }
+            }
+            Sink::Large { stream, pending } => {
+                // Only signal EOS if a subscriber actually attached.
+                let s = stream.take().or_else(|| pending.try_recv().ok());
+                if let Some(s) = s {
+                    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+                        use std::io::Write;
+                        let mut s = s;
+                        s.write_all(&[LARGE_TAG_EOS])
+                    })
+                    .await
+                    .map_err(|e| SurfaceError::Face(format!("join: {e}")))?
+                    .map_err(SurfaceError::Io)?;
                 }
             }
         }
@@ -340,6 +462,9 @@ enum Source {
     Local(ShmHandle),
     /// No local producer — fetch `<surface>/v=<seq>` over the forwarder.
     Remote { consumer: Consumer, seq: u64 },
+    /// Large-frame side channel: each frame's [`SharedBuffer`] fd arrives here.
+    /// `None` once the stream has ended.
+    Large(Option<UnixStream>),
 }
 
 /// Attaches to a named surface and reads its frames by name — zero-copy when the
@@ -374,6 +499,36 @@ impl NamedSubscriber {
         let surface = name.into();
         let cap = capability_token(&surface, secret);
         Self::connect_local_inner(surface, cap, 100).await
+    }
+
+    /// Attach to a **large-frame** surface ([`NamedPublisher::open_large`]) on this
+    /// host: each frame is delivered as a [`SharedBuffer`] over the side channel and
+    /// read in place (zero-copy). Pass `secret` via [`connect_large_gated`](Self::connect_large_gated)
+    /// for a gated surface.
+    pub async fn connect_large(name: impl Into<Name>) -> Result<Self, SurfaceError> {
+        let surface = name.into();
+        let cap = rendezvous_token(&surface);
+        Self::connect_large_inner(surface, cap).await
+    }
+
+    /// Capability-gated large-frame attach (see [`connect_gated`](Self::connect_gated)).
+    pub async fn connect_large_gated(
+        name: impl Into<Name>,
+        secret: &[u8],
+    ) -> Result<Self, SurfaceError> {
+        let surface = name.into();
+        let cap = capability_token(&surface, secret);
+        Self::connect_large_inner(surface, cap).await
+    }
+
+    async fn connect_large_inner(surface: Name, capability: ShmToken) -> Result<Self, SurfaceError> {
+        let path = control_socket_path(&rendezvous_token(&surface));
+        let stream = connect_authorized(&path, capability, 100).await?;
+        Ok(Self {
+            source: Source::Large(Some(stream)),
+            surface,
+            complete: None,
+        })
     }
 
     async fn connect_local_inner(
@@ -507,6 +662,39 @@ impl NamedSubscriber {
                     }
                 }
             }
+            Source::Large(slot) => {
+                let Some(s) = slot.take() else {
+                    return None; // already ended
+                };
+                // Read one side-channel frame off-thread: header + (data) fd.
+                let (returned, outcome) =
+                    tokio::task::spawn_blocking(move || read_large_frame(s))
+                        .await
+                        .unwrap_or((None, LargeOutcome::Aborted));
+                match outcome {
+                    LargeOutcome::Frame { name, buf } => {
+                        *slot = returned; // keep reading
+                        match decode_name_tlv(&name) {
+                            Some(name) => Some(f(FrameRef {
+                                name,
+                                content: buf.as_slice(),
+                            })),
+                            None => {
+                                self.complete = Some(false);
+                                None
+                            }
+                        }
+                    }
+                    LargeOutcome::Eos => {
+                        self.complete = Some(true);
+                        None
+                    }
+                    LargeOutcome::Aborted => {
+                        self.complete = Some(false);
+                        None
+                    }
+                }
+            }
         }
     }
 
@@ -550,6 +738,135 @@ async fn local_connect(
             }
             Err(e) => return Err(e.into()),
         }
+    }
+}
+
+// ---- large-frame side channel ------------------------------------------------
+
+/// Constant-time token compare (local secret; avoids a timing side channel).
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Producer side: accept until one connector presents the right capability, then
+/// keep that stream as the persistent large-frame channel.
+async fn accept_authorized(
+    listener: tokio::net::UnixListener,
+    token: ShmToken,
+) -> std::io::Result<UnixStream> {
+    loop {
+        let (stream, _addr) = listener.accept().await?;
+        let std_stream = stream.into_std()?;
+        std_stream.set_nonblocking(false)?;
+        let res = tokio::task::spawn_blocking(move || -> std::io::Result<Option<UnixStream>> {
+            use std::io::Read;
+            let mut s = std_stream;
+            let mut tok = [0u8; 32];
+            s.read_exact(&mut tok)?;
+            Ok(if ct_eq(&tok, &token) { Some(s) } else { None })
+        })
+        .await
+        .map_err(|e| std::io::Error::other(format!("token task: {e}")))??;
+        if let Some(s) = res {
+            return Ok(s);
+        }
+        // unauthorized — drop and keep listening
+    }
+}
+
+/// Consumer side: connect (retrying until the socket exists), present the
+/// capability, keep the stream. A wrong capability connects but the producer
+/// abandons the stream, so the first frame read ends as aborted.
+async fn connect_authorized(
+    path: &Path,
+    token: ShmToken,
+    attempts: u32,
+) -> Result<UnixStream, SurfaceError> {
+    let mut tried = 0u32;
+    loop {
+        let p = path.to_path_buf();
+        let r = tokio::task::spawn_blocking(move || -> std::io::Result<UnixStream> {
+            use std::io::Write;
+            let mut s = UnixStream::connect(&p)?;
+            s.write_all(&token)?;
+            Ok(s)
+        })
+        .await
+        .map_err(|e| SurfaceError::Face(format!("join: {e}")))?;
+        match r {
+            Ok(s) => return Ok(s),
+            Err(_) if tried + 1 < attempts => {
+                tried += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            Err(e) => return Err(SurfaceError::Io(e)),
+        }
+    }
+}
+
+/// Decode a full NAME TLV (type + len + value) — what `Name::encode_to_tlv`
+/// produces — into a [`Name`] (`Name::decode` itself takes only the value).
+fn decode_name_tlv(full: &[u8]) -> Option<Name> {
+    use ndn_tlv::read_varu64;
+    let (typ, n1) = read_varu64(full).ok()?;
+    if typ != tlv_type::NAME {
+        return None;
+    }
+    let (len, n2) = read_varu64(&full[n1..]).ok()?;
+    let start = n1 + n2;
+    let end = start.checked_add(len as usize).filter(|e| *e <= full.len())?;
+    Name::decode(Bytes::copy_from_slice(&full[start..end])).ok()
+}
+
+enum LargeOutcome {
+    Frame { name: Vec<u8>, buf: SharedBuffer },
+    Eos,
+    Aborted,
+}
+
+/// Blocking read of one large-frame message off the side channel. Returns the
+/// stream (so it can keep reading) only on a data frame; `Eos`/`Aborted` end it.
+fn read_large_frame(mut s: UnixStream) -> (Option<UnixStream>, LargeOutcome) {
+    use std::io::Read;
+    let mut tag = [0u8; 1];
+    if s.read_exact(&mut tag).is_err() {
+        return (None, LargeOutcome::Aborted); // producer gone without close
+    }
+    match tag[0] {
+        LARGE_TAG_EOS => (None, LargeOutcome::Eos),
+        LARGE_TAG_FRAME => {
+            let mut lenb = [0u8; 8];
+            let mut nlb = [0u8; 4];
+            if s.read_exact(&mut lenb).is_err() || s.read_exact(&mut nlb).is_err() {
+                return (None, LargeOutcome::Aborted);
+            }
+            let payload_len = u64::from_le_bytes(lenb) as usize;
+            let nl = u32::from_le_bytes(nlb) as usize;
+            let mut name = vec![0u8; nl];
+            if s.read_exact(&mut name).is_err() {
+                return (None, LargeOutcome::Aborted);
+            }
+            let fds = match recv_fds(s.as_raw_fd(), 1) {
+                Ok(f) => f,
+                Err(_) => return (None, LargeOutcome::Aborted),
+            };
+            let Some(fd) = fds.into_iter().next() else {
+                return (None, LargeOutcome::Aborted);
+            };
+            // mmap retains the mapping after the fd closes, so `fd` may drop here.
+            match SharedBuffer::from_fd(fd.as_raw_fd(), payload_len) {
+                Ok(buf) => (Some(s), LargeOutcome::Frame { name, buf }),
+                Err(_) => (None, LargeOutcome::Aborted),
+            }
+        }
+        _ => (None, LargeOutcome::Aborted),
     }
 }
 
@@ -696,6 +1013,60 @@ mod tests {
             assert_eq!(body, expected, "remote frame {i} content");
         }
         serve.abort();
+    }
+
+    // ---- phase-2: large-frame SharedBuffer path --------------------------
+
+    /// Large frames (each well beyond a ring slot) travel as per-frame
+    /// SharedBuffers over the side channel: written in place by the producer,
+    /// mapped + read in place by the consumer. Proves payloads exceed the slot cap,
+    /// round-trip by name, and the clean-close signal works on this path too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn large_frame_shared_buffer_round_trip() {
+        let name = "/large/surface";
+        let mut pubr = NamedPublisher::open_large(name).await.unwrap();
+        let mut sub = NamedSubscriber::connect_large(name).await.unwrap();
+
+        // 4 MiB per frame — far larger than the 1 MiB default ring slot.
+        const BIG: usize = 4 * 1024 * 1024;
+        for i in 0..3u64 {
+            let frame: Vec<u8> = (0..BIG).map(|j| ((j + i as usize) & 0xff) as u8).collect();
+            let published = pubr.publish_large(&frame).await.unwrap();
+            let (rxname, len, first, last) = timeout(
+                Duration::from_secs(10),
+                sub.next_frame(|f| {
+                    (
+                        f.name.clone(),
+                        f.content.len(),
+                        f.content.first().copied(),
+                        f.content.last().copied(),
+                    )
+                }),
+            )
+            .await
+            .expect("no stall")
+            .expect("large frame");
+            assert_eq!(rxname, published, "large frame {i} name round-trips");
+            assert_eq!(len, BIG, "full payload, no slot cap");
+            assert_eq!(first, Some((i as usize & 0xff) as u8));
+            assert_eq!(last, Some(((BIG - 1 + i as usize) & 0xff) as u8));
+        }
+        pubr.close().await.unwrap();
+        assert!(sub.next_frame(|_| ()).await.is_none());
+        assert_eq!(sub.is_complete(), Some(true), "large path honors clean close");
+    }
+
+    /// publish() on a large surface (and publish_large on a streaming surface) are
+    /// rejected — the mode is explicit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn large_and_streaming_modes_are_distinct() {
+        let mut large = NamedPublisher::open_large("/mode/large").await.unwrap();
+        assert!(large.publish(b"x").await.is_err(), "publish on large surface");
+        let mut stream = NamedPublisher::open("/mode/stream").await.unwrap();
+        assert!(
+            stream.publish_large(b"x").await.is_err(),
+            "publish_large on streaming surface"
+        );
     }
 
     // ---- phase-2: fan-out 1→N --------------------------------------------
