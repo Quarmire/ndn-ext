@@ -50,3 +50,9 @@ pub type ShmHandle = spsc::SpscHandle;
 pub use spsc::{
     ShmToken, connect_fd_handoff, control_socket_path, mint_token, serve_fd_handoff,
 };
+
+/// Zero-copy large-buffer passing (G11 increment 3): a [`SharedBuffer`] holds a
+/// large opaque payload in anonymous shared memory; [`send_fds`]/[`recv_fds`]
+/// hand its fd between processes for in-place (no-copy) consumption.
+#[cfg(unix)]
+pub use spsc::{SharedBuffer, recv_fds, send_fds};

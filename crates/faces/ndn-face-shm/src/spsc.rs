@@ -471,8 +471,10 @@ unsafe fn ring_peek_consume<R>(
 /// alongside one byte of normal data (the kernel requires ancillary data to
 /// ride with ≥1 data byte). Up to 8 fds in one message. This is how an
 /// anonymous ([`ShmRegion::create_anon`]) region + its wakeup channels are
-/// handed to the peer **without ever appearing in a shared namespace**.
-fn send_fds(sock: RawFd, fds: &[RawFd]) -> std::io::Result<()> {
+/// handed to the peer **without ever appearing in a shared namespace**. Also the
+/// low-level utility for passing a [`SharedBuffer`]'s fd (zero-copy large-buffer
+/// delivery).
+pub fn send_fds(sock: RawFd, fds: &[RawFd]) -> std::io::Result<()> {
     if fds.is_empty() || fds.len() > 8 {
         return Err(std::io::Error::other("send_fds: 1..=8 fds required"));
     }
@@ -510,8 +512,9 @@ fn send_fds(sock: RawFd, fds: &[RawFd]) -> std::io::Result<()> {
 
 /// Receive up to `max` file descriptors from a Unix-socket peer (`SCM_RIGHTS`),
 /// as `OwnedFd`s. Errors if the peer closed without sending, or if the control
-/// buffer was truncated (which would silently leak the in-flight fds).
-fn recv_fds(sock: RawFd, max: usize) -> std::io::Result<Vec<OwnedFd>> {
+/// buffer was truncated (which would silently leak the in-flight fds). Counterpart
+/// of [`send_fds`] for receiving a [`SharedBuffer`] fd.
+pub fn recv_fds(sock: RawFd, max: usize) -> std::io::Result<Vec<OwnedFd>> {
     let mut dummy = [0u8; 1];
     let mut iov = libc::iovec {
         iov_base: dummy.as_mut_ptr() as *mut libc::c_void,
@@ -1479,6 +1482,61 @@ impl SpscHandle {
     }
 }
 
+/// A standalone **anonymous shared-memory buffer** for zero-copy passing of a
+/// large opaque payload — a render frame, a video buffer, an ML tensor — between
+/// processes (G11 increment 3). Distinct from the SPSC ring: there is no copy and
+/// no named object. The producer writes the bytes **in place**; the fd is handed
+/// to the consumer ([`send_fds`] over the face's control socket), which maps it
+/// ([`SharedBuffer::from_fd`]) and reads **in place**. The fd is the capability.
+///
+/// This is the substrate for fd/DMA-BUF large-buffer delivery: publish a small
+/// named Data describing the buffer (id / `len` / format), pass the fd out of
+/// band, and the consumer renders straight from the mapping — pairing with the
+/// consume-in-place pattern of [`SpscHandle::recv_with`]. On Linux a producer may
+/// instead hand a **DMA-BUF** fd (GPU-exported): the passing channel is identical;
+/// the consumer maps it the same way or imports it into the GPU.
+pub struct SharedBuffer {
+    region: ShmRegion,
+    len: usize,
+}
+
+impl SharedBuffer {
+    /// Create a writable anonymous buffer of `len` bytes (rounded up to a page by
+    /// the kernel). Returns the mapped buffer plus the fd to hand the consumer.
+    pub fn create(len: usize) -> Result<(Self, OwnedFd), ShmError> {
+        let (region, fd) = ShmRegion::create_anon(len.max(1))?;
+        Ok((Self { region, len }, fd))
+    }
+
+    /// Map a buffer received as an fd (its `len` known from the published
+    /// descriptor). The caller owns `fd`'s lifetime; this only maps it.
+    pub fn from_fd(fd: RawFd, len: usize) -> Result<Self, ShmError> {
+        let region = ShmRegion::from_fd(fd, len.max(1))?;
+        Ok(Self { region, len })
+    }
+
+    /// Logical length in bytes.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// `true` if the buffer is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The bytes, borrowed in place from the shared mapping (zero-copy read).
+    pub fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.region.as_ptr(), self.len) }
+    }
+
+    /// The bytes, mutable — the producer fills these in place before handing the
+    /// fd off (and a consumer with a writable mapping may write back).
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.region.as_ptr(), self.len) }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1896,6 +1954,42 @@ mod tests {
         let name = control_socket_path(&token).to_string_lossy().to_string();
         let tok_hex: String = token.iter().map(|b| format!("{b:02x}")).collect();
         assert!(!name.contains(&tok_hex), "path must not leak the token");
+    }
+
+    // --- zero-copy large-buffer passing (SharedBuffer, G11 incr 3) ---
+
+    #[test]
+    fn shared_buffer_fd_passing_is_zero_copy() {
+        use std::os::unix::net::UnixStream;
+
+        // Producer fills a 1 MiB buffer in place (a stand-in render frame).
+        let len = 1024 * 1024;
+        let (mut buf, fd) = SharedBuffer::create(len).unwrap();
+        assert_eq!(buf.len(), len);
+        for (i, b) in buf.as_mut_slice().iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+
+        // Hand the fd to the consumer (the SCM_RIGHTS utility the control socket
+        // uses); the consumer maps and reads IN PLACE — no copy of the payload.
+        let (a, b) = UnixStream::pair().unwrap();
+        send_fds(a.as_raw_fd(), &[fd.as_raw_fd()]).unwrap();
+        drop(fd);
+        let recvd = recv_fds(b.as_raw_fd(), 1).unwrap();
+        assert_eq!(recvd.len(), 1);
+
+        let view = SharedBuffer::from_fd(recvd[0].as_raw_fd(), len).unwrap();
+        let s = view.as_slice();
+        assert_eq!(s.len(), len);
+        assert_eq!(s[0], 0);
+        assert_eq!(s[250], 250);
+        assert_eq!(s[251], 0);
+        assert_eq!(s[len - 1], ((len - 1) % 251) as u8);
+
+        // Truly shared: a producer write after handoff is visible to the consumer
+        // mapping (same physical pages, no copy).
+        buf.as_mut_slice()[42] = 0xC3;
+        assert_eq!(view.as_slice()[42], 0xC3);
     }
 
     #[test]
