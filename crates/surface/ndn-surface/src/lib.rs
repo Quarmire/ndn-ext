@@ -137,11 +137,29 @@ enum Sink {
         stream: Option<UnixStream>,
         pending: tokio::sync::oneshot::Receiver<UnixStream>,
     },
+    /// Large frames to N subscribers: one SharedBuffer per frame whose fd is dup'd
+    /// to every attached subscriber (they share one read-only mapping — zero-copy
+    /// fan-out). New subscribers arrive over `incoming`.
+    LargeFanout {
+        streams: Vec<UnixStream>,
+        incoming: std::sync::mpsc::Receiver<UnixStream>,
+    },
 }
 
 /// Side-channel frame tags (1 byte, written before the payload header).
 const LARGE_TAG_FRAME: u8 = 0x01;
 const LARGE_TAG_EOS: u8 = 0x00;
+
+/// Large-frame side-channel header: tag + payload len (u64 LE) + name len (u32 LE)
+/// + the NAME TLV. The SharedBuffer fd follows via `send_fds`.
+fn large_frame_header(payload_len: usize, name_wire: &[u8]) -> Vec<u8> {
+    let mut header = Vec::with_capacity(13 + name_wire.len());
+    header.push(LARGE_TAG_FRAME);
+    header.extend_from_slice(&(payload_len as u64).to_le_bytes());
+    header.extend_from_slice(&(name_wire.len() as u32).to_le_bytes());
+    header.extend_from_slice(name_wire);
+    header
+}
 
 /// Publishes a stream of named frames a consumer attaches to **by name**. Default
 /// ([`open`](Self::open)) is reliable 1:1 zero-copy; [`open_fanout`](Self::open_fanout)
@@ -230,6 +248,46 @@ impl NamedPublisher {
         Self::open_large_inner(name, cap).await
     }
 
+    /// Open a **large-frame fan-out** surface: every subscriber receives every
+    /// large frame, all sharing one read-only SharedBuffer mapping per frame
+    /// (zero-copy fan-out — the payload is mapped, not copied, per subscriber).
+    pub async fn open_large_fanout(name: impl Into<Name>) -> Result<Self, SurfaceError> {
+        let name = name.into();
+        let cap = rendezvous_token(&name);
+        Self::open_large_fanout_inner(name, cap).await
+    }
+
+    /// Capability-gated large-frame fan-out (see [`open_gated`](Self::open_gated)).
+    pub async fn open_large_fanout_gated(
+        name: impl Into<Name>,
+        secret: &[u8],
+    ) -> Result<Self, SurfaceError> {
+        let name = name.into();
+        let cap = capability_token(&name, secret);
+        Self::open_large_fanout_inner(name, cap).await
+    }
+
+    async fn open_large_fanout_inner(
+        name: Name,
+        capability: ShmToken,
+    ) -> Result<Self, SurfaceError> {
+        let path = control_socket_path(&rendezvous_token(&name));
+        let _ = std::fs::remove_file(&path);
+        let listener = tokio::net::UnixListener::bind(&path)?;
+        let (tx, incoming) = std::sync::mpsc::channel::<UnixStream>();
+        let serve = tokio::spawn(accept_authorized_loop(listener, capability, tx));
+        Ok(Self {
+            sink: Sink::LargeFanout {
+                streams: Vec::new(),
+                incoming,
+            },
+            name,
+            seq: 0,
+            path,
+            serve,
+        })
+    }
+
     async fn open_large_inner(name: Name, capability: ShmToken) -> Result<Self, SurfaceError> {
         let path = control_socket_path(&rendezvous_token(&name));
         let _ = std::fs::remove_file(&path);
@@ -274,39 +332,62 @@ impl NamedPublisher {
     ) -> Result<Name, SurfaceError> {
         let frame_name = self.name.clone().append_version(self.seq);
         let name_wire = frame_name.encode_to_tlv();
-        let Sink::Large { stream, pending } = &mut self.sink else {
-            return Err(SurfaceError::Face(
-                "publish_large requires a surface opened with open_large".into(),
-            ));
-        };
-        if stream.is_none() {
-            let s = pending
-                .await
-                .map_err(|_| SurfaceError::Face("no subscriber attached".into()))?;
-            *stream = Some(s);
-        }
-        let s = stream.take().unwrap();
-        // Reserve the SharedBuffer and write the payload in place, then ship the fd.
+        // Reserve the SharedBuffer and write the payload in place (no copy).
         let (mut buf, fd) = SharedBuffer::create(len)?;
         fill(buf.as_mut_slice());
-        let payload_len = len;
-        let s = tokio::task::spawn_blocking(move || -> std::io::Result<UnixStream> {
-            use std::io::Write;
-            let mut s = s;
-            let mut header = Vec::with_capacity(13 + name_wire.len());
-            header.push(LARGE_TAG_FRAME);
-            header.extend_from_slice(&(payload_len as u64).to_le_bytes());
-            header.extend_from_slice(&(name_wire.len() as u32).to_le_bytes());
-            header.extend_from_slice(&name_wire);
-            s.write_all(&header)?;
-            send_fds(s.as_raw_fd(), &[fd.as_raw_fd()])?;
-            Ok(s)
-        })
-        .await
-        .map_err(|e| SurfaceError::Face(format!("join: {e}")))?
-        .map_err(SurfaceError::Io)?;
-        drop(buf); // producer's mapping; the peer maps its own via the fd
-        *stream = Some(s);
+        let header = large_frame_header(len, &name_wire);
+
+        match &mut self.sink {
+            Sink::Large { stream, pending } => {
+                if stream.is_none() {
+                    let s = pending
+                        .await
+                        .map_err(|_| SurfaceError::Face("no subscriber attached".into()))?;
+                    *stream = Some(s);
+                }
+                let s = stream.take().unwrap();
+                let s = tokio::task::spawn_blocking(move || -> std::io::Result<UnixStream> {
+                    use std::io::Write;
+                    let mut s = s;
+                    s.write_all(&header)?;
+                    send_fds(s.as_raw_fd(), &[fd.as_raw_fd()])?;
+                    Ok(s)
+                })
+                .await
+                .map_err(|e| SurfaceError::Face(format!("join: {e}")))?
+                .map_err(SurfaceError::Io)?;
+                *stream = Some(s);
+            }
+            Sink::LargeFanout { streams, incoming } => {
+                while let Ok(s) = incoming.try_recv() {
+                    streams.push(s);
+                }
+                let taken = std::mem::take(streams);
+                // dup the same fd to each subscriber: they share one read-only map.
+                let kept = tokio::task::spawn_blocking(move || -> Vec<UnixStream> {
+                    use std::io::Write;
+                    let mut kept = Vec::with_capacity(taken.len());
+                    for mut s in taken {
+                        // a dead subscriber is dropped, not fatal to the others
+                        if s.write_all(&header).is_ok()
+                            && send_fds(s.as_raw_fd(), &[fd.as_raw_fd()]).is_ok()
+                        {
+                            kept.push(s);
+                        }
+                    }
+                    kept
+                })
+                .await
+                .map_err(|e| SurfaceError::Face(format!("join: {e}")))?;
+                *streams = kept;
+            }
+            _ => {
+                return Err(SurfaceError::Face(
+                    "publish_large requires a surface opened with open_large[_fanout]".into(),
+                ));
+            }
+        }
+        drop(buf); // producer's mapping; peers map their own via the fd
         self.seq += 1;
         Ok(frame_name)
     }
@@ -394,9 +475,9 @@ impl NamedPublisher {
                         .map_err(|e| SurfaceError::Face(e.to_string()))?;
                 }
             }
-            Sink::Large { .. } => {
+            Sink::Large { .. } | Sink::LargeFanout { .. } => {
                 return Err(SurfaceError::Face(
-                    "use publish_large on a surface opened with open_large".into(),
+                    "use publish_large on a surface opened with open_large[_fanout]".into(),
                 ));
             }
         }
@@ -442,6 +523,20 @@ impl NamedPublisher {
                     .map_err(|e| SurfaceError::Face(format!("join: {e}")))?
                     .map_err(SurfaceError::Io)?;
                 }
+            }
+            Sink::LargeFanout { streams, incoming } => {
+                while let Ok(s) = incoming.try_recv() {
+                    streams.push(s);
+                }
+                let taken = std::mem::take(streams);
+                tokio::task::spawn_blocking(move || {
+                    use std::io::Write;
+                    for mut s in taken {
+                        let _ = s.write_all(&[LARGE_TAG_EOS]);
+                    }
+                })
+                .await
+                .map_err(|e| SurfaceError::Face(format!("join: {e}")))?;
             }
         }
         Ok(()) // self drops here: serve task aborted, socket removed
@@ -785,29 +880,56 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// Producer side: accept until one connector presents the right capability, then
-/// keep that stream as the persistent large-frame channel.
+/// Accept one connection and check its capability token: `Some` if authorized,
+/// `None` if not (caller keeps listening).
+async fn authorize_one(
+    listener: &tokio::net::UnixListener,
+    token: ShmToken,
+) -> std::io::Result<Option<UnixStream>> {
+    let (stream, _addr) = listener.accept().await?;
+    let std_stream = stream.into_std()?;
+    std_stream.set_nonblocking(false)?;
+    tokio::task::spawn_blocking(move || -> std::io::Result<Option<UnixStream>> {
+        use std::io::Read;
+        let mut s = std_stream;
+        let mut tok = [0u8; 32];
+        s.read_exact(&mut tok)?;
+        Ok(if ct_eq(&tok, &token) { Some(s) } else { None })
+    })
+    .await
+    .map_err(|e| std::io::Error::other(format!("token task: {e}")))?
+}
+
+/// Producer side (1:1): accept until one connector presents the right capability,
+/// then keep that stream as the persistent large-frame channel.
 async fn accept_authorized(
     listener: tokio::net::UnixListener,
     token: ShmToken,
 ) -> std::io::Result<UnixStream> {
     loop {
-        let (stream, _addr) = listener.accept().await?;
-        let std_stream = stream.into_std()?;
-        std_stream.set_nonblocking(false)?;
-        let res = tokio::task::spawn_blocking(move || -> std::io::Result<Option<UnixStream>> {
-            use std::io::Read;
-            let mut s = std_stream;
-            let mut tok = [0u8; 32];
-            s.read_exact(&mut tok)?;
-            Ok(if ct_eq(&tok, &token) { Some(s) } else { None })
-        })
-        .await
-        .map_err(|e| std::io::Error::other(format!("token task: {e}")))??;
-        if let Some(s) = res {
+        if let Some(s) = authorize_one(&listener, token).await? {
             return Ok(s);
         }
-        // unauthorized — drop and keep listening
+    }
+}
+
+/// Producer side (1→N): keep accepting authorized connectors and hand each to the
+/// publisher over `tx`, for large-frame fan-out.
+async fn accept_authorized_loop(
+    listener: tokio::net::UnixListener,
+    token: ShmToken,
+    tx: std::sync::mpsc::Sender<UnixStream>,
+) {
+    loop {
+        match authorize_one(&listener, token).await {
+            Ok(Some(s)) => {
+                if tx.send(s).is_err() {
+                    break; // publisher gone
+                }
+            }
+            Ok(None) => {} // unauthorized — keep listening
+            Err(_) => break,
+        }
     }
 }
 
@@ -1356,6 +1478,51 @@ mod tests {
         pubr.close().await.unwrap();
         assert!(sub.next_frame(|_| ()).await.is_none());
         assert_eq!(sub.is_complete(), Some(true), "large path honors clean close");
+    }
+
+    /// Large-frame fan-out: one publisher, N subscribers, each receiving every
+    /// large frame (all sharing one read-only SharedBuffer mapping per frame).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn large_fanout_one_to_many() {
+        const SUBS: usize = 3;
+        const FRAMES: u64 = 3;
+        const BIG: usize = 2 * 1024 * 1024;
+        let name = "/largefan/surface";
+        let mut pubr = NamedPublisher::open_large_fanout(name).await.unwrap();
+
+        let mut readers = Vec::new();
+        for _ in 0..SUBS {
+            let mut sub = NamedSubscriber::connect_large(name).await.unwrap();
+            readers.push(tokio::spawn(async move {
+                let mut got = Vec::new();
+                while let Some(v) =
+                    timeout(Duration::from_secs(10), sub.next_frame(|f| (f.content.len(), f.content[0])))
+                        .await
+                        .expect("no stall")
+                {
+                    got.push(v);
+                }
+                (got, sub.is_complete())
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        for i in 0..FRAMES {
+            pubr.publish_large_with(BIG, move |slot| slot.fill((i as u8) + 1))
+                .await
+                .unwrap();
+        }
+        pubr.close().await.unwrap();
+
+        for r in readers {
+            let (frames, complete) = r.await.unwrap();
+            assert_eq!(frames.len() as u64, FRAMES, "each subscriber gets every large frame");
+            for (i, (len, first)) in frames.iter().enumerate() {
+                assert_eq!(*len, BIG);
+                assert_eq!(*first, (i as u8) + 1, "frame {i} payload");
+            }
+            assert_eq!(complete, Some(true), "clean close reaches every subscriber");
+        }
     }
 
     /// publish() on a large surface (and publish_large on a streaming surface) are
