@@ -56,4 +56,4 @@ pub use spsc::{
 /// large opaque payload in anonymous shared memory; [`send_fds`]/[`recv_fds`]
 /// hand its fd between processes for in-place (no-copy) consumption.
 #[cfg(unix)]
-pub use spsc::{SharedBuffer, recv_fds, send_fds};
+pub use spsc::{SharedBuffer, SharedBufferReader, recv_fds, send_fds};

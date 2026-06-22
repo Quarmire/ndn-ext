@@ -274,6 +274,107 @@ impl ShmRegion {
         })
     }
 
+    /// Create an anonymous region the **producer maps read-write** while handing
+    /// consumers a **read-only fd**: the only writable access is the producer's own
+    /// mapping (which is never transmittable), so no other process — not a consumer,
+    /// not a third party who obtains the fd — can ever write the region. This is the
+    /// kernel-enforced single-writer foundation: integrity + origin without a
+    /// per-frame signature, because forgery is *impossible*, not merely *trusted*.
+    ///
+    /// Mechanism: open the object `O_RDWR`, open a *second* `O_RDONLY` fd to the same
+    /// object, `shm_unlink` the name, map the RW fd, then close it (the mapping stays
+    /// writable). The returned `OwnedFd` is read-only — `SCM_RIGHTS` preserves the
+    /// `O_RDONLY` mode, and `mmap(PROT_WRITE)` on it is refused by the kernel.
+    fn create_anon_ro(size: usize) -> Result<(Self, OwnedFd), ShmError> {
+        static ANON_RO_CTR: AtomicU64 = AtomicU64::new(0);
+        let pid = unsafe { libc::getpid() };
+        for _ in 0..64 {
+            let n = ANON_RO_CTR.fetch_add(1, Ordering::Relaxed);
+            let name = format!("/ndnshmro-{pid}-{n}");
+            let cname = CString::new(name).map_err(|_| ShmError::InvalidName)?;
+            let rw_fd = unsafe {
+                libc::shm_open(
+                    cname.as_ptr(),
+                    libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+                    0o600 as libc::mode_t as libc::c_uint,
+                )
+            };
+            if rw_fd == -1 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EEXIST) {
+                    continue;
+                }
+                return Err(ShmError::Io(err));
+            }
+            let owned_rw = unsafe { OwnedFd::from_raw_fd(rw_fd) };
+            // A read-only fd to the same object, opened while the name still exists.
+            let ro_fd = unsafe { libc::shm_open(cname.as_ptr(), libc::O_RDONLY, 0) };
+            // Unlink now: the object lives on via the open fds / mapping.
+            unsafe { libc::shm_unlink(cname.as_ptr()) };
+            if ro_fd == -1 {
+                return Err(ShmError::Io(std::io::Error::last_os_error()));
+            }
+            let ro_owned = unsafe { OwnedFd::from_raw_fd(ro_fd) };
+            let ptr = unsafe {
+                if libc::ftruncate(owned_rw.as_raw_fd(), size as libc::off_t) == -1 {
+                    return Err(ShmError::Io(std::io::Error::last_os_error()));
+                }
+                let p = libc::mmap(
+                    std::ptr::null_mut(),
+                    size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    owned_rw.as_raw_fd(),
+                    0,
+                );
+                if p == libc::MAP_FAILED {
+                    return Err(ShmError::Io(std::io::Error::last_os_error()));
+                }
+                p as *mut u8
+            };
+            // Drop the RW fd: the writable mapping persists, but no writable fd
+            // exists anymore to transmit or re-map.
+            drop(owned_rw);
+            return Ok((
+                ShmRegion {
+                    ptr,
+                    size,
+                    shm_name: None,
+                },
+                ro_owned,
+            ));
+        }
+        Err(ShmError::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not allocate an anonymous SHM name after 64 tries",
+        )))
+    }
+
+    /// Map a received fd **read-only** (`PROT_READ`). Pairs with the read-only fd
+    /// from [`create_anon_ro`](Self::create_anon_ro): a consumer can read in place
+    /// but the kernel refuses any writable mapping of this fd.
+    fn from_fd_ro(fd: RawFd, size: usize) -> Result<Self, ShmError> {
+        let ptr = unsafe {
+            let p = libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            );
+            if p == libc::MAP_FAILED {
+                return Err(ShmError::Io(std::io::Error::last_os_error()));
+            }
+            p as *mut u8
+        };
+        Ok(ShmRegion {
+            ptr,
+            size,
+            shm_name: None,
+        })
+    }
+
     fn as_ptr(&self) -> *mut u8 {
         self.ptr
     }
@@ -1740,6 +1841,17 @@ impl SharedBuffer {
         Ok((Self { region, len }, fd))
     }
 
+    /// Create a buffer the **producer maps read-write** while handing consumers a
+    /// **read-only fd** ([`ShmRegion::create_anon_ro`]). The producer is the sole
+    /// writer — enforced by the kernel, not by trust — so frames a consumer reads
+    /// provably originated from the producer, with no per-frame signature. Pair with
+    /// [`SharedBufferReader::from_fd`]. This is the multi-reader multicast case in
+    /// pure form: one buffer, N read-only readers, one exclusive writer.
+    pub fn create_ro(len: usize) -> Result<(Self, OwnedFd), ShmError> {
+        let (region, ro_fd) = ShmRegion::create_anon_ro(len.max(1))?;
+        Ok((Self { region, len }, ro_fd))
+    }
+
     /// Map a buffer received as an fd (its `len` known from the published
     /// descriptor). The caller owns `fd`'s lifetime; this only maps it.
     pub fn from_fd(fd: RawFd, len: usize) -> Result<Self, ShmError> {
@@ -1769,6 +1881,40 @@ impl SharedBuffer {
     }
 }
 
+/// A **read-only** view of a [`SharedBuffer`], mapped from the read-only fd handed
+/// out by [`SharedBuffer::create_ro`]. The kernel refuses any writable mapping of
+/// that fd, so a consumer (or any process that obtains the fd) can read in place but
+/// cannot forge — the producer's exclusive write capability *is* the authenticity
+/// guarantee. There is, by design, no `as_mut_slice`.
+pub struct SharedBufferReader {
+    region: ShmRegion,
+    len: usize,
+}
+
+impl SharedBufferReader {
+    /// Map a read-only fd (from [`SharedBuffer::create_ro`]); `len` is known from the
+    /// published descriptor. Errors if the fd is not read-mappable.
+    pub fn from_fd(fd: RawFd, len: usize) -> Result<Self, ShmError> {
+        let region = ShmRegion::from_fd_ro(fd, len.max(1))?;
+        Ok(Self { region, len })
+    }
+
+    /// Logical length in bytes.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// `true` if the buffer is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The bytes, borrowed in place from the read-only mapping (zero-copy read).
+    pub fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.region.as_ptr(), self.len) }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1785,6 +1931,62 @@ mod tests {
         let face = SpscFace::create(FaceId(7), &name).unwrap();
         assert_eq!(face.id(), FaceId(7));
         assert_eq!(face.kind(), FaceKind::Shm);
+    }
+
+    /// FOUNDATION PROOF (kernel-enforced single-writer): the producer maps the
+    /// buffer read-write and hands out a read-only fd; a consumer reads the
+    /// producer's bytes in place (and sees live updates), but the kernel REFUSES any
+    /// attempt to obtain a writable mapping of that fd. Integrity + origin without a
+    /// per-frame signature — forgery is impossible, not merely trusted.
+    #[test]
+    fn readonly_handoff_consumer_cannot_write_data_region() {
+        let (mut producer, ro_fd) = SharedBuffer::create_ro(4096).unwrap();
+
+        // Producer writes through its read-write mapping.
+        producer.as_mut_slice()[..5].copy_from_slice(b"hello");
+
+        // Consumer maps the handed read-only fd and reads the producer's bytes.
+        let reader = SharedBufferReader::from_fd(ro_fd.as_raw_fd(), 4096).unwrap();
+        assert_eq!(&reader.as_slice()[..5], b"hello");
+
+        // A producer update is visible to the consumer (genuinely shared, zero-copy).
+        producer.as_mut_slice()[..5].copy_from_slice(b"world");
+        assert_eq!(&reader.as_slice()[..5], b"world");
+
+        // PROOF: the read-only fd cannot be escalated to a writable mapping.
+        let attempt = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                ro_fd.as_raw_fd(),
+                0,
+            )
+        };
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        assert_eq!(
+            attempt,
+            libc::MAP_FAILED,
+            "kernel must refuse a writable MAP_SHARED mapping of the read-only fd (errno {errno:?})"
+        );
+        // Permission denial — EACCES on Linux, EPERM on macOS; either confirms the
+        // fd's read-only mode blocks the writable mapping.
+        assert!(
+            matches!(errno, Some(libc::EACCES) | Some(libc::EPERM)),
+            "expected a permission-denial errno, got {errno:?}"
+        );
+    }
+
+    /// The producer's writable mapping survives closing the RW fd (the mapping, not
+    /// the fd, carries write access — so no writable fd lingers to be transmitted).
+    #[test]
+    fn readonly_handoff_producer_mapping_outlives_rw_fd() {
+        let (mut producer, ro_fd) = SharedBuffer::create_ro(64).unwrap();
+        // create_ro already closed the RW fd internally; writing still works.
+        producer.as_mut_slice()[0] = 0x42;
+        let reader = SharedBufferReader::from_fd(ro_fd.as_raw_fd(), 64).unwrap();
+        assert_eq!(reader.as_slice()[0], 0x42);
     }
 
     #[test]
