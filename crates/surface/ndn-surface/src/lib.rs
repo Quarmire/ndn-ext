@@ -34,8 +34,16 @@
 //! [`Consumer`]. The consumer code is identical either way — *fetch by name; get
 //! zero-copy if it's local, the network if it isn't.*
 //!
-//! Scope: the large-frame `SharedBuffer` path, capability auth over name
-//! resolution, and 1:N fan-out remain seams for the next phase.
+//! ## Access control
+//!
+//! An ungated surface ([`NamedPublisher::open`]) is discoverable *and* attachable
+//! by anyone who knows the name. A **gated** surface (`open_gated` paired with
+//! [`NamedSubscriber::connect_gated`]) keeps the name-derived rendezvous (so it is
+//! still findable) but gates the fd-handshake on a caller secret — the secret never
+//! appears on the wire or in the socket path and is bound to the name.
+//!
+//! Scope: the large-frame `SharedBuffer` path and 1:N fan-out remain seams for the
+//! next phase.
 
 use std::path::PathBuf;
 
@@ -65,15 +73,31 @@ pub enum SurfaceError {
     Malformed,
 }
 
-/// The local rendezvous for a surface is derived from its name (so both sides
-/// compute the same control socket). This is *discovery*, not auth — a published
-/// surface is meant to be found by name; restricting *who* may read is a separate
-/// capability layer (a real secret token over the name-resolution path) and is
-/// not yet wired here.
-fn surface_token(name: &Name) -> ShmToken {
+/// **Rendezvous** token — derives the control-socket *path* from the name so both
+/// sides find the same socket. This is *discovery*: anyone who knows the name can
+/// locate (and, on an ungated surface, attach to) the surface. Distinct domain
+/// separation from the capability token so a path value can never double as a gate.
+fn rendezvous_token(name: &Name) -> ShmToken {
+    sha256_parts(&[b"ndn-surface\x00rendezvous\x00", &name.encode_to_tlv()])
+}
+
+/// **Capability** token — the secret presented at the fd-handshake that gates
+/// *who* may attach. Bound to the name (so a secret can't be lifted to another
+/// surface at the same path) and domain-separated from the rendezvous token. An
+/// ungated surface uses [`rendezvous_token`] as its capability (knowing the name
+/// is sufficient); a gated surface uses this, keyed on a caller secret.
+fn capability_token(name: &Name, secret: &[u8]) -> ShmToken {
+    sha256_parts(&[b"ndn-surface\x00capability\x00", &name.encode_to_tlv(), secret])
+}
+
+fn sha256_parts(parts: &[&[u8]]) -> ShmToken {
     use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for p in parts {
+        h.update(p);
+    }
     let mut t = [0u8; 32];
-    t.copy_from_slice(&Sha256::digest(name.encode_to_tlv()));
+    t.copy_from_slice(&h.finalize());
     t
 }
 
@@ -89,25 +113,52 @@ pub struct NamedPublisher {
 }
 
 impl NamedPublisher {
-    /// Open a surface named `name` for publishing (default 1 MiB max frame).
+    /// Open an **ungated** surface named `name` (default 1 MiB max frame): anyone
+    /// who knows the name may attach. For access control use
+    /// [`open_gated`](Self::open_gated).
     pub async fn open(name: impl Into<Name>) -> Result<Self, SurfaceError> {
-        Self::open_with_max_frame(name, DEFAULT_MAX_FRAME).await
+        let name = name.into();
+        let cap = rendezvous_token(&name);
+        Self::open_inner(name, DEFAULT_MAX_FRAME, cap).await
     }
 
-    /// Open a surface whose frames are up to `max_frame` bytes.
+    /// Open an ungated surface whose frames are up to `max_frame` bytes.
     pub async fn open_with_max_frame(
         name: impl Into<Name>,
         max_frame: usize,
     ) -> Result<Self, SurfaceError> {
         let name = name.into();
-        let token = surface_token(&name);
+        let cap = rendezvous_token(&name);
+        Self::open_inner(name, max_frame, cap).await
+    }
+
+    /// Open a **capability-gated** surface: the control socket is still found by
+    /// name (discovery), but the fd-handshake is gated on `secret` — only a
+    /// subscriber that presents the same secret via
+    /// [`NamedSubscriber::connect_gated`] (or `connect_via_gated`) may attach. The
+    /// secret never appears on the wire or in the socket path; it is bound to the
+    /// name so it can't be replayed against another surface.
+    pub async fn open_gated(
+        name: impl Into<Name>,
+        secret: &[u8],
+    ) -> Result<Self, SurfaceError> {
+        let name = name.into();
+        let cap = capability_token(&name, secret);
+        Self::open_inner(name, DEFAULT_MAX_FRAME, cap).await
+    }
+
+    async fn open_inner(
+        name: Name,
+        max_frame: usize,
+        capability: ShmToken,
+    ) -> Result<Self, SurfaceError> {
         // FaceId is irrelevant for a standalone surface — the facade picks one.
         let (face, fds) = ShmFace::create_anon_for_mtu(FaceId(0), max_frame)?;
-        let path = control_socket_path(&token);
+        let path = control_socket_path(&rendezvous_token(&name));
         let _ = std::fs::remove_file(&path);
         let listener = tokio::net::UnixListener::bind(&path)?;
         let serve = tokio::spawn(async move {
-            let _ = serve_fd_handoff(listener, token, fds).await;
+            let _ = serve_fd_handoff(listener, capability, fds).await;
         });
         Ok(Self {
             face,
@@ -174,15 +225,36 @@ pub struct NamedSubscriber {
 }
 
 impl NamedSubscriber {
-    /// Attach to a **local** surface named `name`, establishing the zero-copy SHM
-    /// channel (retrying briefly until the publisher is serving). Errors if no
-    /// local publisher appears — use [`connect_via`](Self::connect_via) for the
-    /// location-transparent path that also covers remote producers.
+    /// Attach to an **ungated local** surface named `name`, establishing the
+    /// zero-copy SHM channel (retrying briefly until the publisher is serving).
+    /// Errors if no local publisher appears — use [`connect_via`](Self::connect_via)
+    /// for the location-transparent path, or [`connect_gated`](Self::connect_gated)
+    /// for a capability-gated surface.
     pub async fn connect(name: impl Into<Name>) -> Result<Self, SurfaceError> {
         let surface = name.into();
-        let token = surface_token(&surface);
-        let path = control_socket_path(&token);
-        let handle = local_connect(&path, token, 100).await?;
+        let cap = rendezvous_token(&surface);
+        Self::connect_local_inner(surface, cap, 100).await
+    }
+
+    /// Attach to a **capability-gated local** surface, presenting `secret` at the
+    /// handshake. Must match the publisher's [`open_gated`](NamedPublisher::open_gated)
+    /// secret or the handshake is refused.
+    pub async fn connect_gated(
+        name: impl Into<Name>,
+        secret: &[u8],
+    ) -> Result<Self, SurfaceError> {
+        let surface = name.into();
+        let cap = capability_token(&surface, secret);
+        Self::connect_local_inner(surface, cap, 100).await
+    }
+
+    async fn connect_local_inner(
+        surface: Name,
+        capability: ShmToken,
+        attempts: u32,
+    ) -> Result<Self, SurfaceError> {
+        let path = control_socket_path(&rendezvous_token(&surface));
+        let handle = local_connect(&path, capability, attempts).await?;
         Ok(Self {
             source: Source::Local(handle),
             surface,
@@ -199,14 +271,36 @@ impl NamedSubscriber {
         consumer: Consumer,
     ) -> Result<Self, SurfaceError> {
         let surface = name.into();
-        let token = surface_token(&surface);
-        let path = control_socket_path(&token);
+        let cap = rendezvous_token(&surface);
+        Self::connect_via_inner(surface, cap, consumer).await
+    }
+
+    /// Like [`connect_via`](Self::connect_via), but presents `secret` at the local
+    /// handshake (for a [`open_gated`](NamedPublisher::open_gated) producer on this
+    /// host). The remote fallback is unaffected — remote authenticity is carried by
+    /// NDN signing on the fetched Data, a separate concern from local attach gating.
+    pub async fn connect_via_gated(
+        name: impl Into<Name>,
+        secret: &[u8],
+        consumer: Consumer,
+    ) -> Result<Self, SurfaceError> {
+        let surface = name.into();
+        let cap = capability_token(&surface, secret);
+        Self::connect_via_inner(surface, cap, consumer).await
+    }
+
+    async fn connect_via_inner(
+        surface: Name,
+        capability: ShmToken,
+        consumer: Consumer,
+    ) -> Result<Self, SurfaceError> {
+        let path = control_socket_path(&rendezvous_token(&surface));
         // A local publisher creates the control socket in `open`; its absence is
         // the cheap, race-free signal that the producer is not on this host.
         if path.exists() {
             // Short probe: tolerate the publisher-still-starting handshake race,
             // but don't stall a genuinely-remote attach on a stale socket.
-            if let Ok(handle) = local_connect(&path, token, 10).await {
+            if let Ok(handle) = local_connect(&path, capability, 10).await {
                 return Ok(Self {
                     source: Source::Local(handle),
                     surface,
@@ -425,6 +519,72 @@ mod tests {
         serve.abort();
     }
 
+    // ---- phase-2: capability auth ----------------------------------------
+
+    /// A gated surface admits the holder of the right secret and reads frames
+    /// normally — the secret never touches the wire or the (name-derived) path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn capability_gated_round_trip() {
+        let name = "/gated/ok";
+        let secret = b"correct horse battery staple";
+        let mut pubr = NamedPublisher::open_gated(name, secret).await.unwrap();
+        let mut sub = NamedSubscriber::connect_gated(name, secret).await.unwrap();
+        pubr.publish(b"for your eyes only").await.unwrap();
+        let body = sub.next_frame(|f| f.content.to_vec()).await.expect("frame");
+        assert_eq!(body, b"for your eyes only");
+    }
+
+    /// The gate actually gates: a connector presenting the wrong secret — or the
+    /// public (name-only) token — is refused the fd-handoff. Driven at the handshake
+    /// level (single attempt each) so the negatives don't burn the publisher's
+    /// reject budget; both rejections land on a throwaway surface.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn capability_wrong_secret_and_public_token_rejected() {
+        let surface: Name = "/gated/reject".parse().unwrap();
+        let _pubr = NamedPublisher::open_gated("/gated/reject", b"right-secret")
+            .await
+            .unwrap();
+        let path = control_socket_path(&rendezvous_token(&surface));
+
+        // (a) wrong secret → rejected
+        let wrong = capability_token(&surface, b"wrong-secret");
+        let p1 = path.clone();
+        let r1 = tokio::task::spawn_blocking(move || connect_fd_handoff(&p1, &wrong))
+            .await
+            .unwrap();
+        assert!(r1.is_err(), "wrong secret must be refused the handoff");
+
+        // (b) public/name-only token (would attach an ungated surface) → rejected
+        let public = rendezvous_token(&surface);
+        let p2 = path.clone();
+        let r2 = tokio::task::spawn_blocking(move || connect_fd_handoff(&p2, &public))
+            .await
+            .unwrap();
+        assert!(
+            r2.is_err(),
+            "knowing the name must NOT be enough on a gated surface"
+        );
+
+        // ...and the legitimate secret still attaches (budget not exhausted: 2<16).
+        let good = NamedSubscriber::connect_gated("/gated/reject", b"right-secret")
+            .await
+            .unwrap();
+        assert!(good.is_local(), "legitimate secret still attaches");
+    }
+
+    /// Rendezvous (path) and capability (gate) are domain-separated: even for an
+    /// ungated surface the two derived tokens differ, so a path value can never
+    /// double as a gate.
+    #[test]
+    fn rendezvous_and_capability_are_domain_separated() {
+        let n: Name = "/x/y".parse().unwrap();
+        assert_ne!(rendezvous_token(&n), capability_token(&n, b""));
+        // distinct secrets ⇒ distinct capabilities; same secret different name ⇒ distinct
+        assert_ne!(capability_token(&n, b"a"), capability_token(&n, b"b"));
+        let m: Name = "/x/z".parse().unwrap();
+        assert_ne!(capability_token(&n, b"a"), capability_token(&m, b"a"));
+    }
+
     // ---- #5 failure / chaos / soak ---------------------------------------
     // The findings are the deliverable: what the surface does when things go
     // wrong, and whether any of it leaks or hangs.
@@ -502,7 +662,7 @@ mod tests {
         let surface: Name = "/chaos/stale".parse().unwrap();
         // Simulate the crash residue: bind then drop a listener — the socket file
         // remains (Unix doesn't unlink on close) but connects are refused.
-        let path = control_socket_path(&surface_token(&surface));
+        let path = control_socket_path(&rendezvous_token(&surface));
         let _ = std::fs::remove_file(&path);
         drop(tokio::net::UnixListener::bind(&path).expect("bind stale socket"));
         assert!(path.exists(), "stale socket should be present for the probe");
@@ -584,7 +744,7 @@ mod tests {
                 let body = sub.next_frame(|f| f.content.to_vec()).await.expect("frame");
                 assert_eq!(body, vec![i as u8; 500]);
             }
-            let path = control_socket_path(&surface_token(&name.parse::<Name>().unwrap()));
+            let path = control_socket_path(&rendezvous_token(&name.parse::<Name>().unwrap()));
             drop(pubr);
             drop(sub);
             assert!(!path.exists(), "cycle {cycle}: control socket left behind");
