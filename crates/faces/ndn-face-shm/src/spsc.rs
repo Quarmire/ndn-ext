@@ -950,6 +950,23 @@ impl SpscFace {
         }
     }
 
+    /// **Non-blocking, zero-syscall receive** — the busy-poll low-latency path.
+    /// Returns the next packet if one is waiting, else `None` (the caller spins).
+    /// A tight `loop { if let Some(p) = face.try_recv() {…} else { spin_loop() } }`
+    /// hits the shared-memory round-trip floor (~hundreds of ns) at the cost of a
+    /// busy core; use [`recv_bytes`](Self::recv_bytes) (spin-then-park) when CPU
+    /// efficiency matters more than the last microsecond.
+    pub fn try_recv(&self) -> Option<Bytes> {
+        self.try_pop_a2e()
+    }
+
+    /// Non-blocking, zero-copy [`recv_with`](Self::recv_with): if a packet is
+    /// waiting, consume it in place via `f`; else `None`. The busy-poll path with
+    /// no slot→heap copy.
+    pub fn try_recv_with<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        self.try_peek_consume_a2e(f)
+    }
+
     fn try_push_e2a(&self, data: &[u8]) -> bool {
         unsafe {
             ring_push(
@@ -1437,6 +1454,20 @@ impl SpscHandle {
                 f,
             )
         }
+    }
+
+    /// **Non-blocking, zero-syscall receive** — the busy-poll low-latency path
+    /// (app side). Returns the next packet if waiting, else `None` (caller
+    /// spins). Tight-loop polling hits the shared-memory floor at the cost of a
+    /// busy core; use [`recv_bytes`](Self::recv_bytes) when CPU efficiency wins.
+    pub fn try_recv(&self) -> Option<Bytes> {
+        self.try_pop_e2a()
+    }
+
+    /// Non-blocking, zero-copy [`recv_with`](Self::recv_with): consume the next
+    /// packet in place via `f` if waiting, else `None`.
+    pub fn try_recv_with<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        self.try_peek_consume_e2a(f)
     }
 
     /// **Zero-copy receive** from the e2a ring: wait for a packet, then run `f`
@@ -1990,6 +2021,36 @@ mod tests {
         // mapping (same physical pages, no copy).
         buf.as_mut_slice()[42] = 0xC3;
         assert_eq!(view.as_slice()[42], 0xC3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn try_recv_busy_poll_round_trip() {
+        let name = format!("{}-trecv", test_name());
+        let face = SpscFace::create(FaceId(50), &name).unwrap();
+        let handle = SpscHandle::connect(&name).unwrap();
+
+        // Empty ring → None (non-blocking).
+        assert!(face.try_recv().is_none());
+
+        // handle → face: busy-poll until the packet appears.
+        handle.send_bytes(Bytes::from_static(b"poll")).await.unwrap();
+        let got = loop {
+            if let Some(p) = face.try_recv() {
+                break p;
+            }
+            std::hint::spin_loop();
+        };
+        assert_eq!(&got[..], b"poll");
+
+        // face → handle: busy-poll, consumed in place (zero-copy).
+        face.send_bytes(Bytes::from_static(b"back")).await.unwrap();
+        let n = loop {
+            if let Some(n) = handle.try_recv_with(|s| s.len()) {
+                break n;
+            }
+            std::hint::spin_loop();
+        };
+        assert_eq!(n, 4);
     }
 
     #[test]
