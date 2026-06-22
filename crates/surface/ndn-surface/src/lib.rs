@@ -940,6 +940,140 @@ fn parse_frame(wire: &[u8]) -> Result<(Name, &[u8]), SurfaceError> {
     Ok((name.ok_or(SurfaceError::Malformed)?, content.unwrap_or(&[])))
 }
 
+// ---- duplex request/reply ----------------------------------------------------
+//
+// The SHM region is already bidirectional: the open side reads the a2e ring and
+// writes the e2a ring; the connect side does the reverse. A streaming surface uses
+// only e2a; an RPC surface uses both — request on a2e, reply on e2a — over the
+// *same* name-derived rendezvous + capability handshake. 1:1.
+
+/// Server side of a request/reply surface: answer named requests with named
+/// replies. Pairs with [`ClientSurface`].
+pub struct ServiceSurface {
+    face: ShmFace,
+    path: PathBuf,
+    serve: tokio::task::JoinHandle<()>,
+}
+
+impl ServiceSurface {
+    /// Open an ungated service named `name`.
+    pub async fn open(name: impl Into<Name>) -> Result<Self, SurfaceError> {
+        let name = name.into();
+        let cap = rendezvous_token(&name);
+        Self::open_inner(name, cap).await
+    }
+
+    /// Open a capability-gated service (see [`NamedPublisher::open_gated`]).
+    pub async fn open_gated(name: impl Into<Name>, secret: &[u8]) -> Result<Self, SurfaceError> {
+        let name = name.into();
+        let cap = capability_token(&name, secret);
+        Self::open_inner(name, cap).await
+    }
+
+    async fn open_inner(name: Name, capability: ShmToken) -> Result<Self, SurfaceError> {
+        let (face, fds) = ShmFace::create_anon_for_mtu(FaceId(0), DEFAULT_MAX_FRAME)?;
+        let path = control_socket_path(&rendezvous_token(&name));
+        let _ = std::fs::remove_file(&path);
+        let listener = tokio::net::UnixListener::bind(&path)?;
+        let serve = tokio::spawn(async move {
+            let _ = serve_fd_handoff(listener, capability, fds).await;
+        });
+        Ok(Self { face, path, serve })
+    }
+
+    /// Serve requests until the client disconnects. For each request Data (read off
+    /// the a2e ring) `handler` receives its name + content and returns the reply
+    /// bytes; the reply is sent back as a Data named after the request (e2a ring).
+    pub async fn serve<F, Fut>(&self, handler: F) -> Result<(), SurfaceError>
+    where
+        F: Fn(Name, Bytes) -> Fut,
+        Fut: std::future::Future<Output = Vec<u8>>,
+    {
+        loop {
+            let req = self
+                .face
+                .recv_with(|wire| parse_frame(wire).map(|(n, c)| (n, Bytes::copy_from_slice(c))).ok())
+                .await;
+            let (req_name, req_content) = match req {
+                Ok(Some(r)) => r,
+                Ok(None) => continue,         // malformed request — skip
+                Err(_) => return Ok(()),       // client gone
+            };
+            let reply = handler(req_name.clone(), req_content).await;
+            let b = DataBuilder::new(req_name, &reply);
+            let len = b.encoded_len_digest_sha256();
+            self.face
+                .send_with(len, |slot| {
+                    b.encode_digest_sha256_into(slot);
+                })
+                .await
+                .map_err(|e| SurfaceError::Face(e.to_string()))?;
+        }
+    }
+}
+
+impl Drop for ServiceSurface {
+    fn drop(&mut self) {
+        self.serve.abort();
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Client side of a request/reply surface. Sends a named request and awaits the
+/// named reply over the same SHM region.
+pub struct ClientSurface {
+    handle: ShmHandle,
+}
+
+impl ClientSurface {
+    /// Connect to an ungated service named `name`.
+    pub async fn connect(name: impl Into<Name>) -> Result<Self, SurfaceError> {
+        let surface = name.into();
+        let cap = rendezvous_token(&surface);
+        Self::connect_inner(&surface, cap).await
+    }
+
+    /// Connect to a capability-gated service (presents `secret`).
+    pub async fn connect_gated(
+        name: impl Into<Name>,
+        secret: &[u8],
+    ) -> Result<Self, SurfaceError> {
+        let surface = name.into();
+        let cap = capability_token(&surface, secret);
+        Self::connect_inner(&surface, cap).await
+    }
+
+    async fn connect_inner(surface: &Name, capability: ShmToken) -> Result<Self, SurfaceError> {
+        let path = control_socket_path(&rendezvous_token(surface));
+        let handle = local_connect(&path, capability, 100).await?;
+        Ok(Self { handle })
+    }
+
+    /// Send a request named `name` with `content` and await the reply — returns the
+    /// reply's name and (owned) content. Errors if the service has gone away.
+    pub async fn request(
+        &self,
+        name: impl Into<Name>,
+        content: &[u8],
+    ) -> Result<(Name, Bytes), SurfaceError> {
+        let b = DataBuilder::new(name.into(), content);
+        let len = b.encoded_len_digest_sha256();
+        self.handle
+            .send_with(len, |slot| {
+                b.encode_digest_sha256_into(slot);
+            })
+            .await?; // a2e: request
+        let reply = self
+            .handle
+            .recv_with(|wire| parse_frame(wire).map(|(n, c)| (n, Bytes::copy_from_slice(c))).ok())
+            .await; // e2a: reply
+        match reply {
+            Some(Some(r)) => Ok(r),
+            _ => Err(SurfaceError::Face("service closed before replying".into())),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1144,6 +1278,38 @@ mod tests {
             }
             assert_eq!(complete, Some(true), "clean close reaches every subscriber");
         }
+    }
+
+    // ---- phase-2: duplex request/reply -----------------------------------
+
+    /// A request/reply surface over the bidirectional SHM region: the client sends
+    /// a named request on a2e, the service replies on e2a — same handshake, both
+    /// rings. Proves RPC composes on the substrate (no extra sockets).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn duplex_request_reply() {
+        let name = "/rpc/echo";
+        let service = ServiceSurface::open(name).await.unwrap();
+        let serve = tokio::spawn(async move {
+            let _ = service
+                .serve(|_req_name, body| async move {
+                    body.iter().map(|b| b.to_ascii_uppercase()).collect::<Vec<u8>>()
+                })
+                .await;
+        });
+
+        let client = ClientSurface::connect(name).await.unwrap();
+        for _ in 0..4 {
+            let (rname, reply) = timeout(
+                Duration::from_secs(5),
+                client.request("/rpc/echo/req", b"hello"),
+            )
+            .await
+            .expect("no stall")
+            .expect("reply");
+            assert_eq!(&reply[..], b"HELLO", "service uppercased the request");
+            assert_eq!(rname.to_string(), "/rpc/echo/req", "reply named after request");
+        }
+        serve.abort();
     }
 
     // ---- phase-2: capability auth ----------------------------------------
