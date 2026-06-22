@@ -596,4 +596,53 @@ mod tests {
             "fd leak across {CYCLES} cycles: warmup={baseline_after_warmup} after={after}"
         );
     }
+
+    // ---- #3 generality ---------------------------------------------------
+    // The API is shaped for "a stream of versioned frames". Probe a different
+    // surface shape to see what that bakes in. See g11-generality-2026-06-21.md
+    // for the full catalogue (request/reply, fan-in, last-value all need new API).
+
+    /// GENERALITY: does the stream model carry a *finite ordered object* (a bulk
+    /// file)? Yes — chunk into frames; use publisher-drop (→ None, proven in #5) as
+    /// the EOF marker; the consumer reads-until-None and reassembles, byte-identical.
+    /// FRICTION (the deliverable): the consumer never learns the content length or
+    /// chunk count up front (no preallocation, no progress %), and a clean end is
+    /// indistinguishable from a crash — "read until None" is the *entire* object
+    /// protocol, with no completion/integrity marker. The missing primitive is
+    /// object framing (length + last-segment/FinalBlockId), which RDR already has at
+    /// the app layer but the surface facade does not expose.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bulk_object_via_frames_drop_as_eof() {
+        const CHUNK: usize = 60_000;
+        let original: Vec<u8> = (0..1_000_000u32).map(|i| (i % 251) as u8).collect();
+
+        let name = "/bulk/file";
+        let mut pubr = NamedPublisher::open_with_max_frame(name, 64 * 1024)
+            .await
+            .unwrap();
+        let mut sub = NamedSubscriber::connect(name).await.unwrap();
+
+        let data = original.clone();
+        let prod = tokio::spawn(async move {
+            for chunk in data.chunks(CHUNK) {
+                pubr.publish(chunk).await.unwrap();
+            }
+            drop(pubr); // EOF = drop — the only completion signal the API offers.
+        });
+
+        // The consumer does NOT know the length or chunk count.
+        let reassembled = timeout(Duration::from_secs(10), async move {
+            let mut r = Vec::new();
+            while let Some(chunk) = sub.next_frame(|f| f.content.to_vec()).await {
+                r.extend_from_slice(&chunk);
+            }
+            r
+        })
+        .await
+        .expect("bulk transfer must terminate (drop ⇒ None)");
+        prod.await.unwrap();
+
+        assert_eq!(reassembled.len(), original.len(), "bulk length");
+        assert_eq!(reassembled, original, "bulk object reassembles byte-identical");
+    }
 }
