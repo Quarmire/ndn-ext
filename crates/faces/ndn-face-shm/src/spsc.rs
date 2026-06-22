@@ -892,6 +892,22 @@ impl SpscFace {
         Ok((face, [region_fd, a2e_w, e2a_r]))
     }
 
+    /// Anonymous face with the default ring geometry. See [`create_anon_with`].
+    ///
+    /// [`create_anon_with`]: Self::create_anon_with
+    pub fn create_anon(id: FaceId) -> Result<(Self, [OwnedFd; 3]), ShmError> {
+        Self::create_anon_with(id, DEFAULT_CAPACITY, DEFAULT_SLOT_SIZE)
+    }
+
+    /// Anonymous face whose slot size carries Data with up to `mtu` content
+    /// bytes (the capability-scoped counterpart of [`create_for_mtu`]).
+    ///
+    /// [`create_for_mtu`]: Self::create_for_mtu
+    pub fn create_anon_for_mtu(id: FaceId, mtu: usize) -> Result<(Self, [OwnedFd; 3]), ShmError> {
+        let ss = slot_size_for_mtu(mtu);
+        Self::create_anon_with(id, capacity_for_slot(ss), ss)
+    }
+
     fn try_pop_a2e(&self) -> Option<Bytes> {
         unsafe {
             ring_pop(

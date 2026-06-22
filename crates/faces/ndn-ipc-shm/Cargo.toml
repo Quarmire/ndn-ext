@@ -13,4 +13,5 @@ ndn-ipc        = { workspace = true }
 ndn-face-shm   = { workspace = true }
 async-trait    = { workspace = true }
 bytes          = { workspace = true, features = ["std"] }
+tokio          = { workspace = true, features = ["rt"] }
 tokio-util     = { workspace = true }

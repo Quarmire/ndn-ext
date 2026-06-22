@@ -42,13 +42,27 @@ impl DataPlaneFactory for ShmFactory {
         mtu: Option<usize>,
         cancel: CancellationToken,
     ) -> Result<Box<dyn DataPlane>, ForwarderError> {
+        // Option-A capability bootstrap: mint a one-time token, send it in the
+        // (signed) face_create command; the router gates the fd handoff on it.
+        let token = ndn_face_shm::mint_token()
+            .map_err(|e| ForwarderError::DataPlane(format!("shm mint token: {e}")))?;
         let resp = mgmt
-            .face_create_with_mtu(&format!("shm://{name}"), mtu.map(|m| m as u64))
+            .face_create_shm(
+                &format!("shm://{name}"),
+                mtu.map(|m| m as u64),
+                bytes::Bytes::copy_from_slice(&token),
+            )
             .await?;
         let face_id = resp.face_id.ok_or(ForwarderError::MalformedResponse)?;
 
+        // Receive the region + wakeup fds over the token-derived control socket
+        // (blocking SCM_RIGHTS exchange → a blocking task).
+        let path = ndn_face_shm::control_socket_path(&token);
         let mut handle =
-            SpscHandle::connect(name).map_err(|e| ForwarderError::DataPlane(e.to_string()))?;
+            tokio::task::spawn_blocking(move || ndn_face_shm::connect_fd_handoff(&path, &token))
+                .await
+                .map_err(|e| ForwarderError::DataPlane(format!("shm handoff join: {e}")))?
+                .map_err(|e| ForwarderError::DataPlane(e.to_string()))?;
         handle.set_cancel(cancel);
 
         Ok(Box::new(ShmDataPlane { handle, face_id }))
