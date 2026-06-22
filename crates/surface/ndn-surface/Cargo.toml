@@ -21,7 +21,7 @@ thiserror            = { workspace = true }
 tokio                = { workspace = true, features = ["rt", "net", "time", "macros", "sync"] }
 
 [dev-dependencies]
-tokio          = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tokio          = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync"] }
 ndn-engine     = { workspace = true }
 ndn-face-local = { workspace = true }
 ndn-security   = { workspace = true }
