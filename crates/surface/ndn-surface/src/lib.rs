@@ -231,6 +231,8 @@ pub struct NamedPublisher {
     serve: tokio::task::JoinHandle<()>,
     /// When serving remotely: the recent-frame window the forwarder loop reads.
     window: Option<Arc<Mutex<FrameWindow>>>,
+    /// Cached surface-name component TLVs for the zero-alloc `publish_fast` path.
+    prefix_components: Option<Bytes>,
 }
 
 impl NamedPublisher {
@@ -347,6 +349,7 @@ impl NamedPublisher {
             path,
             serve,
             window: None,
+            prefix_components: None,
         })
     }
 
@@ -370,6 +373,7 @@ impl NamedPublisher {
             path,
             serve,
             window: None,
+            prefix_components: None,
         })
     }
 
@@ -475,6 +479,7 @@ impl NamedPublisher {
             path,
             serve,
             window: None,
+            prefix_components: None,
         })
     }
 
@@ -508,6 +513,7 @@ impl NamedPublisher {
             path,
             serve,
             window: None,
+            prefix_components: None,
         })
     }
 
@@ -559,6 +565,55 @@ impl NamedPublisher {
         }
         self.seq += 1;
         Ok(frame_name)
+    }
+
+    /// Publish a frame **without a per-frame hash** — a `DATA { NAME ; CONTENT }`
+    /// frame, no SignatureInfo/SignatureValue. For local, same-trust-domain IPC
+    /// where integrity is the channel's (the SHM region is private to the
+    /// capability holders), this skips the SHA-256 that dominates small-frame
+    /// encoding cost — the streaming throughput then tracks the raw ring (faster
+    /// than a typed zero-copy bus while still carrying the NDN name). Consumers read
+    /// it with the same [`next_frame`](NamedSubscriber::next_frame) (which recovers
+    /// the full name `<surface>/v=<seq>` from the wire); the frame is not a verifiable
+    /// NDN Data, so use [`publish`](Self::publish) when it leaves the trust domain.
+    /// Returns the frame's version (no per-frame `Name` allocation on this path).
+    /// Streaming surfaces only.
+    pub async fn publish_fast(&mut self, content: &[u8]) -> Result<u64, SurfaceError> {
+        let seq = self.seq;
+        if self.prefix_components.is_none() {
+            self.prefix_components = Some(name_components_tlv(&self.name));
+        }
+        let comps = self.prefix_components.clone().unwrap(); // Bytes: refcount bump, no alloc
+        let mut vbuf = [0u8; 10];
+        let vlen = encode_version_component(seq, &mut vbuf);
+        let vcomp = &vbuf[..vlen];
+        let len = fast_inline_len(comps.len(), vcomp.len(), content.len());
+        match &mut self.sink {
+            Sink::Single(face) => {
+                face.send_with(len, |slot| encode_fast_inline(&comps, vcomp, content, slot))
+                    .await
+                    .map_err(|e| SurfaceError::Face(e.to_string()))?;
+            }
+            Sink::Fanout { faces, incoming } => {
+                while let Ok(face) = incoming.try_recv() {
+                    faces.push(face);
+                }
+                let mut wire = vec![0u8; len];
+                encode_fast_inline(&comps, vcomp, content, &mut wire);
+                for face in faces.iter() {
+                    face.send_with(wire.len(), |slot| slot.copy_from_slice(&wire))
+                        .await
+                        .map_err(|e| SurfaceError::Face(e.to_string()))?;
+                }
+            }
+            _ => {
+                return Err(SurfaceError::Face(
+                    "publish_fast is for streaming surfaces (open/open_fanout)".into(),
+                ));
+            }
+        }
+        self.seq += 1;
+        Ok(seq)
     }
 
     /// Also answer remote Interests for this surface's frames over a forwarder, so
@@ -1128,6 +1183,80 @@ fn read_large_frame(mut s: UnixStream) -> (Option<UnixStream>, LargeOutcome) {
         }
         _ => (None, LargeOutcome::Aborted),
     }
+}
+
+fn varu64_len(v: u64) -> usize {
+    if v < 253 {
+        1
+    } else if v < 0x1_0000 {
+        3
+    } else if v < 0x1_0000_0000 {
+        5
+    } else {
+        9
+    }
+}
+
+/// The component TLVs of a name (its [`Name::encode_to_tlv`] minus the outer NAME
+/// header) — cached once so a fast publisher needn't re-encode the prefix per frame.
+fn name_components_tlv(name: &Name) -> Bytes {
+    use ndn_tlv::read_varu64;
+    let full = name.encode_to_tlv();
+    let (_typ, n1) = read_varu64(&full).expect("name tlv type");
+    let (_len, n2) = read_varu64(&full[n1..]).expect("name tlv len");
+    full.slice((n1 + n2)..)
+}
+
+/// Encode a VERSION (0x36) name component for `seq` into `out` (≤ 10 bytes); returns
+/// bytes written. Value is an NDN nonNegativeInteger (1/2/4/8 bytes), no alloc.
+fn encode_version_component(seq: u64, out: &mut [u8]) -> usize {
+    out[0] = 0x36; // VERSION
+    let vlen = if seq <= 0xFF {
+        1
+    } else if seq <= 0xFFFF {
+        2
+    } else if seq <= 0xFFFF_FFFF {
+        4
+    } else {
+        8
+    };
+    out[1] = vlen as u8;
+    let be = seq.to_be_bytes();
+    out[2..2 + vlen].copy_from_slice(&be[8 - vlen..]);
+    2 + vlen
+}
+
+/// Encoded length of a fast frame built from cached name components + a version
+/// component + content: `DATA { NAME { comps ; version } ; CONTENT }`, no signature.
+fn fast_inline_len(comps_len: usize, vcomp_len: usize, content_len: usize) -> usize {
+    let name_value = comps_len + vcomp_len;
+    let content_tlv = 1 + varu64_len(content_len as u64) + content_len;
+    let inner = 1 + varu64_len(name_value as u64) + name_value + content_tlv;
+    1 + varu64_len(inner as u64) + inner
+}
+
+/// Encode a fast frame in place (sized by [`fast_inline_len`]) — no per-frame hash,
+/// no name re-encode. Parses identically to a signed frame on the consumer side.
+fn encode_fast_inline(comps: &[u8], vcomp: &[u8], content: &[u8], out: &mut [u8]) {
+    use ndn_tlv::write_varu64;
+    let name_value = comps.len() + vcomp.len();
+    let content_tlv = 1 + varu64_len(content.len() as u64) + content.len();
+    let inner = 1 + varu64_len(name_value as u64) + name_value + content_tlv;
+    let mut pos = 0;
+    out[pos] = tlv_type::DATA as u8;
+    pos += 1;
+    pos += write_varu64(&mut out[pos..], inner as u64);
+    out[pos] = tlv_type::NAME as u8;
+    pos += 1;
+    pos += write_varu64(&mut out[pos..], name_value as u64);
+    out[pos..pos + comps.len()].copy_from_slice(comps);
+    pos += comps.len();
+    out[pos..pos + vcomp.len()].copy_from_slice(vcomp);
+    pos += vcomp.len();
+    out[pos] = tlv_type::CONTENT as u8;
+    pos += 1;
+    pos += write_varu64(&mut out[pos..], content.len() as u64);
+    out[pos..pos + content.len()].copy_from_slice(content);
 }
 
 /// Borrowed parse of a Data wire: extract the Name (small, owned) and the Content
@@ -1793,6 +1922,36 @@ mod tests {
         let mut b = StateSubscriber::connect("/state/multi").await.unwrap();
         let vb = timeout(Duration::from_secs(2), b.next()).await.unwrap().unwrap();
         assert_eq!(&vb[..], b"x", "late subscriber b also sees current value");
+    }
+
+    // ---- fast (no-hash) frames -------------------------------------------
+
+    /// A fast frame (no per-frame SHA-256) still round-trips by name + content
+    /// through the same next_frame path; it just skips the signature.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fast_frame_round_trip() {
+        let name = "/fast/surface";
+        let mut pubr = NamedPublisher::open(name).await.unwrap();
+        let mut sub = NamedSubscriber::connect(name).await.unwrap();
+        for i in 0..5u64 {
+            let frame = vec![(i as u8).wrapping_add(7); 1500];
+            let version = pubr.publish_fast(&frame).await.unwrap();
+            assert_eq!(version, i, "publish_fast returns the version");
+            let (rxname, body) = sub
+                .next_frame(|f| (f.name.clone(), f.content.to_vec()))
+                .await
+                .expect("frame");
+            // Full name recovered from the wire even without a signature.
+            assert_eq!(rxname.to_string(), format!("/fast/surface/v={i}"));
+            assert_eq!(body, frame, "fast frame {i} content");
+        }
+    }
+
+    /// publish_fast is rejected on non-streaming surfaces.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fast_frame_rejected_on_large_surface() {
+        let mut large = NamedPublisher::open_large("/fast/nope").await.unwrap();
+        assert!(large.publish_fast(b"x").await.is_err());
     }
 
     // ---- phase-2: duplex request/reply -----------------------------------

@@ -110,6 +110,30 @@ async fn bench_surface_stream(name: &str, frame: usize, n: usize) -> Duration {
     elapsed
 }
 
+/// Surface, fast streaming path: frames carry name + content but no per-frame hash
+/// (publish_fast) — for local same-trust-domain IPC. Same ring, no SHA-256.
+async fn bench_surface_fast(name: &str, frame: usize, n: usize) -> Duration {
+    let slot = (frame + 256).max(2048);
+    let mut pubr = NamedPublisher::open_with_max_frame(name, slot).await.unwrap();
+    let mut sub = NamedSubscriber::connect(name).await.unwrap();
+    let payload = vec![0xABu8; frame];
+    let start = Instant::now();
+    let prod = tokio::spawn(async move {
+        for _ in 0..n {
+            pubr.publish_fast(&payload).await.unwrap();
+        }
+        pubr.close().await.unwrap();
+    });
+    let mut got = 0usize;
+    while sub.next_frame(|f| f.content.len()).await.is_some() {
+        got += 1;
+    }
+    let elapsed = start.elapsed();
+    prod.await.unwrap();
+    assert_eq!(got, n);
+    elapsed
+}
+
 /// Surface, large path: each frame is an anonymous-shm SharedBuffer whose fd is
 /// passed over the side channel; the consumer maps and reads it in place. The
 /// payload never traverses the kernel socket buffer.
@@ -134,6 +158,58 @@ async fn bench_surface_large(name: &str, frame: usize, n: usize) -> Duration {
     elapsed
 }
 
+/// Attribution probe: the raw SHM ring with NO NDN Data encode — push `frame`
+/// bytes straight into the slot, read length back. Isolates the ring + async +
+/// two-task cost from the per-frame Data encoding (name + SHA-256).
+async fn bench_surface_raw(frame: usize, n: usize) -> Duration {
+    use ndn_face_shm::{
+        ShmFace, connect_fd_handoff, control_socket_path, mint_token, serve_fd_handoff,
+    };
+    use ndn_transport::FaceId;
+    let token = mint_token().unwrap();
+    let (face, fds) = ShmFace::create_anon_for_mtu(FaceId(0), frame + 64).unwrap();
+    let path = control_socket_path(&token);
+    let _ = std::fs::remove_file(&path);
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    let t = token;
+    let serve = tokio::spawn(async move {
+        let _ = serve_fd_handoff(listener, t, fds).await;
+    });
+    let p = path.clone();
+    let handle = tokio::task::spawn_blocking(move || {
+        loop {
+            if let Ok(h) = connect_fd_handoff(&p, &token) {
+                break h;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    })
+    .await
+    .unwrap();
+    let _ = serve.await;
+
+    let payload = vec![0xABu8; frame];
+    let start = Instant::now();
+    let prod = tokio::spawn(async move {
+        for _ in 0..n {
+            face.send_with(frame, |s| s.copy_from_slice(&payload)).await.unwrap();
+        }
+        face // keep alive
+    });
+    let mut got = 0usize;
+    while got < n {
+        if handle.recv_with(|s| s.len()).await.is_some() {
+            got += 1;
+        } else {
+            break;
+        }
+    }
+    let elapsed = start.elapsed();
+    let _ = prod.await.unwrap();
+    let _ = std::fs::remove_file(&path);
+    elapsed
+}
+
 fn mbps(frame: usize, n: usize, d: Duration) -> f64 {
     (frame as f64 * n as f64) / d.as_secs_f64() / 1e6
 }
@@ -151,18 +227,23 @@ async fn main() {
     let _ =
         tokio::task::spawn_blocking(|| bench_iox("bench/warm/iox".into(), 4096, 200)).await;
 
+    let _ = bench_surface_fast("/bench/warmfast", 4096, 200).await;
+    let _ = bench_surface_raw(4096, 200).await;
+
     println!("\n  throughput, MB/s (higher is better)\n");
     println!(
-        "  {:>9} | {:>7} | {:>10} | {:>10} | {:>10} | {:>10}",
-        "frame", "N", "socket", "surf", "surf-lg", "iceoryx2"
+        "  {:>9} | {:>7} | {:>9} | {:>9} | {:>9} | {:>9} | {:>9} | {:>9}",
+        "frame", "N", "socket", "surf", "surf-fast", "surf-raw", "surf-lg", "iceoryx2"
     );
-    println!("  {}", "-".repeat(72));
+    println!("  {}", "-".repeat(96));
 
     for (i, &frame) in sizes.iter().enumerate() {
         let n = (target_bytes / frame).clamp(50, 200_000);
 
         let d_sock = bench_socket(frame, n).await;
         let d_surf = bench_surface_stream(&format!("/bench/s/{i}"), frame, n).await;
+        let d_fast = bench_surface_fast(&format!("/bench/f/{i}"), frame, n).await;
+        let d_raw = bench_surface_raw(frame, n).await;
         let d_large = if frame >= 65_536 {
             Some(bench_surface_large(&format!("/bench/l/{i}"), frame, n).await)
         } else {
@@ -183,20 +264,23 @@ async fn main() {
             None => "-".to_string(),
         };
         println!(
-            "  {:>9} | {:>7} | {:>10.0} | {:>10.0} | {:>10} | {:>10.0}",
+            "  {:>9} | {:>7} | {:>9.0} | {:>9.0} | {:>9.0} | {:>9.0} | {:>9} | {:>9.0}",
             fr,
             n,
             mbps(frame, n, d_sock),
             mbps(frame, n, d_surf),
+            mbps(frame, n, d_fast),
+            mbps(frame, n, d_raw),
             large_cell,
             mbps(frame, n, d_iox),
         );
     }
     println!(
         "\n  socket   = Unix stream + 4B length prefix (raw bytes, no names, copy both ends)\n  \
-         surf     = NamedPublisher/NamedSubscriber streaming (named NDN Data, zero-copy read)\n  \
+         surf     = streaming, signed NDN Data (name + SHA-256 per frame, zero-copy read)\n  \
+         surf-fast= streaming, name+content frame, NO per-frame hash (local trust domain)\n  \
+         surf-raw = the bare ring, no Data encode at all (attribution upper bound)\n  \
          surf-lg  = open_large/publish_large (SharedBuffer fd, payload skips the kernel)\n  \
-         iceoryx2 = typed zero-copy pub/sub over a preallocated SHM pool (no names, paced lossless)\n  \
-         (per-frame latency for 1 KiB ≈ us/frame = 1000/MB/s × KiB; see the bake-off note)\n"
+         iceoryx2 = typed zero-copy pub/sub over a preallocated SHM pool (no names, paced lossless)\n"
     );
 }
