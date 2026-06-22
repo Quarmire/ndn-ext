@@ -347,14 +347,7 @@ impl NamedPublisher {
         let path = control_socket_path(&rendezvous_token(&name));
         let listener = bind_exclusive(&path)?;
         let serve = tokio::spawn(async move {
-            let _ = serve_sealed_handoff(
-                listener,
-                capability,
-                [data_fd, ctrl_fd, wake_fd],
-                capacity,
-                slot_size,
-            )
-            .await;
+            let _ = serve_sealed_handoff(listener, capability, [data_fd, ctrl_fd, wake_fd]).await;
         });
         Ok(Self {
             sink: Sink::Sealed(writer),
@@ -907,7 +900,7 @@ impl NamedSubscriber {
     async fn connect_sealed_inner(surface: Name, capability: ShmToken) -> Result<Self, SurfaceError> {
         let path = control_socket_path(&rendezvous_token(&surface));
         let mut tried = 0u32;
-        let (data, ctrl, wake, cap, slot) = loop {
+        let (data, ctrl, wake) = loop {
             let p = path.clone();
             let r = tokio::task::spawn_blocking(move || connect_sealed_handoff(&p, &capability))
                 .await
@@ -922,7 +915,8 @@ impl NamedSubscriber {
             }
         };
         // Build the reader here (async context) — it needs a runtime for the wakeup.
-        let reader = SealedReader::from_fds(data, ctrl, wake, cap, slot)?;
+        // Geometry is read from the sealed header inside from_fds (bounded).
+        let reader = SealedReader::from_fds(data, ctrl, wake)?;
         Ok(Self {
             source: Source::Sealed(reader),
             surface,

@@ -965,16 +965,15 @@ pub fn connect_fd_handoff(path: &std::path::Path, token: &ShmToken) -> Result<Sp
 }
 
 /// **Sealed handoff (producer side):** hand one authorized consumer the three
-/// sealed-ring fds `[data_ro, ctrl_rw, wake_r]` plus `capacity`/`slot_size` (8
-/// bytes) so it can size its mappings. Like [`serve_fd_handoff`] but for the
-/// sealed ring. One consumer (1:1); unauthorized connectors are rejected.
+/// sealed-ring fds `[data_ro, ctrl_rw, wake_r]`. The geometry is read from the data
+/// region header by the consumer (authoritative), so no metadata rides the wire.
+/// Like [`serve_fd_handoff`] but for the sealed ring. One consumer (1:1);
+/// unauthorized connectors are rejected.
 #[cfg(unix)]
 pub async fn serve_sealed_handoff(
     listener: tokio::net::UnixListener,
     token: ShmToken,
     fds: [OwnedFd; 3],
-    capacity: u32,
-    slot_size: u32,
 ) -> std::io::Result<()> {
     let mut rejects = 0u32;
     loop {
@@ -1007,32 +1006,23 @@ pub async fn serve_sealed_handoff(
             continue;
         };
         let raw = [fds[0].as_raw_fd(), fds[1].as_raw_fd(), fds[2].as_raw_fd()];
-        let mut meta = [0u8; 8];
-        meta[0..4].copy_from_slice(&capacity.to_le_bytes());
-        meta[4..8].copy_from_slice(&slot_size.to_le_bytes());
         return tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-            use std::io::Write;
-            send_fds(s.as_raw_fd(), &raw)?;
-            let mut s = s;
-            s.write_all(&meta)?;
-            Ok(())
+            send_fds(s.as_raw_fd(), &raw)
         })
         .await
         .map_err(|e| std::io::Error::other(format!("shm control send task: {e}")))?;
     }
 }
 
-/// **Sealed handoff (consumer side):** connect, present `token`, receive the three
-/// sealed-ring fds + `(capacity, slot_size)`, and build the [`SealedReader`].
-/// Blocking — call via `spawn_blocking`, then construct the reader in async context
-/// (it needs a Tokio runtime for the wakeup `AsyncFd`). Returns the raw parts so the
-/// caller builds the reader where a runtime is active.
+/// **Sealed handoff (consumer side):** connect, mutually authenticate, and receive
+/// the three sealed-ring fds `[data_ro, ctrl_rw, wake_r]`. The geometry is read from
+/// the data-region header by [`SealedReader::from_fds`], not the wire. Blocking —
+/// call via `spawn_blocking`, then build the reader in async context.
 #[cfg(unix)]
 pub fn connect_sealed_handoff(
     path: &std::path::Path,
     token: &ShmToken,
-) -> Result<(OwnedFd, OwnedFd, OwnedFd, u32, u32), ShmError> {
-    use std::io::Read;
+) -> Result<(OwnedFd, OwnedFd, OwnedFd), ShmError> {
     let mut s = std::os::unix::net::UnixStream::connect(path).map_err(ShmError::Io)?;
     if !mutual_auth_client(&mut s, token).map_err(ShmError::Io)? {
         return Err(ShmError::Io(std::io::Error::other(
@@ -1049,11 +1039,7 @@ pub fn connect_sealed_handoff(
     let data = it.next().unwrap();
     let ctrl = it.next().unwrap();
     let wake = it.next().unwrap();
-    let mut meta = [0u8; 8];
-    s.read_exact(&mut meta).map_err(ShmError::Io)?;
-    let capacity = u32::from_le_bytes([meta[0], meta[1], meta[2], meta[3]]);
-    let slot_size = u32::from_le_bytes([meta[4], meta[5], meta[6], meta[7]]);
-    Ok((data, ctrl, wake, capacity, slot_size))
+    Ok((data, ctrl, wake))
 }
 
 fn set_nonblock_cloexec(fd: RawFd) -> Result<(), ShmError> {
@@ -2248,22 +2234,49 @@ pub struct SealedReader {
 
 impl SealedReader {
     /// Map the fds handed by [`SealedWriter::create`]: `data_fd` read-only,
-    /// `ctrl_fd` read-write, `wake_fd` the wakeup pipe read end (kept). Must be
+    /// `ctrl_fd` read-write, `wake_fd` the wakeup pipe read end (kept). The ring
+    /// geometry is read from the data-region **header** (producer-written, in the
+    /// read-only region — the authoritative source) and **bounded**, so bogus
+    /// geometry can never drive an over-map (SIGBUS) or a gigabyte `mmap`. Must be
     /// called within a Tokio runtime (for the wakeup `AsyncFd`).
     pub fn from_fds(
         data_fd: OwnedFd,
         ctrl_fd: OwnedFd,
         wake_fd: OwnedFd,
-        capacity: u32,
-        slot_size: u32,
     ) -> Result<Self, ShmError> {
+        // Read magic + geometry from the header page first (small, always in bounds).
+        let (capacity, slot_size) = unsafe {
+            let p = libc::mmap(
+                std::ptr::null_mut(),
+                SEALED_DATA_HEADER,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                data_fd.as_raw_fd(),
+                0,
+            );
+            if p == libc::MAP_FAILED {
+                return Err(ShmError::Io(std::io::Error::last_os_error()));
+            }
+            let base = p as *const u8;
+            let magic = (base as *const u64).read_unaligned();
+            let cap = (base.add(8) as *const u32).read_unaligned();
+            let slen = (base.add(12) as *const u32).read_unaligned();
+            libc::munmap(p, SEALED_DATA_HEADER);
+            if magic != MAGIC {
+                return Err(ShmError::InvalidMagic);
+            }
+            (cap, slen)
+        };
+        // Sanity-clamp the geometry before mapping the full region.
+        if capacity == 0
+            || slot_size == 0
+            || sealed_data_size(capacity, slot_size) > 256 * 1024 * 1024
+        {
+            return Err(ShmError::InvalidMagic);
+        }
         let data = ShmRegion::from_fd_ro(data_fd.as_raw_fd(), sealed_data_size(capacity, slot_size))?;
         let ctrl = ShmRegion::from_fd(ctrl_fd.as_raw_fd(), SEALED_CTRL_SIZE)?;
         // data_fd / ctrl_fd may now drop — the mappings persist.
-        let magic = unsafe { (data.as_ptr() as *const u64).read_unaligned() };
-        if magic != MAGIC {
-            return Err(ShmError::InvalidMagic);
-        }
         set_nonblock_cloexec(wake_fd.as_raw_fd())?;
         let wake_rx = tokio::io::unix::AsyncFd::new(wake_fd).map_err(ShmError::Io)?;
         Ok(Self {
@@ -2449,7 +2462,7 @@ mod tests {
         let (writer, data_fd, ctrl_fd, wake_fd) = SealedWriter::create(8, 256).unwrap();
         // Keep a probe handle on the data fd to test the write-refusal after handoff.
         let data_probe = data_fd.try_clone().unwrap();
-        let reader = SealedReader::from_fds(data_fd, ctrl_fd, wake_fd, 8, 256).unwrap();
+        let reader = SealedReader::from_fds(data_fd, ctrl_fd, wake_fd).unwrap();
 
         // Producer writes 5 frames; consumer reads them in order.
         for i in 0..5u8 {
@@ -2489,7 +2502,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sealed_ring_full_refuses_send() {
         let (writer, data_fd, ctrl_fd, wake_fd) = SealedWriter::create(4, 64).unwrap();
-        let reader = SealedReader::from_fds(data_fd, ctrl_fd, wake_fd, 4, 64).unwrap();
+        let reader = SealedReader::from_fds(data_fd, ctrl_fd, wake_fd).unwrap();
         for i in 0..4u8 {
             assert!(writer.try_send(&[i; 8]), "fill slot {i}");
         }
@@ -2504,7 +2517,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sealed_ring_async_wakeup_and_eos() {
         let (writer, data_fd, ctrl_fd, wake_fd) = SealedWriter::create(8, 256).unwrap();
-        let reader = SealedReader::from_fds(data_fd, ctrl_fd, wake_fd, 8, 256).unwrap();
+        let reader = SealedReader::from_fds(data_fd, ctrl_fd, wake_fd).unwrap();
 
         let producer = tokio::spawn(async move {
             for i in 0..4u8 {
