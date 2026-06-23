@@ -19,6 +19,10 @@ engine = ["dep:ndn-app", "dep:tokio"]
 ndn-packet       = { workspace = true, features = ["std"] }
 ndn-store        = { workspace = true }
 ndn-service-core = { workspace = true }
+# Signed-request auth: the canonical ndn-security signed-Interest contract
+# (sign_with_sync / validate_interest / KeyLocator-as-requester) — the same shape
+# the framework command path and NFD-style mgmt commands use.
+ndn-security     = { workspace = true }
 bytes            = { workspace = true, features = ["std"] }
 async-trait      = { workspace = true }
 # Face-backed carrier (the `engine` feature): Consumer/Producer over a forwarder.

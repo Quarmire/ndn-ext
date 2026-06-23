@@ -54,6 +54,9 @@ pub enum RpcError {
     /// The request (name components / `ApplicationParameters`) could not be
     /// decoded into the handler's expected arguments.
     BadRequest(String),
+    /// The request signature was missing or did not verify against the carrier's
+    /// validator (a secure carrier fails closed on unauthenticated requests).
+    Unauthorized(String),
 }
 
 impl std::fmt::Display for RpcError {
@@ -62,6 +65,7 @@ impl std::fmt::Display for RpcError {
             RpcError::NotFound => write!(f, "no RPC handler for this name"),
             RpcError::HandlerFailed(e) => write!(f, "RPC handler failed: {e}"),
             RpcError::BadRequest(e) => write!(f, "bad RPC request: {e}"),
+            RpcError::Unauthorized(e) => write!(f, "unauthorized RPC request: {e}"),
         }
     }
 }
