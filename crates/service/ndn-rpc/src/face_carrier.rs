@@ -18,6 +18,7 @@ use bytes::Bytes;
 use ndn_app::{Consumer, Producer};
 use ndn_packet::encode::{DataBuilder, InterestBuilder};
 use ndn_packet::Name;
+use ndn_security::{InterestValidationOutcome, SignWith, Signer, Validator};
 use ndn_service_core::{
     Carrier, Dispatch, HintedCarrier, Invocation, OpId, Response, ServiceError, ServiceId,
 };
@@ -27,10 +28,19 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// A face-backed Tier-0 carrier. A client holds a [`Consumer`] (for `invoke`); a
 /// provider holds a [`Producer`] (for `serve`); a node doing both holds both.
+///
+/// Like [`RpcCarrier`](crate::RpcCarrier), it can authenticate requests over the
+/// canonical signed-Interest contract: [`with_signer`](Self::with_signer) signs each
+/// outbound request; [`with_validator`](Self::with_validator) verifies inbound
+/// requests and sets `Invocation::requester` to the verified `KeyLocator` identity. A
+/// validator-equipped server **drops** (does not answer) an unsigned/invalid request,
+/// so the client fails closed on timeout — the wire equivalent of `Unauthorized`.
 pub struct FaceRpcCarrier {
     consumer: Option<Mutex<Consumer>>,
     producer: Mutex<Option<Producer>>,
     fetch_timeout: Duration,
+    signer: Option<Arc<dyn Signer>>,
+    validator: Option<Arc<Validator>>,
 }
 
 impl FaceRpcCarrier {
@@ -40,6 +50,8 @@ impl FaceRpcCarrier {
             consumer: Some(Mutex::new(consumer)),
             producer: Mutex::new(None),
             fetch_timeout: DEFAULT_TIMEOUT,
+            signer: None,
+            validator: None,
         }
     }
 
@@ -49,6 +61,8 @@ impl FaceRpcCarrier {
             consumer: None,
             producer: Mutex::new(Some(producer)),
             fetch_timeout: DEFAULT_TIMEOUT,
+            signer: None,
+            validator: None,
         }
     }
 
@@ -58,12 +72,28 @@ impl FaceRpcCarrier {
             consumer: Some(Mutex::new(consumer)),
             producer: Mutex::new(Some(producer)),
             fetch_timeout: DEFAULT_TIMEOUT,
+            signer: None,
+            validator: None,
         }
     }
 
     /// Set the per-invocation fetch timeout.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.fetch_timeout = timeout;
+        self
+    }
+
+    /// Sign each outbound request with `signer` (the requester identity the serve
+    /// side authenticates). Mirrors [`RpcCarrier::with_signer`](crate::RpcCarrier::with_signer).
+    pub fn with_signer(mut self, signer: Arc<dyn Signer>) -> Self {
+        self.signer = Some(signer);
+        self
+    }
+
+    /// Verify each inbound request with `validator` and authenticate its requester;
+    /// a carrier with a validator drops unsigned/invalid requests (fail closed).
+    pub fn with_validator(mut self, validator: Arc<Validator>) -> Self {
+        self.validator = Some(validator);
         self
     }
 }
@@ -76,6 +106,8 @@ async fn handle_request(
     responder: ndn_app::Responder,
     dispatch: Arc<dyn Dispatch>,
     service_len: usize,
+    validator: Option<Arc<Validator>>,
+    signer: Option<Arc<dyn Signer>>,
 ) {
     let comps = interest.name.components();
     let Some(op) = comps
@@ -84,16 +116,39 @@ async fn handle_request(
     else {
         return; // malformed — drop (the client fails closed on timeout)
     };
+    // Authenticate the request when a validator is configured: it must verify, and
+    // its KeyLocator name is the requester. An unsigned/invalid request is dropped
+    // (no response → the client times out) — fail closed over the wire.
+    let requester = match &validator {
+        None => None,
+        Some(v) => match v.validate_interest(&interest).await {
+            InterestValidationOutcome::Valid => {
+                match interest.sig_info().and_then(|si| si.key_locator_name()) {
+                    Some(n) => Some((*n).clone()),
+                    None => return, // signed but no KeyLocator — refuse
+                }
+            }
+            InterestValidationOutcome::Invalid(_) | InterestValidationOutcome::Pending => return,
+        },
+    };
     let request = interest.app_parameters().cloned().unwrap_or_default();
     let invocation = Invocation {
         op,
         request,
-        requester: None, // a signed-Interest variant would fill this from the signer
+        requester,
     };
     let Ok(reply) = dispatch.dispatch(invocation).await else {
         return; // dispatch error — no response (fail closed)
     };
-    let wire = DataBuilder::new((*interest.name).clone(), reply.as_ref()).sign_digest_sha256();
+    // Sign the response with this node's identity when configured; else a digest.
+    let name = (*interest.name).clone();
+    let wire = match &signer {
+        Some(s) => match DataBuilder::new(name, reply.as_ref()).sign_with_sync(s.as_ref()) {
+            Ok(w) => w,
+            Err(_) => return, // can't sign the response — drop
+        },
+        None => DataBuilder::new(name, reply.as_ref()).sign_digest_sha256(),
+    };
     let _ = responder.respond_bytes(wire).await;
 }
 
@@ -116,9 +171,18 @@ impl Carrier for FaceRpcCarrier {
             .take()
             .ok_or_else(|| ServiceError::Transport("carrier has no producer to serve with".into()))?;
         let service_len = svc.name().len();
+        let validator = self.validator.clone();
+        let signer = self.signer.clone();
         producer
             .serve(move |interest, responder| {
-                handle_request(interest, responder, Arc::clone(&dispatch), service_len)
+                handle_request(
+                    interest,
+                    responder,
+                    Arc::clone(&dispatch),
+                    service_len,
+                    validator.clone(),
+                    signer.clone(),
+                )
             })
             .await
             .map_err(|e| ServiceError::Transport(e.to_string()))
@@ -143,7 +207,13 @@ impl HintedCarrier for FaceRpcCarrier {
         if let Some(h) = hint {
             builder = builder.forwarding_hint(vec![h.clone()]);
         }
-        let wire = builder.build();
+        // Sign the request when a signer is configured; else send it unsigned.
+        let wire = match &self.signer {
+            Some(s) => builder
+                .sign_with_sync(s.as_ref())
+                .map_err(|e| ServiceError::Unauthorized(format!("request sign failed: {e}")))?,
+            None => builder.build(),
+        };
         let data = consumer
             .lock()
             .await
