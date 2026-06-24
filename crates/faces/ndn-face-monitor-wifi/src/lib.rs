@@ -70,7 +70,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use ndn_radio_cognition::TxParams;
-use ndn_coding::{LinkFecRx, LinkFecTx};
+use ndn_coding::LinkFecFeature;
 use ndn_signals_core::{LinkSignals, SignalStore};
 use std::collections::VecDeque;
 use ndn_transport::{
@@ -112,6 +112,15 @@ pub use rtl8821c::{RTL8821CU_PIDS, Rtl8821cuBackend};
 mod mt7612;
 #[cfg(feature = "libusb-backend")]
 pub use mt7612::{MT7612U_PIDS, Mt7612uBackend};
+
+// Userspace RTL8812AU backend (the original 11ac monitor-injection chip). A
+// fresh port — different HAL generation from the 8822E/8812EU `libusb_rtl88xx`
+// backend; shares only the Realtek USB register-I/O protocol. Bring-up in
+// progress (open + chip-id today).
+#[cfg(feature = "libusb-backend")]
+mod rtl8812au;
+#[cfg(feature = "libusb-backend")]
+pub use rtl8812au::{ChipInfo, IqkResult, RTL8812AU_PIDS, Rtl8812auBackend};
 
 mod control;
 pub use control::RadioControl;
@@ -175,15 +184,17 @@ impl TxBatcher {
     }
 }
 
-/// Link-layer FEC over the radio (see [`MonitorWifiFace::with_link_fec`]). The
-/// TX side accumulates up to K outbound frames (or a latency window) and emits
-/// K+R coded frames, each as its **own** MPDU (interleaved — never one
-/// generation per A-MSDU); the RX side de-codes, recovering up to R losses per
-/// generation without ARQ. Reuses `ndn_coding`'s systematic K-of-N codec.
+/// Link-layer FEC over the radio (see [`MonitorWifiFace::with_link_fec`]). The codec +
+/// generation batching live in `ndn_coding`'s reusable [`LinkFecFeature`] (G7); this face
+/// only adds the radio specifics — pinning each generation's MCS to its first frame and
+/// injecting each coded frame as its **own** MPDU (interleaved — never one generation per
+/// A-MSDU). The RX side feeds captured frames through the feature, recovering up to R
+/// losses per generation without ARQ.
 struct FaceFec {
-    /// Outbound wire frames + the MCS for the generation.
+    /// Outbound wire frames + the MCS, handed to the batching task.
     tx: tokio::sync::mpsc::UnboundedSender<(Bytes, McsDescriptor)>,
-    rx: std::sync::Mutex<LinkFecRx>,
+    /// The shared FEC feature (decoder side, driven by `recv_bytes`).
+    feature: Arc<LinkFecFeature>,
     /// Payloads recovered/delivered by the decoder, awaiting `recv_bytes`.
     pending: std::sync::Mutex<VecDeque<(Bytes, Option<FaceAddr>)>>,
 }
@@ -197,39 +208,68 @@ impl FaceFec {
         redundancy: u16,
         window: Duration,
     ) -> Self {
+        let feature = Arc::new(LinkFecFeature::new(k, redundancy, window));
+        feature.set_enabled(true);
         let (tx, mut rx_ch) = tokio::sync::mpsc::unbounded_channel::<(Bytes, McsDescriptor)>();
+        let tx_feature = Arc::clone(&feature);
         tokio::spawn(async move {
-            let mut enc = LinkFecTx::new(redundancy);
-            while let Some((first, mcs)) = rx_ch.recv().await {
-                // The whole generation uses the first frame's MCS (parity must match).
-                let mut accum = vec![first];
-                let deadline = tokio::time::Instant::now() + window;
-                while accum.len() < k {
-                    match tokio::time::timeout_at(deadline, rx_ch.recv()).await {
-                        Ok(Some((w, _))) => accum.push(w),
-                        _ => break, // window elapsed (tail flush) or sender dropped
-                    }
-                }
-                if let Ok(coded) = enc.encode(accum) {
-                    // Each coded frame as its own MPDU → interleaved on air.
-                    for f in coded {
-                        let _ = backend
-                            .inject(InjectFrame {
-                                payload: f,
-                                mcs,
-                                dst,
-                                src,
-                            })
-                            .await;
-                    }
-                }
+            // The whole generation rides the MCS of the frame that opened it (parity must
+            // match), and the window is anchored at that frame, not reset per arrival.
+            let mut gen_mcs: Option<McsDescriptor> = None;
+            let mut gen_deadline: Option<tokio::time::Instant> = None;
+            loop {
+                let coded = match gen_deadline {
+                    None => match rx_ch.recv().await {
+                        Some((w, mcs)) => {
+                            gen_mcs = Some(mcs);
+                            gen_deadline = Some(tokio::time::Instant::now() + window);
+                            tx_feature.on_send(w)
+                        }
+                        None => break, // sender dropped
+                    },
+                    Some(deadline) => match tokio::time::timeout_at(deadline, rx_ch.recv()).await {
+                        Ok(Some((w, _))) => tx_feature.on_send(w),
+                        Ok(None) => {
+                            // Sender dropped mid-generation — flush the remainder and exit.
+                            let last = tx_feature.flush();
+                            inject_coded(&backend, &last, gen_mcs, dst, src).await;
+                            break;
+                        }
+                        Err(_) => tx_feature.flush(), // window elapsed → tail flush
+                    },
+                };
+                inject_coded(&backend, &coded, gen_mcs, dst, src).await;
+                // A completed/flushed generation empties the buffer → start fresh.
+                gen_deadline = (tx_feature.pending_len() > 0)
+                    .then(|| gen_deadline.unwrap_or_else(|| tokio::time::Instant::now() + window));
             }
         });
         FaceFec {
             tx,
-            rx: std::sync::Mutex::new(LinkFecRx::new()),
+            feature,
             pending: std::sync::Mutex::new(VecDeque::new()),
         }
+    }
+}
+
+/// Inject each coded frame of a generation as its own MPDU, on the generation's MCS.
+async fn inject_coded(
+    backend: &Arc<dyn FrameIo>,
+    coded: &[Bytes],
+    mcs: Option<McsDescriptor>,
+    dst: [u8; 6],
+    src: [u8; 6],
+) {
+    let Some(mcs) = mcs else { return };
+    for f in coded {
+        let _ = backend
+            .inject(InjectFrame {
+                payload: f.clone(),
+                mcs,
+                dst,
+                src,
+            })
+            .await;
     }
 }
 
@@ -563,15 +603,9 @@ impl Transport for MonitorWifiFace {
                 }
                 let f = self.recv_inner().await?;
                 let addr = f.addr.map(FaceAddr::Ether);
-                if !LinkFecRx::is_fec(&f.payload) {
-                    return Ok((f.payload, addr)); // not a FEC frame — deliver as-is
-                }
-                let delivered = fec
-                    .rx
-                    .lock()
-                    .unwrap()
-                    .absorb(f.payload)
-                    .unwrap_or_default();
+                // The feature delivers a plain frame as-is, a source frame immediately,
+                // and recovered sources when parity completes a generation (0, 1, or many).
+                let delivered = fec.feature.on_recv(f.payload);
                 if delivered.is_empty() {
                     continue; // parity that didn't complete a generation yet
                 }
