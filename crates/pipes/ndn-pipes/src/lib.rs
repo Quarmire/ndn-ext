@@ -40,7 +40,7 @@ pub use mgmt::{PipesModule, render_list};
 pub use pipe::{Pipe, PipeId, PipeParams};
 pub use producer::PipeProducer;
 pub use registry::{PipeInfo, PipeRegistry};
-pub use relay::{PipeRelay, RelayPipeStore};
+pub use relay::{PipeRelay, RelayPipeStore, run_relay_monitor};
 
 /// Errors from pipe setup and transfer.
 #[derive(Debug, thiserror::Error)]

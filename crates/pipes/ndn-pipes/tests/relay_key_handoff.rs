@@ -74,7 +74,9 @@ async fn pipe_exchange_hands_the_key_to_on_path_nodes() {
     // teardown of its own state later (slices 2–3). Its producer face (4) is unused
     // here; learn drives over the `fetcher` consumer.
     let relay = PipeRelay::new(Producer::from_handle(r_h, Name::from("/COMMON")));
-    let learned = relay.learn_pipe_key(&mut fetcher, &pipe_id, 1, TIMEOUT).await;
+    let learned = relay
+        .learn_pipe_key(&mut fetcher, &"/sensors/temp".parse::<Name>().unwrap(), &pipe_id, 0, 1, TIMEOUT)
+        .await;
     assert!(learned, "relay learns the pipe key via the PIPE exchange");
     let store = relay.store();
     assert_eq!(

@@ -21,9 +21,11 @@ use ndn_app::{AppError, Consumer, Producer};
 use ndn_packet::Name;
 use ndn_packet::encode::DataBuilder;
 
+use ndn_packet::encode::InterestBuilder;
+
 use crate::crypto::seal;
 use crate::keyexchange::fetch_pipe_key;
-use crate::message::{GHL, MessageKind, classify, encode_pipe_bundle, hop_index};
+use crate::message::{GHL, MessageKind, classify, encode_pipe_bundle, hop_index, teardown_name};
 
 /// A relay's table of pipe keys it has learned (id → key + PUI), the teardown
 /// credential for pipes passing through it. Cheaply cloneable (`Arc`): the learn path
@@ -35,9 +37,27 @@ pub struct RelayPipeStore {
 }
 
 struct RelayEntry {
+    /// The producer namespace this pipe transfers under — teardown is monitored
+    /// **per namespace** (the thesis: pipes sharing a namespace can't be told apart
+    /// by traffic alone), so activity for the namespace renews every pipe under it.
+    namespace: Name,
+    /// This relay's hop order for the pipe (GHL-derived); shapes the nonuniform
+    /// inactivity threshold so on-path nodes don't all announce teardown at once.
+    hop: u32,
     pipe_key: Vec<u8>,
     pui: Duration,
-    deadline: Instant,
+    /// Last time the namespace showed traffic (renewed by [`note_activity`]).
+    last_activity: Instant,
+    /// A teardown announcement for this pipe is already in flight / suppressed —
+    /// don't re-announce (cleared when activity resumes).
+    announced: bool,
+}
+
+/// One pipe the monitor has decided to tear down (its id + the membership key the
+/// announcement must carry).
+pub(crate) struct DueTeardown {
+    pub id: Vec<u8>,
+    pub pipe_key: Vec<u8>,
 }
 
 impl RelayPipeStore {
@@ -45,33 +65,81 @@ impl RelayPipeStore {
         Self::default()
     }
 
-    fn insert(&self, id: Vec<u8>, pipe_key: Vec<u8>, pui: Duration) {
+    fn insert(&self, id: Vec<u8>, namespace: Name, hop: u32, pipe_key: Vec<u8>, pui: Duration) {
         self.inner.lock().unwrap().insert(
             id,
             RelayEntry {
+                namespace,
+                hop,
                 pipe_key,
                 pui,
-                deadline: Instant::now() + pui,
+                last_activity: Instant::now(),
+                announced: false,
             },
         );
     }
 
-    /// The `(pipe_key, pui)` for a live pipe — for re-sealing it downstream.
+    /// The `(pipe_key, pui)` for a held pipe — for re-sealing it downstream.
     pub fn bundle(&self, id: &[u8]) -> Option<(Vec<u8>, Duration)> {
         let m = self.inner.lock().unwrap();
-        m.get(id)
-            .filter(|e| Instant::now() <= e.deadline)
-            .map(|e| (e.pipe_key.clone(), e.pui))
+        m.get(id).map(|e| (e.pipe_key.clone(), e.pui))
     }
 
-    /// The pipe key for a live pipe (membership credential).
+    /// The pipe key for a held pipe (membership credential).
     pub fn pipe_key(&self, id: &[u8]) -> Option<Vec<u8>> {
         self.bundle(id).map(|(k, _)| k)
     }
 
+    /// Record that `namespace` showed traffic: renew every pipe under it and clear any
+    /// pending teardown (the contract — the consumer used the pipe within the PUI). The
+    /// data-plane / NPD calls this on observing namespace activity.
+    pub fn note_activity(&self, namespace: &Name) {
+        let now = Instant::now();
+        let mut m = self.inner.lock().unwrap();
+        for e in m.values_mut() {
+            if &e.namespace == namespace {
+                e.last_activity = now;
+                e.announced = false;
+            }
+        }
+    }
+
+    /// The pipes whose inactivity has exceeded their **per-hop threshold**
+    /// (`PUI + hop · quantum` — closer-to-consumer hops fire first, so the nearest
+    /// node announces and the rest suppress). Marks them `announced` so a subsequent
+    /// poll won't re-emit. The monitor sends a teardown for each.
+    pub(crate) fn due(&self, quantum: Duration) -> Vec<DueTeardown> {
+        let now = Instant::now();
+        let mut out = Vec::new();
+        let mut m = self.inner.lock().unwrap();
+        for (id, e) in m.iter_mut() {
+            let threshold = e.pui + quantum * e.hop;
+            if !e.announced && now.duration_since(e.last_activity) > threshold {
+                e.announced = true;
+                out.push(DueTeardown {
+                    id: id.clone(),
+                    pipe_key: e.pipe_key.clone(),
+                });
+            }
+        }
+        out
+    }
+
+    /// **Suppression**: a peer announced teardown for `namespace` first — cancel our
+    /// own pending announcement(s) for it (mark `announced` so the monitor won't emit).
+    /// The actual state reap is [`teardown_authorized`](Self::teardown_authorized).
+    pub fn suppress(&self, namespace: &Name) {
+        let mut m = self.inner.lock().unwrap();
+        for e in m.values_mut() {
+            if &e.namespace == namespace {
+                e.announced = true;
+            }
+        }
+    }
+
     /// Authorize (and perform) a teardown of this relay's pipe state: the supplied
-    /// secret must equal the stored pipe key (membership). Used by slice 3. An
-    /// unknown/already-gone pipe is an idempotent success.
+    /// secret must equal the stored pipe key (membership). An unknown/already-gone
+    /// pipe is an idempotent success.
     pub fn teardown_authorized(&self, id: &[u8], secret: Option<&[u8]>) -> bool {
         let mut m = self.inner.lock().unwrap();
         match m.get(id) {
@@ -111,19 +179,23 @@ impl PipeRelay {
         self.store.clone()
     }
 
-    /// Learn the pipe key for `pipe_id` from the adjacent upstream node (`upstream_hop`
-    /// = this relay's hop + 1) via the PIPE exchange, storing it. Call during pipe
-    /// formation; returns whether a key was obtained.
+    /// Learn the pipe key for `pipe_id` (under `namespace`, at this relay's `hop`) from
+    /// the adjacent upstream node (`upstream_hop` = `hop + 1`) via the PIPE exchange,
+    /// storing it with activity tracking. Call during pipe formation; returns whether a
+    /// key was obtained.
     pub async fn learn_pipe_key(
         &self,
         upstream: &mut Consumer,
+        namespace: &Name,
         pipe_id: &[u8],
+        hop: u32,
         upstream_hop: u32,
         timeout: Duration,
     ) -> bool {
         match fetch_pipe_key(upstream, pipe_id, upstream_hop, timeout).await {
             Some((key, pui)) => {
-                self.store.insert(pipe_id.to_vec(), key.to_vec(), pui);
+                self.store
+                    .insert(pipe_id.to_vec(), namespace.clone(), hop, key.to_vec(), pui);
                 true
             }
             None => false,
@@ -172,7 +244,74 @@ impl PipeRelay {
     }
 }
 
+/// Background **PUI-teardown monitor** (slice 2): periodically announce teardown for
+/// any pipe whose namespace has been idle past its per-hop threshold. Spawn alongside
+/// [`PipeRelay::serve`] (share its [`store`](PipeRelay::store)); the caller aborts the
+/// task to stop it. `quantum` is the per-hop delay step (nonuniform suppression);
+/// `tick` the poll cadence. Each announcement is the membership-authenticated TEARDOWN
+/// (pipe key in app-params) — the existing wire (slice 4 migrates it to PathControl).
+pub async fn run_relay_monitor(
+    store: RelayPipeStore,
+    mut emitter: Consumer,
+    quantum: Duration,
+    tick: Duration,
+) {
+    loop {
+        tokio::time::sleep(tick).await;
+        for due in store.due(quantum) {
+            // Fire-and-forget announcement (a BYE ack may or may not return).
+            let wire = InterestBuilder::new(teardown_name(&due.id))
+                .app_parameters(due.pipe_key)
+                .lifetime(tick)
+                .build();
+            let _ = emitter.fetch_wire(wire, tick).await;
+        }
+    }
+}
+
 /// The pipe-id bytes at component 1 of a `/COMMON/{pipe_id}/…` control name.
 fn pid_at1(name: &Name) -> Option<Vec<u8>> {
     name.components().get(1).map(|c| c.value.to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ns(s: &str) -> Name {
+        s.parse().unwrap()
+    }
+
+    /// The inactivity monitor's core logic (no async / engine): nonuniform per-hop
+    /// threshold, single-announce, activity reset, and suppression.
+    #[test]
+    fn monitor_threshold_hop_order_reset_and_suppression() {
+        let store = RelayPipeStore::new();
+        let n = ns("/sensors/temp");
+        // Two pipes under one namespace at different hops; PUI = 0 so the threshold is
+        // purely hop · quantum.
+        store.insert(b"near".to_vec(), n.clone(), 0, vec![1], Duration::ZERO); // thr 0
+        store.insert(b"far".to_vec(), n.clone(), 2, vec![2], Duration::ZERO); // thr 2·q
+        let q = Duration::from_millis(40);
+
+        std::thread::sleep(Duration::from_millis(12));
+        // Only the nearer hop (threshold 0) is due; the far hop (80ms) waits — this is
+        // the nonuniform delay that lets the nearest node announce first.
+        let due: Vec<_> = store.due(q).into_iter().map(|d| d.id).collect();
+        assert_eq!(due, vec![b"near".to_vec()]);
+        // Already-announced is not re-emitted on the next poll.
+        assert!(store.due(q).is_empty(), "single announcement per inactivity episode");
+
+        // Namespace activity renews everything (the PUI contract honored).
+        store.note_activity(&n);
+        std::thread::sleep(Duration::from_millis(12));
+        let due2: Vec<_> = store.due(q).into_iter().map(|d| d.id).collect();
+        assert_eq!(due2, vec![b"near".to_vec()], "due again only after a fresh quiet window");
+
+        // Suppression: a peer announced teardown for the namespace first — cancel our
+        // own pending announcement, so even past the far hop's threshold we stay quiet.
+        store.suppress(&n);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(store.due(q).is_empty(), "suppressed: no self-announcement after a peer's");
+    }
 }
