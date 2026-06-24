@@ -19,6 +19,8 @@ ndn-storage          = { workspace = true, features = ["named"] }
 bytes                = { workspace = true, features = ["std"] }
 sha2                 = { workspace = true }
 thiserror            = { workspace = true }
+# Surface storage errors (the now-fallible ndn-storage API) rather than swallowing them.
+tracing              = { workspace = true }
 tokio                = { workspace = true, features = ["rt", "net", "time", "macros", "sync"] }
 
 [dev-dependencies]

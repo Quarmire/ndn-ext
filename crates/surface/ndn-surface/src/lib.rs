@@ -910,8 +910,12 @@ impl NamedPublisher {
                                 Err(_) => break,
                             }
                         }
-                        if !ops.is_empty() {
-                            store.write_batch(ops).await;
+                        if !ops.is_empty()
+                            && let Err(e) = store.write_batch(ops).await
+                        {
+                            // A durable-write failure is logged, not silently dropped —
+                            // the retained frames did not land on disk.
+                            tracing::warn!(target: "ndn_surface", error = %e, "surface retain write_batch failed");
                         }
                         for ack in acks {
                             let _ = ack.send(()); // durability barrier satisfied
@@ -1510,7 +1514,17 @@ impl NamedSubscriber {
             }
             Source::Replay { store, next } => {
                 let frame_name = self.surface.clone().append_version(*next);
-                match store.get(&frame_name).await {
+                let got = match store.get(&frame_name).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // A store read error ends the replay (rather than masquerading as
+                        // a clean end-of-history), and is logged.
+                        tracing::warn!(target: "ndn_surface", name = %frame_name, error = %e, "surface replay get failed");
+                        self.complete = Some(false);
+                        return None;
+                    }
+                };
+                match got {
                     Some(wire) => {
                         *next += 1;
                         match parse_frame(&wire) {
@@ -1605,9 +1619,15 @@ impl CatchUpFollow {
                 let hv = version_of(&self.held.as_ref().unwrap().0).unwrap_or(self.next);
                 if self.next < hv {
                     let key = self.surface.clone().append_version(self.next);
-                    if let Some(wire) = self.store.get(&key).await {
-                        self.next += 1;
-                        return deliver(&mut f, &wire, &mut self.complete);
+                    match self.store.get(&key).await {
+                        Ok(Some(wire)) => {
+                            self.next += 1;
+                            return deliver(&mut f, &wire, &mut self.complete);
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::warn!(target: "ndn_surface", name = %key, error = %e, "surface back-fill get failed");
+                        }
                     }
                     self.next = hv; // unexpected store gap (write-through should fill)
                 }
@@ -1621,9 +1641,15 @@ impl CatchUpFollow {
             // (2) Replay history until a version is missing, then follow live.
             if !self.caught_up {
                 let key = self.surface.clone().append_version(self.next);
-                if let Some(wire) = self.store.get(&key).await {
-                    self.next += 1;
-                    return deliver(&mut f, &wire, &mut self.complete);
+                match self.store.get(&key).await {
+                    Ok(Some(wire)) => {
+                        self.next += 1;
+                        return deliver(&mut f, &wire, &mut self.complete);
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(target: "ndn_surface", name = %key, error = %e, "surface replay get failed");
+                    }
                 }
                 self.caught_up = true;
             }
@@ -2717,6 +2743,7 @@ mod tests {
             assert!(
                 read.get(&format!("/durable/bounded/v={v}").parse::<Name>().unwrap())
                     .await
+                    .unwrap()
                     .is_none(),
                 "v={v} should be evicted"
             );
@@ -2725,6 +2752,7 @@ mod tests {
             assert!(
                 read.get(&format!("/durable/bounded/v={v}").parse::<Name>().unwrap())
                     .await
+                    .unwrap()
                     .is_some(),
                 "v={v} should be retained"
             );
