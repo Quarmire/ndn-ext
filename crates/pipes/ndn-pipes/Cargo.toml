@@ -8,8 +8,18 @@ license.workspace = true
 [package.metadata.scope]
 classification = "extension"
 
+[features]
+default = []
+# G3 PathControl teardown integration: the forwarder-hook adapter
+# (`PipeTeardownControl`) + the PathControl teardown emit helper, so pipe teardown
+# rides the generic PathControl path-walk. Pulls ndn-pathcontrol + ndn-engine (the
+# PathControl traits); off by default so the core stays forwarder-agnostic.
+pathcontrol = ["dep:ndn-pathcontrol", "dep:ndn-engine"]
+
 [dependencies]
 ndn-packet    = { workspace = true, features = ["std"] }
+ndn-pathcontrol = { workspace = true, optional = true }
+ndn-engine    = { workspace = true, optional = true }
 ndn-app       = { workspace = true }
 # Default features (endpoint) for the coded bulk transfer (CodedFetcher/Producer).
 ndn-coding    = { path = "../../coding/ndn-coding" }

@@ -20,6 +20,8 @@ mod crypto;
 pub mod keyexchange;
 pub mod message;
 mod mgmt;
+#[cfg(feature = "pathcontrol")]
+pub mod pathcontrol;
 pub mod pipe;
 mod producer;
 mod registry;
@@ -41,6 +43,11 @@ pub use pipe::{Pipe, PipeId, PipeParams};
 pub use producer::PipeProducer;
 pub use registry::{PipeInfo, PipeRegistry};
 pub use relay::{PipeRelay, RelayPipeStore, run_relay_monitor};
+#[cfg(feature = "pathcontrol")]
+pub use pathcontrol::{
+    PipeMembership, PipeTeardownControl, decode_pipe_teardown_params, encode_pipe_teardown_params,
+    pipe_teardown_interest,
+};
 
 /// Errors from pipe setup and transfer.
 #[derive(Debug, thiserror::Error)]
