@@ -33,7 +33,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use ndn_packet::encode::{DataBuilder, InterestBuilder};
 use ndn_packet::{Data, Interest, Name};
-use ndn_security::{InterestValidationOutcome, SignWith, Signer, Validator};
+use ndn_security::{
+    InterestValidationOutcome, ReplayCheck, ReplayGuard, SignWith, Signer, ValidationResult,
+    Validator,
+};
 use ndn_service_core::{
     Carrier, Dispatch, HintedCarrier, Invocation, OpId, Response, ServiceError, ServiceId,
 };
@@ -47,8 +50,13 @@ pub struct RpcCarrier {
     /// When set, sign each outbound request Interest (the requester's identity).
     signer: Option<Arc<dyn Signer>>,
     /// When set, verify each inbound request and authenticate its requester;
-    /// unsigned/invalid requests are rejected (fail closed).
+    /// unsigned/invalid requests are rejected (fail closed). The same validator
+    /// verifies the **response** on the invoke side (G2.1).
     validator: Option<Arc<Validator>>,
+    /// Anti-replay for inbound requests (G2.2). Auto-enabled in secure mode
+    /// ([`with_validator`](Self::with_validator)); dedups on the signed-Interest
+    /// nonce (clock-free), so a captured signed request can't be re-dispatched.
+    replay: Option<Arc<ReplayGuard>>,
 }
 
 impl RpcCarrier {
@@ -58,6 +66,7 @@ impl RpcCarrier {
             registry: Arc::new(RpcRegistry::new()),
             signer: None,
             validator: None,
+            replay: None,
         }
     }
 
@@ -67,6 +76,7 @@ impl RpcCarrier {
             registry,
             signer: None,
             validator: None,
+            replay: None,
         }
     }
 
@@ -78,9 +88,15 @@ impl RpcCarrier {
     }
 
     /// Verify each inbound request with `validator` and authenticate its requester.
-    /// A carrier with a validator **fails closed** on unsigned/invalid requests.
+    /// A carrier with a validator **fails closed** on unsigned/invalid requests, verifies
+    /// the response on the invoke side (G2.1), and enables anti-replay on inbound requests
+    /// (G2.2 — dedups on the signed-Interest nonce, clock-free).
     pub fn with_validator(mut self, validator: Arc<Validator>) -> Self {
         self.validator = Some(validator);
+        // Secure mode ⇒ anti-replay on requests. monotonic=false: dedup on the random
+        // nonce only, never a wall clock (no trusted-time dependency).
+        self.replay
+            .get_or_insert_with(|| Arc::new(ReplayGuard::new(256, false)));
         self
     }
 
@@ -105,6 +121,8 @@ struct CarrierHandler {
     dispatch: Arc<dyn Dispatch>,
     /// When set, verify the request and authenticate its requester (fail closed).
     validator: Option<Arc<Validator>>,
+    /// When set, reject a replayed request (dedup on the signed-Interest nonce).
+    replay: Option<Arc<ReplayGuard>>,
     /// When set, sign the response Data with this node's identity (else digest).
     signer: Option<Arc<dyn Signer>>,
 }
@@ -125,6 +143,15 @@ impl CarrierHandler {
             InterestValidationOutcome::Invalid(e) => {
                 return Err(RpcError::Unauthorized(e.to_string()));
             }
+        }
+        // Anti-replay (G2.2): a captured signed request must not be re-dispatched. Dedup on
+        // the signed-Interest nonce; an Interest with no anti-replay field can't be deduped
+        // (the requester should include a SignatureNonce) but still must verify above.
+        if let Some(rg) = &self.replay
+            && let Some(si) = interest.sig_info()
+            && matches!(rg.check(si), ReplayCheck::Replay)
+        {
+            return Err(RpcError::Unauthorized("replayed request rejected".into()));
         }
         // The verified KeyLocator name *is* the authenticated requester (NDN
         // signed-Interest identity), not a name the caller merely claims.
@@ -186,6 +213,7 @@ impl Carrier for RpcCarrier {
             service_len: svc.name().len(),
             dispatch,
             validator: self.validator.clone(),
+            replay: self.replay.clone(),
             signer: self.signer.clone(),
         };
         self.registry.register(svc.name(), handler);
@@ -220,10 +248,30 @@ impl HintedCarrier for RpcCarrier {
         let interest =
             Interest::decode(wire).map_err(|e| ServiceError::Transport(e.to_string()))?;
         match self.registry.dispatch(&interest).await {
-            Some(Ok(data)) => Ok(Response {
-                producer: svc.name().clone(),
-                payload: data.content().cloned().unwrap_or_default(),
-            }),
+            Some(Ok(data)) => {
+                // G2.1: verify the response against trust when secure — an unverified
+                // response could be a forgery/substitution. (Skipped when no validator is
+                // configured: the in-process loopback is digest-only by design.)
+                if let Some(v) = &self.validator {
+                    match v.validate(&data).await {
+                        ValidationResult::Valid(_) => {}
+                        ValidationResult::Pending => {
+                            return Err(ServiceError::Unauthorized(
+                                "response signer certificate unavailable".into(),
+                            ));
+                        }
+                        ValidationResult::Invalid(e) => {
+                            return Err(ServiceError::Unauthorized(format!(
+                                "response verification failed: {e}"
+                            )));
+                        }
+                    }
+                }
+                Ok(Response {
+                    producer: svc.name().clone(),
+                    payload: data.content().cloned().unwrap_or_default(),
+                })
+            }
             Some(Err(RpcError::NotFound)) | None => Err(ServiceError::NotFound),
             Some(Err(RpcError::BadRequest(e))) => Err(ServiceError::Decode(e)),
             Some(Err(RpcError::Unauthorized(e))) => Err(ServiceError::Unauthorized(e)),

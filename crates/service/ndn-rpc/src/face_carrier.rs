@@ -18,7 +18,7 @@ use bytes::Bytes;
 use ndn_app::{Consumer, Producer};
 use ndn_packet::encode::{DataBuilder, InterestBuilder};
 use ndn_packet::Name;
-use ndn_security::{InterestValidationOutcome, SignWith, Signer, Validator};
+use ndn_security::{InterestValidationOutcome, SignWith, Signer, ValidationResult, Validator};
 use ndn_service_core::{
     Carrier, Dispatch, HintedCarrier, Invocation, OpId, Response, ServiceError, ServiceId,
 };
@@ -220,6 +220,24 @@ impl HintedCarrier for FaceRpcCarrier {
             .fetch_wire(wire, self.fetch_timeout)
             .await
             .map_err(|e| ServiceError::Transport(e.to_string()))?;
+        // G2.1: verify the response against trust when a validator is configured — over a
+        // real face an unverified response could be a forgery from any responder on the
+        // name. (No validator ⇒ caller opted out, as before.)
+        if let Some(v) = &self.validator {
+            match v.validate(&data).await {
+                ValidationResult::Valid(_) => {}
+                ValidationResult::Pending => {
+                    return Err(ServiceError::Unauthorized(
+                        "response signer certificate unavailable".into(),
+                    ));
+                }
+                ValidationResult::Invalid(e) => {
+                    return Err(ServiceError::Unauthorized(format!(
+                        "response verification failed: {e}"
+                    )));
+                }
+            }
+        }
         Ok(Response {
             producer: svc.name().clone(),
             payload: data.content().cloned().unwrap_or_default(),

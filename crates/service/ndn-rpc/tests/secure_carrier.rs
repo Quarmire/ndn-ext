@@ -110,6 +110,33 @@ async fn unsigned_request_is_rejected_by_secure_server() {
     );
 }
 
+/// G2.1: the invoke side verifies the *response*. A server signs its response with a key
+/// the client's validator does not trust → the client rejects it rather than returning
+/// unverified content. (Two carriers over one registry: the server authenticates nothing
+/// and signs with alice; the client trusts nobody.)
+#[tokio::test]
+async fn untrusted_response_is_rejected_on_invoke() {
+    use ndn_rpc::RpcRegistry;
+    let key_name = name(KEY_NAME);
+    let alice = Ed25519Signer::from_seed(&[9u8; 32], key_name.clone());
+
+    let registry = Arc::new(RpcRegistry::new());
+    // Server: signs responses with alice, accepts unsigned requests (no validator).
+    let server = RpcCarrier::with_registry(registry.clone())
+        .with_signer(Arc::new(alice) as Arc<dyn Signer>);
+    let svc = ServiceId::new(name("/svc/echo"));
+    server.serve(&svc, Arc::new(WhoamiDispatch)).await.unwrap();
+
+    // Client: a validator that trusts NObody (empty cert cache) ⇒ the alice-signed
+    // response can't be verified.
+    let client = RpcCarrier::with_registry(registry).with_validator(Arc::new(Validator::new(open_schema())));
+    let r = client.invoke(&svc, &OpId::new("whoami"), Bytes::new()).await;
+    assert!(
+        matches!(r, Err(ServiceError::Unauthorized(_))),
+        "an unverifiable response must be rejected, got {r:?}"
+    );
+}
+
 /// No signer and no validator = the plain in-process loopback: the request is
 /// unsigned and the requester is anonymous (back-compat).
 #[tokio::test]
