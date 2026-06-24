@@ -42,6 +42,11 @@ f2-recode = ["dep:sha2"]
 # is the deployment seam, not in this crate. See the design memo and the
 # doctrine's F3 placement note.
 f3-link = []
+# Link-FEC as a composable `LinkServiceFeature` (`LinkFecFeature`): wraps the
+# `link_fec` codec with generation batching + enable/status so a lossy face can
+# compose FEC alongside reliability + congestion-marking, instead of hand-rolling
+# it. Pulls `ndn-transport` for the feature trait; the codec core stays dep-free.
+link-fec-feature = ["dep:ndn-transport"]
 # F3 broadcast-link wiring — `CopeBroadcastLink<T: Transport>` over a
 # broadcast medium (code-on-egress / decode-on-ingress). Native next-hop is
 # supplied by the forwarding plane (the layering constraint); the
