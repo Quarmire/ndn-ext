@@ -13,3 +13,7 @@ ndn-crypto-core = { workspace = true }
 bytes           = { workspace = true, features = ["std"] }
 getrandom       = { workspace = true }
 thiserror       = { workspace = true }
+# Circuit hop-key agreement: per-layer ephemeral × relay static onion key.
+x25519-dalek    = { workspace = true }
+hkdf            = { workspace = true }
+sha2            = { workspace = true }

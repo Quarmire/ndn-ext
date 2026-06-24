@@ -197,6 +197,10 @@ base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 # Cryptography
 ring          = "0.17"
 ed25519-dalek = "2"
+# Static-key X25519 for onion-circuit hop-key agreement (a relay re-uses its
+# long-lived onion key across every Interest, which ring's one-shot
+# EphemeralPrivateKey can't model).
+x25519-dalek  = { version = "2", default-features = false, features = ["static_secrets"] }
 # `rayon` enables `Hasher::update_rayon` for multi-thread hashing of a
 # single large buffer. Useful only above ~128 KiB (rayon overhead beats
 # update at smaller sizes); ndn-rs uses it for bulk content publication
