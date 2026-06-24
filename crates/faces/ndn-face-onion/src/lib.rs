@@ -24,12 +24,28 @@
 //! not ring's one-shot ephemeral agreement.) The return path is then symmetric under those
 //! hop keys.
 //!
+//! ## Security limitations (read before relying on this)
+//!
+//! - **No forward secrecy (G5.1).** Each relay re-uses a *static* X25519 onion key, so a
+//!   hop key is `HKDF(ephemeral × relay_static)` with the ephemeral public on the wire. An
+//!   adversary who records onions and *later* compromises a relay's static secret can
+//!   reconstruct that relay's past hop keys and decrypt its layers retroactively. This is
+//!   inherent to the no-handshake static-key design (the price of skipping a telescoping
+//!   setup). A forward-secret variant needs an ntor-style ephemeral–ephemeral handshake
+//!   (rotate, or a per-epoch relay key) — future work.
+//! - **No traffic-flow padding (G5.3).** Layers are not padded to a fixed cell size, so a
+//!   layer's length leaks how many hops remain and correlates request/response sizes —
+//!   exploitable by a global passive observer for traffic analysis. Fixed-size cells are
+//!   future work; until then this hides *who asks what*, not packet timing/size.
+//! - Replay of a forward layer is rejected at the relay (bounded seen-set), and per-request
+//!   relay/consumer state is capacity-bounded (below) — so neither is a DoS lever.
+//!
 //! ## Non-standard
 //!
 //! ANDaNA is research, not an NDN community spec; mark any user-facing surface as a
 //! **draft extension**.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use bytes::Bytes;
 use hkdf::Hkdf;
@@ -73,9 +89,17 @@ pub enum OnionError {
     Truncated,
     #[error("authentication failed (wrong key or tampered layer)")]
     AuthFailed,
+    #[error("replayed forward layer")]
+    Replay,
     #[error("RNG failure")]
     Rng,
 }
+
+/// Capacity bound on per-request relay/consumer state and the relay's replay seen-set
+/// (G5.4 / G5.2): old entries are evicted FIFO past this, so a peer that opens circuits but
+/// never completes them (no returning Data) can't grow memory without bound. Sized for a
+/// busy relay's in-flight set; tune per deployment if needed.
+const MAX_PENDING: usize = 4096;
 
 /// A relay's long-lived static X25519 onion key. Its [`public`](Self::public) half goes in
 /// the circuit directory; the secret peels forward layers + derives the hop key.
@@ -211,6 +235,8 @@ pub fn unwrap_return(return_keys: &[HopKey], onion: &[u8]) -> Result<Bytes, Onio
 pub struct OnionConsumer {
     circuit: Circuit,
     pending: HashMap<u64, Vec<HopKey>>,
+    /// Insertion order, for FIFO eviction once `pending` hits [`MAX_PENDING`] (G5.4).
+    order: VecDeque<u64>,
     next_token: u64,
 }
 
@@ -219,6 +245,7 @@ impl OnionConsumer {
         Self {
             circuit,
             pending: HashMap::new(),
+            order: VecDeque::new(),
             next_token: 0,
         }
     }
@@ -230,6 +257,16 @@ impl OnionConsumer {
         let token = self.next_token;
         self.next_token += 1;
         self.pending.insert(token, w.return_keys);
+        self.order.push_back(token);
+        // Bound the outstanding-request set: a reply that never arrives must not pin its
+        // return keys forever. Capping `order` (the insertion log) bounds `pending` too,
+        // since every live entry is in `order`; unwrap()'d tokens linger in `order` only
+        // until they reach the front and are dropped (a no-op `remove`).
+        while self.order.len() > MAX_PENDING {
+            if let Some(old) = self.order.pop_front() {
+                self.pending.remove(&old);
+            }
+        }
         Ok((token, w.entry, w.onion))
     }
 
@@ -250,6 +287,12 @@ impl OnionConsumer {
 pub struct OnionRelay {
     key: RelayOnionKey,
     pending: HashMap<Vec<u8>, HopKey>,
+    /// Insertion order for FIFO eviction of `pending` past [`MAX_PENDING`] (G5.4).
+    order: VecDeque<Vec<u8>>,
+    /// Fingerprints of recently-peeled forward layers, to reject replays (G5.2). Bounded
+    /// FIFO: `seen_q` is the eviction order, `seen` the membership set.
+    seen: HashSet<Vec<u8>>,
+    seen_q: VecDeque<Vec<u8>>,
 }
 
 impl OnionRelay {
@@ -257,6 +300,9 @@ impl OnionRelay {
         Self {
             key,
             pending: HashMap::new(),
+            order: VecDeque::new(),
+            seen: HashSet::new(),
+            seen_q: VecDeque::new(),
         }
     }
 
@@ -268,14 +314,43 @@ impl OnionRelay {
     /// Peel one forward layer. The caller extracts a correlation key from `Peeled::inner`
     /// (the inner Interest's name) and calls [`remember`](Self::remember) with it +
     /// `Peeled::hop_key` before forwarding the inner onward.
-    pub fn forward(&self, layer: &[u8]) -> Result<Peeled, OnionError> {
-        self.key.peel(layer)
+    ///
+    /// Rejects a **replayed** layer (G5.2): a forward layer's `eph_pub ‖ nonce` prefix is
+    /// unique per legitimate layer (fresh ephemeral + random nonce), so a byte-identical
+    /// re-injection is caught by a bounded seen-set and returns [`OnionError::Replay`]
+    /// before re-deriving the hop key or re-forwarding.
+    pub fn forward(&mut self, layer: &[u8]) -> Result<Peeled, OnionError> {
+        let fp = layer_fingerprint(layer)?;
+        if self.seen.contains(&fp) {
+            return Err(OnionError::Replay);
+        }
+        // Peel first (only a layer that's actually ours gets a seen-set slot, so a flood of
+        // junk layers can't evict real fingerprints).
+        let peeled = self.key.peel(layer)?;
+        if self.seen.insert(fp.clone()) {
+            self.seen_q.push_back(fp);
+            while self.seen_q.len() > MAX_PENDING {
+                if let Some(old) = self.seen_q.pop_front() {
+                    self.seen.remove(&old);
+                }
+            }
+        }
+        Ok(peeled)
     }
 
     /// Record the hop key for a forwarded request, keyed by its `correlation` (inner
-    /// interest name bytes), so the return path can find it.
+    /// interest name bytes), so the return path can find it. Capacity-bounded (G5.4):
+    /// the oldest record is evicted past [`MAX_PENDING`] so unanswered forwards can't grow
+    /// memory without bound.
     pub fn remember(&mut self, correlation: Vec<u8>, hop_key: HopKey) {
-        self.pending.insert(correlation, hop_key);
+        if self.pending.insert(correlation.clone(), hop_key).is_none() {
+            self.order.push_back(correlation);
+            while self.order.len() > MAX_PENDING {
+                if let Some(old) = self.order.pop_front() {
+                    self.pending.remove(&old);
+                }
+            }
+        }
     }
 
     /// Re-wrap returning `data` with the hop key stored for `correlation` (consuming it).
@@ -287,6 +362,18 @@ impl OnionRelay {
 }
 
 // ---- crypto + codec -----------------------------------------------------------
+
+/// Replay fingerprint of a forward layer: its `eph_pub ‖ nonce` prefix. Unique per
+/// legitimate layer (fresh ephemeral key + random AEAD nonce), and byte-identical on a
+/// re-injection — so a bounded seen-set of these catches replays. `Err(Truncated)` if the
+/// layer is too short to carry one.
+fn layer_fingerprint(layer: &[u8]) -> Result<Vec<u8>, OnionError> {
+    let end = EPH_LEN + NONCE_LEN;
+    if layer.len() < end {
+        return Err(OnionError::Truncated);
+    }
+    Ok(layer[..end].to_vec())
+}
 
 fn derive_hop_key(shared: &x25519_dalek::SharedSecret) -> HopKey {
     let hk = Hkdf::<Sha256>::new(None, shared.as_bytes());
@@ -541,5 +628,45 @@ mod tests {
             Circuit::new(vec![]).wrap_forward(b"x").unwrap_err(),
             OnionError::EmptyCircuit
         );
+    }
+
+    /// G5.2: a re-injected forward layer is rejected by the relay's seen-set, so a captured
+    /// onion can't be replayed to re-forward (or amplify) the inner request.
+    #[test]
+    fn relay_rejects_replayed_forward_layer() {
+        let mut relay = OnionRelay::new(RelayOnionKey::generate().unwrap());
+        let (layer, _hk) =
+            seal_forward_layer(&relay.public(), &encode_inner(b"", b"/inner/interest")).unwrap();
+        assert!(relay.forward(&layer).is_ok(), "first peel of a fresh layer succeeds");
+        assert_eq!(
+            relay.forward(&layer).unwrap_err(),
+            OnionError::Replay,
+            "the same layer re-injected is rejected as a replay"
+        );
+    }
+
+    /// G5.4: the relay's per-request state is capacity-bounded — unanswered forwards (no
+    /// returning Data) can't grow `pending`/`order` without bound.
+    #[test]
+    fn relay_pending_is_capacity_bounded() {
+        let mut relay = OnionRelay::new(RelayOnionKey::generate().unwrap());
+        for i in 0..(MAX_PENDING + 50) {
+            relay.remember(format!("corr-{i}").into_bytes(), [0u8; 32]);
+        }
+        assert!(relay.pending.len() <= MAX_PENDING, "pending bounded at MAX_PENDING");
+        assert!(relay.order.len() <= MAX_PENDING, "insertion log bounded too");
+    }
+
+    /// G5.4: the consumer's outstanding-request map is likewise bounded.
+    #[test]
+    fn consumer_pending_is_capacity_bounded() {
+        let relays = [Relay::new("/r/x")];
+        let circuit = Circuit::new(relays.iter().map(Relay::hop).collect());
+        let mut consumer = OnionConsumer::new(circuit);
+        for _ in 0..(MAX_PENDING + 50) {
+            consumer.wrap(b"/data/obj").unwrap();
+        }
+        assert!(consumer.pending.len() <= MAX_PENDING, "outstanding requests bounded");
+        assert!(consumer.order.len() <= MAX_PENDING, "insertion log bounded too");
     }
 }
