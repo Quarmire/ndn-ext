@@ -39,19 +39,20 @@ use crate::relay::RelayPipeStore;
 pub const TEARDOWN_MAC_LEN: usize = 32;
 
 /// Possession proof for a teardown: a fixed-format MAC binding the pipe `key` to this
-/// exact teardown (`namespace ‖ op ‖ seq ‖ id`). It proves the emitter holds the key
-/// without putting the key on the wire, and the binding stops the proof being lifted
-/// onto a different teardown. Fixed-format (every variable field is length-prefixed),
-/// so `SHA-256(key ‖ …)` is a sound MAC here — length-extension can't forge a *different*
-/// valid (namespace, op, seq, id) tuple. Mirrors the `auth_mac` construction in
-/// `ndn-face-shm`.
-pub fn teardown_mac(key: &[u8], namespace: &Name, op: PathOp, seq: u64, id: &[u8]) -> [u8; 32] {
+/// exact teardown (`target ‖ op ‖ seq ‖ id`, where `target` is the walked PathControl
+/// target — `<namespace>/<id>`). It proves the emitter holds the key without putting the
+/// key on the wire, and the binding stops the proof being lifted onto a different teardown.
+/// Fixed-format (every variable field is length-prefixed), so `SHA-256(key ‖ …)` is a sound
+/// MAC here — length-extension can't forge a *different* valid (target, op, seq, id) tuple.
+/// Mirrors the `auth_mac` construction in `ndn-face-shm`. Verifiers recompute it over
+/// `pc.target`, so the emitter must use the same target it puts on the wire.
+pub fn teardown_mac(key: &[u8], target: &Name, op: PathOp, seq: u64, id: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(b"ndn-pipes/teardown-mac/v1");
     h.update((key.len() as u32).to_be_bytes());
     h.update(key);
-    let ns = namespace.encode_to_tlv();
+    let ns = target.encode_to_tlv();
     h.update((ns.as_ref().len() as u32).to_be_bytes());
     h.update(ns.as_ref());
     h.update([op as u8]);
@@ -165,17 +166,29 @@ pub fn decode_pipe_teardown_params(p: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
     Some((id.to_vec(), mac.to_vec()))
 }
 
+/// The PathControl **target** for a pipe teardown: `<namespace>/<pipe-id>`. Appending the
+/// pipe id makes the forwarder's `(target, op)` `SeqStore` key **per-pipe**, so two pipes
+/// that share a namespace can't dedup each other's teardown (G3.10 — two teardowns on the
+/// same namespace in the same `now_seq` millisecond would otherwise collide and the second
+/// pipe would never be reaped). The walk still routes correctly: longest-prefix match on
+/// `<namespace>/<id>` resolves to the namespace's route, since the id only *extends* the
+/// name.
+pub fn pipe_teardown_target(namespace: &Name, id: &[u8]) -> Name {
+    namespace.clone().append(id)
+}
+
 /// Build an (unsigned) PathControl `Teardown` Interest for a pipe:
-/// `<namespace>/32=PC/Teardown/<seq>` carrying `(id, mac)` in ApplicationParameters,
-/// where `mac` is the possession proof over `key` bound to this teardown. The key is
-/// used here only to compute the MAC — it is never serialized. Unsigned because the
+/// `<namespace>/<id>/32=PC/Teardown/<seq>` carrying `(id, mac)` in ApplicationParameters,
+/// where `mac` is the possession proof over `key` bound to this teardown's **target**. The
+/// key is used here only to compute the MAC — it is never serialized. Unsigned because the
 /// authorization is *membership* (the MAC), not a namespace signature — see the module
 /// docs. `seq` is the PathControl loop/dedup guard *and* part of the MAC binding, so a
 /// captured proof can't be replayed onto a different seq; use a per-emitter monotonic
 /// counter (collisions across emitters are benign — the forwarder's `SeqStore` dedups).
 pub fn pipe_teardown_interest(namespace: &Name, id: &[u8], key: &[u8], seq: u64) -> Bytes {
-    let mac = teardown_mac(key, namespace, PathOp::Teardown, seq, id);
-    let name = PathControl::new(namespace.clone(), PathOp::Teardown, seq).to_name();
+    let target = pipe_teardown_target(namespace, id);
+    let mac = teardown_mac(key, &target, PathOp::Teardown, seq, id);
+    let name = PathControl::new(target, PathOp::Teardown, seq).to_name();
     InterestBuilder::new(name)
         .app_parameters(encode_pipe_teardown_params(id, &mac))
         .build()
@@ -271,7 +284,9 @@ impl<M: PipeMembership> ndn_engine::PathControlObserver for PipeTeardownControl<
         {
             // We tore real state down — defer any pending self-announcement for it.
             self.membership.suppress_namespace(&namespace);
-            debug_assert_eq!(&namespace, &pc.target);
+            // The walked target is `<namespace>/<id>` (G3.10), so the reaped namespace is a
+            // prefix of it.
+            debug_assert!(pc.target.has_prefix(&namespace));
         }
     }
 }
@@ -312,6 +327,29 @@ mod tests {
         assert_ne!(base, teardown_mac(b"key", &ns(), PathOp::Refresh, 7, b"id"));
         assert_ne!(base, teardown_mac(b"key", &ns(), PathOp::Teardown, 8, b"id"));
         assert_ne!(base, teardown_mac(b"key", &ns(), PathOp::Teardown, 7, b"id2"));
+    }
+
+    #[test]
+    fn co_namespaced_pipes_get_distinct_teardown_targets() {
+        // G3.10: two pipes sharing a namespace must produce distinct PathControl targets
+        // (namespace + id), so the forwarder's (target, op) SeqStore can't let one pipe's
+        // teardown dedup the other's — even at the same seq.
+        let shared: Name = "/shared/ns".parse().unwrap();
+        let ta = pipe_teardown_target(&shared, b"pipe-A");
+        let tb = pipe_teardown_target(&shared, b"pipe-B");
+        assert_ne!(ta, tb, "distinct pipes ⇒ distinct targets");
+        assert!(
+            ta.has_prefix(&shared) && tb.has_prefix(&shared),
+            "namespace still routes the walk"
+        );
+
+        // Same seq, same namespace, different pipe → different PathControl names, so the
+        // engine keys them separately (no collision).
+        let wa = pipe_teardown_interest(&shared, b"pipe-A", b"kA", 1700);
+        let wb = pipe_teardown_interest(&shared, b"pipe-B", b"kB", 1700);
+        let na = ndn_packet::Interest::decode(wa).unwrap().name;
+        let nb = ndn_packet::Interest::decode(wb).unwrap().name;
+        assert_ne!(na, nb, "co-namespaced same-seq teardowns have distinct names");
     }
 
     #[test]
