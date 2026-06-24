@@ -172,6 +172,31 @@ impl<M: PipeMembership> ndn_engine::PathAuthorizer for PipeTeardownControl<M> {
     }
 }
 
+/// Feeds the forwarder's data-plane name-activity signal into a relay's PUI monitor: an
+/// interest fetched under a held pipe's namespace renews that pipe, so an actively-used
+/// pipe is never torn down. Register via
+/// [`EngineBuilder::with_name_activity_observer`](ndn_engine::EngineBuilder::with_name_activity_observer).
+///
+/// Behind the `engine` feature (it depends on `ndn-engine`).
+#[cfg(feature = "engine")]
+pub struct RelayActivity {
+    store: RelayPipeStore,
+}
+
+#[cfg(feature = "engine")]
+impl RelayActivity {
+    pub fn new(store: RelayPipeStore) -> Self {
+        Self { store }
+    }
+}
+
+#[cfg(feature = "engine")]
+impl ndn_engine::NameActivityObserver for RelayActivity {
+    fn on_activity(&self, name: &Name) {
+        self.store.note_traffic(name);
+    }
+}
+
 #[cfg(feature = "engine")]
 impl<M: PipeMembership> ndn_engine::PathControlObserver for PipeTeardownControl<M> {
     fn on_teardown(&self, pc: &PathControl, params: &[u8]) {

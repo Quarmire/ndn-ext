@@ -47,7 +47,7 @@ pub use pathcontrol::{
     pipe_teardown_interest,
 };
 #[cfg(feature = "engine")]
-pub use pathcontrol::PipeTeardownControl;
+pub use pathcontrol::{PipeTeardownControl, RelayActivity};
 
 /// Errors from pipe setup and transfer.
 #[derive(Debug, thiserror::Error)]

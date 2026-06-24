@@ -96,6 +96,22 @@ impl RelayPipeStore {
         self.inner.lock().unwrap().get(id).map(|e| e.namespace.clone())
     }
 
+    /// Data-plane activity signal: renew every pipe whose namespace is a **prefix** of
+    /// `name` (i.e. a packet was fetched under that namespace) and clear its pending
+    /// teardown. This is what keeps an actively-used pipe alive under the monitor; the
+    /// forwarder feeds it every interest name via a `NameActivityObserver`. Distinct from
+    /// [`note_activity`](Self::note_activity), which renews by *exact* namespace.
+    pub fn note_traffic(&self, name: &Name) {
+        let now = Instant::now();
+        let mut m = self.inner.lock().unwrap();
+        for e in m.values_mut() {
+            if name.has_prefix(&e.namespace) {
+                e.last_activity = now;
+                e.announced = false;
+            }
+        }
+    }
+
     /// Record that `namespace` showed traffic: renew every pipe under it and clear any
     /// pending teardown (the contract — the consumer used the pipe within the PUI). The
     /// data-plane / NPD calls this on observing namespace activity.
