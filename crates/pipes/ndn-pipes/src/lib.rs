@@ -17,6 +17,7 @@
 mod confidentiality;
 mod consumer;
 mod crypto;
+pub mod keyexchange;
 pub mod message;
 mod mgmt;
 pub mod pipe;
@@ -29,16 +30,17 @@ pub use consumer::PipeConsumer;
 /// Derive a producer's Ed25519 trust anchor (public key) from its signing key,
 /// for [`PipeConsumer::with_trust_anchor`] / [`PipeProducer::with_identity`].
 pub use crypto::ed25519_public;
+pub use keyexchange::fetch_pipe_key;
 pub use message::{
     COMMON_PREFIX, GHL, JOIN_PREFIX, MessageKind, SEEK_PREFIX, check_name, classify, context_name,
-    decode_seek_reply, encode_seek_reply, hop_index, join_name, link_name, pipe_name, seek_name,
-    teardown_name,
+    decode_pipe_bundle, decode_seek_reply, encode_pipe_bundle, encode_seek_reply, hop_index,
+    join_name, link_name, pipe_name, seek_name, teardown_name,
 };
 pub use mgmt::{PipesModule, render_list};
 pub use pipe::{Pipe, PipeId, PipeParams};
 pub use producer::PipeProducer;
 pub use registry::{PipeInfo, PipeRegistry};
-pub use relay::PipeRelay;
+pub use relay::{PipeRelay, RelayPipeStore};
 
 /// Errors from pipe setup and transfer.
 #[derive(Debug, thiserror::Error)]

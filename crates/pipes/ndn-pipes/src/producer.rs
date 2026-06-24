@@ -22,7 +22,7 @@ use ndn_packet::{Name, SignatureType};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::crypto::{PIPE_ID_LEN, PIPE_KEY_LEN, ed25519_sign, random_bytes, seal};
-use crate::message::{GHL, MessageKind, classify, encode_seek_reply, hop_index};
+use crate::message::{GHL, MessageKind, classify, encode_pipe_bundle, encode_seek_reply, hop_index};
 use crate::registry::PipeRegistry;
 
 /// Default Promised Use Interval: a pipe with no liveness traffic for this long
@@ -287,6 +287,27 @@ impl PipeProducer {
                                 responder.respond_bytes(d).await.ok();
                             } else {
                                 drop(responder);
+                            }
+                        }
+                        Some(MessageKind::Pipe) => {
+                            // PIPE-handshake (Table 8): an on-path downstream node
+                            // requests the pipe key, sending its X25519 public key in
+                            // the app-params. If we hold this pipe, seal `pipe_key ‖
+                            // PUI` to that key so only the requester can open it — this
+                            // is how the pipe key (the teardown credential) propagates
+                            // down the path to relays.
+                            let bundle = pid_at(&name, 1)
+                                .and_then(|id| registry.pipe_key(&id))
+                                .zip(interest.app_parameters())
+                                .and_then(|(key, pubkey)| {
+                                    seal(pubkey, &encode_pipe_bundle(&key, pui.as_millis() as u64))
+                                });
+                            match bundle {
+                                Some(sealed) => {
+                                    let d = DataBuilder::new(name, &sealed).build();
+                                    responder.respond_bytes(d).await.ok();
+                                }
+                                None => drop(responder), // unknown pipe / no requester key
                             }
                         }
                         _ => match segments.get(&name.to_string()) {

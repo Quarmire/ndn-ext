@@ -151,6 +151,34 @@ pub fn decode_seek_reply(content: &[u8]) -> Option<(Bytes, u8)> {
     Some((Bytes::copy_from_slice(sealed), pipe_len))
 }
 
+/// The **PIPE-handshake bundle** (Table 8): the *plaintext* an upstream node seals
+/// to a requesting downstream node's public key, distributing the pipe key down the
+/// path so on-path relays can authenticate/announce teardown. Layout: `pipe_key ‖
+/// pui_ms` (u64 BE PUI in the trailing 8 bytes). The PIPE Data body is the *sealed*
+/// form of this; only the requester (holding the session private key) can open it.
+/// (`pipe_len`/consumer-id from Table 8 are derivable from the GHL/CHECK path and
+/// are left out of the bundle for now — extend by appending TLVs if needed.)
+pub fn encode_pipe_bundle(pipe_key: &[u8], pui_ms: u64) -> Vec<u8> {
+    let mut v = Vec::with_capacity(pipe_key.len() + 8);
+    v.extend_from_slice(pipe_key);
+    v.extend_from_slice(&pui_ms.to_be_bytes());
+    v
+}
+
+/// Parse an opened PIPE bundle into `(pipe_key, pui)`. The trailing 8 bytes are the
+/// PUI; everything before is the pipe key.
+pub fn decode_pipe_bundle(plain: &[u8]) -> Option<(Bytes, std::time::Duration)> {
+    if plain.len() <= 8 {
+        return None; // must have a non-empty key + the 8-byte PUI
+    }
+    let (key, pui) = plain.split_at(plain.len() - 8);
+    let pui_ms = u64::from_be_bytes(pui.try_into().ok()?);
+    Some((
+        Bytes::copy_from_slice(key),
+        std::time::Duration::from_millis(pui_ms),
+    ))
+}
+
 /// GHL hop ordering: a node's hop index is the **globally-set** hop limit minus
 /// the Interest's remaining hop limit — coordinator-free distributed addressing
 /// (thesis Fig. 12). The adjacent-downstream hop is `idx - 1`, upstream `idx + 1`.
@@ -191,6 +219,18 @@ mod tests {
         assert_eq!(classify(&check_name(b"p", 3)), Some(MessageKind::Check));
         assert_eq!(classify(&teardown_name(b"p")), Some(MessageKind::Teardown));
         assert_eq!(classify(&Name::from("/random/data")), None);
+    }
+
+    #[test]
+    fn pipe_bundle_codec_round_trips() {
+        let key = b"\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10";
+        let bundle = encode_pipe_bundle(key, 10_000);
+        let (got_key, pui) = decode_pipe_bundle(&bundle).expect("parses");
+        assert_eq!(got_key.as_ref(), key);
+        assert_eq!(pui, std::time::Duration::from_millis(10_000));
+        // Too short (no key, only PUI-sized or less) is rejected.
+        assert!(decode_pipe_bundle(&[0u8; 8]).is_none());
+        assert!(decode_pipe_bundle(&[]).is_none());
     }
 
     #[test]

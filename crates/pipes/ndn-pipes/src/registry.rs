@@ -61,6 +61,15 @@ impl PipeRegistry {
         }
     }
 
+    /// The pipe key for a live pipe (for the PIPE-handshake seal that hands it to an
+    /// on-path relay). `None` if the pipe is unknown or has lapsed.
+    pub(crate) fn pipe_key(&self, id: &[u8]) -> Option<Vec<u8>> {
+        let m = self.inner.lock().unwrap();
+        m.get(id)
+            .filter(|e| Instant::now() <= e.deadline)
+            .map(|e| e.pipe_key.clone())
+    }
+
     /// Authorize (and perform) a teardown: the supplied secret must equal the
     /// stored pipe key. An already-gone pipe is an idempotent success.
     pub(crate) fn teardown_authorized(&self, id: &[u8], secret: Option<&[u8]>) -> bool {
