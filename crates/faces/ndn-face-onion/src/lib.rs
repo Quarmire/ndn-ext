@@ -136,7 +136,8 @@ impl RelayOnionKey {
         }
         let eph_pub: [u8; 32] = layer[..EPH_LEN].try_into().unwrap();
         let hop_key = derive_hop_key(&self.secret.diffie_hellman(&PublicKey::from(eph_pub)));
-        let plaintext = open_sym(&hop_key, &layer[EPH_LEN..])?;
+        // Forward direction key (G5.6).
+        let plaintext = open_sym(&dir_key(&hop_key, DIR_FWD_INFO), &layer[EPH_LEN..])?;
         let (next_addr, inner) = decode_inner(&plaintext)?;
         Ok(Peeled {
             next: (!next_addr.is_empty()).then(|| Bytes::copy_from_slice(next_addr)),
@@ -212,7 +213,8 @@ impl Circuit {
 /// Relay side: add this relay's return layer to a returning `data` blob (symmetric under
 /// the hop key derived during [`RelayOnionKey::peel`]).
 pub fn wrap_return(hop_key: &HopKey, data: &[u8]) -> Result<Bytes, OnionError> {
-    Ok(Bytes::from(seal_sym(hop_key, data)?))
+    // Return direction key (G5.6) — distinct from the forward key under the same hop key.
+    Ok(Bytes::from(seal_sym(&dir_key(hop_key, DIR_RET_INFO), data)?))
 }
 
 /// Consumer side: peel every return layer (entry's outermost first, exit's innermost
@@ -223,7 +225,7 @@ pub fn unwrap_return(return_keys: &[HopKey], onion: &[u8]) -> Result<Bytes, Onio
     }
     let mut payload = onion.to_vec();
     for key in return_keys {
-        payload = open_sym(key, &payload)?;
+        payload = open_sym(&dir_key(key, DIR_RET_INFO), &payload)?;
     }
     Ok(Bytes::from(payload))
 }
@@ -342,15 +344,26 @@ impl OnionRelay {
     /// interest name bytes), so the return path can find it. Capacity-bounded (G5.4):
     /// the oldest record is evicted past [`MAX_PENDING`] so unanswered forwards can't grow
     /// memory without bound.
-    pub fn remember(&mut self, correlation: Vec<u8>, hop_key: HopKey) {
-        if self.pending.insert(correlation.clone(), hop_key).is_none() {
-            self.order.push_back(correlation);
-            while self.order.len() > MAX_PENDING {
-                if let Some(old) = self.order.pop_front() {
-                    self.pending.remove(&old);
-                }
+    ///
+    /// Returns `false` if a live record already exists for `correlation` (G5.5): two
+    /// concurrent circuits forwarding the **same** inner name would otherwise collide, and
+    /// silently overwriting the first hop key would make the first circuit's return
+    /// un-unwrappable. The existing record is **kept** (first-wins); the caller should treat
+    /// `false` as "this correlation is already in flight" (e.g. rely on PIT aggregation of
+    /// the inner Interest rather than forwarding a second copy).
+    #[must_use = "false means the correlation collided and was NOT recorded"]
+    pub fn remember(&mut self, correlation: Vec<u8>, hop_key: HopKey) -> bool {
+        if self.pending.contains_key(&correlation) {
+            return false; // collision — keep the first circuit's key
+        }
+        self.pending.insert(correlation.clone(), hop_key);
+        self.order.push_back(correlation);
+        while self.order.len() > MAX_PENDING {
+            if let Some(old) = self.order.pop_front() {
+                self.pending.remove(&old);
             }
         }
+        true
     }
 
     /// Re-wrap returning `data` with the hop key stored for `correlation` (consuming it).
@@ -383,6 +396,22 @@ fn derive_hop_key(shared: &x25519_dalek::SharedSecret) -> HopKey {
     okm
 }
 
+/// HKDF info labels that split a hop key into **direction-specific** sub-keys (G5.6).
+const DIR_FWD_INFO: &[u8] = b"ndn-onion/dir/fwd/v0";
+const DIR_RET_INFO: &[u8] = b"ndn-onion/dir/ret/v0";
+
+/// Derive a direction-specific AEAD key from the shared hop key, so the forward and return
+/// layers **never share a keystream space** under the same hop key. Without this, a forward
+/// and a return layer that happened to draw the same random nonce would reuse the
+/// ChaCha20-Poly1305 keystream (AAD alone doesn't prevent that) — a confidentiality break.
+fn dir_key(hop_key: &HopKey, info: &[u8]) -> HopKey {
+    let hk = Hkdf::<Sha256>::new(None, hop_key);
+    let mut okm = [0u8; 32];
+    hk.expand(info, &mut okm)
+        .expect("32 is a valid HKDF-SHA256 length");
+    okm
+}
+
 /// Forward layer: `eph_pub(32) ‖ nonce(12) ‖ tag(16) ‖ ciphertext`. Returns the layer +
 /// the derived hop key (kept by the consumer for the return path).
 fn seal_forward_layer(relay_pub: &[u8; 32], plaintext: &[u8]) -> Result<(Vec<u8>, HopKey), OnionError> {
@@ -391,7 +420,8 @@ fn seal_forward_layer(relay_pub: &[u8; 32], plaintext: &[u8]) -> Result<(Vec<u8>
     let eph = StaticSecret::from(eph_bytes);
     let eph_pub = PublicKey::from(&eph);
     let hop_key = derive_hop_key(&eph.diffie_hellman(&PublicKey::from(*relay_pub)));
-    let body = seal_sym(&hop_key, plaintext)?;
+    // Forward direction key (G5.6); the raw hop_key is returned for the return path.
+    let body = seal_sym(&dir_key(&hop_key, DIR_FWD_INFO), plaintext)?;
     let mut layer = Vec::with_capacity(EPH_LEN + body.len());
     layer.extend_from_slice(eph_pub.as_bytes());
     layer.extend_from_slice(&body);
@@ -583,7 +613,7 @@ mod tests {
         let mut i = 0;
         let real = loop {
             let p = relays[i].forward(&layer).unwrap();
-            relays[i].remember(p.inner.to_vec(), p.hop_key);
+            assert!(relays[i].remember(p.inner.to_vec(), p.hop_key), "fresh correlation stored");
             forwarded.push(p.inner.clone());
             match p.next {
                 Some(_) => {
@@ -651,10 +681,34 @@ mod tests {
     fn relay_pending_is_capacity_bounded() {
         let mut relay = OnionRelay::new(RelayOnionKey::generate().unwrap());
         for i in 0..(MAX_PENDING + 50) {
-            relay.remember(format!("corr-{i}").into_bytes(), [0u8; 32]);
+            assert!(relay.remember(format!("corr-{i}").into_bytes(), [0u8; 32]), "distinct correlations stored");
         }
         assert!(relay.pending.len() <= MAX_PENDING, "pending bounded at MAX_PENDING");
         assert!(relay.order.len() <= MAX_PENDING, "insertion log bounded too");
+    }
+
+    /// G5.5: a duplicate live correlation is rejected (first-wins), not silently overwritten
+    /// — so the first circuit's return key survives.
+    #[test]
+    fn duplicate_correlation_is_rejected_first_wins() {
+        let mut relay = OnionRelay::new(RelayOnionKey::generate().unwrap());
+        assert!(relay.remember(b"same-name".to_vec(), [1u8; 32]), "first stored");
+        assert!(!relay.remember(b"same-name".to_vec(), [2u8; 32]), "duplicate rejected");
+        // The first circuit's key is intact, so its return can still be re-wrapped.
+        assert!(relay.wrap_return(b"same-name", b"data").is_some());
+    }
+
+    /// G5.6: forward and return derive distinct keys from the same hop key, so the two
+    /// directions never share a keystream space.
+    #[test]
+    fn forward_and_return_keys_are_distinct() {
+        let hop: HopKey = [9u8; 32];
+        assert_ne!(
+            dir_key(&hop, DIR_FWD_INFO),
+            dir_key(&hop, DIR_RET_INFO),
+            "forward and return sub-keys differ"
+        );
+        assert_ne!(dir_key(&hop, DIR_FWD_INFO), hop, "sub-key differs from the raw hop key");
     }
 
     /// G5.4: the consumer's outstanding-request map is likewise bounded.
