@@ -177,6 +177,13 @@ impl RelayPipeStore {
             None => true,
         }
     }
+
+    /// Remove a pipe's state unconditionally, returning its namespace if it was held.
+    /// The caller must have already authorized the teardown (the PathControl hook
+    /// verifies the possession proof before this runs); this is the post-auth reap.
+    pub fn reap_now(&self, id: &[u8]) -> Option<Name> {
+        self.inner.lock().unwrap().remove(id).map(|e| e.namespace)
+    }
 }
 
 /// A pipe relay: serves the COMMON control channel for one node on the path.

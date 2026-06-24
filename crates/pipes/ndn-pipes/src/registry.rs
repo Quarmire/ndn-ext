@@ -70,21 +70,11 @@ impl PipeRegistry {
             .map(|e| e.pipe_key.clone())
     }
 
-    /// Authorize (and perform) a teardown: the supplied secret must equal the
-    /// stored pipe key. An already-gone pipe is an idempotent success.
-    pub(crate) fn teardown_authorized(&self, id: &[u8], secret: Option<&[u8]>) -> bool {
-        let mut m = self.inner.lock().unwrap();
-        match m.get(id) {
-            Some(e) => {
-                if secret == Some(e.pipe_key.as_slice()) {
-                    m.remove(id);
-                    true
-                } else {
-                    false // wrong pipe key — reject the teardown
-                }
-            }
-            None => true, // already torn down: idempotent no-op
-        }
+    /// Remove a pipe's state unconditionally (post-authorization reap). The PathControl
+    /// hook verifies the teardown possession proof before this runs, so no secret is
+    /// re-checked here. Idempotent — removing an already-gone pipe is a no-op.
+    pub(crate) fn reap_now(&self, id: &[u8]) {
+        self.inner.lock().unwrap().remove(id);
     }
 
     /// Read-only snapshot of the live (unexpired) pipes, sorted by id — the

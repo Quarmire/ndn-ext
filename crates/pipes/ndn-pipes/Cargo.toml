@@ -27,6 +27,9 @@ ndn-app       = { workspace = true }
 ndn-coding    = { path = "../../coding/ndn-coding" }
 # Tier-0 / NAC-baseline AEAD (ChaCha20-Poly1305, no_std) for encrypt-then-code.
 ndn-crypto-core = { workspace = true }
+# Teardown possession-proof MAC (fixed-format SHA-256 over the pipe key + binding):
+# proves membership without putting the pipe key on the wire.
+sha2          = { workspace = true }
 # Handshake sealed box (X25519 ECDH + HKDF-SHA256 + AES-256-GCM): seals the pipe
 # id + pipe key to the consumer pubkey. Shared with ndn-compute.
 ndn-sealed-box = { workspace = true }
