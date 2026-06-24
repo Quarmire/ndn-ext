@@ -1,0 +1,15 @@
+[package]
+name = "ndn-face-onion"
+description = "ANDaNA-style onion/oblivious forwarding for NDN (G5, draft): layered per-hop encryption so no single relay links consumer to name. Non-standard research primitive."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "extension"
+
+[dependencies]
+ndn-crypto-core = { workspace = true }
+bytes           = { workspace = true, features = ["std"] }
+getrandom       = { workspace = true }
+thiserror       = { workspace = true }
