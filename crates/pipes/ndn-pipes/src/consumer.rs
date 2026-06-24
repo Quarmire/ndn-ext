@@ -13,8 +13,9 @@ use ndn_packet::{Interest, Name};
 
 use crate::crypto::{ConsumerSession, PIPE_ID_LEN, PIPE_KEY_LEN};
 use crate::message::{
-    GHL, check_name, context_name, decode_seek_reply, join_name, seek_name, teardown_name,
+    GHL, check_name, context_name, decode_seek_reply, join_name, seek_name,
 };
+use crate::pathcontrol::{now_seq, pipe_teardown_interest};
 use crate::{Pipe, PipeError, PipeId, PipeParams};
 
 /// What a SEEK established: the recovered pipe id, the pipe key (for TEARDOWN),
@@ -225,17 +226,22 @@ impl PipeConsumer {
             .ok_or_else(|| PipeError::Crypto("pushed bulk decrypt/auth failed".into()))
     }
 
-    /// Tear the pipe down: send a TEARDOWN carrying the pipe id as the capability
-    /// (the real protocol signs it with the pipe private key). The producer (and
-    /// any on-path relay) reclaims the pipe and acks `BYE`; teardown is
-    /// idempotent, so a repeat is harmless.
+    /// Tear the pipe down with a PathControl `Teardown` path-walk: each on-path
+    /// forwarder's hook reaps that hop's pipe state (producer and relays), authorized by
+    /// the pipe key carried as the membership credential. It returns no Data — the
+    /// forwarder hook consumes the control Interest — so the (expected) timeout is not an
+    /// error; teardown is idempotent, so a repeat is harmless.
     pub async fn close(&mut self, pipe: &Pipe) -> Result<(), PipeError> {
-        let i = InterestBuilder::new(teardown_name(pipe.id.as_bytes()))
-            .app_parameters(pipe.teardown_secret.to_vec())
-            .hop_limit(GHL)
-            .must_be_fresh()
-            .lifetime(Duration::from_secs(2));
-        self.consumer.fetch_with(i).await?;
+        let wire = pipe_teardown_interest(
+            &pipe.namespace,
+            pipe.id.as_bytes(),
+            pipe.teardown_secret.as_ref(),
+            now_seq(),
+        );
+        // The teardown is emitted on the way in; no Data returns, so this short wait is
+        // only a flush/settle window (the forwarder reaps as it processes the walk), not
+        // a round-trip — hence the timeout is expected and ignored.
+        let _ = self.consumer.fetch_wire(wire, Duration::from_millis(250)).await;
         Ok(())
     }
 

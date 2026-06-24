@@ -271,24 +271,6 @@ impl PipeProducer {
                                 drop(responder);
                             }
                         }
-                        Some(MessageKind::Teardown) => {
-                            // Authenticated reclaim: the TEARDOWN must carry the
-                            // pipe key (sealed to the consumer, never in a name)
-                            // in its app-params. A relay that saw the JOIN knows
-                            // the pipe id but not the key, so it cannot forge
-                            // this. A teardown for an already-gone pipe is an
-                            // idempotent no-op ack (the suppression floor).
-                            let provided = interest.app_parameters().map(|b| b.to_vec());
-                            let ok = pid_at(&name, 1)
-                                .map(|k| registry.teardown_authorized(&k, provided.as_deref()))
-                                .unwrap_or(false);
-                            if ok {
-                                let d = DataBuilder::new(name, b"BYE").build();
-                                responder.respond_bytes(d).await.ok();
-                            } else {
-                                drop(responder);
-                            }
-                        }
                         Some(MessageKind::Pipe) => {
                             // PIPE-handshake (Table 8): an on-path downstream node
                             // requests the pipe key, sending its X25519 public key in

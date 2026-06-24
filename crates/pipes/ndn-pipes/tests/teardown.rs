@@ -1,9 +1,15 @@
-//! Slice-6 witness: teardown. A pipe is reclaimed two ways — an explicit
-//! TEARDOWN from the consumer, and PUI inactivity (no CHECK keep-alive within
-//! the Promised Use Interval). A live pipe answers CHECK with `OK`; a reclaimed
-//! one goes silent, so the consumer's liveness probe times out to `false`.
-//! CHECK doubles as the keep-alive, so steady use renews the promise.
+//! Slice-6 witness: teardown. A pipe is reclaimed two ways — an explicit teardown
+//! from the consumer (now a PathControl `Teardown` path-walk reaped by the forwarder's
+//! membership-authorized hook) and PUI inactivity (no CHECK keep-alive within the
+//! Promised Use Interval). A live pipe answers CHECK with `OK`; a reclaimed one goes
+//! silent, so the consumer's liveness probe times out to `false`. CHECK doubles as the
+//! keep-alive, so steady use renews the promise.
+//!
+//! The explicit-teardown path needs the forwarder's teardown adapter
+//! (`PipeTeardownControl`), so this witness is built with the `engine` feature.
+#![cfg(feature = "engine")]
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use ndn_app::{Consumer, EngineBuilder, Producer};
@@ -12,10 +18,12 @@ use ndn_face::local::InProcFace;
 use ndn_packet::Name;
 use ndn_transport::FaceId;
 
-use ndn_pipes::{Confidentiality, PipeConsumer, PipeParams, PipeProducer};
+use ndn_pipes::{Confidentiality, PipeConsumer, PipeParams, PipeProducer, PipeTeardownControl};
 
-/// Stand up a single-engine consumer↔producer pipe; the producer's PUI is `pui`.
-/// Returns the wired-up consumer + the open pipe, plus the teardown handles.
+/// Stand up a single-engine consumer↔producer pipe; the producer's PUI is `pui`. The
+/// producer's teardown adapter is registered on the engine, so a consumer teardown
+/// path-walk reaps the producer's pipe state via the forwarder hook. Returns the
+/// wired-up consumer + the open pipe, plus the teardown handles.
 async fn open_pipe(
     pui: Duration,
 ) -> (
@@ -27,16 +35,9 @@ async fn open_pipe(
 ) {
     let (consumer_face, consumer_handle) = InProcFace::new(FaceId(1), 256);
     let (producer_face, producer_handle) = InProcFace::new(FaceId(2), 256);
-    let (engine, shutdown) = EngineBuilder::new(EngineConfig::default())
-        .face(consumer_face)
-        .face(producer_face)
-        .build()
-        .await
-        .expect("engine build");
     let root: Name = "/".parse().unwrap();
-    engine.fib().add_nexthop(&root, FaceId(2), 0);
 
-    let producer = PipeProducer::new(Producer::from_handle(producer_handle, root))
+    let producer = PipeProducer::new(Producer::from_handle(producer_handle, root.clone()))
         .with_pui(pui)
         .serve_object(
             &"/sensors/temp/v=42".parse().unwrap(),
@@ -46,6 +47,17 @@ async fn open_pipe(
             &[],
             &Confidentiality::None,
         );
+    let adapter = Arc::new(PipeTeardownControl::new(producer.registry()));
+    let (engine, shutdown) = EngineBuilder::new(EngineConfig::default())
+        .face(consumer_face)
+        .face(producer_face)
+        .path_authorizer(adapter.clone())
+        .path_control_observer(adapter.clone())
+        .build()
+        .await
+        .expect("engine build");
+    engine.fib().add_nexthop(&root, FaceId(2), 0);
+
     let serve = tokio::spawn(async move { producer.serve().await });
 
     let mut pc = PipeConsumer::new(Consumer::from_handle(consumer_handle));
@@ -61,10 +73,13 @@ async fn explicit_teardown_reclaims_the_pipe() {
     let (mut pc, pipe, engine, shutdown, serve) = open_pipe(Duration::from_secs(10)).await;
 
     assert!(pc.is_alive(&pipe).await, "pipe is live right after opening");
-    pc.close(&pipe).await.expect("teardown acked");
+    // A PathControl teardown is fire-and-forget (no Data comes back); the reap is
+    // observable through CHECK going silent.
+    pc.close(&pipe).await.expect("teardown emitted");
     assert!(!pc.is_alive(&pipe).await, "torn-down pipe no longer answers CHECK");
-    // Teardown is idempotent — a repeat is a harmless no-op (suppression floor).
-    pc.close(&pipe).await.expect("repeat teardown still acks");
+    // Teardown is idempotent — a repeat is a harmless no-op (the pipe is already gone).
+    pc.close(&pipe).await.expect("repeat teardown emitted");
+    assert!(!pc.is_alive(&pipe).await, "still torn down after a repeat");
 
     drop(pc);
     drop(engine);

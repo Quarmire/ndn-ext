@@ -21,11 +21,10 @@ use ndn_app::{AppError, Consumer, Producer};
 use ndn_packet::Name;
 use ndn_packet::encode::DataBuilder;
 
-use ndn_packet::encode::InterestBuilder;
-
 use crate::crypto::seal;
 use crate::keyexchange::fetch_pipe_key;
-use crate::message::{GHL, MessageKind, classify, encode_pipe_bundle, hop_index, teardown_name};
+use crate::message::{GHL, MessageKind, classify, encode_pipe_bundle, hop_index};
+use crate::pathcontrol::{now_seq, pipe_teardown_interest};
 
 /// A relay's table of pipe keys it has learned (id → key + PUI), the teardown
 /// credential for pipes passing through it. Cheaply cloneable (`Arc`): the learn path
@@ -53,9 +52,10 @@ struct RelayEntry {
     announced: bool,
 }
 
-/// One pipe the monitor has decided to tear down (its id + the membership key the
-/// announcement must carry).
+/// One pipe the monitor has decided to tear down: its namespace (the PathControl
+/// teardown walks this prefix), id, and the membership key the announcement carries.
 pub(crate) struct DueTeardown {
+    pub namespace: Name,
     pub id: Vec<u8>,
     pub pipe_key: Vec<u8>,
 }
@@ -123,6 +123,7 @@ impl RelayPipeStore {
             if !e.announced && now.duration_since(e.last_activity) > threshold {
                 e.announced = true;
                 out.push(DueTeardown {
+                    namespace: e.namespace.clone(),
                     id: id.clone(),
                     pipe_key: e.pipe_key.clone(),
                 });
@@ -238,30 +239,6 @@ impl PipeRelay {
                             };
                             responder.respond_bytes(d).await.ok();
                         }
-                        Some(MessageKind::Teardown) => {
-                            // Membership-authenticated reap: the TEARDOWN must carry the
-                            // pipe key in its app-params. On success, reap this relay's
-                            // pipe state and `suppress` the namespace — the *receive*
-                            // side of slice-2 suppression (a peer beat us to it, so
-                            // cancel our own pending announcement). An already-gone pipe
-                            // is an idempotent BYE; a wrong key is dropped.
-                            let id = pid_at1(&name);
-                            let provided = interest.app_parameters().map(|b| b.to_vec());
-                            let ns = id.as_deref().and_then(|i| store.namespace_of(i));
-                            let ok = id
-                                .as_deref()
-                                .map(|i| store.teardown_authorized(i, provided.as_deref()))
-                                .unwrap_or(false);
-                            if ok {
-                                if let Some(ns) = ns {
-                                    store.suppress(&ns);
-                                }
-                                let d = DataBuilder::new(name, b"BYE").build();
-                                responder.respond_bytes(d).await.ok();
-                            } else {
-                                drop(responder); // wrong pipe key — reject
-                            }
-                        }
                         Some(MessageKind::Context | MessageKind::Link) => {
                             let d = DataBuilder::new(name, &[hop]).build();
                             responder.respond_bytes(d).await.ok();
@@ -278,8 +255,9 @@ impl PipeRelay {
 /// any pipe whose namespace has been idle past its per-hop threshold. Spawn alongside
 /// [`PipeRelay::serve`] (share its [`store`](PipeRelay::store)); the caller aborts the
 /// task to stop it. `quantum` is the per-hop delay step (nonuniform suppression);
-/// `tick` the poll cadence. Each announcement is the membership-authenticated TEARDOWN
-/// (pipe key in app-params) — the existing wire (slice 4 migrates it to PathControl).
+/// `tick` the poll cadence. Each announcement is a membership-authenticated PathControl
+/// `Teardown` (slice 4): a single signed-by-membership path-walk that reaps this relay's
+/// state (the emitter's own engine hook) and every downstream hop's, toward the producer.
 pub async fn run_relay_monitor(
     store: RelayPipeStore,
     mut emitter: Consumer,
@@ -289,11 +267,9 @@ pub async fn run_relay_monitor(
     loop {
         tokio::time::sleep(tick).await;
         for due in store.due(quantum) {
-            // Fire-and-forget announcement (a BYE ack may or may not return).
-            let wire = InterestBuilder::new(teardown_name(&due.id))
-                .app_parameters(due.pipe_key)
-                .lifetime(tick)
-                .build();
+            // Fire-and-forget: a teardown path-walk returns no Data (the forwarder hook
+            // consumes it), so the fetch is expected to time out.
+            let wire = pipe_teardown_interest(&due.namespace, &due.id, &due.pipe_key, now_seq());
             let _ = emitter.fetch_wire(wire, tick).await;
         }
     }

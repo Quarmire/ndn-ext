@@ -20,7 +20,6 @@ mod crypto;
 pub mod keyexchange;
 pub mod message;
 mod mgmt;
-#[cfg(feature = "pathcontrol")]
 pub mod pathcontrol;
 pub mod pipe;
 mod producer;
@@ -36,18 +35,19 @@ pub use keyexchange::fetch_pipe_key;
 pub use message::{
     COMMON_PREFIX, GHL, JOIN_PREFIX, MessageKind, SEEK_PREFIX, check_name, classify, context_name,
     decode_pipe_bundle, decode_seek_reply, encode_pipe_bundle, encode_seek_reply, hop_index,
-    join_name, link_name, pipe_name, seek_name, teardown_name,
+    join_name, link_name, pipe_name, seek_name,
 };
 pub use mgmt::{PipesModule, render_list};
 pub use pipe::{Pipe, PipeId, PipeParams};
 pub use producer::PipeProducer;
 pub use registry::{PipeInfo, PipeRegistry};
 pub use relay::{PipeRelay, RelayPipeStore, run_relay_monitor};
-#[cfg(feature = "pathcontrol")]
 pub use pathcontrol::{
-    PipeMembership, PipeTeardownControl, decode_pipe_teardown_params, encode_pipe_teardown_params,
+    PipeMembership, decode_pipe_teardown_params, encode_pipe_teardown_params, now_seq,
     pipe_teardown_interest,
 };
+#[cfg(feature = "engine")]
+pub use pathcontrol::PipeTeardownControl;
 
 /// Errors from pipe setup and transfer.
 #[derive(Debug, thiserror::Error)]

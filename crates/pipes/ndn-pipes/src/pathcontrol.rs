@@ -15,12 +15,14 @@
 //! ApplicationParameters is the membership credential. (MAP-Me's `Redirect` keeps its
 //! `Validator` authorizer; pipes never `Redirect` — they teardown-and-rebuild.)
 //!
-//! Feature-gated (`pathcontrol`) so the core stays forwarder-agnostic.
+//! The teardown *wire* (the emit helper + codec + the [`PipeMembership`] view) is
+//! unconditional. The in-engine adapter [`PipeTeardownControl`] — which plugs this into
+//! a running forwarder's PathControl hook — is behind the `engine` feature, so the core
+//! stays forwarder-agnostic.
 
 use bytes::Bytes;
-use ndn_engine::{PathAuthorizer, PathControlObserver};
 use ndn_packet::encode::InterestBuilder;
-use ndn_packet::{Interest, Name};
+use ndn_packet::Name;
 use ndn_pathcontrol::{PathControl, PathOp};
 
 use crate::registry::PipeRegistry;
@@ -118,24 +120,42 @@ pub fn pipe_teardown_interest(namespace: &Name, id: &[u8], key: &[u8], seq: u64)
         .build()
 }
 
+/// A monotonic PathControl sequence number for teardown emitters: wall-clock
+/// milliseconds. Globally increasing across emitters and across namespace reuse (a new
+/// pipe reusing a torn-down namespace gets a strictly-higher seq, so the forwarder's
+/// `SeqStore` admits its teardown rather than treating it as a stale duplicate).
+/// Two emitters firing in the same millisecond collide — benign, since the loser is
+/// simply deduped, which is the announcement suppression.
+pub fn now_seq() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Hosts pipe teardown on the forwarder's PathControl hook. Registered as **both** the
-/// [`PathAuthorizer`] (membership check) and the [`PathControlObserver`] (reap) on a
-/// node's engine, backed by that node's [`PipeMembership`] (a [`RelayPipeStore`] on a
-/// relay, the [`PipeRegistry`] on the producer). A `Teardown` walking the path is then
+/// `PathAuthorizer` (membership check) and the `PathControlObserver` (reap) on a node's
+/// engine, backed by that node's [`PipeMembership`] (a [`RelayPipeStore`] on a relay,
+/// the [`PipeRegistry`] on the producer). A `Teardown` walking the path is then
 /// authorized + reaped per hop by the forwarder — the app never sees it.
+///
+/// Behind the `engine` feature (it depends on `ndn-engine`).
+#[cfg(feature = "engine")]
 pub struct PipeTeardownControl<M> {
     membership: M,
 }
 
+#[cfg(feature = "engine")]
 impl<M: PipeMembership> PipeTeardownControl<M> {
     pub fn new(membership: M) -> Self {
         Self { membership }
     }
 }
 
+#[cfg(feature = "engine")]
 #[async_trait::async_trait]
-impl<M: PipeMembership> PathAuthorizer for PipeTeardownControl<M> {
-    async fn authorize(&self, pc: &PathControl, interest: &Interest) -> bool {
+impl<M: PipeMembership> ndn_engine::PathAuthorizer for PipeTeardownControl<M> {
+    async fn authorize(&self, pc: &PathControl, interest: &ndn_packet::Interest) -> bool {
         // This authorizer governs *teardown* only; it deliberately rejects Redirect
         // (pipes teardown-and-rebuild, they don't re-anchor).
         if pc.op != PathOp::Teardown {
@@ -152,7 +172,8 @@ impl<M: PipeMembership> PathAuthorizer for PipeTeardownControl<M> {
     }
 }
 
-impl<M: PipeMembership> PathControlObserver for PipeTeardownControl<M> {
+#[cfg(feature = "engine")]
+impl<M: PipeMembership> ndn_engine::PathControlObserver for PipeTeardownControl<M> {
     fn on_teardown(&self, pc: &PathControl, params: &[u8]) {
         if let Some((id, key)) = decode_pipe_teardown_params(params)
             && let Some(namespace) = self.membership.reap(&id, &key)

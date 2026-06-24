@@ -10,15 +10,17 @@ classification = "extension"
 
 [features]
 default = []
-# G3 PathControl teardown integration: the forwarder-hook adapter
-# (`PipeTeardownControl`) + the PathControl teardown emit helper, so pipe teardown
-# rides the generic PathControl path-walk. Pulls ndn-pathcontrol + ndn-engine (the
-# PathControl traits); off by default so the core stays forwarder-agnostic.
-pathcontrol = ["dep:ndn-pathcontrol", "dep:ndn-engine"]
+# The in-engine teardown adapter (`PipeTeardownControl`) — plugs pipe teardown into a
+# running forwarder's PathControl hook. Pulls ndn-engine (the PathControl traits); off
+# by default so the core stays forwarder-agnostic. The teardown *wire* itself is always
+# PathControl (ndn-pathcontrol is unconditional) — only the in-engine adapter needs the
+# forwarder crate.
+engine = ["dep:ndn-engine"]
 
 [dependencies]
 ndn-packet    = { workspace = true, features = ["std"] }
-ndn-pathcontrol = { workspace = true, optional = true }
+# Pipe teardown rides the generic PathControl path-walk; the emit wire is unconditional.
+ndn-pathcontrol = { workspace = true }
 ndn-engine    = { workspace = true, optional = true }
 ndn-app       = { workspace = true }
 # Default features (endpoint) for the coded bulk transfer (CodedFetcher/Producer).

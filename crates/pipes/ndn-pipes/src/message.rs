@@ -42,7 +42,6 @@ pub enum MessageKind {
     Link,
     Pipe,
     Check,
-    Teardown,
 }
 
 fn extend(mut n: Name, suffix: &Name) -> Name {
@@ -87,13 +86,6 @@ pub fn pipe_name(pipe_id: &[u8], hop: u32) -> Name {
         .append("PIPE")
 }
 
-/// `/COMMON/{pipe_id}/TEARDOWN` — pipe-wide teardown. Authenticated by the pipe
-/// private key in the real protocol; the crypto-stub treats the pipe id itself
-/// as the capability (only consumer + producer + on-path relays hold it).
-pub fn teardown_name(pipe_id: &[u8]) -> Name {
-    Name::from(COMMON_PREFIX).append(pipe_id).append("TEARDOWN")
-}
-
 /// `/{pipe_id}/{pipe_length}/CHECK` — the consumer's final liveness gate.
 pub fn check_name(pipe_id: &[u8], pipe_length: u32) -> Name {
     Name::root()
@@ -115,7 +107,7 @@ pub fn classify(name: &Name) -> Option<MessageKind> {
         return Some(MessageKind::Join);
     }
     // The verb is the last *generic* component: an Interest carrying
-    // ApplicationParameters (SEEK pubkey, TEARDOWN pipe key) has a trailing
+    // ApplicationParameters (e.g. the SEEK pubkey) has a trailing
     // ParametersSha256Digest component appended by the builder — skip it.
     match comps
         .iter()
@@ -127,7 +119,6 @@ pub fn classify(name: &Name) -> Option<MessageKind> {
         Some("LINK") => Some(MessageKind::Link),
         Some("PIPE") => Some(MessageKind::Pipe),
         Some("CHECK") => Some(MessageKind::Check),
-        Some("TEARDOWN") => Some(MessageKind::Teardown),
         _ => None,
     }
 }
@@ -217,7 +208,6 @@ mod tests {
         assert_eq!(classify(&link_name(b"p", 1)), Some(MessageKind::Link));
         assert_eq!(classify(&pipe_name(b"p", 1)), Some(MessageKind::Pipe));
         assert_eq!(classify(&check_name(b"p", 3)), Some(MessageKind::Check));
-        assert_eq!(classify(&teardown_name(b"p")), Some(MessageKind::Teardown));
         assert_eq!(classify(&Name::from("/random/data")), None);
     }
 

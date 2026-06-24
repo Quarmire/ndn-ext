@@ -7,7 +7,7 @@
 //! the pipe's path is authorized by membership (the pipe key in app-params) and reaps
 //! the relay's per-hop state — the forwarder, not the app, does the cleanup. A teardown
 //! carrying the wrong key never gets past the authorizer.
-#![cfg(feature = "pathcontrol")]
+#![cfg(feature = "engine")]
 
 use std::sync::Arc;
 use std::time::Duration;
