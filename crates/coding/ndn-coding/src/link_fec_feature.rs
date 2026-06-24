@@ -21,6 +21,10 @@ use ndn_transport::link_service::{LinkServiceFeature, TickCtx};
 
 use crate::link_fec::{LinkFecRx, LinkFecTx};
 
+/// Maximum total frames per generation `N = K + R` the systematic codec supports (a coded
+/// frame's index is a single byte). Configurations are clamped to keep `K + R ≤ MAX_N`.
+const MAX_N: u16 = 255;
+
 /// Link-FEC behind the [`LinkServiceFeature`] seam. A *generation* of K source frames is
 /// transmitted as K+R coded frames; a receiver recovers all K from any K of the N.
 ///
@@ -46,10 +50,20 @@ impl LinkFecFeature {
     /// `k` source frames per generation, `redundancy` parity frames (losses tolerated per
     /// generation), `window` = how long a partial generation waits before a tail flush.
     /// Constructed disabled.
+    ///
+    /// The systematic codec requires `N = K + R ≤ 255`. A configuration that would exceed
+    /// that makes **every** generation fail to encode — i.e. silently dropped traffic — so
+    /// the parameters are **clamped into range here** (rather than failing later, per
+    /// generation): `redundancy` to ≤ `MAX_N - 1` and `k` to `1..=(MAX_N - redundancy)`.
+    /// With in-range parameters [`encode`](Self::encode) cannot fail on N, so a valid
+    /// generation is never dropped.
     pub fn new(k: usize, redundancy: u16, window: Duration) -> Self {
+        // Clamp so K + R ≤ MAX_N (leaving room for at least one source frame).
+        let redundancy = redundancy.min(MAX_N - 1);
+        let k = k.clamp(1, (MAX_N - redundancy) as usize);
         Self {
             enabled: AtomicBool::new(false),
-            k: k.max(1),
+            k,
             window,
             tx: Mutex::new(LinkFecTx::new(redundancy)),
             rx: Mutex::new(LinkFecRx::new()),
@@ -92,6 +106,11 @@ impl LinkFecFeature {
     /// transmit **now** — empty while the generation is still filling (held for batching),
     /// or the K+R coded frames once it reaches K. When disabled, passes the frame straight
     /// through (`[frame]`). Transmit each returned frame as its own link-layer unit.
+    ///
+    /// `#[must_use]`: the returned frames are the *only* copy of the buffered generation —
+    /// dropping them strands those source frames (they are not re-buffered). This makes the
+    /// transmit step impossible to forget at a call site.
+    #[must_use = "these coded frames must be transmitted, or the generation is lost"]
     pub fn on_send(&self, frame: Bytes) -> Vec<Bytes> {
         if !self.is_enabled() {
             return vec![frame];
@@ -108,9 +127,15 @@ impl LinkFecFeature {
     }
 
     /// Egress tail-flush: encode whatever partial generation is buffered (≥1 source) into
-    /// its coded frames. Drive this from the face's tick at the [`window`](Self::window)
-    /// cadence so a sub-K generation is not stranded. Empty when nothing is buffered or
-    /// the feature is disabled.
+    /// its coded frames. Empty when nothing is buffered or the feature is disabled.
+    ///
+    /// **Wiring contract (do not skip):** a face that enables this feature MUST drive
+    /// `flush()` from its tick at the [`window`](Self::window) cadence — [`tick`](#impl-LinkServiceFeature)
+    /// returns exactly that interval while enabled. Without it, a generation that never
+    /// reaches K (the common tail case) is buffered forever and those frames are never
+    /// sent. The `#[must_use]` return makes a dropped flush a compile warning, but the
+    /// *scheduling* of flush is the integrator's responsibility.
+    #[must_use = "these coded frames must be transmitted, or the tail generation is lost"]
     pub fn flush(&self) -> Vec<Bytes> {
         if !self.is_enabled() {
             return Vec::new();
@@ -131,8 +156,8 @@ impl LinkFecFeature {
                 self.gens_encoded.fetch_add(1, Ordering::Relaxed);
                 coded
             }
-            // A generation that can't be coded (e.g. N > 255) is dropped rather than sent
-            // un-coded; the redundancy/K config is the caller's to keep in range.
+            // Unreachable for an in-range config: `new` clamps K + R ≤ MAX_N, so the codec
+            // cannot reject on N here. Kept as a defensive drop (never send un-coded).
             Err(_) => Vec::new(),
         }
     }
@@ -174,6 +199,27 @@ mod tests {
 
     fn b(s: &str) -> Bytes {
         Bytes::from(s.to_owned())
+    }
+
+    #[test]
+    fn out_of_range_config_is_clamped_not_silently_dropping() {
+        // K + R > 255 would make every generation fail to encode (silent drop). `new` must
+        // clamp into range so a real generation still encodes + delivers.
+        let f = LinkFecFeature::new(usize::MAX, 1000, Duration::from_millis(20));
+        f.set_enabled(true);
+        assert!(f.generation_size() >= 1, "K clamped to at least 1");
+        assert!(
+            f.generation_size() + 1 <= MAX_N as usize,
+            "K + R kept within the codec's N bound"
+        );
+        // A full generation actually produces coded frames (not an empty silent drop).
+        let mut produced = 0usize;
+        for i in 0..f.generation_size() {
+            produced += f.on_send(b(&format!("f{i}"))).len();
+        }
+        produced += f.flush().len();
+        assert!(produced > 0, "a clamped config still encodes + emits a generation");
+        assert!(f.generations_encoded() >= 1);
     }
 
     #[test]
