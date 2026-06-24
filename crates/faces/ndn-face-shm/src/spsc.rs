@@ -84,6 +84,31 @@ fn shm_total_size(capacity: u32, slot_size: u32) -> usize {
     HEADER_SIZE + 2 * capacity as usize * slot_stride(slot_size)
 }
 
+/// Largest region geometry we'll map from a peer-declared header — a guard against
+/// mapping gigabytes off a bogus or hostile header.
+const MAX_REGION_SIZE: usize = 256 * 1024 * 1024;
+
+/// Validate a header-declared ring geometry before it's used for any indexing or
+/// mapping. A `capacity` of 0 is the dangerous one — every ring op computes
+/// `index % capacity`, so a zero would SIGFPE; a 0 `slot_size` and an oversized
+/// region are rejected for the same defensive reason the sealed paths already do.
+/// The size is computed with checked arithmetic so a hostile geometry can't even
+/// overflow the bounds check itself.
+fn validate_geometry(capacity: u32, slot_size: u32) -> Result<(), ShmError> {
+    if capacity == 0 || slot_size == 0 {
+        return Err(ShmError::InvalidGeometry);
+    }
+    let stride = 4usize.checked_add(slot_size as usize);
+    let total = stride
+        .and_then(|s| s.checked_mul(capacity as usize))
+        .and_then(|s| s.checked_mul(2))
+        .and_then(|s| s.checked_add(HEADER_SIZE));
+    match total {
+        Some(t) if t <= MAX_REGION_SIZE => Ok(()),
+        _ => Err(ShmError::InvalidGeometry),
+    }
+}
+
 fn a2e_ring_offset() -> usize {
     HEADER_SIZE
 }
@@ -103,6 +128,20 @@ fn e2a_pipe_path(name: &str) -> PathBuf {
     PathBuf::from(format!("/tmp/.ndn-{name}.e2a.pipe"))
 }
 
+/// Verify the object behind `fd` is at least `size` bytes before it's mapped — a
+/// region truncated below its declared geometry would SIGBUS on first access to the
+/// short pages. `fstat` is cheap and runs once at open/handoff time.
+fn fstat_at_least(fd: RawFd, size: usize) -> Result<(), ShmError> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut st) } == -1 {
+        return Err(ShmError::Io(std::io::Error::last_os_error()));
+    }
+    if (st.st_size as u64) < size as u64 {
+        return Err(ShmError::InvalidGeometry);
+    }
+    Ok(())
+}
+
 /// Owns a POSIX SHM mapping; the creator unlinks the name on drop.
 struct ShmRegion {
     ptr: *mut u8,
@@ -116,13 +155,23 @@ unsafe impl Sync for ShmRegion {}
 impl ShmRegion {
     fn create(shm_name: &str, size: usize) -> Result<Self, ShmError> {
         let cname = CString::new(shm_name).map_err(|_| ShmError::InvalidName)?;
+        // Clear any region left behind by a previous run of *ours* (same uid), then
+        // create exclusively. With O_EXCL we are guaranteed to be the creator, so the
+        // 0o600 mode below is the region's real mode — a squatter who pre-created the
+        // name (esp. a different uid we can't unlink) makes shm_open fail with EEXIST
+        // rather than us silently adopting their region (and their permissions).
+        unsafe { libc::shm_unlink(cname.as_ptr()) };
         let ptr = unsafe {
             let fd = libc::shm_open(
                 cname.as_ptr(),
-                libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
-                // 0o666 so an unprivileged app can connect to a router
-                // running as root; the SHM name is per app instance.
-                0o666 as libc::mode_t as libc::c_uint,
+                libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+                // 0o600 (owner-only): at 0o666 any local user can attach, read every
+                // frame, and inject forged ones into the ring. Owner-only matches the
+                // 0o600 wakeup FIFOs (which already gate this named path to a single
+                // uid). Cross-uid sharing (e.g. a root router ↔ an unprivileged app)
+                // must go through the capability fd-handoff or sealed path, where
+                // access is gated by a token rather than filesystem perms.
+                0o600 as libc::mode_t as libc::c_uint,
             );
             if fd == -1 {
                 return Err(ShmError::Io(std::io::Error::last_os_error()));
@@ -160,6 +209,15 @@ impl ShmRegion {
             let fd = libc::shm_open(cname.as_ptr(), libc::O_RDWR, 0);
             if fd == -1 {
                 return Err(ShmError::Io(std::io::Error::last_os_error()));
+            }
+
+            // The object's real size must cover the mapping we're about to make:
+            // mapping past the end and then touching those pages is a SIGBUS, so a
+            // region truncated below its header-declared geometry must be rejected,
+            // not mapped.
+            if let Err(e) = fstat_at_least(fd, size) {
+                libc::close(fd);
+                return Err(e);
             }
 
             let p = libc::mmap(
@@ -253,6 +311,7 @@ impl ShmRegion {
     /// lifetime; this only mmaps it (and `munmap`s on drop). No name is involved,
     /// so nothing is unlinked on drop.
     fn from_fd(fd: RawFd, size: usize) -> Result<Self, ShmError> {
+        fstat_at_least(fd, size)?;
         let ptr = unsafe {
             let p = libc::mmap(
                 std::ptr::null_mut(),
@@ -354,6 +413,7 @@ impl ShmRegion {
     /// from [`create_anon_ro`](Self::create_anon_ro): a consumer can read in place
     /// but the kernel refuses any writable mapping of this fd.
     fn from_fd_ro(fd: RawFd, size: usize) -> Result<Self, ShmError> {
+        fstat_at_least(fd, size)?;
         let ptr = unsafe {
             let p = libc::mmap(
                 std::ptr::null_mut(),
@@ -1589,6 +1649,9 @@ impl SpscHandle {
             (cap, slen)
         };
 
+        // Reject a bogus geometry (esp. capacity==0 → `% capacity` SIGFPE) before
+        // it's used to size the mapping or index any ring.
+        validate_geometry(capacity, slot_size)?;
         let size = shm_total_size(capacity, slot_size);
         let shm = ShmRegion::open(&shm_name_str, size)?;
         unsafe { shm.read_header()? };
@@ -1655,12 +1718,12 @@ impl SpscHandle {
             (cap, slen)
         };
 
-        let size = shm_total_size(capacity, slot_size);
         // Defensive bound: even though the region is handed by a trusted (token-
-        // gated) peer, refuse an absurd geometry rather than mmap gigabytes.
-        if size > 256 * 1024 * 1024 {
-            return Err(ShmError::InvalidMagic);
-        }
+        // gated) peer, refuse an absurd or degenerate geometry — a zero capacity
+        // would SIGFPE on the first `% capacity`, an oversized one would mmap
+        // gigabytes — rather than trust the header.
+        validate_geometry(capacity, slot_size)?;
+        let size = shm_total_size(capacity, slot_size);
         let shm = ShmRegion::from_fd(region_fd.as_raw_fd(), size)?;
         // region_fd may now be dropped — the mapping persists. The pipe fds are
         // retained (they carry the wakeups).
@@ -2853,6 +2916,27 @@ mod tests {
 
     fn test_name() -> String {
         format!("test-spsc-{}", std::process::id())
+    }
+
+    #[test]
+    fn geometry_validation_rejects_degenerate_and_oversized() {
+        // capacity == 0 is the dangerous one: every ring op does `% capacity`, so a
+        // peer-declared zero would SIGFPE before this guard.
+        assert!(matches!(
+            validate_geometry(0, DEFAULT_SLOT_SIZE),
+            Err(ShmError::InvalidGeometry)
+        ));
+        assert!(matches!(
+            validate_geometry(DEFAULT_CAPACITY, 0),
+            Err(ShmError::InvalidGeometry)
+        ));
+        // An absurd geometry that would map gigabytes is refused, not trusted.
+        assert!(matches!(
+            validate_geometry(u32::MAX, u32::MAX),
+            Err(ShmError::InvalidGeometry)
+        ));
+        // The defaults are valid.
+        assert!(validate_geometry(DEFAULT_CAPACITY, DEFAULT_SLOT_SIZE).is_ok());
     }
 
     // multi_thread runtime so AsyncFd can use the I/O driver.

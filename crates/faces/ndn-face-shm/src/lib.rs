@@ -30,6 +30,8 @@ pub enum ShmError {
     InvalidName,
     #[error("SHM region has wrong magic number (stale or wrong name?)")]
     InvalidMagic,
+    #[error("SHM region header declares an invalid geometry (zero/oversized capacity or slot)")]
+    InvalidGeometry,
     #[error("packet exceeds the SHM slot size")]
     PacketTooLarge,
     #[error("SHM face closed (peer died or cancelled)")]
