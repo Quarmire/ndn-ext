@@ -110,6 +110,12 @@ impl LinkFecFeature {
     /// `#[must_use]`: the returned frames are the *only* copy of the buffered generation —
     /// dropping them strands those source frames (they are not re-buffered). This makes the
     /// transmit step impossible to forget at a call site.
+    ///
+    /// **Concurrency (G7.4):** the `pending` mutex keeps this memory-safe under concurrent
+    /// callers, but generation *membership* then depends on lock-acquisition order — which K
+    /// frames land in one generation becomes non-deterministic. Drive `on_send` from a
+    /// **single egress task** (the intended use — a face's tx loop) for deterministic
+    /// generation grouping; concurrent callers get safe-but-arbitrary grouping.
     #[must_use = "these coded frames must be transmitted, or the generation is lost"]
     pub fn on_send(&self, frame: Bytes) -> Vec<Bytes> {
         if !self.is_enabled() {

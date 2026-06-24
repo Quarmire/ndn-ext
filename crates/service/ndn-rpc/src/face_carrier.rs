@@ -35,6 +35,15 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(4);
 /// requests and sets `Invocation::requester` to the verified `KeyLocator` identity. A
 /// validator-equipped server **drops** (does not answer) an unsigned/invalid request,
 /// so the client fails closed on timeout — the wire equivalent of `Unauthorized`.
+///
+/// **G2.3 — rejection manifests as a timeout, not a distinct error.** Because NDN drops
+/// rather than NACKs an unauthorized Interest, the client cannot distinguish "rejected as
+/// unauthorized" from "lost / no producer / slow" — both surface as
+/// `ServiceError::Transport` after `fetch_timeout` (default 4 s). This is inherent to the
+/// silent-drop model (unlike the in-process [`RpcCarrier`](crate::RpcCarrier), which can
+/// return `Unauthorized` directly). Tune `fetch_timeout` to trade failure latency vs.
+/// tolerance; an application that needs an explicit authorization verdict should use an
+/// app-layer NACK convention rather than inferring it from the timeout.
 pub struct FaceRpcCarrier {
     consumer: Option<Mutex<Consumer>>,
     producer: Mutex<Option<Producer>>,
