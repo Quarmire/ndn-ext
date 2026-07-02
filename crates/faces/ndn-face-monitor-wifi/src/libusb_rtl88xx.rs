@@ -4448,7 +4448,7 @@ impl LibUsbRtl88xxBackend {
 
     /// Build `[48-byte TX descriptor][802.11 frame]` for `frame`. The frame is
     /// a non-QoS data frame (or the format's frame) carrying the NDN payload;
-    /// the descriptor fixes the rate from `frame.mcs` (USE_RATE + DISDATAFB,
+    /// the descriptor fixes the rate from `mcs` (USE_RATE + DISDATAFB,
     /// no rate fallback) and routes the packet to the MGT/high queue.
     /// Build one TX unit (descriptor + 802.11 body). `agg = Some((agg_num,
     /// is_first))` marks it as part of an **A-MPDU**: the descriptor's AGG_EN +
@@ -4517,14 +4517,17 @@ impl LibUsbRtl88xxBackend {
         // 2-stream (`DESC_RATEVHTSS2MCS0` 0x36 + index). The chip builds the
         // HT-SIG / VHT-SIG PHY header from this code; 2-stream also needs the
         // 2SS TX path (`0x820=0x31`, set in `set_channel_bw20`).
-        let rate_code = if frame.mcs.vht {
-            if frame.mcs.nss >= 2 {
-                DESC_RATE_VHT2SS_MCS0 + frame.mcs.index
+        // Resolve the bearer-agnostic transmit intent to a concrete 802.11 rate
+        // for this radio (11ac-capable, up to the validated single-stream MCS).
+        let mcs = crate::McsDescriptor::for_intent(&frame.tx, crate::MAX_RELIABLE_MCS, true);
+        let rate_code = if mcs.vht {
+            if mcs.nss >= 2 {
+                DESC_RATE_VHT2SS_MCS0 + mcs.index
             } else {
-                DESC_RATE_VHT1SS_MCS0 + frame.mcs.index
+                DESC_RATE_VHT1SS_MCS0 + mcs.index
             }
         } else {
-            DESC_RATE_MCS0 + frame.mcs.index
+            DESC_RATE_MCS0 + mcs.index
         };
         // NDN_RADIO_TX_RATE=<dec> overrides the DESC_RATE code for A/B testing the
         // modulation. The kernel's monitor-inject golden descriptor uses 0x04 =
@@ -4538,7 +4541,7 @@ impl LibUsbRtl88xxBackend {
         txdesc_set(&mut buf, 0x10, 0, 7, rate_code as u32);
         txdesc_set(&mut buf, 0x10, 17, 1, 1); // RTY_LMT_EN (use the limit below)
         txdesc_set(&mut buf, 0x10, 18, 6, 6); // RTS_DATA_RTY_LMT = 6 (kernel default)
-        if frame.mcs.short_gi {
+        if mcs.short_gi {
             txdesc_set(&mut buf, 0x14, 4, 1, 1); // DATA_SHORT (SGI)
         }
         // DATA_BW (0x14[6:5]) = the channel bandwidth (20/40/80). The frame is
@@ -4559,7 +4562,7 @@ impl LibUsbRtl88xxBackend {
         // advertises it in the HT-SIG/VHT-SIG; a non-LDPC receiver ignores the
         // frame, an LDPC-capable one (the kernel rtl8812eu) decodes it.
         // `NDN_RADIO_LDPC=1` forces it on for on-air A/B regardless of the rate.
-        let ldpc = frame.mcs.ldpc || std::env::var("NDN_RADIO_LDPC").is_ok();
+        let ldpc = mcs.ldpc || std::env::var("NDN_RADIO_LDPC").is_ok();
         if ldpc {
             txdesc_set(&mut buf, 0x14, 7, 1, 1);
         }
@@ -4569,12 +4572,12 @@ impl LibUsbRtl88xxBackend {
         // a 1-stream rate (HT MCS0–7, or VHT `nss == 1`): there is no 802.11 STBC
         // mode for 2 spatial streams, so suppress the bit for 2-stream rates
         // rather than emit an illegal HT-SIG/VHT-SIG. `NDN_RADIO_STBC=1` forces it.
-        let one_stream = if frame.mcs.vht {
-            frame.mcs.nss < 2
+        let one_stream = if mcs.vht {
+            mcs.nss < 2
         } else {
-            frame.mcs.index < 8
+            mcs.index < 8
         };
-        let stbc = (frame.mcs.stbc || std::env::var("NDN_RADIO_STBC").is_ok()) && one_stream;
+        let stbc = (mcs.stbc || std::env::var("NDN_RADIO_STBC").is_ok()) && one_stream;
         if stbc {
             txdesc_set(&mut buf, 0x14, 8, 2, 1);
         }
@@ -4679,7 +4682,7 @@ impl LibUsbRtl88xxBackend {
         let body = self.build_amsdu_body(payloads, dst, src)?;
         let frame = InjectFrame {
             payload: Bytes::new(),
-            mcs,
+            tx: crate::TxIntent::wifi(mcs),
             dst,
             src,
         };
@@ -4718,7 +4721,7 @@ impl LibUsbRtl88xxBackend {
         let k = mpdus.len().min(0xff) as u8;
         let frame = InjectFrame {
             payload: Bytes::new(),
-            mcs,
+            tx: crate::TxIntent::wifi(mcs),
             dst,
             src,
         };
@@ -5008,7 +5011,7 @@ impl FrameIo for LibUsbRtl88xxBackend {
             while j < frames.len()
                 && frames[j].dst == f0.dst
                 && frames[j].src == f0.src
-                && frames[j].mcs == f0.mcs
+                && frames[j].tx == f0.tx
                 && bytes + frames[j].payload.len() <= MPDU_BUDGET
             {
                 bytes += frames[j].payload.len();
@@ -5019,7 +5022,8 @@ impl FrameIo for LibUsbRtl88xxBackend {
             } else {
                 let payloads: Vec<Bytes> =
                     frames[i..j].iter().map(|f| f.payload.clone()).collect();
-                self.inject_amsdu(&payloads, f0.mcs, f0.dst, f0.src).await?;
+                let mcs = crate::McsDescriptor::for_intent(&f0.tx, crate::MAX_RELIABLE_MCS, true);
+                self.inject_amsdu(&payloads, mcs, f0.dst, f0.src).await?;
             }
             i = j;
         }

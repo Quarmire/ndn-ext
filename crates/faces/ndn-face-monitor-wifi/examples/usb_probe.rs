@@ -856,7 +856,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return Ok(());
                 }
                 if ok {
-                    use ndn_face_monitor_wifi::{InjectFrame, McsDescriptor};
+                    use ndn_face_monitor_wifi::{InjectFrame, TxIntent};
                     // --qsel N: override the TX queue selector (default MGT 0x12;
                     // try BE=0x00 to test a normal EDCA data queue).
                     if let Some(q) = std::env::args()
@@ -932,7 +932,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             break;
                         }
                         let payload = bytes::Bytes::from(format!("ndn-rs monitor-wifi probe #{i}"));
-                        let frame = InjectFrame::broadcast(payload, McsDescriptor::CONSERVATIVE);
+                        let frame = InjectFrame::broadcast(payload, TxIntent::CONSERVATIVE);
                         match rt.block_on(
                             <ndn_face_monitor_wifi::LibUsbRtl88xxBackend as ndn_face_monitor_wifi::FrameIo>::inject(&radio, frame),
                         ) {

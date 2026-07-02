@@ -19,6 +19,7 @@
 //! multi-channel DWs, Device-Capability/Availability attributes, and NDP land in
 //! later phases — the structure here grows into them.
 
+use alloc::boxed::Box;
 use alloc::collections::{BTreeSet, VecDeque};
 use alloc::vec::Vec;
 
@@ -27,10 +28,10 @@ use crate::attr::{
     ServiceDescriptor, ServiceIdList,
 };
 use crate::frame::{classify, FrameType, NanBeacon, ServiceDiscoveryFrame};
+use crate::rendezvous::{DiscoveryWindow, Rendezvous};
 use crate::service::service_id;
 use crate::{
-    ServiceId, BROADCAST, DW_INTERVAL_TU, DW_LENGTH_TU, NAN_CLUSTER_ID_BASE, NAN_NETWORK_ID,
-    SYNC_BEACON_INTERVAL_TU, USEC_PER_TU,
+    ServiceId, BROADCAST, NAN_CLUSTER_ID_BASE, NAN_NETWORK_ID, SYNC_BEACON_INTERVAL_TU,
 };
 
 /// Microseconds — the engine's time unit (a free-running monotonic clock the
@@ -189,6 +190,11 @@ pub struct NanEngine {
     /// with the greater anchor-master rank wins; lower-graded members adopt its id
     /// + TSF). This is what makes our SDFs land in a peer's Discovery Window.
     cluster_amr: u64,
+    /// The wake / transmit schedule (medium-access mode). Defaults to the NAN
+    /// [`DiscoveryWindow`]; swap it for an always-on or TSCH schedule via
+    /// [`with_rendezvous`](NanEngine::with_rendezvous). The engine's timing is
+    /// neutral — this strategy owns "when."
+    rendezvous: Box<dyn Rendezvous>,
 }
 
 impl NanEngine {
@@ -210,7 +216,17 @@ impl NanEngine {
             channel_set: false,
             base_initialized: false,
             cluster_amr: own_rank,
+            rendezvous: Box::new(DiscoveryWindow),
         }
+    }
+
+    /// A new engine using an explicit rendezvous (medium-access) schedule instead
+    /// of the default [`DiscoveryWindow`] — e.g. [`AlwaysOn`](crate::AlwaysOn) for
+    /// a mains-powered / SDR relay that never sleeps.
+    pub fn with_rendezvous(cfg: NanConfig, rendezvous: Box<dyn Rendezvous>) -> Self {
+        let mut engine = Self::new(cfg);
+        engine.rendezvous = rendezvous;
+        engine
     }
 
     /// Our NMI.
@@ -286,30 +302,28 @@ impl NanEngine {
         now.wrapping_sub(self.base_time_usec)
     }
 
-    /// The current Discovery-Window index (one every 512 TU).
+    /// The current transmit-window index — one burst per window. Delegates to the
+    /// [`rendezvous`](crate::rendezvous) schedule (a Discovery-Window index by
+    /// default) over the synced clock.
     fn dw_index(&self, now: Usec) -> u64 {
-        (self.synced_usec(now) / USEC_PER_TU) / DW_INTERVAL_TU
+        self.rendezvous.window_index(self.synced_usec(now))
     }
 
-    /// Whether `now` falls within a Discovery Window (the first 16 of every
-    /// 512 TU).
+    /// Whether `now` falls within a transmit / listen window (a Discovery Window
+    /// by default), per the rendezvous schedule.
     fn in_dw(&self, now: Usec) -> bool {
-        let tu = self.synced_usec(now) / USEC_PER_TU;
-        (tu % DW_INTERVAL_TU) < DW_LENGTH_TU
+        self.rendezvous.in_window(self.synced_usec(now))
     }
 
-    /// Absolute usec of the start of the next Discovery Window after `now`.
+    /// Absolute (now-domain) usec of the next window start after `now`. The
+    /// rendezvous returns the next start in the synced domain; adding
+    /// `base_time_usec` maps it back to `now`'s domain. All arithmetic is modular
+    /// (mod 2^64), like the 802.11 TSF it tracks: after a cluster merge
+    /// `base_time_usec` is `now - anchor_tsf`, so the wrapping is correct and the
+    /// result lands back in `now`'s domain.
     fn next_dw_start_usec(&self, now: Usec) -> Usec {
-        // All TSF arithmetic is modular (mod 2^64), like the 802.11 timer it
-        // tracks: after a cluster merge `base_time_usec` is `now - anchor_tsf`,
-        // so `synced` is the (large) anchor TSF domain and these products are
-        // huge — wrapping is correct and lands the result back in `now`'s domain.
-        let tu = self.synced_usec(now) / USEC_PER_TU;
-        let next_dw_tu = (tu / DW_INTERVAL_TU)
-            .wrapping_add(1)
-            .wrapping_mul(DW_INTERVAL_TU);
         self.base_time_usec
-            .wrapping_add(next_dw_tu.wrapping_mul(USEC_PER_TU))
+            .wrapping_add(self.rendezvous.next_window_start(self.synced_usec(now)))
     }
 
     /// The main entry point. See the module docs.
@@ -591,6 +605,7 @@ fn rx_addr2(buf: &[u8]) -> [u8; 6] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::USEC_PER_TU;
 
     const A: [u8; 6] = [0x02, 0, 0, 0, 0, 0xAA];
     const B: [u8; 6] = [0x02, 0, 0, 0, 0, 0xBB];

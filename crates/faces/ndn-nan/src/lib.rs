@@ -40,7 +40,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use ndn_face_wifi_aware::{FaceError, FollowupFrame, NanBackend, NanMatch, NanServiceName};
-use ndn_frame_io::{CapturedFrame, FrameIo, InjectFrame, McsDescriptor, BROADCAST};
+use ndn_frame_io::{CapturedFrame, FrameIo, InjectFrame, TxIntent, BROADCAST};
 use ndn_nan_core::{service_id, NanConfig, NanEngine, NanEvent, RxFrame, ServiceId};
 use tokio::sync::mpsc;
 
@@ -237,7 +237,10 @@ impl EngineTask {
         for tx in step.tx {
             let frame = InjectFrame {
                 payload: Bytes::from(tx.bytes),
-                mcs: McsDescriptor::CONSERVATIVE,
+                // NAN beacons/SDFs are legacy-rate management frames: maximum
+                // robustness, broadcast. The backend maps this to its PHY (the
+                // 8812AU NAN backend forces legacy 6 Mbps OFDM regardless).
+                tx: TxIntent::ROBUST,
                 dst: BROADCAST,
                 src: self.nmi,
             };

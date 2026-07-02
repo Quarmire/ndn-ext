@@ -14,7 +14,7 @@
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use bytes::Bytes;
     use ndn_face_monitor_wifi::{
-        FaceId, InjectFrame, LibUsbRtl88xxBackend, McsDescriptor, MonitorWifiFace, FrameIo,
+        FaceId, InjectFrame, LibUsbRtl88xxBackend, McsDescriptor, TxIntent, MonitorWifiFace, FrameIo,
     };
     use std::sync::Arc;
 
@@ -155,7 +155,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let t0 = std::time::Instant::now();
     for _ in 0..count {
         backend
-            .inject(InjectFrame::broadcast(data.clone(), mcs))
+            .inject(InjectFrame::broadcast(data.clone(), TxIntent::wifi(mcs)))
             .await?;
     }
     let dt = t0.elapsed().as_secs_f64();

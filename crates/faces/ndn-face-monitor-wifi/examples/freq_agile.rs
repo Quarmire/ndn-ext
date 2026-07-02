@@ -24,7 +24,7 @@
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use bytes::Bytes;
     use ndn_face_monitor_wifi::{
-        ChannelBw, InjectFrame, LibUsbRtl88xxBackend, McsDescriptor, FrameIo,
+        ChannelBw, InjectFrame, LibUsbRtl88xxBackend, McsDescriptor, TxIntent, FrameIo,
     };
     use std::sync::Arc;
 
@@ -68,7 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("[announce] beaconing data ch{data_ch} on rendezvous ch{rendezvous_ch}…");
     for _ in 0..200 {
         backend
-            .inject(InjectFrame::broadcast(beacon.clone(), McsDescriptor::ht(1)))
+            .inject(InjectFrame::broadcast(beacon.clone(), TxIntent::wifi(McsDescriptor::ht(1))))
             .await?;
     }
 
@@ -78,7 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("[operate] sending data on ch{data_ch}…");
     for _ in 0..2000 {
         backend
-            .inject(InjectFrame::broadcast(data.clone(), McsDescriptor::ht(5)))
+            .inject(InjectFrame::broadcast(data.clone(), TxIntent::wifi(McsDescriptor::ht(5))))
             .await?;
     }
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;

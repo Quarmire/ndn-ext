@@ -1030,7 +1030,9 @@ impl Rtl8821cuBackend {
         txdesc_set(&mut buf, 1, 16, 5, 6); // W1 RATE_ID = 6
         txdesc_set(&mut buf, 2, 19, 1, 1); // W2 SPE_RPT
 
-        let rate = rate_code(&frame.mcs);
+        // Resolve the bearer-agnostic transmit intent to a concrete 802.11 rate.
+        let mcs = crate::McsDescriptor::for_intent(&frame.tx, crate::MAX_RELIABLE_MCS, true);
+        let rate = rate_code(&mcs);
         // The kernel injects with USE_RATE=0 (rate adaptation). Forcing a fixed
         // rate (USE_RATE+DISDATAFB) with no rate-table entry may be why TX didn't
         // key; default to the kernel style, `NDN_RADIO_FIXEDRATE=1` forces fixed.
@@ -1039,10 +1041,10 @@ impl Rtl8821cuBackend {
             txdesc_set(&mut buf, 3, 10, 1, 1); // W3 DISDATAFB
         }
         txdesc_set(&mut buf, 4, 0, 7, rate as u32); // W4 DATARATE
-        if frame.mcs.short_gi {
+        if mcs.short_gi {
             txdesc_set(&mut buf, 5, 4, 1, 1); // W5 DATA_SHORT (SGI)
         }
-        if frame.mcs.ldpc {
+        if mcs.ldpc {
             txdesc_set(&mut buf, 5, 7, 1, 1); // W5 DATA_LDPC
         }
         let seq = self.seq.fetch_add(1, Ordering::Relaxed) & 0x0fff;

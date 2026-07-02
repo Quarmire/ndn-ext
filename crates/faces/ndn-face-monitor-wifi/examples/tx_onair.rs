@@ -13,7 +13,7 @@
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use bytes::Bytes;
     use ndn_face_monitor_wifi::{
-        FrameIo, InjectFrame, LibUsbRtl88xxBackend, McsDescriptor, Rtl8821cuBackend,
+        FrameIo, InjectFrame, LibUsbRtl88xxBackend, TxIntent, Rtl8821cuBackend,
     };
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -52,7 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut p = MARKER.to_vec();
                 p.extend_from_slice(&i.to_le_bytes());
                 let _ = tx
-                    .inject(InjectFrame::broadcast(Bytes::from(p), McsDescriptor::CONSERVATIVE))
+                    .inject(InjectFrame::broadcast(Bytes::from(p), TxIntent::CONSERVATIVE))
                     .await;
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }

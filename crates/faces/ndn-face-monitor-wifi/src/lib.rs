@@ -86,8 +86,8 @@ use ndn_transport::{
 pub use ndn_frame_io::{
     BROADCAST, CapturedFrame, DEFAULT_SRC, ESPNOW_MAX_BODY, ESPNOW_OUI, FaceError, FaceId,
     FrameFormat, FrameIo, InjectFrame, LEGACY_ETHER_MTU, LoopbackEndpoint, LoopbackMonitorBus,
-    MAX_RELIABLE_MCS, MONITOR_MTU, McsDescriptor, McsPolicy, frame, mcs_for_rssi, mcs_phy_rate_bps,
-    name_group_mac, name_group_uni, radiotap,
+    MAX_RELIABLE_MCS, MONITOR_MTU, McsDescriptor, McsPolicy, Reach, Reliability, TxIntent, frame,
+    mcs_for_rssi, mcs_phy_rate_bps, name_group_mac, name_group_uni, radiotap,
 };
 #[cfg(target_os = "linux")]
 pub use ndn_frame_io::AfPacketBackend;
@@ -265,7 +265,7 @@ async fn inject_coded(
         let _ = backend
             .inject(InjectFrame {
                 payload: f.clone(),
-                mcs,
+                tx: TxIntent::wifi(mcs),
                 dst,
                 src,
             })
@@ -575,7 +575,7 @@ impl Transport for MonitorWifiFace {
         }
         let frame = InjectFrame {
             payload: wire,
-            mcs,
+            tx: TxIntent::wifi(mcs),
             dst,
             src,
         };
@@ -764,7 +764,7 @@ mod tests {
 
         a.inject(InjectFrame {
             payload: Bytes::from_static(b"hello"),
-            mcs: McsDescriptor::CONSERVATIVE,
+            tx: TxIntent::CONSERVATIVE,
             dst: BROADCAST,
             src: ADDR_A,
         })
@@ -798,7 +798,7 @@ mod tests {
 
         peer.inject(InjectFrame {
             payload: Bytes::from_static(b"x"),
-            mcs: McsDescriptor::CONSERVATIVE,
+            tx: TxIntent::CONSERVATIVE,
             dst: BROADCAST,
             src: ADDR_B,
         })
@@ -840,12 +840,12 @@ mod tests {
         let face = MonitorWifiFace::new(FaceId(1), Arc::new(bus.endpoint(1, -50)))
             .with_name_group("/sensors/temp");
         let peer = Arc::new(bus.endpoint(2, -50));
-        let mcs = McsDescriptor::CONSERVATIVE;
+        let tx = TxIntent::CONSERVATIVE;
 
         // Frame for a *different* group → filtered out (recv times out).
         peer.inject(InjectFrame {
             payload: Bytes::from_static(b"x"),
-            mcs,
+            tx,
             dst: name_group_mac(b"/other/feed"),
             src: name_group_uni(b"/other/feed"),
         })
@@ -857,7 +857,7 @@ mod tests {
         // Frame for our group → delivered.
         peer.inject(InjectFrame {
             payload: Bytes::from_static(b"mine"),
-            mcs,
+            tx,
             dst: name_group_mac(b"/sensors/temp"),
             src: name_group_uni(b"/sensors/temp"),
         })
@@ -870,7 +870,7 @@ mod tests {
         assert_eq!(got, Bytes::from_static(b"mine"));
 
         // Broadcast frame → also delivered (joins every group).
-        peer.inject(InjectFrame::broadcast(Bytes::from_static(b"bcast"), mcs))
+        peer.inject(InjectFrame::broadcast(Bytes::from_static(b"bcast"), tx))
             .await
             .unwrap();
         let got = tokio::time::timeout(Duration::from_millis(200), face.recv_bytes())

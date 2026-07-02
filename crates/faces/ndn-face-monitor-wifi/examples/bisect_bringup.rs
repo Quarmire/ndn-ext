@@ -13,7 +13,7 @@
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use bytes::Bytes;
-    use ndn_face_monitor_wifi::{InjectFrame, LibUsbRtl88xxBackend, McsDescriptor, FrameIo};
+    use ndn_face_monitor_wifi::{InjectFrame, LibUsbRtl88xxBackend, McsDescriptor, TxIntent, FrameIo};
     use std::sync::Arc;
 
     let channel: u8 = std::env::args()
@@ -67,7 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("flooding {count} frames at MCS1…");
     for _ in 0..count {
         backend
-            .inject(InjectFrame::broadcast(data.clone(), mcs))
+            .inject(InjectFrame::broadcast(data.clone(), TxIntent::wifi(mcs)))
             .await?;
     }
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;

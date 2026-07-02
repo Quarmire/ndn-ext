@@ -8,7 +8,7 @@
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use bytes::Bytes;
-    use ndn_face_monitor_wifi::{FrameIo, InjectFrame, McsDescriptor, Rtl8821cuBackend};
+    use ndn_face_monitor_wifi::{FrameIo, InjectFrame, TxIntent, Rtl8821cuBackend};
     use std::time::{Duration, Instant};
 
     let ch: u8 = std::env::var("NDN_RADIO_CHANNEL").ok().and_then(|s| s.parse().ok()).unwrap_or(36);
@@ -24,7 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     while Instant::now() < deadline {
         let mut p = MARKER.to_vec();
         p.extend_from_slice(&sent.to_le_bytes());
-        match dev.inject(InjectFrame::broadcast(Bytes::from(p), McsDescriptor::CONSERVATIVE)).await {
+        match dev.inject(InjectFrame::broadcast(Bytes::from(p), TxIntent::CONSERVATIVE)).await {
             Ok(()) => sent += 1,
             Err(_) => err += 1,
         }

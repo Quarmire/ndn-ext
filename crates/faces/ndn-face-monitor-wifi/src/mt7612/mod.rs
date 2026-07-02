@@ -1465,7 +1465,10 @@ impl FrameIo for Mt7612uBackend {
         // NDN frames are 802.11 DATA frames → data TXWI (wcid 0xff, no-ACK) on the
         // data AC endpoint (0x04). Mgmt TXWI/ep 0x07 would be dropped (see
         // build_data_bulk / docs/RADIO_SUBSYSTEM.md).
-        let buf = self.build_data_bulk(&dot11, &frame.mcs);
+        // Resolve the bearer-agnostic transmit intent to a concrete 802.11 rate
+        // (the MT7612U is 11ac-capable).
+        let mcs = crate::McsDescriptor::for_intent(&frame.tx, crate::MAX_RELIABLE_MCS, true);
+        let buf = self.build_data_bulk(&dot11, &mcs);
         self.send_bulk(buf).await
     }
 

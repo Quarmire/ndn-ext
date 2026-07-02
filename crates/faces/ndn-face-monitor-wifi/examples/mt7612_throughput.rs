@@ -6,7 +6,7 @@
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use bytes::Bytes;
-    use ndn_face_monitor_wifi::{FrameIo, InjectFrame, McsDescriptor, Mt7612uBackend};
+    use ndn_face_monitor_wifi::{FrameIo, InjectFrame, McsDescriptor, TxIntent, Mt7612uBackend};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -31,7 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let base = dev.tx_count_written();
         let t = Instant::now();
         for _ in 0..n {
-            dev.inject(InjectFrame::broadcast(payload.clone(), mcs)).await?;
+            dev.inject(InjectFrame::broadcast(payload.clone(), TxIntent::wifi(mcs))).await?;
         }
         while dev.tx_count_written() - base < n as u64 && t.elapsed() < Duration::from_secs(30) {
             tokio::time::sleep(Duration::from_millis(1)).await;

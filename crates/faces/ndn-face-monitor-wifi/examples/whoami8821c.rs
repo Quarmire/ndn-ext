@@ -119,12 +119,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // onto air; if a bit stays cleared, frames are stuck in the FIFO (PA gated /
     // not keying — the 8812EU failure mode). On-air confirmation still needs a
     // co-located receiver, but draining proves the MAC/PHY TX path runs.
-    use ndn_face_monitor_wifi::{InjectFrame, McsDescriptor};
+    use ndn_face_monitor_wifi::{InjectFrame, TxIntent};
     let txempty_before = dev.read16(0x041a)?;
     let mut tx_ok = 0u32;
     for i in 0..100u32 {
         let payload = bytes::Bytes::from(format!("/ndn/tx-test/{i}").into_bytes());
-        match dev.inject(InjectFrame::broadcast(payload, McsDescriptor::CONSERVATIVE)).await {
+        match dev.inject(InjectFrame::broadcast(payload, TxIntent::CONSERVATIVE)).await {
             Ok(()) => tx_ok += 1,
             Err(e) => {
                 println!("TX: inject #{i} failed: {e}");

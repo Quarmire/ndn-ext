@@ -11,7 +11,7 @@
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use bytes::Bytes;
-    use ndn_face_monitor_wifi::{InjectFrame, LibUsbRtl88xxBackend, McsDescriptor, FrameIo};
+    use ndn_face_monitor_wifi::{InjectFrame, LibUsbRtl88xxBackend, McsDescriptor, TxIntent, FrameIo};
     use std::sync::Arc;
 
     // The 31 BB registers where my bring-up differs from golden (golden values).
@@ -83,7 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("flooding {count} frames at MCS{mcs_idx}…");
     for _ in 0..count {
         backend
-            .inject(InjectFrame::broadcast(data.clone(), mcs))
+            .inject(InjectFrame::broadcast(data.clone(), TxIntent::wifi(mcs)))
             .await?;
     }
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;

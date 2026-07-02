@@ -20,7 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     use bytes::Bytes;
     use ndn_face_monitor_wifi::{
-        AfPacketBackend, ESPNOW_OUI, FrameFormat, InjectFrame, McsDescriptor, FrameIo,
+        AfPacketBackend, ESPNOW_OUI, FrameFormat, InjectFrame, McsDescriptor, TxIntent, FrameIo,
     };
 
     let mut args = std::env::args().skip(1);
@@ -47,13 +47,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 backend
                     .inject(InjectFrame::broadcast(
                         Bytes::from(text.clone().into_bytes()),
-                        McsDescriptor {
+                        TxIntent::wifi(McsDescriptor {
                             index: mcs,
                             short_gi: false,
                             vht: false,
                         nss: 1,
                         stbc: false,
-                        ldpc: false,                        },
+                        ldpc: false,                        }),
                     ))
                     .await?;
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;

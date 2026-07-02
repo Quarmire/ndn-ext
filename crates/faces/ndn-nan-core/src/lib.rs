@@ -47,6 +47,7 @@ extern crate alloc;
 pub mod attr;
 pub mod engine;
 pub mod frame;
+pub mod rendezvous;
 pub mod service;
 pub mod wire;
 
@@ -55,6 +56,7 @@ pub use attr::{
     MasterIndication, Sdea, ServiceControl, ServiceControlType, ServiceDescriptor, ServiceIdList,
 };
 pub use engine::{master_rank, NanConfig, NanEngine, NanEvent, RxFrame, Step, TxFrame, Usec};
+pub use rendezvous::{AlwaysOn, DiscoveryWindow, Rendezvous};
 pub use frame::{
     classify, Dot11Frame, Dot11Header, FrameType, NanBeacon, ServiceDiscoveryFrame,
 };
