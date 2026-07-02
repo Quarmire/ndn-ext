@@ -125,6 +125,7 @@ ndn-face-shm         = { path = "crates/faces/ndn-face-shm" }
 ndn-face-bluetooth   = { path = "crates/faces/ndn-face-bluetooth" }
 ndn-face-webrtc       = { path = "crates/faces/ndn-face-webrtc" }
 ndn-frame-io          = { path = "../ndn-rs/crates/core/ndn-frame-io" }
+ndn-radio-hal         = { path = "../ndn-rs/crates/core/ndn-radio-hal" }
 ndn-face-wifi-aware   = { path = "crates/faces/ndn-face-wifi-aware" }
 ndn-nan       = { path = "crates/faces/ndn-nan" }
 ndn-face-monitor-wifi = { path = "crates/faces/ndn-face-monitor-wifi" }
