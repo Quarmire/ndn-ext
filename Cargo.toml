@@ -29,6 +29,8 @@ members = [
     "crates/faces/ndn-face-webble",
     "crates/faces/ndn-face-ble-adv",
     "crates/faces/ndn-face-wifi-aware",
+    "crates/faces/ndn-nan-core",
+    "crates/faces/ndn-nan",
     "crates/faces/ndn-face-monitor-wifi",
     "crates/faces/ndn-face-onion",
     "crates/pipes/ndn-pipes",
@@ -73,6 +75,8 @@ default-members = [
     "crates/faces/ndn-face-webble",
     "crates/faces/ndn-face-ble-adv",
     "crates/faces/ndn-face-wifi-aware",
+    "crates/faces/ndn-nan-core",
+    "crates/faces/ndn-nan",
     "crates/faces/ndn-face-monitor-wifi",
     "crates/faces/ndn-face-onion",
     "crates/pipes/ndn-pipes",
@@ -121,6 +125,8 @@ ndn-face-shm         = { path = "crates/faces/ndn-face-shm" }
 ndn-face-bluetooth   = { path = "crates/faces/ndn-face-bluetooth" }
 ndn-face-webrtc       = { path = "crates/faces/ndn-face-webrtc" }
 ndn-frame-io          = { path = "../ndn-rs/crates/core/ndn-frame-io" }
+ndn-face-wifi-aware   = { path = "crates/faces/ndn-face-wifi-aware" }
+ndn-nan       = { path = "crates/faces/ndn-nan" }
 ndn-face-monitor-wifi = { path = "crates/faces/ndn-face-monitor-wifi" }
 ndn-rtc-signaling-relay = { path = "crates/faces/ndn-rtc-signaling-relay" }
 ndn-strategy  = { path = "../ndn-rs/crates/forwarding/ndn-strategy" }
@@ -146,6 +152,7 @@ ndn-nacabe    = { path = "crates/service/ndn-nacabe" }
 ndn-ndnsf     = { path = "crates/service/ndn-ndnsf" }
 ndn-ratelimit = { path = "crates/ratelimit/ndn-ratelimit" }
 ndn-radio-cognition = { path = "crates/faces/ndn-radio-cognition" }
+ndn-nan-core  = { path = "crates/faces/ndn-nan-core", default-features = false }
 
 # Core async runtime — individual crates enable only the features they need
 tokio      = { version = "1", default-features = false }

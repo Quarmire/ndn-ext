@@ -1,0 +1,19 @@
+[package]
+name = "ndn-nan-core"
+description = "Byte-exact, sans-I/O Wi-Fi Aware (NAN) protocol core for ndn-rs — the no_std wire codec (802.11 NAN beacons / Service Discovery Frames / attribute TLVs, service-ID hashing) and (later) the sync/discovery state machine, shared by desktop and embedded NAN backends"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "extension"
+
+[dependencies]
+# SHA-256 for the NAN service-ID hash (first 6 bytes of SHA-256 of the
+# lowercased service name). Declared directly (not inherited) so we can pin
+# `default-features = false` for no_std — the codec must compile for embedded.
+# Version tracks the workspace's sha2 (0.11 line).
+sha2 = { version = "0.11", default-features = false }
+
+[dev-dependencies]
+# Tests run on the host (std); the library itself is no_std (see lib.rs).

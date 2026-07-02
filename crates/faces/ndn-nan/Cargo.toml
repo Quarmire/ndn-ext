@@ -1,0 +1,21 @@
+[package]
+name = "ndn-nan"
+description = "Desktop driver for userspace Wi-Fi Aware (NAN) — wires the sans-I/O ndn-nan-core engine to a FrameIo monitor radio + tokio and presents the ndn-face-wifi-aware NanBackend (publish/subscribe discovery + connectionless follow-up coordination)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "extension"
+
+[dependencies]
+ndn-nan-core        = { workspace = true }
+ndn-frame-io        = { workspace = true }
+ndn-face-wifi-aware = { workspace = true }
+bytes        = { workspace = true, features = ["std"] }
+tracing      = { workspace = true }
+async-trait  = { workspace = true }
+tokio        = { workspace = true, features = ["sync", "rt", "macros", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["sync", "rt", "macros", "rt-multi-thread", "time"] }
