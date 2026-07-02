@@ -6,7 +6,7 @@
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use bytes::Bytes;
-    use ndn_face_monitor_wifi::{InjectFrame, LibUsbRtl88xxBackend, McsDescriptor, TxIntent, FrameIo, RfPath};
+    use ndn_face_monitor_wifi::{InjectFrame, LibUsbRtl88xxBackend, McsDescriptor, TxIntent, FrameIo, RfPath, WifiRadio};
     use std::sync::Arc;
     let b = Arc::new(LibUsbRtl88xxBackend::open_monitor(149)?);
     b.set_tx_power(0x3f)?;
@@ -14,7 +14,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("thermal before: A={} B={}", b.read_thermal(RfPath::A)?, b.read_thermal(RfPath::B)?);
     for round in 0..6 {
         for _ in 0..3000 {
-            b.inject(InjectFrame::broadcast(data.clone(), TxIntent::wifi(McsDescriptor::ht(0)))).await?;
+            b.inject_at(InjectFrame::broadcast(data.clone(), TxIntent::CONSERVATIVE), McsDescriptor::ht(0)).await?;
         }
         println!("round {round}: thermal A={} B={}", b.read_thermal(RfPath::A)?, b.read_thermal(RfPath::B)?);
     }

@@ -4458,9 +4458,33 @@ impl LibUsbRtl88xxBackend {
     /// the count of USB-packed units. Aggregate units are returned unpadded (the
     /// caller 8-byte-aligns each within the USB burst); a lone frame is padded
     /// off the 512-byte bulk boundary as before.
-    fn build_tx(&self, frame: &InjectFrame, agg: Option<(u8, bool)>) -> Result<Vec<u8>, FaceError> {
+    /// Write one pre-built descriptor+frame buffer to the bulk-OUT endpoint,
+    /// erroring on a short write. Shared by every inject path.
+    async fn send_buf(&self, buf: Vec<u8>, what: &'static str) -> Result<(), FaceError> {
+        let handle = self.handle.clone();
+        let ep = self.bulk_out;
+        tokio::task::spawn_blocking(move || {
+            handle
+                .write_bulk(ep, &buf, Duration::from_secs(1))
+                .map_err(usb_err)
+                .and_then(|n| {
+                    (n == buf.len()).then_some(()).ok_or_else(|| {
+                        init_err(format!("rtl88xx {what}: short write {n}/{}", buf.len()))
+                    })
+                })
+        })
+        .await
+        .map_err(|e| init_err(format!("rtl88xx {what}: join {e}")))?
+    }
+
+    fn build_tx(
+        &self,
+        frame: &InjectFrame,
+        mcs: crate::McsDescriptor,
+        agg: Option<(u8, bool)>,
+    ) -> Result<Vec<u8>, FaceError> {
         // A-MPDU path: the descriptor's AGG_EN is set (along with DMA_TXAGG_NUM).
-        self.build_tx_body(frame, agg.map(|(n, first)| (n, first, true)), None)
+        self.build_tx_body(frame, mcs, agg.map(|(n, first)| (n, first, true)), None)
     }
 
     /// As [`build_tx`](Self::build_tx) but with an optional pre-built MPDU `body`
@@ -4476,6 +4500,7 @@ impl LibUsbRtl88xxBackend {
     fn build_tx_body(
         &self,
         frame: &InjectFrame,
+        mcs: crate::McsDescriptor,
         agg: Option<(u8, bool, bool)>,
         body: Option<Vec<u8>>,
     ) -> Result<Vec<u8>, FaceError> {
@@ -4517,9 +4542,8 @@ impl LibUsbRtl88xxBackend {
         // 2-stream (`DESC_RATEVHTSS2MCS0` 0x36 + index). The chip builds the
         // HT-SIG / VHT-SIG PHY header from this code; 2-stream also needs the
         // 2SS TX path (`0x820=0x31`, set in `set_channel_bw20`).
-        // Resolve the bearer-agnostic transmit intent to a concrete 802.11 rate
-        // for this radio (11ac-capable, up to the validated single-stream MCS).
-        let mcs = crate::McsDescriptor::for_intent(&frame.tx, crate::MAX_RELIABLE_MCS, true);
+        // `mcs` is the resolved 802.11 rate for this frame — from the frame's
+        // intent on the generic path, or an exact rate on the `WifiRadio` path.
         let rate_code = if mcs.vht {
             if mcs.nss >= 2 {
                 DESC_RATE_VHT2SS_MCS0 + mcs.index
@@ -4635,7 +4659,8 @@ impl LibUsbRtl88xxBackend {
         let n = frames.len().min(0xff) as u8;
         let mut buf = Vec::new();
         for (i, f) in frames.iter().enumerate() {
-            let unit = self.build_tx(f, Some((n, i == 0)))?;
+            let mcs = crate::McsDescriptor::for_intent(&f.tx, crate::MAX_RELIABLE_MCS, true);
+            let unit = self.build_tx(f, mcs, Some((n, i == 0)))?;
             buf.extend_from_slice(&unit);
             while buf.len() % 8 != 0 {
                 buf.push(0); // 8-byte-align the next unit's descriptor
@@ -4680,13 +4705,14 @@ impl LibUsbRtl88xxBackend {
             return Ok(());
         }
         let body = self.build_amsdu_body(payloads, dst, src)?;
+        // The rate rides `mcs` (the descriptor param), not the placeholder tx.
         let frame = InjectFrame {
             payload: Bytes::new(),
-            tx: crate::TxIntent::wifi(mcs),
+            tx: crate::TxIntent::CONSERVATIVE,
             dst,
             src,
         };
-        let buf = self.build_tx_body(&frame, None, Some(body))?;
+        let buf = self.build_tx_body(&frame, mcs, None, Some(body))?;
         let handle = self.handle.clone();
         let ep = self.bulk_out;
         tokio::task::spawn_blocking(move || {
@@ -4719,9 +4745,10 @@ impl LibUsbRtl88xxBackend {
             return Ok(());
         }
         let k = mpdus.len().min(0xff) as u8;
+        // The rate rides `mcs` (the descriptor param), not the placeholder tx.
         let frame = InjectFrame {
             payload: Bytes::new(),
-            tx: crate::TxIntent::wifi(mcs),
+            tx: crate::TxIntent::CONSERVATIVE,
             dst,
             src,
         };
@@ -4729,7 +4756,7 @@ impl LibUsbRtl88xxBackend {
         for (i, msdus) in mpdus.iter().enumerate() {
             let body = self.build_amsdu_body(msdus, dst, src)?;
             // First unit carries DMA_TXAGG_NUM = K; ampdu_en = false (A-MSDU, not A-MPDU).
-            let unit = self.build_tx_body(&frame, Some((k, i == 0, false)), Some(body))?;
+            let unit = self.build_tx_body(&frame, mcs, Some((k, i == 0, false)), Some(body))?;
             buf.extend_from_slice(&unit);
             while buf.len() % 8 != 0 {
                 buf.push(0); // 8-byte-align the next unit's descriptor
@@ -4980,54 +5007,22 @@ impl LibUsbRtl88xxBackend {
 #[async_trait]
 impl FrameIo for LibUsbRtl88xxBackend {
     async fn inject(&self, frame: InjectFrame) -> Result<(), FaceError> {
-        let buf = self.build_tx(&frame, None)?;
-        let handle = self.handle.clone();
-        let ep = self.bulk_out;
-        tokio::task::spawn_blocking(move || {
-            handle
-                .write_bulk(ep, &buf, Duration::from_secs(1))
-                .map_err(usb_err)
-                .and_then(|n| {
-                    (n == buf.len()).then_some(()).ok_or_else(|| {
-                        init_err(format!("rtl88xx inject: short write {n}/{}", buf.len()))
-                    })
-                })
-        })
-        .await
-        .map_err(|e| init_err(format!("rtl88xx inject: join {e}")))?
+        // Generic path: resolve the frame's intent to this radio's rate.
+        let mcs = crate::McsDescriptor::for_intent(&frame.tx, crate::MAX_RELIABLE_MCS, true);
+        let buf = self.build_tx(&frame, mcs, None)?;
+        self.send_buf(buf, "inject").await
     }
 
     async fn inject_batch(&self, frames: Vec<InjectFrame>) -> Result<(), FaceError> {
-        // Bundle maximal runs that share dst/src/mcs into one A-MSDU, bounded by
-        // the 7935-byte A-MSDU max. Bigger A-MSDUs amortize the per-MPDU overhead
-        // (descriptor/preamble) — the lever that took us 177→265 Mb/s toward the
-        // USB 2.0 ceiling (USB-agg and write-pipelining gave nothing beyond it).
-        const MPDU_BUDGET: usize = 7935;
-        let mut i = 0;
-        while i < frames.len() {
-            let f0 = &frames[i];
-            let mut j = i + 1;
-            let mut bytes = f0.payload.len();
-            while j < frames.len()
-                && frames[j].dst == f0.dst
-                && frames[j].src == f0.src
-                && frames[j].tx == f0.tx
-                && bytes + frames[j].payload.len() <= MPDU_BUDGET
-            {
-                bytes += frames[j].payload.len();
-                j += 1;
-            }
-            if j - i == 1 {
-                self.inject(frames[i].clone()).await?;
-            } else {
-                let payloads: Vec<Bytes> =
-                    frames[i..j].iter().map(|f| f.payload.clone()).collect();
-                let mcs = crate::McsDescriptor::for_intent(&f0.tx, crate::MAX_RELIABLE_MCS, true);
-                self.inject_amsdu(&payloads, mcs, f0.dst, f0.src).await?;
-            }
-            i = j;
-        }
-        Ok(())
+        // Resolve each frame's intent, then reuse the exact-rate A-MSDU batcher.
+        let pairs = frames
+            .into_iter()
+            .map(|f| {
+                let mcs = crate::McsDescriptor::for_intent(&f.tx, crate::MAX_RELIABLE_MCS, true);
+                (f, mcs)
+            })
+            .collect();
+        crate::WifiRadio::inject_batch_at(self, pairs).await
     }
 
     // NOTE: `inject` builds the descriptor + frame correctly and the chip
@@ -5085,5 +5080,54 @@ impl FrameIo for LibUsbRtl88xxBackend {
                 }
             }
         }
+    }
+}
+
+#[async_trait]
+impl crate::WifiRadio for LibUsbRtl88xxBackend {
+    /// Inject one frame at an exact rate (the cognitive/adaptive face and
+    /// fixed-rate benches). The rate travels here, not on the frame's intent.
+    async fn inject_at(
+        &self,
+        frame: InjectFrame,
+        mcs: crate::McsDescriptor,
+    ) -> Result<(), FaceError> {
+        let buf = self.build_tx(&frame, mcs, None)?;
+        self.send_buf(buf, "inject_at").await
+    }
+
+    /// A-MSDU-bundle maximal runs sharing dst/src/**rate** into one MPDU, bounded
+    /// by the 7935-byte A-MSDU max — the amortization lever that reached ~265 Mb/s
+    /// toward the USB 2.0 ceiling. Each frame carries its own resolved rate, so a
+    /// rate change mid-batch simply starts a new aggregate.
+    async fn inject_batch_at(
+        &self,
+        frames: Vec<(InjectFrame, crate::McsDescriptor)>,
+    ) -> Result<(), FaceError> {
+        const MPDU_BUDGET: usize = 7935;
+        let mut i = 0;
+        while i < frames.len() {
+            let (f0, mcs0) = (&frames[i].0, frames[i].1);
+            let mut j = i + 1;
+            let mut bytes = f0.payload.len();
+            while j < frames.len()
+                && frames[j].0.dst == f0.dst
+                && frames[j].0.src == f0.src
+                && frames[j].1 == mcs0
+                && bytes + frames[j].0.payload.len() <= MPDU_BUDGET
+            {
+                bytes += frames[j].0.payload.len();
+                j += 1;
+            }
+            if j - i == 1 {
+                self.inject_at(frames[i].0.clone(), mcs0).await?;
+            } else {
+                let payloads: Vec<Bytes> =
+                    frames[i..j].iter().map(|(f, _)| f.payload.clone()).collect();
+                self.inject_amsdu(&payloads, mcs0, f0.dst, f0.src).await?;
+            }
+            i = j;
+        }
+        Ok(())
     }
 }

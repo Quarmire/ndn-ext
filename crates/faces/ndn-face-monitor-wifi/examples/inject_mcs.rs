@@ -22,7 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     use bytes::Bytes;
     use ndn_face_monitor_wifi::{
-        AfPacketBackend, FrameFormat, InjectFrame, McsDescriptor, TxIntent, FrameIo,
+        AfPacketBackend, FrameFormat, InjectFrame, McsDescriptor, TxIntent, FrameIo, WifiRadio,
     };
 
     let mut args = std::env::args().skip(1);
@@ -40,16 +40,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("injecting {count} frames of {size} B at MCS{mcs} on {iface} …");
     for _ in 0..count {
         backend
-            .inject(InjectFrame::broadcast(
-                payload.clone(),
-                TxIntent::wifi(McsDescriptor {
+            .inject_at(
+                InjectFrame::broadcast(payload.clone(), TxIntent::CONSERVATIVE),
+                McsDescriptor {
                     index: mcs,
                     short_gi: false,
                     vht: false,
-                        nss: 1,
-                        stbc: false,
-                        ldpc: false,                }),
-            ))
+                    nss: 1,
+                    stbc: false,
+                    ldpc: false,
+                },
+            )
             .await?;
     }
     println!(

@@ -37,7 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use bytes::Bytes;
     use ndn_face_monitor_wifi::measure::frame_airtime_us;
     use ndn_face_monitor_wifi::{
-        ChannelBw, FrameIo, InjectFrame, LibUsbRtl88xxBackend, McsDescriptor, TxIntent, RadioControl,
+        ChannelBw, FrameIo, InjectFrame, LibUsbRtl88xxBackend, McsDescriptor, TxIntent, RadioControl, WifiRadio,
     };
     use ndn_radio_cognition::{
         NameContext, PolicyConfig, RadioCapability, RadioId, TxParams, prefix_hash,
@@ -113,7 +113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut airtime = 0.0f64;
         for seq in 0..frames {
             backend
-                .inject(InjectFrame::broadcast(mk_payload(arm, seq), TxIntent::wifi(d)))
+                .inject_at(InjectFrame::broadcast(mk_payload(arm, seq), TxIntent::CONSERVATIVE), d)
                 .await?;
             airtime += frame_airtime_us(&p, payload) as f64;
         }
@@ -132,7 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(|a| a.params)
             .unwrap_or_else(|| template(5));
         backend
-            .inject(InjectFrame::broadcast(mk_payload(3, seq), TxIntent::wifi(desc(&p))))
+            .inject_at(InjectFrame::broadcast(mk_payload(3, seq), TxIntent::CONSERVATIVE), desc(&p))
             .await?;
         airtime += frame_airtime_us(&p, payload) as f64;
         mcs_sum += p.mcs.unwrap_or(0) as u64;

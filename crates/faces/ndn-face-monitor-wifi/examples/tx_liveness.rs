@@ -7,7 +7,7 @@
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use bytes::Bytes;
-    use ndn_face_monitor_wifi::{InjectFrame, LibUsbRtl88xxBackend, McsDescriptor, TxIntent, FrameIo};
+    use ndn_face_monitor_wifi::{InjectFrame, LibUsbRtl88xxBackend, McsDescriptor, TxIntent, FrameIo, WifiRadio};
     use std::sync::Arc;
     let ch: u8 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(149);
     let nframes: u32 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(2000);
@@ -48,7 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rate = if vht && nss2 { "VHT-2SS MCS" } else if vht { "VHT MCS" } else { "HT MCS" };
     println!("flooding {nframes} frames on ch{ch} at {rate}{mcs}…");
     for _ in 0..nframes {
-        b.inject(InjectFrame::broadcast(data.clone(), TxIntent::wifi(desc))).await?;
+        b.inject_at(InjectFrame::broadcast(data.clone(), TxIntent::CONSERVATIVE), desc).await?;
     }
     let after = b.read32(0x2d08)?;
     println!("  TX activity 0x2d08 after flood = {after:#010x}");

@@ -27,7 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use ndn_coding::FecPolicy;
     use ndn_engine::EngineConfig;
     use ndn_face_monitor_wifi::{
-        AfPacketBackend, FrameFormat, McsDescriptor, MonitorWifiFace, FrameIo,
+        AfPacketBackend, FrameFormat, McsDescriptor, MonitorWifiFace, WifiRadio,
     };
     use ndn_face::local::InProcFace;
     use ndn_packet::Name;
@@ -51,7 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let nth = |i: usize| rest.get(i).and_then(|s| s.parse::<usize>().ok());
 
     let root: Name = "/".parse().unwrap();
-    let backend: Arc<dyn FrameIo> =
+    let backend: Arc<dyn WifiRadio> =
         Arc::new(AfPacketBackend::new(&iface, FrameFormat::default())?);
     // The radio is bound to the namespace as its name-group (the coupling) and
     // injects at a fixed, robust MCS.

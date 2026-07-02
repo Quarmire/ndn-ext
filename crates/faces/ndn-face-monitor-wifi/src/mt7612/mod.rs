@@ -1531,3 +1531,18 @@ impl FrameIo for Mt7612uBackend {
         }
     }
 }
+
+#[async_trait]
+impl crate::WifiRadio for Mt7612uBackend {
+    async fn inject_at(
+        &self,
+        frame: InjectFrame,
+        mcs: crate::McsDescriptor,
+    ) -> Result<(), FaceError> {
+        // Same DATA-TXWI path as `inject`, at an exact rate instead of resolving
+        // the frame's intent.
+        let dot11 = crate::frame::build_dot11(self.format, &frame)?;
+        let buf = self.build_data_bulk(&dot11, &mcs);
+        self.send_bulk(buf).await
+    }
+}

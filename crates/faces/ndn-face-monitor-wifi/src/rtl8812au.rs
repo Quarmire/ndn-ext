@@ -1701,3 +1701,16 @@ impl FrameIo for Rtl8812auBackend {
         }
     }
 }
+
+#[async_trait]
+impl crate::WifiRadio for Rtl8812auBackend {
+    async fn inject_at(
+        &self,
+        frame: InjectFrame,
+        _mcs: crate::McsDescriptor,
+    ) -> Result<(), FaceError> {
+        // Whole-frame legacy 6 Mbps injection (NAN management frames); the exact
+        // HT/VHT rate does not apply, so it is ignored — same as `inject`.
+        self.inject(frame).await
+    }
+}

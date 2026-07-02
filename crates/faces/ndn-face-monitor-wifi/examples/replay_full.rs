@@ -14,7 +14,7 @@
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use bytes::Bytes;
-    use ndn_face_monitor_wifi::{InjectFrame, LibUsbRtl88xxBackend, McsDescriptor, TxIntent, FrameIo};
+    use ndn_face_monitor_wifi::{InjectFrame, LibUsbRtl88xxBackend, McsDescriptor, TxIntent, FrameIo, WifiRadio};
     use std::sync::Arc;
 
     const REGSEQ: &str = include_str!("../golden/opi-usbmon-2026-06-13/init_regseq.txt");
@@ -72,7 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("flooding {count} frames at MCS1…");
     for _ in 0..count {
         backend
-            .inject(InjectFrame::broadcast(data.clone(), TxIntent::wifi(mcs)))
+            .inject_at(InjectFrame::broadcast(data.clone(), TxIntent::CONSERVATIVE), mcs)
             .await?;
     }
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;

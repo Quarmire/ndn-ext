@@ -1005,7 +1005,7 @@ impl Rtl8821cuBackend {
 
     /// Build `[48-byte rtw88 TX descriptor][802.11 frame]` for `frame`, fixing
     /// the rate (USE_RATE + DISDATAFB + DATARATE) and routing to the MGMT queue.
-    fn build_tx(&self, frame: &InjectFrame) -> Result<Vec<u8>, FaceError> {
+    fn build_tx(&self, frame: &InjectFrame, mcs: crate::McsDescriptor) -> Result<Vec<u8>, FaceError> {
         let body = self.build_80211(frame)?;
         let mut buf = vec![0u8; TX_DESC_SIZE + body.len()];
 
@@ -1030,8 +1030,8 @@ impl Rtl8821cuBackend {
         txdesc_set(&mut buf, 1, 16, 5, 6); // W1 RATE_ID = 6
         txdesc_set(&mut buf, 2, 19, 1, 1); // W2 SPE_RPT
 
-        // Resolve the bearer-agnostic transmit intent to a concrete 802.11 rate.
-        let mcs = crate::McsDescriptor::for_intent(&frame.tx, crate::MAX_RELIABLE_MCS, true);
+        // `mcs` is the resolved rate — from the frame's intent (generic path) or
+        // an exact rate (the `WifiRadio` path).
         let rate = rate_code(&mcs);
         // The kernel injects with USE_RATE=0 (rate adaptation). Forcing a fixed
         // rate (USE_RATE+DISDATAFB) with no rate-table entry may be why TX didn't
@@ -1265,10 +1265,10 @@ fn check_positive(cond: PhyCond, drv: PhyCond) -> bool {
     cond.rfe == drv.rfe
 }
 
-#[async_trait]
-impl FrameIo for Rtl8821cuBackend {
-    async fn inject(&self, frame: InjectFrame) -> Result<(), FaceError> {
-        let buf = self.build_tx(&frame)?;
+impl Rtl8821cuBackend {
+    /// Write one descriptor+frame to the radiating OUT pipe, erroring on a short
+    /// write. Shared by the generic and exact-rate inject paths.
+    async fn send(&self, buf: Vec<u8>) -> Result<(), FaceError> {
         let handle = self.handle.clone();
         // Endpoint selection for the TX-radiate investigation: NDN_RADIO_EP picks
         // an OUT pipe either by index (0,1,2…) or by raw address (e.g. 0x05).
@@ -1295,6 +1295,15 @@ impl FrameIo for Rtl8821cuBackend {
         })
         .await
         .map_err(|e| init_err(format!("8821cu inject join {e}")))?
+    }
+}
+
+#[async_trait]
+impl FrameIo for Rtl8821cuBackend {
+    async fn inject(&self, frame: InjectFrame) -> Result<(), FaceError> {
+        let mcs = crate::McsDescriptor::for_intent(&frame.tx, crate::MAX_RELIABLE_MCS, true);
+        let buf = self.build_tx(&frame, mcs)?;
+        self.send(buf).await
     }
 
     async fn recv_frame(&self) -> Result<CapturedFrame, FaceError> {
@@ -1349,5 +1358,17 @@ impl FrameIo for Rtl8821cuBackend {
                 }
             }
         }
+    }
+}
+
+#[async_trait]
+impl crate::WifiRadio for Rtl8821cuBackend {
+    async fn inject_at(
+        &self,
+        frame: InjectFrame,
+        mcs: crate::McsDescriptor,
+    ) -> Result<(), FaceError> {
+        let buf = self.build_tx(&frame, mcs)?;
+        self.send(buf).await
     }
 }

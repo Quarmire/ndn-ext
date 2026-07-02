@@ -5,7 +5,7 @@
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use bytes::Bytes;
     use ndn_face_monitor_wifi::{
-        InjectFrame, LibUsbRtl88xxBackend, McsDescriptor, TxIntent, FrameIo, RfPath,
+        InjectFrame, LibUsbRtl88xxBackend, McsDescriptor, TxIntent, FrameIo, RfPath, WifiRadio,
     };
     use std::sync::Arc;
     let b = Arc::new(LibUsbRtl88xxBackend::open_monitor(161)?);
@@ -18,7 +18,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mcs = McsDescriptor::ht(1);
     for round in 0..4 {
         for _ in 0..15000 {
-            b.inject(InjectFrame::broadcast(data.clone(), TxIntent::wifi(mcs))).await?;
+            b.inject_at(InjectFrame::broadcast(data.clone(), TxIntent::CONSERVATIVE), mcs).await?;
         }
         let t = b.read_thermal(RfPath::A)?;
         let off = b.thermal_track()?;

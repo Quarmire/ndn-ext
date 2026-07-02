@@ -6,7 +6,7 @@
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use bytes::Bytes;
     use ndn_face_monitor_wifi::{
-        InjectFrame, LibUsbRtl88xxBackend, McsDescriptor, TxIntent, FrameIo, RTL88XX_PIDS, REALTEK_VID,
+        InjectFrame, LibUsbRtl88xxBackend, McsDescriptor, TxIntent, FrameIo, RTL88XX_PIDS, REALTEK_VID, WifiRadio,
     };
     use rusb::UsbContext;
     use std::sync::Arc;
@@ -30,7 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let b = Arc::new(LibUsbRtl88xxBackend::open_monitor(149)?);
     let data: Bytes = (0..1400u32).map(|i| (i & 0xff) as u8).collect();
     for _ in 0..4000 {
-        b.inject(InjectFrame::broadcast(data.clone(), TxIntent::wifi(McsDescriptor::ht(1))))
+        b.inject_at(InjectFrame::broadcast(data.clone(), TxIntent::CONSERVATIVE), McsDescriptor::ht(1))
             .await?;
     }
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;

@@ -86,8 +86,8 @@ use ndn_transport::{
 pub use ndn_frame_io::{
     BROADCAST, CapturedFrame, DEFAULT_SRC, ESPNOW_MAX_BODY, ESPNOW_OUI, FaceError, FaceId,
     FrameFormat, FrameIo, InjectFrame, LEGACY_ETHER_MTU, LoopbackEndpoint, LoopbackMonitorBus,
-    MAX_RELIABLE_MCS, MONITOR_MTU, McsDescriptor, McsPolicy, Reach, Reliability, TxIntent, frame,
-    mcs_for_rssi, mcs_phy_rate_bps, name_group_mac, name_group_uni, radiotap,
+    MAX_RELIABLE_MCS, MONITOR_MTU, McsDescriptor, McsPolicy, Reach, Reliability, TxIntent,
+    WifiRadio, frame, mcs_for_rssi, mcs_phy_rate_bps, name_group_mac, name_group_uni, radiotap,
 };
 #[cfg(target_os = "linux")]
 pub use ndn_frame_io::AfPacketBackend;
@@ -152,17 +152,18 @@ pub const ESPNOW_MTU: usize = ESPNOW_MAX_BODY;
 /// Coalesces queued outbound frames into **A-MSDU bursts** — the face-level
 /// realization of radio-layer bundling. [`submit`](Self::submit) is non-blocking;
 /// a background task drains up to `max_msdus` frames within a latency `window`
-/// and hands them to [`FrameIo::inject_batch`] (one A-MSDU per same-dst/src/mcs
+/// and hands them to [`WifiRadio::inject_batch_at`] (one A-MSDU per same-dst/src/mcs
 /// run). Each MSDU stays an independent NDN packet (the receiver de-aggregates),
 /// so only airtime is shared — the throughput↔latency knob, not NDN-layer Interest
-/// bundling. Started by [`MonitorWifiFace::with_amsdu_batching`].
+/// bundling. Started by [`MonitorWifiFace::with_amsdu_batching`]. Each queued frame
+/// carries its resolved MCS, so the exact rate rides the batch, not the seam.
 struct TxBatcher {
-    tx: tokio::sync::mpsc::UnboundedSender<InjectFrame>,
+    tx: tokio::sync::mpsc::UnboundedSender<(InjectFrame, McsDescriptor)>,
 }
 
 impl TxBatcher {
-    fn spawn(backend: Arc<dyn FrameIo>, max_msdus: usize, window: Duration) -> Self {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<InjectFrame>();
+    fn spawn(backend: Arc<dyn WifiRadio>, max_msdus: usize, window: Duration) -> Self {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(InjectFrame, McsDescriptor)>();
         tokio::spawn(async move {
             while let Some(first) = rx.recv().await {
                 let mut batch = vec![first];
@@ -173,14 +174,14 @@ impl TxBatcher {
                         _ => break, // window elapsed, or the face was dropped
                     }
                 }
-                let _ = backend.inject_batch(batch).await;
+                let _ = backend.inject_batch_at(batch).await;
             }
         });
         TxBatcher { tx }
     }
 
-    fn submit(&self, frame: InjectFrame) -> Result<(), FaceError> {
-        self.tx.send(frame).map_err(|_| FaceError::Closed)
+    fn submit(&self, frame: InjectFrame, mcs: McsDescriptor) -> Result<(), FaceError> {
+        self.tx.send((frame, mcs)).map_err(|_| FaceError::Closed)
     }
 }
 
@@ -201,7 +202,7 @@ struct FaceFec {
 
 impl FaceFec {
     fn spawn(
-        backend: Arc<dyn FrameIo>,
+        backend: Arc<dyn WifiRadio>,
         dst: [u8; 6],
         src: [u8; 6],
         k: usize,
@@ -254,7 +255,7 @@ impl FaceFec {
 
 /// Inject each coded frame of a generation as its own MPDU, on the generation's MCS.
 async fn inject_coded(
-    backend: &Arc<dyn FrameIo>,
+    backend: &Arc<dyn WifiRadio>,
     coded: &[Bytes],
     mcs: Option<McsDescriptor>,
     dst: [u8; 6],
@@ -263,19 +264,22 @@ async fn inject_coded(
     let Some(mcs) = mcs else { return };
     for f in coded {
         let _ = backend
-            .inject(InjectFrame {
-                payload: f.clone(),
-                tx: TxIntent::wifi(mcs),
-                dst,
-                src,
-            })
+            .inject_at(
+                InjectFrame {
+                    payload: f.clone(),
+                    tx: TxIntent::CONSERVATIVE,
+                    dst,
+                    src,
+                },
+                mcs,
+            )
             .await;
     }
 }
 
 pub struct MonitorWifiFace {
     id: FaceId,
-    backend: Arc<dyn FrameIo>,
+    backend: Arc<dyn WifiRadio>,
     mtu: usize,
     policy: McsPolicy,
     signal_sink: Option<Arc<dyn SignalStore<FaceId> + Send + Sync>>,
@@ -315,7 +319,7 @@ pub struct MonitorWifiFace {
 impl MonitorWifiFace {
     /// New monitor-mode face over `backend`, sized for fragmented NDN traffic
     /// (`MONITOR_MTU`) and injecting at the conservative default rate.
-    pub fn new(id: FaceId, backend: Arc<dyn FrameIo>) -> Self {
+    pub fn new(id: FaceId, backend: Arc<dyn WifiRadio>) -> Self {
         Self {
             id,
             backend,
@@ -340,7 +344,7 @@ impl MonitorWifiFace {
     /// the broadcast addressing ESP-NOW requires is the default (no name-group).
     /// Chainable with [`with_signal_sink`](Self::with_signal_sink),
     /// [`with_link_fec`](Self::with_link_fec), etc.
-    pub fn espnow(id: FaceId, backend: Arc<dyn FrameIo>) -> Self {
+    pub fn espnow(id: FaceId, backend: Arc<dyn WifiRadio>) -> Self {
         Self::new(id, backend).with_mtu(ESPNOW_MTU)
     }
 
@@ -573,17 +577,19 @@ impl Transport for MonitorWifiFace {
         if let Some(fec) = &self.fec {
             return fec.tx.send((wire, mcs)).map_err(|_| FaceError::Closed);
         }
+        // The exact resolved rate travels alongside the frame (via inject_at /
+        // the batcher), not on the intent — the frame's tx is a placeholder.
         let frame = InjectFrame {
             payload: wire,
-            tx: TxIntent::wifi(mcs),
+            tx: TxIntent::CONSERVATIVE,
             dst,
             src,
         };
         // With A-MSDU batching the frame is enqueued (non-blocking) and bundled
         // by the flush task; otherwise it is injected immediately.
         match &self.batcher {
-            Some(b) => b.submit(frame),
-            None => self.backend.inject(frame).await,
+            Some(b) => b.submit(frame, mcs),
+            None => self.backend.inject_at(frame, mcs).await,
         }
     }
 

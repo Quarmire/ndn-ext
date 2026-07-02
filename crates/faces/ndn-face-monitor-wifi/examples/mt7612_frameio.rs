@@ -15,7 +15,7 @@
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use bytes::Bytes;
     use ndn_face_monitor_wifi::{
-        FaceId, FrameIo, InjectFrame, McsDescriptor, TxIntent, MonitorWifiFace, Mt7612uBackend,
+        FaceId, FrameIo, InjectFrame, McsDescriptor, TxIntent, MonitorWifiFace, Mt7612uBackend, WifiRadio,
     };
     use std::sync::Arc;
     use std::time::Instant;
@@ -43,12 +43,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..McsDescriptor::vht_2ss(9)
     };
     let payload = Bytes::from(vec![0xA5u8; 4000]); // big frame → amortise the ~300µs/MPDU
-    let frame = InjectFrame::broadcast(payload, TxIntent::wifi(mcs));
+    let frame = InjectFrame::broadcast(payload, TxIntent::CONSERVATIVE);
     let n = 20_000u32;
     let t = Instant::now();
     let mut ok = 0u32;
     for _ in 0..n {
-        if dev.inject(frame.clone()).await.is_ok() {
+        if dev.inject_at(frame.clone(), mcs).await.is_ok() {
             ok += 1;
         }
     }

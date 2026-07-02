@@ -11,7 +11,7 @@
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use bytes::Bytes;
     use ndn_face_monitor_wifi::{
-        BROADCAST, DEFAULT_SRC, InjectFrame, LibUsbRtl88xxBackend, McsDescriptor, TxIntent, FrameIo,
+        BROADCAST, DEFAULT_SRC, InjectFrame, LibUsbRtl88xxBackend, McsDescriptor, TxIntent, FrameIo, WifiRadio,
     };
     use std::sync::Arc;
 
@@ -96,7 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let n = burst.min(total - sent);
         if off {
             for _ in 0..n {
-                b.inject(InjectFrame::broadcast(data.clone(), TxIntent::wifi(desc))).await?;
+                b.inject_at(InjectFrame::broadcast(data.clone(), TxIntent::CONSERVATIVE), desc).await?;
             }
         } else if let Ok(g) = std::env::var("USBAGG") {
             // USBAGG=<k>: pack k A-MSDU MPDUs (each `burst` MSDUs) into one bulk-OUT.
@@ -110,7 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             b.inject_amsdu(&payloads, desc, BROADCAST, DEFAULT_SRC).await?;
         } else {
             let frames: Vec<InjectFrame> =
-                (0..n).map(|_| InjectFrame::broadcast(data.clone(), TxIntent::wifi(desc))).collect();
+                (0..n).map(|_| InjectFrame::broadcast(data.clone(), TxIntent::CONSERVATIVE)).collect();
             b.inject_ampdu(frames).await?;
         }
         sent += n;
