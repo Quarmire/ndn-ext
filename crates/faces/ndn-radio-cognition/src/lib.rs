@@ -58,7 +58,7 @@ pub use plan::{AllocRole, RadioActuators, RadioAllocation, RadioError, RadioPlan
 pub use policy::{NameContext, PolicyConfig, Priority, RadioPolicy};
 pub use sense::{
     Band, ChannelOccupancy, Demand, Ewma, LinkResidual, MediumState, MediumView, NeighborReport,
-    RadioCapability, RadioId, RadioKind,
+    RadioCapability, RadioId, RadioKind, TimingModel,
 };
 pub use strategy::RadioStrategy;
 

@@ -58,10 +58,32 @@ pub enum RadioKind {
     Other,
 }
 
+/// Whether a radio can afford to listen continuously — the axis that selects the
+/// rendezvous mode. A mains-powered monitor radio listens always; a battery
+/// sub-GHz node duty-cycles. This is *not* an 802.11 concept: it is the
+/// bearer-agnostic reason Discovery Windows exist (see `ndn-nan-core::rendezvous`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub enum TimingModel {
+    /// Continuous RX — no wake schedule needed; the rendezvous mode can be null
+    /// (always-on). Commodity Wi-Fi monitor radios, SDRs, mains-powered relays.
+    #[default]
+    AlwaysOn,
+    /// Duty-cycled RX to save power — needs a windowed rendezvous (a NAN-style
+    /// Discovery Window, a TSCH slotframe). Battery sub-GHz / IoT nodes.
+    DutyCycled,
+}
+
 /// Per-radio capability descriptor — the single switch between homogeneous
 /// (NDNPIPES: identical capabilities → channel assignment + spatial reuse) and
 /// heterogeneous (NDN-CRAHNs: divergent capabilities → object→radio mapping by
 /// fit) regimes. Generalizes the `LinkProfile` cost prior.
+///
+/// Carries both 802.11-flavoured rate caps (`max_mcs`/`max_nss`/`max_bw`, which a
+/// non-WiFi bearer sets to its own equivalents or zero) **and** the
+/// bearer-agnostic operational axes a cognitive plane needs to place work on a
+/// heterogeneous radio: its timing model, duty-cycle ceiling, on-air payload cap,
+/// and duplex. Those four are what let LoRa, an SDR, or a future PHY be *described*
+/// rather than special-cased.
 #[derive(Clone, Debug)]
 pub struct RadioCapability {
     pub kind: RadioKind,
@@ -81,6 +103,19 @@ pub struct RadioCapability {
     /// RX-only — participates in sensing/reception, never selected for TX (e.g. SDR
     /// sensor). Such radios still contribute to macrodiversity reception pooling.
     pub rx_only: bool,
+    /// Whether the radio listens continuously or duty-cycles — selects the
+    /// rendezvous mode (always-on vs a windowed schedule).
+    pub timing: TimingModel,
+    /// Regulatory / policy ceiling on the fraction of airtime this radio may use
+    /// (`1.0` = unrestricted; LoRa sub-GHz is ~`0.01`). A broadcast rate planner
+    /// must respect it.
+    pub duty_cycle_max: f32,
+    /// Largest on-air payload one frame carries (bytes) — the fragmentation MTU
+    /// the link service targets (WiFi ~1500+, ESP-NOW 250, LoRa ~256).
+    pub max_payload: usize,
+    /// Half-duplex: cannot receive while transmitting (a node never hears its own
+    /// TX). True for essentially every single-antenna packet radio.
+    pub half_duplex: bool,
 }
 
 impl RadioCapability {
@@ -96,6 +131,10 @@ impl RadioCapability {
             max_tx_power: 63,
             agile: true,
             rx_only: false,
+            timing: TimingModel::AlwaysOn,
+            duty_cycle_max: 1.0,
+            max_payload: 1500,
+            half_duplex: true,
         }
     }
 
@@ -114,6 +153,10 @@ impl RadioCapability {
             max_tx_power: 63,
             agile: true,
             rx_only: false,
+            timing: TimingModel::AlwaysOn,
+            duty_cycle_max: 1.0,
+            max_payload: 1500,
+            half_duplex: true,
         }
     }
 
@@ -129,6 +172,12 @@ impl RadioCapability {
             max_tx_power: 63,
             agile: false,
             rx_only: false,
+            // Sub-GHz is duty-cycle-limited (~1%) and needs a windowed rendezvous;
+            // tiny frames, half-duplex.
+            timing: TimingModel::DutyCycled,
+            duty_cycle_max: 0.01,
+            max_payload: 256,
+            half_duplex: true,
         }
     }
 
@@ -144,6 +193,11 @@ impl RadioCapability {
             max_tx_power: 0,
             agile: true,
             rx_only: true,
+            // A spectrum instrument: always listening, never transmits.
+            timing: TimingModel::AlwaysOn,
+            duty_cycle_max: 1.0,
+            max_payload: 0,
+            half_duplex: false,
         }
     }
 }
