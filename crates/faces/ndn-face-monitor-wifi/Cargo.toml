@@ -17,6 +17,9 @@ libusb-backend = ["dep:rusb", "dep:libusb1-sys"]
 [dependencies]
 ndn-transport    = { workspace = true }
 ndn-frame-io     = { workspace = true }
+# The shared radio HAL contract — home of the `RadioKnobs` control-plane trait +
+# `Bandwidth` (re-exported through `src/radio.rs`).
+ndn-radio-hal    = { workspace = true }
 ndn-signals-core = { workspace = true }
 # The pure cross-layer cognitive control plane this face is the actuator/seam for.
 ndn-radio-cognition = { workspace = true }

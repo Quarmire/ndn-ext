@@ -15,82 +15,11 @@
 //! day it can tune a channel, and gains power/CSD/EDCCA control as those are
 //! ported, without changing the trait or the control plane that drives it.
 
-use ndn_transport::FaceError;
-
-/// Channel bandwidth, uniform across backends. The numeric `code()` matches the
-/// cognition plane's `TxParams.bw` / `RadioCapability.max_bw` encoding and the
-/// RTL `ChannelBw` discriminants: `0=20, 1=40, 2=80, 3=10MHz, 4=5MHz`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum Bandwidth {
-    /// 20 MHz (standard).
-    #[default]
-    Bw20,
-    /// 40 MHz.
-    Bw40,
-    /// 80 MHz (VHT).
-    Bw80,
-    /// 10 MHz narrowband (non-standard; longer range / lower rate).
-    Nb10,
-    /// 5 MHz narrowband.
-    Nb5,
-}
-
-impl Bandwidth {
-    /// Numeric code shared with `TxParams.bw` / `RadioCapability.max_bw`.
-    pub fn code(self) -> u8 {
-        match self {
-            Bandwidth::Bw20 => 0,
-            Bandwidth::Bw40 => 1,
-            Bandwidth::Bw80 => 2,
-            Bandwidth::Nb10 => 3,
-            Bandwidth::Nb5 => 4,
-        }
-    }
-
-    /// Inverse of [`code`](Self::code); unknown codes fall back to 20 MHz.
-    pub fn from_code(c: u8) -> Self {
-        match c {
-            1 => Bandwidth::Bw40,
-            2 => Bandwidth::Bw80,
-            3 => Bandwidth::Nb10,
-            4 => Bandwidth::Nb5,
-            _ => Bandwidth::Bw20,
-        }
-    }
-}
-
-/// The uniform stateful-knob surface every userspace radio backend exposes to
-/// the named-radio control plane. Implementors are wrapped behind a
-/// `RadioActuators` adapter (see `control.rs`) so a single generic actuator can
-/// drive any radio.
-///
-/// Only [`set_channel`](Self::set_channel) is required — a radio that cannot at
-/// least tune is not useful. The remaining knobs default to no-ops so a port can
-/// land RX/TX first and grow contention/power control later. Per-frame
-/// rate/STBC/LDPC/short-GI/NSS is NOT here; that travels with each
-/// [`crate::InjectFrame`]`.mcs` on the data plane.
-pub trait RadioKnobs: Send + Sync {
-    /// Tune to `channel` at bandwidth `bw`. Returns an error if the radio cannot
-    /// reach that channel/width (e.g. a port that has only captured one channel).
-    fn set_channel(&self, channel: u8, bw: Bandwidth) -> Result<(), FaceError>;
-
-    /// Set the TXAGC reference index (a back-off below the regulatory ceiling;
-    /// never used to exceed it). Default: no-op (radio runs at its init power).
-    fn set_tx_power(&self, _idx: u32) -> Result<(), FaceError> {
-        Ok(())
-    }
-
-    /// Enable cyclic-shift diversity on the second chain (1-stream robustness via
-    /// antenna diversity). Default: no-op (not supported / single-chain).
-    fn set_tx_csd(&self, _on: bool) -> Result<(), FaceError> {
-        Ok(())
-    }
-
-    /// Ignore EDCCA so TX proceeds under channel contention. Default: no-op.
-    fn set_edcca_ignore(&self, _on: bool) -> Result<(), FaceError> {
-        Ok(())
-    }
-}
+// The radio control-plane trait + the channel-bandwidth enum moved down into the
+// shared HAL crate (`ndn-radio-hal`) so a driver depends on one contract crate.
+// Re-exported here so `crate::radio::Bandwidth` / `crate::radio::RadioKnobs` (and
+// the `super::*` in the tests below) still resolve unchanged.
+pub use ndn_radio_hal::{Bandwidth, RadioKnobs};
 
 #[cfg(feature = "libusb-backend")]
 mod impls {
