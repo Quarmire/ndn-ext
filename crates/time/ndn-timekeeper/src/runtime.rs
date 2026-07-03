@@ -99,16 +99,14 @@ impl Timekeeper {
         }
     }
 
-    /// Feed a reading from a local time source (OS clock, GNSS, …). `local_wall_ns`
-    /// is the node's current wall reading, used to express the reading as an
-    /// offset for the loop.
-    pub fn ingest_local_reading(&mut self, reading: &Reading, local_wall_ns: i64) {
-        let offset = reading.wall.center_ns.saturating_sub(local_wall_ns);
+    /// Feed a reading from a local time source (OS clock, GNSS, …). Stored as
+    /// the node's own absolute wall belief, self-authenticated.
+    pub fn ingest_local_reading(&mut self, reading: &Reading) {
         self.state.ingest(
             SELF_PEER_ID,
             PeerSample {
-                offset: Measured {
-                    value: offset,
+                wall: Measured {
+                    value: reading.wall.center_ns,
                     sigma_ns: reading.wall.radius_ns,
                     prov: self.self_prov(),
                 },
@@ -119,20 +117,14 @@ impl Timekeeper {
     }
 
     /// Feed a *validated* peer beacon (from [`crate::beacon_wire`] + the security
-    /// layer). `peer_id` identifies the peer; `local_wall_ns` is our current wall.
-    /// Panics if `peer_id` is [`u64::MAX`] (reserved for local readings).
-    pub fn ingest_beacon(
-        &mut self,
-        peer_id: u64,
-        beacon: &ndn_time::TimeBeacon,
-        local_wall_ns: i64,
-    ) {
+    /// layer). `peer_id` identifies the peer. Panics if `peer_id` is
+    /// [`u64::MAX`] (reserved for local readings).
+    pub fn ingest_beacon(&mut self, peer_id: u64, beacon: &ndn_time::TimeBeacon) {
         assert_ne!(
             peer_id, SELF_PEER_ID,
             "peer id u64::MAX is reserved for self"
         );
-        self.state
-            .ingest(peer_id, beacon.into_peer_sample(local_wall_ns));
+        self.state.ingest(peer_id, beacon.into_peer_sample());
     }
 
     /// Run one discipline pass. `now_mono_ns` is the monotonic clock (for aging
@@ -218,10 +210,12 @@ mod tests {
         );
         let local_wall = 1_700_000_000_000;
         // GPS reads +30 ns ahead of the local wall.
-        tk.ingest_local_reading(
-            &reading(local_wall + 30, 30, ClockCapability::gnss_disciplined(), 0),
-            local_wall,
-        );
+        tk.ingest_local_reading(&reading(
+            local_wall + 30,
+            30,
+            ClockCapability::gnss_disciplined(),
+            0,
+        ));
         let out = tk.tick(0, local_wall);
         assert!(out.correction.admitted, "own trusted clock founds a fix");
         assert!(
@@ -243,15 +237,12 @@ mod tests {
             TimePolicy::default(),
         );
         let local_wall = 1_700_000_000_000;
-        // Our own OS clock (loose), plus a peer 300 µs ahead with a tight GPS.
-        tk.ingest_local_reading(
-            &reading(local_wall, 5_000_000, ClockCapability::oscillator_tcxo(), 0),
-            local_wall,
-        );
-        let peer = TimeBeacon {
+        // A peer 300 µs ahead (sub-threshold) with a tight GPS. Fresh each tick,
+        // as the real loop re-ingests every round.
+        let peer = |mono| TimeBeacon {
             wall: TimeInterval::new(local_wall + 300_000, 50_000),
             cap: ClockCapability::gnss_disciplined(),
-            captured_mono_ns: 0,
+            captured_mono_ns: mono,
             prov: MeasurementProvenance {
                 distance_bounded: false,
                 replay_protected: true,
@@ -259,8 +250,14 @@ mod tests {
                 path: PathId(7),
             },
         };
-        tk.ingest_beacon(99, &peer, local_wall);
         // Bootstrap: first tick steps.
+        tk.ingest_local_reading(&reading(
+            local_wall,
+            5_000_000,
+            ClockCapability::oscillator_tcxo(),
+            0,
+        ));
+        tk.ingest_beacon(99, &peer(0));
         let first = tk.tick(0, local_wall);
         assert!(first.correction.admitted);
         assert!(
@@ -268,7 +265,14 @@ mod tests {
             "bootstrap steps, got {:?}",
             first.discipline
         );
-        // Second tick (now has a prior wall) slews instead of stepping.
+        // Second tick, fresh samples, prior wall: the sub-threshold offset slews.
+        tk.ingest_local_reading(&reading(
+            local_wall,
+            5_000_000,
+            ClockCapability::oscillator_tcxo(),
+            1_000_000,
+        ));
+        tk.ingest_beacon(99, &peer(1_000_000));
         let second = tk.tick(1_000_000, local_wall);
         assert!(
             matches!(second.discipline, Discipline::Slew { .. }),
@@ -286,10 +290,12 @@ mod tests {
         };
         let mut tk = Timekeeper::new(3, KeyId(3), ClockCapability::esp32_rc(), policy);
         let local_wall = 1_700_000_000_000;
-        tk.ingest_local_reading(
-            &reading(local_wall, 100_000_000, ClockCapability::esp32_rc(), 0),
+        tk.ingest_local_reading(&reading(
             local_wall,
-        );
+            100_000_000,
+            ClockCapability::esp32_rc(),
+            0,
+        ));
         let out = tk.tick(0, local_wall);
         assert!(
             matches!(out.discipline, Discipline::Withhold { .. }),
@@ -307,14 +313,22 @@ mod tests {
             TimePolicy::default(),
         );
         let local_wall = 1_700_000_000_000;
-        tk.ingest_local_reading(
-            &reading(local_wall, 30, ClockCapability::gnss_disciplined(), 0),
+        tk.ingest_local_reading(&reading(
             local_wall,
-        );
+            30,
+            ClockCapability::gnss_disciplined(),
+            0,
+        ));
         let a = tk.tick(0, local_wall);
         assert!(a.beacon.is_some());
         assert_eq!(tk.seq(), 1);
         // Same (not-tighter) fix: no new beacon, seq unchanged.
+        tk.ingest_local_reading(&reading(
+            local_wall,
+            30,
+            ClockCapability::gnss_disciplined(),
+            1_000,
+        ));
         let b = tk.tick(1_000, local_wall);
         assert!(b.beacon.is_none(), "no tightening ⇒ no beacon");
         assert_eq!(tk.seq(), 1);

@@ -17,12 +17,12 @@
 //! ```text
 //! loop {
 //!     for src in &mut sources {                       // OS clock, GNSS, …
-//!         if let Some(r) = src.poll() { tk.ingest_local_reading(&r, wall_now()); }
+//!         if let Some(r) = src.poll() { tk.ingest_local_reading(&r); }
 //!     }
 //!     while let Some(data) = time_sub.try_recv() {    // SVS/pubsub carriage
 //!         let safe = validator.verify(data)?;         // security: SafeData
 //!         let d = beacon_wire::decode(safe.content())?;
-//!         tk.ingest_beacon(peer_id(&safe), &d.into_beacon(mono_now(), prov(&safe)), wall_now());
+//!         tk.ingest_beacon(peer_id(&safe), &d.into_beacon(mono_now(), prov(&safe)));
 //!     }
 //!     let out = tk.tick(mono_now(), wall_now());
 //!     match out.discipline { Slew{rate_ppb} => steer(rate_ppb), Step{..} => step(), .. }
