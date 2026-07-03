@@ -104,6 +104,11 @@ pub use ndn_radio_drivers::{
     ChipInfo, IqkResult, RTL8812AU_PIDS, Rtl8812auBackend,
 };
 
+// The BW16 (RTL8720DN) serial-bridged backend — a dual-band 802.11 node driven
+// over USB-serial, usable under a MonitorWifiFace exactly like the USB backends.
+#[cfg(feature = "bw16")]
+pub use ndn_radio_drivers::Bw16SerialBackend;
+
 mod control;
 pub use control::RadioControl;
 #[cfg(feature = "libusb-backend")]

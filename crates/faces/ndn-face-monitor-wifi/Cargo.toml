@@ -13,6 +13,9 @@ classification = "extension"
 # without an AF_PACKET monitor interface (macOS / non-rtl8812au Linux). Pulls
 # rusb (needs libusb-1.0 at build time). Scaffold: see src/libusb_rtl88xx.rs.
 libusb-backend = ["dep:ndn-radio-drivers", "dep:rusb", "dep:libusb1-sys"]
+# The BW16 (RTL8720DN) serial-bridged backend, re-exported for use under a
+# MonitorWifiFace like any other WiFi backend.
+bw16 = ["dep:ndn-radio-drivers", "ndn-radio-drivers/bw16"]
 
 [dependencies]
 ndn-transport    = { workspace = true }
