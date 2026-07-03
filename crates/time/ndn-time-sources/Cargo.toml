@@ -1,0 +1,19 @@
+[package]
+name = "ndn-time-sources"
+description = "Concrete local time sources (OS clock, GNSS/NMEA, RTC, uplink) producing ndn-time Readings for the discipline loop. Pluggable backends; the pure PeerDerived (beacon->sample) path lives in the ndn-time core, not here."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "extension"
+
+[features]
+# The source framework + OS clock + the pure NMEA parser + a mock are always
+# available (std only, no extra deps). Concrete hardware/network backends
+# (serial GNSS, an SNTP uplink client) are added behind their own features so
+# the dependency surface stays opt-in — matching ndn-signal-sources.
+default = []
+
+[dependencies]
+ndn-time = { workspace = true }

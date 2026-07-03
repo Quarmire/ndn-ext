@@ -44,6 +44,7 @@ members = [
     "crates/compute/ndn-compute",
     "crates/faces/ndn-radio-cognition",
     "crates/faces/ndn-signal-sources",
+    "crates/time/ndn-time-sources",
     "crates/strategies/ndn-strategy-cclf",
     "crates/faces/ndn-rtc-signaling-relay",
     "crates/faces/ndn-remote-signer-webrtc",
@@ -88,6 +89,7 @@ default-members = [
     "crates/compute/ndn-compute",
     "crates/faces/ndn-radio-cognition",
     "crates/faces/ndn-signal-sources",
+    "crates/time/ndn-time-sources",
     "crates/strategies/ndn-strategy-cclf",
     "crates/faces/ndn-rtc-signaling-relay",
     "crates/faces/ndn-remote-signer-webrtc",
@@ -114,6 +116,8 @@ ndn-fwd-core  = { path = "../ndn-rs/crates/forwarding/ndn-fwd-core", default-fea
 ndn-crypto-core = { path = "../ndn-rs/crates/core/ndn-crypto-core" }
 ndn-sealed-box  = { path = "crates/compute/ndn-sealed-box" }
 ndn-signals-core = { path = "../ndn-rs/crates/core/ndn-signals-core", default-features = false }
+ndn-time      = { path = "../ndn-rs/crates/core/ndn-time", default-features = false }
+ndn-time-sources = { path = "crates/time/ndn-time-sources" }
 ndn-ble-framing = { path = "../ndn-rs/crates/core/ndn-ble-framing" }
 ndn-mgmt-wire = { path = "../ndn-rs/crates/core/ndn-mgmt-wire" }
 ndn-transport = { path = "../ndn-rs/crates/core/ndn-transport" }
