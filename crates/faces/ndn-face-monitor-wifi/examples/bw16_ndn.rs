@@ -52,16 +52,29 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut a = std::env::args().skip(1);
     let port = a.next().unwrap_or_else(|| "/dev/cu.usbserial-1110".into());
     let ch: u8 = a.next().and_then(|s| s.parse().ok()).unwrap_or(149);
+    let rx_port = a.next(); // optional: a second BW16 serial port as the receiver
 
     // Sender: the BW16 under a MonitorWifiFace.
     let bw = Bw16SerialBackend::open(&port)?;
     bw.set_channel(ch)?;
     let tx_face = MonitorWifiFace::new(FaceId(1), Arc::new(bw));
 
-    // Receiver: the RTL8812EU under a MonitorWifiFace (pumped for full-rate RX).
-    let eu = Arc::new(LibUsbRtl88xxBackend::open_monitor(ch)?);
-    let _pumps = eu.spawn_rx_pump(8);
-    let rx_face = MonitorWifiFace::new(FaceId(2), eu);
+    // Receiver: a second BW16 if given, else the RTL8812EU (pumped for full-rate RX).
+    let rx_face = match &rx_port {
+        Some(p) => {
+            let rb = Bw16SerialBackend::open(p)?;
+            rb.set_channel(ch)?;
+            println!("(receiver: second BW16 {p})");
+            MonitorWifiFace::new(FaceId(2), Arc::new(rb))
+        }
+        None => {
+            let eu = Arc::new(LibUsbRtl88xxBackend::open_monitor(ch)?);
+            let _pumps = eu.spawn_rx_pump(8);
+            std::mem::forget(_pumps); // keep the RX pump threads alive
+            println!("(receiver: RTL8812EU)");
+            MonitorWifiFace::new(FaceId(2), eu)
+        }
+    };
 
     let data = build_data(&[b"ndn", b"bw16"], b"hello-over-bw16-radio");
     println!(
