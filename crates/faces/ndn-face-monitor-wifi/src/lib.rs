@@ -92,35 +92,17 @@ pub use ndn_frame_io::{
 #[cfg(target_os = "linux")]
 pub use ndn_frame_io::AfPacketBackend;
 
+// The four userspace USB Wi-Fi driver backends (RTL8812EU/8822E, RTL8821CU,
+// MT7612U, RTL8812AU) were lifted into the standalone `ndn-radio-drivers` crate
+// so drivers have a dedicated home. Re-exported here so existing
+// `ndn_face_monitor_wifi::` paths (and this crate's `crate::LibUsbRtl88xxBackend`
+// etc. references in `control.rs`/`lib.rs`) keep working unchanged.
 #[cfg(feature = "libusb-backend")]
-mod libusb_rtl88xx;
-#[cfg(feature = "libusb-backend")]
-pub use libusb_rtl88xx::{
+pub use ndn_radio_drivers::{
     CHIP_ID_8822E, ChannelBw, FwVersion, LibUsbRtl88xxBackend, REALTEK_VID, REG_SYS_CFG,
-    RTL88XX_PIDS, RfPath,
+    RTL88XX_PIDS, RfPath, RTL8821CU_PIDS, Rtl8821cuBackend, MT7612U_PIDS, Mt7612uBackend,
+    ChipInfo, IqkResult, RTL8812AU_PIDS, Rtl8812auBackend,
 };
-
-// Userspace RTL8821CU/8811CU backend (rtw88-derived). Separate module from the
-// 8822E backend above: different HAL generation, power sequence, firmware-download
-// path, and descriptors. See `docs/rtl8821cu-port-reference.md`.
-#[cfg(feature = "libusb-backend")]
-mod rtl8821c;
-#[cfg(feature = "libusb-backend")]
-pub use rtl8821c::{RTL8821CU_PIDS, Rtl8821cuBackend};
-
-#[cfg(feature = "libusb-backend")]
-mod mt7612;
-#[cfg(feature = "libusb-backend")]
-pub use mt7612::{MT7612U_PIDS, Mt7612uBackend};
-
-// Userspace RTL8812AU backend (the original 11ac monitor-injection chip). A
-// fresh port — different HAL generation from the 8822E/8812EU `libusb_rtl88xx`
-// backend; shares only the Realtek USB register-I/O protocol. Bring-up in
-// progress (open + chip-id today).
-#[cfg(feature = "libusb-backend")]
-mod rtl8812au;
-#[cfg(feature = "libusb-backend")]
-pub use rtl8812au::{ChipInfo, IqkResult, RTL8812AU_PIDS, Rtl8812auBackend};
 
 mod control;
 pub use control::RadioControl;

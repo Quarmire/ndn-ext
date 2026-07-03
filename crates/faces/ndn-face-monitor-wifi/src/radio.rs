@@ -21,48 +21,7 @@
 // the `super::*` in the tests below) still resolve unchanged.
 pub use ndn_radio_hal::{Bandwidth, RadioKnobs};
 
-#[cfg(feature = "libusb-backend")]
-mod impls {
-    use super::{Bandwidth, RadioKnobs};
-    use ndn_transport::FaceError;
-
-    impl RadioKnobs for crate::LibUsbRtl88xxBackend {
-        fn set_channel(&self, channel: u8, bw: Bandwidth) -> Result<(), FaceError> {
-            let cbw = match bw {
-                Bandwidth::Bw20 => crate::ChannelBw::Bw20,
-                Bandwidth::Bw40 => crate::ChannelBw::Bw40,
-                Bandwidth::Bw80 => crate::ChannelBw::Bw80,
-                Bandwidth::Nb10 => crate::ChannelBw::Nb10,
-                Bandwidth::Nb5 => crate::ChannelBw::Nb5,
-            };
-            crate::LibUsbRtl88xxBackend::set_channel(self, channel, cbw)
-        }
-        fn set_tx_power(&self, idx: u32) -> Result<(), FaceError> {
-            crate::LibUsbRtl88xxBackend::set_tx_power(self, idx)
-        }
-        fn set_tx_csd(&self, on: bool) -> Result<(), FaceError> {
-            crate::LibUsbRtl88xxBackend::set_tx_csd(self, on)
-        }
-        fn set_edcca_ignore(&self, on: bool) -> Result<(), FaceError> {
-            crate::LibUsbRtl88xxBackend::set_edcca_ignore(self, on)
-        }
-    }
-
-    impl RadioKnobs for crate::Mt7612uBackend {
-        fn set_channel(&self, channel: u8, bw: Bandwidth) -> Result<(), FaceError> {
-            // Only channel 6 / 20 MHz has been captured + replayed so far. Other
-            // channels need the per-channel RF program captured the same way
-            // (see docs/RADIO_SUBSYSTEM.md "Adding a channel"). This is the
-            // "capability added incrementally" boundary made explicit.
-            if channel == 6 && bw == Bandwidth::Bw20 {
-                crate::Mt7612uBackend::set_channel_ch6(self)
-            } else {
-                Err(FaceError::Io(std::io::Error::other(format!(
-                    "mt7612u: only ch6/20MHz tuned so far (requested ch{channel}/{bw:?})"
-                ))))
-            }
-        }
-        // set_tx_power / set_tx_csd / set_edcca_ignore: default no-ops until the
-        // mt76x2 power-table / TXOP-CTRL / ED-CCA registers are ported.
-    }
-}
+// The `RadioKnobs` impls for the driver backends (`LibUsbRtl88xxBackend`,
+// `Mt7612uBackend`) moved into `ndn-radio-drivers` alongside the backend types —
+// the orphan rule requires the impl travel with the local type now that both the
+// trait (`ndn-radio-hal`) and the types are foreign to this crate.
