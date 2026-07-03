@@ -1,0 +1,17 @@
+[package]
+name = "ndn-timekeeper"
+description = "The named-time runtime: a sans-IO Timekeeper that drives the ndn-time discipline loop over local sources + validated peer beacons, plus the beacon wire codec. The async SVS carriage / face I/O is a thin driver on top."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "extension"
+
+[features]
+default = []
+
+[dependencies]
+ndn-time = { workspace = true }
+ndn-time-sources = { workspace = true }
+bytes = { workspace = true, features = ["std"] }
