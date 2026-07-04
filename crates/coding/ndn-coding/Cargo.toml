@@ -103,6 +103,7 @@ ndn-face    = { workspace = true }
 ndn-transport = { workspace = true }
 criterion     = { workspace = true }
 ed25519-dalek = { workspace = true }
+proptest      = "1"
 
 # Authenticated-network-coding benchmarks (fingerprint filter vs Ed25519,
 # FingerprintSet scaling, verify-on-decode commitment cost). Needs `f2-recode`

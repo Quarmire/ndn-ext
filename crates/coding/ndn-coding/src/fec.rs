@@ -268,6 +268,7 @@ impl Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn source_segments(k: u16, len: usize) -> Vec<Bytes> {
         (0..k)
@@ -276,6 +277,56 @@ mod tests {
                 Bytes::from(v)
             })
             .collect()
+    }
+
+    proptest! {
+        /// Round-trips the systematic K-of-N FEC over random shapes: encode K
+        /// sources into N coded segments (K systematic + parity), then absorb
+        /// all N in a random order and recover every source exactly. (The code
+        /// is systematic but not MDS, so recovery is asserted from the full N,
+        /// not from an arbitrary K-subset.)
+        #[test]
+        fn fec_round_trips_over_random_shapes(
+            k in 1u16..=16,
+            extra in 1u16..=12,
+            seg_len in 1usize..=96,
+            sel_seed in any::<u64>(),
+        ) {
+            let n = k + extra;
+            let sources = source_segments(k, seg_len);
+            let mut enc = Encoder::new(k, n).unwrap();
+            for s in &sources {
+                enc.feed(s.clone()).unwrap();
+            }
+            // All N coded: 0..K systematic sources, K..N parity.
+            let mut coded: Vec<(u16, Bytes)> =
+                (0..k).map(|j| (j, sources[j as usize].clone())).collect();
+            for i in k..n {
+                coded.push((i, enc.parity(i).unwrap()));
+            }
+            // Deterministic Fisher-Yates shuffle from the seed; take any K.
+            let mut order: Vec<usize> = (0..coded.len()).collect();
+            let mut x = sel_seed | 1;
+            for i in (1..order.len()).rev() {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                order.swap(i, (x % (i as u64 + 1)) as usize);
+            }
+            let mut dec = Decoder::new(k, n).unwrap();
+            // Absorb every coded segment in a random order (dependents are
+            // no-ops); the K systematic sources are always among the N, so the
+            // decoder reaches full rank regardless of the order.
+            for &pos in order.iter() {
+                let (idx, ref bytes) = coded[pos];
+                dec.absorb(idx, bytes.clone()).unwrap();
+            }
+            prop_assert!(dec.is_complete(), "rank={} k={} n={}", dec.rank(), k, n);
+            let recovered = dec.recover().unwrap();
+            for (j, src) in sources.iter().enumerate() {
+                prop_assert_eq!(&recovered[j], src);
+            }
+        }
     }
 
     #[test]
