@@ -14,3 +14,6 @@ bytes         = { workspace = true, features = ["std"] }
 tokio         = { workspace = true, features = ["io-util", "rt"] }
 tokio-util    = { workspace = true, features = ["codec"] }
 tokio-serial  = { workspace = true }
+
+[lints]
+workspace = true

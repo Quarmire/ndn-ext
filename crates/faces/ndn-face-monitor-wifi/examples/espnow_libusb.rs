@@ -16,6 +16,10 @@
 //!       --example espnow_libusb -- <channel> recv
 //! e.g. channel 36 or 161 for a 5 GHz ESP32-C5.
 
+// Example demonstrating the raw shared-memory ring; the unsafe atomic-from-ptr
+// calls are the point of the demo. Denied workspace-wide.
+#![allow(unsafe_code)]
+
 #[cfg(feature = "libusb-backend")]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -27,15 +31,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let mut args = std::env::args().skip(1);
-    let channel: u8 = args
-        .next()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| {
-            eprintln!(
-                "usage: espnow_libusb <channel> send \"<text>\" [count] | recv  (e.g. 36 for 5 GHz C5)"
-            );
-            std::process::exit(2);
-        });
+    let channel: u8 = args.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| {
+        eprintln!(
+            "usage: espnow_libusb <channel> send \"<text>\" [count] | recv  (e.g. 36 for 5 GHz C5)"
+        );
+        std::process::exit(2);
+    });
     let mode = args.next().unwrap_or_default();
 
     // On 5 GHz the lowest legacy rate is 6 Mbps OFDM (DESC_RATE 0x04); 1 Mbps
@@ -74,7 +75,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let f = backend.recv_frame().await?;
                 let mac = f
                     .addr
-                    .map(|a| a.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":"))
+                    .map(|a| {
+                        a.iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<Vec<_>>()
+                            .join(":")
+                    })
                     .unwrap_or_else(|| "??".into());
                 println!(
                     "from {mac}  rssi={:?}  {} B  {:?}",

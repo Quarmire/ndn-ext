@@ -40,3 +40,6 @@ wasmtime      = { version = "31", default-features = false, features = ["craneli
 [dev-dependencies]
 tokio   = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time"] }
 wat     = "1"
+
+[lints]
+workspace = true

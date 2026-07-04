@@ -17,3 +17,6 @@ default = []
 
 [dependencies]
 ndn-time = { workspace = true }
+
+[lints]
+workspace = true

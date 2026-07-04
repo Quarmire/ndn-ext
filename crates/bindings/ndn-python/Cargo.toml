@@ -30,3 +30,6 @@ pyo3       = { version = "0.22", features = ["macros"] }
 ndn-service-core = { workspace = true }
 ndn-rpc          = { workspace = true }
 tokio            = { workspace = true, features = ["rt"] }
+
+[lints]
+workspace = true

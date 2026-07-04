@@ -20,3 +20,6 @@ tokio = { workspace = true, features = ["rt", "macros", "sync"] }
 
 [package.metadata.scope]
 classification = "extension"
+
+[lints]
+workspace = true

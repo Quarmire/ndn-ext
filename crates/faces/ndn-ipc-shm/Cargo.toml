@@ -15,3 +15,6 @@ async-trait    = { workspace = true }
 bytes          = { workspace = true, features = ["std"] }
 tokio          = { workspace = true, features = ["rt"] }
 tokio-util     = { workspace = true }
+
+[lints]
+workspace = true

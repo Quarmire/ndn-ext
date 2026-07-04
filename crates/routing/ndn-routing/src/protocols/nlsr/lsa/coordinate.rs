@@ -91,6 +91,7 @@ impl CoordinateLsa {
         })
     }
 
+    #[allow(clippy::todo, reason = "NLSR LSA update not yet ported; tracked stub")]
     pub fn update(&mut self, _newer: &CoordinateLsa) -> bool {
         todo!("CoordinateLsa::update")
     }

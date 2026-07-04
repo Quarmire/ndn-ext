@@ -37,3 +37,6 @@ ndn-service-macro = { workspace = true }
 ndn-engine    = { workspace = true }
 ndn-face      = { workspace = true }
 ndn-transport = { workspace = true }
+
+[lints]
+workspace = true

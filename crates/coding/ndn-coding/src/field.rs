@@ -10,6 +10,10 @@
 //! `simd` feature additionally enables explicit NEON / SSSE3 / AVX2 shuffle
 //! paths. `tests::bench_mul_add` records throughput and gates regressions.
 
+// SIMD kernels (NEON / SSSE3 / AVX2) for the GF(2^8) multiply; unsafe is
+// confined to these feature-gated intrinsics. Denied workspace-wide.
+#![allow(unsafe_code)]
+
 use std::sync::OnceLock;
 
 /// Low byte of the reduction polynomial `x^8 + x^4 + x^3 + x^2 + 1`; the

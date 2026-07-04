@@ -111,3 +111,6 @@ ed25519-dalek = { workspace = true }
 name = "recode_auth"
 harness = false
 required-features = ["f2-recode"]
+
+[lints]
+workspace = true

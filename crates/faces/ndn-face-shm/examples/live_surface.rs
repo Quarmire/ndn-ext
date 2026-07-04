@@ -15,7 +15,10 @@
 // plumbing before writing a line.
 
 #[cfg(unix)]
-use ndn_face_shm::{ShmFace, ShmHandle, ShmToken, connect_fd_handoff, control_socket_path, mint_token, serve_fd_handoff};
+use ndn_face_shm::{
+    ShmFace, ShmHandle, ShmToken, connect_fd_handoff, control_socket_path, mint_token,
+    serve_fd_handoff,
+};
 #[cfg(unix)]
 use ndn_transport::FaceId; // FRICTION #1: need a dep the docs never mentioned just to call create_*.
 
@@ -51,8 +54,7 @@ async fn producer() {
     // "size this for 64 KiB frames" helper; `create_anon_for_mtu` exists — but I
     // only found it by scanning every constructor (create / create_with /
     // create_anon / create_anon_with / create_anon_for_mtu — which one??).
-    let (face, fds) =
-        ShmFace::create_anon_for_mtu(FaceId(1), FRAME_LEN).expect("create anon face");
+    let (face, fds) = ShmFace::create_anon_for_mtu(FaceId(1), FRAME_LEN).expect("create anon face");
 
     // FRICTION #7 (I assemble the rendezvous myself): derive path, remove stale
     // file, bind a UnixListener, know it's a tokio one. None of this is wrapped.
@@ -111,20 +113,18 @@ async fn consumer(token: ShmToken) {
     // Consume each frame zero-copy.
     let mut rendered = 0u32;
     let mut checksum = 0u64;
-    loop {
-        // FRICTION #11 (when does the stream end?): recv_with returns
-        // Option/Result, but there is no end-of-stream concept — I just count to
-        // FRAMES, which the consumer only knows because I hard-coded it. A real
-        // surface needs a "closed"/length signal the API doesn't carry.
-        match handle.recv_with(|slot| (slot[0] as u64) + slot.len() as u64).await {
-            Some(v) => {
-                checksum = checksum.wrapping_add(v);
-                rendered += 1;
-                if rendered >= FRAMES {
-                    break;
-                }
-            }
-            None => break,
+    // FRICTION #11 (when does the stream end?): recv_with returns
+    // Option/Result, but there is no end-of-stream concept — I just count to
+    // FRAMES, which the consumer only knows because I hard-coded it. A real
+    // surface needs a "closed"/length signal the API doesn't carry.
+    while let Some(v) = handle
+        .recv_with(|slot| (slot[0] as u64) + slot.len() as u64)
+        .await
+    {
+        checksum = checksum.wrapping_add(v);
+        rendered += 1;
+        if rendered >= FRAMES {
+            break;
         }
     }
     eprintln!("consumer: rendered {rendered} frames (checksum {checksum})");

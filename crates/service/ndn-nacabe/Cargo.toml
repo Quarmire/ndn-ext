@@ -37,3 +37,6 @@ ndn-engine    = { workspace = true }
 ndn-face      = { workspace = true }
 ndn-transport = { workspace = true }
 tokio         = { workspace = true, features = ["rt", "macros"] }
+
+[lints]
+workspace = true

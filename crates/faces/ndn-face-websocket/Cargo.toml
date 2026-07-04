@@ -29,3 +29,6 @@ rustls-pemfile = { workspace = true, optional = true }
 [dev-dependencies]
 ndn-tlv = { workspace = true, features = ["std"] }
 tokio   = { workspace = true, features = ["rt", "macros", "net", "io-util", "time"] }
+
+[lints]
+workspace = true

@@ -33,3 +33,6 @@ thiserror    = { workspace = true }
 ndn-face-webrtc = { workspace = true }
 ndn-transport   = { workspace = true }
 bytes           = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true

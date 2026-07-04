@@ -29,3 +29,6 @@ ndn-security = { workspace = true }
 # Phase 2 NDP bulk witness: wrap the NDP socket in ndn-face's UdpFace.
 ndn-face = { workspace = true }
 tokio-util   = { workspace = true, features = ["rt"] }
+
+[lints]
+workspace = true

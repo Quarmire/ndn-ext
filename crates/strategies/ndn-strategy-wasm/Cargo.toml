@@ -20,3 +20,6 @@ wasmtime      = { version = "31", default-features = false, features = ["craneli
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
+
+[lints]
+workspace = true

@@ -16,3 +16,6 @@ ndn-signals-core = { workspace = true }
 # The shared radio HAL contract — home of the `RadioCapability` descriptor +
 # `Band`/`RadioKind`/`TimingModel` (re-exported through `src/sense.rs`).
 ndn-radio-hal    = { workspace = true }
+
+[lints]
+workspace = true

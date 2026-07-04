@@ -29,3 +29,6 @@ ndn-engine     = { workspace = true }
 ndn-face-local = { workspace = true }
 ndn-security   = { workspace = true }
 iceoryx2 = "0.9.2"
+
+[lints]
+workspace = true

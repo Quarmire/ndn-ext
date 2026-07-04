@@ -37,3 +37,6 @@ ndn-security = { path = "../../../../ndn-rs/crates/security/ndn-security", defau
 
 # Still deferred (see lib.rs TODOs): ndn-face-shared-worker (SharedWorker tier),
 # WebTransport upstream dial for InPage, and a `web-sys` SharedWorker probe.
+
+[lints]
+workspace = true

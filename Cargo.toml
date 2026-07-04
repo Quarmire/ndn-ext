@@ -102,8 +102,24 @@ default-members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+# MSRV — verified in CI by the `msrv` job; bump deliberately with a matching CI
+# run. Mirrors the ndn-rs floor (edition 2024 + fjall's declared 1.90).
+rust-version = "1.90"
 authors = ["ndn-rs contributors"]
 license = "MIT OR Apache-2.0"
+
+# Single source of truth for lint policy — every member inherits via
+# `[lints] workspace = true`. CI escalates warn → error with -D warnings.
+# unsafe_code is denied (not forbidden) so the OS-I/O leaf crates (shm,
+# bluetooth, afxdp, monitor-wifi) and the ndn-coding SIMD kernel can opt back
+# in with a scoped, documented `#[allow(unsafe_code)]`.
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
 
 [workspace.metadata.crane]
 name = "ndn-rs"

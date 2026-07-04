@@ -35,3 +35,6 @@ ndn-service-macro = { workspace = true }
 [[example]]
 name = "embedded_sensor"
 required-features = ["seal"]
+
+[lints]
+workspace = true

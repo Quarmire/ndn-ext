@@ -19,3 +19,6 @@ tokio        = { workspace = true, features = ["sync", "rt", "macros", "time"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["sync", "rt", "macros", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

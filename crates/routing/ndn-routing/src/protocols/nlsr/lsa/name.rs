@@ -97,6 +97,7 @@ impl NameLsa {
     }
 
     /// Returns `(changed, prefixes_added, prefixes_removed)`.
+    #[allow(clippy::todo, reason = "NLSR LSA update not yet ported; tracked stub")]
     pub fn update(&mut self, _newer: &NameLsa) -> (bool, Vec<PrefixInfo>, Vec<PrefixInfo>) {
         todo!("NameLsa::update")
     }

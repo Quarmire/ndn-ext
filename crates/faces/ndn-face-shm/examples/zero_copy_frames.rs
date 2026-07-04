@@ -15,6 +15,10 @@
 //!
 //! Run: `cargo run -p ndn-face-shm --example zero_copy_frames --release`
 
+// Example demonstrating the raw shared-memory ring; the unsafe atomic-from-ptr
+// calls are the point of the demo. Denied workspace-wide.
+#![allow(unsafe_code)]
+
 #[cfg(unix)]
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -228,7 +232,9 @@ fn consumer(sock_path: &str) {
             let mut nb = [0u8; 4];
             sock.read_exact(&mut nb).unwrap();
             let s = view.as_slice();
-            sink = sink.wrapping_add(s[0] as u64).wrapping_add(s[len - 1] as u64);
+            sink = sink
+                .wrapping_add(s[0] as u64)
+                .wrapping_add(s[len - 1] as u64);
             sock.write_all(&[1u8]).unwrap();
         }
     }

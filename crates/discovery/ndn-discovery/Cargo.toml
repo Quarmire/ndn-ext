@@ -41,3 +41,6 @@ ndn-mgmt      = { workspace = true, optional = true }
 ndn-mgmt-wire = { workspace = true, optional = true }
 ndn-engine    = { workspace = true, optional = true }
 async-trait   = { workspace = true, optional = true }
+
+[lints]
+workspace = true

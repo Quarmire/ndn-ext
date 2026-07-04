@@ -28,3 +28,6 @@ btleplug = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 btleplug = { workspace = true }
+
+[lints]
+workspace = true

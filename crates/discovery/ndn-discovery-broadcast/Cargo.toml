@@ -39,3 +39,6 @@ web-sys = { version = "0.3", features = [
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 ndn-packet = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true

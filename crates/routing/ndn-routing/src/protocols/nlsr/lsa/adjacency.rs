@@ -117,6 +117,7 @@ impl AdjacencyLsa {
     }
 
     /// Returns whether the adjacency set changed.
+    #[allow(clippy::todo, reason = "NLSR LSA update not yet ported; tracked stub")]
     pub fn update(&mut self, _newer: &AdjacencyLsa) -> bool {
         todo!("AdjacencyLsa::update")
     }

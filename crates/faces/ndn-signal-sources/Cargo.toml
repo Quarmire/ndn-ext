@@ -16,3 +16,6 @@ default = []
 
 [dependencies]
 ndn-signals-core = { workspace = true }
+
+[lints]
+workspace = true

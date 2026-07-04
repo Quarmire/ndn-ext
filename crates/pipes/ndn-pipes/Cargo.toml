@@ -42,7 +42,7 @@ ndn-security  = { workspace = true }
 ndn-transport = { workspace = true }
 # Read-only PIPES introspection module (`/localhost/nfd/pipes/list`).
 ndn-mgmt      = { workspace = true }
-ndn-config    = { workspace = true }
+ndn-config    = { workspace = true, features = ["mgmt"] }
 async-trait   = { workspace = true }
 bytes         = { workspace = true, features = ["std"] }
 thiserror     = { workspace = true }
@@ -57,3 +57,6 @@ ndn-sim         = { workspace = true }
 ndn-face-monitor-wifi = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 tokio-util = { workspace = true }
+
+[lints]
+workspace = true

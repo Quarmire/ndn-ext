@@ -63,19 +63,23 @@
 //!   40/80 MHz and narrowband bandwidths, and the 2.4 GHz band. See
 //!   the crate docs (`docs/named-radio.md`).
 
+// OS-I/O leaf crate: it owns the raw syscall / mmap / FFI boundary, so
+// unsafe is inherent here. Denied workspace-wide, allowed in this crate.
+#![allow(unsafe_code)]
+
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicI8, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
-use ndn_radio_cognition::TxParams;
 use ndn_coding::LinkFecFeature;
+use ndn_radio_cognition::TxParams;
 use ndn_signals_core::{LinkSignals, SignalStore};
-use std::collections::VecDeque;
 use ndn_transport::{
     Face, FaceAddr, FaceKind, FacePersistency, LinkType, MtuError, PersistencyError, Transport,
 };
+use std::collections::VecDeque;
 
 // The frame-I/O substrate — the `FrameIo` trait, the inject/capture frame
 // types, the on-air framing (`frame`/`radiotap`), and the reusable AF_PACKET +
@@ -83,14 +87,14 @@ use ndn_transport::{
 // `ndn_face_monitor_wifi::` paths (and this crate's own modules, which still
 // reference `crate::frame::…`, `crate::McsDescriptor`, `crate::FrameIo`) keep
 // working unchanged.
+#[cfg(target_os = "linux")]
+pub use ndn_frame_io::AfPacketBackend;
 pub use ndn_frame_io::{
     BROADCAST, CapturedFrame, DEFAULT_SRC, ESPNOW_MAX_BODY, ESPNOW_OUI, FaceError, FaceId,
     FrameFormat, FrameIo, InjectFrame, LEGACY_ETHER_MTU, LoopbackEndpoint, LoopbackMonitorBus,
     MAX_RELIABLE_MCS, MONITOR_MTU, McsDescriptor, McsPolicy, Reach, Reliability, TxIntent,
     WifiRadio, frame, mcs_for_rssi, mcs_phy_rate_bps, name_group_mac, name_group_uni, radiotap,
 };
-#[cfg(target_os = "linux")]
-pub use ndn_frame_io::AfPacketBackend;
 
 // The four userspace USB Wi-Fi driver backends (RTL8812EU/8822E, RTL8821CU,
 // MT7612U, RTL8812AU) were lifted into the standalone `ndn-radio-drivers` crate
@@ -99,9 +103,9 @@ pub use ndn_frame_io::AfPacketBackend;
 // etc. references in `control.rs`/`lib.rs`) keep working unchanged.
 #[cfg(feature = "libusb-backend")]
 pub use ndn_radio_drivers::{
-    CHIP_ID_8822E, ChannelBw, FwVersion, LibUsbRtl88xxBackend, REALTEK_VID, REG_SYS_CFG,
-    RTL88XX_PIDS, RfPath, RTL8821CU_PIDS, Rtl8821cuBackend, MT7612U_PIDS, Mt7612uBackend,
-    ChipInfo, IqkResult, RTL8812AU_PIDS, Rtl8812auBackend,
+    CHIP_ID_8822E, ChannelBw, ChipInfo, FwVersion, IqkResult, LibUsbRtl88xxBackend, MT7612U_PIDS,
+    Mt7612uBackend, REALTEK_VID, REG_SYS_CFG, RTL88XX_PIDS, RTL8812AU_PIDS, RTL8821CU_PIDS, RfPath,
+    Rtl8812auBackend, Rtl8821cuBackend,
 };
 
 // The BW16 (RTL8720DN) serial-bridged backend — a dual-band 802.11 node driven
@@ -110,9 +114,9 @@ pub use ndn_radio_drivers::{
 pub use ndn_radio_drivers::Bw16SerialBackend;
 
 mod control;
-pub use control::RadioControl;
 #[cfg(feature = "libusb-backend")]
 pub use control::LibUsbActuator;
+pub use control::RadioControl;
 
 pub mod radio;
 pub use radio::{Bandwidth, RadioKnobs};
@@ -131,7 +135,6 @@ pub use channel_manager::ChannelManager;
 /// this so every NDNLPv2 fragment rides one ESP-NOW frame a stock `esp-wifi`
 /// peer (e.g. an ESP32-C5) can parse. Built by [`MonitorWifiFace::espnow`].
 pub const ESPNOW_MTU: usize = ESPNOW_MAX_BODY;
-
 
 /// A connectionless 802.11 monitor-mode injection face. Build a [`Face`] with
 /// [`into_face`](Self::into_face), which pairs the `LpLinkService` so the engine
@@ -654,10 +657,16 @@ mod tests {
     async fn link_fec_face_roundtrip() {
         use ndn_transport::Transport;
         let bus = LoopbackMonitorBus::new();
-        let tx = MonitorWifiFace::new(FaceId(1), Arc::new(bus.endpoint(1, -50)))
-            .with_link_fec(3, 2, Duration::from_millis(20));
-        let rx = MonitorWifiFace::new(FaceId(2), Arc::new(bus.endpoint(2, -60)))
-            .with_link_fec(3, 2, Duration::from_millis(20));
+        let tx = MonitorWifiFace::new(FaceId(1), Arc::new(bus.endpoint(1, -50))).with_link_fec(
+            3,
+            2,
+            Duration::from_millis(20),
+        );
+        let rx = MonitorWifiFace::new(FaceId(2), Arc::new(bus.endpoint(2, -60))).with_link_fec(
+            3,
+            2,
+            Duration::from_millis(20),
+        );
 
         let sent: Vec<Bytes> = (0..3u8).map(|i| Bytes::from(vec![i; 12])).collect();
         for w in &sent {
@@ -730,7 +739,9 @@ mod tests {
         assert_eq!(ESPNOW_MTU, 250);
         assert_eq!(tx.send_mtu(), Some(ESPNOW_MTU));
 
-        tx.send_bytes(Bytes::from_static(b"\x05\x03ndn")).await.unwrap();
+        tx.send_bytes(Bytes::from_static(b"\x05\x03ndn"))
+            .await
+            .unwrap();
         let (got, addr) =
             tokio::time::timeout(Duration::from_millis(200), rx.recv_bytes_with_addr())
                 .await

@@ -10,3 +10,6 @@ classification = "extension"
 
 [dependencies]
 ring = { workspace = true }
+
+[lints]
+workspace = true

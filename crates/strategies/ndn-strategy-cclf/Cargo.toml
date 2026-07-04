@@ -34,3 +34,6 @@ ndn-packet    = { workspace = true, optional = true, features = ["std"] }
 smallvec      = { workspace = true, optional = true }
 bytes         = { workspace = true, optional = true, features = ["std"] }
 linkme        = { workspace = true, optional = true }
+
+[lints]
+workspace = true

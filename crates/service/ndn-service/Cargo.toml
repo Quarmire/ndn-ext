@@ -60,3 +60,6 @@ ndn-service-macro = { workspace = true }
 ndn-transport = { workspace = true }
 # Leaf-seal ⇄ ContentKey interop witness: ScopeKey needs the `seal` feature.
 ndn-service-core = { workspace = true, features = ["seal"] }
+
+[lints]
+workspace = true

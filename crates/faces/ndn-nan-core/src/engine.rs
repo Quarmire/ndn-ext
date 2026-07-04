@@ -27,12 +27,10 @@ use crate::attr::{
     AttributeId, Cluster, DeviceCapability, MasterIndication, Sdea, ServiceControlType,
     ServiceDescriptor, ServiceIdList,
 };
-use crate::frame::{classify, FrameType, NanBeacon, ServiceDiscoveryFrame};
+use crate::frame::{FrameType, NanBeacon, ServiceDiscoveryFrame, classify};
 use crate::rendezvous::{DiscoveryWindow, Rendezvous};
 use crate::service::service_id;
-use crate::{
-    ServiceId, BROADCAST, NAN_CLUSTER_ID_BASE, NAN_NETWORK_ID, SYNC_BEACON_INTERVAL_TU,
-};
+use crate::{BROADCAST, NAN_CLUSTER_ID_BASE, NAN_NETWORK_ID, SYNC_BEACON_INTERVAL_TU, ServiceId};
 
 /// Microseconds — the engine's time unit (a free-running monotonic clock the
 /// driver supplies; only differences matter).
@@ -251,7 +249,12 @@ impl NanEngine {
     /// Subscribe to a service by name (`active` transmits a subscribe SDF;
     /// passive listens only). Returns the assigned instance id.
     pub fn subscribe(&mut self, name: &str, active: bool) -> u8 {
-        self.add_function(service_id(name), FunctionKind::Subscribe, Vec::new(), active)
+        self.add_function(
+            service_id(name),
+            FunctionKind::Subscribe,
+            Vec::new(),
+            active,
+        )
     }
 
     fn add_function(
@@ -283,7 +286,11 @@ impl NanEngine {
         let ssi = ssi.into();
         // Originate from our first function (the coordination service handle).
         let instance_id = self.functions.first().map(|f| f.instance_id).unwrap_or(0);
-        let service = self.functions.first().map(|f| f.service_id).unwrap_or([0; 6]);
+        let service = self
+            .functions
+            .first()
+            .map(|f| f.service_id)
+            .unwrap_or([0; 6]);
         let peers: Vec<_> = self.peers.clone();
         for (peer, their_inst) in &peers {
             self.followups.push_back(Followup {
@@ -697,10 +704,16 @@ mod tests {
         // polls exactly at the DW boundaries `wake_at` reports).
         for _ in 0..200 {
             let (ae, be) = m.tick(8 * USEC_PER_TU);
-            if ae.iter().any(|e| matches!(e, NanEvent::Discovered { peer, .. } if *peer == B)) {
+            if ae
+                .iter()
+                .any(|e| matches!(e, NanEvent::Discovered { peer, .. } if *peer == B))
+            {
                 a_found = true;
             }
-            if be.iter().any(|e| matches!(e, NanEvent::Discovered { peer, .. } if *peer == A)) {
+            if be
+                .iter()
+                .any(|e| matches!(e, NanEvent::Discovered { peer, .. } if *peer == A))
+            {
                 b_found = true;
             }
         }
@@ -720,10 +733,10 @@ mod tests {
         for _ in 0..200 {
             let (_ae, be) = m.tick(8 * USEC_PER_TU);
             for e in be {
-                if let NanEvent::Discovered { ssi, peer, .. } = e {
-                    if peer == A {
-                        got = Some(ssi);
-                    }
+                if let NanEvent::Discovered { ssi, peer, .. } = e
+                    && peer == A
+                {
+                    got = Some(ssi);
                 }
             }
         }
@@ -752,10 +765,10 @@ mod tests {
         for _ in 0..200 {
             let (_ae, be) = m.tick(8 * USEC_PER_TU);
             for e in be {
-                if let NanEvent::Followup { peer, ssi, .. } = e {
-                    if peer == A {
-                        delivered = Some(ssi);
-                    }
+                if let NanEvent::Followup { peer, ssi, .. } = e
+                    && peer == A
+                {
+                    delivered = Some(ssi);
                 }
             }
         }

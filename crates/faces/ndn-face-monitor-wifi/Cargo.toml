@@ -58,3 +58,6 @@ ndn-coding = { path = "../../coding/ndn-coding", default-features = false, featu
 ndn-nan = { workspace = true }
 ndn-nan-core = { workspace = true }
 ndn-face-wifi-aware = { workspace = true }
+
+[lints]
+workspace = true

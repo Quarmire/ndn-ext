@@ -55,3 +55,6 @@ ndn-rpc = { workspace = true }
 [[example]]
 name = "weather"
 required-features = ["driver"]
+
+[lints]
+workspace = true

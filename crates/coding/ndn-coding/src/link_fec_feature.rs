@@ -215,7 +215,7 @@ mod tests {
         f.set_enabled(true);
         assert!(f.generation_size() >= 1, "K clamped to at least 1");
         assert!(
-            f.generation_size() + 1 <= MAX_N as usize,
+            f.generation_size() < MAX_N as usize,
             "K + R kept within the codec's N bound"
         );
         // A full generation actually produces coded frames (not an empty silent drop).
@@ -224,15 +224,26 @@ mod tests {
             produced += f.on_send(b(&format!("f{i}"))).len();
         }
         produced += f.flush().len();
-        assert!(produced > 0, "a clamped config still encodes + emits a generation");
+        assert!(
+            produced > 0,
+            "a clamped config still encodes + emits a generation"
+        );
         assert!(f.generations_encoded() >= 1);
     }
 
     #[test]
     fn disabled_is_passthrough() {
         let f = LinkFecFeature::new(4, 2, Duration::from_millis(20));
-        assert_eq!(f.on_send(b("hi")), vec![b("hi")], "egress passthrough when off");
-        assert_eq!(f.on_recv(b("hi")), vec![b("hi")], "ingress passthrough when off");
+        assert_eq!(
+            f.on_send(b("hi")),
+            vec![b("hi")],
+            "egress passthrough when off"
+        );
+        assert_eq!(
+            f.on_recv(b("hi")),
+            vec![b("hi")],
+            "ingress passthrough when off"
+        );
         assert!(f.flush().is_empty());
         assert_eq!(f.generations_encoded(), 0);
     }
@@ -268,7 +279,10 @@ mod tests {
         got.sort();
         let mut want: Vec<Bytes> = sources.to_vec();
         want.sort();
-        assert_eq!(got, want, "recovered the full generation despite two losses");
+        assert_eq!(
+            got, want,
+            "recovered the full generation despite two losses"
+        );
     }
 
     #[test]

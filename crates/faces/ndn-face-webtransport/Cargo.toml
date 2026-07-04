@@ -31,3 +31,6 @@ rcgen = { workspace = true }
 # `dangerous-configuration` enables `with_no_cert_validation` for the loopback
 # witness — the listener uses a self-signed cert and the client must accept it.
 wtransport = { workspace = true, features = ["dangerous-configuration"] }
+
+[lints]
+workspace = true

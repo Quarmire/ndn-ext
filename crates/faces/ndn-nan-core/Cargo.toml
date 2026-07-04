@@ -17,3 +17,6 @@ sha2 = { version = "0.11", default-features = false }
 
 [dev-dependencies]
 # Tests run on the host (std); the library itself is no_std (see lib.rs).
+
+[lints]
+workspace = true

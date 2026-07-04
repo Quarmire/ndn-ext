@@ -34,6 +34,10 @@
 //! Backends: Linux via `bluer` (BlueZ), macOS via `objc2`
 //! (`CBPeripheralManager`).
 
+// OS-I/O leaf crate: it owns the raw syscall / mmap / FFI boundary, so
+// unsafe is inherent here. Denied workspace-wide, allowed in this crate.
+#![allow(unsafe_code)]
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]

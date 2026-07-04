@@ -67,3 +67,6 @@ tokio                 = { workspace = true, features = ["full"] }
 rcgen                 = { workspace = true }
 wtransport            = { workspace = true, features = ["dangerous-configuration"] }
 xwt-cert-fingerprint  = "0.1"
+
+[lints]
+workspace = true
