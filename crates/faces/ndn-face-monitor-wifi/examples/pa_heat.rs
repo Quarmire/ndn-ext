@@ -6,17 +6,31 @@
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use bytes::Bytes;
-    use ndn_face_monitor_wifi::{InjectFrame, LibUsbRtl88xxBackend, McsDescriptor, TxIntent, FrameIo, RfPath, WifiRadio};
+    use ndn_face_monitor_wifi::{
+        FrameIo, InjectFrame, LibUsbRtl88xxBackend, McsDescriptor, RfPath, TxIntent, WifiRadio,
+    };
     use std::sync::Arc;
     let b = Arc::new(LibUsbRtl88xxBackend::open_monitor(149)?);
     b.set_tx_power(0x3f)?;
     let data: Bytes = (0..1400u32).map(|i| (i & 0xff) as u8).collect();
-    println!("thermal before: A={} B={}", b.read_thermal(RfPath::A)?, b.read_thermal(RfPath::B)?);
+    println!(
+        "thermal before: A={} B={}",
+        b.read_thermal(RfPath::A)?,
+        b.read_thermal(RfPath::B)?
+    );
     for round in 0..6 {
         for _ in 0..3000 {
-            b.inject_at(InjectFrame::broadcast(data.clone(), TxIntent::CONSERVATIVE), McsDescriptor::ht(0)).await?;
+            b.inject_at(
+                InjectFrame::broadcast(data.clone(), TxIntent::CONSERVATIVE),
+                McsDescriptor::ht(0),
+            )
+            .await?;
         }
-        println!("round {round}: thermal A={} B={}", b.read_thermal(RfPath::A)?, b.read_thermal(RfPath::B)?);
+        println!(
+            "round {round}: thermal A={} B={}",
+            b.read_thermal(RfPath::A)?,
+            b.read_thermal(RfPath::B)?
+        );
     }
     Ok(())
 }

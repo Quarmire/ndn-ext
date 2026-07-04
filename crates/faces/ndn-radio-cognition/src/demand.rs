@@ -52,11 +52,14 @@ impl DemandTracker {
     /// Returns `true` if this was a re-expression (a delivery miss signal).
     pub fn on_interest(&mut self, prefix_hash: u64, downstream: u64, now_ms: u64) -> bool {
         let lifetime = self.pit_lifetime_ms;
-        let e = self.prefixes.entry(prefix_hash).or_insert_with(|| PrefixDemand {
-            downstreams: HashMap::new(),
-            reinterest: Ewma::new(0.3),
-            last_activity_ms: now_ms,
-        });
+        let e = self
+            .prefixes
+            .entry(prefix_hash)
+            .or_insert_with(|| PrefixDemand {
+                downstreams: HashMap::new(),
+                reinterest: Ewma::new(0.3),
+                last_activity_ms: now_ms,
+            });
         let reexpressed = e
             .downstreams
             .get(&downstream)
@@ -172,11 +175,21 @@ mod tests {
         let mut t = DemandTracker::new(4_000);
         // first expression: not a re-Interest
         t.on_interest(0xAA, 1, 1_000);
-        let r0 = t.demand(0xAA, 1_000).unwrap().reinterest_rate.get().unwrap();
+        let r0 = t
+            .demand(0xAA, 1_000)
+            .unwrap()
+            .reinterest_rate
+            .get()
+            .unwrap();
         // same downstream re-expresses before satisfaction
         t.on_interest(0xAA, 1, 1_500);
         t.on_interest(0xAA, 1, 2_000);
-        let r1 = t.demand(0xAA, 2_000).unwrap().reinterest_rate.get().unwrap();
+        let r1 = t
+            .demand(0xAA, 2_000)
+            .unwrap()
+            .reinterest_rate
+            .get()
+            .unwrap();
         assert!(r1 > r0, "re-Interest rate should rise: {r1} > {r0}");
     }
 
@@ -198,7 +211,10 @@ mod tests {
         let ctxs = t.active_contexts(1_000);
         assert_eq!(ctxs.len(), 1);
         assert_eq!(ctxs[0].prefix_hash, 0xAA);
-        assert!(!ctxs[0].is_origin, "PIT-driven demand ⇒ we're relaying, not origin");
+        assert!(
+            !ctxs[0].is_origin,
+            "PIT-driven demand ⇒ we're relaying, not origin"
+        );
     }
 
     #[test]

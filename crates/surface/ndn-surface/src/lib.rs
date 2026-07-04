@@ -61,9 +61,9 @@ use ndn_face_shm::{
     serve_sealed_handoff,
 };
 use ndn_foundation_types::Name;
-use ndn_storage::{NamedOp, NamedReadStore, NamedWriteStore};
 use ndn_packet::encode::DataBuilder;
 use ndn_packet::tlv_type;
+use ndn_storage::{NamedOp, NamedReadStore, NamedWriteStore};
 use ndn_transport::FaceId;
 
 /// Default maximum frame size (ring slot) — 1 MiB. Override with
@@ -106,7 +106,11 @@ fn rendezvous_token(name: &Name) -> ShmToken {
 /// ungated surface uses [`rendezvous_token`] as its capability (knowing the name
 /// is sufficient); a gated surface uses this, keyed on a caller secret.
 fn capability_token(name: &Name, secret: &[u8]) -> ShmToken {
-    sha256_parts(&[b"ndn-surface\x00capability\x00", &name.encode_to_tlv(), secret])
+    sha256_parts(&[
+        b"ndn-surface\x00capability\x00",
+        &name.encode_to_tlv(),
+        secret,
+    ])
 }
 
 fn sha256_parts(parts: &[&[u8]]) -> ShmToken {
@@ -227,9 +231,11 @@ async fn send_wire_to_sink(sink: &mut Sink, wire: &[u8]) -> Result<(), SurfaceEr
             }
             Ok(())
         }
-        Sink::Large { .. } | Sink::LargeFanout { .. } | Sink::Sealed(_) | Sink::Broadcast(_) => Err(SurfaceError::Face(
-            "serve_on_forwarder is for signed streaming surfaces".into(),
-        )),
+        Sink::Large { .. } | Sink::LargeFanout { .. } | Sink::Sealed(_) | Sink::Broadcast(_) => {
+            Err(SurfaceError::Face(
+                "serve_on_forwarder is for signed streaming surfaces".into(),
+            ))
+        }
     }
 }
 
@@ -339,10 +345,7 @@ impl NamedPublisher {
     /// [`NamedSubscriber::connect_gated`] (or `connect_via_gated`) may attach. The
     /// secret never appears on the wire or in the socket path; it is bound to the
     /// name so it can't be replayed against another surface.
-    pub async fn open_gated(
-        name: impl Into<Name>,
-        secret: &[u8],
-    ) -> Result<Self, SurfaceError> {
+    pub async fn open_gated(name: impl Into<Name>, secret: &[u8]) -> Result<Self, SurfaceError> {
         let name = name.into();
         let cap = capability_token(&name, secret);
         Self::open_inner(name, DEFAULT_MAX_FRAME, cap).await
@@ -449,7 +452,8 @@ impl NamedPublisher {
         capability: ShmToken,
     ) -> Result<Self, SurfaceError> {
         let (capacity, slot_size) = sealed_geometry(max_frame);
-        let writer = std::sync::Arc::new(BroadcastWriter::create(capacity, slot_size, max_consumers)?);
+        let writer =
+            std::sync::Arc::new(BroadcastWriter::create(capacity, slot_size, max_consumers)?);
         let path = control_socket_path(&rendezvous_token(&name));
         let listener = bind_exclusive(&path)?;
         let serve_writer = writer.clone();
@@ -751,11 +755,9 @@ impl NamedPublisher {
                 }
                 Sink::Broadcast(writer) => {
                     // Lossy SPMC: never blocks; only fails if the frame exceeds the slot.
-                    if !writer
-                        .publish_with(l, |slot| {
-                            encode_fast_inline(&comps, &vbuf[..vlen], content, slot)
-                        })
-                    {
+                    if !writer.publish_with(l, |slot| {
+                        encode_fast_inline(&comps, &vbuf[..vlen], content, slot)
+                    }) {
                         return Err(SurfaceError::Face(
                             "broadcast frame exceeds the surface slot size".into(),
                         ));
@@ -834,8 +836,7 @@ impl NamedPublisher {
                     let w = w.clone();
                     async move {
                         let n = interest.name.to_string();
-                        if let Some(seq) =
-                            n.rsplit("v=").next().and_then(|s| s.parse::<u64>().ok())
+                        if let Some(seq) = n.rsplit("v=").next().and_then(|s| s.parse::<u64>().ok())
                         {
                             let hit = w.lock().unwrap().get(seq);
                             if let Some(wire) = hit {
@@ -1111,10 +1112,7 @@ impl NamedSubscriber {
     /// Attach to a **capability-gated local** surface, presenting `secret` at the
     /// handshake. Must match the publisher's [`open_gated`](NamedPublisher::open_gated)
     /// secret or the handshake is refused.
-    pub async fn connect_gated(
-        name: impl Into<Name>,
-        secret: &[u8],
-    ) -> Result<Self, SurfaceError> {
+    pub async fn connect_gated(name: impl Into<Name>, secret: &[u8]) -> Result<Self, SurfaceError> {
         let surface = name.into();
         let cap = capability_token(&surface, secret);
         Self::connect_local_inner(surface, cap, 100).await
@@ -1140,7 +1138,10 @@ impl NamedSubscriber {
         Self::connect_large_inner(surface, cap).await
     }
 
-    async fn connect_large_inner(surface: Name, capability: ShmToken) -> Result<Self, SurfaceError> {
+    async fn connect_large_inner(
+        surface: Name,
+        capability: ShmToken,
+    ) -> Result<Self, SurfaceError> {
         let path = control_socket_path(&rendezvous_token(&surface));
         let stream = connect_authorized(&path, capability, 100).await?;
         Ok(Self {
@@ -1188,7 +1189,10 @@ impl NamedSubscriber {
         Self::connect_sealed_inner(surface, cap).await
     }
 
-    async fn connect_sealed_inner(surface: Name, capability: ShmToken) -> Result<Self, SurfaceError> {
+    async fn connect_sealed_inner(
+        surface: Name,
+        capability: ShmToken,
+    ) -> Result<Self, SurfaceError> {
         let path = control_socket_path(&rendezvous_token(&surface));
         let mut tried = 0u32;
         let (data, ctrl, wake) = loop {
@@ -1426,10 +1430,9 @@ impl NamedSubscriber {
                     return None; // already ended
                 };
                 // Read one side-channel frame off-thread: header + (data) fd.
-                let (returned, outcome) =
-                    tokio::task::spawn_blocking(move || read_large_frame(s))
-                        .await
-                        .unwrap_or((None, LargeOutcome::Aborted));
+                let (returned, outcome) = tokio::task::spawn_blocking(move || read_large_frame(s))
+                    .await
+                    .unwrap_or((None, LargeOutcome::Aborted));
                 match outcome {
                     LargeOutcome::Frame { name, buf } => {
                         *slot = returned; // keep reading
@@ -1822,12 +1825,17 @@ fn decode_name_tlv(full: &[u8]) -> Option<Name> {
     }
     let (len, n2) = read_varu64(&full[n1..]).ok()?;
     let start = n1 + n2;
-    let end = start.checked_add(len as usize).filter(|e| *e <= full.len())?;
+    let end = start
+        .checked_add(len as usize)
+        .filter(|e| *e <= full.len())?;
     Name::decode(Bytes::copy_from_slice(&full[start..end])).ok()
 }
 
 enum LargeOutcome {
-    Frame { name: Vec<u8>, buf: SharedBufferReader },
+    Frame {
+        name: Vec<u8>,
+        buf: SharedBufferReader,
+    },
     Eos,
     Aborted,
 }
@@ -1969,7 +1977,10 @@ fn parse_frame(wire: &[u8]) -> Result<(Name, &[u8]), SurfaceError> {
         let typ = read(wire, &mut pos)?;
         let len = read(wire, &mut pos)? as usize;
         let start = pos;
-        let end = start.checked_add(len).filter(|e| *e <= wire.len()).ok_or(SurfaceError::Malformed)?;
+        let end = start
+            .checked_add(len)
+            .filter(|e| *e <= wire.len())
+            .ok_or(SurfaceError::Malformed)?;
         match typ {
             t if t == tlv_type::NAME => {
                 name = Some(
@@ -2038,12 +2049,16 @@ impl ServiceSurface {
         loop {
             let req = self
                 .face
-                .recv_with(|wire| parse_frame(wire).map(|(n, c)| (n, Bytes::copy_from_slice(c))).ok())
+                .recv_with(|wire| {
+                    parse_frame(wire)
+                        .map(|(n, c)| (n, Bytes::copy_from_slice(c)))
+                        .ok()
+                })
                 .await;
             let (req_name, req_content) = match req {
                 Ok(Some(r)) => r,
-                Ok(None) => continue,         // malformed request — skip
-                Err(_) => return Ok(()),       // client gone
+                Ok(None) => continue,    // malformed request — skip
+                Err(_) => return Ok(()), // client gone
             };
             let reply = handler(req_name.clone(), req_content).await;
             let b = DataBuilder::new(req_name, &reply);
@@ -2080,10 +2095,7 @@ impl ClientSurface {
     }
 
     /// Connect to a capability-gated service (presents `secret`).
-    pub async fn connect_gated(
-        name: impl Into<Name>,
-        secret: &[u8],
-    ) -> Result<Self, SurfaceError> {
+    pub async fn connect_gated(name: impl Into<Name>, secret: &[u8]) -> Result<Self, SurfaceError> {
         let surface = name.into();
         let cap = capability_token(&surface, secret);
         Self::connect_inner(&surface, cap).await
@@ -2111,7 +2123,11 @@ impl ClientSurface {
             .await?; // a2e: request
         let reply = self
             .handle
-            .recv_with(|wire| parse_frame(wire).map(|(n, c)| (n, Bytes::copy_from_slice(c))).ok())
+            .recv_with(|wire| {
+                parse_frame(wire)
+                    .map(|(n, c)| (n, Bytes::copy_from_slice(c)))
+                    .ok()
+            })
             .await; // e2a: reply
         match reply {
             Some(Some(r)) => Ok(r),
@@ -2325,8 +2341,7 @@ mod tests {
         // `<surface>/v=<seq>` Interest with that frame's content.
         let kc = KeyChain::ephemeral(surface_str).expect("keychain");
         let signer = kc.signer().expect("signer");
-        let producer =
-            Producer::from_handle(producer_handle, surface.clone()).with_signer(signer);
+        let producer = Producer::from_handle(producer_handle, surface.clone()).with_signer(signer);
         let serve = tokio::spawn(async move {
             producer
                 .serve(|interest, responder| async move {
@@ -2400,7 +2415,11 @@ mod tests {
         }
         pubr.close().await.unwrap();
         assert!(sub.next_frame(|_| ()).await.is_none());
-        assert_eq!(sub.is_complete(), Some(true), "large path honors clean close");
+        assert_eq!(
+            sub.is_complete(),
+            Some(true),
+            "large path honors clean close"
+        );
     }
 
     /// Large-frame fan-out: one publisher, N subscribers, each receiving every
@@ -2418,10 +2437,12 @@ mod tests {
             let mut sub = NamedSubscriber::connect_large(name).await.unwrap();
             readers.push(tokio::spawn(async move {
                 let mut got = Vec::new();
-                while let Some(v) =
-                    timeout(Duration::from_secs(10), sub.next_frame(|f| (f.content.len(), f.content[0])))
-                        .await
-                        .expect("no stall")
+                while let Some(v) = timeout(
+                    Duration::from_secs(10),
+                    sub.next_frame(|f| (f.content.len(), f.content[0])),
+                )
+                .await
+                .expect("no stall")
                 {
                     got.push(v);
                 }
@@ -2439,7 +2460,11 @@ mod tests {
 
         for r in readers {
             let (frames, complete) = r.await.unwrap();
-            assert_eq!(frames.len() as u64, FRAMES, "each subscriber gets every large frame");
+            assert_eq!(
+                frames.len() as u64,
+                FRAMES,
+                "each subscriber gets every large frame"
+            );
             for (i, (len, first)) in frames.iter().enumerate() {
                 assert_eq!(*len, BIG);
                 assert_eq!(*first, (i as u8) + 1, "frame {i} payload");
@@ -2453,7 +2478,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn large_and_streaming_modes_are_distinct() {
         let mut large = NamedPublisher::open_large("/mode/large").await.unwrap();
-        assert!(large.publish(b"x").await.is_err(), "publish on large surface");
+        assert!(
+            large.publish(b"x").await.is_err(),
+            "publish on large surface"
+        );
         let mut stream = NamedPublisher::open("/mode/stream").await.unwrap();
         assert!(
             stream.publish_large(b"x").await.is_err(),
@@ -2479,10 +2507,12 @@ mod tests {
             let mut sub = NamedSubscriber::connect(name).await.unwrap();
             readers.push(tokio::spawn(async move {
                 let mut got = Vec::new();
-                while let Some(frame) =
-                    timeout(Duration::from_secs(5), sub.next_frame(|f| f.content.to_vec()))
-                        .await
-                        .expect("no stall")
+                while let Some(frame) = timeout(
+                    Duration::from_secs(5),
+                    sub.next_frame(|f| f.content.to_vec()),
+                )
+                .await
+                .expect("no stall")
                 {
                     got.push(frame);
                 }
@@ -2500,7 +2530,11 @@ mod tests {
 
         for r in readers {
             let (frames, complete) = r.await.unwrap();
-            assert_eq!(frames.len() as u64, FRAMES, "every subscriber gets every frame");
+            assert_eq!(
+                frames.len() as u64,
+                FRAMES,
+                "every subscriber gets every frame"
+            );
             for (i, frame) in frames.iter().enumerate() {
                 assert_eq!(frame, &vec![i as u8; 1000], "frame {i} in order");
             }
@@ -2522,10 +2556,12 @@ mod tests {
             let mut sub = NamedSubscriber::connect_broadcast(name).await.unwrap();
             readers.push(tokio::spawn(async move {
                 let mut got = Vec::new();
-                while let Some(frame) =
-                    timeout(Duration::from_secs(5), sub.next_frame(|f| f.content.to_vec()))
-                        .await
-                        .expect("no stall")
+                while let Some(frame) = timeout(
+                    Duration::from_secs(5),
+                    sub.next_frame(|f| f.content.to_vec()),
+                )
+                .await
+                .expect("no stall")
                 {
                     got.push(frame);
                 }
@@ -2542,7 +2578,11 @@ mod tests {
 
         for r in readers {
             let (frames, complete, dropped) = r.await.unwrap();
-            assert_eq!(frames.len() as u64, FRAMES, "keeping-up subscriber gets all frames");
+            assert_eq!(
+                frames.len() as u64,
+                FRAMES,
+                "keeping-up subscriber gets all frames"
+            );
             for (i, frame) in frames.iter().enumerate() {
                 assert_eq!(frame, &vec![i as u8; 500], "frame {i} in order");
             }
@@ -2559,7 +2599,9 @@ mod tests {
     async fn broadcast_lossy_laps_a_slow_subscriber() {
         let name = "/broadcast/lossy";
         // 1 MiB max frame ⇒ sealed_geometry capacity == 4 slots.
-        let mut pubr = NamedPublisher::open_broadcast_with(name, 1 << 20, 4).await.unwrap();
+        let mut pubr = NamedPublisher::open_broadcast_with(name, 1 << 20, 4)
+            .await
+            .unwrap();
         let mut sub = NamedSubscriber::connect_broadcast(name).await.unwrap();
 
         // Publish 10 frames before reading any: the producer never blocks, so the
@@ -2568,15 +2610,20 @@ mod tests {
             pubr.publish(&i.to_le_bytes()).await.unwrap();
         }
         let mut got = Vec::new();
-        while let Some(v) = timeout(Duration::from_millis(200), sub.next_frame(|f| {
-            u32::from_le_bytes(f.content.try_into().unwrap())
-        }))
+        while let Some(v) = timeout(
+            Duration::from_millis(200),
+            sub.next_frame(|f| u32::from_le_bytes(f.content.try_into().unwrap())),
+        )
         .await
         .unwrap_or(None)
         {
             got.push(v);
         }
-        assert_eq!(got, vec![6, 7, 8, 9], "only the last capacity-worth survive");
+        assert_eq!(
+            got,
+            vec![6, 7, 8, 9],
+            "only the last capacity-worth survive"
+        );
         assert_eq!(sub.dropped(), 6, "the lapped frames are counted");
     }
 
@@ -2612,10 +2659,13 @@ mod tests {
 
         // Local subscriber reads over SHM (zero-copy).
         for i in 0..4u64 {
-            let body = timeout(Duration::from_secs(2), local.next_frame(|f| f.content.to_vec()))
-                .await
-                .expect("no stall")
-                .expect("local frame");
+            let body = timeout(
+                Duration::from_secs(2),
+                local.next_frame(|f| f.content.to_vec()),
+            )
+            .await
+            .expect("no stall")
+            .expect("local frame");
             assert_eq!(body, vec![(i as u8) + 1; 500], "local frame {i}");
         }
 
@@ -2626,7 +2676,10 @@ mod tests {
         let mut remote = NamedSubscriber::connect_via(surface.clone(), consumer)
             .await
             .unwrap();
-        assert!(!remote.is_local(), "second reader resolves to the remote path");
+        assert!(
+            !remote.is_local(),
+            "second reader resolves to the remote path"
+        );
         for i in 0..4u64 {
             let (name, body) = timeout(
                 Duration::from_secs(5),
@@ -2673,12 +2726,18 @@ mod tests {
         let pubr = StatePublisher::open("/state/multi").await.unwrap();
         let mut a = StateSubscriber::connect("/state/multi").await.unwrap();
         pubr.set(b"x").unwrap();
-        let va = timeout(Duration::from_secs(2), a.next()).await.unwrap().unwrap();
+        let va = timeout(Duration::from_secs(2), a.next())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(&va[..], b"x");
 
         // b attaches late, still gets the current value.
         let mut b = StateSubscriber::connect("/state/multi").await.unwrap();
-        let vb = timeout(Duration::from_secs(2), b.next()).await.unwrap().unwrap();
+        let vb = timeout(Duration::from_secs(2), b.next())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(&vb[..], b"x", "late subscriber b also sees current value");
     }
 
@@ -2762,7 +2821,7 @@ mod tests {
     /// Random access: replay from a specific version (fill a gap).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn replay_from_specific_version() {
-        use ndn_storage::{MemoryBackend, NamedStore, NamedReadStore, NamedWriteStore};
+        use ndn_storage::{MemoryBackend, NamedReadStore, NamedStore, NamedWriteStore};
         let store: Arc<dyn NamedWriteStore> = Arc::new(NamedStore::new(MemoryBackend::new()));
         let mut pubr = NamedPublisher::open("/durable/seek")
             .await
@@ -2776,7 +2835,10 @@ mod tests {
         let read: Arc<dyn NamedReadStore> = store;
         let mut replay = NamedSubscriber::connect_replay("/durable/seek", read, 3);
         let first = replay.next_frame(|f| f.name.to_string()).await.unwrap();
-        assert_eq!(first, "/durable/seek/v=3", "replay starts at the requested version");
+        assert_eq!(
+            first, "/durable/seek/v=3",
+            "replay starts at the requested version"
+        );
     }
 
     /// Catch-up-then-follow: a late joiner replays history from the store and then
@@ -2820,11 +2882,19 @@ mod tests {
             .await
             .expect("no stall")
             .expect("frame");
-            assert_eq!(name.to_string(), format!("/cascade/s/v={i}"), "in-order, no gaps/dups");
+            assert_eq!(
+                name.to_string(),
+                format!("/cascade/s/v={i}"),
+                "in-order, no gaps/dups"
+            );
             assert_eq!(body, vec![i as u8; 100]);
         }
         assert!(cu.next_frame(|_| ()).await.is_none());
-        assert_eq!(cu.is_complete(), Some(true), "clean end after the live close");
+        assert_eq!(
+            cu.is_complete(),
+            Some(true),
+            "clean end after the live close"
+        );
         prod.await.unwrap();
     }
 
@@ -2834,7 +2904,10 @@ mod tests {
         use ndn_storage::{MemoryBackend, NamedStore, NamedWriteStore};
         let store: Arc<dyn NamedWriteStore> = Arc::new(NamedStore::new(MemoryBackend::new()));
         let sealed = NamedPublisher::open_local("/durable/nope").await.unwrap();
-        assert!(sealed.retain(store, RetentionPolicy::unlimited()).is_err(), "sealed is ephemeral; retain refused");
+        assert!(
+            sealed.retain(store, RetentionPolicy::unlimited()).is_err(),
+            "sealed is ephemeral; retain refused"
+        );
     }
 
     // ---- exclusive producer ownership ------------------------------------
@@ -2904,10 +2977,13 @@ mod tests {
             .await
             .unwrap();
         pubr.publish(b"sealed+gated").await.unwrap();
-        let body = timeout(Duration::from_secs(2), sub.next_frame(|f| f.content.to_vec()))
-            .await
-            .expect("no stall")
-            .expect("frame");
+        let body = timeout(
+            Duration::from_secs(2),
+            sub.next_frame(|f| f.content.to_vec()),
+        )
+        .await
+        .expect("no stall")
+        .expect("frame");
         assert_eq!(&body[..], b"sealed+gated");
         assert!(
             pubr.publish_large(b"x").await.is_err(),
@@ -2927,7 +3003,9 @@ mod tests {
         let serve = tokio::spawn(async move {
             let _ = service
                 .serve(|_req_name, body| async move {
-                    body.iter().map(|b| b.to_ascii_uppercase()).collect::<Vec<u8>>()
+                    body.iter()
+                        .map(|b| b.to_ascii_uppercase())
+                        .collect::<Vec<u8>>()
                 })
                 .await;
         });
@@ -2942,7 +3020,11 @@ mod tests {
             .expect("no stall")
             .expect("reply");
             assert_eq!(&reply[..], b"HELLO", "service uppercased the request");
-            assert_eq!(rname.to_string(), "/rpc/echo/req", "reply named after request");
+            assert_eq!(
+                rname.to_string(),
+                "/rpc/echo/req",
+                "reply named after request"
+            );
         }
         serve.abort();
     }
@@ -3166,14 +3248,21 @@ mod tests {
 
         // (a) buffered frames survive the producer's exit (shared pages outlive it).
         for i in 0..3u64 {
-            let body = timeout(Duration::from_secs(2), sub.next_frame(|f| f.content.to_vec()))
-                .await
-                .expect("must not hang on buffered frame")
-                .expect("buffered frame still readable");
+            let body = timeout(
+                Duration::from_secs(2),
+                sub.next_frame(|f| f.content.to_vec()),
+            )
+            .await
+            .expect("must not hang on buffered frame")
+            .expect("buffered frame still readable");
             assert_eq!(body, vec![i as u8; 100], "buffered frame {i}");
         }
         // (b) then clean end-of-stream, within a bound (proves no infinite park).
-        let end = timeout(Duration::from_secs(2), sub.next_frame(|f| f.content.to_vec())).await;
+        let end = timeout(
+            Duration::from_secs(2),
+            sub.next_frame(|f| f.content.to_vec()),
+        )
+        .await;
         assert!(
             matches!(end, Ok(None)),
             "publisher gone ⇒ end-of-stream None, got {end:?}"
@@ -3191,7 +3280,10 @@ mod tests {
         let path = control_socket_path(&rendezvous_token(&surface));
         let _ = std::fs::remove_file(&path);
         drop(tokio::net::UnixListener::bind(&path).expect("bind stale socket"));
-        assert!(path.exists(), "stale socket should be present for the probe");
+        assert!(
+            path.exists(),
+            "stale socket should be present for the probe"
+        );
 
         let (consumer, serve, _engine) = spawn_remote_surface(&surface).await;
         let mut sub = NamedSubscriber::connect_via(surface.clone(), consumer)
@@ -3201,7 +3293,10 @@ mod tests {
             !sub.is_local(),
             "stale local socket must not be taken — should fall back to remote"
         );
-        let name = sub.next_frame(|f| f.name.clone()).await.expect("remote frame");
+        let name = sub
+            .next_frame(|f| f.name.clone())
+            .await
+            .expect("remote frame");
         assert_eq!(name.to_string(), "/chaos/stale/v=0");
         serve.abort();
         let _ = std::fs::remove_file(&path);
@@ -3214,7 +3309,9 @@ mod tests {
     async fn slow_consumer_backpressure_no_loss() {
         const N: u64 = 64;
         let mut pubr = NamedPublisher::open("/chaos/backpressure").await.unwrap();
-        let mut sub = NamedSubscriber::connect("/chaos/backpressure").await.unwrap();
+        let mut sub = NamedSubscriber::connect("/chaos/backpressure")
+            .await
+            .unwrap();
 
         // Producer races ahead; send_with parks when the ring is full.
         let prod = tokio::spawn(async move {
@@ -3225,10 +3322,13 @@ mod tests {
         });
 
         for i in 0..N {
-            let body = timeout(Duration::from_secs(5), sub.next_frame(|f| f.content.to_vec()))
-                .await
-                .expect("no stall under backpressure")
-                .expect("frame");
+            let body = timeout(
+                Duration::from_secs(5),
+                sub.next_frame(|f| f.content.to_vec()),
+            )
+            .await
+            .expect("no stall under backpressure")
+            .expect("frame");
             assert_eq!(
                 body,
                 vec![(i & 0xff) as u8; 1000],
@@ -3329,7 +3429,10 @@ mod tests {
         prod.await.unwrap();
 
         assert_eq!(reassembled.len(), original.len(), "bulk length");
-        assert_eq!(reassembled, original, "bulk object reassembles byte-identical");
+        assert_eq!(
+            reassembled, original,
+            "bulk object reassembles byte-identical"
+        );
         assert_eq!(
             sub.is_complete(),
             Some(true),

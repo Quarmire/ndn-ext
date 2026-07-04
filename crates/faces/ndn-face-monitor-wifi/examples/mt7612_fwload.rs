@@ -26,8 +26,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Efuse sanity: chip ID + factory MAC (proves efuse access post-firmware).
     let chip = dev.chip_id()?;
     let mac = dev.mac_address()?;
-    println!("chip ID = 0x{chip:04x}  MAC = {}",
-        mac.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":"));
+    println!(
+        "chip ID = 0x{chip:04x}  MAC = {}",
+        mac.iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(":")
+    );
     Ok(())
 }
 #[cfg(not(feature = "libusb-backend"))]

@@ -67,9 +67,18 @@ fn main() {
     let mut radio = RadioSink::default();
 
     for r in [
-        Reading { decicelsius: 213, humidity_pct: 41 },
-        Reading { decicelsius: 215, humidity_pct: 42 },
-        Reading { decicelsius: 208, humidity_pct: 44 },
+        Reading {
+            decicelsius: 213,
+            humidity_pct: 41,
+        },
+        Reading {
+            decicelsius: 215,
+            humidity_pct: 42,
+        },
+        Reading {
+            decicelsius: 208,
+            humidity_pct: 44,
+        },
     ] {
         sensor.publish(&r, &mut radio).unwrap();
     }
@@ -94,12 +103,21 @@ fn main() {
     let scope_key = ScopeKey::from_bytes([7u8; 32]);
     // `publisher_id` (here 1) must be unique among leaves sharing the scope key —
     // it is the high 4 bytes of the AEAD nonce, so two leaves never collide.
-    let mut secure_sensor =
-        Publisher::<Reading>::sealed("/sensor/lab-3/secure".parse().unwrap(), scope_key.clone(), 1);
+    let mut secure_sensor = Publisher::<Reading>::sealed(
+        "/sensor/lab-3/secure".parse().unwrap(),
+        scope_key.clone(),
+        1,
+    );
     let mut secure_radio = RadioSink::default();
 
     secure_sensor
-        .publish(&Reading { decicelsius: 221, humidity_pct: 39 }, &mut secure_radio)
+        .publish(
+            &Reading {
+                decicelsius: 221,
+                humidity_pct: 39,
+            },
+            &mut secure_radio,
+        )
         .unwrap();
 
     // On air the payload is the `ContentKey` wire layout: nonce ‖ tag ‖ ciphertext.
@@ -117,7 +135,9 @@ fn main() {
     // decodes the same `Frame`. (A capable node would open with `ContentKey`
     // directly; the bytes are identical.)
     let aad = sealed.name.encode_to_tlv();
-    let opened = scope_key.open(&aad, &sealed.payload).expect("scope key opens it");
+    let opened = scope_key
+        .open(&aad, &sealed.payload)
+        .expect("scope key opens it");
     let reading = Reading::decode(&opened).unwrap();
     println!(
         "  member gateway (has key) reads: {:.1} °C, {}% RH",

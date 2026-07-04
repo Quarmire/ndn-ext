@@ -225,7 +225,9 @@ pub async fn serve_provider<H>(
                         pending_payloads.insert(reqid.to_string(), (req.payload.clone(), now));
                         let ack = engine.on_request(now, requester.clone(), service.clone(), &req);
                         let name = names::ack_name(&node, &requester, &service, &reqid);
-                        let _ = ps.publish(name.clone(), trust.seal(name, ack.encode()).as_ref()).await;
+                        let _ = ps
+                            .publish(name.clone(), trust.seal(name, ack.encode()).as_ref())
+                            .await;
                     }
                     RequestMode::TargetedBootstrap => {
                         // Pre-issue a token batch and return it in the RESPONSE.
@@ -248,7 +250,9 @@ pub async fn serve_provider<H>(
                             payload: Bytes::from(toks.join("\n").into_bytes()),
                         };
                         let name = names::response_name(&node, &requester, &service, &reqid);
-                        let _ = ps.publish(name.clone(), trust.seal(name, resp.encode()).as_ref()).await;
+                        let _ = ps
+                            .publish(name.clone(), trust.seal(name, resp.encode()).as_ref())
+                            .await;
                     }
                     RequestMode::Targeted => {
                         // Consume the pre-issued token and respond directly — no
@@ -257,13 +261,13 @@ pub async fn serve_provider<H>(
                             provider_token: req.provider_token.clone(),
                             request_id: reqid.to_string(),
                         };
-                        if let Ok(resp) =
-                            engine.on_selection(now, &sel, &requester, |coord| {
-                                handler(coord, &req.payload)
-                            })
-                        {
+                        if let Ok(resp) = engine.on_selection(now, &sel, &requester, |coord| {
+                            handler(coord, &req.payload)
+                        }) {
                             let name = names::response_name(&node, &requester, &service, &reqid);
-                            let _ = ps.publish(name.clone(), trust.seal(name, resp.encode()).as_ref()).await;
+                            let _ = ps
+                                .publish(name.clone(), trust.seal(name, resp.encode()).as_ref())
+                                .await;
                         }
                     }
                 }
@@ -291,7 +295,9 @@ pub async fn serve_provider<H>(
                 {
                     pending_payloads.remove(&reqid.to_string());
                     let name = names::response_name(&node, &requester, &service, &reqid);
-                    let _ = ps.publish(name.clone(), trust.seal(name, resp.encode()).as_ref()).await;
+                    let _ = ps
+                        .publish(name.clone(), trust.seal(name, resp.encode()).as_ref())
+                        .await;
                 }
             }
             _ => {} // ACK/RESPONSE: our own or others' — ignore
@@ -303,9 +309,7 @@ pub async fn serve_provider<H>(
 /// coordination and the (owned) request payload, yield the response payload.
 /// This is the seam a service `Carrier` plugs its async `Dispatch` into.
 pub type AsyncResponder = Arc<
-    dyn Fn(PendingCoordination, Bytes) -> Pin<Box<dyn Future<Output = Bytes> + Send>>
-        + Send
-        + Sync,
+    dyn Fn(PendingCoordination, Bytes) -> Pin<Box<dyn Future<Output = Bytes> + Send>> + Send + Sync,
 >;
 
 /// Provider loop for the Normal four-phase path (REQUEST→ACK, SELECTION→RESPONSE)
@@ -364,7 +368,9 @@ pub async fn serve_provider_async(
                 pending_payloads.insert(reqid.to_string(), (req.payload.clone(), now));
                 let ack = engine.on_request(now, requester.clone(), service.clone(), &req);
                 let name = names::ack_name(&node, &requester, &service, &reqid);
-                let _ = ps.publish(name.clone(), trust.seal(name, ack.encode()).as_ref()).await;
+                let _ = ps
+                    .publish(name.clone(), trust.seal(name, ack.encode()).as_ref())
+                    .await;
             }
             Some(Phase::Selection) => {
                 if service_of(&pubn.name).as_ref() != Some(&service) {
@@ -410,7 +416,10 @@ pub async fn serve_provider_async(
                             },
                         };
                         let _ = ps
-                            .publish(resp_name.clone(), trust.seal(resp_name, resp.encode()).as_ref())
+                            .publish(
+                                resp_name.clone(),
+                                trust.seal(resp_name, resp.encode()).as_ref(),
+                            )
                             .await;
                     });
                 }
@@ -443,9 +452,12 @@ pub async fn call(
     // Phase 1: REQUEST (signed as the requester).
     let req = make_request(&request_id.to_string(), user_token, payload);
     let req_name = names::request_name(&requester, &service, &request_id);
-    ps.publish(req_name.clone(), trust.seal(req_name, req.encode()).as_ref())
-        .await
-        .ok()?;
+    ps.publish(
+        req_name.clone(),
+        trust.seal(req_name, req.encode()).as_ref(),
+    )
+    .await
+    .ok()?;
 
     // Await our provider's ACK (Phase 2), verified to come from `provider`.
     let ack = loop {
@@ -459,14 +471,18 @@ pub async fn call(
     // Phase 3: SELECTION, echoing the provider token (signed as the requester).
     let sel = make_selection(&ack, &request_id.to_string());
     let sel_name = names::selection_name(&requester, &provider, &service, &request_id);
-    ps.publish(sel_name.clone(), trust.seal(sel_name, sel.encode()).as_ref())
-        .await
-        .ok()?;
+    ps.publish(
+        sel_name.clone(),
+        trust.seal(sel_name, sel.encode()).as_ref(),
+    )
+    .await
+    .ok()?;
 
     // Await the RESPONSE (Phase 4), verified to come from `provider`.
     loop {
         let pubn = rx.recv().await?;
-        if phase_of(&pubn.name) == Some(Phase::Response) && request_id_of(&pubn.name) == request_id {
+        if phase_of(&pubn.name) == Some(Phase::Response) && request_id_of(&pubn.name) == request_id
+        {
             let payload = trust.unseal(pubn.payload, &provider, &pubn.name).await?;
             return ResponseMessage::decode(payload).ok().map(|r| r.payload);
         }
@@ -504,7 +520,10 @@ pub async fn select_and_call(
     };
     let req_name = names::request_name(&requester, &service, &request_id);
     if ps
-        .publish(req_name.clone(), trust.seal(req_name, req.encode()).as_ref())
+        .publish(
+            req_name.clone(),
+            trust.seal(req_name, req.encode()).as_ref(),
+        )
         .await
         .is_err()
     {
@@ -539,13 +558,20 @@ pub async fn select_and_call(
     }
 
     // Phase 3: SELECT the provider(s) per strategy and send each a SELECTION.
-    let selected: Vec<(Name, AckMessage)> =
-        select_providers(strategy, &acks).into_iter().cloned().collect();
+    let selected: Vec<(Name, AckMessage)> = select_providers(strategy, &acks)
+        .into_iter()
+        .cloned()
+        .collect();
     let want: Vec<Name> = selected.iter().map(|(p, _)| p.clone()).collect();
     for (provider, ack) in &selected {
         let sel = make_selection(ack, &request_id.to_string());
         let sel_name = names::selection_name(&requester, provider, &service, &request_id);
-        let _ = ps.publish(sel_name.clone(), trust.seal(sel_name, sel.encode()).as_ref()).await;
+        let _ = ps
+            .publish(
+                sel_name.clone(),
+                trust.seal(sel_name, sel.encode()).as_ref(),
+            )
+            .await;
     }
 
     // Phase 4: collect one RESPONSE per selected provider, within the window.
@@ -564,7 +590,8 @@ pub async fn select_and_call(
                     let provider = before_ndnsf(&pubn.name);
                     if want.contains(&provider)
                         && !responses.iter().any(|(p, _)| *p == provider)
-                        && let Some(payload) = trust.unseal(pubn.payload, &provider, &pubn.name).await
+                        && let Some(payload) =
+                            trust.unseal(pubn.payload, &provider, &pubn.name).await
                         && let Ok(resp) = ResponseMessage::decode(payload)
                     {
                         responses.push((provider, resp.payload));
@@ -601,7 +628,10 @@ pub async fn bootstrap_targeted(
     };
     let req_name = names::request_name(&requester, &service, &request_id);
     if ps
-        .publish(req_name.clone(), trust.seal(req_name, req.encode()).as_ref())
+        .publish(
+            req_name.clone(),
+            trust.seal(req_name, req.encode()).as_ref(),
+        )
         .await
         .is_err()
     {
@@ -611,7 +641,8 @@ pub async fn bootstrap_targeted(
         let Some(pubn) = rx.recv().await else {
             return Vec::new();
         };
-        if phase_of(&pubn.name) == Some(Phase::Response) && request_id_of(&pubn.name) == request_id {
+        if phase_of(&pubn.name) == Some(Phase::Response) && request_id_of(&pubn.name) == request_id
+        {
             let Some(payload) = trust.unseal(pubn.payload, &provider, &pubn.name).await else {
                 return Vec::new();
             };
@@ -654,12 +685,16 @@ pub async fn call_targeted(
         ..Default::default()
     };
     let req_name = names::request_name(&requester, &service, &request_id);
-    ps.publish(req_name.clone(), trust.seal(req_name, req.encode()).as_ref())
-        .await
-        .ok()?;
+    ps.publish(
+        req_name.clone(),
+        trust.seal(req_name, req.encode()).as_ref(),
+    )
+    .await
+    .ok()?;
     loop {
         let pubn = rx.recv().await?;
-        if phase_of(&pubn.name) == Some(Phase::Response) && request_id_of(&pubn.name) == request_id {
+        if phase_of(&pubn.name) == Some(Phase::Response) && request_id_of(&pubn.name) == request_id
+        {
             let payload = trust.unseal(pubn.payload, &provider, &pubn.name).await?;
             return ResponseMessage::decode(payload).ok().map(|r| r.payload);
         }
@@ -681,11 +716,20 @@ mod tests {
         let mut limiter = RequesterLimiter::new();
         let alice = n("/muas/alice");
         let permitted = (0..1000).filter(|_| limiter.admit(&alice)).count();
-        assert!(permitted > 0, "the burst allowance must let an initial run through");
-        assert!(permitted < 1000, "a tight flood from one requester must be rate-limited");
+        assert!(
+            permitted > 0,
+            "the burst allowance must let an initial run through"
+        );
+        assert!(
+            permitted < 1000,
+            "a tight flood from one requester must be rate-limited"
+        );
 
         let bob = n("/muas/bob");
-        assert!(limiter.admit(&bob), "a distinct requester must not be starved by another's flood");
+        assert!(
+            limiter.admit(&bob),
+            "a distinct requester must not be starved by another's flood"
+        );
     }
 
     #[test]

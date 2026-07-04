@@ -22,7 +22,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Open + identify before the full bring-up.
     let dev = Rtl8821cuBackend::open()?;
     let sys_cfg1 = dev.read32(0x00f0)?;
-    println!("REG_SYS_CFG1 (0x00f0) = {sys_cfg1:#010x}  cut={}", (sys_cfg1 >> 12) & 0xf);
+    println!(
+        "REG_SYS_CFG1 (0x00f0) = {sys_cfg1:#010x}  cut={}",
+        (sys_cfg1 >> 12) & 0xf
+    );
     let mut mac = [0u8; 6];
     for (i, m) in mac.iter_mut().enumerate() {
         *m = dev.read8(0x0610 + i as u16)?;
@@ -36,8 +39,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dev.bring_up(channel)?;
 
     let (rfe, btg) = dev.rfe_profile();
-    println!("RFE profile (efuse): rfe_option={rfe:#04x} btg={btg}{}",
-        if rfe == 0xff { "  (efuse read FAILED — using defaults)" } else { "" });
+    println!(
+        "RFE profile (efuse): rfe_option={rfe:#04x} btg={btg}{}",
+        if rfe == 0xff {
+            "  (efuse read FAILED — using defaults)"
+        } else {
+            ""
+        }
+    );
 
     // Firmware liveness: REG_MCUFW_CTRL FW_INIT_RDY(bit15)/FW_DW_RDY(bit14) show
     // the fw booted; the H2C write/read pointers show whether the fw is actually
@@ -51,8 +60,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let h2c_w = dev.read32(0x10d4)? & 0x3ffff;
     let h2c_r = dev.read32(0x10d0)? & 0x3ffff;
-    println!("FW: H2C_PKT write_addr(0x10d4)={h2c_w:#06x}  read_addr(0x10d0)={h2c_r:#06x}  {}",
-        if h2c_w == h2c_r { "(fw consumed all H2C — alive)" } else { "(fw NOT consuming H2C — stuck/dead)" });
+    println!(
+        "FW: H2C_PKT write_addr(0x10d4)={h2c_w:#06x}  read_addr(0x10d0)={h2c_r:#06x}  {}",
+        if h2c_w == h2c_r {
+            "(fw consumed all H2C — alive)"
+        } else {
+            "(fw NOT consuming H2C — stuck/dead)"
+        }
+    );
     // RF register dump: if these are all the same constant, RF *reads* are
     // broken; if varied, the read path works and a write/tune issue remains.
     for rf in [0x00u8, 0x18, 0x25, 0x42, 0xb8, 0xef] {
@@ -66,7 +81,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //  - FA climbs + RXPKT zero                    → MAC RX filter/enable issue.
     //  - FA zero                                   → RF/BB receiver is deaf.
     dev.debug_reset_rx_counters()?; // kick the BB counters so they accumulate
-    let fa0 = (dev.read16(0x0a5c)?, dev.read16(0x0f48)?, dev.read32(0x0284)?);
+    let fa0 = (
+        dev.read16(0x0a5c)?,
+        dev.read16(0x0f48)?,
+        dev.read32(0x0284)?,
+    );
 
     println!("listening 5s for ambient frames ...");
     // Start the background RX pump (concurrent bulk-IN reads) then drain.
@@ -88,7 +107,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ => {}
         }
     }
-    let fa1 = (dev.read16(0x0a5c)?, dev.read16(0x0f48)?, dev.read32(0x0284)?);
+    let fa1 = (
+        dev.read16(0x0a5c)?,
+        dev.read16(0x0f48)?,
+        dev.read32(0x0284)?,
+    );
     // CRC counters (frames the BB actually demodulated): CCK 0xf04, OFDM 0xf14;
     // low16 = CRC-ok count, high16 = CRC-err count.
     let crc_cck = dev.read32(0x0f04)?;
@@ -101,7 +124,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!(
         "BB CRC counters: CCK ok={} err={} | OFDM ok={} err={}  (>0 ⇒ BB demodulating frames)",
-        crc_cck & 0xffff, crc_cck >> 16, crc_ofdm & 0xffff, crc_ofdm >> 16
+        crc_cck & 0xffff,
+        crc_cck >> 16,
+        crc_ofdm & 0xffff,
+        crc_ofdm >> 16
     );
 
     // The honest receiver test: raw 802.11 frames seen on air (ch1/2.4 GHz is
@@ -124,7 +150,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut tx_ok = 0u32;
     for i in 0..100u32 {
         let payload = bytes::Bytes::from(format!("/ndn/tx-test/{i}").into_bytes());
-        match dev.inject(InjectFrame::broadcast(payload, TxIntent::CONSERVATIVE)).await {
+        match dev
+            .inject(InjectFrame::broadcast(payload, TxIntent::CONSERVATIVE))
+            .await
+        {
             Ok(()) => tx_ok += 1,
             Err(e) => {
                 println!("TX: inject #{i} failed: {e}");
@@ -136,7 +165,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let txempty_after = dev.read16(0x041a)?;
     println!(
         "TX: {tx_ok}/100 frames accepted by USB; TXPKT_EMPTY before={txempty_before:#06x} after={txempty_after:#06x} {}",
-        if txempty_after == txempty_before { "(queues drained — TX path keying)" } else { "(queue stuck — frames not keyed)" }
+        if txempty_after == txempty_before {
+            "(queues drained — TX path keying)"
+        } else {
+            "(queue stuck — frames not keyed)"
+        }
     );
     Ok(())
 }

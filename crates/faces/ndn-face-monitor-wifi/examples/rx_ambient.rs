@@ -3,8 +3,14 @@
 #[cfg(feature = "libusb-backend")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use ndn_face_monitor_wifi::LibUsbRtl88xxBackend;
-    let ch: u8 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(149);
-    let secs = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(8u64);
+    let ch: u8 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(149);
+    let secs = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8u64);
     let b = LibUsbRtl88xxBackend::open_monitor(ch)?;
     if let Ok(s) = std::env::var("RADIO_BW") {
         use ndn_face_monitor_wifi::ChannelBw;
@@ -30,7 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    println!("ch{ch}: {n} frames total, {hits} carrying the peer marker", );
+    println!("ch{ch}: {n} frames total, {hits} carrying the peer marker",);
     Ok(())
 }
 #[cfg(not(feature = "libusb-backend"))]

@@ -39,7 +39,11 @@ fn cfg() -> SvSyncConfig {
 async fn secure_four_phase_access_controlled() {
     // The ServiceController's KP-ABE master keypair + the authorized user's key.
     let (mp, ms) = lsw_setup().unwrap();
-    let kgc = (n("/muas/controller"), Hash::of(&mp.public_key_bytes), mp.clone());
+    let kgc = (
+        n("/muas/controller"),
+        Hash::of(&mp.public_key_bytes),
+        mp.clone(),
+    );
     let authorized = lsw_keygen(
         &mp,
         &ms,

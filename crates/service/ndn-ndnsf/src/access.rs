@@ -95,11 +95,22 @@ mod tests {
     #[test]
     fn authorized_key_opens_unauthorized_fails_closed() {
         let (mp, ms) = controller();
-        let kgc = (name("/muas/controller"), Hash::of(&mp.public_key_bytes), mp.clone());
+        let kgc = (
+            name("/muas/controller"),
+            Hash::of(&mp.public_key_bytes),
+            mp.clone(),
+        );
         let aad = b"/svc/echo/r1";
 
         // Provider seals a response tagged with the service attribute.
-        let blob = seal_for(name("/p/CK/1"), &["service:echo".into()], &kgc, b"pong", aad).unwrap();
+        let blob = seal_for(
+            name("/p/CK/1"),
+            &["service:echo".into()],
+            &kgc,
+            b"pong",
+            aad,
+        )
+        .unwrap();
 
         // An authorized user (policy satisfied by the attribute) reads it.
         let ok_key = lsw_keygen(

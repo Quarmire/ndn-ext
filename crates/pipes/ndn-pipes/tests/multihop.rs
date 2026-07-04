@@ -93,7 +93,10 @@ async fn run(skip: &'static [u16]) -> (Vec<u8>, Vec<u8>) {
 #[tokio::test]
 async fn pipe_works_multihop_through_a_relay() {
     let (payload, got) = run(&[]).await;
-    assert_eq!(got, payload, "consumer recovers + decrypts the multi-hop bulk");
+    assert_eq!(
+        got, payload,
+        "consumer recovers + decrypts the multi-hop bulk"
+    );
 }
 
 #[tokio::test]
@@ -101,5 +104,8 @@ async fn coded_bulk_recovers_through_a_relay_under_loss() {
     // The relay forwards sealed coded segments it can't read; 3 source segments
     // are dropped on the wire, yet K-of-N parity still recovers the plaintext.
     let (payload, got) = run(&[1, 4, 6]).await;
-    assert_eq!(got, payload, "FEC recovers the sealed bulk despite multi-hop loss");
+    assert_eq!(
+        got, payload,
+        "FEC recovers the sealed bulk despite multi-hop loss"
+    );
 }

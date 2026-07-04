@@ -55,7 +55,10 @@ impl Weather for Station {
 }
 
 fn station(name: &str, bias_c: i32) -> Arc<WeatherDispatch<Station>> {
-    Arc::new(WeatherDispatch(Arc::new(Station { name: name.into(), bias_c })))
+    Arc::new(WeatherDispatch(Arc::new(Station {
+        name: name.into(),
+        bias_c,
+    })))
 }
 
 fn n(s: &str) -> Name {
@@ -100,7 +103,9 @@ async fn ndnsf() {
     b.serve(&svc, station("station-B", 2)).await.unwrap();
 
     // The app holds a user capability token and speaks the same generated client.
-    let app = NdnsfCarrier::new(pss.next().unwrap(), n("/met/app"), group).insecure().token("forecast-cap");
+    let app = NdnsfCarrier::new(pss.next().unwrap(), n("/met/app"), group)
+        .insecure()
+        .token("forecast-cap");
     let client = WeatherClient::new(app, svc);
 
     // A normal call: one station is selected (first to respond) and answers.
@@ -111,7 +116,10 @@ async fn ndnsf() {
     );
 
     // NDNSF selection: ask ALL stations and gather every forecast.
-    let all = client.forecast_select("Paris".into(), 2, Strategy::All).await.unwrap();
+    let all = client
+        .forecast_select("Paris".into(), 2, Strategy::All)
+        .await
+        .unwrap();
     println!("  forecast_select(Paris, day 2, All) — every station responds:");
     for (provider, fc) in all {
         println!(
@@ -145,7 +153,13 @@ fn hub(nodes: &[&str], group: &Name) -> Vec<SvsPubSub> {
     for node in nodes {
         let (out_tx, out_rx) = mpsc::channel::<Bytes>(256);
         let (in_tx, in_rx) = mpsc::channel::<Bytes>(256);
-        pubsubs.push(SvsPubSub::join(group.clone(), n(node), out_tx, in_rx, cfg()));
+        pubsubs.push(SvsPubSub::join(
+            group.clone(),
+            n(node),
+            out_tx,
+            in_rx,
+            cfg(),
+        ));
         outs.push(out_rx);
         ins.push(in_tx);
     }

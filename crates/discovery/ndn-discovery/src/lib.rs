@@ -29,9 +29,9 @@ pub mod wire;
 pub use autoconfig::{AutoConfigDiscovery, build_hub_data, build_hub_discovery_interest};
 pub use composite::CompositeDiscovery;
 pub use config::{
-    DiscoveryConfig, DiscoveryProfile, DiscoveryScope, HelloStrategyKind, PrefixAnnouncementMode,
-    DigestSigner, DigestVerifier, KeyedVerifier, RecordSigner, RecordVerifier, ServiceDiscoveryConfig,
-    SignerAdapter, VerifyVerdict,
+    DigestSigner, DigestVerifier, DiscoveryConfig, DiscoveryProfile, DiscoveryScope,
+    HelloStrategyKind, KeyedVerifier, PrefixAnnouncementMode, RecordSigner, RecordVerifier,
+    ServiceDiscoveryConfig, SignerAdapter, VerifyVerdict,
 };
 #[cfg(all(feature = "ether-nd", target_os = "linux"))]
 pub use ether_nd::EtherNeighborDiscovery;

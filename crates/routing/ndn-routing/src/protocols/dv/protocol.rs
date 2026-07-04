@@ -15,8 +15,6 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use ndn_app::{Consumer, Producer};
-use ndn_mgmt_wire::control_parameters::origin;
-use ndn_mgmt_wire::control_parameters::route_flags;
 use ndn_discovery::{
     DiscoveryContext, DiscoveryProtocol, InboundMeta, NeighborTableView, ProtocolId,
 };
@@ -26,6 +24,8 @@ use ndn_engine::{
     ConfigError, ConfigUpdate, RoutingHandle, RoutingProtocol, RoutingProtocolStatus,
 };
 use ndn_face::local::InProcHandle;
+use ndn_mgmt_wire::control_parameters::origin;
+use ndn_mgmt_wire::control_parameters::route_flags;
 use ndn_packet::{Interest, Name};
 use ndn_transport::FaceId;
 use tokio::sync::mpsc;
@@ -1317,7 +1317,10 @@ mod tests {
     #[test]
     fn origin_is_dvr() {
         let proto = DvProtocol::new(DvConfig::new(name("/ndn"), name("/r"), 100));
-        assert_eq!(proto.origin(), ndn_mgmt_wire::control_parameters::origin::DVR);
+        assert_eq!(
+            proto.origin(),
+            ndn_mgmt_wire::control_parameters::origin::DVR
+        );
     }
 
     /// `apply_config` accepts the three runtime-mutable keys,

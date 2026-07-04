@@ -39,7 +39,13 @@ fn hub(nodes: &[&str], group: &Name) -> Vec<SvsPubSub> {
     for n in nodes {
         let (out_tx, out_rx) = mpsc::channel::<Bytes>(256);
         let (in_tx, in_rx) = mpsc::channel::<Bytes>(256);
-        pubsubs.push(SvsPubSub::join(group.clone(), name(n), out_tx, in_rx, cfg()));
+        pubsubs.push(SvsPubSub::join(
+            group.clone(),
+            name(n),
+            out_tx,
+            in_rx,
+            cfg(),
+        ));
         outs.push(out_rx);
         ins.push(in_tx);
     }
@@ -91,7 +97,9 @@ async fn macro_service_over_ndnsf_and_select() {
     let carol = NdnsfCarrier::new(carol_ps, name("/muas/carol"), group.clone()).insecure();
     carol.serve(&svc, greeter("carol")).await.unwrap();
 
-    let alice = NdnsfCarrier::new(alice_ps, name("/muas/alice"), group.clone()).insecure().token("utok");
+    let alice = NdnsfCarrier::new(alice_ps, name("/muas/alice"), group.clone())
+        .insecure()
+        .token("utok");
     let client = GreeterClient::new(alice, svc);
 
     // Unary (FirstResponding) — one provider answers.
@@ -111,7 +119,10 @@ async fn macro_service_over_ndnsf_and_select() {
     .expect("greet_select failed");
     let texts: HashSet<String> = many.into_iter().map(|(_, t)| t).collect();
     assert!(texts.contains("bob:hello ada"), "bob missing: {texts:?}");
-    assert!(texts.contains("carol:hello ada"), "carol missing: {texts:?}");
+    assert!(
+        texts.contains("carol:hello ada"),
+        "carol missing: {texts:?}"
+    );
 
     drop(bob);
     drop(carol);

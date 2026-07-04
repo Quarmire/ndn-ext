@@ -131,7 +131,8 @@ mod tests {
             guard: crate::keyguard::GuardKind::OsKeychain,
             ..s.clone()
         };
-        let back: SavedIdentity = serde_json::from_str(&serde_json::to_string(&os).unwrap()).unwrap();
+        let back: SavedIdentity =
+            serde_json::from_str(&serde_json::to_string(&os).unwrap()).unwrap();
         assert_eq!(back.guard, crate::keyguard::GuardKind::OsKeychain);
     }
 }

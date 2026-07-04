@@ -9,7 +9,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let logi = LibUsbRtl88xxBackend::efuse_decode_logical(&phys)?;
     let at = |o: usize| logi.get(o).copied().unwrap_or(0xff);
     println!("logical EFUSE len={}", logi.len());
-    println!("0xCA RFE_OPTION    = {:#04x} ({})   [we hardcode RFE_TYPE=21=0x15]", at(0xca), at(0xca));
+    println!(
+        "0xCA RFE_OPTION    = {:#04x} ({})   [we hardcode RFE_TYPE=21=0x15]",
+        at(0xca),
+        at(0xca)
+    );
     // nearby RF/antenna-relevant bytes for context
     for o in [0xb8usize, 0xbf, 0xc8, 0xc9, 0xcb, 0xcc] {
         println!("  0x{:02x} = {:#04x}", o, at(o));

@@ -145,7 +145,9 @@ impl ArtifactShare {
     /// Provision (publish) the artifact `name` with `content`, sealed under the
     /// scope key. Returns the publication sequence number.
     pub async fn provision(&self, name: &str, content: &[u8]) -> Result<u64, ServiceError> {
-        self.object(name).publish(&Bytes::copy_from_slice(content)).await
+        self.object(name)
+            .publish(&Bytes::copy_from_slice(content))
+            .await
     }
 
     /// Fetch the artifact `name`: await its publication and return the opened
@@ -397,7 +399,11 @@ impl ScopedSession {
     /// grant the scope, so it cannot publish to or read the topic.
     pub fn topic<T: Frame>(&self, scope: &str, sub: &str) -> Option<ScopedTopic<T>> {
         let key = self.keyring.get(scope)?;
-        let name = self.name.clone().append(scope.as_bytes()).append(sub.as_bytes());
+        let name = self
+            .name
+            .clone()
+            .append(scope.as_bytes())
+            .append(sub.as_bytes());
         Some(build_scoped_topic(self.ps.clone(), name, key))
     }
 

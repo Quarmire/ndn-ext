@@ -146,7 +146,10 @@ impl<T: Frame> Publisher<T> {
         Self {
             topic,
             seq: 0,
-            seal: Some(SealCtx { key, publisher_id: publisher_id.to_be_bytes() }),
+            seal: Some(SealCtx {
+                key,
+                publisher_id: publisher_id.to_be_bytes(),
+            }),
             _marker: PhantomData,
         }
     }

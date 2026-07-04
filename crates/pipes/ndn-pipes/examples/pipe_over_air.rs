@@ -26,10 +26,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use ndn_app::{Consumer, EngineBuilder, Producer};
     use ndn_coding::FecPolicy;
     use ndn_engine::EngineConfig;
+    use ndn_face::local::InProcFace;
     use ndn_face_monitor_wifi::{
         AfPacketBackend, FrameFormat, McsDescriptor, MonitorWifiFace, WifiRadio,
     };
-    use ndn_face::local::InProcFace;
     use ndn_packet::Name;
     use ndn_pipes::{Confidentiality, PipeConsumer, PipeParams, PipeProducer};
     use ndn_transport::FaceId;
@@ -117,7 +117,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("pipe up (len={}); fetching {object} …", pipe.pipe_len);
             let got = pc.fetch(&pipe, object.as_str()).await?;
             let sum: u64 = got.iter().map(|&b| b as u64).sum();
-            println!("recovered {} bytes (checksum {sum}); tearing down", got.len());
+            println!(
+                "recovered {} bytes (checksum {sum}); tearing down",
+                got.len()
+            );
             pc.close(&pipe).await.ok();
             drop(pc);
             drop(engine);

@@ -22,7 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use ndn_face_monitor_wifi::{AfPacketBackend, FrameFormat, RadioControl, FrameIo};
+    use ndn_face_monitor_wifi::{AfPacketBackend, FrameFormat, FrameIo, RadioControl};
     use ndn_radio_cognition::{RadioCapability, RadioId};
 
     // Build the rtl88x2eu cfg80211-monitor injection frame for `payload`:
@@ -74,9 +74,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     const RX_NODE: u64 = 0x02_5252_5800_0001; // "RRX"
 
     let iface = std::env::var("RADIO_IFACE").unwrap_or_else(|_| "wlu1".into());
-    let report_ms: u128 = std::env::var("RADIO_REPORT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(1000);
-    let report_mcs: u8 = std::env::var("RADIO_REPORT_MCS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
-    let report_burst: u32 = std::env::var("RADIO_REPORT_BURST").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    let report_ms: u128 = std::env::var("RADIO_REPORT_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1000);
+    let report_mcs: u8 = std::env::var("RADIO_REPORT_MCS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    let report_burst: u32 = std::env::var("RADIO_REPORT_BURST")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
 
     let backend = Arc::new(AfPacketBackend::new(&iface, FrameFormat::default())?);
     let radio = RadioId(0);
@@ -84,10 +93,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut control = RadioControl::new(ndn_radio_cognition::RadioPolicy::default())
         .with_node_id(RX_NODE)
         .with_report_interval(report_ms as u64);
-    control.register_radio(radio, ndn_face_monitor_wifi::FaceId(0), RadioCapability::wifi_monitor_5ghz(vec![]));
+    control.register_radio(
+        radio,
+        ndn_face_monitor_wifi::FaceId(0),
+        RadioCapability::wifi_monitor_5ghz(vec![]),
+    );
 
     let tx_node = mac_node(TX_SRC);
-    println!("reception_rx on {iface}: RX_NODE={RX_NODE:#x} listening for TX_SRC node {tx_node:#x}; reports every {report_ms}ms at HT MCS{report_mcs}");
+    println!(
+        "reception_rx on {iface}: RX_NODE={RX_NODE:#x} listening for TX_SRC node {tx_node:#x}; reports every {report_ms}ms at HT MCS{report_mcs}"
+    );
 
     // Diagnostic: tight inject loop (no recv) to test whether the kernel monitor
     // actually radiates our injected frames. RADIO_FLOOD=<n> sends n report frames
@@ -106,7 +121,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // these frames radiated + decoded.
         let payload = [b"OPI-RECIP-TEST".as_slice(), &rep].concat();
         let frame = build_action_inject(&payload, TX_SRC, report_mcs);
-        println!("FLOOD: injecting {n} action frames ({} B on air, 14B radiotap) at HT MCS{report_mcs}…", frame.len());
+        println!(
+            "FLOOD: injecting {n} action frames ({} B on air, 14B radiotap) at HT MCS{report_mcs}…",
+            frame.len()
+        );
         let mut ok = 0u64;
         let mut err = 0u64;
         for _ in 0..n {
@@ -164,7 +182,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .neighbor_rssi(radio, tx_node)
                 .map(|r| format!("{r} dBm"))
                 .unwrap_or_else(|| "—".into());
-            println!("recv total={total} (TX-matched {heard}); measured outbound-link RSSI = {rssi}");
+            println!(
+                "recv total={total} (TX-matched {heard}); measured outbound-link RSSI = {rssi}"
+            );
             last_log = Instant::now();
             heard = 0;
             total = 0;

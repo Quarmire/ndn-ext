@@ -11,12 +11,12 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use ndn_app::{Connection, Consumer, InProcConnection};
-use ndn_mgmt_wire::control_parameters::{origin, route_flags};
 use ndn_engine::observability::targets as t;
 use ndn_engine::{
     LsdbEntry, NeighborInfo, RibRoute, RoutingHandle, RoutingProtocol, RoutingProtocolStatus,
 };
 use ndn_face::local::InProcHandle;
+use ndn_mgmt_wire::control_parameters::{origin, route_flags};
 use ndn_packet::lp::{LpHeaders, encode_lp_with_headers};
 use ndn_packet::{Name, NameComponent};
 use ndn_sync::{PSyncConfig, SyncHandle, SyncUpdate, join_psync_group};
@@ -363,7 +363,7 @@ impl RoutingProtocol for NlsrProtocol {
         // announced in our NameLSA so peers learn them without manual config.
         let readvertised = Arc::new(ndn_engine::ReadvertisedPrefixes::new());
         rib.set_readvertise_destination(
-            Arc::clone(&readvertised) as Arc<dyn ndn_engine::ReadvertiseDestination>,
+            Arc::clone(&readvertised) as Arc<dyn ndn_engine::ReadvertiseDestination>
         );
         let lsa_fetch_rx = self
             .lsa_fetch_rx

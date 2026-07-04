@@ -45,7 +45,14 @@ fn policy_gates_issuance_live() {
     let key = open_kp_dkey(r1, &sealed).expect("the sealed dkey opens to a real policy key");
 
     let kgc = (n("/muas/group"), Hash::of(&mp.public_key_bytes), mp.clone());
-    let (ck, ct) = seal_kp(n("/c/CK/1"), &["service:echo".into()], &kgc, b"intel", b"/aad").unwrap();
+    let (ck, ct) = seal_kp(
+        n("/c/CK/1"),
+        &["service:echo".into()],
+        &kgc,
+        b"intel",
+        b"/aad",
+    )
+    .unwrap();
     assert_eq!(
         open_kp(&ck, &key, &ct, b"/aad").unwrap(),
         b"intel",

@@ -76,7 +76,10 @@ async fn explicit_teardown_reclaims_the_pipe() {
     // A PathControl teardown is fire-and-forget (no Data comes back); the reap is
     // observable through CHECK going silent.
     pc.close(&pipe).await.expect("teardown emitted");
-    assert!(!pc.is_alive(&pipe).await, "torn-down pipe no longer answers CHECK");
+    assert!(
+        !pc.is_alive(&pipe).await,
+        "torn-down pipe no longer answers CHECK"
+    );
     // Teardown is idempotent — a repeat is a harmless no-op (the pipe is already gone).
     pc.close(&pipe).await.expect("repeat teardown emitted");
     assert!(!pc.is_alive(&pipe).await, "still torn down after a repeat");
@@ -94,7 +97,10 @@ async fn pui_inactivity_tears_down_an_idle_pipe() {
     assert!(pc.is_alive(&pipe).await, "pipe is live within the PUI");
     // Stay quiet past the Promised Use Interval; no CHECK keep-alive.
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(!pc.is_alive(&pipe).await, "idle pipe is reclaimed after the PUI lapses");
+    assert!(
+        !pc.is_alive(&pipe).await,
+        "idle pipe is reclaimed after the PUI lapses"
+    );
 
     drop(pc);
     drop(engine);
@@ -110,7 +116,10 @@ async fn check_keepalive_renews_the_pui() {
     // the pipe stays live because use keeps refreshing it.
     for _ in 0..3 {
         tokio::time::sleep(Duration::from_millis(120)).await;
-        assert!(pc.is_alive(&pipe).await, "steady CHECK use keeps the pipe live");
+        assert!(
+            pc.is_alive(&pipe).await,
+            "steady CHECK use keeps the pipe live"
+        );
     }
 
     drop(pc);

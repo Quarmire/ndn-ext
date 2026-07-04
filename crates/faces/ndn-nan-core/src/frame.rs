@@ -300,7 +300,11 @@ fn find_nan_vendor_ie<'a>(r: &mut Reader<'a>) -> Result<&'a [u8], WireError> {
         let id = r.u8()?;
         let len = r.u8()? as usize;
         let body = r.take(len)?;
-        if id == ELEMENT_ID_VENDOR_SPECIFIC && body.len() >= 4 && body[..3] == NAN_OUI[..] && body[3] == NAN_OUI_TYPE {
+        if id == ELEMENT_ID_VENDOR_SPECIFIC
+            && body.len() >= 4
+            && body[..3] == NAN_OUI[..]
+            && body[3] == NAN_OUI_TYPE
+        {
             return Ok(&body[4..]);
         }
     }
@@ -425,6 +429,9 @@ mod tests {
         bad.put_u8(ACTION_PUBLIC_VENDOR_SPECIFIC);
         bad.put_bytes(&[0x00, 0x11, 0x22]); // wrong OUI
         bad.put_u8(NAN_OUI_TYPE);
-        assert_eq!(ServiceDiscoveryFrame::parse(&bad).err(), Some(WireError::Invalid));
+        assert_eq!(
+            ServiceDiscoveryFrame::parse(&bad).err(),
+            Some(WireError::Invalid)
+        );
     }
 }

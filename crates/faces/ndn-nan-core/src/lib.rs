@@ -55,11 +55,9 @@ pub use attr::{
     Attribute, AttributeId, Attributes, Cluster, CommittedAvailability, DeviceCapability,
     MasterIndication, Sdea, ServiceControl, ServiceControlType, ServiceDescriptor, ServiceIdList,
 };
-pub use engine::{master_rank, NanConfig, NanEngine, NanEvent, RxFrame, Step, TxFrame, Usec};
+pub use engine::{NanConfig, NanEngine, NanEvent, RxFrame, Step, TxFrame, Usec, master_rank};
+pub use frame::{Dot11Frame, Dot11Header, FrameType, NanBeacon, ServiceDiscoveryFrame, classify};
 pub use rendezvous::{AlwaysOn, DiscoveryWindow, Rendezvous};
-pub use frame::{
-    classify, Dot11Frame, Dot11Header, FrameType, NanBeacon, ServiceDiscoveryFrame,
-};
 pub use service::service_id;
 pub use wire::{Reader, WireError, WriteExt};
 

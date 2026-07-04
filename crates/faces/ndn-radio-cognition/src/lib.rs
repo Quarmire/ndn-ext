@@ -51,11 +51,13 @@ mod sense;
 mod strategy;
 
 pub use calibrate::{RateCalibrator, RateThresholds, STATIC_REQ_RSSI, default_thresholds};
-pub use contextual::{ARMS, Arm, Context, ContextualBandit, FOOTPRINT_LAMBDA, MISS_PENALTY, apply_arm, reward};
+pub use contextual::{
+    ARMS, Arm, Context, ContextualBandit, FOOTPRINT_LAMBDA, MISS_PENALTY, apply_arm, reward,
+};
 pub use demand::DemandTracker;
-pub use report::{MAX_ENTRIES, REPORT_MAGIC, ReceptionReport, decode_report, encode_report};
 pub use plan::{AllocRole, RadioActuators, RadioAllocation, RadioError, RadioPlan, TxParams};
 pub use policy::{NameContext, PolicyConfig, Priority, RadioPolicy};
+pub use report::{MAX_ENTRIES, REPORT_MAGIC, ReceptionReport, decode_report, encode_report};
 pub use sense::{
     Band, ChannelOccupancy, Demand, Ewma, LinkResidual, MediumState, MediumView, NeighborReport,
     RadioCapability, RadioId, RadioKind, TimingModel,

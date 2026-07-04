@@ -7,8 +7,8 @@ use ndn_app::{Consumer, EngineBuilder, Producer};
 use ndn_config::{ControlParameters, ForwarderConfig, control_response::status, nfd_command::verb};
 use ndn_engine::{EngineConfig, ForwarderEngine};
 use ndn_face::local::InProcFace;
-use ndn_mgmt::module::{MgmtContext, MgmtModule};
 use ndn_mgmt::MgmtResponse;
+use ndn_mgmt::module::{MgmtContext, MgmtModule};
 use ndn_packet::Name;
 use ndn_transport::FaceId;
 use tokio_util::sync::CancellationToken;
@@ -82,26 +82,64 @@ async fn pipes_list_reports_live_pipes() {
     let config = ForwarderConfig::default();
 
     // Before any pipe: the dataset is empty.
-    let before = module.dispatch(verb::LIST, ControlParameters::default(), &ctx(&engine, &cancel, &config)).await;
+    let before = module
+        .dispatch(
+            verb::LIST,
+            ControlParameters::default(),
+            &ctx(&engine, &cancel, &config),
+        )
+        .await;
     assert!(list_text(&before).starts_with("0 pipes"), "no pipes yet");
 
     // Open a pipe, then list: it appears with a hex id and a remaining PUI.
     let mut pc = PipeConsumer::new(Consumer::from_handle(consumer_handle));
-    let pipe = pc.open("/sensors/temp", PipeParams::default()).await.expect("pipe");
-    let listed = module.dispatch(verb::LIST, ControlParameters::default(), &ctx(&engine, &cancel, &config)).await;
+    let pipe = pc
+        .open("/sensors/temp", PipeParams::default())
+        .await
+        .expect("pipe");
+    let listed = module
+        .dispatch(
+            verb::LIST,
+            ControlParameters::default(),
+            &ctx(&engine, &cancel, &config),
+        )
+        .await;
     let text = list_text(&listed);
-    let id_hex: String = pipe.id.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+    let id_hex: String = pipe
+        .id
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     assert!(text.starts_with("1 pipes"), "one live pipe, got: {text}");
-    assert!(text.contains(&id_hex), "lists the pipe's id {id_hex}, got: {text}");
+    assert!(
+        text.contains(&id_hex),
+        "lists the pipe's id {id_hex}, got: {text}"
+    );
     assert!(text.contains("pui_remaining="), "shows the remaining PUI");
 
     // Tear it down; the dataset drops it.
     pc.close(&pipe).await.expect("teardown acked");
-    let after = module.dispatch(verb::LIST, ControlParameters::default(), &ctx(&engine, &cancel, &config)).await;
-    assert!(list_text(&after).starts_with("0 pipes"), "torn-down pipe is gone");
+    let after = module
+        .dispatch(
+            verb::LIST,
+            ControlParameters::default(),
+            &ctx(&engine, &cancel, &config),
+        )
+        .await;
+    assert!(
+        list_text(&after).starts_with("0 pipes"),
+        "torn-down pipe is gone"
+    );
 
     // Unknown verb → NOT_FOUND.
-    let bad = module.dispatch(b"bogus", ControlParameters::default(), &ctx(&engine, &cancel, &config)).await;
+    let bad = module
+        .dispatch(
+            b"bogus",
+            ControlParameters::default(),
+            &ctx(&engine, &cancel, &config),
+        )
+        .await;
     match bad {
         MgmtResponse::Control(cr) => assert_eq!(cr.status_code, status::NOT_FOUND),
         _ => panic!("expected control response"),

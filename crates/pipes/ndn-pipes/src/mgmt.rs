@@ -9,8 +9,8 @@
 
 use async_trait::async_trait;
 use ndn_config::{ControlParameters, ControlResponse, control_response::status, nfd_command::verb};
-use ndn_mgmt::module::{MgmtContext, MgmtModule};
 use ndn_mgmt::MgmtResponse;
+use ndn_mgmt::module::{MgmtContext, MgmtModule};
 
 use crate::registry::{PipeInfo, PipeRegistry};
 
@@ -31,7 +31,10 @@ impl PipesModule {
 pub fn render_list(rows: &[PipeInfo]) -> String {
     let mut text = format!("{} pipes\n", rows.len());
     for r in rows {
-        text.push_str(&format!("  {}  pui_remaining={}ms\n", r.id_hex, r.remaining_ms));
+        text.push_str(&format!(
+            "  {}  pui_remaining={}ms\n",
+            r.id_hex, r.remaining_ms
+        ));
     }
     text
 }

@@ -11,7 +11,8 @@
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use bytes::Bytes;
     use ndn_face_monitor_wifi::{
-        BROADCAST, DEFAULT_SRC, InjectFrame, LibUsbRtl88xxBackend, McsDescriptor, TxIntent, FrameIo, WifiRadio,
+        BROADCAST, DEFAULT_SRC, FrameIo, InjectFrame, LibUsbRtl88xxBackend, McsDescriptor,
+        TxIntent, WifiRadio,
     };
     use std::sync::Arc;
 
@@ -42,7 +43,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("TX power idx {idx:#x}");
     }
     let vht = std::env::var("RADIO_VHT").is_ok();
-    let nss2 = std::env::var("RADIO_NSS").map(|s| s == "2").unwrap_or(false);
+    let nss2 = std::env::var("RADIO_NSS")
+        .map(|s| s == "2")
+        .unwrap_or(false);
     let desc = match (vht, nss2) {
         (true, true) => McsDescriptor::vht_2ss(mcs),
         (true, false) => McsDescriptor::vht(mcs),
@@ -75,7 +78,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (b2, d) = (b.clone(), data.clone());
             handles.push(tokio::spawn(async move {
                 let payloads: Vec<Bytes> = (0..burst).map(|_| d.clone()).collect();
-                let _ = b2.inject_amsdu(&payloads, desc, BROADCAST, DEFAULT_SRC).await;
+                let _ = b2
+                    .inject_amsdu(&payloads, desc, BROADCAST, DEFAULT_SRC)
+                    .await;
                 drop(permit);
             }));
         }
@@ -96,21 +101,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let n = burst.min(total - sent);
         if off {
             for _ in 0..n {
-                b.inject_at(InjectFrame::broadcast(data.clone(), TxIntent::CONSERVATIVE), desc).await?;
+                b.inject_at(
+                    InjectFrame::broadcast(data.clone(), TxIntent::CONSERVATIVE),
+                    desc,
+                )
+                .await?;
             }
         } else if let Ok(g) = std::env::var("USBAGG") {
             // USBAGG=<k>: pack k A-MSDU MPDUs (each `burst` MSDUs) into one bulk-OUT.
             let k: usize = g.parse().unwrap_or(4);
-            let mpdus: Vec<Vec<Bytes>> =
-                (0..k).map(|_| (0..burst).map(|_| data.clone()).collect()).collect();
-            b.inject_amsdu_usbagg(&mpdus, desc, BROADCAST, DEFAULT_SRC).await?;
+            let mpdus: Vec<Vec<Bytes>> = (0..k)
+                .map(|_| (0..burst).map(|_| data.clone()).collect())
+                .collect();
+            b.inject_amsdu_usbagg(&mpdus, desc, BROADCAST, DEFAULT_SRC)
+                .await?;
             sent += burst * k - n; // account: this path sent burst*k MSDUs
         } else if amsdu {
             let payloads: Vec<Bytes> = (0..n).map(|_| data.clone()).collect();
-            b.inject_amsdu(&payloads, desc, BROADCAST, DEFAULT_SRC).await?;
+            b.inject_amsdu(&payloads, desc, BROADCAST, DEFAULT_SRC)
+                .await?;
         } else {
-            let frames: Vec<InjectFrame> =
-                (0..n).map(|_| InjectFrame::broadcast(data.clone(), TxIntent::CONSERVATIVE)).collect();
+            let frames: Vec<InjectFrame> = (0..n)
+                .map(|_| InjectFrame::broadcast(data.clone(), TxIntent::CONSERVATIVE))
+                .collect();
             b.inject_ampdu(frames).await?;
         }
         sent += n;

@@ -12,12 +12,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let dev = Arc::new(Mt7612uBackend::open()?);
     dev.bring_up()?;
-    println!("chip 0x{:04x} — wiring MT7612 into the cognition plane", dev.chip_id()?);
+    println!(
+        "chip 0x{:04x} — wiring MT7612 into the cognition plane",
+        dev.chip_id()?
+    );
 
     let radio = RadioId(0);
     let mut control = RadioControl::new(RadioPolicy::default());
     // The MT7612 as a 2.4 GHz pool of capability (channel 6 only for now).
-    control.register_radio(radio, FaceId(0), RadioCapability::wifi_monitor_2ghz(vec![6]));
+    control.register_radio(
+        radio,
+        FaceId(0),
+        RadioCapability::wifi_monitor_2ghz(vec![6]),
+    );
     // Bind the generic actuator: `Arc<Mt7612uBackend>` coerces to
     // `Arc<dyn RadioKnobs>` — identical call to the RTL backend, no special case.
     let _planned = control.libusb_actuator(radio, dev.clone());

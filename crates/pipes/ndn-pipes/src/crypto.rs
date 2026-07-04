@@ -68,7 +68,9 @@ pub fn ed25519_sign(signing_key: &[u8; 32], region: &[u8]) -> [u8; 64] {
 /// The Ed25519 public key (the consumer's trust anchor) for a signing key.
 pub fn ed25519_public(signing_key: &[u8; 32]) -> [u8; 32] {
     use ed25519_dalek::SigningKey;
-    SigningKey::from_bytes(signing_key).verifying_key().to_bytes()
+    SigningKey::from_bytes(signing_key)
+        .verifying_key()
+        .to_bytes()
 }
 
 #[cfg(test)]

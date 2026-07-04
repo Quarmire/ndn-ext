@@ -15,8 +15,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::time::{Duration, Instant};
 
     const MAGIC: [u8; 4] = [0x5A, 0xCA, 0x99, 0x71];
-    const SIZES: [usize; 11] =
-        [4096, 5000, 5300, 5500, 5700, 6000, 6500, 7000, 7935, 9000, 11000];
+    const SIZES: [usize; 11] = [
+        4096, 5000, 5300, 5500, 5700, 6000, 6500, 7000, 7935, 9000, 11000,
+    ];
 
     let role = std::env::var("NDN_ROLE").unwrap_or_default();
     let dev = Mt7612uBackend::open()?;
@@ -49,12 +50,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // value that looks like the cap in bytes (~5600-6200) or pages (~22-26 @256B,
         // ~44-48 @128B), or a 12-16 bit subfield in those ranges.
         let ranges = [
-            (0x0400u32, 0x0460u32), (0x0a40, 0x0a80), (0x1200, 0x1260),
-            (0x1300, 0x1360), (0x1600, 0x1700), (0x1230, 0x1240),
+            (0x0400u32, 0x0460u32),
+            (0x0a40, 0x0a80),
+            (0x1200, 0x1260),
+            (0x1300, 0x1360),
+            (0x1600, 0x1700),
+            (0x1230, 0x1240),
         ];
         let interesting = |v: u32| -> bool {
-            let cand = |x: u32| (5600..=6200).contains(&x) || (22..=26).contains(&x) || (44..=48).contains(&x);
-            cand(v) || cand(v & 0xffff) || cand((v >> 16) & 0xffff) || cand(v & 0xfff) || cand((v >> 12) & 0xfff)
+            let cand = |x: u32| {
+                (5600..=6200).contains(&x) || (22..=26).contains(&x) || (44..=48).contains(&x)
+            };
+            cand(v)
+                || cand(v & 0xffff)
+                || cand((v >> 16) & 0xffff)
+                || cand(v & 0xfff)
+                || cand((v >> 12) & 0xfff)
         };
         println!("--- wide register scan (flagging cap-like values) ---");
         for (lo, hi) in ranges {
@@ -75,12 +86,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Dump TX/PSE/PBF/FCE candidate registers — hunting the value that caps a
         // single MPDU at ~5800B (≈45 pages of 128B). Look for ~5760/6000/0x16xx/45.
         let dump: &[(u32, &str)] = &[
-            (0x0400, "PBF_SYS_CTRL"), (0x0404, "PBF_CFG"), (0x0408, "PBF_TX_MAX_PCNT"),
-            (0x040c, "PBF_RX_MAX_PCNT"), (0x0410, "PBF_0410"), (0x0414, "PBF_0414"),
-            (0x0420, "PBF_0420"), (0x0800, "FCE_PSE_CTRL"), (0x09a4, "FCE_TX_MAXCNT"),
-            (0x09c4, "FCE_PDMA_GCONF"), (0x0a6c, "FCE_SKIP_FS"), (0x0a4c, "FCE_0a4c"),
-            (0x1004, "MAC_SYS_CTRL"), (0x1610, "TX_MAX_LEN?"), (0x1690, "TX_1690"),
-            (0x131c, "TX_131c"), (0x13b4, "TX_13b4"),
+            (0x0400, "PBF_SYS_CTRL"),
+            (0x0404, "PBF_CFG"),
+            (0x0408, "PBF_TX_MAX_PCNT"),
+            (0x040c, "PBF_RX_MAX_PCNT"),
+            (0x0410, "PBF_0410"),
+            (0x0414, "PBF_0414"),
+            (0x0420, "PBF_0420"),
+            (0x0800, "FCE_PSE_CTRL"),
+            (0x09a4, "FCE_TX_MAXCNT"),
+            (0x09c4, "FCE_PDMA_GCONF"),
+            (0x0a6c, "FCE_SKIP_FS"),
+            (0x0a4c, "FCE_0a4c"),
+            (0x1004, "MAC_SYS_CTRL"),
+            (0x1610, "TX_MAX_LEN?"),
+            (0x1690, "TX_1690"),
+            (0x131c, "TX_131c"),
+            (0x13b4, "TX_13b4"),
         ];
         println!("--- register dump ---");
         for (a, name) in dump {
@@ -93,8 +115,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // behind 0x1238). Flag any field ≈ 23-26 pages or ≈ 5900-6300 bytes.
         println!("--- co-limit scan (fields ~23-26 pages / ~5900-6300B) ---");
         let coflag = |x: u32| (23..=26).contains(&x) || (5900..=6300).contains(&x);
-        let hit = |v: u32| coflag(v) || coflag(v & 0xffff) || coflag((v >> 16) & 0xffff)
-            || coflag(v & 0xfff) || coflag((v >> 8) & 0xff) || coflag(v & 0xff) || coflag((v >> 16) & 0xff);
+        let hit = |v: u32| {
+            coflag(v)
+                || coflag(v & 0xffff)
+                || coflag((v >> 16) & 0xffff)
+                || coflag(v & 0xfff)
+                || coflag((v >> 8) & 0xff)
+                || coflag(v & 0xff)
+                || coflag((v >> 16) & 0xff)
+        };
         for base in [0x0400u32, 0x0500, 0x0a00, 0x1200, 0x1300, 0x1340, 0x1600] {
             let mut a = base;
             while a < base + 0x100 {
@@ -110,10 +139,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Ok(p) = std::env::var("NDN_POKE") {
             for pair in p.split(';').filter(|s| !s.is_empty()) {
                 let mut it = pair.split(':');
-                let a = u32::from_str_radix(it.next().unwrap().trim_start_matches("0x"), 16).unwrap();
-                let v = u32::from_str_radix(it.next().unwrap().trim_start_matches("0x"), 16).unwrap();
+                let a =
+                    u32::from_str_radix(it.next().unwrap().trim_start_matches("0x"), 16).unwrap();
+                let v =
+                    u32::from_str_radix(it.next().unwrap().trim_start_matches("0x"), 16).unwrap();
                 let _ = dev.wr(a, v);
-                println!("POKE 0x{a:04x} = 0x{v:08x} -> readback 0x{:08x}", dev.rr(a).unwrap_or(0));
+                println!(
+                    "POKE 0x{a:04x} = 0x{v:08x} -> readback 0x{:08x}",
+                    dev.rr(a).unwrap_or(0)
+                );
             }
         }
         let mcs = McsDescriptor::vht(9);
@@ -126,7 +160,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 std::thread::sleep(Duration::from_millis(2));
             }
-            println!("TX size={plen:5} (frame {} B): {ok}/120 USB-accepted", frame.len());
+            println!(
+                "TX size={plen:5} (frame {} B): {ok}/120 USB-accepted",
+                frame.len()
+            );
             std::thread::sleep(Duration::from_millis(300));
         }
         println!("TX done.");

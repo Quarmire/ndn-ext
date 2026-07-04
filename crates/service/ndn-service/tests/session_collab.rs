@@ -36,7 +36,13 @@ fn hub(nodes: &[&str], group: &Name) -> Vec<SvsPubSub> {
     for node in nodes {
         let (out_tx, out_rx) = mpsc::channel::<Bytes>(256);
         let (in_tx, in_rx) = mpsc::channel::<Bytes>(256);
-        pubsubs.push(SvsPubSub::join(group.clone(), n(node), out_tx, in_rx, cfg()));
+        pubsubs.push(SvsPubSub::join(
+            group.clone(),
+            n(node),
+            out_tx,
+            in_rx,
+            cfg(),
+        ));
         outs.push(out_rx);
         ins.push(in_tx);
     }
@@ -93,13 +99,19 @@ async fn session_feed_is_confidential_to_members() {
     let bob_ps = Arc::new(pss.next().unwrap());
     let mallory_ps = Arc::new(pss.next().unwrap());
 
-    let mut alice: Session<Role> =
-        Session::new(session_name.clone(), alice_ps, ContentKey::from_bytes(scope_key_bytes));
+    let mut alice: Session<Role> = Session::new(
+        session_name.clone(),
+        alice_ps,
+        ContentKey::from_bytes(scope_key_bytes),
+    );
     alice.admit(n("/muas/alice"), Role::Commander);
     alice.admit(n("/muas/bob"), Role::Observer);
 
-    let bob: Session<Role> =
-        Session::new(session_name.clone(), bob_ps, ContentKey::from_bytes(scope_key_bytes));
+    let bob: Session<Role> = Session::new(
+        session_name.clone(),
+        bob_ps,
+        ContentKey::from_bytes(scope_key_bytes),
+    );
 
     // Mallory is NOT a member — a different scope key.
     let mallory: Session<Role> =
@@ -114,7 +126,10 @@ async fn session_feed_is_confidential_to_members() {
     let mut bob_feed = bob.scoped_topic::<Order>("orders").subscribe().await;
     let mut mallory_feed = mallory.scoped_topic::<Order>("orders").subscribe().await;
 
-    let order = Order { verb: "advance".into(), target: 12 };
+    let order = Order {
+        verb: "advance".into(),
+        target: 12,
+    };
     orders.publish(&order).await.unwrap();
 
     // A member with the scope key reads the order in the clear.

@@ -41,7 +41,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Enable MAC DMA blocks right after power-on (REG_CR = 0x063F).
     b.mac_enable_dma()?;
-    println!("✓ MAC DMA/scheduler/security blocks enabled (REG_CR={:#06x})", b.read_cr()?);
+    println!(
+        "✓ MAC DMA/scheduler/security blocks enabled (REG_CR={:#06x})",
+        b.read_cr()?
+    );
 
     // LLT page list (C order: before firmware).
     b.init_llt()?;
@@ -53,7 +56,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("MAC init: register table (phydm conditional, USB/B-cut) …");
     b.mac_config()?;
-    println!("✓ MAC register table applied (0x010 = {:#04x})", b.read8(0x0010)?);
+    println!(
+        "✓ MAC register table applied (0x010 = {:#04x})",
+        b.read8(0x0010)?
+    );
 
     println!("MAC init: queues / boundaries / RCR / enable …");
     b.mac_init_queues()?;

@@ -16,7 +16,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::thread::sleep(Duration::from_millis(200));
     println!("chip 0x{:04x}", dev.chip_id()?);
 
-    let k: usize = std::env::var("NDN_AGG_K").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
+    let k: usize = std::env::var("NDN_AGG_K")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4);
     let plen = 256usize;
     let snap = [0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x86, 0x24];
     let frame = |sa: u8| -> Vec<u8> {
@@ -47,10 +50,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let el = t.elapsed();
     let payload = ok as usize * k * plen;
-    println!("USB-agg K={k}: {ok}/{n} aggregates written ({} bulk B), {:.2}s", bytes, el.as_secs_f64());
-    println!("  payload goodput: {:.1} Mb/s, {:.0} MPDU/s",
-             payload as f64 * 8.0 / el.as_secs_f64() / 1e6, (ok as usize * k) as f64 / el.as_secs_f64());
-    println!("done — receiver should show SA 02:00:00:00:00:0{{1..{k}}} each ~{n}x if chaining works.");
+    println!(
+        "USB-agg K={k}: {ok}/{n} aggregates written ({} bulk B), {:.2}s",
+        bytes,
+        el.as_secs_f64()
+    );
+    println!(
+        "  payload goodput: {:.1} Mb/s, {:.0} MPDU/s",
+        payload as f64 * 8.0 / el.as_secs_f64() / 1e6,
+        (ok as usize * k) as f64 / el.as_secs_f64()
+    );
+    println!(
+        "done — receiver should show SA 02:00:00:00:00:0{{1..{k}}} each ~{n}x if chaining works."
+    );
     Ok(())
 }
 #[cfg(not(feature = "libusb-backend"))]

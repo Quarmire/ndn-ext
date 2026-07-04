@@ -38,16 +38,16 @@ pub use message::{
     join_name, link_name, pipe_name, seek_name,
 };
 pub use mgmt::{PipesModule, render_list};
-pub use pipe::{Pipe, PipeId, PipeParams};
-pub use producer::PipeProducer;
-pub use registry::{PipeInfo, PipeRegistry};
-pub use relay::{PipeRelay, RelayPipeStore, run_relay_monitor};
 pub use pathcontrol::{
     PipeMembership, decode_pipe_teardown_params, encode_pipe_teardown_params, now_seq,
     pipe_teardown_interest,
 };
 #[cfg(feature = "engine")]
 pub use pathcontrol::{PipeTeardownControl, RelayActivity};
+pub use pipe::{Pipe, PipeId, PipeParams};
+pub use producer::PipeProducer;
+pub use registry::{PipeInfo, PipeRegistry};
+pub use relay::{PipeRelay, RelayPipeStore, run_relay_monitor};
 
 /// Errors from pipe setup and transfer.
 #[derive(Debug, thiserror::Error)]

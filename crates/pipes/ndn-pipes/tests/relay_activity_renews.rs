@@ -78,7 +78,10 @@ async fn active_fetch_renews_a_pipe_then_idle_tears_it_down() {
             .await,
         "relay learns the key"
     );
-    assert!(store.pipe_key(pipe.id.as_bytes()).is_some(), "relay holds the pipe");
+    assert!(
+        store.pipe_key(pipe.id.as_bytes()).is_some(),
+        "relay holds the pipe"
+    );
 
     let monitor = tokio::spawn(run_relay_monitor(
         store.clone(),

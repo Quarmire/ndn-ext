@@ -37,21 +37,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use bytes::Bytes;
     use ndn_face_monitor_wifi::measure::frame_airtime_us;
     use ndn_face_monitor_wifi::{
-        ChannelBw, FrameIo, InjectFrame, LibUsbRtl88xxBackend, McsDescriptor, TxIntent, RadioControl, WifiRadio,
+        ChannelBw, FrameIo, InjectFrame, LibUsbRtl88xxBackend, McsDescriptor, RadioControl,
+        TxIntent, WifiRadio,
     };
     use ndn_radio_cognition::{
         NameContext, PolicyConfig, RadioCapability, RadioId, TxParams, prefix_hash,
     };
 
     fn env_u32(k: &str, d: u32) -> u32 {
-        std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
     }
 
     let ch = env_u32("RADIO_CH", 149) as u8;
     let frames = env_u32("RADIO_FRAMES", 5000);
     let payload = env_u32("RADIO_PAYLOAD", 1000) as usize;
     let txpwr = env_u32("RADIO_TXPWR", 0x30); // moderate: full power overloads a close RX
-    let rssi = std::env::var("RADIO_RSSI").ok().and_then(|v| v.parse().ok()).unwrap_or(-65i8);
+    let rssi = std::env::var("RADIO_RSSI")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(-65i8);
     let mode = std::env::var("RADIO_MODE").unwrap_or_else(|_| "bandit".into());
     // Run a single arm ("mcs1"|"mcs5"|"mcs9"|"adaptive") so each RX capture window
     // maps to exactly one arm; unset = all arms in sequence.
@@ -69,7 +76,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "calibrated" => RadioControl::new_calibrated(PolicyConfig::default(), 0.9, 1.0),
         _ => RadioControl::new_bandit(PolicyConfig::default(), 0.4),
     };
-    control.register_radio(radio, ndn_face_monitor_wifi::FaceId(0), RadioCapability::wifi_monitor_5ghz(vec![ch]));
+    control.register_radio(
+        radio,
+        ndn_face_monitor_wifi::FaceId(0),
+        RadioCapability::wifi_monitor_5ghz(vec![ch]),
+    );
     let _cell = control.libusb_actuator(radio, backend.clone());
     let px = prefix_hash(&[b"airtime-ab"]);
     control.set_active(vec![NameContext::new(px)]);
@@ -98,9 +109,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Bytes::from(v)
     };
 
-    println!("on-air A/B  ch{ch}@80MHz  txpwr=0x{txpwr:02x}  {frames} frames/arm  {payload} B  mode={mode}  synth-rssi={rssi}");
-    println!("src MAC for RX filter: 02:4e:44:4e:00:01   arm={}", only.as_deref().unwrap_or("ALL"));
-    println!("{:>10}  {:>6}  {:>12}  {:>8}", "arm", "frames", "airtime(ms)", "avg_mcs");
+    println!(
+        "on-air A/B  ch{ch}@80MHz  txpwr=0x{txpwr:02x}  {frames} frames/arm  {payload} B  mode={mode}  synth-rssi={rssi}"
+    );
+    println!(
+        "src MAC for RX filter: 02:4e:44:4e:00:01   arm={}",
+        only.as_deref().unwrap_or("ALL")
+    );
+    println!(
+        "{:>10}  {:>6}  {:>12}  {:>8}",
+        "arm", "frames", "airtime(ms)", "avg_mcs"
+    );
 
     // --- fixed-MCS baselines ---
     for (arm, mcs) in [(0u8, 1u8), (1, 5), (2, 9)] {
@@ -113,42 +132,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut airtime = 0.0f64;
         for seq in 0..frames {
             backend
-                .inject_at(InjectFrame::broadcast(mk_payload(arm, seq), TxIntent::CONSERVATIVE), d)
+                .inject_at(
+                    InjectFrame::broadcast(mk_payload(arm, seq), TxIntent::CONSERVATIVE),
+                    d,
+                )
                 .await?;
             airtime += frame_airtime_us(&p, payload) as f64;
         }
-        println!("{:>10}  {:>6}  {:>12.1}  {:>8}", format!("fixed-mcs{mcs}"), frames, airtime / 1000.0, mcs);
+        println!(
+            "{:>10}  {:>6}  {:>12.1}  {:>8}",
+            format!("fixed-mcs{mcs}"),
+            frames,
+            airtime / 1000.0,
+            mcs
+        );
     }
 
     // --- adaptive arm (the control plane decides per frame) ---
     if want("adaptive") {
-    let mut airtime = 0.0f64;
-    let mut mcs_sum = 0u64;
-    for seq in 0..frames {
-        let plans = control.tick_now(seq as u64); // decides + applies channel/power/CSD/EDCCA
-        let p = plans
-            .first()
-            .and_then(|pl| pl.allocations.first())
-            .map(|a| a.params)
-            .unwrap_or_else(|| template(5));
-        backend
-            .inject_at(InjectFrame::broadcast(mk_payload(3, seq), TxIntent::CONSERVATIVE), desc(&p))
-            .await?;
-        airtime += frame_airtime_us(&p, payload) as f64;
-        mcs_sum += p.mcs.unwrap_or(0) as u64;
-    }
-    println!(
-        "{:>10}  {:>6}  {:>12.1}  {:>8.1}",
-        "adaptive",
-        frames,
-        airtime / 1000.0,
-        mcs_sum as f64 / frames as f64
-    );
+        let mut airtime = 0.0f64;
+        let mut mcs_sum = 0u64;
+        for seq in 0..frames {
+            let plans = control.tick_now(seq as u64); // decides + applies channel/power/CSD/EDCCA
+            let p = plans
+                .first()
+                .and_then(|pl| pl.allocations.first())
+                .map(|a| a.params)
+                .unwrap_or_else(|| template(5));
+            backend
+                .inject_at(
+                    InjectFrame::broadcast(mk_payload(3, seq), TxIntent::CONSERVATIVE),
+                    desc(&p),
+                )
+                .await?;
+            airtime += frame_airtime_us(&p, payload) as f64;
+            mcs_sum += p.mcs.unwrap_or(0) as u64;
+        }
+        println!(
+            "{:>10}  {:>6}  {:>12.1}  {:>8.1}",
+            "adaptive",
+            frames,
+            airtime / 1000.0,
+            mcs_sum as f64 / frames as f64
+        );
     }
 
-    println!("\nRead each arm's 'received by filter' at the RX (filter: wlan src 02:4e:44:4e:00:01).");
+    println!(
+        "\nRead each arm's 'received by filter' at the RX (filter: wlan src 02:4e:44:4e:00:01)."
+    );
     println!("airtime-per-satisfied(arm) = printed airtime(arm) / received(arm). Lowest wins.");
     let t = control.telemetry();
-    println!("strategy={}  worst-objective={:.3}", t.strategy, t.objective);
+    println!(
+        "strategy={}  worst-objective={:.3}",
+        t.strategy, t.objective
+    );
     Ok(())
 }

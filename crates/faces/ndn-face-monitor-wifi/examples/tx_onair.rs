@@ -13,12 +13,15 @@
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use bytes::Bytes;
     use ndn_face_monitor_wifi::{
-        FrameIo, InjectFrame, LibUsbRtl88xxBackend, TxIntent, Rtl8821cuBackend,
+        FrameIo, InjectFrame, LibUsbRtl88xxBackend, Rtl8821cuBackend, TxIntent,
     };
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    let ch: u8 = std::env::var("NDN_RADIO_CHANNEL").ok().and_then(|s| s.parse().ok()).unwrap_or(36);
+    let ch: u8 = std::env::var("NDN_RADIO_CHANNEL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(36);
     let reverse = std::env::var("NDN_RADIO_REVERSE").is_ok();
     const MARKER: &[u8] = b"TXONAIR-link";
 
@@ -52,7 +55,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut p = MARKER.to_vec();
                 p.extend_from_slice(&i.to_le_bytes());
                 let _ = tx
-                    .inject(InjectFrame::broadcast(Bytes::from(p), TxIntent::CONSERVATIVE))
+                    .inject(InjectFrame::broadcast(
+                        Bytes::from(p),
+                        TxIntent::CONSERVATIVE,
+                    ))
                     .await;
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -72,8 +78,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if f.addr == Some(OUR_SRC) {
                 from_src += 1;
                 if from_src <= 3 {
-                    println!("  FROM-US #{from_src}: src={:?} grp={:?} {} bytes rssi={:?} mcs={:?}",
-                        f.addr, f.group, f.payload.len(), f.rssi_dbm, f.mcs_index);
+                    println!(
+                        "  FROM-US #{from_src}: src={:?} grp={:?} {} bytes rssi={:?} mcs={:?}",
+                        f.addr,
+                        f.group,
+                        f.payload.len(),
+                        f.rssi_dbm,
+                        f.mcs_index
+                    );
                 }
             }
             if f.payload.starts_with(MARKER) {
@@ -87,7 +99,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("(frames received with our source addr2 {OUR_SRC:02x?}: {from_src})");
 
     if let Some(c) = &c811_rx {
-        println!("(c811 RX raw frames seen during test, ambient incl.: {})", c.raw_rx_count());
+        println!(
+            "(c811 RX raw frames seen during test, ambient incl.: {})",
+            c.raw_rx_count()
+        );
     }
     println!("\nRESULT: {rx_name} heard {heard} {tx_name} frames ({other} other NDN frames).");
     if heard > 0 {

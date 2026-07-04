@@ -154,7 +154,10 @@ mod tests {
         assert_eq!(policy.apply_to(&mut aa).unwrap(), 2);
 
         let recipient = ndn_sealed_box::Recipient::generate().unwrap();
-        assert!(aa.issue_dkey(&"/muas/alice".parse().unwrap(), &recipient.public).is_ok());
+        assert!(
+            aa.issue_dkey(&"/muas/alice".parse().unwrap(), &recipient.public)
+                .is_ok()
+        );
 
         let recipient2 = ndn_sealed_box::Recipient::generate().unwrap();
         assert!(

@@ -29,16 +29,14 @@ pub const NOISE_FLOOR_DBM: f32 = -95.0;
 /// HT/VHT PHY data rate (Mbps): 20 MHz 1SS long-GI base scaled by bw/nss/SGI.
 pub fn mcs_rate_mbps(p: &TxParams) -> f32 {
     // HT/VHT MCS0–9 (8–9 = VHT 256-QAM), 20 MHz, 1 SS, long GI.
-    const BASE: [f32; 10] = [
-        6.5, 13.0, 19.5, 26.0, 39.0, 52.0, 58.5, 65.0, 78.0, 87.75,
-    ];
+    const BASE: [f32; 10] = [6.5, 13.0, 19.5, 26.0, 39.0, 52.0, 58.5, 65.0, 78.0, 87.75];
     let idx = p.mcs.unwrap_or(0).min(9) as usize;
     let bw = match p.bw.unwrap_or(0) {
-        1 => 2.0,   // 40 MHz
-        2 => 4.0,   // 80 MHz
-        3 => 0.5,   // 10 MHz
-        4 => 0.25,  // 5 MHz
-        _ => 1.0,   // 20 MHz
+        1 => 2.0,  // 40 MHz
+        2 => 4.0,  // 80 MHz
+        3 => 0.5,  // 10 MHz
+        4 => 0.25, // 5 MHz
+        _ => 1.0,  // 20 MHz
     };
     let nss = p.nss.unwrap_or(1).max(1) as f32;
     let sgi = if p.short_gi { 1.0 / 0.9 } else { 1.0 }; // ~+11%

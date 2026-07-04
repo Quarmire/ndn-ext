@@ -78,8 +78,14 @@ async fn aa_serves_params_and_issues_sealed_dkey_over_ndn() {
     // 3. the obtained key decrypts NAC content under a policy alice satisfies.
     let kgc = (aa_prefix.clone(), Hash::of(&mp.public_key_bytes), mp);
     let policy = PolicyExpr::parse("role:analyst OR role:commander").unwrap();
-    let (ck_data, content) =
-        seal_cp("/p/CK/1".parse().unwrap(), &policy, &kgc, b"intel", b"/intel/v1").unwrap();
+    let (ck_data, content) = seal_cp(
+        "/p/CK/1".parse().unwrap(),
+        &policy,
+        &kgc,
+        b"intel",
+        b"/intel/v1",
+    )
+    .unwrap();
     assert_eq!(
         open_cp(&ck_data, &keys, &content, b"/intel/v1").unwrap(),
         b"intel"

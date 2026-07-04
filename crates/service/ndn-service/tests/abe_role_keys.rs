@@ -62,12 +62,27 @@ fn role_kp_key_opens_only_its_granted_scopes() {
 
     let commander_scopes: HashSet<&str> = commander_kr.scopes().collect();
     let observer_scopes: HashSet<&str> = observer_kr.scopes().collect();
-    assert_eq!(commander_scopes, HashSet::from(["control", "telemetry"]), "no secret");
-    assert_eq!(observer_scopes, HashSet::from(["telemetry"]), "only telemetry");
+    assert_eq!(
+        commander_scopes,
+        HashSet::from(["control", "telemetry"]),
+        "no secret"
+    );
+    assert_eq!(
+        observer_scopes,
+        HashSet::from(["telemetry"]),
+        "only telemetry"
+    );
 
     // The recovered keys are the genuine scope keys (open content sealed by them).
     let aad = b"/muas/session/control";
     let sealed = all.get("control").unwrap().seal(b"advance", aad);
-    let opened = commander_kr.get("control").unwrap().open(&sealed, aad).unwrap();
-    assert_eq!(opened, b"advance", "ABE-recovered key is the real scope key");
+    let opened = commander_kr
+        .get("control")
+        .unwrap()
+        .open(&sealed, aad)
+        .unwrap();
+    assert_eq!(
+        opened, b"advance",
+        "ABE-recovered key is the real scope key"
+    );
 }

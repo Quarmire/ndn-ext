@@ -20,8 +20,8 @@ use std::path::Path;
 use anyhow::Result;
 use bytes::Bytes;
 
-use crate::executor::ComputeExecutor;
 use crate::ComputeError;
+use crate::executor::ComputeExecutor;
 
 const ENTRY: &str = "compute";
 

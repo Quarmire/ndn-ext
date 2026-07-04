@@ -76,15 +76,11 @@ impl CpAuthority {
     /// sealed to its advertised X25519 `recipient_public`. Fails closed
     /// ([`NacError::Unauthorized`]) if the requester has no grant.
     #[instrument(skip(self, recipient_public), fields(requester = %requester, scheme = "cp-abe"))]
-    pub fn issue_dkey(
-        &self,
-        requester: &Name,
-        recipient_public: &[u8],
-    ) -> Result<Bytes, NacError> {
+    pub fn issue_dkey(&self, requester: &Name, recipient_public: &[u8]) -> Result<Bytes, NacError> {
         let attrs = self.grants.get(requester).ok_or(NacError::Unauthorized)?;
         let keys = bsw_keygen(&self.params, &self.secret, attrs)?;
-        let sealed = seal(DKEY_SEAL_SALT, recipient_public, &keys.keys_bytes)
-            .ok_or(NacError::SealFailed)?;
+        let sealed =
+            seal(DKEY_SEAL_SALT, recipient_public, &keys.keys_bytes).ok_or(NacError::SealFailed)?;
         Ok(Bytes::from(sealed))
     }
 }
@@ -129,11 +125,7 @@ impl KpAuthority {
     /// advertised X25519 key, using this authority's **own grant table**. Fails
     /// closed if the requester has no grant (the NDNSF-compat path).
     #[instrument(skip(self, recipient_public), fields(requester = %requester, scheme = "kp-abe"))]
-    pub fn issue_dkey(
-        &self,
-        requester: &Name,
-        recipient_public: &[u8],
-    ) -> Result<Bytes, NacError> {
+    pub fn issue_dkey(&self, requester: &Name, recipient_public: &[u8]) -> Result<Bytes, NacError> {
         let policy = self.grants.get(requester).ok_or(NacError::Unauthorized)?;
         self.issue_with_policy(requester, policy, recipient_public)
     }
@@ -152,8 +144,8 @@ impl KpAuthority {
     ) -> Result<Bytes, NacError> {
         let _ = requester; // present for the tracing span
         let key = lsw_keygen(&self.params, &self.secret, policy)?;
-        let sealed = seal(DKEY_SEAL_SALT, recipient_public, &key.key_bytes)
-            .ok_or(NacError::SealFailed)?;
+        let sealed =
+            seal(DKEY_SEAL_SALT, recipient_public, &key.key_bytes).ok_or(NacError::SealFailed)?;
         Ok(Bytes::from(sealed))
     }
 }
@@ -205,11 +197,16 @@ mod tests {
 
         // alice requests her DKEY: generates a Recipient, AA seals to it.
         let recipient = Recipient::generate().unwrap();
-        let sealed_dkey = aa.issue_dkey(&name("/muas/alice"), &recipient.public).unwrap();
+        let sealed_dkey = aa
+            .issue_dkey(&name("/muas/alice"), &recipient.public)
+            .unwrap();
 
         // alice opens the sealed DKEY, then decrypts the content end-to-end.
         let keys = open_cp_dkey(recipient, &sealed_dkey).unwrap();
-        assert_eq!(open_cp(&ck_data, &keys, &sealed_content, b"/intel/v1").unwrap(), b"intel");
+        assert_eq!(
+            open_cp(&ck_data, &keys, &sealed_content, b"/intel/v1").unwrap(),
+            b"intel"
+        );
     }
 
     #[test]
@@ -235,7 +232,10 @@ mod tests {
         let sealed = aa.issue_dkey(&name("/muas/alice"), &alice.public).unwrap();
 
         let eve = Recipient::generate().unwrap();
-        assert!(matches!(open_cp_dkey(eve, &sealed), Err(NacError::UnsealFailed)));
+        assert!(matches!(
+            open_cp_dkey(eve, &sealed),
+            Err(NacError::UnsealFailed)
+        ));
     }
 
     #[test]
@@ -249,12 +249,23 @@ mod tests {
         );
 
         let kgc = (name("/muas/controller"), Hash::of(&mp.public_key_bytes), mp);
-        let (ck_data, sealed_content) =
-            seal_kp(name("/p/CK/2"), &["service:mavlink".into()], &kgc, b"cmd", b"/cmd/1").unwrap();
+        let (ck_data, sealed_content) = seal_kp(
+            name("/p/CK/2"),
+            &["service:mavlink".into()],
+            &kgc,
+            b"cmd",
+            b"/cmd/1",
+        )
+        .unwrap();
 
         let recipient = Recipient::generate().unwrap();
-        let sealed_dkey = aa.issue_dkey(&name("/muas/alice"), &recipient.public).unwrap();
+        let sealed_dkey = aa
+            .issue_dkey(&name("/muas/alice"), &recipient.public)
+            .unwrap();
         let key = open_kp_dkey(recipient, &sealed_dkey).unwrap();
-        assert_eq!(open_kp(&ck_data, &key, &sealed_content, b"/cmd/1").unwrap(), b"cmd");
+        assert_eq!(
+            open_kp(&ck_data, &key, &sealed_content, b"/cmd/1").unwrap(),
+            b"cmd"
+        );
     }
 }

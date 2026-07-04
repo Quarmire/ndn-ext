@@ -58,7 +58,10 @@ impl ServiceDiscoveryProtocol {
                     // DigestSha256 verdict is integrity-only and must not drive FIB
                     // (SEC-11). The identity is still returned (for rate-limiting and
                     // the SEC-12 name-binding check).
-                    VerifyVerdict::Verified { identity, authentic } => (authentic, Some(identity)),
+                    VerifyVerdict::Verified {
+                        identity,
+                        authentic,
+                    } => (authentic, Some(identity)),
                     _ => (false, None),
                 },
                 Err(_) => (false, None),
@@ -456,7 +459,10 @@ impl ServiceDiscoveryProtocol {
                     Err(e) => {
                         warn!(error=%e, name=%name_str, "body decryption failed, dropping");
                         if let Some(rec) = record_opt {
-                            let k = (prefix_hash_hex(&rec.announced_prefix), rec.node_name.to_string());
+                            let k = (
+                                prefix_hash_hex(&rec.announced_prefix),
+                                rec.node_name.to_string(),
+                            );
                             self.has_body_map.lock().unwrap().insert(k, false);
                         }
                         return true;
@@ -466,7 +472,10 @@ impl ServiceDiscoveryProtocol {
             };
 
             if let Some(rec) = record_opt.as_ref() {
-                let k = (prefix_hash_hex(&rec.announced_prefix), rec.node_name.to_string());
+                let k = (
+                    prefix_hash_hex(&rec.announced_prefix),
+                    rec.node_name.to_string(),
+                );
                 self.has_body_map.lock().unwrap().insert(k, true);
                 self.measurements.lock().unwrap().record_rtt(
                     &rec.announced_prefix,
@@ -515,7 +524,10 @@ impl ServiceDiscoveryProtocol {
                     .cloned()
                 {
                     self.has_body_map.lock().unwrap().insert(
-                        (prefix_hash_hex(&rec.announced_prefix), rec.node_name.to_string()),
+                        (
+                            prefix_hash_hex(&rec.announced_prefix),
+                            rec.node_name.to_string(),
+                        ),
                         false,
                     );
                     self.measurements.lock().unwrap().record_timeout(

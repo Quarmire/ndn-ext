@@ -38,7 +38,13 @@ fn hub(nodes: &[&str], group: &Name) -> Vec<SvsPubSub> {
     for node in nodes {
         let (out_tx, out_rx) = mpsc::channel::<Bytes>(256);
         let (in_tx, in_rx) = mpsc::channel::<Bytes>(256);
-        pubsubs.push(SvsPubSub::join(group.clone(), n(node), out_tx, in_rx, cfg()));
+        pubsubs.push(SvsPubSub::join(
+            group.clone(),
+            n(node),
+            out_tx,
+            in_rx,
+            cfg(),
+        ));
         outs.push(out_rx);
         ins.push(in_tx);
     }
@@ -74,7 +80,9 @@ impl Frame for Order {
     }
     fn decode(b: &[u8]) -> Result<Self, ServiceError> {
         let mut p = 0;
-        Ok(Order { verb: String::decode(read_field(b, &mut p)?)? })
+        Ok(Order {
+            verb: String::decode(read_field(b, &mut p)?)?,
+        })
     }
 }
 
@@ -88,7 +96,9 @@ impl Frame for Reading {
     }
     fn decode(b: &[u8]) -> Result<Self, ServiceError> {
         let mut p = 0;
-        Ok(Reading { celsius: u64::decode(read_field(b, &mut p)?)? })
+        Ok(Reading {
+            celsius: u64::decode(read_field(b, &mut p)?)?,
+        })
     }
 }
 
@@ -130,25 +140,55 @@ async fn roles_grant_scopes_and_gate_topics() {
     );
 
     // Commander reader (carol) subscribes to control; observer (bob) to telemetry.
-    let mut carol_control = carol.topic::<Order>("control", "orders").unwrap().subscribe().await;
-    let mut bob_telemetry = bob.topic::<Reading>("telemetry", "temps").unwrap().subscribe().await;
+    let mut carol_control = carol
+        .topic::<Order>("control", "orders")
+        .unwrap()
+        .subscribe()
+        .await;
+    let mut bob_telemetry = bob
+        .topic::<Reading>("telemetry", "temps")
+        .unwrap()
+        .subscribe()
+        .await;
 
     // Commander (alice) publishes into both scopes.
-    alice.topic::<Order>("control", "orders").unwrap().publish(&Order { verb: "advance".into() }).await.unwrap();
-    alice.topic::<Reading>("telemetry", "temps").unwrap().publish(&Reading { celsius: 21 }).await.unwrap();
+    alice
+        .topic::<Order>("control", "orders")
+        .unwrap()
+        .publish(&Order {
+            verb: "advance".into(),
+        })
+        .await
+        .unwrap();
+    alice
+        .topic::<Reading>("telemetry", "temps")
+        .unwrap()
+        .publish(&Reading { celsius: 21 })
+        .await
+        .unwrap();
 
     // A commander reads the control order; the observer reads telemetry.
     let order = tokio::time::timeout(Duration::from_secs(6), carol_control.recv())
         .await
         .expect("control recv timed out")
         .expect("session closed");
-    assert_eq!(order, Order { verb: "advance".into() }, "a commander reads the control scope");
+    assert_eq!(
+        order,
+        Order {
+            verb: "advance".into()
+        },
+        "a commander reads the control scope"
+    );
 
     let reading = tokio::time::timeout(Duration::from_secs(6), bob_telemetry.recv())
         .await
         .expect("telemetry recv timed out")
         .expect("session closed");
-    assert_eq!(reading, Reading { celsius: 21 }, "an observer reads the telemetry scope");
+    assert_eq!(
+        reading,
+        Reading { celsius: 21 },
+        "an observer reads the telemetry scope"
+    );
 }
 
 #[test]
@@ -172,5 +212,9 @@ fn derived_scope_keys_are_distinct_and_deterministic() {
     // Same master + scope re-derives the same key.
     let kr2 = ScopeKeyring::derive(&master, &["control"]);
     let sealed2 = kr2.get("control").unwrap().seal(b"x", aad);
-    assert_eq!(control.open(&sealed2, aad).unwrap(), b"x", "same master+scope -> same key");
+    assert_eq!(
+        control.open(&sealed2, aad).unwrap(),
+        b"x",
+        "same master+scope -> same key"
+    );
 }

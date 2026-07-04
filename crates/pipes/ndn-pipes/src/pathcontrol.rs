@@ -28,8 +28,8 @@
 //! stays forwarder-agnostic.
 
 use bytes::Bytes;
-use ndn_packet::encode::InterestBuilder;
 use ndn_packet::Name;
+use ndn_packet::encode::InterestBuilder;
 use ndn_pathcontrol::{PathControl, PathOp};
 
 use crate::registry::PipeRegistry;
@@ -318,15 +318,30 @@ mod tests {
     fn mac_binds_every_field() {
         let base = teardown_mac(b"key", &ns(), PathOp::Teardown, 7, b"id");
         // Deterministic for the same inputs.
-        assert_eq!(base, teardown_mac(b"key", &ns(), PathOp::Teardown, 7, b"id"));
+        assert_eq!(
+            base,
+            teardown_mac(b"key", &ns(), PathOp::Teardown, 7, b"id")
+        );
         // …and changes if *any* bound field changes (so a captured proof can't be lifted
         // onto a different teardown, key, or pipe).
-        assert_ne!(base, teardown_mac(b"key2", &ns(), PathOp::Teardown, 7, b"id"));
+        assert_ne!(
+            base,
+            teardown_mac(b"key2", &ns(), PathOp::Teardown, 7, b"id")
+        );
         let other_ns: Name = "/bob/pipe".parse().unwrap();
-        assert_ne!(base, teardown_mac(b"key", &other_ns, PathOp::Teardown, 7, b"id"));
+        assert_ne!(
+            base,
+            teardown_mac(b"key", &other_ns, PathOp::Teardown, 7, b"id")
+        );
         assert_ne!(base, teardown_mac(b"key", &ns(), PathOp::Refresh, 7, b"id"));
-        assert_ne!(base, teardown_mac(b"key", &ns(), PathOp::Teardown, 8, b"id"));
-        assert_ne!(base, teardown_mac(b"key", &ns(), PathOp::Teardown, 7, b"id2"));
+        assert_ne!(
+            base,
+            teardown_mac(b"key", &ns(), PathOp::Teardown, 8, b"id")
+        );
+        assert_ne!(
+            base,
+            teardown_mac(b"key", &ns(), PathOp::Teardown, 7, b"id2")
+        );
     }
 
     #[test]
@@ -349,7 +364,10 @@ mod tests {
         let wb = pipe_teardown_interest(&shared, b"pipe-B", b"kB", 1700);
         let na = ndn_packet::Interest::decode(wa).unwrap().name;
         let nb = ndn_packet::Interest::decode(wb).unwrap().name;
-        assert_ne!(na, nb, "co-namespaced same-seq teardowns have distinct names");
+        assert_ne!(
+            na, nb,
+            "co-namespaced same-seq teardowns have distinct names"
+        );
     }
 
     #[test]

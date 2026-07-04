@@ -14,7 +14,8 @@
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use bytes::Bytes;
     use ndn_face_monitor_wifi::{
-        FaceId, InjectFrame, LibUsbRtl88xxBackend, McsDescriptor, TxIntent, MonitorWifiFace, FrameIo, WifiRadio,
+        FaceId, FrameIo, InjectFrame, LibUsbRtl88xxBackend, McsDescriptor, MonitorWifiFace,
+        TxIntent, WifiRadio,
     };
     use std::sync::Arc;
 
@@ -80,7 +81,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(s) = std::env::var("RADIO_EDCCA") {
         let mut it = s.split(',');
         let l2h: i8 = it.next().and_then(|v| v.trim().parse().ok()).unwrap_or(10);
-        let h2l: i8 = it.next().and_then(|v| v.trim().parse().ok()).unwrap_or(l2h - 8);
+        let h2l: i8 = it
+            .next()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(l2h - 8);
         backend.set_edcca_threshold(l2h, h2l)?;
         println!("EDCCA threshold set: L2H={l2h} dBm, H2L={h2l} dBm");
     }
@@ -155,7 +159,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let t0 = std::time::Instant::now();
     for _ in 0..count {
         backend
-            .inject_at(InjectFrame::broadcast(data.clone(), TxIntent::CONSERVATIVE), mcs)
+            .inject_at(
+                InjectFrame::broadcast(data.clone(), TxIntent::CONSERVATIVE),
+                mcs,
+            )
             .await?;
     }
     let dt = t0.elapsed().as_secs_f64();

@@ -35,7 +35,10 @@ async fn producer_pushes_coded_bulk_over_the_reflexive_route() {
         .build()
         .await
         .expect("engine build");
-    assert!(engine.reflexive().is_enabled(), "reflexive forwarding must be on");
+    assert!(
+        engine.reflexive().is_enabled(),
+        "reflexive forwarding must be on"
+    );
 
     // SEEK/JOIN flow toward the producer; the reverse pushes route reflexively.
     let npd: Name = "/NPD".parse().unwrap();
@@ -54,7 +57,10 @@ async fn producer_pushes_coded_bulk_over_the_reflexive_route() {
         .await
         .expect("pushed bulk received");
 
-    assert_eq!(got, payload, "consumer recovers + decrypts the producer-pushed bulk");
+    assert_eq!(
+        got, payload,
+        "consumer recovers + decrypts the producer-pushed bulk"
+    );
 
     drop(pc);
     drop(engine);

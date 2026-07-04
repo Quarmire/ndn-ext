@@ -40,7 +40,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         f
     };
 
-    for (rate, sa, label) in [(0x0000u16, 0x01u8, "data CCK-1M"), (0x2000, 0x02, "data OFDM-6M"), (0x4001, 0x03, "data HT-MCS1")] {
+    for (rate, sa, label) in [
+        (0x0000u16, 0x01u8, "data CCK-1M"),
+        (0x2000, 0x02, "data OFDM-6M"),
+        (0x4001, 0x03, "data HT-MCS1"),
+    ] {
         let f = data(sa);
         let mut ok = 0u32;
         for _ in 0..200 {

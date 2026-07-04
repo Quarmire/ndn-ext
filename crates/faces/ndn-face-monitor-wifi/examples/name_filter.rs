@@ -17,13 +17,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use ndn_face_monitor_wifi::{LibUsbRtl88xxBackend, name_group_mac};
 
     // argv[1] may be a comma-separated list of prefixes (multi-prefix DCNLA).
-    let prefixes_arg = std::env::args().nth(1).unwrap_or_else(|| "/sensors/temp".to_string());
-    let secs: u64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(10);
-    let ch: u8 = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(149);
+    let prefixes_arg = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "/sensors/temp".to_string());
+    let secs: u64 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
+    let ch: u8 = std::env::args()
+        .nth(3)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(149);
 
     let prefixes: Vec<&str> = prefixes_arg.split(',').collect();
-    let groups: Vec<[u8; 6]> = prefixes.iter().map(|p| name_group_mac(p.as_bytes())).collect();
-    let fmt = |m: &[u8; 6]| m.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":");
+    let groups: Vec<[u8; 6]> = prefixes
+        .iter()
+        .map(|p| name_group_mac(p.as_bytes()))
+        .collect();
+    let fmt = |m: &[u8; 6]| {
+        m.iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(":")
+    };
     for (p, g) in prefixes.iter().zip(&groups) {
         println!("prefix {p:?} → name-group MAC {}", fmt(g));
     }
@@ -36,7 +52,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         b.set_name_group_filter(groups[0])?;
         let (rcr, bssid, msr) = b.name_group_filter_state()?;
         println!("RX = DCNLA single-group filter (BSSID match) — drops other groups in HW");
-        println!("     readback: RCR={rcr:#010x} BSSID={} MSR={msr} (1=AdHoc)", fmt(&bssid));
+        println!(
+            "     readback: RCR={rcr:#010x} BSSID={} MSR={msr} (1=AdHoc)",
+            fmt(&bssid)
+        );
     } else {
         b.set_name_group_filter_multi(&groups)?;
         let (rcr, _, msr) = b.name_group_filter_state()?;
@@ -44,7 +63,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "RX = DCNLA multi-prefix ({} name-groups): HW multicast-narrow (AM) + SW set-match",
             groups.len()
         );
-        println!("     readback: RCR={rcr:#010x} (AM bit2={}) MSR={msr}", (rcr >> 2) & 1);
+        println!(
+            "     readback: RCR={rcr:#010x} (AM bit2={}) MSR={msr}",
+            (rcr >> 2) & 1
+        );
     }
 
     println!("listening on ch{ch} for {secs}s…");

@@ -125,7 +125,10 @@ mod tests {
             cal.observe(before, -60, false);
         }
         let after = pick_mcs(-60, 9, &cal.thresholds());
-        assert!(after < before, "persistent failure should drop the rate: {after} < {before}");
+        assert!(
+            after < before,
+            "persistent failure should drop the rate: {after} < {before}"
+        );
     }
 
     #[test]
@@ -139,7 +142,10 @@ mod tests {
             cal.observe(7, -64, true);
         }
         let t1 = cal.thresholds()[7];
-        assert!(t1 < t0, "persistent success should lower the threshold: {t1} < {t0}");
+        assert!(
+            t1 < t0,
+            "persistent success should lower the threshold: {t1} < {t0}"
+        );
     }
 
     #[test]
@@ -152,7 +158,11 @@ mod tests {
         }
         let t = cal.thresholds();
         for m in 1..10 {
-            assert!(t[m] >= t[m - 1], "req must be nondecreasing at {m}: {:?}", t);
+            assert!(
+                t[m] >= t[m - 1],
+                "req must be nondecreasing at {m}: {:?}",
+                t
+            );
         }
     }
 
@@ -163,6 +173,10 @@ mod tests {
         let t0 = cal.thresholds()[7]; // -62
         // a success at -20 dBm (far above the cliff) tells us nothing about it.
         cal.observe(7, -20, true);
-        assert_eq!(cal.thresholds()[7], t0, "easy far-above success must not move the cliff");
+        assert_eq!(
+            cal.thresholds()[7],
+            t0,
+            "easy far-above success must not move the cliff"
+        );
     }
 }

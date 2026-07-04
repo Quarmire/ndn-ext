@@ -28,8 +28,8 @@ use bytes::Bytes;
 use crate::codec::{ComputeArgs, ComputeValue};
 use crate::compute_face::ComputeFace;
 use crate::executor::ComputeExecutor;
-use crate::{ComputeError, ComputeHandler, ComputeRegistry};
 use crate::thunk::Thunk;
+use crate::{ComputeError, ComputeHandler, ComputeRegistry};
 
 /// Freshness stamped on transparent function results, bounding how long the
 /// Content Store memoizes them.
@@ -814,9 +814,7 @@ fn arg_components(
                 .checked_sub(1)
                 .filter(|end| *end >= prefix_len)
                 .ok_or_else(|| {
-                    ComputeError::BadRequest(
-                        "opaque call missing trailing nonce component".into(),
-                    )
+                    ComputeError::BadRequest("opaque call missing trailing nonce component".into())
                 })?;
             Ok(&comps[prefix_len..end])
         }

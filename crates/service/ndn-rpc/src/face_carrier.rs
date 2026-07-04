@@ -16,8 +16,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use ndn_app::{Consumer, Producer};
-use ndn_packet::encode::{DataBuilder, InterestBuilder};
 use ndn_packet::Name;
+use ndn_packet::encode::{DataBuilder, InterestBuilder};
 use ndn_security::{InterestValidationOutcome, SignWith, Signer, ValidationResult, Validator};
 use ndn_service_core::{
     Carrier, Dispatch, HintedCarrier, Invocation, OpId, Response, ServiceError, ServiceId,
@@ -172,13 +172,14 @@ impl Carrier for FaceRpcCarrier {
         self.invoke_hinted(svc, op, request, None).await
     }
 
-    async fn serve(&self, svc: &ServiceId, dispatch: Arc<dyn Dispatch>) -> Result<(), ServiceError> {
-        let producer = self
-            .producer
-            .lock()
-            .await
-            .take()
-            .ok_or_else(|| ServiceError::Transport("carrier has no producer to serve with".into()))?;
+    async fn serve(
+        &self,
+        svc: &ServiceId,
+        dispatch: Arc<dyn Dispatch>,
+    ) -> Result<(), ServiceError> {
+        let producer = self.producer.lock().await.take().ok_or_else(|| {
+            ServiceError::Transport("carrier has no producer to serve with".into())
+        })?;
         let service_len = svc.name().len();
         let validator = self.validator.clone();
         let signer = self.signer.clone();
@@ -207,10 +208,9 @@ impl HintedCarrier for FaceRpcCarrier {
         request: Bytes,
         hint: Option<&Name>,
     ) -> Result<Response, ServiceError> {
-        let consumer = self
-            .consumer
-            .as_ref()
-            .ok_or_else(|| ServiceError::Transport("carrier has no consumer to invoke with".into()))?;
+        let consumer = self.consumer.as_ref().ok_or_else(|| {
+            ServiceError::Transport("carrier has no consumer to invoke with".into())
+        })?;
         let name = svc.name().clone().append(op.as_str());
         let mut builder = InterestBuilder::new(name).app_parameters(request.to_vec());
         if let Some(h) = hint {

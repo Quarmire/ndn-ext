@@ -60,7 +60,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         f
     };
 
-    for (label, frame) in [("plain(..01)", &plain), ("qos(..02)", &qos), ("amsdu(..03)", &amsdu)] {
+    for (label, frame) in [
+        ("plain(..01)", &plain),
+        ("qos(..02)", &qos),
+        ("amsdu(..03)", &amsdu),
+    ] {
         let mut ok = 0u32;
         for _ in 0..200 {
             if dev.tx_data_at(frame, 0x4001).is_ok() {

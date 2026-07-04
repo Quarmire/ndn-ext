@@ -62,8 +62,17 @@ async fn smoke_poll_and_command_against_live_forwarder() {
             f.face_id, f.remote_uri, f.local_uri, f.persistency, f.n_in_interests, f.n_out_data
         );
     }
-    println!("routes:     {:?}", st.routes.iter().map(|r| &r.prefix).collect::<Vec<_>>());
-    println!("strategies: {:?}", st.strategies.iter().map(|s| (&s.prefix, &s.strategy)).collect::<Vec<_>>());
+    println!(
+        "routes:     {:?}",
+        st.routes.iter().map(|r| &r.prefix).collect::<Vec<_>>()
+    );
+    println!(
+        "strategies: {:?}",
+        st.strategies
+            .iter()
+            .map(|s| (&s.prefix, &s.strategy))
+            .collect::<Vec<_>>()
+    );
     println!("cs:         {:?}", st.cs);
 
     // A healthy forwarder always returns its general status + face table.
@@ -81,7 +90,10 @@ async fn smoke_poll_and_command_against_live_forwarder() {
     println!("\n=== route_register /smoke/test ===");
     match engine.route_register("/smoke/test", 0, 100).await {
         Ok(resp) => {
-            println!("route_register -> {} {}", resp.status_code, resp.status_text);
+            println!(
+                "route_register -> {} {}",
+                resp.status_code, resp.status_text
+            );
             if resp.is_ok() {
                 // 3) Re-poll; RIB registration may propagate into the FIB.
                 let _ = engine.poll_forwarding().await;

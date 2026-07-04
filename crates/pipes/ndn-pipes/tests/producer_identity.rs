@@ -42,7 +42,10 @@ async fn open_with(producer_sk: [u8; 32], anchor: [u8; 32]) -> Result<(), PipeEr
 
     let mut pc =
         PipeConsumer::new(Consumer::from_handle(consumer_handle)).with_trust_anchor(anchor);
-    let result = pc.open("/sensors/temp", PipeParams::default()).await.map(|_| ());
+    let result = pc
+        .open("/sensors/temp", PipeParams::default())
+        .await
+        .map(|_| ());
 
     drop(pc);
     drop(engine);

@@ -99,7 +99,11 @@ pub fn check_name(pipe_id: &[u8], pipe_length: u32) -> Name {
 /// on the trailing verb.
 pub fn classify(name: &Name) -> Option<MessageKind> {
     let comps = name.components();
-    let at = |i: usize| comps.get(i).and_then(|c| std::str::from_utf8(&c.value).ok());
+    let at = |i: usize| {
+        comps
+            .get(i)
+            .and_then(|c| std::str::from_utf8(&c.value).ok())
+    };
     if let (Some("NPD"), Some("SEEK")) = (at(0), at(1)) {
         return Some(MessageKind::Seek);
     }
@@ -202,8 +206,14 @@ mod tests {
 
     #[test]
     fn classify_dispatches_each_message() {
-        assert_eq!(classify(&seek_name(&Name::from("/a"))), Some(MessageKind::Seek));
-        assert_eq!(classify(&join_name(&Name::from("/a"), b"p")), Some(MessageKind::Join));
+        assert_eq!(
+            classify(&seek_name(&Name::from("/a"))),
+            Some(MessageKind::Seek)
+        );
+        assert_eq!(
+            classify(&join_name(&Name::from("/a"), b"p")),
+            Some(MessageKind::Join)
+        );
         assert_eq!(classify(&context_name(b"p", 1)), Some(MessageKind::Context));
         assert_eq!(classify(&link_name(b"p", 1)), Some(MessageKind::Link));
         assert_eq!(classify(&pipe_name(b"p", 1)), Some(MessageKind::Pipe));

@@ -24,7 +24,7 @@
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use bytes::Bytes;
     use ndn_face_monitor_wifi::{
-        ChannelBw, InjectFrame, LibUsbRtl88xxBackend, McsDescriptor, TxIntent, FrameIo, WifiRadio,
+        ChannelBw, FrameIo, InjectFrame, LibUsbRtl88xxBackend, McsDescriptor, TxIntent, WifiRadio,
     };
     use std::sync::Arc;
 
@@ -54,7 +54,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("        ch{ch:<3} busy {busy:>3}%");
         map.push((ch, busy));
     }
-    let (data_ch, busy) = *map.iter().min_by_key(|(_, b)| *b).expect("non-empty candidates");
+    let (data_ch, busy) = *map
+        .iter()
+        .min_by_key(|(_, b)| *b)
+        .expect("non-empty candidates");
     println!("[select] clearest data channel = ch{data_ch} ({busy}% busy)");
 
     // 3. ANNOUNCE: presence beacon on the rendezvous channel.
@@ -68,7 +71,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("[announce] beaconing data ch{data_ch} on rendezvous ch{rendezvous_ch}…");
     for _ in 0..200 {
         backend
-            .inject_at(InjectFrame::broadcast(beacon.clone(), TxIntent::CONSERVATIVE), McsDescriptor::ht(1))
+            .inject_at(
+                InjectFrame::broadcast(beacon.clone(), TxIntent::CONSERVATIVE),
+                McsDescriptor::ht(1),
+            )
             .await?;
     }
 
@@ -78,7 +84,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("[operate] sending data on ch{data_ch}…");
     for _ in 0..2000 {
         backend
-            .inject_at(InjectFrame::broadcast(data.clone(), TxIntent::CONSERVATIVE), McsDescriptor::ht(5))
+            .inject_at(
+                InjectFrame::broadcast(data.clone(), TxIntent::CONSERVATIVE),
+                McsDescriptor::ht(5),
+            )
             .await?;
     }
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;

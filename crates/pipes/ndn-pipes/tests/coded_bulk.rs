@@ -27,8 +27,14 @@ async fn run(skip: &'static [u16]) -> (Vec<u8>, Vec<u8>) {
     let root: Name = "/".parse().unwrap();
     engine.fib().add_nexthop(&root, FaceId(2), 0);
 
-    let producer = PipeProducer::new(Producer::from_handle(producer_handle, root))
-        .serve_object(&object, &payload, &policy, 1, skip, &Confidentiality::None);
+    let producer = PipeProducer::new(Producer::from_handle(producer_handle, root)).serve_object(
+        &object,
+        &payload,
+        &policy,
+        1,
+        skip,
+        &Confidentiality::None,
+    );
     let serve = tokio::spawn(async move { producer.serve().await });
 
     let mut pc = PipeConsumer::new(Consumer::from_handle(consumer_handle));
@@ -36,7 +42,10 @@ async fn run(skip: &'static [u16]) -> (Vec<u8>, Vec<u8>) {
         .open("/sensors/temp", PipeParams::default().with_fec(8, 12))
         .await
         .expect("pipe establishes");
-    let got = pc.fetch(&pipe, "/v=42").await.expect("coded fetch recovers");
+    let got = pc
+        .fetch(&pipe, "/v=42")
+        .await
+        .expect("coded fetch recovers");
 
     drop(pc);
     drop(engine);
@@ -55,5 +64,8 @@ async fn coded_bulk_round_trips_without_loss() {
 async fn coded_bulk_recovers_under_loss() {
     // Withhold 3 of 12 source segments; 9 ≥ K=8 remain → recover via parity.
     let (payload, got) = run(&[1, 4, 6]).await;
-    assert_eq!(got, payload, "K-of-N FEC recovers despite withheld segments");
+    assert_eq!(
+        got, payload,
+        "K-of-N FEC recovers despite withheld segments"
+    );
 }

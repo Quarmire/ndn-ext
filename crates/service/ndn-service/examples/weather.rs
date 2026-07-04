@@ -66,7 +66,10 @@ impl Weather for Station {
 }
 
 fn station(name: &str, bias_c: i32) -> Arc<WeatherDispatch<Station>> {
-    Arc::new(WeatherDispatch(Arc::new(Station { name: name.into(), bias_c })))
+    Arc::new(WeatherDispatch(Arc::new(Station {
+        name: name.into(),
+        bias_c,
+    })))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -97,9 +100,17 @@ async fn discovery() {
 
     // Two stations advertise + serve over a shared Tier-0 carrier (in-process here;
     // a real deployment uses ServiceDiscoveryDirectory over a forwarder).
-    let s1 = DiscoveryCarrier::new(dir.clone(), RpcCarrier::with_registry(registry.clone()), n("/met/s1"));
+    let s1 = DiscoveryCarrier::new(
+        dir.clone(),
+        RpcCarrier::with_registry(registry.clone()),
+        n("/met/s1"),
+    );
     s1.serve(&svc, station("station-1", 0)).await.unwrap();
-    let s2 = DiscoveryCarrier::new(dir.clone(), RpcCarrier::with_registry(registry.clone()), n("/met/s2"));
+    let s2 = DiscoveryCarrier::new(
+        dir.clone(),
+        RpcCarrier::with_registry(registry.clone()),
+        n("/met/s2"),
+    );
     s2.serve(&svc, station("station-2", 2)).await.unwrap();
 
     // The client knows only the *service* name — discovery finds the providers.
@@ -107,9 +118,15 @@ async fn discovery() {
     let client = WeatherClient::new(app, svc);
 
     let f = client.forecast("Berlin".into(), 1).await.unwrap();
-    println!("  discovered + forecast(Berlin, 1) -> high {}C  [{}]", f.high_c, f.summary);
+    println!(
+        "  discovered + forecast(Berlin, 1) -> high {}C  [{}]",
+        f.high_c, f.summary
+    );
 
-    let all = client.forecast_select("Berlin".into(), 1, Strategy::All).await.unwrap();
+    let all = client
+        .forecast_select("Berlin".into(), 1, Strategy::All)
+        .await
+        .unwrap();
     println!("  forecast_select(All) across discovered stations:");
     for (provider, fc) in all {
         println!("    {provider} -> high {}C  [{}]", fc.high_c, fc.summary);
@@ -130,7 +147,13 @@ async fn feed() {
     let mut feed = dashboard.subscribe().await;
 
     for temp_c in [19, 20, 21] {
-        sensor.publish(&Observation { city: "Berlin".into(), temp_c }).await.unwrap();
+        sensor
+            .publish(&Observation {
+                city: "Berlin".into(),
+                temp_c,
+            })
+            .await
+            .unwrap();
     }
 
     println!("  dashboard receives the stream:");
@@ -156,7 +179,11 @@ async fn confidential() {
     let outsider_kr = policy.keyring_for(&Role::Free, &all_keys); // empty
 
     let mut pss = hub(&["/met/forecaster", "/met/member", "/met/outsider"], &group).into_iter();
-    let forecaster = ScopedSession::new(session.clone(), Arc::new(pss.next().unwrap()), member_kr.clone());
+    let forecaster = ScopedSession::new(
+        session.clone(),
+        Arc::new(pss.next().unwrap()),
+        member_kr.clone(),
+    );
     let member = ScopedSession::new(session.clone(), Arc::new(pss.next().unwrap()), member_kr);
     let outsider = ScopedSession::new(session, Arc::new(pss.next().unwrap()), outsider_kr);
 
@@ -189,7 +216,10 @@ async fn confidential() {
         .await
         .expect("premium recv timed out")
         .expect("session closed");
-    println!("  member reads the premium forecast: high {}C  [{}]", f.high_c, f.summary);
+    println!(
+        "  member reads the premium forecast: high {}C  [{}]",
+        f.high_c, f.summary
+    );
 }
 
 // --- A tiny in-memory SVS medium so the example runs without a forwarder. ---
@@ -212,7 +242,13 @@ fn hub(nodes: &[&str], group: &Name) -> Vec<SvsPubSub> {
     for node in nodes {
         let (out_tx, out_rx) = mpsc::channel::<Bytes>(256);
         let (in_tx, in_rx) = mpsc::channel::<Bytes>(256);
-        pubsubs.push(SvsPubSub::join(group.clone(), n(node), out_tx, in_rx, cfg()));
+        pubsubs.push(SvsPubSub::join(
+            group.clone(),
+            n(node),
+            out_tx,
+            in_rx,
+            cfg(),
+        ));
         outs.push(out_rx);
         ins.push(in_tx);
     }

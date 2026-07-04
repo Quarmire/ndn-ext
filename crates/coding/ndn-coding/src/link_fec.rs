@@ -199,12 +199,14 @@ impl LinkFecRx {
             {
                 self.gens.remove(&old);
             }
-            self.gens
-                .insert(g, GenState {
+            self.gens.insert(
+                g,
+                GenState {
                     dec: Decoder::new(k, n)?,
                     delivered: vec![false; k as usize],
                     done: false,
-                });
+                },
+            );
             self.order.push_back(g);
         }
         let st = self.gens.get_mut(&g).unwrap();

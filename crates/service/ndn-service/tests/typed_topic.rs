@@ -36,7 +36,13 @@ fn hub(nodes: &[&str], group: &Name) -> Vec<SvsPubSub> {
     for node in nodes {
         let (out_tx, out_rx) = mpsc::channel::<Bytes>(256);
         let (in_tx, in_rx) = mpsc::channel::<Bytes>(256);
-        pubsubs.push(SvsPubSub::join(group.clone(), n(node), out_tx, in_rx, cfg()));
+        pubsubs.push(SvsPubSub::join(
+            group.clone(),
+            n(node),
+            out_tx,
+            in_rx,
+            cfg(),
+        ));
         outs.push(out_rx);
         ins.push(in_tx);
     }
@@ -89,9 +95,18 @@ async fn typed_feed_delivers_published_values() {
     let mut feed = subscriber.subscribe().await;
 
     let sent = [
-        Reading { sensor: "bow".into(), celsius: 21 },
-        Reading { sensor: "stern".into(), celsius: 23 },
-        Reading { sensor: "bow".into(), celsius: 22 },
+        Reading {
+            sensor: "bow".into(),
+            celsius: 21,
+        },
+        Reading {
+            sensor: "stern".into(),
+            celsius: 23,
+        },
+        Reading {
+            sensor: "bow".into(),
+            celsius: 22,
+        },
     ];
     for r in &sent {
         publisher.publish(r).await.unwrap();
@@ -110,5 +125,8 @@ async fn typed_feed_delivers_published_values() {
     got.sort_by(|a, b| (a.celsius, &a.sensor).cmp(&(b.celsius, &b.sensor)));
     let mut want: Vec<Reading> = sent.into_iter().collect();
     want.sort_by(|a, b| (a.celsius, &a.sensor).cmp(&(b.celsius, &b.sensor)));
-    assert_eq!(got, want, "the typed feed must deliver every published value, decoded");
+    assert_eq!(
+        got, want,
+        "the typed feed must deliver every published value, decoded"
+    );
 }

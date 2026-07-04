@@ -13,10 +13,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use ndn_packet::Name;
 use ndn_rpc::RpcCarrier;
+use ndn_security::Validator;
 use ndn_security::cert_cache::Certificate;
 use ndn_security::signer::{Ed25519Signer, Signer};
 use ndn_security::trust_schema::{NamePattern, PatternComponent, SchemaRule, TrustSchema};
-use ndn_security::Validator;
 use ndn_service_core::{Carrier, Dispatch, Invocation, OpId, ServiceError, ServiceId};
 
 fn name(s: &str) -> Name {
@@ -103,7 +103,9 @@ async fn unsigned_request_is_rejected_by_secure_server() {
     let svc = ServiceId::new(name("/svc/echo"));
     carrier.serve(&svc, Arc::new(WhoamiDispatch)).await.unwrap();
 
-    let r = carrier.invoke(&svc, &OpId::new("whoami"), Bytes::new()).await;
+    let r = carrier
+        .invoke(&svc, &OpId::new("whoami"), Bytes::new())
+        .await;
     assert!(
         matches!(r, Err(ServiceError::Unauthorized(_))),
         "an unsigned request must be rejected as Unauthorized, got {r:?}"
@@ -122,15 +124,18 @@ async fn untrusted_response_is_rejected_on_invoke() {
 
     let registry = Arc::new(RpcRegistry::new());
     // Server: signs responses with alice, accepts unsigned requests (no validator).
-    let server = RpcCarrier::with_registry(registry.clone())
-        .with_signer(Arc::new(alice) as Arc<dyn Signer>);
+    let server =
+        RpcCarrier::with_registry(registry.clone()).with_signer(Arc::new(alice) as Arc<dyn Signer>);
     let svc = ServiceId::new(name("/svc/echo"));
     server.serve(&svc, Arc::new(WhoamiDispatch)).await.unwrap();
 
     // Client: a validator that trusts NObody (empty cert cache) ⇒ the alice-signed
     // response can't be verified.
-    let client = RpcCarrier::with_registry(registry).with_validator(Arc::new(Validator::new(open_schema())));
-    let r = client.invoke(&svc, &OpId::new("whoami"), Bytes::new()).await;
+    let client =
+        RpcCarrier::with_registry(registry).with_validator(Arc::new(Validator::new(open_schema())));
+    let r = client
+        .invoke(&svc, &OpId::new("whoami"), Bytes::new())
+        .await;
     assert!(
         matches!(r, Err(ServiceError::Unauthorized(_))),
         "an unverifiable response must be rejected, got {r:?}"

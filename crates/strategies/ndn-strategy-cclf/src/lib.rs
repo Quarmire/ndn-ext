@@ -406,10 +406,7 @@ pub mod native {
             self.decide_sync(ctx)
         }
 
-        fn after_receive_data(
-            &self,
-            ctx: &StrategyContext<'_>,
-        ) -> SmallVec<[ForwardingAction; 2]> {
+        fn after_receive_data(&self, ctx: &StrategyContext<'_>) -> SmallVec<[ForwardingAction; 2]> {
             // CCS: returning Data lifts this node's content connectivity.
             let now = self.now_ms();
             let prefix = Self::name_prefix(ctx.name);

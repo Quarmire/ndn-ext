@@ -45,7 +45,13 @@ fn hub(nodes: &[&str], group: &Name) -> Vec<SvsPubSub> {
     for n in nodes {
         let (out_tx, out_rx) = mpsc::channel::<Bytes>(256);
         let (in_tx, in_rx) = mpsc::channel::<Bytes>(256);
-        pubsubs.push(SvsPubSub::join(group.clone(), name(n), out_tx, in_rx, cfg()));
+        pubsubs.push(SvsPubSub::join(
+            group.clone(),
+            name(n),
+            out_tx,
+            in_rx,
+            cfg(),
+        ));
         outs.push(out_rx);
         ins.push(in_tx);
     }
@@ -79,7 +85,8 @@ impl Frame for EchoReq {
     }
     fn decode(bytes: &[u8]) -> Result<Self, ServiceError> {
         Ok(EchoReq {
-            msg: String::from_utf8(bytes.to_vec()).map_err(|e| ServiceError::Decode(e.to_string()))?,
+            msg: String::from_utf8(bytes.to_vec())
+                .map_err(|e| ServiceError::Decode(e.to_string()))?,
         })
     }
 }
@@ -89,7 +96,8 @@ impl Frame for EchoResp {
     }
     fn decode(bytes: &[u8]) -> Result<Self, ServiceError> {
         Ok(EchoResp {
-            text: String::from_utf8(bytes.to_vec()).map_err(|e| ServiceError::Decode(e.to_string()))?,
+            text: String::from_utf8(bytes.to_vec())
+                .map_err(|e| ServiceError::Decode(e.to_string()))?,
         })
     }
 }
@@ -117,7 +125,10 @@ impl<S: EchoService> Dispatch for EchoDispatch<S> {
         match inv.op.as_str() {
             "echo" => {
                 let req = EchoReq::decode(&inv.request)?;
-                Ok(EchoResp { text: self.0.echo(req.msg).await }.encode())
+                Ok(EchoResp {
+                    text: self.0.echo(req.msg).await,
+                }
+                .encode())
             }
             _ => Err(ServiceError::NotFound),
         }
@@ -148,7 +159,12 @@ impl<C: Carrier> EchoClient<C> {
     {
         let resps = self
             .carrier
-            .invoke_select(&self.svc, &OpId::new("echo"), EchoReq { msg }.encode(), strategy)
+            .invoke_select(
+                &self.svc,
+                &OpId::new("echo"),
+                EchoReq { msg }.encode(),
+                strategy,
+            )
             .await?;
         resps
             .into_iter()
@@ -172,14 +188,22 @@ async fn echo_round_trips_over_ndnsf_carrier() {
     let bob = NdnsfCarrier::new(bob_ps, name("/muas/bob"), group.clone()).insecure();
     bob.serve(&svc, dispatch_for("bob")).await.unwrap();
 
-    let alice = NdnsfCarrier::new(alice_ps, name("/muas/alice"), group.clone()).insecure().token("utok");
-    let client = EchoClient { carrier: alice, svc: svc.clone() };
+    let alice = NdnsfCarrier::new(alice_ps, name("/muas/alice"), group.clone())
+        .insecure()
+        .token("utok");
+    let client = EchoClient {
+        carrier: alice,
+        svc: svc.clone(),
+    };
 
     let reply = tokio::time::timeout(Duration::from_secs(10), client.echo("ping".into()))
         .await
         .expect("call did not complete")
         .expect("echo failed");
-    assert_eq!(reply, "bob:ping", "the same service definition must round-trip over the four-phase carrier");
+    assert_eq!(
+        reply, "bob:ping",
+        "the same service definition must round-trip over the four-phase carrier"
+    );
 
     drop(bob);
 }
@@ -198,8 +222,13 @@ async fn invoke_select_all_gathers_every_provider() {
     let carol = NdnsfCarrier::new(carol_ps, name("/muas/carol"), group.clone()).insecure();
     carol.serve(&svc, dispatch_for("carol")).await.unwrap();
 
-    let alice = NdnsfCarrier::new(alice_ps, name("/muas/alice"), group.clone()).insecure().token("utok");
-    let client = EchoClient { carrier: alice, svc };
+    let alice = NdnsfCarrier::new(alice_ps, name("/muas/alice"), group.clone())
+        .insecure()
+        .token("utok");
+    let client = EchoClient {
+        carrier: alice,
+        svc,
+    };
 
     let resps = tokio::time::timeout(
         Duration::from_secs(10),
@@ -209,8 +238,14 @@ async fn invoke_select_all_gathers_every_provider() {
     .expect("select did not complete")
     .expect("select failed");
     let texts: HashSet<String> = resps.into_iter().map(|(_, t)| t).collect();
-    assert!(texts.contains("bob:hi"), "bob must respond under All: {texts:?}");
-    assert!(texts.contains("carol:hi"), "carol must respond under All: {texts:?}");
+    assert!(
+        texts.contains("bob:hi"),
+        "bob must respond under All: {texts:?}"
+    );
+    assert!(
+        texts.contains("carol:hi"),
+        "carol must respond under All: {texts:?}"
+    );
 
     drop(bob);
     drop(carol);

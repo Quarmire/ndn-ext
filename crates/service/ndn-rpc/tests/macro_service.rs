@@ -67,7 +67,11 @@ async fn macro_service_round_trips_over_rpc_carrier() {
     // with data" round-trips through the generated Frame codec.
     assert_eq!(
         client.summarize(2, 4).await.unwrap(),
-        Stats { sum: 6, even: true, label: "2+4".into() }
+        Stats {
+            sum: 6,
+            even: true,
+            label: "2+4".into()
+        }
     );
 }
 

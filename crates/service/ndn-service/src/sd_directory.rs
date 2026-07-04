@@ -40,7 +40,10 @@ impl ServiceDiscoveryDirectory {
     }
 
     /// A directory over `sd` using `convention`.
-    pub fn with_convention(sd: Arc<ServiceDiscoveryProtocol>, convention: NamingConvention) -> Self {
+    pub fn with_convention(
+        sd: Arc<ServiceDiscoveryProtocol>,
+        convention: NamingConvention,
+    ) -> Self {
         Self { sd, convention }
     }
 }

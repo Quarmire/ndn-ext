@@ -49,8 +49,7 @@ async fn targeted_fast_path_over_svs() {
     let user_ps = SvsPubSub::join(group.clone(), n("/muas/alice"), b_out_tx, b_in_rx, cfg());
     let trust = TrustCtx::insecure();
 
-    let handler =
-        |_c: &PendingCoordination, _req: &Bytes| -> Bytes { Bytes::from_static(b"pong") };
+    let handler = |_c: &PendingCoordination, _req: &Bytes| -> Bytes { Bytes::from_static(b"pong") };
 
     let user_flow = async {
         // Bootstrap: obtain a pool of single-use tokens from the provider.
@@ -111,6 +110,10 @@ async fn targeted_fast_path_over_svs() {
     };
 
     assert!(ntokens >= 1, "bootstrap should return a token pool");
-    assert_eq!(good, Some(Bytes::from_static(b"pong")), "targeted call should respond");
+    assert_eq!(
+        good,
+        Some(Bytes::from_static(b"pong")),
+        "targeted call should respond"
+    );
     assert_eq!(bad, None, "a bogus token must fail closed (no response)");
 }

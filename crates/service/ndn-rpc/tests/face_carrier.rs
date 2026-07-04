@@ -15,10 +15,10 @@ use ndn_engine::EngineConfig;
 use ndn_face::local::InProcFace;
 use ndn_packet::Name;
 use ndn_rpc::FaceRpcCarrier;
+use ndn_security::Validator;
 use ndn_security::cert_cache::Certificate;
 use ndn_security::signer::{Ed25519Signer, Signer};
 use ndn_security::trust_schema::{NamePattern, PatternComponent, SchemaRule, TrustSchema};
-use ndn_security::Validator;
 use ndn_service_core::{Carrier, Dispatch, Invocation, OpId, ServiceError, ServiceId};
 use ndn_service_macro::ndn_service;
 use ndn_transport::FaceId;
@@ -60,7 +60,9 @@ async fn macro_client_calls_a_provider_over_the_engine() {
     let serve = tokio::spawn(async move {
         let server = FaceRpcCarrier::server(producer);
         let svc = ServiceId::new(n("/svc/echo"));
-        let _ = server.serve(&svc, Arc::new(EchoDispatch(Arc::new(EchoImpl)))).await;
+        let _ = server
+            .serve(&svc, Arc::new(EchoDispatch(Arc::new(EchoImpl))))
+            .await;
     });
 
     // Client: a generated EchoClient over a face-backed carrier on its own face.
@@ -71,7 +73,10 @@ async fn macro_client_calls_a_provider_over_the_engine() {
         .await
         .expect("call timed out")
         .expect("echo failed");
-    assert_eq!(reply, "echo:ping", "a real cross-face service call over the engine");
+    assert_eq!(
+        reply, "echo:ping",
+        "a real cross-face service call over the engine"
+    );
 
     serve.abort();
     drop(engine);
@@ -88,7 +93,9 @@ struct WhoamiDispatch;
 impl Dispatch for WhoamiDispatch {
     async fn dispatch(&self, inv: Invocation) -> Result<Bytes, ServiceError> {
         Ok(Bytes::from(
-            inv.requester.map(|n| n.to_string()).unwrap_or_else(|| "anon".into()),
+            inv.requester
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "anon".into()),
         ))
     }
 }
@@ -118,7 +125,12 @@ fn validator_trusting(signer: &Ed25519Signer, key_name: &Name) -> Validator {
 }
 
 /// Spin up a one-engine two-face forwarder routing `/svc/whoami` to a provider.
-async fn whoami_engine() -> (Consumer, Producer, ndn_engine::ForwarderEngine, ndn_engine::ShutdownHandle) {
+async fn whoami_engine() -> (
+    Consumer,
+    Producer,
+    ndn_engine::ForwarderEngine,
+    ndn_engine::ShutdownHandle,
+) {
     let svc_prefix = n("/svc/whoami");
     let (c_face, c_handle) = InProcFace::new(FaceId(1), 64);
     let (p_face, p_handle) = InProcFace::new(FaceId(2), 64);
@@ -157,7 +169,11 @@ async fn signed_request_authenticates_requester_over_engine() {
     let client = FaceRpcCarrier::client(consumer).with_signer(Arc::new(signer) as Arc<dyn Signer>);
     let resp = tokio::time::timeout(
         Duration::from_secs(8),
-        client.invoke(&ServiceId::new(n("/svc/whoami")), &OpId::new("whoami"), Bytes::new()),
+        client.invoke(
+            &ServiceId::new(n("/svc/whoami")),
+            &OpId::new("whoami"),
+            Bytes::new(),
+        ),
     )
     .await
     .expect("call timed out")
@@ -188,9 +204,16 @@ async fn unsigned_request_dropped_by_secure_provider_over_engine() {
     // Client with no signer ⇒ unsigned request ⇒ provider drops it ⇒ timeout.
     let client = FaceRpcCarrier::client(consumer).with_timeout(Duration::from_millis(600));
     let r = client
-        .invoke(&ServiceId::new(n("/svc/whoami")), &OpId::new("whoami"), Bytes::new())
+        .invoke(
+            &ServiceId::new(n("/svc/whoami")),
+            &OpId::new("whoami"),
+            Bytes::new(),
+        )
         .await;
-    assert!(r.is_err(), "an unsigned request must not be answered, got {r:?}");
+    assert!(
+        r.is_err(),
+        "an unsigned request must not be answered, got {r:?}"
+    );
 
     serve.abort();
     drop(engine);

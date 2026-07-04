@@ -36,7 +36,10 @@ fn reload_applies_diff_and_is_idempotent() {
     // alice re-granted (policy changed) + bob granted; nothing revoked.
     assert_eq!(report.granted.len(), 2, "alice (changed) + bob (new)");
     assert!(report.revoked.is_empty());
-    assert!(report.version > v0, "changes bumped the version (no restart)");
+    assert!(
+        report.version > v0,
+        "changes bumped the version (no restart)"
+    );
     assert_eq!(
         authority.grant_state(&n("/muas/alice")).unwrap().policy,
         "service:echo OR service:cam"
@@ -48,7 +51,10 @@ fn reload_applies_diff_and_is_idempotent() {
 
     // Reloading the SAME config is a no-op (idempotent).
     let again = reload(&mut authority, &desired);
-    assert!(again.is_noop(), "re-applying an unchanged file changes nothing");
+    assert!(
+        again.is_noop(),
+        "re-applying an unchanged file changes nothing"
+    );
     assert_eq!(again.version, report.version);
 
     // A config that drops bob revokes it.
@@ -59,7 +65,11 @@ fn reload_applies_diff_and_is_idempotent() {
     "#;
     let desired2 = load_policy_toml(toml2).unwrap();
     let report2 = reload(&mut authority, &desired2);
-    assert_eq!(report2.revoked, vec![n("/muas/bob")], "bob dropped from the file → revoked");
+    assert_eq!(
+        report2.revoked,
+        vec![n("/muas/bob")],
+        "bob dropped from the file → revoked"
+    );
     assert!(report2.granted.is_empty(), "alice unchanged");
     assert!(authority.grant_state(&n("/muas/bob")).unwrap().revoked);
 }

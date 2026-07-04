@@ -7,25 +7,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::time::Instant;
 
     let dev = Mt7612uBackend::open()?;
-    let bench = |label: &str, n: u32, dev: &Mt7612uBackend| -> Result<(), Box<dyn std::error::Error>> {
-        // write a benign register (MT_MAC_SYS_CTRL) n times
-        let t = Instant::now();
-        for _ in 0..n {
-            dev.wr(0x1004, 0x0000_000c)?;
-        }
-        let us = t.elapsed().as_micros() as f64 / n as f64;
-        println!("  {label}: {us:.1} µs/write ({:.1} ms for {n})", us * n as f64 / 1000.0);
-        Ok(())
-    };
-    let bench_rd = |label: &str, n: u32, dev: &Mt7612uBackend| -> Result<(), Box<dyn std::error::Error>> {
-        let t = Instant::now();
-        for _ in 0..n {
-            let _ = dev.rr(0x1004)?;
-        }
-        let us = t.elapsed().as_micros() as f64 / n as f64;
-        println!("  {label}: {us:.1} µs/read");
-        Ok(())
-    };
+    let bench =
+        |label: &str, n: u32, dev: &Mt7612uBackend| -> Result<(), Box<dyn std::error::Error>> {
+            // write a benign register (MT_MAC_SYS_CTRL) n times
+            let t = Instant::now();
+            for _ in 0..n {
+                dev.wr(0x1004, 0x0000_000c)?;
+            }
+            let us = t.elapsed().as_micros() as f64 / n as f64;
+            println!(
+                "  {label}: {us:.1} µs/write ({:.1} ms for {n})",
+                us * n as f64 / 1000.0
+            );
+            Ok(())
+        };
+    let bench_rd =
+        |label: &str, n: u32, dev: &Mt7612uBackend| -> Result<(), Box<dyn std::error::Error>> {
+            let t = Instant::now();
+            for _ in 0..n {
+                let _ = dev.rr(0x1004)?;
+            }
+            let us = t.elapsed().as_micros() as f64 / n as f64;
+            println!("  {label}: {us:.1} µs/read");
+            Ok(())
+        };
 
     println!("=== pre-firmware (cold) ===");
     bench("write", 300, &dev)?;

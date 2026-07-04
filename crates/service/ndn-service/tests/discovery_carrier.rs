@@ -44,23 +44,40 @@ async fn discovery_selects_among_providers_over_tier0() {
 
     // Two providers offer /svc/echo, each a DiscoveryCarrier over the shared
     // RpcCarrier; serve advertises their callable and registers their dispatch.
-    let p1 = DiscoveryCarrier::new(dir.clone(), RpcCarrier::with_registry(registry.clone()), n("/p1"));
+    let p1 = DiscoveryCarrier::new(
+        dir.clone(),
+        RpcCarrier::with_registry(registry.clone()),
+        n("/p1"),
+    );
     p1.serve(&svc, dispatch("p1")).await.unwrap();
-    let p2 = DiscoveryCarrier::new(dir.clone(), RpcCarrier::with_registry(registry.clone()), n("/p2"));
+    let p2 = DiscoveryCarrier::new(
+        dir.clone(),
+        RpcCarrier::with_registry(registry.clone()),
+        n("/p2"),
+    );
     p2.serve(&svc, dispatch("p2")).await.unwrap();
 
     // The consumer's client speaks the macro-generated Echo over discovery.
-    let consumer =
-        DiscoveryCarrier::new(dir.clone(), RpcCarrier::with_registry(registry.clone()), n("/consumer"));
+    let consumer = DiscoveryCarrier::new(
+        dir.clone(),
+        RpcCarrier::with_registry(registry.clone()),
+        n("/consumer"),
+    );
     let client = EchoClient::new(consumer, svc);
 
     // invoke → best-first → one discovered provider answers.
     let one = client.echo("hi".into()).await.unwrap();
-    assert!(one == "p1:hi" || one == "p2:hi", "a discovered provider must answer: {one}");
+    assert!(
+        one == "p1:hi" || one == "p2:hi",
+        "a discovered provider must answer: {one}"
+    );
 
     // echo_select(All): DiscoveryCarrier is a SelectCarrier even though RpcCarrier
     // is not — the discovery layer adds the multi-provider fan-out.
-    let many = client.echo_select("hi".into(), Strategy::All).await.unwrap();
+    let many = client
+        .echo_select("hi".into(), Strategy::All)
+        .await
+        .unwrap();
     let texts: HashSet<String> = many.into_iter().map(|(_, t)| t).collect();
     assert!(texts.contains("p1:hi"), "p1 missing: {texts:?}");
     assert!(texts.contains("p2:hi"), "p2 missing: {texts:?}");
@@ -75,7 +92,11 @@ async fn forwarding_hint_convention_shares_name_with_per_node_hints() {
 
     let serve = dir.advertise(&svc, &n("/p1")).await;
     dir.advertise(&svc, &n("/p2")).await;
-    assert_eq!(serve, n("/svc/echo"), "providers serve the shared content name");
+    assert_eq!(
+        serve,
+        n("/svc/echo"),
+        "providers serve the shared content name"
+    );
 
     let entries = dir.providers(&svc).await;
     assert_eq!(entries.len(), 2);
@@ -87,18 +108,23 @@ async fn forwarding_hint_convention_shares_name_with_per_node_hints() {
         .iter()
         .filter_map(|e| e.forwarding_hint.as_ref().map(|h| h.to_string()))
         .collect();
-    assert!(hints.contains("/p1") && hints.contains("/p2"), "per-node hints: {hints:?}");
+    assert!(
+        hints.contains("/p1") && hints.contains("/p2"),
+        "per-node hints: {hints:?}"
+    );
 }
 
 #[tokio::test]
 async fn no_provider_discovered_fails_closed() {
     let registry = Arc::new(RpcRegistry::new());
     let dir = Arc::new(MemoryDirectory::new());
-    let consumer =
-        DiscoveryCarrier::new(dir, RpcCarrier::with_registry(registry), n("/consumer"));
+    let consumer = DiscoveryCarrier::new(dir, RpcCarrier::with_registry(registry), n("/consumer"));
     // Nothing advertised for /svc/ghost.
     let client = EchoClient::new(consumer, ServiceId::new(n("/svc/ghost")));
-    assert!(client.echo("hi".into()).await.is_err(), "no discovered provider → fail closed");
+    assert!(
+        client.echo("hi".into()).await.is_err(),
+        "no discovered provider → fail closed"
+    );
 }
 
 #[tokio::test]
@@ -111,11 +137,18 @@ async fn directory_dedups_and_caps_advertisements() {
     for _ in 0..5 {
         dir.advertise(&svc, &n("/node/a")).await;
     }
-    assert_eq!(dir.providers(&svc).await.len(), 1, "re-advertising must not duplicate");
+    assert_eq!(
+        dir.providers(&svc).await.len(),
+        1,
+        "re-advertising must not duplicate"
+    );
 
     for i in 0..1000 {
         dir.advertise(&svc, &n(&format!("/node/n{i}"))).await;
     }
     let count = dir.providers(&svc).await.len();
-    assert!(count <= 256, "per-service providers must be capped (got {count})");
+    assert!(
+        count <= 256,
+        "per-service providers must be capped (got {count})"
+    );
 }

@@ -25,9 +25,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use ndn_security::custodian::{ChannelRemoteSigner, CustodianError, SignerChannel};
 use ndn_face_webrtc::{IceServers, RtcChannel, WebRtcConnector, WebRtcError};
 use ndn_rtc_signaling_relay::{ClientError, RelayClient};
+use ndn_security::custodian::{ChannelRemoteSigner, CustodianError, SignerChannel};
 
 /// Wraps an `ndn-face-webrtc` datachannel as a [`SignerChannel`], so the
 /// transport-agnostic [`ChannelRemoteSigner`] can frame the remote-signer

@@ -9,8 +9,8 @@
 
 use ndn_packet::Name;
 use ndn_security::confidentiality::{ContentKey, Sealed};
-use ndn_service_core::publish::{Publisher, ScopeKey};
 use ndn_service_core::Frame;
+use ndn_service_core::publish::{Publisher, ScopeKey};
 
 fn name(s: &str) -> Name {
     s.parse().unwrap()
@@ -74,11 +74,19 @@ fn distinct_publishers_never_collide_nonces() {
 
     let a0 = a.build(&1);
     let b0 = b.build(&1);
-    assert_ne!(a0.payload[..12], b0.payload[..12], "distinct publisher ids ⇒ distinct nonces");
+    assert_ne!(
+        a0.payload[..12],
+        b0.payload[..12],
+        "distinct publisher ids ⇒ distinct nonces"
+    );
 
     a.advance();
     let a1 = a.build(&1);
-    assert_ne!(a0.payload[..12], a1.payload[..12], "advancing seq ⇒ distinct nonce");
+    assert_ne!(
+        a0.payload[..12],
+        a1.payload[..12],
+        "advancing seq ⇒ distinct nonce"
+    );
 }
 
 #[test]
@@ -108,5 +116,9 @@ fn end_to_end_publisher_to_contentkey() {
 
     // Wrong AAD (a different name) must fail — the name binding is authenticated.
     let wrong_aad = name("/sensor/y").encode_to_tlv();
-    assert!(ContentKey::from_bytes(raw).open(&sealed, &wrong_aad).is_err());
+    assert!(
+        ContentKey::from_bytes(raw)
+            .open(&sealed, &wrong_aad)
+            .is_err()
+    );
 }

@@ -30,11 +30,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         dev.set_edca_aggressive()?;
         println!("EDCA minimized (AIFSN=1, CW=0)");
     }
-    let depth: usize = std::env::var("NDN_TX_DEPTH").ok().and_then(|s| s.parse().ok()).unwrap_or(256);
+    let depth: usize = std::env::var("NDN_TX_DEPTH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(256);
     let ring = dev.new_tx_ring(depth);
     // NDN_TX_RATE: ht7 | vht9 | vht9sgi | vht9_2ss | vht9_2ss_sgi (default ht7)
-    println!("chip 0x{chip:04x}, async TX ring depth={depth}, band={}",
-             if band == "5g" { "5GHz ch36/80" } else { "2.4 ch6/20" });
+    println!(
+        "chip 0x{chip:04x}, async TX ring depth={depth}, band={}",
+        if band == "5g" {
+            "5GHz ch36/80"
+        } else {
+            "2.4 ch6/20"
+        }
+    );
     let mk = |plen: usize| -> Vec<u8> {
         let mut f = vec![0x08u8, 0x00, 0x00, 0x00];
         f.extend_from_slice(&[0xff; 6]);
@@ -50,7 +59,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1SS rates first, then enable the 2nd TX chain (0x820=0x31) for the 2SS rates.
     // Frame sizes go to ~4090B (the 12-bit TXWI len_ctl max) to amortize the fixed
     // ~283µs/transfer overhead as far as a single MPDU can.
-    let sgi = |m: McsDescriptor| McsDescriptor { short_gi: true, ..m };
+    let sgi = |m: McsDescriptor| McsDescriptor {
+        short_gi: true,
+        ..m
+    };
     let rates: &[(&str, McsDescriptor, bool)] = &[
         ("vht9-1ss     ", McsDescriptor::vht(9), false),
         ("vht9-1ss-sgi ", sgi(McsDescriptor::vht(9)), false),
@@ -74,8 +86,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let el = t.elapsed();
             let per = el.as_secs_f64() / done.max(1) as f64 * 1e6;
             let mbps = (done as usize * plen * 8) as f64 / el.as_secs_f64() / 1e6;
-            println!("{label} plen={plen:4}: {:5.1} Mb/s, {:.0} fps, {:.0} us/frame, {} errs",
-                     mbps, done as f64 / el.as_secs_f64(), per, errs);
+            println!(
+                "{label} plen={plen:4}: {:5.1} Mb/s, {:.0} fps, {:.0} us/frame, {} errs",
+                mbps,
+                done as f64 / el.as_secs_f64(),
+                per,
+                errs
+            );
         }
     }
     println!("done.");

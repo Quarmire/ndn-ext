@@ -50,9 +50,17 @@ async fn sd_directory_feeds_discovery_carrier() {
 
     // Two providers advertise (publish) /svc/echo via the SD-backed directory and
     // serve it over the shared Tier-0 carrier.
-    let p1 = DiscoveryCarrier::new(dir.clone(), RpcCarrier::with_registry(registry.clone()), n("/p1"));
+    let p1 = DiscoveryCarrier::new(
+        dir.clone(),
+        RpcCarrier::with_registry(registry.clone()),
+        n("/p1"),
+    );
     p1.serve(&svc, dispatch("p1")).await.unwrap();
-    let p2 = DiscoveryCarrier::new(dir.clone(), RpcCarrier::with_registry(registry.clone()), n("/p2"));
+    let p2 = DiscoveryCarrier::new(
+        dir.clone(),
+        RpcCarrier::with_registry(registry.clone()),
+        n("/p2"),
+    );
     p2.serve(&svc, dispatch("p2")).await.unwrap();
 
     // The directory itself resolves the providers from the SD protocol's records.
@@ -62,18 +70,33 @@ async fn sd_directory_feeds_discovery_carrier() {
         .into_iter()
         .map(|e| e.callable.to_string())
         .collect();
-    assert!(found.contains("/p1/svc/echo"), "p1 not discovered: {found:?}");
-    assert!(found.contains("/p2/svc/echo"), "p2 not discovered: {found:?}");
+    assert!(
+        found.contains("/p1/svc/echo"),
+        "p1 not discovered: {found:?}"
+    );
+    assert!(
+        found.contains("/p2/svc/echo"),
+        "p2 not discovered: {found:?}"
+    );
 
     // A #[ndn_service] client runs over the discovery carrier backed by real SD.
-    let consumer =
-        DiscoveryCarrier::new(dir.clone(), RpcCarrier::with_registry(registry.clone()), n("/consumer"));
+    let consumer = DiscoveryCarrier::new(
+        dir.clone(),
+        RpcCarrier::with_registry(registry.clone()),
+        n("/consumer"),
+    );
     let client = EchoClient::new(consumer, svc);
 
     let one = client.echo("hi".into()).await.unwrap();
-    assert!(one == "p1:hi" || one == "p2:hi", "a discovered provider must answer: {one}");
+    assert!(
+        one == "p1:hi" || one == "p2:hi",
+        "a discovered provider must answer: {one}"
+    );
 
-    let many = client.echo_select("hi".into(), Strategy::All).await.unwrap();
+    let many = client
+        .echo_select("hi".into(), Strategy::All)
+        .await
+        .unwrap();
     let texts: HashSet<String> = many.into_iter().map(|(_, t)| t).collect();
     assert!(texts.contains("p1:hi"), "p1 missing: {texts:?}");
     assert!(texts.contains("p2:hi"), "p2 missing: {texts:?}");

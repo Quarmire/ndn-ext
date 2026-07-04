@@ -34,7 +34,8 @@ impl ndn_service_core::Frame for EchoReq {
         Bytes::copy_from_slice(self.msg.as_bytes())
     }
     fn decode(bytes: &[u8]) -> Result<Self, ServiceError> {
-        let msg = String::from_utf8(bytes.to_vec()).map_err(|e| ServiceError::Decode(e.to_string()))?;
+        let msg =
+            String::from_utf8(bytes.to_vec()).map_err(|e| ServiceError::Decode(e.to_string()))?;
         Ok(EchoReq { msg })
     }
 }
@@ -43,7 +44,8 @@ impl ndn_service_core::Frame for EchoResp {
         Bytes::copy_from_slice(self.text.as_bytes())
     }
     fn decode(bytes: &[u8]) -> Result<Self, ServiceError> {
-        let text = String::from_utf8(bytes.to_vec()).map_err(|e| ServiceError::Decode(e.to_string()))?;
+        let text =
+            String::from_utf8(bytes.to_vec()).map_err(|e| ServiceError::Decode(e.to_string()))?;
         Ok(EchoResp { text })
     }
 }
@@ -77,11 +79,17 @@ impl<S: EchoService> Dispatch for EchoDispatch<S> {
         match inv.op.as_str() {
             "echo" => {
                 let req = EchoReq::decode(&inv.request)?;
-                Ok(EchoResp { text: self.0.echo(req.msg).await }.encode())
+                Ok(EchoResp {
+                    text: self.0.echo(req.msg).await,
+                }
+                .encode())
             }
             "shout" => {
                 let req = EchoReq::decode(&inv.request)?;
-                Ok(EchoResp { text: self.0.shout(req.msg).await }.encode())
+                Ok(EchoResp {
+                    text: self.0.shout(req.msg).await,
+                }
+                .encode())
             }
             _ => Err(ServiceError::NotFound),
         }
@@ -139,9 +147,16 @@ async fn unknown_operation_fails_closed() {
 
     use ndn_service_core::Frame;
     let r = carrier
-        .invoke(&svc, &OpId::new("nope"), EchoReq { msg: "x".into() }.encode())
+        .invoke(
+            &svc,
+            &OpId::new("nope"),
+            EchoReq { msg: "x".into() }.encode(),
+        )
         .await;
-    assert!(matches!(r, Err(ServiceError::NotFound)), "an unknown op must fail closed");
+    assert!(
+        matches!(r, Err(ServiceError::NotFound)),
+        "an unknown op must fail closed"
+    );
 }
 
 #[tokio::test]
@@ -156,5 +171,8 @@ async fn unknown_service_is_not_found() {
             EchoReq { msg: "x".into() }.encode(),
         )
         .await;
-    assert!(matches!(r, Err(ServiceError::NotFound)), "an unmounted service must be NotFound");
+    assert!(
+        matches!(r, Err(ServiceError::NotFound)),
+        "an unmounted service must be NotFound"
+    );
 }

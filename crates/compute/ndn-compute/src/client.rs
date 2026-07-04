@@ -16,8 +16,8 @@ use ndn_app::{AppError, Consumer};
 use ndn_packet::encode::InterestBuilder;
 use ndn_packet::{Name, NameComponent};
 
-use crate::codec::{ComputeArgs, ComputeValue};
 use crate::ComputeError;
+use crate::codec::{ComputeArgs, ComputeValue};
 use crate::thunk::Thunk;
 
 const CALL_LIFETIME: Duration = Duration::from_millis(4000);

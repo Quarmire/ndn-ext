@@ -20,7 +20,9 @@ use ndn_face::local::InProcFace;
 use ndn_packet::Name;
 use ndn_transport::FaceId;
 
-use ndn_pipes::{Confidentiality, Pipe, PipeConsumer, PipeParams, PipeProducer, PipeTeardownControl};
+use ndn_pipes::{
+    Confidentiality, Pipe, PipeConsumer, PipeParams, PipeProducer, PipeTeardownControl,
+};
 
 #[tokio::test]
 async fn pipe_key_authenticates_teardown() {
@@ -52,8 +54,14 @@ async fn pipe_key_authenticates_teardown() {
     let serve = tokio::spawn(async move { producer.serve().await });
 
     let mut pc = PipeConsumer::new(Consumer::from_handle(consumer_handle));
-    let pipe = pc.open("/sensors/temp", PipeParams::default()).await.expect("pipe");
-    assert!(pc.is_alive(&pipe).await, "pipe is live after the sealed handshake");
+    let pipe = pc
+        .open("/sensors/temp", PipeParams::default())
+        .await
+        .expect("pipe");
+    assert!(
+        pc.is_alive(&pipe).await,
+        "pipe is live after the sealed handshake"
+    );
 
     // Forge a teardown that knows the pipe id (as a relay would from the JOIN) but
     // carries the wrong pipe key. The forwarder's authorizer rejects it — no reap — so
@@ -64,11 +72,17 @@ async fn pipe_key_authenticates_teardown() {
         ..pipe.clone()
     };
     pc.close(&forged).await.expect("forged teardown emitted");
-    assert!(pc.is_alive(&pipe).await, "pipe survives a forged teardown — wrong key, no reap");
+    assert!(
+        pc.is_alive(&pipe).await,
+        "pipe survives a forged teardown — wrong key, no reap"
+    );
 
     // The real pipe key reclaims it.
     pc.close(&pipe).await.expect("authentic teardown emitted");
-    assert!(!pc.is_alive(&pipe).await, "pipe is reclaimed by the authentic key");
+    assert!(
+        !pc.is_alive(&pipe).await,
+        "pipe is reclaimed by the authentic key"
+    );
 
     drop(pc);
     drop(engine);

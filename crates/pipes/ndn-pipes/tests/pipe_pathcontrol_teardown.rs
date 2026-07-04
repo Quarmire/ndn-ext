@@ -51,27 +51,31 @@ async fn pathcontrol_teardown_reaps_relay_state_membership_authed() {
     let root: Name = "/".parse().unwrap();
     engine.fib().add_nexthop(&root, FaceId(2), 0); // SEEK/JOIN/PIPE → producer
 
-    let producer = PipeProducer::new(Producer::from_handle(p_h, root))
-        .serve_object(
-            &"/sensors/temp/v=1".parse().unwrap(),
-            b"x",
-            &ndn_coding::FecPolicy::systematic(8, 12).unwrap(),
-            1,
-            &[],
-            &Confidentiality::None,
-        );
+    let producer = PipeProducer::new(Producer::from_handle(p_h, root)).serve_object(
+        &"/sensors/temp/v=1".parse().unwrap(),
+        b"x",
+        &ndn_coding::FecPolicy::systematic(8, 12).unwrap(),
+        1,
+        &[],
+        &Confidentiality::None,
+    );
     let serve = tokio::spawn(async move { producer.serve().await });
 
     // Consumer opens the pipe (yields the pipe id + pipe key); the relay learns the same
     // pipe key from the producer via the PIPE exchange (slice 1).
     let ns: Name = "/sensors/temp".parse().unwrap();
     let mut pc = PipeConsumer::new(Consumer::from_handle(c_h));
-    let pipe = pc.open(ns.clone(), PipeParams::default()).await.expect("pipe opens");
+    let pipe = pc
+        .open(ns.clone(), PipeParams::default())
+        .await
+        .expect("pipe opens");
     let id = pipe.id.as_bytes().to_vec();
 
     let mut tool = Consumer::from_handle(t_h);
     assert!(
-        relay.learn_pipe_key(&mut tool, &ns, &id, 0, 1, TIMEOUT).await,
+        relay
+            .learn_pipe_key(&mut tool, &ns, &id, 0, 1, TIMEOUT)
+            .await,
         "relay learns the pipe key"
     );
     assert!(store.pipe_key(&id).is_some(), "relay holds the pipe");

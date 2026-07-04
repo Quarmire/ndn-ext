@@ -15,8 +15,8 @@ use std::sync::Arc;
 use ndn_app::{Consumer, EngineBuilder, Producer};
 use ndn_coding::FecPolicy;
 use ndn_engine::EngineConfig;
-use ndn_face_monitor_wifi::{LoopbackMonitorBus, MonitorWifiFace};
 use ndn_face::local::InProcFace;
+use ndn_face_monitor_wifi::{LoopbackMonitorBus, MonitorWifiFace};
 use ndn_packet::Name;
 use ndn_transport::FaceId;
 
@@ -99,7 +99,10 @@ async fn run(name_group: Option<&'static str>, skip: &'static [u16]) -> (Vec<u8>
 #[tokio::test]
 async fn pipe_handshake_and_coded_bulk_over_the_radio() {
     let (payload, got) = run(None, &[]).await;
-    assert_eq!(got, payload, "consumer recovers + decrypts the bulk over the air");
+    assert_eq!(
+        got, payload,
+        "consumer recovers + decrypts the bulk over the air"
+    );
 }
 
 #[tokio::test]
@@ -107,5 +110,8 @@ async fn name_grouped_pipe_recovers_under_air_loss() {
     // Both radios bound to one name-group (the coupling); 3 of 12 segments are
     // dropped "on the air", yet K-of-N parity still recovers the sealed bulk.
     let (payload, got) = run(Some("/sensors/temp"), &[1, 4, 6]).await;
-    assert_eq!(got, payload, "FEC recovers the sealed bulk over a name-grouped radio");
+    assert_eq!(
+        got, payload,
+        "FEC recovers the sealed bulk over a name-grouped radio"
+    );
 }

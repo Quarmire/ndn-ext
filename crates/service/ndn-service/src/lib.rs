@@ -258,7 +258,9 @@ fn grant_principal_key(name: &Name) -> Option<Name> {
     if comps.len() < 2 {
         return None;
     }
-    Some(Name::from_components(comps[..comps.len() - 1].iter().cloned()))
+    Some(Name::from_components(
+        comps[..comps.len() - 1].iter().cloned(),
+    ))
 }
 
 /// A stateful, **anti-rollback** verifier over [`verify_grant`]: it remembers the
@@ -304,7 +306,10 @@ impl GrantCache {
 
     /// The highest grant version accepted for `principal` under `scope`, if any.
     pub fn latest_version(&self, scope: &Name, principal: &Name) -> Option<u64> {
-        let key = scope.clone().append("policy").append(principal.to_string().as_bytes());
+        let key = scope
+            .clone()
+            .append("policy")
+            .append(principal.to_string().as_bytes());
         self.seen.get(&key).copied()
     }
 }

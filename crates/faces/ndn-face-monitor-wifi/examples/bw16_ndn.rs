@@ -101,14 +101,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         {
             if let Ok(d) = Data::decode(wire) {
                 let content = d.content().map(|c| String::from_utf8_lossy(c).into_owned());
-                println!("  ✅ decoded NDN Data over the air: name={} content={:?}", d.name, content);
+                println!(
+                    "  ✅ decoded NDN Data over the air: name={} content={:?}",
+                    d.name, content
+                );
                 got = true;
                 break;
             }
         }
     }
     sender.abort();
-    println!("{}", if got { "NDN-over-BW16: OK" } else { "no NDN Data decoded" });
+    println!(
+        "{}",
+        if got {
+            "NDN-over-BW16: OK"
+        } else {
+            "no NDN Data decoded"
+        }
+    );
     Ok(())
 }
 

@@ -68,7 +68,9 @@ async fn bench_socket(frame: usize, n: usize) -> Duration {
     let start = Instant::now();
     let prod = tokio::spawn(async move {
         for _ in 0..n {
-            tx.write_all(&(payload.len() as u32).to_le_bytes()).await.unwrap();
+            tx.write_all(&(payload.len() as u32).to_le_bytes())
+                .await
+                .unwrap();
             tx.write_all(&payload).await.unwrap();
         }
         tx.flush().await.unwrap();
@@ -90,7 +92,9 @@ async fn bench_socket(frame: usize, n: usize) -> Duration {
 /// frame so the pipeline is deep.
 async fn bench_surface_stream(name: &str, frame: usize, n: usize) -> Duration {
     let slot = (frame + 256).max(2048);
-    let mut pubr = NamedPublisher::open_with_max_frame(name, slot).await.unwrap();
+    let mut pubr = NamedPublisher::open_with_max_frame(name, slot)
+        .await
+        .unwrap();
     let mut sub = NamedSubscriber::connect(name).await.unwrap();
     let payload = vec![0xABu8; frame];
     let start = Instant::now();
@@ -113,7 +117,9 @@ async fn bench_surface_stream(name: &str, frame: usize, n: usize) -> Duration {
 /// Surface, local (sealed) path: hash-free frames over the sealed ring (data mapped
 /// read-only — forge-proof). Uniform `publish`; for in-host same-trust-domain IPC.
 async fn bench_surface_local(name: &str, frame: usize, n: usize) -> Duration {
-    let mut pubr = NamedPublisher::open_local_with_max_frame(name, frame).await.unwrap();
+    let mut pubr = NamedPublisher::open_local_with_max_frame(name, frame)
+        .await
+        .unwrap();
     let mut sub = NamedSubscriber::connect_local(name).await.unwrap();
     let payload = vec![0xABu8; frame];
     let start = Instant::now();
@@ -143,7 +149,9 @@ async fn bench_surface_large(name: &str, frame: usize, n: usize) -> Duration {
     let prod = tokio::spawn(async move {
         for _ in 0..n {
             // Write-in-place: no producer-side copy — fill the SharedBuffer directly.
-            pubr.publish_large_with(frame, |slot| slot.fill(0xAB)).await.unwrap();
+            pubr.publish_large_with(frame, |slot| slot.fill(0xAB))
+                .await
+                .unwrap();
         }
         pubr.close().await.unwrap();
     });
@@ -191,7 +199,9 @@ async fn bench_surface_raw(frame: usize, n: usize) -> Duration {
     let start = Instant::now();
     let prod = tokio::spawn(async move {
         for _ in 0..n {
-            face.send_with(frame, |s| s.copy_from_slice(&payload)).await.unwrap();
+            face.send_with(frame, |s| s.copy_from_slice(&payload))
+                .await
+                .unwrap();
         }
         face // keep alive
     });
@@ -223,8 +233,7 @@ async fn main() {
     let _ = bench_socket(4096, 200).await;
     let _ = bench_surface_stream("/bench/warm", 4096, 200).await;
     let _ = bench_surface_large("/bench/warmlarge", 1 << 20, 8).await;
-    let _ =
-        tokio::task::spawn_blocking(|| bench_iox("bench/warm/iox".into(), 4096, 200)).await;
+    let _ = tokio::task::spawn_blocking(|| bench_iox("bench/warm/iox".into(), 4096, 200)).await;
 
     let _ = bench_surface_local("/bench/warmlocal", 4096, 200).await;
     let _ = bench_surface_raw(4096, 200).await;

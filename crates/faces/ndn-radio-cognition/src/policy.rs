@@ -199,8 +199,9 @@ impl RadioPolicy {
         let mut allocations = Vec::with_capacity(chosen);
         for (i, (radio, cap)) in tx.iter().take(chosen).enumerate() {
             let channel = self.pick_channel(*radio, cap, view);
-            let params =
-                self.tx_params(*radio, cap, ctx, view, receivers, broad, deficit, channel, now_ms);
+            let params = self.tx_params(
+                *radio, cap, ctx, view, receivers, broad, deficit, channel, now_ms,
+            );
             // Heterogeneous + coded ⇒ second radio carries a distinct generation
             // subset (Split); otherwise it replicates the same content.
             let role = if i > 0 && ctx.generation.is_some() && cap.band != tx[0].1.band {
@@ -229,7 +230,10 @@ impl RadioPolicy {
 
     // --- effective demand-set size ---
     fn effective_receivers(&self, ctx: &NameContext, view: &dyn MediumView, now_ms: u64) -> usize {
-        let fanout = view.demand(ctx.prefix_hash).map(|d| d.fanout as usize).unwrap_or(0);
+        let fanout = view
+            .demand(ctx.prefix_hash)
+            .map(|d| d.fanout as usize)
+            .unwrap_or(0);
         fanout.max(view.receiver_count(now_ms))
     }
 
@@ -285,9 +289,7 @@ impl RadioPolicy {
             };
         }
 
-        let busy = channel
-            .and_then(|ch| view.busy_pct(radio, ch))
-            .unwrap_or(0);
+        let busy = channel.and_then(|ch| view.busy_pct(radio, ch)).unwrap_or(0);
 
         // Rate from RSSI — but the broad/unicast intent is expressed as an RSSI
         // *margin* so it goes through the (learned) thresholds too, rather than a
@@ -399,7 +401,10 @@ impl RadioPolicy {
         }
         // No receiver heard yet: derive a conservative proxy from link residual
         // (high residual ⇒ treat the link as worse).
-        let res = view.residual(radio).and_then(|r| r.phy_per.get()).unwrap_or(0.0);
+        let res = view
+            .residual(radio)
+            .and_then(|r| r.phy_per.get())
+            .unwrap_or(0.0);
         let base = -55.0 - res * 40.0; // 0% → -55 dBm, 50% → -75 dBm
         Some(base.round().clamp(-95.0, -40.0) as i8)
     }
@@ -464,7 +469,12 @@ impl RadioPolicy {
 
     /// Deterministic digest of the salient choices so independent nodes converge
     /// and contradictory re-transmits can be detected/suppressed on the wire.
-    fn consistency(&self, ctx: &NameContext, allocations: &[RadioAllocation], receivers: usize) -> u64 {
+    fn consistency(
+        &self,
+        ctx: &NameContext,
+        allocations: &[RadioAllocation],
+        receivers: usize,
+    ) -> u64 {
         let mut h = Fnv::new();
         h.add(ctx.prefix_hash);
         // bucket the demand so small fluctuations don't change the digest
@@ -566,7 +576,10 @@ mod tests {
         let mut m = wifi_only();
         // downstream already satisfied: deficit ~0
         m.observe_rank_deficit(0xAA, 0.0, 1_000);
-        let ctx = NameContext { is_origin: false, ..NameContext::new(0xAA) };
+        let ctx = NameContext {
+            is_origin: false,
+            ..NameContext::new(0xAA)
+        };
         let p = RadioPolicy::default().decide(&ctx, &m, 1_000);
         assert!(p.suppress);
         assert!(p.allocations.is_empty());
@@ -577,7 +590,10 @@ mod tests {
         let mut m = wifi_only();
         m.observe_rx(W, 1, Some(-60), 1_000); // a live receiver
         m.observe_rank_deficit(0xAA, 2.0, 1_000); // still rank-deficient
-        let ctx = NameContext { is_origin: false, ..NameContext::new(0xAA) };
+        let ctx = NameContext {
+            is_origin: false,
+            ..NameContext::new(0xAA)
+        };
         let p = RadioPolicy::default().decide(&ctx, &m, 1_000);
         assert!(!p.suppress);
         assert!(p.relay);
@@ -597,7 +613,10 @@ mod tests {
 
         let broad_mcs = broad.allocations[0].params.mcs.unwrap();
         let uni_mcs = uni.allocations[0].params.mcs.unwrap();
-        assert!(broad_mcs < uni_mcs, "broad {broad_mcs} should be < unicast {uni_mcs}");
+        assert!(
+            broad_mcs < uni_mcs,
+            "broad {broad_mcs} should be < unicast {uni_mcs}"
+        );
     }
 
     #[test]
@@ -620,21 +639,30 @@ mod tests {
         m2.observe_rank_deficit(0xAA, 1.0, 1_000);
         let many = RadioPolicy::default().decide(&NameContext::new(0xAA), &m2, 1_000);
         let parity_many = many.allocations[0].params.link_fec_redundancy.unwrap_or(0);
-        assert!(parity_many < parity_one, "pooling should discount: {parity_many} < {parity_one}");
+        assert!(
+            parity_many < parity_one,
+            "pooling should discount: {parity_many} < {parity_one}"
+        );
     }
 
     #[test]
     fn heterogeneous_bulk_prefers_wifi_urgent_prefers_lora() {
         let m = hetero();
         let bulk = RadioPolicy::default().decide(
-            &NameContext { priority: Priority::Bulk, ..NameContext::new(0xAA) },
+            &NameContext {
+                priority: Priority::Bulk,
+                ..NameContext::new(0xAA)
+            },
             &m,
             1_000,
         );
         assert_eq!(bulk.allocations[0].radio, W, "bulk → high-rate Wi-Fi");
 
         let urgent = RadioPolicy::default().decide(
-            &NameContext { priority: Priority::Urgent, ..NameContext::new(0xAA) },
+            &NameContext {
+                priority: Priority::Urgent,
+                ..NameContext::new(0xAA)
+            },
             &m,
             1_000,
         );
@@ -646,14 +674,21 @@ mod tests {
         let mut m = hetero();
         m.observe_rank_deficit(0xAA, 3.0, 1_000); // big deficit
         let p = RadioPolicy::default().decide(&NameContext::new(0xAA), &m, 1_000);
-        assert_eq!(p.allocations.len(), 2, "should replicate across both radios");
+        assert_eq!(
+            p.allocations.len(),
+            2,
+            "should replicate across both radios"
+        );
     }
 
     #[test]
     fn split_role_when_coded_and_heterogeneous() {
         let mut m = hetero();
         m.observe_rank_deficit(0xAA, 3.0, 1_000);
-        let ctx = NameContext { generation: Some(7), ..NameContext::new(0xAA) };
+        let ctx = NameContext {
+            generation: Some(7),
+            ..NameContext::new(0xAA)
+        };
         let p = RadioPolicy::default().decide(&ctx, &m, 1_000);
         assert_eq!(p.allocations.len(), 2);
         assert_eq!(p.allocations[1].role, AllocRole::Split);
@@ -664,15 +699,33 @@ mod tests {
         let m = hetero();
         let a = RadioPolicy::default().decide(&NameContext::new(0xAA), &m, 1_000);
         let b = RadioPolicy::default().decide(&NameContext::new(0xAA), &m, 5_000);
-        assert_eq!(a.consistency, b.consistency, "same name+demand ⇒ same plan digest");
+        assert_eq!(
+            a.consistency, b.consistency,
+            "same name+demand ⇒ same plan digest"
+        );
     }
 
     #[test]
     fn picks_least_busy_channel() {
         let mut m = wifi_only();
-        m.observe_occupancy(ChannelOccupancy { radio: W, channel: 149, busy_pct: 80, ts_ms: 1 });
-        m.observe_occupancy(ChannelOccupancy { radio: W, channel: 161, busy_pct: 10, ts_ms: 1 });
-        m.observe_occupancy(ChannelOccupancy { radio: W, channel: 165, busy_pct: 50, ts_ms: 1 });
+        m.observe_occupancy(ChannelOccupancy {
+            radio: W,
+            channel: 149,
+            busy_pct: 80,
+            ts_ms: 1,
+        });
+        m.observe_occupancy(ChannelOccupancy {
+            radio: W,
+            channel: 161,
+            busy_pct: 10,
+            ts_ms: 1,
+        });
+        m.observe_occupancy(ChannelOccupancy {
+            radio: W,
+            channel: 165,
+            busy_pct: 50,
+            ts_ms: 1,
+        });
         let p = RadioPolicy::default().decide(&NameContext::new(0xAA), &m, 1_000);
         assert_eq!(p.allocations[0].channel, Some(161));
     }

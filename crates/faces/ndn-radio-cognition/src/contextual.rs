@@ -39,11 +39,31 @@ pub struct Arm {
 
 /// The arm set spanning the rate × power × FEC tradeoff around the baseline.
 pub const ARMS: [Arm; 5] = [
-    Arm { mcs_delta: 0, power_backoff_db: 0, fec_delta: 0 }, // 0: baseline (trust the policy)
-    Arm { mcs_delta: -1, power_backoff_db: 0, fec_delta: 0 }, // 1: more robust rate
-    Arm { mcs_delta: 1, power_backoff_db: 0, fec_delta: 0 }, // 2: more aggressive rate
-    Arm { mcs_delta: 0, power_backoff_db: 6, fec_delta: 0 }, // 3: trim power (spatial reuse)
-    Arm { mcs_delta: -1, power_backoff_db: 0, fec_delta: 1 }, // 4: robustness via FEC, not rate
+    Arm {
+        mcs_delta: 0,
+        power_backoff_db: 0,
+        fec_delta: 0,
+    }, // 0: baseline (trust the policy)
+    Arm {
+        mcs_delta: -1,
+        power_backoff_db: 0,
+        fec_delta: 0,
+    }, // 1: more robust rate
+    Arm {
+        mcs_delta: 1,
+        power_backoff_db: 0,
+        fec_delta: 0,
+    }, // 2: more aggressive rate
+    Arm {
+        mcs_delta: 0,
+        power_backoff_db: 6,
+        fec_delta: 0,
+    }, // 3: trim power (spatial reuse)
+    Arm {
+        mcs_delta: -1,
+        power_backoff_db: 0,
+        fec_delta: 1,
+    }, // 4: robustness via FEC, not rate
 ];
 
 /// Apply an arm to a baseline [`TxParams`], clamped to the radio's capability.
@@ -263,7 +283,10 @@ mod tests {
             seen[a] = true;
             b.update(&ctx, a, -1.0);
         }
-        assert!(seen.iter().all(|&s| s), "each arm tried once before UCB kicks in");
+        assert!(
+            seen.iter().all(|&s| s),
+            "each arm tried once before UCB kicks in"
+        );
     }
 
     #[test]

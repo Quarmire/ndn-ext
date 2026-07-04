@@ -24,7 +24,7 @@ use std::task::{Context, Poll, Waker};
 
 use bytes::Bytes;
 use ndn_packet::{Data, Name, SignatureType};
-use ndn_security::{Ed25519Verifier, Signer, VerifyOutcome, Verifier};
+use ndn_security::{Ed25519Verifier, Signer, Verifier, VerifyOutcome};
 
 /// Outcome of verifying an inbound SD Data.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -241,9 +241,12 @@ mod tests {
         w.write_nested(ndn_packet::tlv_type::DATA, |w: &mut ndn_tlv::TlvWriter| {
             crate::wire::write_name_tlv(w, &"/sd/x".parse::<Name>().unwrap());
             w.write_tlv(ndn_packet::tlv_type::CONTENT, b"hi");
-            w.write_nested(ndn_packet::tlv_type::SIGNATURE_INFO, |w: &mut ndn_tlv::TlvWriter| {
-                w.write_tlv(ndn_packet::tlv_type::SIGNATURE_TYPE, &[0u8]);
-            });
+            w.write_nested(
+                ndn_packet::tlv_type::SIGNATURE_INFO,
+                |w: &mut ndn_tlv::TlvWriter| {
+                    w.write_tlv(ndn_packet::tlv_type::SIGNATURE_TYPE, &[0u8]);
+                },
+            );
             w.write_tlv(ndn_packet::tlv_type::SIGNATURE_VALUE, &[0u8; 32]);
         });
         if let Ok(data) = Data::decode(w.finish()) {

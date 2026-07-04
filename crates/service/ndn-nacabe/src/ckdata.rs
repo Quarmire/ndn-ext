@@ -198,9 +198,16 @@ mod tests {
         // CK-data survives a Content-bytes round trip (it rides as Data Content).
         let ck_data = CkData::from_parts(ck_data.name.clone(), ck_data.to_content_bytes()).unwrap();
 
-        let keys =
-            bsw_keygen(&kgc.2, &ms, &["role:doctor".into(), "dept:cardiology".into()]).unwrap();
-        assert_eq!(open_cp(&ck_data, &keys, &sealed, aad).unwrap(), b"ECG trace");
+        let keys = bsw_keygen(
+            &kgc.2,
+            &ms,
+            &["role:doctor".into(), "dept:cardiology".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            open_cp(&ck_data, &keys, &sealed, aad).unwrap(),
+            b"ECG trace"
+        );
     }
 
     #[test]
@@ -210,7 +217,8 @@ mod tests {
         let (mp, ms) = bsw_setup().unwrap();
         let kgc = (name("/hospital/kgc"), Hash::of(&mp.public_key_bytes), mp);
         let policy = PolicyExpr::parse("role:doctor").unwrap();
-        let (ck_data, sealed) = seal_cp(name("/dr/CK/1"), &policy, &kgc, b"secret", b"aad").unwrap();
+        let (ck_data, sealed) =
+            seal_cp(name("/dr/CK/1"), &policy, &kgc, b"secret", b"aad").unwrap();
 
         let wrong = bsw_keygen(&kgc.2, &ms, &["role:nurse".into()]).unwrap();
         assert!(open_cp(&ck_data, &wrong, &sealed, b"aad").is_err());
@@ -226,9 +234,12 @@ mod tests {
         let aad = b"/muas/cmd/1";
 
         let (ck_data, sealed) = seal_kp(name("/p/CK/3"), &attrs, &kgc, b"takeoff", aad).unwrap();
-        let key =
-            lsw_keygen(&kgc.2, &ms, &PolicyExpr::parse("service:mavlink OR service:camera").unwrap())
-                .unwrap();
+        let key = lsw_keygen(
+            &kgc.2,
+            &ms,
+            &PolicyExpr::parse("service:mavlink OR service:camera").unwrap(),
+        )
+        .unwrap();
         assert_eq!(open_kp(&ck_data, &key, &sealed, aad).unwrap(), b"takeoff");
     }
 }

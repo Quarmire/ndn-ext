@@ -20,7 +20,9 @@ fn main() {
             safebag: read_artifact(&args[1]),
         },
         Some("anchor") if args.len() == 3 => TrustEnvelope::Anchor {
-            version: args[1].parse().unwrap_or_else(|_| die("version must be a number")),
+            version: args[1]
+                .parse()
+                .unwrap_or_else(|_| die("version must be a number")),
             context_content: read_artifact(&args[2]),
         },
         Some("invite") if args.len() == 4 || args.len() == 5 => TrustEnvelope::Invite {
@@ -31,7 +33,8 @@ fn main() {
         },
         // Round-trip check: parse a URI back and describe it.
         Some("decode") if args.len() == 2 => {
-            let parsed = TrustEnvelope::from_uri(&args[1]).unwrap_or_else(|e| die(&format!("decode: {e}")));
+            let parsed =
+                TrustEnvelope::from_uri(&args[1]).unwrap_or_else(|e| die(&format!("decode: {e}")));
             eprintln!("decoded kind={:?} -> {parsed:?}", parsed.kind());
             return;
         }
@@ -62,7 +65,10 @@ fn read_artifact(path: &str) -> Bytes {
     let raw = fs::read(path).unwrap_or_else(|e| die(&format!("read {path}: {e}")));
     if let Ok(text) = std::str::from_utf8(&raw) {
         let t = text.trim();
-        if !t.is_empty() && t.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'-' | b'_')) {
+        if !t.is_empty()
+            && t.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'-' | b'_'))
+        {
             for eng in [
                 base64::engine::general_purpose::STANDARD,
                 base64::engine::general_purpose::URL_SAFE_NO_PAD,

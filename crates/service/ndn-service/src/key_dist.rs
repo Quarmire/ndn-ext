@@ -49,7 +49,9 @@ pub fn open_keyring(recipient: Recipient, sealed: &[u8]) -> Option<ScopeKeyring>
 fn encode_keyring(keyring: &ScopeKeyring) -> Bytes {
     let mut fields: Vec<Bytes> = Vec::new();
     for scope in keyring.scopes() {
-        let key = keyring.get(scope).expect("scope present in its own keyring");
+        let key = keyring
+            .get(scope)
+            .expect("scope present in its own keyring");
         fields.push(Frame::encode(&scope.to_string()));
         fields.push(Bytes::copy_from_slice(key.expose()));
     }

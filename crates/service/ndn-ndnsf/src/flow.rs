@@ -112,10 +112,12 @@ impl ProviderEngine {
         requester: &Name,
     ) -> Result<PendingCoordination, FlowError> {
         let token = ProviderToken::from_wire(sel.provider_token.clone());
-        self.tokens.consume(now_secs, &token, requester).map_err(|e| {
-            tracing::warn!(error = %e, "selection rejected — fail closed (no response)");
-            FlowError::TokenRejected(e)
-        })
+        self.tokens
+            .consume(now_secs, &token, requester)
+            .map_err(|e| {
+                tracing::warn!(error = %e, "selection rejected — fail closed (no response)");
+                FlowError::TokenRejected(e)
+            })
     }
 
     /// Pending (issued-but-unconsumed) token count.
@@ -244,7 +246,11 @@ mod tests {
         let ack = provider.on_request(0, name("/muas/alice"), name("/svc/x"), &req);
         let sel = make_selection(&ack, "r1");
 
-        assert!(provider.on_selection(0, &sel, &name("/muas/alice"), |_| Bytes::new()).is_ok());
+        assert!(
+            provider
+                .on_selection(0, &sel, &name("/muas/alice"), |_| Bytes::new())
+                .is_ok()
+        );
         // A replayed SELECTION coordinates nothing (token already consumed).
         let mut ran = false;
         let result = provider.on_selection(0, &sel, &name("/muas/alice"), |_| {
@@ -252,7 +258,10 @@ mod tests {
             Bytes::new()
         });
         assert_eq!(result, Err(FlowError::TokenRejected(TokenError::Unknown)));
-        assert!(!ran, "handler must not run on a rejected selection (fail closed)");
+        assert!(
+            !ran,
+            "handler must not run on a rejected selection (fail closed)"
+        );
     }
 
     #[test]

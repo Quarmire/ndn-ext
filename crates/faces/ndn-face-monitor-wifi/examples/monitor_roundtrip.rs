@@ -324,7 +324,8 @@ mod imp {
                         vht: false,
                         nss: 1,
                         stbc: false,
-                        ldpc: false,                    })
+                        ldpc: false,
+                    })
                     .into_face();
                 let mut reasm = ReassemblyBuffer::new(Duration::from_secs(2));
                 println!("fetching {count}×{size} B under {prefix} at MCS{mcs} on {iface} …");
@@ -358,7 +359,8 @@ mod imp {
                         vht: false,
                         nss: 1,
                         stbc: false,
-                        ldpc: false,                    })
+                        ldpc: false,
+                    })
                     .into_face();
                 let mut reasm = ReassemblyBuffer::new(Duration::from_secs(2));
                 let sizes = [256usize, 800, 1400, 2200, 4000, 8000, 16000];
@@ -408,7 +410,8 @@ mod imp {
                         vht: false,
                         nss: 1,
                         stbc: false,
-                        ldpc: false,                    })
+                        ldpc: false,
+                    })
                     .into_face();
                 let mut reasm = ReassemblyBuffer::new(Duration::from_secs(2));
                 let sizes = [256usize, 800, 1400, 2200, 4000, 8000, 16000];

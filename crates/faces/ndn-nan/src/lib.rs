@@ -40,8 +40,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use ndn_face_wifi_aware::{FaceError, FollowupFrame, NanBackend, NanMatch, NanServiceName};
-use ndn_frame_io::{CapturedFrame, FrameIo, InjectFrame, TxIntent, BROADCAST};
-use ndn_nan_core::{service_id, NanConfig, NanEngine, NanEvent, RxFrame, ServiceId};
+use ndn_frame_io::{BROADCAST, CapturedFrame, FrameIo, InjectFrame, TxIntent};
+use ndn_nan_core::{NanConfig, NanEngine, NanEvent, RxFrame, ServiceId, service_id};
 use tokio::sync::mpsc;
 
 pub use ndn_nan_core::NanConfig as Config;
@@ -283,12 +283,18 @@ impl EngineTask {
     fn route_event(&self, ev: NanEvent) {
         match ev {
             NanEvent::Discovered { service, peer, .. } => {
-                if let Some(name) = self.shared.name_by_id.lock().unwrap().get(&service).cloned() {
-                    self.shared
-                        .matches
-                        .lock()
-                        .unwrap()
-                        .push(NanMatch { service: name, peer });
+                if let Some(name) = self
+                    .shared
+                    .name_by_id
+                    .lock()
+                    .unwrap()
+                    .get(&service)
+                    .cloned()
+                {
+                    self.shared.matches.lock().unwrap().push(NanMatch {
+                        service: name,
+                        peer,
+                    });
                 }
             }
             NanEvent::Followup {

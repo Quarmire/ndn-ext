@@ -19,7 +19,11 @@ async fn grant_and_revoke_are_dynamic_without_restart() {
     let bob = n("/muas/bob");
 
     let mut authority = PolicyAuthority::new(n("/muas/group"), kc.signer().unwrap());
-    assert_eq!(authority.version(), 0, "fresh authority starts at version 0");
+    assert_eq!(
+        authority.version(),
+        0,
+        "fresh authority starts at version 0"
+    );
 
     // Grant alice, then bob — on the same live authority (no restart).
     let v1 = authority.grant(alice.clone(), "service:echo");
@@ -83,7 +87,10 @@ async fn grant_cache_rejects_rollback() {
     let current = authority.signed_grant(&alice).unwrap();
 
     let mut cache = GrantCache::new();
-    let g = cache.accept(&validator, current).await.expect("current grant verifies");
+    let g = cache
+        .accept(&validator, current)
+        .await
+        .expect("current grant verifies");
     assert!(g.revoked, "the consumer first sees the revocation");
 
     // The attacker replays the stale (older-version) but validly-signed grant.

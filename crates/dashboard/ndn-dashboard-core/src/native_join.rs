@@ -29,8 +29,8 @@ use bytes::Bytes;
 use ndn_cert::EnrollmentSession;
 use ndn_packet::encode::InterestBuilder;
 use ndn_packet::{Data, Name, NameComponent};
-use ndn_security::safebag::{SafeBag, ed25519_seed_to_pkcs8};
 use ndn_security::Signer;
+use ndn_security::safebag::{SafeBag, ed25519_seed_to_pkcs8};
 
 /// The NDNCERT token challenge type code, per the CA's offered challenges.
 const TOKEN_CHALLENGE: &str = "token";
@@ -229,7 +229,9 @@ impl CaExchange for SignedInterestCaExchange {
             .clone()
             .append(b"CA")
             .append(b"CHALLENGE")
-            .append_component(NameComponent::generic(Bytes::copy_from_slice(request_id_bytes)));
+            .append_component(NameComponent::generic(Bytes::copy_from_slice(
+                request_id_bytes,
+            )));
         let interest = self.signed_interest(name, body).await?;
         data_content(&self.wire.express(interest).await?)
     }
@@ -276,7 +278,10 @@ pub fn save_software_safebag(
 }
 
 /// Reload a software identity persisted by [`save_software_safebag`].
-pub fn load_software_safebag(path: &Path, passphrase: &[u8]) -> Result<RestoredIdentity, JoinError> {
+pub fn load_software_safebag(
+    path: &Path,
+    passphrase: &[u8],
+) -> Result<RestoredIdentity, JoinError> {
     let wire = std::fs::read(path).map_err(|e| JoinError::Io(e.to_string()))?;
     let bag = SafeBag::decode(&wire).map_err(|e| JoinError::SafeBag(e.to_string()))?;
     let seed = bag
@@ -433,7 +438,10 @@ mod tests {
         save_software_safebag(&path, &seed, &joined.cert_wire, pw).expect("persist safebag");
 
         let restored = load_software_safebag(&path, pw).expect("reload safebag");
-        assert_eq!(restored.seed, seed, "the seed round-trips through the SafeBag");
+        assert_eq!(
+            restored.seed, seed,
+            "the seed round-trips through the SafeBag"
+        );
         assert_eq!(
             restored.cert_wire, joined.cert_wire,
             "the issued cert round-trips through the SafeBag"
@@ -486,7 +494,10 @@ mod tests {
                     .app_parameters()
                     .ok_or_else(|| JoinError::Protocol("NEW interest has no params".into()))?;
                 let resp = self.ca.new_request(body).await?;
-                Ok(DataBuilder::new(interest.name.as_ref().clone(), resp.as_ref()).sign_digest_sha256())
+                Ok(
+                    DataBuilder::new(interest.name.as_ref().clone(), resp.as_ref())
+                        .sign_digest_sha256(),
+                )
             } else if let Some(i) = verb_pos(b"CHALLENGE") {
                 // The request-id component follows CHALLENGE (the trailing
                 // ParametersSha256Digest the signed-interest encoder appends is
@@ -508,7 +519,10 @@ mod tests {
                     .ca
                     .challenge_request(&request_id, &rid_bytes, body)
                     .await?;
-                Ok(DataBuilder::new(interest.name.as_ref().clone(), resp.as_ref()).sign_digest_sha256())
+                Ok(
+                    DataBuilder::new(interest.name.as_ref().clone(), resp.as_ref())
+                        .sign_digest_sha256(),
+                )
             } else {
                 // Cert fetch — the served cert is already a Data wire.
                 self.ca.fetch_cert(&interest.name.to_string()).await

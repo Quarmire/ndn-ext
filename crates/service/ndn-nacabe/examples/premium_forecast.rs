@@ -32,7 +32,10 @@ fn main() {
     let mut authority = KpAuthority::new(mp.clone(), ms);
 
     // Enroll two subscribers with key-policies — what attributes their key satisfies.
-    authority.grant(n("/sub/alice"), PolicyExpr::parse("tier:premium OR tier:pro").unwrap());
+    authority.grant(
+        n("/sub/alice"),
+        PolicyExpr::parse("tier:premium OR tier:pro").unwrap(),
+    );
     authority.grant(n("/sub/bob"), PolicyExpr::parse("tier:free").unwrap());
 
     // A publisher seals a premium forecast under the `tier:premium` attribute. CK

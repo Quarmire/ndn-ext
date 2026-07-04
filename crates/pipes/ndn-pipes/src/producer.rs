@@ -22,7 +22,9 @@ use ndn_packet::{Name, SignatureType};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::crypto::{PIPE_ID_LEN, PIPE_KEY_LEN, ed25519_sign, random_bytes, seal};
-use crate::message::{GHL, MessageKind, classify, encode_pipe_bundle, encode_seek_reply, hop_index};
+use crate::message::{
+    GHL, MessageKind, classify, encode_pipe_bundle, encode_seek_reply, hop_index,
+};
 use crate::registry::PipeRegistry;
 
 /// Default Promised Use Interval: a pipe with no liveness traffic for this long
@@ -140,8 +142,8 @@ impl PipeProducer {
         conf: &crate::Confidentiality,
     ) -> Self {
         let sealed = conf.seal(payload);
-        let segs = segment_payload(&sealed, policy, generation_id)
-            .expect("valid FEC policy + payload");
+        let segs =
+            segment_payload(&sealed, policy, generation_id).expect("valid FEC policy + payload");
         for s in segs {
             if lossy_skip.contains(&s.index) {
                 continue; // dropped "on the air"

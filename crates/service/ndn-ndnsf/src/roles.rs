@@ -61,7 +61,14 @@ impl ServiceProvider {
     /// using the default token TTL until configured. Owns its `SvsPubSub`; to
     /// serve several services over one pub/sub, use [`ServiceNode`].
     pub fn new(ps: SvsPubSub, node: Name, service: Name, group: Name) -> Self {
-        Self::shared(Arc::new(ps), node, service, group, DEFAULT_TTL_SECS, TrustCtx::default())
+        Self::shared(
+            Arc::new(ps),
+            node,
+            service,
+            group,
+            DEFAULT_TTL_SECS,
+            TrustCtx::default(),
+        )
     }
 
     /// A provider sharing an existing `Arc<SvsPubSub>` (used by [`ServiceNode`]).
@@ -193,7 +200,9 @@ impl ServiceUser {
     /// The next monotonic request id (`/r1`, `/r2`, …).
     fn next_request_id(&self) -> Name {
         let n = self.next_id.fetch_add(1, Ordering::Relaxed);
-        format!("/r{n}").parse().expect("request id is a valid name")
+        format!("/r{n}")
+            .parse()
+            .expect("request id is a valid name")
     }
 
     /// Call a specific `provider` (Normal four-phase: REQUEST→ACK→SELECTION→

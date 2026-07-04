@@ -395,7 +395,10 @@ mod tests {
             status: true,
             ..Default::default()
         };
-        assert_eq!(RequestMessage::decode(ack.encode()), Err(MsgError::WrongType));
+        assert_eq!(
+            RequestMessage::decode(ack.encode()),
+            Err(MsgError::WrongType)
+        );
     }
 
     #[test]

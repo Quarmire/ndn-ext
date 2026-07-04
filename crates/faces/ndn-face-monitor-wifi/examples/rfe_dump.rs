@@ -7,8 +7,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let b = LibUsbRtl88xxBackend::open_monitor(149)?;
     let chk = |name: &str, addr: u16, want: u32| -> Result<(), Box<dyn std::error::Error>> {
         let got = b.read32(addr)?;
-        println!("  {name} 0x{addr:04x} = {got:#010x}  want {want:#010x}  {}",
-                 if got == want { "OK" } else { "** MISMATCH **" });
+        println!(
+            "  {name} 0x{addr:04x} = {got:#010x}  want {want:#010x}  {}",
+            if got == want { "OK" } else { "** MISMATCH **" }
+        );
         Ok(())
     };
     println!("RFE pin / mode regs after bring_up (BB_PATH_AB, RFE 21):");

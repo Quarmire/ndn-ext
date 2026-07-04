@@ -43,14 +43,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     }
 
-    let ch: u8 = std::env::var("RADIO_CH").ok().and_then(|v| v.parse().ok()).unwrap_or(149);
+    let ch: u8 = std::env::var("RADIO_CH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(149);
     let backend = LibUsbRtl88xxBackend::open_monitor(ch)?;
     backend.set_channel(ch, ChannelBw::Bw80)?;
 
     let radio = RadioId(0);
     let me = mac_node(TX_SRC);
-    let mut control = RadioControl::new(ndn_radio_cognition::RadioPolicy::default()).with_node_id(me);
-    control.register_radio(radio, ndn_face_monitor_wifi::FaceId(0), RadioCapability::wifi_monitor_5ghz(vec![ch]));
+    let mut control =
+        RadioControl::new(ndn_radio_cognition::RadioPolicy::default()).with_node_id(me);
+    control.register_radio(
+        radio,
+        ndn_face_monitor_wifi::FaceId(0),
+        RadioCapability::wifi_monitor_5ghz(vec![ch]),
+    );
 
     println!("report_listen on ch{ch}: my node {me:#x}; waiting for reception reports…");
     let started = Instant::now();

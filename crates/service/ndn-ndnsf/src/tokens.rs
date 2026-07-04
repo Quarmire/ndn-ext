@@ -150,7 +150,10 @@ impl PendingProviderTokens {
             }
             Some(_) => {}
         }
-        let (coord, created) = self.entries.remove(token).expect("present per the peek above");
+        let (coord, created) = self
+            .entries
+            .remove(token)
+            .expect("present per the peek above");
         if self.is_expired(created, now_secs) {
             return Err(TokenError::Expired);
         }
@@ -187,7 +190,12 @@ mod tests {
     }
 
     fn issue(t: &mut PendingProviderTokens, now: u64) -> ProviderToken {
-        t.issue(now, name("/muas/alice"), name("/svc/mavlink"), "utok".into())
+        t.issue(
+            now,
+            name("/muas/alice"),
+            name("/svc/mavlink"),
+            "utok".into(),
+        )
     }
 
     /// SEC-22 — the pending-token table is hard-capped, so a flood of issuance
@@ -196,7 +204,12 @@ mod tests {
     fn token_table_is_capped() {
         let mut t = store();
         for i in 0..(MAX_PENDING_TOKENS + 500) {
-            t.issue(0, name(&format!("/muas/u{i}")), name("/svc/x"), String::new());
+            t.issue(
+                0,
+                name(&format!("/muas/u{i}")),
+                name("/svc/x"),
+                String::new(),
+            );
         }
         assert!(t.pending_count() <= MAX_PENDING_TOKENS);
     }
@@ -211,7 +224,10 @@ mod tests {
             t.consume(0, &tok, &name("/muas/mallory")),
             Err(TokenError::Unauthorized)
         );
-        assert!(t.consume(0, &tok, &name("/muas/alice")).is_ok(), "alice can still redeem it");
+        assert!(
+            t.consume(0, &tok, &name("/muas/alice")).is_ok(),
+            "alice can still redeem it"
+        );
     }
 
     /// NSF-T1 / NSF-T3 — a token is single-use; consuming it again (replay,
@@ -221,7 +237,10 @@ mod tests {
         let mut t = store();
         let tok = issue(&mut t, 0);
         assert!(t.consume(10, &tok, &name("/muas/alice")).is_ok());
-        assert_eq!(t.consume(10, &tok, &name("/muas/alice")), Err(TokenError::Unknown));
+        assert_eq!(
+            t.consume(10, &tok, &name("/muas/alice")),
+            Err(TokenError::Unknown)
+        );
     }
 
     /// NSF-T4 — an expired token cannot coordinate.
@@ -229,7 +248,10 @@ mod tests {
     fn nsf_t4_expired_token_rejected() {
         let mut t = store();
         let tok = issue(&mut t, 0);
-        assert_eq!(t.consume(60, &tok, &name("/muas/alice")), Err(TokenError::Expired));
+        assert_eq!(
+            t.consume(60, &tok, &name("/muas/alice")),
+            Err(TokenError::Expired)
+        );
     }
 
     /// NSF-T5 — an unknown/random token is rejected.
@@ -237,7 +259,11 @@ mod tests {
     fn nsf_t5_unknown_token_rejected() {
         let mut t = store();
         assert_eq!(
-            t.consume(0, &ProviderToken::from_wire("deadbeef"), &name("/muas/alice")),
+            t.consume(
+                0,
+                &ProviderToken::from_wire("deadbeef"),
+                &name("/muas/alice")
+            ),
             Err(TokenError::Unknown)
         );
     }

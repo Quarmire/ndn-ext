@@ -2,9 +2,9 @@
 //! under `origin::STATIC` (255). Routes are permanent (no expiry) and
 //! flushed from the RIB on `RoutingManager::disable`.
 
-use ndn_mgmt_wire::control_parameters::{origin, route_flags};
 use ndn_engine::observability::targets as t;
 use ndn_engine::{RibRoute, RoutingHandle, RoutingProtocol, RoutingProtocolStatus};
+use ndn_mgmt_wire::control_parameters::{origin, route_flags};
 use ndn_packet::Name;
 use ndn_transport::FaceId;
 use tokio_util::sync::CancellationToken;

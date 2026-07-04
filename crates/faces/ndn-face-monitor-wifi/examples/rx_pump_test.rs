@@ -7,7 +7,7 @@
 #[cfg(feature = "libusb-backend")]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use ndn_face_monitor_wifi::{LibUsbRtl88xxBackend, FrameIo};
+    use ndn_face_monitor_wifi::{FrameIo, LibUsbRtl88xxBackend};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -21,16 +21,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _pump = pumped.then(|| b.spawn_rx_pump(depth));
     println!(
         "counting recv_frame frames for {secs}s on ch{ch}, RX pump {}",
-        if pumped { format!("ON (depth {depth})") } else { "OFF".into() }
+        if pumped {
+            format!("ON (depth {depth})")
+        } else {
+            "OFF".into()
+        }
     );
 
     let t0 = Instant::now();
     let mut total = 0u64;
     let mut from_peer = 0u64;
     while t0.elapsed().as_secs() < secs {
-        if let Ok(Ok(f)) =
-            tokio::time::timeout(Duration::from_millis(300), b.recv_frame()).await
-        {
+        if let Ok(Ok(f)) = tokio::time::timeout(Duration::from_millis(300), b.recv_frame()).await {
             total += 1;
             if matches!(f.addr, Some(a) if a[..4] == [0x02, 0x4e, 0x44, 0x4e]) {
                 from_peer += 1;

@@ -147,7 +147,10 @@ mod tests {
         let r = Recipient::generate().unwrap();
         let pubk = r.public;
         let blob = seal(SALT, &pubk, b"top secret").unwrap();
-        assert!(!blob.windows(6).any(|w| w == b"secret"), "blob is ciphertext");
+        assert!(
+            !blob.windows(6).any(|w| w == b"secret"),
+            "blob is ciphertext"
+        );
         assert_eq!(r.open(SALT, &blob).unwrap(), b"top secret");
     }
 
@@ -177,6 +180,11 @@ mod tests {
         let last = blob.len() - 1;
         blob[last] ^= 0x01;
         assert!(r.open(SALT, &blob).is_none());
-        assert!(Recipient::generate().unwrap().open(SALT, &[0u8; 8]).is_none());
+        assert!(
+            Recipient::generate()
+                .unwrap()
+                .open(SALT, &[0u8; 8])
+                .is_none()
+        );
     }
 }

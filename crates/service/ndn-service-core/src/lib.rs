@@ -240,7 +240,8 @@ pub trait Carrier: Send + Sync {
     /// Mount `dispatch` as the server for `svc`. Returns once the service is
     /// serving (registry/engine-backed carriers dispatch asynchronously; loop-
     /// based carriers spawn their receive loop). Errors if mounting fails.
-    async fn serve(&self, svc: &ServiceId, dispatch: Arc<dyn Dispatch>) -> Result<(), ServiceError>;
+    async fn serve(&self, svc: &ServiceId, dispatch: Arc<dyn Dispatch>)
+    -> Result<(), ServiceError>;
 }
 
 /// How a multi-provider carrier selects among responders. Mirrors NDNSF's

@@ -255,7 +255,10 @@ impl std::fmt::Debug for ServiceDiscoveryConfig {
             .field("record_signer", &"<dyn RecordSigner>")
             .field(
                 "record_verifier",
-                &self.record_verifier.as_ref().map(|_| "<dyn RecordVerifier>"),
+                &self
+                    .record_verifier
+                    .as_ref()
+                    .map(|_| "<dyn RecordVerifier>"),
             )
             .finish()
     }

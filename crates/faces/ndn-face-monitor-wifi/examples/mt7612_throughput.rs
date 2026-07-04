@@ -6,7 +6,9 @@
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use bytes::Bytes;
-    use ndn_face_monitor_wifi::{FrameIo, InjectFrame, McsDescriptor, TxIntent, Mt7612uBackend, WifiRadio};
+    use ndn_face_monitor_wifi::{
+        FrameIo, InjectFrame, McsDescriptor, Mt7612uBackend, TxIntent, WifiRadio,
+    };
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -15,7 +17,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dev.set_channel_ch6()?;
     dev.setup_monitor_rx()?;
     dev.pause_drain(true);
-    let depth: usize = std::env::var("NDN_TX_DEPTH").ok().and_then(|s| s.parse().ok()).unwrap_or(16);
+    let depth: usize = std::env::var("NDN_TX_DEPTH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16);
     let _tx = dev.spawn_tx_pump(depth);
     println!("chip 0x{:04x}, TX pump depth={depth}", dev.chip_id()?);
 
@@ -31,15 +36,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let base = dev.tx_count_written();
         let t = Instant::now();
         for _ in 0..n {
-            dev.inject_at(InjectFrame::broadcast(payload.clone(), TxIntent::CONSERVATIVE), mcs).await?;
+            dev.inject_at(
+                InjectFrame::broadcast(payload.clone(), TxIntent::CONSERVATIVE),
+                mcs,
+            )
+            .await?;
         }
         while dev.tx_count_written() - base < n as u64 && t.elapsed() < Duration::from_secs(30) {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
         let el = t.elapsed();
         let got = (dev.tx_count_written() - base) as usize;
-        println!("plen={plen:4}: {got}/{n} written, {:.2}s = {:6.1} Mb/s payload, {:5.0} fps",
-                 el.as_secs_f64(), mbps(got * plen, el), got as f64 / el.as_secs_f64());
+        println!(
+            "plen={plen:4}: {got}/{n} written, {:.2}s = {:6.1} Mb/s payload, {:5.0} fps",
+            el.as_secs_f64(),
+            mbps(got * plen, el),
+            got as f64 / el.as_secs_f64()
+        );
     }
     println!("done.");
     Ok(())

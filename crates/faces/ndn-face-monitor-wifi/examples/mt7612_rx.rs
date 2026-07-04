@@ -11,7 +11,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dev = Mt7612uBackend::open()?;
     println!("full bring-up (firmware + MAC/BB init + 473 MCU cmds) ...");
     dev.bring_up()?;
-    println!("chip 0x{:04x}  MAC {:02x?}", dev.chip_id()?, dev.mac_address()?);
+    println!(
+        "chip 0x{:04x}  MAC {:02x?}",
+        dev.chip_id()?,
+        dev.mac_address()?
+    );
     println!("tuning RF to channel 6 (2.4GHz) ...");
     dev.set_channel_ch6()?;
     dev.setup_monitor_rx()?;
@@ -29,8 +33,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if shown < 3 {
                 shown += 1;
                 let head = &buf[..n.min(48)];
-                println!("  RX burst {n} bytes: {}",
-                    head.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" "));
+                println!(
+                    "  RX burst {n} bytes: {}",
+                    head.iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
             }
         }
     }

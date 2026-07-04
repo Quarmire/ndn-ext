@@ -131,10 +131,16 @@ impl<C: HintedCarrier> Carrier for DiscoveryCarrier<C> {
             .await
     }
 
-    async fn serve(&self, svc: &ServiceId, dispatch: Arc<dyn ndn_service_core::Dispatch>) -> Result<(), ServiceError> {
+    async fn serve(
+        &self,
+        svc: &ServiceId,
+        dispatch: Arc<dyn ndn_service_core::Dispatch>,
+    ) -> Result<(), ServiceError> {
         // The directory (owner of the naming convention) returns the serve name.
         let serve_name = self.directory.advertise(svc, &self.node).await;
-        self.inner.serve(&ServiceId::new(serve_name), dispatch).await
+        self.inner
+            .serve(&ServiceId::new(serve_name), dispatch)
+            .await
     }
 }
 
@@ -225,8 +231,7 @@ impl ProviderDirectory for MemoryDirectory {
     }
 
     async fn advertise(&self, service: &ServiceId, node: &Name) -> Name {
-        let (serve, callable, forwarding_hint) =
-            names_for(self.convention, service.name(), node);
+        let (serve, callable, forwarding_hint) = names_for(self.convention, service.name(), node);
         let mut table = self.table.lock().expect("directory lock");
         let entries = table.entry(service.name().clone()).or_default();
         // Re-advertising the same provider refreshes rather than duplicates, and the

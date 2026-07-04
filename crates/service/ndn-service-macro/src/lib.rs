@@ -113,9 +113,12 @@ pub fn ndn_service(_attr: TokenStream, item: TokenStream) -> TokenStream {
         for input in &f.sig.inputs {
             let FnArg::Typed(pt) = input else { continue }; // skip &self
             let Pat::Ident(pi) = &*pt.pat else {
-                return syn::Error::new_spanned(&pt.pat, "ndn_service: each argument must be a plain identifier")
-                    .to_compile_error()
-                    .into();
+                return syn::Error::new_spanned(
+                    &pt.pat,
+                    "ndn_service: each argument must be a plain identifier",
+                )
+                .to_compile_error()
+                .into();
             };
             arg_names.push(pi.ident.clone());
             arg_types.push((*pt.ty).clone());
@@ -126,8 +129,7 @@ pub fn ndn_service(_attr: TokenStream, item: TokenStream) -> TokenStream {
         };
         if f.sig.asyncness.is_some() {
             f.sig.asyncness = None;
-            f.sig.output =
-                syn::parse_quote!(-> impl ::core::future::Future<Output = #ret> + ::core::marker::Send);
+            f.sig.output = syn::parse_quote!(-> impl ::core::future::Future<Output = #ret> + ::core::marker::Send);
         }
         methods.push(Method {
             name,
@@ -138,8 +140,12 @@ pub fn ndn_service(_attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     // The trait gains Send + Sync + 'static so a provider can hold `Arc<S>`.
-    trait_def.supertraits.push(syn::parse_quote!(::core::marker::Send));
-    trait_def.supertraits.push(syn::parse_quote!(::core::marker::Sync));
+    trait_def
+        .supertraits
+        .push(syn::parse_quote!(::core::marker::Send));
+    trait_def
+        .supertraits
+        .push(syn::parse_quote!(::core::marker::Sync));
     trait_def.supertraits.push(syn::parse_quote!('static));
 
     let dispatch_ident = format_ident!("{}Dispatch", trait_ident);

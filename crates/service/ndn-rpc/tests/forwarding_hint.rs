@@ -37,7 +37,12 @@ async fn invoke_hinted_attaches_forwarding_hint() {
 
     // With a hint: the inbound Interest carries it (the forwarder would steer here).
     carrier
-        .invoke_hinted(&svc, &OpId::new("echo"), bytes::Bytes::new(), Some(&n("/p1")))
+        .invoke_hinted(
+            &svc,
+            &OpId::new("echo"),
+            bytes::Bytes::new(),
+            Some(&n("/p1")),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -47,7 +52,10 @@ async fn invoke_hinted_attaches_forwarding_hint() {
     );
 
     // Plain invoke: no hint on the wire.
-    carrier.invoke(&svc, &OpId::new("echo"), bytes::Bytes::new()).await.unwrap();
+    carrier
+        .invoke(&svc, &OpId::new("echo"), bytes::Bytes::new())
+        .await
+        .unwrap();
     assert_eq!(
         captured.lock().unwrap().clone(),
         None,

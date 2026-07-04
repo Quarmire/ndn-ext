@@ -138,7 +138,9 @@ impl CarrierHandler {
         match validator.validate_interest(interest).await {
             InterestValidationOutcome::Valid => {}
             InterestValidationOutcome::Pending => {
-                return Err(RpcError::Unauthorized("signer certificate not available".into()));
+                return Err(RpcError::Unauthorized(
+                    "signer certificate not available".into(),
+                ));
             }
             InterestValidationOutcome::Invalid(e) => {
                 return Err(RpcError::Unauthorized(e.to_string()));
@@ -170,7 +172,9 @@ impl RpcHandler for CarrierHandler {
         let op = comps
             .get(self.service_len)
             .map(|c| OpId::new(String::from_utf8_lossy(c.value.as_ref()).into_owned()))
-            .ok_or_else(|| RpcError::BadRequest("interest carries no operation component".into()))?;
+            .ok_or_else(|| {
+                RpcError::BadRequest("interest carries no operation component".into())
+            })?;
         let requester = self.authenticate(interest).await?;
         let request = interest.app_parameters().cloned().unwrap_or_default();
         let invocation = Invocation {
@@ -178,12 +182,16 @@ impl RpcHandler for CarrierHandler {
             request,
             requester,
         };
-        let reply = self.dispatch.dispatch(invocation).await.map_err(|e| match e {
-            ServiceError::NotFound => RpcError::NotFound,
-            ServiceError::Decode(m) => RpcError::BadRequest(m),
-            ServiceError::Unauthorized(m) => RpcError::Unauthorized(m),
-            other => RpcError::HandlerFailed(other.to_string()),
-        })?;
+        let reply = self
+            .dispatch
+            .dispatch(invocation)
+            .await
+            .map_err(|e| match e {
+                ServiceError::NotFound => RpcError::NotFound,
+                ServiceError::Decode(m) => RpcError::BadRequest(m),
+                ServiceError::Unauthorized(m) => RpcError::Unauthorized(m),
+                other => RpcError::HandlerFailed(other.to_string()),
+            })?;
         // Sign the response with this node's identity when configured; else a bare
         // digest (loopback integrity), as before.
         let name = (*interest.name).clone();
@@ -193,7 +201,8 @@ impl RpcHandler for CarrierHandler {
                 .map_err(|e| RpcError::HandlerFailed(format!("response sign failed: {e}")))?,
             None => DataBuilder::new(name, reply.as_ref()).sign_digest_sha256(),
         };
-        Data::decode(wire).map_err(|e| RpcError::HandlerFailed(format!("response encode failed: {e}")))
+        Data::decode(wire)
+            .map_err(|e| RpcError::HandlerFailed(format!("response encode failed: {e}")))
     }
 }
 
@@ -208,7 +217,11 @@ impl Carrier for RpcCarrier {
         self.invoke_hinted(svc, op, request, None).await
     }
 
-    async fn serve(&self, svc: &ServiceId, dispatch: Arc<dyn Dispatch>) -> Result<(), ServiceError> {
+    async fn serve(
+        &self,
+        svc: &ServiceId,
+        dispatch: Arc<dyn Dispatch>,
+    ) -> Result<(), ServiceError> {
         let handler = CarrierHandler {
             service_len: svc.name().len(),
             dispatch,

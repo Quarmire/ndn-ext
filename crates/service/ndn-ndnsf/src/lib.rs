@@ -35,16 +35,16 @@ pub mod access;
 pub mod carrier;
 #[cfg(feature = "driver")]
 pub mod driver;
+pub mod flow;
+pub mod messages;
+pub mod names;
 #[cfg(feature = "driver")]
 pub mod policy;
 #[cfg(feature = "driver")]
 pub mod roles;
+pub mod tokens;
 #[cfg(feature = "driver")]
 pub mod trust;
-pub mod flow;
-pub mod messages;
-pub mod names;
-pub mod tokens;
 
 pub use flow::{FlowError, ProviderEngine, make_request, make_selection};
 pub use messages::{

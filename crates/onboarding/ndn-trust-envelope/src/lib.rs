@@ -161,7 +161,10 @@ pub struct Capability {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrustEnvelope {
     /// Adopt a trust context: `context_content` is `SignedTrustContext::encode_content()`.
-    Anchor { version: u64, context_content: Bytes },
+    Anchor {
+        version: u64,
+        context_content: Bytes,
+    },
     /// NDNCERT enrollment invitation.
     Invite {
         ca_prefix: String,
@@ -363,7 +366,11 @@ impl TrustEnvelope {
 
     /// The canonical scannable URI: `ndn-trust://<kind>/<base64url(TLV)>`.
     pub fn to_uri(&self) -> String {
-        format!("{SCHEME}{}/{}", self.kind().as_str(), B64.encode(self.encode()))
+        format!(
+            "{SCHEME}{}/{}",
+            self.kind().as_str(),
+            B64.encode(self.encode())
+        )
     }
 
     /// Parse any supported carriage: the `ndn-trust://` scheme, the `https://…#`
@@ -374,7 +381,9 @@ impl TrustEnvelope {
         if let Some(rest) = s.strip_prefix(LEGACY_ANCHOR_TAG) {
             let (ver, b64) = rest.split_once(':').ok_or(EnvelopeError::MalformedUri)?;
             let version = ver.parse().map_err(|_| EnvelopeError::MalformedUri)?;
-            let content = B64.decode(b64.trim()).map_err(|_| EnvelopeError::BadBase64)?;
+            let content = B64
+                .decode(b64.trim())
+                .map_err(|_| EnvelopeError::BadBase64)?;
             return Ok(TrustEnvelope::Anchor {
                 version,
                 context_content: Bytes::from(content),
@@ -392,7 +401,9 @@ impl TrustEnvelope {
             return Err(EnvelopeError::UnknownScheme);
         };
 
-        let wire = B64.decode(b64.trim()).map_err(|_| EnvelopeError::BadBase64)?;
+        let wire = B64
+            .decode(b64.trim())
+            .map_err(|_| EnvelopeError::BadBase64)?;
         Self::decode(&wire)
     }
 }

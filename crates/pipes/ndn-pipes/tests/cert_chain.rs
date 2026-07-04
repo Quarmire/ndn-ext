@@ -43,8 +43,12 @@ async fn open_with(producer_kc: &KeyChain, validator: Arc<Validator>) -> Result<
         );
     let serve = tokio::spawn(async move { producer.serve().await });
 
-    let mut pc = PipeConsumer::new(Consumer::from_handle(consumer_handle)).with_validator(validator);
-    let result = pc.open("/sensors/temp", PipeParams::default()).await.map(|_| ());
+    let mut pc =
+        PipeConsumer::new(Consumer::from_handle(consumer_handle)).with_validator(validator);
+    let result = pc
+        .open("/sensors/temp", PipeParams::default())
+        .await
+        .map(|_| ());
 
     drop(pc);
     drop(engine);

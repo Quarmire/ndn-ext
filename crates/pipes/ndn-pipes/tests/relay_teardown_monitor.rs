@@ -70,7 +70,10 @@ async fn relay_monitor_pathcontrol_teardown_reaps_producer_and_relay() {
 
     let mut pc = PipeConsumer::new(Consumer::from_handle(c_h));
     let ns: Name = "/sensors/temp".parse().unwrap();
-    let pipe = pc.open(ns.clone(), PipeParams::default()).await.expect("pipe opens");
+    let pipe = pc
+        .open(ns.clone(), PipeParams::default())
+        .await
+        .expect("pipe opens");
 
     // The relay learns the pipe key at hop 0 (threshold == PUI), then runs its monitor.
     // It never sees activity (note_activity is never called), so it announces a
@@ -82,7 +85,10 @@ async fn relay_monitor_pathcontrol_teardown_reaps_producer_and_relay() {
             .await,
         "relay learns the key"
     );
-    assert!(store.pipe_key(pipe.id.as_bytes()).is_some(), "relay holds the pipe");
+    assert!(
+        store.pipe_key(pipe.id.as_bytes()).is_some(),
+        "relay holds the pipe"
+    );
     let monitor = tokio::spawn(run_relay_monitor(
         relay.store(),
         fetcher,

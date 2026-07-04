@@ -43,7 +43,10 @@ async fn run(consumer_params: PipeParams) -> (Vec<u8>, Result<Vec<u8>, PipeError
     let serve = tokio::spawn(async move { producer.serve().await });
 
     let mut pc = PipeConsumer::new(Consumer::from_handle(consumer_handle));
-    let pipe = pc.open("/sensors/temp", consumer_params).await.expect("pipe");
+    let pipe = pc
+        .open("/sensors/temp", consumer_params)
+        .await
+        .expect("pipe");
     let got = pc.fetch(&pipe, "/v=42").await.map(|b| b.to_vec());
 
     drop(pc);
@@ -63,5 +66,8 @@ async fn consumer_with_the_key_recovers_plaintext() {
 async fn consumer_with_wrong_key_cannot_read_the_bulk() {
     // Decodes the ciphertext fine, but the AEAD tag fails → no plaintext.
     let (_payload, got) = run(PipeParams::default().with_aead_key([9u8; 32])).await;
-    assert!(matches!(got, Err(PipeError::Crypto(_))), "wrong key must not decrypt");
+    assert!(
+        matches!(got, Err(PipeError::Crypto(_))),
+        "wrong key must not decrypt"
+    );
 }

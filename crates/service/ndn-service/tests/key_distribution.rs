@@ -31,19 +31,33 @@ fn member_receives_only_its_roles_scope_keys() {
 
     // A stranger cannot open it (sealed to the member only).
     let stranger = Recipient::generate().unwrap();
-    assert!(open_keyring(stranger, &sealed).is_none(), "sealed to the member only");
+    assert!(
+        open_keyring(stranger, &sealed).is_none(),
+        "sealed to the member only"
+    );
 
     // The member opens its role-scoped keyring: exactly the observer's scopes.
     let keyring = open_keyring(member, &sealed).expect("member opens its keyring");
     let scopes: HashSet<&str> = keyring.scopes().collect();
-    assert_eq!(scopes, HashSet::from(["telemetry"]), "observer receives only telemetry");
+    assert_eq!(
+        scopes,
+        HashSet::from(["telemetry"]),
+        "observer receives only telemetry"
+    );
 
     // The distributed key IS the real scope key: it opens content sealed by it.
     let aad = b"/muas/session/telemetry";
     let original = all.get("telemetry").unwrap();
     let sealed_msg = original.seal(b"21C", aad);
-    let opened = keyring.get("telemetry").unwrap().open(&sealed_msg, aad).unwrap();
-    assert_eq!(opened, b"21C", "the distributed key is the genuine scope key");
+    let opened = keyring
+        .get("telemetry")
+        .unwrap()
+        .open(&sealed_msg, aad)
+        .unwrap();
+    assert_eq!(
+        opened, b"21C",
+        "the distributed key is the genuine scope key"
+    );
 }
 
 #[test]

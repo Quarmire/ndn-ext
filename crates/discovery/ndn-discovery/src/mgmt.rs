@@ -27,8 +27,8 @@ use ndn_packet::Name;
 use ndn_transport::FaceId;
 
 use crate::config::{DiscoveryConfig, HelloStrategyKind, PrefixAnnouncementMode};
-use crate::service_discovery::ServiceDiscoveryProtocol;
 use crate::prefix_announce::ServiceRecord;
+use crate::service_discovery::ServiceDiscoveryProtocol;
 
 // ---------------------------------------------------------------------------
 // `/localhost/nfd/discovery/{status, config}` — runtime-mutable Hello config.

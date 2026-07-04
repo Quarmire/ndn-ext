@@ -73,7 +73,10 @@ async fn unsigned_discovery_returns_authenticated_params() {
 
     let mut fetcher = ParamFetcher::new(consumer, aa_prefix.clone(), Arc::new(aa_kc.validator()));
     let params = fetcher.fetch_public_params().await;
-    assert!(params.is_ok(), "an unsigned discovery must return authenticated params");
+    assert!(
+        params.is_ok(),
+        "an unsigned discovery must return authenticated params"
+    );
 
     drop(fetcher);
     drop(engine);
@@ -95,20 +98,32 @@ async fn validation_failure_fires_callback_once_with_name_and_reason() {
     let calls_cb = calls.clone();
     let captured_cb = captured.clone();
 
-    let mut fetcher = ParamFetcher::new(consumer, aa_prefix.clone(), Arc::new(stranger.validator()))
-        .with_failure_callback(Arc::new(move |name: &Name, reason: &str| {
-            calls_cb.fetch_add(1, Ordering::SeqCst);
-            *captured_cb.lock().unwrap() = Some((name.clone(), reason.to_string()));
-        }));
+    let mut fetcher =
+        ParamFetcher::new(consumer, aa_prefix.clone(), Arc::new(stranger.validator()))
+            .with_failure_callback(Arc::new(move |name: &Name, reason: &str| {
+                calls_cb.fetch_add(1, Ordering::SeqCst);
+                *captured_cb.lock().unwrap() = Some((name.clone(), reason.to_string()));
+            }));
 
     let result = fetcher.fetch_public_params().await;
     assert!(result.is_err(), "an unverifiable response must fail closed");
 
     // NSF-F1: exactly one callback invocation.
-    assert_eq!(calls.load(Ordering::SeqCst), 1, "the failure callback must fire exactly once");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the failure callback must fire exactly once"
+    );
     // NSF-F2: the failure carries the failed name and a non-empty reason.
-    let (name, reason) = captured.lock().unwrap().clone().expect("callback captured a failure");
-    assert!(name.has_prefix(&aa_prefix), "failure name is the discovery Data name: {name}");
+    let (name, reason) = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("callback captured a failure");
+    assert!(
+        name.has_prefix(&aa_prefix),
+        "failure name is the discovery Data name: {name}"
+    );
     assert!(!reason.is_empty(), "failure reason must be populated");
 
     drop(fetcher);

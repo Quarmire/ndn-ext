@@ -80,7 +80,10 @@ async fn ghl_gives_each_node_its_hop_index() {
 
     // The producer derived the pipe length from GHL: consumer-engine, relay-
     // engine and producer-engine each decremented once → 3 hops to the producer.
-    assert_eq!(pipe.pipe_len, 3, "producer reports the GHL-derived pipe length");
+    assert_eq!(
+        pipe.pipe_len, 3,
+        "producer reports the GHL-derived pipe length"
+    );
 
     // The relay answers CONTEXT with the hop it derived for itself: two decrements
     // (consumer + relay engines) lie between the consumer and the relay app.
@@ -92,8 +95,14 @@ async fn ghl_gives_each_node_its_hop_index() {
     );
 
     // Data plane still flows through the relay while it serves the control band.
-    let got = pc.fetch(&pipe, "/v=42").await.expect("bulk arrives through the relay");
-    assert_eq!(got, payload, "coded bulk recovered while the relay handles COMMON");
+    let got = pc
+        .fetch(&pipe, "/v=42")
+        .await
+        .expect("bulk arrives through the relay");
+    assert_eq!(
+        got, payload,
+        "coded bulk recovered while the relay handles COMMON"
+    );
 
     drop(pc);
     drop(ce);

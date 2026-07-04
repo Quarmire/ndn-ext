@@ -20,7 +20,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     use bytes::Bytes;
     use ndn_face_monitor_wifi::{
-        AfPacketBackend, ESPNOW_OUI, FrameFormat, InjectFrame, McsDescriptor, TxIntent, FrameIo, WifiRadio,
+        AfPacketBackend, ESPNOW_OUI, FrameFormat, FrameIo, InjectFrame, McsDescriptor, TxIntent,
+        WifiRadio,
     };
 
     let mut args = std::env::args().skip(1);

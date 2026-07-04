@@ -105,7 +105,9 @@ mod tests {
 
     #[test]
     fn pipe_params_builders() {
-        let p = PipeParams::default().with_fec(16, 20).with_pui(Duration::from_secs(30));
+        let p = PipeParams::default()
+            .with_fec(16, 20)
+            .with_pui(Duration::from_secs(30));
         assert_eq!(p.fec.map(|f| (f.k, f.n)), Some((16, 20)));
         assert_eq!(p.pui, Duration::from_secs(30));
         assert!(PipeParams::uncoded().fec.is_none());

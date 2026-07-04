@@ -309,11 +309,7 @@ pub trait MediumView {
 
 impl MediumView for MediumState {
     fn radios(&self) -> Vec<(RadioId, RadioCapability)> {
-        let mut v: Vec<_> = self
-            .radios
-            .iter()
-            .map(|(id, c)| (*id, c.clone()))
-            .collect();
+        let mut v: Vec<_> = self.radios.iter().map(|(id, c)| (*id, c.clone())).collect();
         v.sort_by_key(|(id, _)| *id);
         v
     }

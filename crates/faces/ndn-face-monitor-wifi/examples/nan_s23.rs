@@ -89,7 +89,11 @@ async fn node(
     use std::sync::Arc;
     use std::time::Duration;
 
-    let service = if service == "node" { "ndn".to_string() } else { service };
+    let service = if service == "node" {
+        "ndn".to_string()
+    } else {
+        service
+    };
     // Low master preference + low NMI → merge INTO the S23's cluster.
     let nmi: [u8; 6] = [0x02, 0x4e, 0x41, 0x4e, 0x00, 0x31];
     let cfg = ndn_nan::Config::new(nmi, 6, 0);
@@ -112,7 +116,10 @@ async fn node(
     loop {
         for m in driver.drain_matches() {
             if seen.insert(m.peer) {
-                println!("★ DISCOVERED peer NMI {:02x?} advertising \"{}\"", m.peer, m.service.0);
+                println!(
+                    "★ DISCOVERED peer NMI {:02x?} advertising \"{}\"",
+                    m.peer, m.service.0
+                );
             }
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -125,7 +132,10 @@ async fn node(
 
 #[cfg(feature = "libusb-backend")]
 fn mac(m: &[u8; 6]) -> String {
-    m.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":")
+    m.iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 #[cfg(feature = "libusb-backend")]
@@ -142,31 +152,39 @@ fn dump_attrs(attrs: &[u8]) {
         match a.id {
             x if x == AttributeId::MasterIndication as u8 => {
                 if let Ok(mi) = MasterIndication::decode(a.body) {
-                    println!("   MasterIndication: pref={} rf={}", mi.master_preference, mi.random_factor);
+                    println!(
+                        "   MasterIndication: pref={} rf={}",
+                        mi.master_preference, mi.random_factor
+                    );
                 }
             }
             x if x == AttributeId::Cluster as u8 => {
                 if let Ok(c) = Cluster::decode(a.body) {
-                    println!("   Cluster: amr={:#018x} hop={} ambtt={}", c.anchor_master_rank, c.hop_count, c.ambtt);
-                }
-            }
-            x if x == AttributeId::ServiceDescriptor as u8 => match ServiceDescriptor::decode(a.body) {
-                Ok(sda) => {
-                    let t = match sda.control.control_type {
-                        ServiceControlType::Publish => "publish",
-                        ServiceControlType::Subscribe => "subscribe",
-                        ServiceControlType::FollowUp => "follow-up",
-                    };
                     println!(
-                        "   SDA: id={} inst={} req={} type={t} ssi={:?}",
-                        hex(&sda.service_id),
-                        sda.instance_id,
-                        sda.requestor_instance_id,
-                        String::from_utf8_lossy(&sda.service_info)
+                        "   Cluster: amr={:#018x} hop={} ambtt={}",
+                        c.anchor_master_rank, c.hop_count, c.ambtt
                     );
                 }
-                Err(_) => println!("   SDA(0x03) len={} [unmodelled fields]", a.body.len()),
-            },
+            }
+            x if x == AttributeId::ServiceDescriptor as u8 => {
+                match ServiceDescriptor::decode(a.body) {
+                    Ok(sda) => {
+                        let t = match sda.control.control_type {
+                            ServiceControlType::Publish => "publish",
+                            ServiceControlType::Subscribe => "subscribe",
+                            ServiceControlType::FollowUp => "follow-up",
+                        };
+                        println!(
+                            "   SDA: id={} inst={} req={} type={t} ssi={:?}",
+                            hex(&sda.service_id),
+                            sda.instance_id,
+                            sda.requestor_instance_id,
+                            String::from_utf8_lossy(&sda.service_info)
+                        );
+                    }
+                    Err(_) => println!("   SDA(0x03) len={} [unmodelled fields]", a.body.len()),
+                }
+            }
             id => println!(
                 "   attr {:#04x} len={} {} body={}",
                 id,

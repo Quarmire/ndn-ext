@@ -61,7 +61,9 @@ async fn roles_echo_round_trips() {
 
     let provider =
         ServiceProvider::new(provider_ps, n("/muas/bob"), svc.clone(), group.clone()).insecure();
-    let user = ServiceUser::new(user_ps, n("/muas/alice"), svc, group).insecure().token("utok");
+    let user = ServiceUser::new(user_ps, n("/muas/alice"), svc, group)
+        .insecure()
+        .token("utok");
 
     let reply = tokio::select! {
         _ = provider.serve(|_coord, req| Bytes::copy_from_slice(req)) => None,

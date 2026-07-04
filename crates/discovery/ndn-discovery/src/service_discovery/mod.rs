@@ -449,7 +449,11 @@ mod tests {
         let pkt = inbound_record("/ndn/svc/x", "/ndn/peer/n", 30_000, 1);
         sd.on_inbound(&pkt, FaceId(10), &crate::InboundMeta::none(), &ctx);
 
-        assert_eq!(sd.peer_records.lock().unwrap().len(), 1, "stored for browsing");
+        assert_eq!(
+            sd.peer_records.lock().unwrap().len(),
+            1,
+            "stored for browsing"
+        );
         assert!(
             ctx.added.lock().unwrap().is_empty(),
             "fail-closed: unverified record must not install FIB"
@@ -572,7 +576,11 @@ mod tests {
             &crate::InboundMeta::none(),
             &ctx,
         );
-        assert_eq!(sd.peer_records.lock().unwrap()[0].version, 9, "v9 upgrades v5");
+        assert_eq!(
+            sd.peer_records.lock().unwrap()[0].version,
+            9,
+            "v9 upgrades v5"
+        );
     }
 
     #[test]

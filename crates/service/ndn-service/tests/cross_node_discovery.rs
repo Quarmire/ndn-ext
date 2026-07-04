@@ -34,7 +34,9 @@ struct PeerTable {
 impl PeerTable {
     fn entry(&self) -> NeighborEntry {
         let mut e = NeighborEntry::new(self.peer.clone());
-        e.state = NeighborState::Established { last_seen: Instant::now() };
+        e.state = NeighborState::Established {
+            last_seen: Instant::now(),
+        };
         e.faces.push((LINK, MacAddr([0u8; 6]), "link".into()));
         e
     }
@@ -59,7 +61,10 @@ struct HostCtx {
 }
 impl HostCtx {
     fn new(peer: Name) -> Self {
-        Self { peer, outbox: Mutex::new(Vec::new()) }
+        Self {
+            peer,
+            outbox: Mutex::new(Vec::new()),
+        }
     }
     fn drain(&self) -> Vec<Bytes> {
         self.outbox.lock().unwrap().drain(..).collect()
@@ -81,7 +86,9 @@ impl RoutingTableContext for HostCtx {
 }
 impl NeighborContext for HostCtx {
     fn neighbors(&self) -> Arc<dyn NeighborTableView> {
-        Arc::new(PeerTable { peer: self.peer.clone() })
+        Arc::new(PeerTable {
+            peer: self.peer.clone(),
+        })
     }
     fn update_neighbor(&self, _: NeighborUpdate) {}
 }
@@ -104,7 +111,9 @@ async fn two_nodes_discover_a_service_over_the_wire() {
 
     // Node A advertises a service through the real SD-backed directory.
     let svc = ServiceId::new(n("/svc/echo"));
-    ServiceDiscoveryDirectory::new(a.clone()).advertise(&svc, &n("/p1")).await;
+    ServiceDiscoveryDirectory::new(a.clone())
+        .advertise(&svc, &n("/p1"))
+        .await;
 
     // Host loop: tick both (their own browse fires), route each node's send_on
     // bytes to the peer's on_inbound. A's browse → B answers (empty); B's browse
@@ -123,7 +132,9 @@ async fn two_nodes_discover_a_service_over_the_wire() {
     }
 
     // Node B discovered A's advertised service over the wire (its directory sees it).
-    let providers = ServiceDiscoveryDirectory::new(b.clone()).providers(&svc).await;
+    let providers = ServiceDiscoveryDirectory::new(b.clone())
+        .providers(&svc)
+        .await;
     let callables: Vec<String> = providers.iter().map(|e| e.callable.to_string()).collect();
     assert!(
         callables.iter().any(|c| c == "/p1/svc/echo"),

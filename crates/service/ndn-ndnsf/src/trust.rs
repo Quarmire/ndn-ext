@@ -17,9 +17,9 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
+use ndn_packet::Data;
 use ndn_packet::Name;
 use ndn_packet::encode::DataBuilder;
-use ndn_packet::Data;
 use ndn_security::validator::ValidationResult;
 use ndn_security::{SignWith, Signer, Validator};
 use ndn_sync::{IngestValidator, PublisherSigner};
@@ -200,8 +200,12 @@ mod tests {
     #[tokio::test]
     async fn valid_message_from_expected_sender_accepted() {
         let kc = KeyChain::ephemeral("/muas/alice").unwrap();
-        let blob = sign_message(&*kc.signer().unwrap(), n("/muas/alice/NDNSF/REQUEST/x/r1"), b"hi")
-            .unwrap();
+        let blob = sign_message(
+            &*kc.signer().unwrap(),
+            n("/muas/alice/NDNSF/REQUEST/x/r1"),
+            b"hi",
+        )
+        .unwrap();
         let got = verify_message(
             &kc.validator(),
             blob,
@@ -215,8 +219,12 @@ mod tests {
     #[tokio::test]
     async fn wrong_sender_prefix_rejected() {
         let kc = KeyChain::ephemeral("/muas/alice").unwrap();
-        let blob =
-            sign_message(&*kc.signer().unwrap(), n("/muas/alice/NDNSF/REQUEST/x/r1"), b"hi").unwrap();
+        let blob = sign_message(
+            &*kc.signer().unwrap(),
+            n("/muas/alice/NDNSF/REQUEST/x/r1"),
+            b"hi",
+        )
+        .unwrap();
         // The message claims to be from /muas/bob, but alice signed it.
         assert!(
             verify_message(
@@ -256,8 +264,12 @@ mod tests {
     #[tokio::test]
     async fn tampered_message_rejected() {
         let kc = KeyChain::ephemeral("/muas/alice").unwrap();
-        let blob = sign_message(&*kc.signer().unwrap(), n("/muas/alice/NDNSF/REQUEST/x/r1"), b"hi")
-            .unwrap();
+        let blob = sign_message(
+            &*kc.signer().unwrap(),
+            n("/muas/alice/NDNSF/REQUEST/x/r1"),
+            b"hi",
+        )
+        .unwrap();
         let mut bad = blob.to_vec();
         let last = bad.len() - 1;
         bad[last] ^= 0xff;
@@ -279,8 +291,12 @@ mod tests {
         // when the flow presents it under a different outer publication name (a
         // different request-id / phase / service).
         let kc = KeyChain::ephemeral("/muas/alice").unwrap();
-        let blob =
-            sign_message(&*kc.signer().unwrap(), n("/muas/alice/NDNSF/REQUEST/x/r1"), b"hi").unwrap();
+        let blob = sign_message(
+            &*kc.signer().unwrap(),
+            n("/muas/alice/NDNSF/REQUEST/x/r1"),
+            b"hi",
+        )
+        .unwrap();
         let got = verify_message(
             &kc.validator(),
             blob,
@@ -288,6 +304,9 @@ mod tests {
             &n("/muas/alice/NDNSF/REQUEST/x/r2"), // routed as r2 — must be rejected
         )
         .await;
-        assert!(got.is_none(), "a message must not verify under a coordinate it wasn't signed for");
+        assert!(
+            got.is_none(),
+            "a message must not verify under a coordinate it wasn't signed for"
+        );
     }
 }

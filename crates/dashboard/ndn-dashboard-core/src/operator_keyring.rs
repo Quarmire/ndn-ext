@@ -25,11 +25,11 @@
 use std::sync::{Arc, OnceLock, RwLock};
 
 use bytes::Bytes;
+use ndn_packet::{Name, SignatureType};
 use ndn_security::custodian::{
     Custodian, CustodianRef, CustodianSigner, InPageCustodian, KeyId, RemoteCustodian,
     RemoteSignerTransport,
 };
-use ndn_packet::{Name, SignatureType};
 use ndn_security::{EcdsaP256Signer, Ed25519Signer, Signer};
 
 /// One identity the dashboard holds and can sign as.
@@ -248,7 +248,8 @@ pub fn provision_remote_signer_from_cert(
     transport: Arc<dyn RemoteSignerTransport>,
     kind: CustodianRef,
 ) -> Result<String, String> {
-    let cert = ndn_packet::Data::decode(cert_wire).map_err(|e| format!("certificate decode: {e:?}"))?;
+    let cert =
+        ndn_packet::Data::decode(cert_wire).map_err(|e| format!("certificate decode: {e:?}"))?;
     let cert_name = (*cert.name).clone();
     let key_name = key_name_from_cert(&cert_name);
     let sig_type = cert
@@ -256,7 +257,14 @@ pub fn provision_remote_signer_from_cert(
         .map(|si| si.sig_type)
         .ok_or("certificate has no SignatureInfo")?;
     let public_key = cert.content().cloned();
-    provision_remote_signer(key_name, Some(cert_name), sig_type, public_key, transport, kind);
+    provision_remote_signer(
+        key_name,
+        Some(cert_name),
+        sig_type,
+        public_key,
+        transport,
+        kind,
+    );
     active_identity_name().ok_or_else(|| "provisioned but no active identity".into())
 }
 
@@ -325,7 +333,8 @@ pub fn provision_imported(
 /// it's the single entry point for both SafeBag import and unlocking a
 /// persisted identity. Returns the identity name on success.
 pub fn provision_from_safebag(wire: &[u8], passphrase: &[u8]) -> Result<String, String> {
-    let bag = ndn_security::safebag::SafeBag::decode(wire).map_err(|e| format!("SafeBag decode: {e}"))?;
+    let bag =
+        ndn_security::safebag::SafeBag::decode(wire).map_err(|e| format!("SafeBag decode: {e}"))?;
     let pkcs8 = bag
         .decrypt_pkcs8(passphrase)
         .map_err(|e| format!("decrypt failed (wrong passphrase?): {e}"))?;
@@ -347,9 +356,7 @@ fn key_name_from_cert(cert_name: &Name) -> Name {
         .position(|c| c.typ == NAME_COMPONENT && c.value.as_ref() == b"KEY");
     match key_idx {
         // identity.../KEY/<keyid> → keep through keyid.
-        Some(i) if i + 1 < comps.len() => {
-            Name::from_components(comps[..=i + 1].iter().cloned())
-        }
+        Some(i) if i + 1 < comps.len() => Name::from_components(comps[..=i + 1].iter().cloned()),
         _ => cert_name.clone(),
     }
 }
@@ -498,7 +505,7 @@ mod tests {
     use super::*;
     use ndn_security::custodian::{CustodianError, RemoteSignRequest};
     use ndn_security::verifier::EcdsaSha256Verifier;
-    use ndn_security::{VerifyOutcome, Verifier, encode_cert_data};
+    use ndn_security::{Verifier, VerifyOutcome, encode_cert_data};
 
     /// A loopback "phone": a local signer standing in for a paired remote
     /// device, so the keyring's remote-signer wiring is testable without one.
@@ -528,7 +535,10 @@ mod tests {
         let ed: Name = "/op/dash/KEY/k1".parse().unwrap();
         provision_ed25519(ed.clone(), &[5u8; 32]);
         assert!(is_provisioned());
-        assert_eq!(command_signer().unwrap().key_name().to_string(), "/op/dash/KEY/k1");
+        assert_eq!(
+            command_signer().unwrap().key_name().to_string(),
+            "/op/dash/KEY/k1"
+        );
 
         // Provision an ECDSA identity with a cert name → becomes active, and
         // its cert name surfaces in the signer (the command KeyLocator).
@@ -544,12 +554,18 @@ mod tests {
         // Both identities are held.
         let ids = list_identities();
         assert!(ids.iter().any(|i| i.key_name == "/op/dash/KEY/k1"));
-        assert!(ids.iter().any(|i| i.key_name == "/op/dash/KEY/ec" && i.active));
+        assert!(
+            ids.iter()
+                .any(|i| i.key_name == "/op/dash/KEY/ec" && i.active)
+        );
         assert_eq!(ids.iter().filter(|i| i.active).count(), 1);
 
         // Switch back to the Ed25519 identity.
         assert!(set_active("/op/dash/KEY/k1"));
-        assert_eq!(command_signer().unwrap().key_name().to_string(), "/op/dash/KEY/k1");
+        assert_eq!(
+            command_signer().unwrap().key_name().to_string(),
+            "/op/dash/KEY/k1"
+        );
         assert_eq!(active_identity_name().as_deref(), Some("/op/dash"));
 
         // Forget it → active clears.

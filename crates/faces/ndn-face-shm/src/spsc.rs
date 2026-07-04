@@ -1004,7 +1004,10 @@ where
 /// **Client side of the Option-A handshake:** connect to the control socket at
 /// `path`, present `token`, receive the face's three fds, and build the
 /// [`SpscHandle`]. Blocking — call via `spawn_blocking` from async code.
-pub fn connect_fd_handoff(path: &std::path::Path, token: &ShmToken) -> Result<SpscHandle, ShmError> {
+pub fn connect_fd_handoff(
+    path: &std::path::Path,
+    token: &ShmToken,
+) -> Result<SpscHandle, ShmError> {
     let mut s = std::os::unix::net::UnixStream::connect(path).map_err(ShmError::Io)?;
     if !mutual_auth_client(&mut s, token).map_err(ShmError::Io)? {
         return Err(ShmError::Io(std::io::Error::other(
@@ -1333,10 +1336,8 @@ impl SpscFace {
     /// [`Self::try_peek_consume_a2e`] is guaranteed to find the packet (only we
     /// remove from this ring; the producer can only add).
     fn a2e_has_data(&self) -> bool {
-        let tail =
-            unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_A2E_TAIL) as *mut u32) };
-        let head =
-            unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_A2E_HEAD) as *mut u32) };
+        let tail = unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_A2E_TAIL) as *mut u32) };
+        let head = unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_A2E_HEAD) as *mut u32) };
         head.load(Ordering::Relaxed) != tail.load(Ordering::Acquire)
     }
 
@@ -1372,10 +1373,8 @@ impl SpscFace {
     }
 
     fn e2a_has_space(&self) -> bool {
-        let tail =
-            unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_E2A_TAIL) as *mut u32) };
-        let head =
-            unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_E2A_HEAD) as *mut u32) };
+        let tail = unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_E2A_TAIL) as *mut u32) };
+        let head = unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_E2A_HEAD) as *mut u32) };
         tail.load(Ordering::Relaxed)
             .wrapping_sub(head.load(Ordering::Acquire))
             < self.capacity
@@ -1386,11 +1385,7 @@ impl SpscFace {
     /// shared memory, no intermediate buffer or memcpy (the producer mirror of
     /// [`recv_with`](Self::recv_with)). Same yield-until-space backpressure +
     /// parked-peer wakeup as [`send_bytes`](Self::send_bytes).
-    pub async fn send_with(
-        &self,
-        len: usize,
-        f: impl FnOnce(&mut [u8]),
-    ) -> Result<(), FaceError> {
+    pub async fn send_with(&self, len: usize, f: impl FnOnce(&mut [u8])) -> Result<(), FaceError> {
         if len > self.slot_size as usize {
             return Err(FaceError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -1499,20 +1494,28 @@ impl SpscFace {
         let mut f = Some(f);
         loop {
             if self.a2e_has_data() {
-                return Ok(self.try_peek_consume_a2e(f.take().unwrap()).expect("data present"));
+                return Ok(self
+                    .try_peek_consume_a2e(f.take().unwrap())
+                    .expect("data present"));
             }
             for _ in 0..SPIN_ITERS {
                 std::hint::spin_loop();
                 if self.a2e_has_data() {
-                    return Ok(self.try_peek_consume_a2e(f.take().unwrap()).expect("data present"));
+                    return Ok(self
+                        .try_peek_consume_a2e(f.take().unwrap())
+                        .expect("data present"));
                 }
             }
             parked.store(1, Ordering::SeqCst);
             if self.a2e_has_data() {
                 parked.store(0, Ordering::Relaxed);
-                return Ok(self.try_peek_consume_a2e(f.take().unwrap()).expect("data present"));
+                return Ok(self
+                    .try_peek_consume_a2e(f.take().unwrap())
+                    .expect("data present"));
             }
-            pipe_await(&self.a2e_rx).await.map_err(|_| FaceError::Closed)?;
+            pipe_await(&self.a2e_rx)
+                .await
+                .map_err(|_| FaceError::Closed)?;
             parked.store(0, Ordering::Relaxed);
         }
     }
@@ -1897,10 +1900,8 @@ impl SpscHandle {
     }
 
     fn e2a_has_data(&self) -> bool {
-        let tail =
-            unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_E2A_TAIL) as *mut u32) };
-        let head =
-            unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_E2A_HEAD) as *mut u32) };
+        let tail = unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_E2A_TAIL) as *mut u32) };
+        let head = unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_E2A_HEAD) as *mut u32) };
         head.load(Ordering::Relaxed) != tail.load(Ordering::Acquire)
     }
 
@@ -1933,10 +1934,8 @@ impl SpscHandle {
     }
 
     fn a2e_has_space(&self) -> bool {
-        let tail =
-            unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_A2E_TAIL) as *mut u32) };
-        let head =
-            unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_A2E_HEAD) as *mut u32) };
+        let tail = unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_A2E_TAIL) as *mut u32) };
+        let head = unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_A2E_HEAD) as *mut u32) };
         tail.load(Ordering::Relaxed)
             .wrapping_sub(head.load(Ordering::Acquire))
             < self.capacity
@@ -1946,11 +1945,7 @@ impl SpscHandle {
     /// `len` bytes into it **in place** via `f` — encode straight into shared
     /// memory, no intermediate buffer or memcpy. Same wall-clock-deadline
     /// backpressure + cancel handling as [`send_bytes`](Self::send_bytes).
-    pub async fn send_with(
-        &self,
-        len: usize,
-        f: impl FnOnce(&mut [u8]),
-    ) -> Result<(), ShmError> {
+    pub async fn send_with(&self, len: usize, f: impl FnOnce(&mut [u8])) -> Result<(), ShmError> {
         if self.cancel.is_cancelled() {
             return Err(ShmError::Closed);
         }
@@ -2337,7 +2332,8 @@ impl SealedReader {
         {
             return Err(ShmError::InvalidMagic);
         }
-        let data = ShmRegion::from_fd_ro(data_fd.as_raw_fd(), sealed_data_size(capacity, slot_size))?;
+        let data =
+            ShmRegion::from_fd_ro(data_fd.as_raw_fd(), sealed_data_size(capacity, slot_size))?;
         let ctrl = ShmRegion::from_fd(ctrl_fd.as_raw_fd(), SEALED_CTRL_SIZE)?;
         // data_fd / ctrl_fd may now drop — the mappings persist.
         set_nonblock_cloexec(wake_fd.as_raw_fd())?;
@@ -2475,8 +2471,8 @@ fn bcast_reg_size(max_consumers: u32) -> usize {
 /// alone can write) and serves each consumer a **read-only** data fd, the shared
 /// **read-write** registry fd, a private wakeup pipe, and its registry index.
 pub struct BroadcastWriter {
-    data: ShmRegion, // read-write mapping (consumers map the same region read-only)
-    reg: ShmRegion,  // read-write mapping (shared consumer registry)
+    data: ShmRegion,     // read-write mapping (consumers map the same region read-only)
+    reg: ShmRegion,      // read-write mapping (shared consumer registry)
     data_ro_fd: OwnedFd, // the read-only data fd, cloned per consumer
     reg_rw_fd: OwnedFd,  // the registry fd, cloned per consumer
     capacity: u32,
@@ -2490,11 +2486,7 @@ impl BroadcastWriter {
     /// Create a broadcast ring sized for `capacity` slots of `slot_size` bytes and up
     /// to `max_consumers` readers. The producer holds the writable mappings; consumers
     /// are added later with [`register_consumer`](Self::register_consumer).
-    pub fn create(
-        capacity: u32,
-        slot_size: u32,
-        max_consumers: u32,
-    ) -> Result<Self, ShmError> {
+    pub fn create(capacity: u32, slot_size: u32, max_consumers: u32) -> Result<Self, ShmError> {
         if capacity == 0 || slot_size == 0 || max_consumers == 0 {
             return Err(ShmError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -2562,9 +2554,10 @@ impl BroadcastWriter {
     fn commit(&self, len: usize, fill: impl FnOnce(&mut [u8])) {
         let t = self.tail().load(Ordering::Relaxed);
         let slot = unsafe {
-            self.data
-                .as_ptr()
-                .add(BCAST_DATA_HEADER + (t % self.capacity as u64) as usize * bcast_slot_stride(self.slot_size))
+            self.data.as_ptr().add(
+                BCAST_DATA_HEADER
+                    + (t % self.capacity as u64) as usize * bcast_slot_stride(self.slot_size),
+            )
         };
         let seq = unsafe { AtomicU64::from_ptr(slot as *mut u64) };
         // Mark the slot "being written" so a reader mid-overwrite rejects it, then
@@ -2691,7 +2684,8 @@ impl BroadcastReader {
             return Err(ShmError::InvalidMagic);
         }
 
-        let data = ShmRegion::from_fd_ro(data_fd.as_raw_fd(), bcast_data_size(capacity, slot_size))?;
+        let data =
+            ShmRegion::from_fd_ro(data_fd.as_raw_fd(), bcast_data_size(capacity, slot_size))?;
         let reg = ShmRegion::from_fd(reg_fd.as_raw_fd(), bcast_reg_size(max_consumers))?;
         set_nonblock_cloexec(wake_fd.as_raw_fd())?;
         let wake_rx = tokio::io::unix::AsyncFd::new(wake_fd).map_err(ShmError::Io)?;
@@ -2751,9 +2745,10 @@ impl BroadcastReader {
             self.next.store(next, Ordering::Relaxed);
         }
         let slot = unsafe {
-            self.data
-                .as_ptr()
-                .add(BCAST_DATA_HEADER + (next % self.capacity as u64) as usize * bcast_slot_stride(self.slot_size))
+            self.data.as_ptr().add(
+                BCAST_DATA_HEADER
+                    + (next % self.capacity as u64) as usize * bcast_slot_stride(self.slot_size),
+            )
         };
         let seq = unsafe { AtomicU64::from_ptr(slot as *mut u64) };
         let s1 = seq.load(Ordering::Acquire);
@@ -3002,7 +2997,10 @@ mod tests {
         let server = std::thread::spawn(move || mutual_auth_server(&mut s, &k));
         let client = mutual_auth_client(&mut c, &k).unwrap();
         assert!(client, "consumer authenticates the producer");
-        assert!(server.join().unwrap().unwrap(), "producer authenticates the consumer");
+        assert!(
+            server.join().unwrap().unwrap(),
+            "producer authenticates the consumer"
+        );
     }
 
     /// A squatter that does NOT know the capability cannot fool the consumer (its
@@ -3016,7 +3014,10 @@ mod tests {
         let server = std::thread::spawn(move || mutual_auth_server(&mut s, &wrong));
         let client = mutual_auth_client(&mut c, &real).unwrap();
         drop(c); // closing lets the squatter's pending read see EOF (no deadlock)
-        assert!(!client, "consumer must reject a producer that can't prove the capability");
+        assert!(
+            !client,
+            "consumer must reject a producer that can't prove the capability"
+        );
         // The squatter never gets a valid client proof (EOF or mismatch).
         assert!(matches!(server.join().unwrap(), Ok(false) | Err(_)));
     }
@@ -3340,8 +3341,14 @@ mod tests {
         let face = SpscFace::create(FaceId(31), &name).unwrap();
         let handle = SpscHandle::connect(&name).unwrap();
 
-        handle.send_bytes(Bytes::from_static(b"first")).await.unwrap();
-        handle.send_bytes(Bytes::from_static(b"second")).await.unwrap();
+        handle
+            .send_bytes(Bytes::from_static(b"first"))
+            .await
+            .unwrap();
+        handle
+            .send_bytes(Bytes::from_static(b"second"))
+            .await
+            .unwrap();
 
         let a = tokio::time::timeout(
             std::time::Duration::from_secs(2),
@@ -3383,14 +3390,20 @@ mod tests {
         // without any shared name (proves the capability is the fd, not a path).
         let mapped = ShmRegion::from_fd(received[0].as_raw_fd(), 4096).unwrap();
         let seen = unsafe { (mapped.as_ptr() as *const u64).read_unaligned() };
-        assert_eq!(seen, 0xFEED_FACE_DEAD_BEEF, "fd-passed region must share memory");
+        assert_eq!(
+            seen, 0xFEED_FACE_DEAD_BEEF,
+            "fd-passed region must share memory"
+        );
 
         // Write through the peer mapping, read through the original → truly shared.
         unsafe {
             (mapped.as_ptr().add(8) as *mut u32).write_unaligned(0x1234_5678);
         }
         let back = unsafe { (region.as_ptr().add(8) as *const u32).read_unaligned() };
-        assert_eq!(back, 0x1234_5678, "writes through the fd mapping must be shared");
+        assert_eq!(
+            back, 0x1234_5678,
+            "writes through the fd mapping must be shared"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3570,7 +3583,10 @@ mod tests {
         assert!(face.try_recv().is_none());
 
         // handle → face: busy-poll until the packet appears.
-        handle.send_bytes(Bytes::from_static(b"poll")).await.unwrap();
+        handle
+            .send_bytes(Bytes::from_static(b"poll"))
+            .await
+            .unwrap();
         let got = loop {
             if let Some(p) = face.try_recv() {
                 break p;
@@ -3704,7 +3720,11 @@ mod tests {
             )
         };
         let errno = std::io::Error::last_os_error().raw_os_error();
-        assert_eq!(attempt, libc::MAP_FAILED, "writable mapping must be refused");
+        assert_eq!(
+            attempt,
+            libc::MAP_FAILED,
+            "writable mapping must be refused"
+        );
         assert!(matches!(errno, Some(libc::EACCES) | Some(libc::EPERM)));
     }
 
@@ -3715,7 +3735,10 @@ mod tests {
         let writer = BroadcastWriter::create(4, 64, 1).unwrap();
         let r = reader_from(&writer);
         writer.publish(&7u32.to_le_bytes());
-        assert_eq!(u32::from_le_bytes(r.recv().await.unwrap().try_into().unwrap()), 7);
+        assert_eq!(
+            u32::from_le_bytes(r.recv().await.unwrap().try_into().unwrap()),
+            7
+        );
         drop(writer); // closes the wake pipe write end
         assert!(r.recv().await.is_none(), "producer gone ⇒ end of stream");
     }

@@ -61,7 +61,6 @@ impl WriteCapability {
             }
         }
     }
-
 }
 
 /// Predict the write capability from polled state. `cert_expired` is the

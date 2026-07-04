@@ -105,7 +105,9 @@ mod tests {
 
     #[test]
     fn always_on_never_sleeps_but_paces_bursts() {
-        let ao = AlwaysOn { burst_interval_usec: 1000 };
+        let ao = AlwaysOn {
+            burst_interval_usec: 1000,
+        };
         assert!(ao.in_window(0));
         assert!(ao.in_window(999_999)); // the window is always open
         assert_eq!(ao.window_index(0), 0);

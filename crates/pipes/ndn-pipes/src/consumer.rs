@@ -12,9 +12,7 @@ use ndn_packet::encode::{DataBuilder, InterestBuilder};
 use ndn_packet::{Interest, Name};
 
 use crate::crypto::{ConsumerSession, PIPE_ID_LEN, PIPE_KEY_LEN};
-use crate::message::{
-    GHL, check_name, context_name, decode_seek_reply, join_name, seek_name,
-};
+use crate::message::{GHL, check_name, context_name, decode_seek_reply, join_name, seek_name};
 use crate::pathcontrol::{now_seq, pipe_teardown_interest};
 use crate::{Pipe, PipeError, PipeId, PipeParams};
 
@@ -241,7 +239,10 @@ impl PipeConsumer {
         // The teardown is emitted on the way in; no Data returns, so this short wait is
         // only a flush/settle window (the forwarder reaps as it processes the walk), not
         // a round-trip — hence the timeout is expected and ignored.
-        let _ = self.consumer.fetch_wire(wire, Duration::from_millis(250)).await;
+        let _ = self
+            .consumer
+            .fetch_wire(wire, Duration::from_millis(250))
+            .await;
         Ok(())
     }
 

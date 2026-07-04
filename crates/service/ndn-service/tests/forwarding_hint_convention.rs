@@ -13,7 +13,9 @@ use ndn_discovery::ServiceDiscoveryProtocol;
 use ndn_packet::encode::DataBuilder;
 use ndn_packet::{Data, Interest, Name};
 use ndn_rpc::{RpcCarrier, RpcError, RpcHandler, RpcRegistry};
-use ndn_service::{DiscoveryCarrier, NamingConvention, ProviderDirectory, ServiceDiscoveryDirectory};
+use ndn_service::{
+    DiscoveryCarrier, NamingConvention, ProviderDirectory, ServiceDiscoveryDirectory,
+};
 use ndn_service_core::{Carrier, OpId, ServiceId};
 
 fn n(s: &str) -> Name {
@@ -53,7 +55,11 @@ async fn forwarding_hint_convention_shares_name_and_steers_by_hint() {
 
     // The directory resolves a shared callable with per-node forwarding hints.
     let entries = dir.providers(&svc).await;
-    assert_eq!(entries.len(), 2, "both providers discovered under the shared name");
+    assert_eq!(
+        entries.len(),
+        2,
+        "both providers discovered under the shared name"
+    );
     assert!(
         entries.iter().all(|e| e.callable == n("/svc/echo")),
         "shared content name across providers"
@@ -62,12 +68,18 @@ async fn forwarding_hint_convention_shares_name_and_steers_by_hint() {
         .iter()
         .filter_map(|e| e.forwarding_hint.as_ref().map(|h| h.to_string()))
         .collect();
-    assert!(hints.contains("/p1") && hints.contains("/p2"), "per-node hints: {hints:?}");
+    assert!(
+        hints.contains("/p1") && hints.contains("/p2"),
+        "per-node hints: {hints:?}"
+    );
 
     // Through the carrier: invoke the shared name; the selected provider's hint
     // rides on the Interest (a real forwarder steers by it).
     let consumer = DiscoveryCarrier::new(dir, RpcCarrier::with_registry(registry), n("/consumer"));
-    consumer.invoke(&svc, &OpId::new("echo"), bytes::Bytes::new()).await.unwrap();
+    consumer
+        .invoke(&svc, &OpId::new("echo"), bytes::Bytes::new())
+        .await
+        .unwrap();
     let got = captured.lock().unwrap().clone();
     assert!(
         got == Some("/p1".to_string()) || got == Some("/p2".to_string()),

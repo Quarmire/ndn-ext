@@ -25,14 +25,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use ndn_radio_cognition::{
-    ARMS, ChannelOccupancy, Context, ContextualBandit, Demand, DemandTracker, MediumState,
-    MediumView, NameContext, NeighborReport, PolicyConfig, RadioActuators, RadioCapability, RadioId,
-    RadioPlan, RadioPolicy, RadioStrategy, RateCalibrator, TxParams, apply_arm, decode_report,
-    default_thresholds, encode_report, reward,
-};
 #[cfg(any(test, feature = "libusb-backend"))]
 use ndn_radio_cognition::RadioAllocation;
+use ndn_radio_cognition::{
+    ARMS, ChannelOccupancy, Context, ContextualBandit, Demand, DemandTracker, MediumState,
+    MediumView, NameContext, NeighborReport, PolicyConfig, RadioActuators, RadioCapability,
+    RadioId, RadioPlan, RadioPolicy, RadioStrategy, RateCalibrator, TxParams, apply_arm,
+    decode_report, default_thresholds, encode_report, reward,
+};
 use ndn_signals_core::SignalView;
 use ndn_transport::link_service::{InboundLpFrame, IngressCtx, LinkServiceFeature, TickCtx};
 
@@ -226,11 +226,11 @@ impl RadioControl {
     /// in-record). Use [`ndn_radio_cognition::prefix_hash`] to derive the key. A
     /// re-expression is fed to the rate calibrator as a delivery **miss**.
     pub fn on_interest(&self, prefix_hash: u64, downstream_face: FaceId, now_ms: u64) {
-        let reexpressed = self
-            .demand_tracker
-            .lock()
-            .unwrap()
-            .on_interest(prefix_hash, downstream_face.0, now_ms);
+        let reexpressed =
+            self.demand_tracker
+                .lock()
+                .unwrap()
+                .on_interest(prefix_hash, downstream_face.0, now_ms);
         if reexpressed {
             self.observe_delivery(false);
         }
@@ -239,7 +239,10 @@ impl RadioControl {
     /// The forwarder returned Data for `prefix_hash` (satisfies the in-records, and
     /// is fed to the rate calibrator as a delivery **success**).
     pub fn on_data(&self, prefix_hash: u64, now_ms: u64) {
-        self.demand_tracker.lock().unwrap().on_data(prefix_hash, now_ms);
+        self.demand_tracker
+            .lock()
+            .unwrap()
+            .on_data(prefix_hash, now_ms);
         self.observe_delivery(true);
     }
 
@@ -266,7 +269,14 @@ impl RadioControl {
                 let m = self.medium.lock().unwrap();
                 records
                     .iter()
-                    .map(|(r, _)| (*r, m.capability(RadioId(*r)).map(|c| c.max_tx_power).unwrap_or(63)))
+                    .map(|(r, _)| {
+                        (
+                            *r,
+                            m.capability(RadioId(*r))
+                                .map(|c| c.max_tx_power)
+                                .unwrap_or(63),
+                        )
+                    })
                     .collect()
             };
             let arms = self.last_arm.lock().unwrap();
@@ -313,7 +323,11 @@ impl RadioControl {
             *s = s.wrapping_add(1);
             *s
         };
-        let rep = self.medium.lock().unwrap().snapshot_report(self.node_id, seq, now_ms);
+        let rep = self
+            .medium
+            .lock()
+            .unwrap()
+            .snapshot_report(self.node_id, seq, now_ms);
         Some(Bytes::from(encode_report(&rep)))
     }
 
@@ -359,7 +373,10 @@ impl RadioControl {
         self.medium.lock().unwrap().observe_occupancy(occ);
     }
     pub fn observe_demand(&self, prefix_hash: u64, demand: Demand) {
-        self.medium.lock().unwrap().observe_demand(prefix_hash, demand);
+        self.medium
+            .lock()
+            .unwrap()
+            .observe_demand(prefix_hash, demand);
     }
     pub fn observe_reinterest(&self, prefix_hash: u64, rate: f32, now_ms: u64) {
         self.medium
@@ -445,7 +462,10 @@ impl RadioControl {
                         let cap = m.capability(alloc.radio);
                         (
                             m.weakest_rssi(alloc.radio, now_ms).unwrap_or(-90),
-                            alloc.channel.and_then(|ch| m.busy_pct(alloc.radio, ch)).unwrap_or(0),
+                            alloc
+                                .channel
+                                .and_then(|ch| m.busy_pct(alloc.radio, ch))
+                                .unwrap_or(0),
                             m.receiver_count(now_ms),
                             cap.as_ref().map(|c| c.max_mcs).unwrap_or(9),
                             cap.as_ref().map(|c| c.max_tx_power).unwrap_or(63),
@@ -454,7 +474,10 @@ impl RadioControl {
                     let ctx = Context::new(rssi, busy, recv, name_ctx.priority.rank());
                     let arm = bandit.lock().unwrap().select(&ctx);
                     apply_arm(&ARMS[arm], &mut alloc.params, max_mcs, max_power);
-                    self.last_arm.lock().unwrap().insert(alloc.radio.0, (ctx, arm));
+                    self.last_arm
+                        .lock()
+                        .unwrap()
+                        .insert(alloc.radio.0, (ctx, arm));
                 }
             }
         } else if self.calibrator.is_some() && self.probe_interval > 0 {
@@ -677,7 +700,9 @@ impl RadioActuators for LibUsbActuator {
             last.csd = Some(p.csd);
         }
         if last.edcca != Some(p.edcca_ignore) {
-            self.knobs.set_edcca_ignore(p.edcca_ignore).map_err(to_err)?;
+            self.knobs
+                .set_edcca_ignore(p.edcca_ignore)
+                .map_err(to_err)?;
             last.edcca = Some(p.edcca_ignore);
         }
         // Power: only when the plane asks to back off — `None` preserves the
@@ -750,7 +775,10 @@ mod tests {
         let applied = mock.last.read().unwrap().expect("actuator applied");
         assert_eq!(applied.radio, W);
         let mcs = applied.params.mcs.expect("mcs decided");
-        assert!(mcs >= 7, "strong unicast link should pick a high MCS, got {mcs}");
+        assert!(
+            mcs >= 7,
+            "strong unicast link should pick a high MCS, got {mcs}"
+        );
         assert_eq!(applied.role, AllocRole::Replicate);
     }
 
@@ -768,7 +796,10 @@ mod tests {
         c2.tick_now(1_000);
         let strong_mcs = mock2.last.read().unwrap().unwrap().params.mcs.unwrap();
 
-        assert!(weak_mcs < strong_mcs, "weak {weak_mcs} should be < strong {strong_mcs}");
+        assert!(
+            weak_mcs < strong_mcs,
+            "weak {weak_mcs} should be < strong {strong_mcs}"
+        );
     }
 
     #[test]
@@ -782,7 +813,10 @@ mod tests {
         c.set_active(vec![ctx]);
         let plans = c.tick_now(1_000);
         assert!(plans[0].suppress);
-        assert!(mock.last.read().unwrap().is_none(), "suppressed ⇒ no actuator apply");
+        assert!(
+            mock.last.read().unwrap().is_none(),
+            "suppressed ⇒ no actuator apply"
+        );
     }
 
     #[test]
@@ -797,8 +831,18 @@ mod tests {
         });
         // make 149 the only/least-busy by leaving others unmeasured? others default 0,
         // so pick_channel would avoid 149. Mark all busy so 149 (busy) can be chosen:
-        c.observe_occupancy(ChannelOccupancy { radio: W, channel: 161, busy_pct: 90, ts_ms: 1_000 });
-        c.observe_occupancy(ChannelOccupancy { radio: W, channel: 165, busy_pct: 95, ts_ms: 1_000 });
+        c.observe_occupancy(ChannelOccupancy {
+            radio: W,
+            channel: 161,
+            busy_pct: 90,
+            ts_ms: 1_000,
+        });
+        c.observe_occupancy(ChannelOccupancy {
+            radio: W,
+            channel: 165,
+            busy_pct: 95,
+            ts_ms: 1_000,
+        });
         let ctx = NameContext {
             priority: Priority::Urgent,
             ..NameContext::new(0xABCD)
@@ -844,18 +888,17 @@ mod tests {
 
         c.on_data(0xABCD, 1_100); // Data returns → in-records cleared
         let plans = c.tick_now(1_100);
-        assert!(plans.is_empty(), "satisfied object is no longer transmitted");
+        assert!(
+            plans.is_empty(),
+            "satisfied object is no longer transmitted"
+        );
     }
 
     #[test]
     fn calibration_drops_rate_after_repeated_misses() {
         use ndn_radio_cognition::PolicyConfig;
         let mut c = RadioControl::new_calibrated(PolicyConfig::default(), 0.9, 2.0);
-        c.register_radio(
-            W,
-            FaceId(10),
-            RadioCapability::wifi_monitor_5ghz(vec![149]),
-        );
+        c.register_radio(W, FaceId(10), RadioCapability::wifi_monitor_5ghz(vec![149]));
         c.add_actuator(Arc::new(MockActuator {
             radio: W,
             last: RwLock::new(None),
@@ -887,7 +930,10 @@ mod tests {
     #[test]
     fn no_calibrator_means_static_behavior() {
         let (c, _m) = control_with_mock();
-        assert!(c.learned_thresholds().is_none(), "default control is static");
+        assert!(
+            c.learned_thresholds().is_none(),
+            "default control is static"
+        );
     }
 
     #[test]
@@ -909,7 +955,10 @@ mod tests {
         a.set_active(vec![NameContext::new(0xF00D)]);
         let plan = a.tick_now(2_000).pop().unwrap();
         let mcs = plan.allocations[0].params.mcs.unwrap();
-        assert!(mcs >= 7, "measured -55 outbound link should yield a high MCS, got {mcs}");
+        assert!(
+            mcs >= 7,
+            "measured -55 outbound link should yield a high MCS, got {mcs}"
+        );
     }
 
     #[test]
@@ -946,8 +995,8 @@ mod tests {
     #[test]
     fn probing_occasionally_samples_the_next_rate_up() {
         use ndn_radio_cognition::PolicyConfig;
-        let c = RadioControl::new_calibrated(PolicyConfig::default(), 0.9, 1.0)
-            .with_probe_interval(2); // every 2nd tick is a probe
+        let c =
+            RadioControl::new_calibrated(PolicyConfig::default(), 0.9, 1.0).with_probe_interval(2); // every 2nd tick is a probe
         let c = {
             let mut c = c;
             c.register_radio(W, FaceId(10), RadioCapability::wifi_monitor_5ghz(vec![149]));
@@ -967,7 +1016,11 @@ mod tests {
         c.tick_now(1_000); // probe_count=2 (probe)
         let probed = mock.last.read().unwrap().unwrap().params.mcs.unwrap();
 
-        assert_eq!(probed, steady + 1, "probe should sample one rung up: {probed} vs {steady}");
+        assert_eq!(
+            probed,
+            steady + 1,
+            "probe should sample one rung up: {probed} vs {steady}"
+        );
     }
 
     #[test]
@@ -988,8 +1041,14 @@ mod tests {
         let weak_pwr = mock_weak.last.read().unwrap().unwrap().params.tx_power;
 
         assert!(strong_pwr.is_some(), "strong link should back off power");
-        assert!(strong_pwr.unwrap() < 63, "backed-off power below calibrated max");
-        assert!(weak_pwr.is_none(), "weak link keeps full calibrated power (None)");
+        assert!(
+            strong_pwr.unwrap() < 63,
+            "backed-off power below calibrated max"
+        );
+        assert!(
+            weak_pwr.is_none(),
+            "weak link keeps full calibrated power (None)"
+        );
     }
 
     #[test]
@@ -1069,6 +1128,9 @@ mod tests {
         c.observe_rx(W, 99, Some(-50), 1_000);
         c.set_active(vec![NameContext::new(0xABCD)]);
         c.tick_now(1_000);
-        assert!(cell.read().unwrap().is_some(), "face would now read decided params");
+        assert!(
+            cell.read().unwrap().is_some(),
+            "face would now read decided params"
+        );
     }
 }

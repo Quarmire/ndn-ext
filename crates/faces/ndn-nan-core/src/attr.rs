@@ -13,8 +13,8 @@
 
 use alloc::vec::Vec;
 
-use crate::wire::{Reader, WireError, WriteExt};
 use crate::ServiceId;
+use crate::wire::{Reader, WireError, WriteExt};
 
 /// NAN attribute IDs (from the Wi-Fi Aware spec / Wireshark `wifi_nan`
 /// dissector). The full catalog is listed for reference; only a subset is typed
@@ -750,7 +750,10 @@ mod tests {
         assert_eq!(buf.len(), 3 + len);
         let attr = Attributes::find(&buf, AttributeId::NanAvailability).unwrap();
         // Attribute Control: map id 0, committed-changed bit set.
-        assert_eq!(u16::from_le_bytes([attr.body[0], attr.body[1]]) & 0x10, 0x10);
+        assert_eq!(
+            u16::from_le_bytes([attr.body[0], attr.body[1]]) & 0x10,
+            0x10
+        );
         // The whole frame still iterates cleanly as one attribute.
         assert_eq!(Attributes::new(&buf).flatten().count(), 1);
     }

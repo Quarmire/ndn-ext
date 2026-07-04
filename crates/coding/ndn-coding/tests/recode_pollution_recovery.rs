@@ -219,7 +219,10 @@ fn recover_time_under_pollution() {
     for set in [None, Some(&f1), Some(&f4)] {
         let o = simulate(&sources, set, 0, 0xBEEF);
         assert!(o.recovered);
-        assert_eq!(o.offered, K as usize, "clean channel needs exactly K offers");
+        assert_eq!(
+            o.offered, K as usize,
+            "clean channel needs exactly K offers"
+        );
         assert_eq!(o.restarts, 0);
     }
 

@@ -53,11 +53,14 @@ pub fn issue_decryption_key(
     requester: &Name,
     recipient_public: &[u8],
 ) -> Result<Bytes, IssueError> {
-    let grant = policy.grant_state(requester).ok_or(IssueError::Unauthorized)?;
+    let grant = policy
+        .grant_state(requester)
+        .ok_or(IssueError::Unauthorized)?;
     if grant.revoked {
         return Err(IssueError::Revoked);
     }
-    let expr = PolicyExpr::parse(&grant.policy).map_err(|e| IssueError::BadPolicy(format!("{e:?}")))?;
+    let expr =
+        PolicyExpr::parse(&grant.policy).map_err(|e| IssueError::BadPolicy(format!("{e:?}")))?;
     kp.issue_with_policy(requester, &expr, recipient_public)
         .map_err(|e| IssueError::Issue(e.to_string()))
 }

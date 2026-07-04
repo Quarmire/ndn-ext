@@ -38,7 +38,8 @@ async fn main() -> Result<()> {
     let backend = build_backend(&args)?;
     // Embedded forwarder with just the radio face; Disabled profile relays
     // peer Data (Default drops unsigned peer Data).
-    let mut builder = EngineBuilder::new(Default::default()).security_profile(SecurityProfile::Disabled);
+    let mut builder =
+        EngineBuilder::new(Default::default()).security_profile(SecurityProfile::Disabled);
 
     // Rate control. Default = fixed MCS1: measurement shows this link is
     // power-starved (peer hears us at ~-74 dBm at 2 ft), so MCS>1 delivers ~0%
@@ -50,7 +51,10 @@ async fn main() -> Result<()> {
         println!("rate: ADAPTIVE (RSSI-driven MCS)");
         face.with_adaptive_mcs()
     } else {
-        let n = std::env::var("RADIO_PING_MCS").ok().and_then(|s| s.parse::<u8>().ok()).unwrap_or(1);
+        let n = std::env::var("RADIO_PING_MCS")
+            .ok()
+            .and_then(|s| s.parse::<u8>().ok())
+            .unwrap_or(1);
         println!("rate: FIXED MCS{n}");
         face.with_fixed_mcs(McsDescriptor::ht(n))
     };
@@ -106,7 +110,10 @@ async fn main() -> Result<()> {
                     Ok(data) => {
                         let content = data.content().map(|c| c.as_ref()).unwrap_or(&[]);
                         // Verify the reassembled content matches the pattern.
-                        let bad = content.iter().enumerate().find(|(j, b)| **b != (*j & 0xff) as u8);
+                        let bad = content
+                            .iter()
+                            .enumerate()
+                            .find(|(j, b)| **b != (*j & 0xff) as u8);
                         let verdict = match bad {
                             None => "pattern OK".to_string(),
                             Some((j, b)) => format!("MISMATCH at {j}: {:#x}", *b),
@@ -123,7 +130,8 @@ async fn main() -> Result<()> {
                             println!(
                                 "  radio link signals: RSSI {} dBm, rate {} Mb/s",
                                 sig.rssi_dbm.map_or("?".into(), |r| r.to_string()),
-                                sig.observed_tput_bps.map_or("?".into(), |b| (b / 1_000_000).to_string()),
+                                sig.observed_tput_bps
+                                    .map_or("?".into(), |b| (b / 1_000_000).to_string()),
                             );
                         }
                         got = true;
@@ -157,7 +165,10 @@ fn build_backend(args: &[String]) -> Result<Arc<dyn WifiRadio>> {
         let _chan_idx = i + 1;
         #[cfg(feature = "libusb")]
         {
-            let chan: u8 = args.get(_chan_idx).and_then(|s| s.parse().ok()).unwrap_or(149);
+            let chan: u8 = args
+                .get(_chan_idx)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(149);
             let be = ndn_face_monitor_wifi::LibUsbRtl88xxBackend::open_monitor(chan)?;
             println!("RTL8812EU (userspace/libusb) up on ch{chan}");
             return Ok(Arc::new(be));
@@ -169,7 +180,10 @@ fn build_backend(args: &[String]) -> Result<Arc<dyn WifiRadio>> {
         let _iface_idx = i + 1;
         #[cfg(target_os = "linux")]
         {
-            let iface = args.get(_iface_idx).cloned().unwrap_or_else(|| "wlu1u1".into());
+            let iface = args
+                .get(_iface_idx)
+                .cloned()
+                .unwrap_or_else(|| "wlu1u1".into());
             let be = ndn_face_monitor_wifi::AfPacketBackend::new(
                 &iface,
                 ndn_face_monitor_wifi::FrameFormat::default(),

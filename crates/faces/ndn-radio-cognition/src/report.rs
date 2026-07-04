@@ -169,7 +169,11 @@ mod tests {
         let mut r = sample();
         r.heard_prefixes = (0..1000).collect();
         let dec = decode_report(&encode_report(&r)).unwrap();
-        assert_eq!(dec.heard_prefixes.len(), MAX_ENTRIES, "encode caps at MAX_ENTRIES");
+        assert_eq!(
+            dec.heard_prefixes.len(),
+            MAX_ENTRIES,
+            "encode caps at MAX_ENTRIES"
+        );
     }
 
     #[test]

@@ -16,7 +16,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     cbw[15] = 0x1b; // START STOP UNIT
     cbw[19] = 0x02; // LOEJ=1
 
-    let secs: u64 = std::env::var("NDN_RADIO_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(45);
+    let secs: u64 = std::env::var("NDN_RADIO_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(45);
     println!("RACING the macOS mass-storage driver for ~{secs}s.");
     println!(">>> UNPLUG the dongle, wait 2s, then PLUG IT BACK IN now. <<<");
     println!("(I'll grab + eject it the instant it enumerates, before macOS claims it.)");
@@ -49,7 +52,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 for ep in d.endpoint_descriptors() {
                                     if ep.transfer_type() == TransferType::Bulk {
                                         match ep.direction() {
-                                            Direction::Out => { iface_n = iface.number(); ep_out = ep.address(); }
+                                            Direction::Out => {
+                                                iface_n = iface.number();
+                                                ep_out = ep.address();
+                                            }
                                             Direction::In => ep_in = ep.address(),
                                         }
                                     }
@@ -58,11 +64,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         let _ = handle.detach_kernel_driver(iface_n);
                         if handle.claim_interface(iface_n).is_ok() {
-                            println!("\n*** WON THE RACE (after {attempts} tries)! claimed iface {iface_n}, sending eject ... ***");
+                            println!(
+                                "\n*** WON THE RACE (after {attempts} tries)! claimed iface {iface_n}, sending eject ... ***"
+                            );
                             let _ = handle.write_bulk(ep_out, &cbw, Duration::from_millis(500));
                             let mut csw = [0u8; 13];
                             let _ = handle.read_bulk(ep_in, &mut csw, Duration::from_millis(300));
-                            println!("eject sent — dongle should re-enumerate as WiFi mode (0bda:c811/c820).");
+                            println!(
+                                "eject sent — dongle should re-enumerate as WiFi mode (0bda:c811/c820)."
+                            );
                             std::thread::sleep(Duration::from_secs(2));
                             return Ok(());
                         }

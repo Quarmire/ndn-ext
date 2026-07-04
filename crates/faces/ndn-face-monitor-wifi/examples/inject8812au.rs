@@ -32,7 +32,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::var_os("NDN_SKIP_CAL").is_none() {
         let iqk = b.iq_calibrate()?;
         b.lc_calibrate()?;
-        println!("✓ radio up on ch6 — IQK A.TX={} B.TX={}", iqk.tx_a, iqk.tx_b);
+        println!(
+            "✓ radio up on ch6 — IQK A.TX={} B.TX={}",
+            iqk.tx_a, iqk.tx_b
+        );
     } else {
         println!("✓ radio up on ch6 — calibration SKIPPED (NDN_SKIP_CAL)");
     }
@@ -42,7 +45,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if mode == "rxdiag" {
         // Dump the RX datapath registers to see why bulk-IN delivers nothing.
-        println!("CR(0x100)        = {:#06x}  (MACRXEN bit7)", b.read16(0x100)?);
+        println!(
+            "CR(0x100)        = {:#06x}  (MACRXEN bit7)",
+            b.read16(0x100)?
+        );
         println!("RCR(0x608)       = {:#010x}", b.read32(0x608)?);
         println!("TRXDMA_CTRL(0x10C)= {:#06x}", b.read16(0x10c)?);
         println!("RXFF_BNDY(0x114) = {:#06x}", b.read16(0x114)?);
@@ -59,7 +65,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         println!("RXDMA_STATUS(0x288) = {:#010x}", b.read32(0x288)?);
         println!("USB_SPECIAL_OPT(0xFE55) = {:#04x}", b.read8(0xfe55)?);
-        println!("USB_AGG_TO(0xFE5C)/TH(0xFE5D) = {:#04x}/{:#04x}", b.read8(0xfe5c)?, b.read8(0xfe5d)?);
+        println!(
+            "USB_AGG_TO(0xFE5C)/TH(0xFE5D) = {:#04x}/{:#04x}",
+            b.read8(0xfe5c)?,
+            b.read8(0xfe5d)?
+        );
         return Ok(());
     }
 

@@ -10,7 +10,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let t0 = std::time::Instant::now();
         let mut n = 0;
         while t0.elapsed().as_secs() < secs {
-            if b.recv_raw(200)?.is_some() { n += 1; }
+            if b.recv_raw(200)?.is_some() {
+                n += 1;
+            }
         }
         Ok(n)
     };
@@ -22,7 +24,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("forced IGI -> {:#010x}", b.read32(0x1d70)?);
     println!("ambient after forcing sensitive IGI (4s): {}", count(4)?);
     // also try forcing the path-A RX AGC table gain high via 0x1d70 readback
-    println!("IGI now reads {:#010x} (did AGC overwrite?)", b.read32(0x1d70)?);
+    println!(
+        "IGI now reads {:#010x} (did AGC overwrite?)",
+        b.read32(0x1d70)?
+    );
     Ok(())
 }
 #[cfg(not(feature = "libusb-backend"))]

@@ -185,7 +185,9 @@ impl<M: ManagementClient> DashboardEngine<M> {
             face_id: Some(face_id),
             ..Default::default()
         };
-        self.client.send_cmd("faces", "destroy", Some(&params)).await
+        self.client
+            .send_cmd("faces", "destroy", Some(&params))
+            .await
     }
 
     pub async fn route_register(
@@ -217,7 +219,9 @@ impl<M: ManagementClient> DashboardEngine<M> {
             face_id: (face_id != 0).then_some(face_id),
             ..Default::default()
         };
-        self.client.send_cmd("rib", "unregister", Some(&params)).await
+        self.client
+            .send_cmd("rib", "unregister", Some(&params))
+            .await
     }
 
     pub async fn strategy_set(
@@ -290,7 +294,10 @@ impl<M: ManagementClient> DashboardEngine<M> {
             self.identity.approvals = ndn_mgmt_wire::PendingApproval::decode_all(&resp.body);
             changed.push(StateUpdate::Approvals);
         }
-        if let Ok(resp) = self.client.send_cmd("security", "identity-list", None).await
+        if let Ok(resp) = self
+            .client
+            .send_cmd("security", "identity-list", None)
+            .await
             && resp.is_ok()
         {
             self.identity.identities = SecurityKeyInfo::parse_list(&resp.status_text);
@@ -373,7 +380,11 @@ impl<M: ManagementClient> DashboardEngine<M> {
     /// Deny a pending request by id. An empty `reason` records the default
     /// denial detail. Signed command. The id/reason are joined as
     /// `id:reason` to match the forwarder's `ca/deny` parameter shape.
-    pub async fn ca_deny(&mut self, request_id: &str, reason: &str) -> Result<MgmtResponse, String> {
+    pub async fn ca_deny(
+        &mut self,
+        request_id: &str,
+        reason: &str,
+    ) -> Result<MgmtResponse, String> {
         let uri = if reason.is_empty() {
             request_id.to_owned()
         } else {
@@ -629,9 +640,18 @@ mod tests {
         assert_eq!(calls[2].2.as_ref().unwrap().uri.as_deref(), Some("req-3"));
 
         // anchor-remove carries the key name, not a uri.
-        assert_eq!((calls[3].0.as_str(), calls[3].1.as_str()), ("security", "anchor-remove"));
         assert_eq!(
-            calls[3].2.as_ref().unwrap().name.as_ref().map(|n| n.to_string()),
+            (calls[3].0.as_str(), calls[3].1.as_str()),
+            ("security", "anchor-remove")
+        );
+        assert_eq!(
+            calls[3]
+                .2
+                .as_ref()
+                .unwrap()
+                .name
+                .as_ref()
+                .map(|n| n.to_string()),
             Some("/lab/router-ca/KEY/k0".to_string())
         );
     }
@@ -651,13 +671,22 @@ mod tests {
         let calls = &engine.client().calls;
 
         // anchor-add: name = cert key name, uri = cert wire as lowercase hex.
-        assert_eq!((calls[0].0.as_str(), calls[0].1.as_str()), ("security", "anchor-add"));
+        assert_eq!(
+            (calls[0].0.as_str(), calls[0].1.as_str()),
+            ("security", "anchor-add")
+        );
         let p0 = calls[0].2.as_ref().unwrap();
-        assert_eq!(p0.name.as_ref().map(|n| n.to_string()), Some("/lab/ca/KEY/k0".into()));
+        assert_eq!(
+            p0.name.as_ref().map(|n| n.to_string()),
+            Some("/lab/ca/KEY/k0".into())
+        );
         assert_eq!(p0.uri.as_deref(), Some("deadbeef"));
 
         // safebag-import: uri = `<safebag_hex>:<passphrase_hex>` ("pw" = 70 77).
         assert_eq!(calls[1].1, "safebag-import");
-        assert_eq!(calls[1].2.as_ref().unwrap().uri.as_deref(), Some("0102:7077"));
+        assert_eq!(
+            calls[1].2.as_ref().unwrap().uri.as_deref(),
+            Some("0102:7077")
+        );
     }
 }

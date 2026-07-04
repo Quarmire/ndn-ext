@@ -17,7 +17,9 @@
 
 use ndn_foundation_types::Hash;
 use ndn_packet::Name;
-use ndn_security::abe::{AbeCiphertext, AbeError, KpMasterParams, KpPolicyKey, decrypt_kp, encrypt_kp};
+use ndn_security::abe::{
+    AbeCiphertext, AbeError, KpMasterParams, KpPolicyKey, decrypt_kp, encrypt_kp,
+};
 use ndn_security::confidentiality::{CK_LEN, ContentKey};
 
 use crate::session::{SCOPE_ATTR, ScopeKeyring};

@@ -92,7 +92,11 @@ mod tests {
         let conf = Confidentiality::Aead([7u8; 32]);
         let plain = b"the bulk content a relay must not read";
         let sealed = conf.seal(plain);
-        assert_ne!(sealed.as_ref(), plain, "sealed bulk is ciphertext, not plaintext");
+        assert_ne!(
+            sealed.as_ref(),
+            plain,
+            "sealed bulk is ciphertext, not plaintext"
+        );
         assert_eq!(conf.open(&sealed).unwrap().as_ref(), plain);
         // Wrong key fails (auth) — read-control holds.
         assert!(Confidentiality::Aead([8u8; 32]).open(&sealed).is_none());

@@ -60,8 +60,10 @@ async fn one_node_serves_two_services_routed_by_name() {
     let bob = ServiceNode::new(provider_ps, n("/muas/bob"), n("/muas")).insecure();
     let echo = bob.provider(n("/svc/echo"));
     let cam = bob.provider(n("/svc/cam"));
-    let echo_task = tokio::spawn(async move { echo.serve(|_c, req| Bytes::copy_from_slice(req)).await });
-    let cam_task = tokio::spawn(async move { cam.serve(|_c, _req| Bytes::from_static(b"frame")).await });
+    let echo_task =
+        tokio::spawn(async move { echo.serve(|_c, req| Bytes::copy_from_slice(req)).await });
+    let cam_task =
+        tokio::spawn(async move { cam.serve(|_c, _req| Bytes::from_static(b"frame")).await });
 
     // One user node, calling both services.
     let alice = ServiceNode::new(user_ps, n("/muas/alice"), n("/muas")).insecure();

@@ -50,7 +50,12 @@ pub fn ack_name(provider: &Name, requester: &Name, service: &Name, request_id: &
 }
 
 /// `/<requester>/NDNSF/SELECTION/<provider-uri>/<service...>/<request_id...>`
-pub fn selection_name(requester: &Name, provider: &Name, service: &Name, request_id: &Name) -> Name {
+pub fn selection_name(
+    requester: &Name,
+    provider: &Name,
+    service: &Name,
+    request_id: &Name,
+) -> Name {
     let base = append_peer_uri(requester.clone().append(NDNSF).append(SELECTION), provider);
     append_name(append_name(base, service), request_id)
 }
@@ -77,7 +82,12 @@ mod tests {
 
     #[test]
     fn ack_name_carries_requester_as_single_component() {
-        let name = ack_name(&n("/muas/bob"), &n("/muas/alice"), &n("/svc/mavlink"), &n("/r1"));
+        let name = ack_name(
+            &n("/muas/bob"),
+            &n("/muas/alice"),
+            &n("/svc/mavlink"),
+            &n("/r1"),
+        );
         assert!(name.has_prefix(&n("/muas/bob/NDNSF/ACK")));
         // muas, bob, NDNSF, ACK, <requester-uri>, svc, mavlink, r1 = the requester
         // collapses to a single component, so the total is 8 (not 9).

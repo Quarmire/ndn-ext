@@ -93,7 +93,11 @@ impl RelayPipeStore {
     /// The namespace a held pipe transfers under (for suppressing siblings on an
     /// inbound teardown). `None` if not held.
     pub fn namespace_of(&self, id: &[u8]) -> Option<Name> {
-        self.inner.lock().unwrap().get(id).map(|e| e.namespace.clone())
+        self.inner
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|e| e.namespace.clone())
     }
 
     /// Data-plane activity signal: renew every pipe whose namespace is a **prefix** of
@@ -329,19 +333,29 @@ mod tests {
         let due: Vec<_> = store.due(q).into_iter().map(|d| d.id).collect();
         assert_eq!(due, vec![b"near".to_vec()]);
         // Already-announced is not re-emitted on the next poll.
-        assert!(store.due(q).is_empty(), "single announcement per inactivity episode");
+        assert!(
+            store.due(q).is_empty(),
+            "single announcement per inactivity episode"
+        );
 
         // Namespace activity renews everything (the PUI contract honored).
         store.note_activity(&n);
         std::thread::sleep(Duration::from_millis(12));
         let due2: Vec<_> = store.due(q).into_iter().map(|d| d.id).collect();
-        assert_eq!(due2, vec![b"near".to_vec()], "due again only after a fresh quiet window");
+        assert_eq!(
+            due2,
+            vec![b"near".to_vec()],
+            "due again only after a fresh quiet window"
+        );
 
         // Suppression: a peer announced teardown for the namespace first — cancel our
         // own pending announcement, so even past the far hop's threshold we stay quiet.
         store.suppress(&n);
         std::thread::sleep(Duration::from_millis(100));
-        assert!(store.due(q).is_empty(), "suppressed: no self-announcement after a peer's");
+        assert!(
+            store.due(q).is_empty(),
+            "suppressed: no self-announcement after a peer's"
+        );
     }
 
     /// Receive side (slice 3): an authenticated inbound teardown for one pipe reaps it
@@ -356,17 +370,26 @@ mod tests {
 
         // A wrong key for A is rejected — nothing reaped.
         assert!(!store.teardown_authorized(b"a", Some(&[0x00])));
-        assert!(store.pipe_key(b"a").is_some(), "rejected teardown leaves A held");
+        assert!(
+            store.pipe_key(b"a").is_some(),
+            "rejected teardown leaves A held"
+        );
 
         // A correct teardown for A: capture its namespace, reap it, suppress siblings.
         let ns_a = store.namespace_of(b"a").expect("A held");
-        assert!(store.teardown_authorized(b"a", Some(&[0xAA])), "membership authorizes");
+        assert!(
+            store.teardown_authorized(b"a", Some(&[0xAA])),
+            "membership authorizes"
+        );
         store.suppress(&ns_a);
         assert!(store.pipe_key(b"a").is_none(), "A reaped");
 
         // B (sibling in the same namespace) is suppressed: even past its threshold it
         // does not self-announce — the peer's teardown beat it.
         std::thread::sleep(Duration::from_millis(100));
-        assert!(store.due(Duration::from_millis(40)).is_empty(), "B's announcement suppressed");
+        assert!(
+            store.due(Duration::from_millis(40)).is_empty(),
+            "B's announcement suppressed"
+        );
     }
 }

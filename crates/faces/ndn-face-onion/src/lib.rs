@@ -214,7 +214,10 @@ impl Circuit {
 /// the hop key derived during [`RelayOnionKey::peel`]).
 pub fn wrap_return(hop_key: &HopKey, data: &[u8]) -> Result<Bytes, OnionError> {
     // Return direction key (G5.6) — distinct from the forward key under the same hop key.
-    Ok(Bytes::from(seal_sym(&dir_key(hop_key, DIR_RET_INFO), data)?))
+    Ok(Bytes::from(seal_sym(
+        &dir_key(hop_key, DIR_RET_INFO),
+        data,
+    )?))
 }
 
 /// Consumer side: peel every return layer (entry's outermost first, exit's innermost
@@ -274,7 +277,10 @@ impl OnionConsumer {
 
     /// Unwrap the reply onion for `token`, freeing the request's state.
     pub fn unwrap(&mut self, token: u64, onion: &[u8]) -> Result<Bytes, OnionError> {
-        let keys = self.pending.remove(&token).ok_or(OnionError::EmptyCircuit)?;
+        let keys = self
+            .pending
+            .remove(&token)
+            .ok_or(OnionError::EmptyCircuit)?;
         unwrap_return(&keys, onion)
     }
 }
@@ -414,7 +420,10 @@ fn dir_key(hop_key: &HopKey, info: &[u8]) -> HopKey {
 
 /// Forward layer: `eph_pub(32) ‖ nonce(12) ‖ tag(16) ‖ ciphertext`. Returns the layer +
 /// the derived hop key (kept by the consumer for the return path).
-fn seal_forward_layer(relay_pub: &[u8; 32], plaintext: &[u8]) -> Result<(Vec<u8>, HopKey), OnionError> {
+fn seal_forward_layer(
+    relay_pub: &[u8; 32],
+    plaintext: &[u8],
+) -> Result<(Vec<u8>, HopKey), OnionError> {
     let mut eph_bytes = [0u8; 32];
     getrandom::getrandom(&mut eph_bytes).map_err(|_| OnionError::Rng)?;
     let eph = StaticSecret::from(eph_bytes);
@@ -524,7 +533,11 @@ mod tests {
                 Some(next) => {
                     assert_ne!(p.inner.as_ref(), interest, "relay sees only ciphertext");
                     idx += 1;
-                    assert_eq!(relays[idx].addr.as_bytes(), next.as_ref(), "routed to next hop");
+                    assert_eq!(
+                        relays[idx].addr.as_bytes(),
+                        next.as_ref(),
+                        "routed to next hop"
+                    );
                     layer = p.inner;
                 }
                 None => break p.inner, // exit
@@ -533,7 +546,10 @@ mod tests {
         assert_eq!(idx, 2, "reached the exit (3rd relay)");
         assert_eq!(real.as_ref(), interest, "exit recovers the real interest");
         // Each side derived the same hop keys via DH.
-        assert_eq!(hop_keys, w.return_keys, "relay-derived hop keys match the consumer's");
+        assert_eq!(
+            hop_keys, w.return_keys,
+            "relay-derived hop keys match the consumer's"
+        );
 
         // Return: producer Data, re-wrapped exit→entry, peeled by the consumer.
         let data = b"<the producer's Data wire>";
@@ -613,7 +629,10 @@ mod tests {
         let mut i = 0;
         let real = loop {
             let p = relays[i].forward(&layer).unwrap();
-            assert!(relays[i].remember(p.inner.to_vec(), p.hop_key), "fresh correlation stored");
+            assert!(
+                relays[i].remember(p.inner.to_vec(), p.hop_key),
+                "fresh correlation stored"
+            );
             forwarded.push(p.inner.clone());
             match p.next {
                 Some(_) => {
@@ -667,7 +686,10 @@ mod tests {
         let mut relay = OnionRelay::new(RelayOnionKey::generate().unwrap());
         let (layer, _hk) =
             seal_forward_layer(&relay.public(), &encode_inner(b"", b"/inner/interest")).unwrap();
-        assert!(relay.forward(&layer).is_ok(), "first peel of a fresh layer succeeds");
+        assert!(
+            relay.forward(&layer).is_ok(),
+            "first peel of a fresh layer succeeds"
+        );
         assert_eq!(
             relay.forward(&layer).unwrap_err(),
             OnionError::Replay,
@@ -681,10 +703,19 @@ mod tests {
     fn relay_pending_is_capacity_bounded() {
         let mut relay = OnionRelay::new(RelayOnionKey::generate().unwrap());
         for i in 0..(MAX_PENDING + 50) {
-            assert!(relay.remember(format!("corr-{i}").into_bytes(), [0u8; 32]), "distinct correlations stored");
+            assert!(
+                relay.remember(format!("corr-{i}").into_bytes(), [0u8; 32]),
+                "distinct correlations stored"
+            );
         }
-        assert!(relay.pending.len() <= MAX_PENDING, "pending bounded at MAX_PENDING");
-        assert!(relay.order.len() <= MAX_PENDING, "insertion log bounded too");
+        assert!(
+            relay.pending.len() <= MAX_PENDING,
+            "pending bounded at MAX_PENDING"
+        );
+        assert!(
+            relay.order.len() <= MAX_PENDING,
+            "insertion log bounded too"
+        );
     }
 
     /// G5.5: a duplicate live correlation is rejected (first-wins), not silently overwritten
@@ -692,8 +723,14 @@ mod tests {
     #[test]
     fn duplicate_correlation_is_rejected_first_wins() {
         let mut relay = OnionRelay::new(RelayOnionKey::generate().unwrap());
-        assert!(relay.remember(b"same-name".to_vec(), [1u8; 32]), "first stored");
-        assert!(!relay.remember(b"same-name".to_vec(), [2u8; 32]), "duplicate rejected");
+        assert!(
+            relay.remember(b"same-name".to_vec(), [1u8; 32]),
+            "first stored"
+        );
+        assert!(
+            !relay.remember(b"same-name".to_vec(), [2u8; 32]),
+            "duplicate rejected"
+        );
         // The first circuit's key is intact, so its return can still be re-wrapped.
         assert!(relay.wrap_return(b"same-name", b"data").is_some());
     }
@@ -708,7 +745,11 @@ mod tests {
             dir_key(&hop, DIR_RET_INFO),
             "forward and return sub-keys differ"
         );
-        assert_ne!(dir_key(&hop, DIR_FWD_INFO), hop, "sub-key differs from the raw hop key");
+        assert_ne!(
+            dir_key(&hop, DIR_FWD_INFO),
+            hop,
+            "sub-key differs from the raw hop key"
+        );
     }
 
     /// G5.4: the consumer's outstanding-request map is likewise bounded.
@@ -720,7 +761,13 @@ mod tests {
         for _ in 0..(MAX_PENDING + 50) {
             consumer.wrap(b"/data/obj").unwrap();
         }
-        assert!(consumer.pending.len() <= MAX_PENDING, "outstanding requests bounded");
-        assert!(consumer.order.len() <= MAX_PENDING, "insertion log bounded too");
+        assert!(
+            consumer.pending.len() <= MAX_PENDING,
+            "outstanding requests bounded"
+        );
+        assert!(
+            consumer.order.len() <= MAX_PENDING,
+            "insertion log bounded too"
+        );
     }
 }

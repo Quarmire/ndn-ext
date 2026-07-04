@@ -12,9 +12,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "MAC = {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
     );
-    println!("RF_A 0x18 (chan/bw) = {:#07x}", b.rf_read(RfPath::A, 0x18, 0xfffff)?);
-    println!("RF_A 0x00 (gain)    = {:#07x}", b.rf_read(RfPath::A, 0x00, 0xfffff)?);
-    println!("RF_B 0x18 (chan/bw) = {:#07x}", b.rf_read(RfPath::B, 0x18, 0xfffff)?);
+    println!(
+        "RF_A 0x18 (chan/bw) = {:#07x}",
+        b.rf_read(RfPath::A, 0x18, 0xfffff)?
+    );
+    println!(
+        "RF_A 0x00 (gain)    = {:#07x}",
+        b.rf_read(RfPath::A, 0x00, 0xfffff)?
+    );
+    println!(
+        "RF_B 0x18 (chan/bw) = {:#07x}",
+        b.rf_read(RfPath::B, 0x18, 0xfffff)?
+    );
     // BT-coex grant readback: indirect read of BTC reg 0x38 (strobe 0x1700,
     // data 0x1708). [15:8] must read 0x77 (GNT_WL=1) or TX sits ~50 dB low.
     b.write32(0x1700, 0x800f_0000 | 0x38)?;

@@ -35,7 +35,11 @@ fn main() {
     println!("payload {payload} B, ARQ ≤ {max_attempts} attempts, 80 MHz VHT+LDPC 1SS\n");
     println!(
         "{:>5}  | {:>26} | {:>26} | {:>26} | {:>26}",
-        "SNR", "ADAPTIVE (the loop)", "fixed MCS9 (fast)", "fixed MCS5 (mid)", "fixed MCS1 (robust)"
+        "SNR",
+        "ADAPTIVE (the loop)",
+        "fixed MCS9 (fast)",
+        "fixed MCS5 (mid)",
+        "fixed MCS1 (robust)"
     );
     println!("{}", "-".repeat(5 + 4 * 29));
     for (i, snr) in r.snrs.iter().enumerate() {
@@ -68,7 +72,9 @@ fn main() {
         );
         println!("   That margin is the answer to \"more than wfb-ng?\" — a number, not a claim.");
     } else {
-        println!("\n❌ A fixed MCS matched/beat the loop on this sweep — investigate the RSSI→MCS calibration.");
+        println!(
+            "\n❌ A fixed MCS matched/beat the loop on this sweep — investigate the RSSI→MCS calibration."
+        );
         std::process::exit(1);
     }
 }

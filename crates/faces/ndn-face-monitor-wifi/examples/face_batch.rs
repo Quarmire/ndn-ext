@@ -27,7 +27,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!(
         "sending {total} x {psize}B via the face, batching {}",
-        if off { "OFF (1 MPDU/send)".into() } else { format!("ON ({max_msdus}/A-MSDU, 5ms)") }
+        if off {
+            "OFF (1 MPDU/send)".into()
+        } else {
+            format!("ON ({max_msdus}/A-MSDU, 5ms)")
+        }
     );
 
     let data = Bytes::from(vec![0x5au8; psize]);
@@ -38,7 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Let the last batch's flush window elapse + the FIFO drain.
     tokio::time::sleep(Duration::from_millis(400)).await;
     let dt = t0.elapsed().as_secs_f64();
-    println!("submitted {total} frames in {dt:.2}s — count MPDUs at the peer", );
+    println!("submitted {total} frames in {dt:.2}s — count MPDUs at the peer",);
     Ok(())
 }
 

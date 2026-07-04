@@ -23,8 +23,8 @@
 use std::time::Duration;
 
 use ndn_face::l2::get_interface_mac;
-use ndn_face_afxdp::AfXdpFace;
 use ndn_face::{NamedEtherFace, RadioFaceMetadata};
+use ndn_face_afxdp::AfXdpFace;
 use ndn_packet::encode::{DataBuilder, InterestBuilder};
 use ndn_packet::{Data, Interest, Name};
 use ndn_transport::{FaceId, Transport};

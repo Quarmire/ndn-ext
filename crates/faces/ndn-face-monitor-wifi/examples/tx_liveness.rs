@@ -7,11 +7,22 @@
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use bytes::Bytes;
-    use ndn_face_monitor_wifi::{InjectFrame, LibUsbRtl88xxBackend, McsDescriptor, TxIntent, FrameIo, WifiRadio};
+    use ndn_face_monitor_wifi::{
+        FrameIo, InjectFrame, LibUsbRtl88xxBackend, McsDescriptor, TxIntent, WifiRadio,
+    };
     use std::sync::Arc;
-    let ch: u8 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(149);
-    let nframes: u32 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(2000);
-    let mcs: u8 = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(1);
+    let ch: u8 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(149);
+    let nframes: u32 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2000);
+    let mcs: u8 = std::env::args()
+        .nth(3)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
     let b = Arc::new(LibUsbRtl88xxBackend::open_monitor(ch)?);
     // RADIO_BW=40|80|10|5 switches the channel bandwidth (default 20 MHz).
     if let Ok(s) = std::env::var("RADIO_BW") {
@@ -30,25 +41,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "fw IQK done-flag 0x2d9c = {:#04x}  -> {}",
         iqk,
-        if iqk == 0xaa { "COMPLETED" } else { "NOT raised (fw cal did not land)" }
+        if iqk == 0xaa {
+            "COMPLETED"
+        } else {
+            "NOT raised (fw cal did not land)"
+        }
     );
     // a few more firmware/TX-state regs for context
-    println!("  REG_MCUFW_CTRL 0x80 = {:#06x} (fw alive = 0xc078)", b.read16(0x0080)?);
+    println!(
+        "  REG_MCUFW_CTRL 0x80 = {:#06x} (fw alive = 0xc078)",
+        b.read16(0x0080)?
+    );
     println!("  TX activity 0x2d08 = {:#010x}", b.read32(0x2d08)?);
     let data: Bytes = (0..1400u32).map(|i| (i & 0xff) as u8).collect();
     // RADIO_VHT=1 uses 802.11ac VHT (required for 80 MHz; HT is 20/40 only).
     // RADIO_NSS=2 selects 2 spatial streams (VHT 2SS; for HT use index 8–15).
     let vht = std::env::var("RADIO_VHT").is_ok();
-    let nss2 = std::env::var("RADIO_NSS").map(|s| s == "2").unwrap_or(false);
+    let nss2 = std::env::var("RADIO_NSS")
+        .map(|s| s == "2")
+        .unwrap_or(false);
     let desc = match (vht, nss2) {
         (true, true) => McsDescriptor::vht_2ss(mcs),
         (true, false) => McsDescriptor::vht(mcs),
         (false, _) => McsDescriptor::ht(mcs),
     };
-    let rate = if vht && nss2 { "VHT-2SS MCS" } else if vht { "VHT MCS" } else { "HT MCS" };
+    let rate = if vht && nss2 {
+        "VHT-2SS MCS"
+    } else if vht {
+        "VHT MCS"
+    } else {
+        "HT MCS"
+    };
     println!("flooding {nframes} frames on ch{ch} at {rate}{mcs}…");
     for _ in 0..nframes {
-        b.inject_at(InjectFrame::broadcast(data.clone(), TxIntent::CONSERVATIVE), desc).await?;
+        b.inject_at(
+            InjectFrame::broadcast(data.clone(), TxIntent::CONSERVATIVE),
+            desc,
+        )
+        .await?;
     }
     let after = b.read32(0x2d08)?;
     println!("  TX activity 0x2d08 after flood = {after:#010x}");

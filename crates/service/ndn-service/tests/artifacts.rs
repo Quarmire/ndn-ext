@@ -35,7 +35,13 @@ fn hub(nodes: &[&str], group: &Name) -> Vec<SvsPubSub> {
     for node in nodes {
         let (out_tx, out_rx) = mpsc::channel::<Bytes>(256);
         let (in_tx, in_rx) = mpsc::channel::<Bytes>(256);
-        pubsubs.push(SvsPubSub::join(group.clone(), n(node), out_tx, in_rx, cfg()));
+        pubsubs.push(SvsPubSub::join(
+            group.clone(),
+            n(node),
+            out_tx,
+            in_rx,
+            cfg(),
+        ));
         outs.push(out_rx);
         ins.push(in_tx);
     }
@@ -72,7 +78,11 @@ async fn artifact_provision_and_fetch_is_scope_confidential() {
     let outsider_kr = policy.keyring_for(&Role::Outsider, &all); // empty
 
     let mut pss = hub(&["/muas/alice", "/muas/bob"], &group).into_iter();
-    let alice = ScopedSession::new(session.clone(), Arc::new(pss.next().unwrap()), member_kr.clone());
+    let alice = ScopedSession::new(
+        session.clone(),
+        Arc::new(pss.next().unwrap()),
+        member_kr.clone(),
+    );
     let bob = ScopedSession::new(session.clone(), Arc::new(pss.next().unwrap()), member_kr);
 
     // A subscriber must exist before the one-shot artifact is published.
@@ -95,16 +105,24 @@ async fn artifact_provision_and_fetch_is_scope_confidential() {
         .expect("fetch timed out")
         .expect("join")
         .expect("artifact not delivered");
-    assert_eq!(got.as_ref(), content.as_slice(), "member fetches and opens the artifact");
+    assert_eq!(
+        got.as_ref(),
+        content.as_slice(),
+        "member fetches and opens the artifact"
+    );
 
     // An outsider (no scope key) cannot even obtain the artifact share.
-    let outsider = ScopedSession::new(session, Arc::new(SvsPubSub::join(
-        group,
-        n("/muas/mallory"),
-        mpsc::channel(8).0,
-        mpsc::channel(8).1,
-        cfg(),
-    )), outsider_kr);
+    let outsider = ScopedSession::new(
+        session,
+        Arc::new(SvsPubSub::join(
+            group,
+            n("/muas/mallory"),
+            mpsc::channel(8).0,
+            mpsc::channel(8).1,
+            cfg(),
+        )),
+        outsider_kr,
+    );
     assert!(
         outsider.artifacts("plans").is_none(),
         "a node without the scope key cannot access the artifact share"

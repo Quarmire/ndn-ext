@@ -130,7 +130,9 @@ impl NdnsfCarrier {
 
     fn next_request_id(&self) -> Name {
         let n = self.next_id.fetch_add(1, Ordering::Relaxed);
-        format!("/r{n}").parse().expect("request id is a valid name")
+        format!("/r{n}")
+            .parse()
+            .expect("request id is a valid name")
     }
 }
 
@@ -258,7 +260,11 @@ impl Carrier for NdnsfCarrier {
         }
     }
 
-    async fn serve(&self, svc: &ServiceId, dispatch: Arc<dyn Dispatch>) -> Result<(), ServiceError> {
+    async fn serve(
+        &self,
+        svc: &ServiceId,
+        dispatch: Arc<dyn Dispatch>,
+    ) -> Result<(), ServiceError> {
         let ps = self.ps.clone();
         let node = self.node.clone();
         let service = svc.name().clone();

@@ -54,7 +54,10 @@ async fn pipe_exchange_hands_the_key_to_on_path_nodes() {
 
     // Consumer opens the pipe; it holds the pipe key as `teardown_secret`.
     let mut pc = PipeConsumer::new(Consumer::from_handle(c_h));
-    let pipe = pc.open("/sensors/temp", PipeParams::default()).await.expect("pipe opens");
+    let pipe = pc
+        .open("/sensors/temp", PipeParams::default())
+        .await
+        .expect("pipe opens");
     let pipe_id = pipe.id.as_bytes().to_vec();
 
     // (1) An independent on-path node fetches the pipe key via the PIPE exchange and
@@ -75,7 +78,14 @@ async fn pipe_exchange_hands_the_key_to_on_path_nodes() {
     // here; learn drives over the `fetcher` consumer.
     let relay = PipeRelay::new(Producer::from_handle(r_h, Name::from("/COMMON")));
     let learned = relay
-        .learn_pipe_key(&mut fetcher, &"/sensors/temp".parse::<Name>().unwrap(), &pipe_id, 0, 1, TIMEOUT)
+        .learn_pipe_key(
+            &mut fetcher,
+            &"/sensors/temp".parse::<Name>().unwrap(),
+            &pipe_id,
+            0,
+            1,
+            TIMEOUT,
+        )
         .await;
     assert!(learned, "relay learns the pipe key via the PIPE exchange");
     let store = relay.store();
@@ -94,7 +104,10 @@ async fn pipe_exchange_hands_the_key_to_on_path_nodes() {
         store.teardown_authorized(&pipe_id, Some(pipe.teardown_secret.as_ref())),
         "holding the pipe key authorizes teardown"
     );
-    assert!(store.pipe_key(&pipe_id).is_none(), "an authorized teardown reaped the entry");
+    assert!(
+        store.pipe_key(&pipe_id).is_none(),
+        "an authorized teardown reaped the entry"
+    );
 
     drop(pc);
     drop(engine);

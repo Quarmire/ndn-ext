@@ -44,8 +44,11 @@ mod linux {
     use ndn_face_wifi_aware::NanServiceName;
     use ndn_frame_io::{AfPacketBackend, FrameFormat, FrameIo};
     use ndn_nan_core::{
-        attr::{AttributeId, Attributes, Cluster, MasterIndication, ServiceControlType, ServiceDescriptor},
         NanBeacon, NanConfig, NanEngine, ServiceDiscoveryFrame,
+        attr::{
+            AttributeId, Attributes, Cluster, MasterIndication, ServiceControlType,
+            ServiceDescriptor,
+        },
     };
 
     pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -57,8 +60,12 @@ mod linux {
                 sniff(&iface).await
             }
             "node" => {
-                let iface = args.next().ok_or("usage: nan_node node <iface> <service>")?;
-                let service = args.next().ok_or("usage: nan_node node <iface> <service>")?;
+                let iface = args
+                    .next()
+                    .ok_or("usage: nan_node node <iface> <service>")?;
+                let service = args
+                    .next()
+                    .ok_or("usage: nan_node node <iface> <service>")?;
                 node(&iface, &service).await
             }
             "dump" => {
@@ -89,7 +96,10 @@ mod linux {
         for tx in &step.tx {
             text2pcap_frame(&tx.bytes);
         }
-        eprintln!("[dump] emitted {} frame(s) for service {service:?}", step.tx.len());
+        eprintln!(
+            "[dump] emitted {} frame(s) for service {service:?}",
+            step.tx.len()
+        );
     }
 
     /// Print one frame as a `text2pcap` offset hexdump (a blank-offset line per
@@ -148,9 +158,19 @@ mod linux {
         let backend: Arc<dyn FrameIo> =
             Arc::new(AfPacketBackend::new(iface, FrameFormat::Raw80211)?);
         // A locally-administered NMI derived from the interface name's bytes.
-        let nmi = [0x02, b'N', b'A', b'N', 0x00, iface.bytes().last().unwrap_or(1)];
+        let nmi = [
+            0x02,
+            b'N',
+            b'A',
+            b'N',
+            0x00,
+            iface.bytes().last().unwrap_or(1),
+        ];
         let driver = ndn_nan::spawn(backend, NanConfig::new(nmi, 6, 200), None);
-        println!("[node] NAN up on {iface}, nmi={}, service={service:?}", mac(&nmi));
+        println!(
+            "[node] NAN up on {iface}, nmi={}, service={service:?}",
+            mac(&nmi)
+        );
 
         let svc = NanServiceName(service.to_string());
         driver.publish(&svc).await?;
@@ -177,11 +197,18 @@ mod linux {
         loop {
             tokio::time::sleep(Duration::from_secs(3)).await;
             for m in driver.drain_matches() {
-                println!("[node] DISCOVERED peer {} for service {:?}", mac(&m.peer), m.service.0);
+                println!(
+                    "[node] DISCOVERED peer {} for service {:?}",
+                    mac(&m.peer),
+                    m.service.0
+                );
             }
             beat += 1;
             let msg = format!("hello-{beat}");
-            let n = driver.broadcast(bytes::Bytes::from(msg.clone())).await.is_ok();
+            let n = driver
+                .broadcast(bytes::Bytes::from(msg.clone()))
+                .await
+                .is_ok();
             println!("[node] sent follow-up {msg:?} (queued={n})");
         }
     }
@@ -192,25 +219,36 @@ mod linux {
             match a.id {
                 x if x == AttributeId::MasterIndication as u8 => {
                     if let Ok(mi) = MasterIndication::decode(a.body) {
-                        println!("   MasterIndication: pref={} rf={}", mi.master_preference, mi.random_factor);
+                        println!(
+                            "   MasterIndication: pref={} rf={}",
+                            mi.master_preference, mi.random_factor
+                        );
                     }
                 }
                 x if x == AttributeId::Cluster as u8 => {
                     if let Ok(c) = Cluster::decode(a.body) {
-                        println!("   Cluster: amr={:#018x} hop={} ambtt={}", c.anchor_master_rank, c.hop_count, c.ambtt);
+                        println!(
+                            "   Cluster: amr={:#018x} hop={} ambtt={}",
+                            c.anchor_master_rank, c.hop_count, c.ambtt
+                        );
                     }
                 }
-                x if x == AttributeId::ServiceDescriptor as u8 => match ServiceDescriptor::decode(a.body) {
-                    Ok(sda) => println!(
-                        "   SDA: id={} inst={} req={} type={:?} ssi={:?}",
-                        hex(&sda.service_id),
-                        sda.instance_id,
-                        sda.requestor_instance_id,
-                        type_name(&sda),
-                        String::from_utf8_lossy(&sda.service_info)
-                    ),
-                    Err(_) => println!("   SDA(0x03) len={} [has fields we don't model yet]", a.body.len()),
-                },
+                x if x == AttributeId::ServiceDescriptor as u8 => {
+                    match ServiceDescriptor::decode(a.body) {
+                        Ok(sda) => println!(
+                            "   SDA: id={} inst={} req={} type={:?} ssi={:?}",
+                            hex(&sda.service_id),
+                            sda.instance_id,
+                            sda.requestor_instance_id,
+                            type_name(&sda),
+                            String::from_utf8_lossy(&sda.service_info)
+                        ),
+                        Err(_) => println!(
+                            "   SDA(0x03) len={} [has fields we don't model yet]",
+                            a.body.len()
+                        ),
+                    }
+                }
                 id => println!("   attr {:#04x} len={} {}", id, a.body.len(), attr_name(id)),
             }
         }
@@ -241,7 +279,10 @@ mod linux {
     }
 
     fn mac(m: &[u8; 6]) -> String {
-        m.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":")
+        m.iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(":")
     }
     fn hex(b: &[u8]) -> String {
         b.iter().map(|b| format!("{b:02x}")).collect()
