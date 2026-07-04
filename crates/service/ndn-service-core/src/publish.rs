@@ -10,15 +10,15 @@
 //! `docs/specs/service-layer.md`) already puts the heavy machinery — ABE, policy
 //! authorities, SVS coordination — on the gateway, leaving the leaf the cheap part:
 //! **frame a value, name it, seal it with a symmetric key, emit it.** That cheap
-//! part needs nothing but [`Frame`](crate::Frame) + [`Name`], both `no_std`, so it
+//! part needs nothing but [`Frame`] + [`Name`], both `no_std`, so it
 //! lives in this foundation crate rather than a separate one: a leaf depends on
 //! `ndn-service-core` with `default-features = false` and nothing else.
 //!
-//! - **Typed.** A value implements [`Frame`](crate::Frame) (hand-written, or
+//! - **Typed.** A value implements [`Frame`] (hand-written, or
 //!   `#[derive(Frame)]` from `ndn-service-macro` — proc-macros run on the host, so
 //!   the derive is available to `no_std` leaves too). The gateway decodes with the
 //!   *same* `Frame`, so leaf and node speak one message format.
-//! - **Confidential, cheaply.** With the `seal` feature a [`ScopeKey`] seals each
+//! - **Confidential, cheaply.** With the `seal` feature a `ScopeKey` seals each
 //!   publication with ChaCha20-Poly1305 — the same AEAD the rest of the stack uses
 //!   (via `ndn-crypto-core`), an embedded-appropriate cipher (no pairings, no RNG
 //!   on the hot path). The leaf *holds* a symmetric scope key; the gateway
@@ -65,7 +65,7 @@ use ndn_packet::Name;
 use crate::Frame;
 
 /// A named, ready-to-transmit publication: the NDN name (`<topic>/seq=N`) and its
-/// payload bytes (the encoded [`Frame`](crate::Frame), or — with the `seal`
+/// payload bytes (the encoded [`Frame`], or — with the `seal`
 /// feature — the sealed frame). A [`PublicationSink`] is what actually puts it on
 /// the air; building it is allocation-light and runtime-free.
 #[derive(Clone, Debug)]
@@ -96,7 +96,7 @@ pub trait PublicationSink {
 
 /// A typed, append-only **feed producer** for a constrained leaf.
 ///
-/// Frames each value with its [`Frame`](crate::Frame), names it `<topic>/seq=N`
+/// Frames each value with its [`Frame`], names it `<topic>/seq=N`
 /// (the NDN sequence-number naming convention), and hands the [`Publication`] to a
 /// [`PublicationSink`]. Holds only the topic name, the next sequence number, and
 /// (with `seal`) an optional seal context (scope key + publisher id) — no buffers,

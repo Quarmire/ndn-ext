@@ -123,8 +123,8 @@ fn to_prefix(components: &[&[u8]]) -> Prefix {
 ///
 /// Location Score is `None` here (the sans-IO seam carries no position fix), so
 /// the embedded election is CCS-only — the paper's documented graceful
-/// degradation. The shell feeds [`Strategy::observe_data`] and
-/// [`Strategy::observe_neighbor`] from the Data and beacon/adornment paths.
+/// degradation. The shell feeds [`Strategy::observe_data`](ndn_fwd_core::strategy::Strategy::observe_data) and
+/// [`Strategy::observe_neighbor`](ndn_fwd_core::strategy::Strategy::observe_neighbor) from the Data and beacon/adornment paths.
 pub struct Cclf<F: Copy + Ord> {
     cltree: RefCell<ClTree>,
     neighbors: RefCell<NamedNeighborTable<F>>,

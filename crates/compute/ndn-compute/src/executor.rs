@@ -1,7 +1,7 @@
 //! [`ComputeExecutor`] — the extensibility seam.
 //!
 //! An executor is a pure bytes-in / bytes-out compute kernel that knows nothing
-//! about NDN packets. Native code, a [`WasmExecutor`](crate::WasmExecutor), or a
+//! about NDN packets. Native code, a `WasmExecutor`, or a
 //! future remote-process backend all implement the same trait, so
 //! [`ComputeService::executor_function`](crate::ComputeService::executor_function)
 //! is backend-agnostic.
@@ -21,7 +21,7 @@ pub trait ComputeExecutor: Send + Sync + 'static {
     fn execute(&self, input: &[u8]) -> Result<Bytes, ComputeError>;
 
     /// Per-invocation fuel budget, if this executor meters CPU (e.g.
-    /// [`WasmExecutor`](crate::WasmExecutor)). Surfaced in the `compute`
+    /// `WasmExecutor`). Surfaced in the `compute`
     /// management dataset; defaults to `None` for unmetered kernels.
     fn fuel(&self) -> Option<u64> {
         None

@@ -1,6 +1,6 @@
 //! [`ComputeService`] — the ergonomic, engine-attached front door.
 //!
-//! `attach` allocates the synthetic [`ComputeFace`](crate::ComputeFace) on a
+//! `attach` allocates the synthetic [`ComputeFace`] on a
 //! live engine; each registration wires a FIB route for the function prefix to
 //! that face. Results are injected back into the pipeline and cached like any
 //! other Data.
@@ -444,7 +444,7 @@ impl ComputeService {
     }
 
     /// Tier 2: register a transparent function backed by a [`ComputeExecutor`]
-    /// (native kernel, [`WasmExecutor`](crate::WasmExecutor), …). The input is
+    /// (native kernel, `WasmExecutor`, …). The input is
     /// the single name component after `prefix`; the executor's output bytes
     /// become the response Data content. Because the input rides the name, the
     /// result caches and coalesces like any other transparent function — pair

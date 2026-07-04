@@ -121,7 +121,7 @@ pub struct DvSync {
 
 impl DvSync {
     /// Uses [`crate::protocols::dv::signing::InsecureTrust`]; call
-    /// [`with_trust`] to install
+    /// [`Self::with_trust`] to install
     /// [`crate::protocols::dv::signing::StaticTrust`] or
     /// [`crate::protocols::dv::signing::LvsTrust`].
     pub fn new(network: Name, router: Name, boot: u64) -> Self {
@@ -204,7 +204,7 @@ impl DvSync {
         name
     }
 
-    /// Same shape as [`advertisement_data_name`] but for an
+    /// Same shape as [`Self::advertisement_data_name`] but for an
     /// arbitrary peer.
     pub fn peer_advertisement_data_name(peer: &Name, boot: u64, seq: u64) -> Name {
         let mut name = Self::peer_advertisement_data_prefix(peer);
@@ -372,7 +372,7 @@ impl DvSync {
 
     /// Names of neighbours whose `last_seen` is older than
     /// `now - dead_interval`. Caller drops the face binding via
-    /// [`forget_neighbor`] and clears RIB routes through them.
+    /// [`Self::forget_neighbor`] and clears RIB routes through them.
     pub fn dead_neighbors(&self, now: Instant, dead_interval: Duration) -> Vec<Name> {
         let faces = self.faces.read().expect("DvSync::faces poisoned");
         faces

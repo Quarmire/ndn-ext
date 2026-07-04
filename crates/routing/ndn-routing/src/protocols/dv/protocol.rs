@@ -142,7 +142,7 @@ pub struct DvProtocol {
 
 impl DvProtocol {
     /// Test-only constructor: no I/O wiring; `start()` will not spawn
-    /// the fetcher/producer tasks. Use [`with_io`] in production.
+    /// the fetcher/producer tasks. Use [`Self::with_io`] in production.
     pub fn new(config: DvConfig) -> Arc<Self> {
         Self::build(
             config,
@@ -153,7 +153,7 @@ impl DvProtocol {
         )
     }
 
-    /// Like [`new`] but threads a custom
+    /// Like [`Self::new`] but threads a custom
     /// [`crate::protocols::dv::signing::DvTrust`].
     pub fn new_with_trust(
         config: DvConfig,
@@ -183,7 +183,7 @@ impl DvProtocol {
         )
     }
 
-    /// Like [`with_io`] with a custom
+    /// Like [`Self::with_io`] with a custom
     /// [`crate::protocols::dv::signing::DvTrust`].
     pub fn with_io_and_trust(
         config: DvConfig,

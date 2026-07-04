@@ -56,7 +56,7 @@ pub fn slot_size_for_mtu(mtu: usize) -> u32 {
     aligned.min(u32::MAX as usize) as u32
 }
 
-/// Ring capacity that keeps total ring memory within [`SHM_BUDGET`];
+/// Ring capacity that keeps total ring memory within `SHM_BUDGET`;
 /// returns at least 16.
 pub fn capacity_for_slot(slot_size: u32) -> u32 {
     let stride = slot_stride(slot_size);
@@ -670,7 +670,7 @@ unsafe fn ring_peek_consume<R>(
 /// Send file descriptors to a connected Unix-socket peer via `SCM_RIGHTS`,
 /// alongside one byte of normal data (the kernel requires ancillary data to
 /// ride with ≥1 data byte). Up to 8 fds in one message. This is how an
-/// anonymous ([`ShmRegion::create_anon`]) region + its wakeup channels are
+/// anonymous (`ShmRegion::create_anon`) region + its wakeup channels are
 /// handed to the peer **without ever appearing in a shared namespace**. Also the
 /// low-level utility for passing a [`SharedBuffer`]'s fd (zero-copy large-buffer
 /// delivery).
@@ -1261,7 +1261,7 @@ impl SpscFace {
     }
 
     /// Create an **anonymous, capability-scoped** face: an fd-only SHM region
-    /// ([`ShmRegion::create_anon`]) + two anonymous wakeup pipes — **no named SHM
+    /// (`ShmRegion::create_anon`) + two anonymous wakeup pipes — **no named SHM
     /// object, no named FIFOs**, so nothing appears in any shared namespace.
     /// Returns the engine-side face plus the three fds to hand the peer via
     /// [`send_fds`], in the fixed order **`[region, a2e_write, e2a_read]`**; the
@@ -2057,7 +2057,7 @@ impl SharedBuffer {
     }
 
     /// Create a buffer the **producer maps read-write** while handing consumers a
-    /// **read-only fd** ([`ShmRegion::create_anon_ro`]). The producer is the sole
+    /// **read-only fd** (`ShmRegion::create_anon_ro`). The producer is the sole
     /// writer — enforced by the kernel, not by trust — so frames a consumer reads
     /// provably originated from the producer, with no per-frame signature. Pair with
     /// [`SharedBufferReader::from_fd`]. This is the multi-reader multicast case in

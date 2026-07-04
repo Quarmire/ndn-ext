@@ -348,7 +348,7 @@ impl OnionRelay {
 
     /// Record the hop key for a forwarded request, keyed by its `correlation` (inner
     /// interest name bytes), so the return path can find it. Capacity-bounded (G5.4):
-    /// the oldest record is evicted past [`MAX_PENDING`] so unanswered forwards can't grow
+    /// the oldest record is evicted past `MAX_PENDING` so unanswered forwards can't grow
     /// memory without bound.
     ///
     /// Returns `false` if a live record already exists for `correlation` (G5.5): two

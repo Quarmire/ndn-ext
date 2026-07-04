@@ -6,7 +6,7 @@
 //! shared across tabs, or an out-of-page engine (browser extension / native
 //! `ndn-fwd` companion) is a deployment concern, not an app-code concern.
 //!
-//! [`EngineAttachment`] is that seam. The app picks (or [`auto`]-detects) an
+//! [`EngineAttachment`] is that seam. The app picks (or [`auto`](EngineAttachment::auto)-detects) an
 //! attachment, calls [`EngineAttachment::attach`], and receives an
 //! [`AppHandle`] — the only surface app code touches.
 //!
@@ -169,7 +169,7 @@ impl AppHandle {
 
     /// Escape hatch to the embedded engine — e.g. to install additional
     /// faces/routes. Most apps need only the two methods above (plus
-    /// [`mount_management`](Self::mount_management) for wire control).
+    /// `mount_management` for wire control).
     pub fn engine(&self) -> &ForwarderEngine {
         &self.engine
     }

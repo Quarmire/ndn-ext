@@ -83,7 +83,7 @@ impl ServiceDiscoveryProtocol {
     }
 
     /// Publish a rendezvous record and stash its body bytes. The body
-    /// is wrapped via [`ServiceDiscoveryConfig::encryption_hook`] and
+    /// is wrapped via [`ServiceDiscoveryConfig::encryption_hook`](crate::ServiceDiscoveryConfig::encryption_hook) and
     /// served when a `<root>/service-info/...` Interest arrives.
     pub fn publish_with_body(&self, mut record: ServiceRecord, body_bytes: Bytes) {
         let ts = current_timestamp_ms();

@@ -388,7 +388,7 @@ pub fn list_identities() -> Vec<IdentitySummary> {
 }
 
 /// Make the identity with key name `key_name` the active signer. Returns true
-/// when it was found. Follow with [`crate::app_shared::bump_keyring_gen`].
+/// when it was found. Follow with `crate::app_shared::bump_keyring_gen`.
 pub fn set_active(key_name: &str) -> bool {
     let kr = keyring();
     let found = kr

@@ -40,10 +40,10 @@
 //! ## Structure
 //!
 //! The radio is abstracted behind [`FrameIo`]: how raw frames reach the air
-//! is a backend choice, exactly the [`AdvBackend`]/`RadioBackend`/`NanBackend`
+//! is a backend choice, exactly the `AdvBackend`/`RadioBackend`/`NanBackend`
 //! pattern used elsewhere in the stack.
 //!
-//! - [`AfPacketBackend`] (Linux, `cfg(target_os = "linux")`) — `AF_PACKET`
+//! - `AfPacketBackend` (Linux, `cfg(target_os = "linux")`) — `AF_PACKET`
 //!   `SOCK_RAW` on a monitor-mode interface; builds radiotap TX + the 802.11
 //!   frame per [`FrameFormat`], parses radiotap RX. Requires `CAP_NET_RAW`.
 //! - [`LoopbackMonitorBus`] — a hardware-free shared medium for CI and
@@ -51,7 +51,7 @@
 //!   face, NDNLPv2 fragmentation, and RSSI plumbing run through a real engine
 //!   without a radio.
 //!
-//! - [`LibUsbRtl88xxBackend`] (`libusb-backend` feature) — a **working**
+//! - `LibUsbRtl88xxBackend` (`libusb-backend` feature) — a **working**
 //!   userspace driver for the RTL8812EU (halmac 8822E) over libusb, for hosts
 //!   without an `AF_PACKET` monitor interface (macOS / non-`rtl8812au` Linux).
 //!   Full 5 GHz monitor-mode bring-up (power, firmware, MAC/BB/RF, the
@@ -327,7 +327,7 @@ impl MonitorWifiFace {
     /// Build an **ESP-NOW** face over `backend` — the first-class
     /// NDN-over-ESP-NOW path. `backend` must be in [`FrameFormat::EspNow`] mode
     /// (e.g. `AfPacketBackend::new(iface, FrameFormat::EspNow { oui: ESPNOW_OUI })`
-    /// on Linux, or use [`open_libusb_espnow`](Self::open_libusb_espnow) on a
+    /// on Linux, or use `open_libusb_espnow` on a
     /// host without a kernel monitor driver). The face is sized to the 250-B
     /// ESP-NOW body ([`ESPNOW_MTU`]) so the paired `LpLinkService` fragments NDN
     /// packets into vendor-action frames a stock `esp-wifi` ESP-NOW peer hears;
@@ -383,12 +383,10 @@ impl MonitorWifiFace {
     /// are coalesced into one A-MSDU per up-to-`max_msdus` frames or `window`
     /// elapsed, whichever first — one PHY preamble for many NDN packets. Trades a
     /// little latency for ~3–4× airtime efficiency on the broadcast medium
-    /// ([`inject_amsdu`]); each MSDU stays an independent NDN packet the receiver
+    /// (`inject_amsdu`); each MSDU stays an independent NDN packet the receiver
     /// de-aggregates, so PIT/FIB semantics are untouched. Call before mounting
     /// (it spawns the flush task on the current runtime). A `window` of a few
     /// milliseconds and `max_msdus` ~8–16 is a sane default.
-    ///
-    /// [`inject_amsdu`]: crate::LibUsbRtl88xxBackend::inject_amsdu
     pub fn with_amsdu_batching(mut self, max_msdus: usize, window: Duration) -> Self {
         self.batcher = Some(TxBatcher::spawn(self.backend.clone(), max_msdus, window));
         self
@@ -445,10 +443,9 @@ impl MonitorWifiFace {
     /// shared cell. The [`RadioControl`] actuator writes the decided params here;
     /// `select_mcs` reads them so a *decision* actually changes the transmitted
     /// rate/coding. This is the ACT half of the sense→decide→act loop. Pass the
-    /// same `Arc` to [`RadioControl::libusb_actuator`] so both ends share it.
+    /// same `Arc` to `RadioControl::libusb_actuator` so both ends share it.
     ///
     /// [`RadioControl`]: crate::RadioControl
-    /// [`RadioControl::libusb_actuator`]: crate::RadioControl::libusb_actuator
     pub fn with_planned_params(mut self, cell: Arc<RwLock<Option<TxParams>>>) -> Self {
         self.planned = Some(cell);
         self

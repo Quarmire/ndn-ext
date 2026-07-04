@@ -2,7 +2,7 @@
 //!
 //! A *source* turns a clock backend (the OS clock, a GNSS receiver, an RTC, an
 //! uplink) into a [`Reading`] — a wall-clock estimate with its honest
-//! uncertainty and the [`ClockCapability`](ndn_time::ClockCapability) that
+//! uncertainty and the [`ClockCapability`] that
 //! produced it — which the `ndn-time` discipline loop combines. Sources are
 //! **push, not pull**, exactly like `ndn-signal-sources`: a driver loop calls
 //! [`TimeSource::poll`] on a cadence and the latest reading is what the loop

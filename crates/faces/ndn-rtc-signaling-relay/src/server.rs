@@ -1,6 +1,6 @@
 //! Axum-based rendezvous server. Sessions are keyed by an opaque string
 //! (callers pick collision-free ids, e.g. UUIDs) and freed once both peers
-//! have read the other's blob. Long-polls are capped at [`POLL_TIMEOUT`];
+//! have read the other's blob. Long-polls are capped at `POLL_TIMEOUT`;
 //! clients retry on 408.
 
 use std::collections::VecDeque;

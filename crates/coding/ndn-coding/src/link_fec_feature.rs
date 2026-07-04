@@ -55,7 +55,7 @@ impl LinkFecFeature {
     /// that makes **every** generation fail to encode — i.e. silently dropped traffic — so
     /// the parameters are **clamped into range here** (rather than failing later, per
     /// generation): `redundancy` to ≤ `MAX_N - 1` and `k` to `1..=(MAX_N - redundancy)`.
-    /// With in-range parameters [`encode`](Self::encode) cannot fail on N, so a valid
+    /// With in-range parameters `encode` cannot fail on N, so a valid
     /// generation is never dropped.
     pub fn new(k: usize, redundancy: u16, window: Duration) -> Self {
         // Clamp so K + R ≤ MAX_N (leaving room for at least one source frame).

@@ -5,7 +5,8 @@
 //! them, and invokes the chosen provider(s) over an **inner Tier-0 carrier** `C`
 //! (e.g. `ndn-rpc`'s `RpcCarrier`) — "selection yields a provider set; the call
 //! drops to Tier-0". The discovery layer therefore *adds* multi-provider
-//! [`SelectCarrier`] on top of a plain inner [`Carrier`].
+//! [`SelectCarrier`](ndn_service_core::SelectCarrier) on top of a plain inner
+//! [`Carrier`](ndn_service_core::Carrier).
 //!
 //! Two [naming conventions](NamingConvention) for addressing a selected provider,
 //! both behind the same [`ProviderDirectory`] seam (the carrier is agnostic):
@@ -14,7 +15,8 @@
 //! - [`NamingConvention::ForwardingHint`]: all providers share the content name
 //!   `<service>`; a selected provider is reached via an NDN **forwarding hint**
 //!   (= its node), the more data-centric model (one content name, the network
-//!   routes). Requires the inner carrier to honour hints ([`HintedCarrier`]).
+//!   routes). Requires the inner carrier to honour hints
+//!   ([`HintedCarrier`](ndn_service_core::HintedCarrier)).
 
 use std::collections::HashMap;
 use std::sync::Arc;

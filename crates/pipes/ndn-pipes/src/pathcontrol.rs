@@ -11,7 +11,7 @@
 //! The trust model is faithful to the thesis (NDNPIPES.pdf pp. 41–46): teardown is
 //! authorized by **pipe membership** — possession of the pipe key handed out in the
 //! PIPE exchange — not by a prefix-namespace signature. So this rides PathControl's
-//! *pluggable* [`PathAuthorizer`]. But the pipe key is a long-lived shared secret, so
+//! *pluggable* `PathAuthorizer`. But the pipe key is a long-lived shared secret, so
 //! it must **never travel on the wire**: a teardown Interest is broadcast along the
 //! path, and a cleartext key in its ApplicationParameters would let any on-path observer
 //! capture it and forge teardowns (or worse, impersonate membership) forever. Instead
@@ -23,7 +23,7 @@
 //! authorizer; pipes never `Redirect` — they teardown-and-rebuild.)
 //!
 //! The teardown *wire* (the emit helper + codec + the [`PipeMembership`] view) is
-//! unconditional. The in-engine adapter [`PipeTeardownControl`] — which plugs this into
+//! unconditional. The in-engine adapter `PipeTeardownControl` — which plugs this into
 //! a running forwarder's PathControl hook — is behind the `engine` feature, so the core
 //! stays forwarder-agnostic.
 
@@ -93,7 +93,7 @@ fn verify_teardown<M: PipeMembership + ?Sized>(
 
 /// The membership view a node has of the pipes it holds — exactly what a PathControl
 /// teardown needs to authorize and reap. Implemented by the producer's [`PipeRegistry`]
-/// and a relay's [`RelayPipeStore`], so the *same* [`PipeTeardownControl`] adapter hosts
+/// and a relay's [`RelayPipeStore`], so the *same* `PipeTeardownControl` adapter hosts
 /// either on its engine.
 pub trait PipeMembership: Send + Sync {
     /// The pipe key for `id`, if this node holds the pipe (the secret used to recompute
@@ -102,7 +102,7 @@ pub trait PipeMembership: Send + Sync {
     fn pipe_key(&self, id: &[u8]) -> Option<Vec<u8>>;
 
     /// Remove the pipe state for `id` — called **only after** the possession proof has
-    /// been verified by [`verify_teardown`] (the forwarder drops unauthorized control
+    /// been verified by `verify_teardown` (the forwarder drops unauthorized control
     /// before observers fire). Returns the pipe's namespace when it was held (so the
     /// caller can suppress sibling self-announcements); `None` if it wasn't held.
     fn reap_authorized(&self, id: &[u8]) -> Option<Name>;

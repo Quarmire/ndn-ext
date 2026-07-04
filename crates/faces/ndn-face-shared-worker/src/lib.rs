@@ -1,12 +1,12 @@
 //! SharedWorker face: one engine per origin, shared across every tab.
 //!
-//! A single [`SharedWorker`](web_sys::SharedWorker) hosts the engine. Each
-//! tab opens a [`MessagePort`](web_sys::MessagePort) and installs a
-//! [`SharedWorkerProxyFace`]; inside the worker, each connected port becomes
-//! a [`WorkerPortFace`] from the engine's POV.
+//! A single `SharedWorker` hosts the engine. Each
+//! tab opens a `MessagePort` and installs a
+//! `SharedWorkerProxyFace`; inside the worker, each connected port becomes
+//! a `WorkerPortFace` from the engine's POV.
 //!
 //! Wire format: raw NDN TLV bytes, one packet per `postMessage`, transferred
-//! as an [`ArrayBuffer`](js_sys::ArrayBuffer) so the move is zero-copy.
+//! as an `ArrayBuffer` so the move is zero-copy.
 //!
 //! `MessagePort` is `!Send`; the `Face` trait requires `Send + Sync + 'static`.
 //! Each face holds two [`mpsc`](tokio::sync::mpsc) channels and a pump task

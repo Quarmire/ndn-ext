@@ -8,13 +8,13 @@
 //!
 //! ## Where it sits (three distinct coding axes — see also `fec`, `cope`)
 //!
-//! - **F1 [`fec`]** — end-to-end K-of-N over *named, signed Data* segments.
-//! - **F3 [`cope`]** — *inter-flow* COPE (XORs in the Air): throughput via
+//! - **F1 [`crate::fec`]** — end-to-end K-of-N over *named, signed Data* segments.
+//! - **F3 `cope`** — *inter-flow* COPE (XORs in the Air): throughput via
 //!   overhearing, codes frames for *different* next-hops.
 //! - **link-FEC (here)** — *intra-flow* erasure FEC over *opaque link frames*
 //!   on one broadcast hop. Below the trust layer (a recovered frame is whatever
 //!   signed bytes it always was — coding is transparent framing, like NDNLP
-//!   fragmentation). Reuses the F1 systematic K-of-N codec ([`fec`]) at the link
+//!   fragmentation). Reuses the F1 systematic K-of-N codec ([`crate::fec`]) at the link
 //!   layer over arbitrary bytes, not named Data.
 //!
 //! ## Systematic = deliver source immediately, recover only on loss

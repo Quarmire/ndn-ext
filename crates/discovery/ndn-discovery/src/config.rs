@@ -215,7 +215,7 @@ pub struct ServiceDiscoveryConfig {
     /// LRU cap on `(prefix, node_name)` provider entries.
     pub measurement_capacity: usize,
     /// Entries unseen for longer than this are evicted lazily on the
-    /// next [`ServiceDiscoveryProtocol::measurements`] call.
+    /// next [`ServiceDiscoveryProtocol::measurements`](crate::ServiceDiscoveryProtocol::measurements) call.
     pub measurement_idle_ttl: Duration,
     /// Default [`NoEncryption`] (pass-through).
     pub encryption_hook: Arc<dyn EncryptionHook>,

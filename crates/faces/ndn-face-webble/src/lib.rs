@@ -5,7 +5,7 @@
 //! exchange Interest/Data over it. The peripheral side already ships in this
 //! workspace:
 //!
-//! - native — [`ndn_face::l2::BleFace`] (Linux `bluer`, macOS `CBPeripheralManager`)
+//! - native — `ndn_face::l2::BleFace` (Linux `bluer`, macOS `CBPeripheralManager`)
 //! - embedded — `ndn-embedded` (ESP32, trouble-host)
 //!
 //! All of those speak the NDNts `@ndn/web-bluetooth-transport` GATT profile,

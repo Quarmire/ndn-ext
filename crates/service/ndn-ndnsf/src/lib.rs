@@ -19,13 +19,13 @@
 //! - [`messages`] — the message TLV taxonomy (Request/Ack/Selection/Response,
 //!   type numbers 128–131) + [`Strategy`]/[`RequestMode`].
 //! - [`flow`] — the sans-IO orchestration ([`ProviderEngine`]).
-//! - [`driver`] — the four-phase flow over `ndn-sync` SVS pub/sub (feature
+//! - `driver` — the four-phase flow over `ndn-sync` SVS pub/sub (feature
 //!   `driver`).
-//! - [`roles`] — ergonomic [`ServiceProvider`]/[`ServiceUser`] wrappers over the
+//! - `roles` — ergonomic `ServiceProvider`/`ServiceUser` wrappers over the
 //!   driver (spec §11.2 mode 1).
-//! - [`trust`] / [`access`] — per-message trust ([`TrustCtx`], NSF-A3 trust half)
+//! - `trust` / `access` — per-message trust (`TrustCtx`, NSF-A3 trust half)
 //!   and KP-ABE access control (NSF-A3 authorization).
-//! - [`policy`] — TOML/`PolicyBuilder` → `ndn-nacabe` `KpAuthority` grants.
+//! - `policy` — TOML/`PolicyBuilder` → `ndn-nacabe` `KpAuthority` grants.
 
 #![deny(missing_docs)]
 

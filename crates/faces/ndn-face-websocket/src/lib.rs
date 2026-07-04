@@ -3,8 +3,8 @@
 //! `TlvCodec` is needed. Supports client (`connect`) and server
 //! (`from_stream`); compatible with NFD's WebSocket face.
 //!
-//! Feature `websocket-tls` enables [`TlsConfig`] and
-//! [`WebSocketFace::listen_tls`] (self-signed via `rcgen`, or PEM cert/key
+//! Feature `websocket-tls` enables `TlsConfig` and
+//! `WebSocketFace::listen_tls` (self-signed via `rcgen`, or PEM cert/key
 //! pair).
 
 #[cfg(feature = "websocket-tls")]
@@ -114,7 +114,7 @@ impl Transport for WebSocketFace {
         FaceKind::WebSocket
     }
 
-    /// TLS server connections flow through [`TlsWebSocketFace`] (which emits
+    /// TLS server connections flow through `TlsWebSocketFace` (which emits
     /// `wss://`), so this branch is always plain.
     fn remote_uri(&self) -> Option<String> {
         Some(format!(

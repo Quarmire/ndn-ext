@@ -76,7 +76,7 @@ pub struct DvPfxSync {
 
 impl DvPfxSync {
     /// Uses [`crate::protocols::dv::signing::InsecureTrust`]; call
-    /// [`with_trust`] for key-based signing or LVS validation.
+    /// [`Self::with_trust`] for key-based signing or LVS validation.
     pub fn new(network: Name, router: Name, boot: u64) -> Self {
         Self::with_trust(
             network,
@@ -218,7 +218,7 @@ impl DvPfxSync {
         self.process_sync_app_param(&app_param)
     }
 
-    /// Like [`process_sync_interest`] but takes AppParam bytes
+    /// Like [`Self::process_sync_interest`] but takes AppParam bytes
     /// directly — useful when the caller already holds the parsed
     /// Interest.
     pub fn process_sync_app_param(

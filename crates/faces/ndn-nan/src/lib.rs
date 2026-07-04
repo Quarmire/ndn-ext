@@ -2,7 +2,7 @@
 //!
 //! This crate is the I/O half of the NAN stack: it drives the sans-I/O
 //! [`ndn_nan_core::NanEngine`] from a [`FrameIo`] monitor radio + a tokio timer,
-//! and presents the [`NanBackend`](ndn_face_wifi_aware::NanBackend) that
+//! and presents the [`NanBackend`] that
 //! `ndn-face-wifi-aware`'s `NanCoordFace` / `NanDiscovery` already consume. So a
 //! commodity monitor-mode Wi-Fi adapter becomes a real NAN radio with no kernel
 //! NAN support — the cluster sync, Discovery-Window scheduling, service matching,

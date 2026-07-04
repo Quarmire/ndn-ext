@@ -73,7 +73,7 @@ impl InsecureTrust {
 /// signatures. Acceptance:
 ///
 /// 1. `DigestSha256` — accepted iff the embedded hash matches the
-///    signed region (gated by [`accept_digest_sha256`]).
+///    signed region (gated by [`Self::accept_digest_sha256`]).
 /// 2. Key-based signatures (Ed25519, RSA, ECDSA, HMAC) — accepted iff
 ///    the [`KeyLocator`] name resolves to a key in `trusted_keys` and
 ///    the cryptographic check passes.
@@ -82,7 +82,7 @@ pub struct StaticTrust {
     pub default_signer: Option<Arc<dyn Signer>>,
     /// Key = the `KeyLocator` name in the incoming Data's
     /// `SignatureInfo`. Value = raw public-key bytes for
-    /// [`ndn_security::verify_by_sig_type`].
+    /// [`ndn_security::verifier::verify_by_sig_type`].
     pub trusted_keys: HashMap<Name, Bytes>,
     /// Default `true`. Set `false` to require every packet be signed
     /// by a known key.

@@ -5,7 +5,7 @@
 //!
 //! - [`autoconfig`] — NDN AutoConfig hub discovery (multicast + NDN-FCH)
 //! - [`probe`] — per-neighbor liveness probe
-//! - [`ether_nd`] — Ethernet wrapper around [`probe`]
+//! - `ether_nd` — Ethernet wrapper around [`probe`]
 //! - [`service_discovery`] — NDNSD-style announce + browse with
 //!   optional body encryption
 

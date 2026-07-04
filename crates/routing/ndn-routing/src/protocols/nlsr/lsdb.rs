@@ -235,7 +235,7 @@ impl Lsdb {
             .map(|e| e.value().lsa.clone())
     }
 
-    /// Pure storage mutation; no I/O. Driven by [`start_age_out_task`].
+    /// Pure storage mutation; no I/O. Driven by [`Self::start_age_out_task`].
     pub fn expire_due(&self, now: tokio::time::Instant) -> Vec<ExpiredLsa> {
         let expired_keys: Vec<LsaKey> = self
             .store

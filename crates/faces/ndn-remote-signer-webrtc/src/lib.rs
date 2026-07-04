@@ -1,7 +1,7 @@
 //! WebRTC binding for the remote-signer transport.
 //!
 //! Adapts an [`ndn-face-webrtc`](ndn_face_webrtc) datachannel into a
-//! [`ChannelRemoteSigner`] (from [`ndn-custodian`](ndn_custodian)) and drives
+//! [`ChannelRemoteSigner`] (from [`ndn-custodian`](ndn_security::custodian)) and drives
 //! the HTTP signaling relay to pair with a phone fob over the internet — the
 //! concrete v1 transport for the dashboard's phone-as-signer second factor.
 //!

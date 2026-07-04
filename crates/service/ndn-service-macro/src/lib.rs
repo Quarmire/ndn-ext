@@ -1,5 +1,5 @@
 //! `#[ndn_service]` — turn a unary service trait into the service-layer §12
-//! seam: per-operation `Frame` message types, a [`Dispatch`] that routes an
+//! seam: per-operation `Frame` message types, a `Dispatch` that routes an
 //! `OpId` to the typed handler, and a client generic over `C: Carrier`. The same
 //! definition then runs over any carrier (Tier-0 `RpcCarrier`, the four-phase
 //! `NdnsfCarrier`, v2) unchanged.

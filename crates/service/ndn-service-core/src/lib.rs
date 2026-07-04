@@ -4,7 +4,7 @@
 //! A *service* is a typed set of **unary** operations (request → response). A
 //! [`Carrier`] is the pluggable backend that names, transports, multiplexes, and
 //! secures an invocation. One service definition runs over any carrier — Tier-0
-//! `ndn-rpc` ([`ndn_rpc::RpcCarrier`]), the NDNSF four-phase, or v2 — unchanged.
+//! `ndn-rpc` (`ndn_rpc::RpcCarrier`), the NDNSF four-phase, or v2 — unchanged.
 //!
 //! This crate holds only the seam (no transport): the [`Carrier`] /
 //! [`SelectCarrier`] traits, the server-side [`Dispatch`] a service exposes, the
