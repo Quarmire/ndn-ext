@@ -1,69 +1,150 @@
 name: CI — ndn-ext
 
-# ndn-ext crates depend on ndn-rs via ../ path deps, so CI checks out ndn-rs as a
-# sibling. Once cross-repo deps become { git, tag }, drop the extra checkout and
-# the `path:`/`working-directory:` indirection.
+# PR gate mirroring the ndn-rs A+ lane (fmt+clippy, nextest, rustdoc-deny, MSRV,
+# wasm, python, cargo-deny).
+#
+# ndn-ext depends on ndn-rs via `../` path deps, and ndn-pipes dev-deps ndn-sim,
+# so the build jobs check both out as siblings. When the repos are released,
+# switch those path deps to { git, tag } and drop the sibling checkouts.
+#
+# Toolchain: rust-toolchain.toml (in ndn-ext/) pins 1.96 + the wasm target;
+# rustup auto-installs it (the MSRV job overrides). Host compile jobs run the
+# default-members set; the wasm/python crates have their own jobs below.
 
 on:
   push:
     branches: [main]
-    paths: ["crates/**", "Cargo.toml", ".github/workflows/ci.yml"]
   pull_request:
     branches: [main]
-    paths: ["crates/**", "Cargo.toml", ".github/workflows/ci.yml"]
   workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+defaults:
+  run:
+    working-directory: ndn-ext
 
 env:
   CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
 
 jobs:
-  core:
-    name: ext (clippy / test / doc)
+  lint:
+    name: fmt + clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with: { path: ndn-ext }
       - uses: actions/checkout@v4
         with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: main, path: ndn-rs }
-      - uses: dtolnay/rust-toolchain@stable
-        with: { components: rustfmt, clippy }
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ndn-ext/target
-          key: ${{ runner.os }}-cargo-ext-${{ hashFiles('ndn-ext/**/Cargo.toml') }}
-          restore-keys: ${{ runner.os }}-cargo-ext-
-      # bluetooth (libdbus), monitor-wifi (libusb) host builds need these.
-      - name: Install system dependencies
+      - uses: actions/checkout@v4
+        with: { repository: "${{ github.repository_owner }}/ndn-sim", ref: main, path: ndn-sim }
+      - name: Install system dependencies (dbus / libusb / libpcap)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev libusb-1.0-0-dev libpcap-dev pkg-config
-      # default-members excludes wasm/python/mobile/afxdp crates (own jobs below).
-      - name: Format
-        working-directory: ndn-ext
-        run: cargo fmt --all -- --check
-      - name: Lint
-        working-directory: ndn-ext
-        run: cargo clippy -- -D warnings
-      - name: Test
-        working-directory: ndn-ext
-        run: cargo test
-      - name: Doc build
-        working-directory: ndn-ext
-        run: cargo doc --no-deps
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ndn-ext
+          shared-key: lint
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Scope fmt to ndn-ext's own members: `cargo fmt --all` also formats the
+      # sibling path deps, which are not this repo's responsibility.
+      - name: rustfmt (ndn-ext members)
+        run: |
+          PKGS=$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c "import json,sys;print(' '.join('-p '+p['name'] for p in json.load(sys.stdin)['packages']))")
+          cargo fmt $PKGS -- --check
+      - name: clippy (default-members, all targets)
+        run: cargo clippy --all-targets
+
+  test:
+    name: tests (nextest + doctests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: ndn-ext }
+      - uses: actions/checkout@v4
+        with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: main, path: ndn-rs }
+      - uses: actions/checkout@v4
+        with: { repository: "${{ github.repository_owner }}/ndn-sim", ref: main, path: ndn-sim }
+      - name: Install system dependencies (dbus / libusb / libpcap)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev libusb-1.0-0-dev libpcap-dev pkg-config
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ndn-ext
+          shared-key: test
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: nextest (unit + integration)
+        run: cargo nextest run --profile ci
+      - name: doctests (nextest does not run these)
+        run: cargo test --doc
+
+  docs:
+    name: rustdoc (broken links are errors)
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -Dwarnings
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: ndn-ext }
+      - uses: actions/checkout@v4
+        with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: main, path: ndn-rs }
+      - uses: actions/checkout@v4
+        with: { repository: "${{ github.repository_owner }}/ndn-sim", ref: main, path: ndn-sim }
+      - name: Install system dependencies (dbus / libusb / libpcap)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev libusb-1.0-0-dev libpcap-dev pkg-config
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ndn-ext
+          shared-key: docs
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo doc --no-deps
+
+  msrv:
+    name: MSRV (1.90)
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: ndn-ext }
+      - uses: actions/checkout@v4
+        with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: main, path: ndn-rs }
+      - uses: actions/checkout@v4
+        with: { repository: "${{ github.repository_owner }}/ndn-sim", ref: main, path: ndn-sim }
+      - name: Install system dependencies (dbus / libusb / libpcap)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev libusb-1.0-0-dev libpcap-dev pkg-config
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ndn-ext
+          shared-key: msrv
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: cargo check on rust-version
+        run: |
+          MSRV=$(cargo metadata --no-deps --format-version 1 |
+                 python3 -c "import json,sys; print(json.load(sys.stdin)['packages'][0]['rust_version'])")
+          echo "MSRV from Cargo.toml: $MSRV"
+          rustup toolchain install "$MSRV" --profile minimal
+          cargo "+$MSRV" check
 
   wasm32:
-    name: WASM crates (wasm32-unknown-unknown)
+    name: wasm32 (browser + binding crates)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with: { path: ndn-ext }
       - uses: actions/checkout@v4
         with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: main, path: ndn-rs }
-      - uses: dtolnay/rust-toolchain@stable
-        with: { targets: wasm32-unknown-unknown }
-      - name: Check wasm crates
-        working-directory: ndn-ext
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ndn-ext
+          shared-key: wasm32
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: check wasm crates
         run: |
           for p in ndn-wasm ndn-web-attach ndn-face-webtransport-wasm ndn-face-shared-worker ndn-face-webble ndn-strategy-wasm; do
             cargo check -p "$p" --target wasm32-unknown-unknown
@@ -77,14 +158,32 @@ jobs:
         with: { path: ndn-ext }
       - uses: actions/checkout@v4
         with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: main, path: ndn-rs }
-      - uses: dtolnay/rust-toolchain@stable
-        with: { components: clippy }
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ndn-ext
+          shared-key: python
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install maturin
         run: pip install maturin
       - name: Lint + build wheel
-        working-directory: ndn-ext
         run: |
-          cargo clippy -p ndn-python -- -D warnings
+          cargo clippy -p ndn-python --all-targets
           maturin build -m crates/bindings/ndn-python/Cargo.toml
+
+  deny:
+    name: cargo-deny (advisories + licenses + sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: ndn-ext }
+      - uses: actions/checkout@v4
+        with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: main, path: ndn-rs }
+      - uses: actions/checkout@v4
+        with: { repository: "${{ github.repository_owner }}/ndn-sim", ref: main, path: ndn-sim }
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: cargo deny check
+        run: cargo deny check
