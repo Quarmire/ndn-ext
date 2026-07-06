@@ -80,6 +80,10 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: nextest (unit + integration)
         run: cargo nextest run --profile ci
+      # ndn-pipes' teardown tests are gated on the off-by-default `engine`
+      # feature (they need the PathControl adapter); the default run skips them.
+      - name: nextest (engine-gated pipe teardown tests)
+        run: cargo nextest run --profile ci -p ndn-pipes --features engine
       - name: doctests (nextest does not run these)
         run: cargo test --doc
 
