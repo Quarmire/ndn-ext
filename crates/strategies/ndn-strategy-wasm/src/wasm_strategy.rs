@@ -1,8 +1,8 @@
 use std::path::Path;
 
-use wasmtime::Result;
 use smallvec::{SmallVec, smallvec};
 use tracing::warn;
+use wasmtime::Result;
 
 use ndn_engine::pipeline::{ForwardingAction, NackReason};
 use ndn_packet::Name;
