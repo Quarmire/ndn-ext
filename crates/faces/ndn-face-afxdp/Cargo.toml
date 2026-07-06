@@ -15,6 +15,9 @@ bytes         = { workspace = true, features = ["std"] }
 
 # AF_XDP is Linux-only: aya = XDP redirect prog + XskMap; xdpilone = UMEM/XSK
 # rings (deps libc/spin — no libbpf/clang). The crate is empty on other targets.
+[dev-dependencies]
+ndn-packet = { workspace = true, features = ["std"] }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio    = { workspace = true, features = ["net", "sync", "rt", "macros"] }
 aya      = "0.13"

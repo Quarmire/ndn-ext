@@ -156,6 +156,8 @@ jobs:
         with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: main, path: ndn-rs }
       - uses: actions/checkout@v4
         with: { repository: "${{ github.repository_owner }}/ndn-radio-drivers", ref: main, path: ndn-radio-drivers }
+      - uses: actions/checkout@v4
+        with: { repository: "${{ github.repository_owner }}/ndn-sim", ref: main, path: ndn-sim }
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ndn-ext
@@ -177,6 +179,8 @@ jobs:
         with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: main, path: ndn-rs }
       - uses: actions/checkout@v4
         with: { repository: "${{ github.repository_owner }}/ndn-radio-drivers", ref: main, path: ndn-radio-drivers }
+      - uses: actions/checkout@v4
+        with: { repository: "${{ github.repository_owner }}/ndn-sim", ref: main, path: ndn-sim }
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - uses: Swatinem/rust-cache@v2

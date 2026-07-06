@@ -77,7 +77,7 @@ impl AfXdpFace {
     }
 
     /// Like [`new`](Self::new) but uses the redirect program embedded in the
-    /// binary ([`DEFAULT_REDIRECT_OBJ`]) — no external object required.
+    /// binary (`DEFAULT_REDIRECT_OBJ`) — no external object required.
     pub fn new_with_embedded_redirect(
         id: FaceId,
         iface: &str,
