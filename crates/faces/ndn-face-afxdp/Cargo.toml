@@ -9,7 +9,7 @@ license.workspace = true
 classification = "extension"
 
 [dependencies]
-ndn-face      = { workspace = true }
+ndn-face      = { workspace = true, features = ["l2"] }
 ndn-transport = { workspace = true }
 bytes         = { workspace = true, features = ["std"] }
 
