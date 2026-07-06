@@ -3,9 +3,9 @@ name: CI — ndn-ext
 # PR gate mirroring the ndn-rs A+ lane (fmt+clippy, nextest, rustdoc-deny, MSRV,
 # wasm, python, cargo-deny).
 #
-# ndn-ext depends on ndn-rs via `../` path deps, and ndn-pipes dev-deps ndn-sim,
-# so the build jobs check both out as siblings. When the repos are released,
-# switch those path deps to { git, tag } and drop the sibling checkouts.
+# ndn-ext depends on ndn-rs (and ndn-radio-drivers, via the monitor-wifi face)
+# through `../` path deps, so the build jobs check those out as siblings. When the
+# repos are released, switch those path deps to { git, tag } and drop the checkouts.
 #
 # Toolchain: rust-toolchain.toml (in ndn-ext/) pins 1.96 + the wasm target;
 # rustup auto-installs it (the MSRV job overrides). Host compile jobs run the
@@ -41,8 +41,6 @@ jobs:
         with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: main, path: ndn-rs }
       - uses: actions/checkout@v4
         with: { repository: "${{ github.repository_owner }}/ndn-radio-drivers", ref: main, path: ndn-radio-drivers }
-      - uses: actions/checkout@v4
-        with: { repository: "${{ github.repository_owner }}/ndn-sim", ref: main, path: ndn-sim }
       - name: Install system dependencies (dbus / libusb / libpcap)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev libusb-1.0-0-dev libpcap-dev pkg-config
       - uses: Swatinem/rust-cache@v2
@@ -70,8 +68,6 @@ jobs:
         with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: main, path: ndn-rs }
       - uses: actions/checkout@v4
         with: { repository: "${{ github.repository_owner }}/ndn-radio-drivers", ref: main, path: ndn-radio-drivers }
-      - uses: actions/checkout@v4
-        with: { repository: "${{ github.repository_owner }}/ndn-sim", ref: main, path: ndn-sim }
       - name: Install system dependencies (dbus / libusb / libpcap)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev libusb-1.0-0-dev libpcap-dev pkg-config
       - uses: taiki-e/install-action@v2
@@ -103,8 +99,6 @@ jobs:
         with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: main, path: ndn-rs }
       - uses: actions/checkout@v4
         with: { repository: "${{ github.repository_owner }}/ndn-radio-drivers", ref: main, path: ndn-radio-drivers }
-      - uses: actions/checkout@v4
-        with: { repository: "${{ github.repository_owner }}/ndn-sim", ref: main, path: ndn-sim }
       - name: Install system dependencies (dbus / libusb / libpcap)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev libusb-1.0-0-dev libpcap-dev pkg-config
       - uses: Swatinem/rust-cache@v2
@@ -126,8 +120,6 @@ jobs:
         with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: main, path: ndn-rs }
       - uses: actions/checkout@v4
         with: { repository: "${{ github.repository_owner }}/ndn-radio-drivers", ref: main, path: ndn-radio-drivers }
-      - uses: actions/checkout@v4
-        with: { repository: "${{ github.repository_owner }}/ndn-sim", ref: main, path: ndn-sim }
       - name: Install system dependencies (dbus / libusb / libpcap)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev libusb-1.0-0-dev libpcap-dev pkg-config
       - uses: Swatinem/rust-cache@v2
@@ -156,8 +148,6 @@ jobs:
         with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: main, path: ndn-rs }
       - uses: actions/checkout@v4
         with: { repository: "${{ github.repository_owner }}/ndn-radio-drivers", ref: main, path: ndn-radio-drivers }
-      - uses: actions/checkout@v4
-        with: { repository: "${{ github.repository_owner }}/ndn-sim", ref: main, path: ndn-sim }
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ndn-ext
@@ -182,8 +172,6 @@ jobs:
         with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: main, path: ndn-rs }
       - uses: actions/checkout@v4
         with: { repository: "${{ github.repository_owner }}/ndn-radio-drivers", ref: main, path: ndn-radio-drivers }
-      - uses: actions/checkout@v4
-        with: { repository: "${{ github.repository_owner }}/ndn-sim", ref: main, path: ndn-sim }
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - uses: Swatinem/rust-cache@v2
@@ -208,8 +196,6 @@ jobs:
         with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: main, path: ndn-rs }
       - uses: actions/checkout@v4
         with: { repository: "${{ github.repository_owner }}/ndn-radio-drivers", ref: main, path: ndn-radio-drivers }
-      - uses: actions/checkout@v4
-        with: { repository: "${{ github.repository_owner }}/ndn-sim", ref: main, path: ndn-sim }
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny
