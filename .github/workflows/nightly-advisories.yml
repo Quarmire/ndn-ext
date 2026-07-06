@@ -1,0 +1,43 @@
+name: Nightly — advisories
+
+# The per-push CI deny gate checks the deterministic parts (bans + licenses +
+# sources). Advisories are a moving target — new RUSTSEC entries land for
+# transitive deps constantly — so they run here on a schedule rather than
+# blocking every push (and to avoid the temptation to blindly suppress real CVEs
+# just to keep a PR green).
+#
+# `--all-features` so feature-gated deps are covered — notably wasmtime, which is
+# behind ndn-compute's off-by-default `wasm-exec` feature and in ndn-strategy-wasm
+# (a native wasmtime host). Reviewed/triaged advisories are tracked with rationale
+# in deny.toml's [advisories].ignore; a RED run here means a NEW advisory landed
+# and needs a look (bump the dep, or add a documented ignore).
+
+on:
+  schedule:
+    - cron: "27 6 * * *" # 06:27 UTC daily
+  workflow_dispatch:
+
+concurrency:
+  group: nightly-advisories
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: ndn-ext
+
+jobs:
+  advisories:
+    name: cargo-deny advisories (--all-features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: ndn-ext }
+      - uses: actions/checkout@v4
+        with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: main, path: ndn-rs }
+      - uses: actions/checkout@v4
+        with: { repository: "${{ github.repository_owner }}/ndn-radio-drivers", ref: main, path: ndn-radio-drivers }
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: cargo deny check advisories (--all-features)
+        run: cargo deny --all-features check advisories
