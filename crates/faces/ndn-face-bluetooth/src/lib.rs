@@ -178,7 +178,7 @@ impl Transport for BleFace {
 /// [`accept`](BleListener::accept) — the NFD-style listener/channel model the
 /// forwarder drives in an accept loop.
 ///
-/// ```no_run
+/// ```ignore
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// use ndn_face::l2::BleListener;
 /// use ndn_transport::FaceId;

@@ -180,16 +180,13 @@ mod linux {
         // every 3 s.
         let d2 = driver.clone();
         tokio::spawn(async move {
-            loop {
-                match d2.next_followup().await {
-                    Ok(fu) => println!(
-                        "[node] FOLLOW-UP from {}: {:?}  rssi={:?}",
-                        fu.peer.map(|p| mac(&p)).unwrap_or_default(),
-                        String::from_utf8_lossy(&fu.frame),
-                        fu.rssi_dbm
-                    ),
-                    Err(_) => break,
-                }
+            while let Ok(fu) = d2.next_followup().await {
+                println!(
+                    "[node] FOLLOW-UP from {}: {:?}  rssi={:?}",
+                    fu.peer.map(|p| mac(&p)).unwrap_or_default(),
+                    String::from_utf8_lossy(&fu.frame),
+                    fu.rssi_dbm
+                );
             }
         });
 

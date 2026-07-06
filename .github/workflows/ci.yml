@@ -163,9 +163,12 @@ jobs:
           workspaces: ndn-ext
           shared-key: wasm32
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # ndn-strategy-wasm is NOT a browser crate — it's a native host that *runs*
+      # wasm strategies via wasmtime (which can't compile to wasm32). It's covered
+      # by the native nextest/clippy jobs; excluded here on purpose.
       - name: check wasm crates
         run: |
-          for p in ndn-wasm ndn-web-attach ndn-face-webtransport-wasm ndn-face-shared-worker ndn-face-webble ndn-strategy-wasm; do
+          for p in ndn-wasm ndn-web-attach ndn-face-webtransport-wasm ndn-face-shared-worker ndn-face-webble; do
             cargo check -p "$p" --target wasm32-unknown-unknown
           done
 
