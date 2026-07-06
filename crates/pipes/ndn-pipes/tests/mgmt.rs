@@ -2,6 +2,12 @@
 //! opens a pipe, `/localhost/nfd/pipes/list` (the `pipes` MgmtModule over the
 //! producer's shared registry) reports it; once it is torn down, the dataset
 //! drops it. Mirrors `compute/list`.
+//!
+//! Gated on `engine`: the teardown -> reap is a forwarder PathControl hook
+//! (`PipeTeardownControl`), which pulls ndn-engine.
+#![cfg(feature = "engine")]
+
+use std::sync::Arc;
 
 use ndn_app::{Consumer, EngineBuilder, Producer};
 use ndn_config::{ControlParameters, ForwarderConfig, control_response::status, nfd_command::verb};
@@ -13,7 +19,9 @@ use ndn_packet::Name;
 use ndn_transport::FaceId;
 use tokio_util::sync::CancellationToken;
 
-use ndn_pipes::{Confidentiality, PipeConsumer, PipeParams, PipeProducer, PipesModule};
+use ndn_pipes::{
+    Confidentiality, PipeConsumer, PipeParams, PipeProducer, PipeTeardownControl, PipesModule,
+};
 
 /// A minimal engine-backed `MgmtContext` (the PIPES module ignores it, but the
 /// trait requires one — same shape as the other read-only module tests).
@@ -52,39 +60,43 @@ fn list_text(resp: &MgmtResponse) -> &str {
     }
 }
 
-// NOTE: dormant until now — this test never compiled (ndn-pipes didn't enable
-// ndn-config's `mgmt` feature, so `ForwarderConfig: MgmtConfig` was unmet). With
-// the feature enabled it runs, and exposes an unfinished feature: explicit
-// teardown does NOT reap the producer's mgmt registry. `PipeRegistry::reap_now`
-// exists for exactly this but nothing calls it, and there is no
-// `MessageKind::Teardown` handler in the producer — a torn-down pipe only leaves
-// the `list` dataset on PUI expiry. Ignored (not deleted) so the gap stays
-// tracked; wiring teardown -> reap_now is a protocol change, out of scope here.
-#[ignore = "exposes unwired teardown->registry reap in ndn-pipes; see note"]
+/// After a consumer opens a pipe the `pipes/list` dataset reports it; once the
+/// consumer tears it down, the PathControl teardown walk reaps the producer's
+/// registry (via the `PipeTeardownControl` hook registered on the engine) and the
+/// dataset drops it.
 #[tokio::test]
 async fn pipes_list_reports_live_pipes() {
     let (consumer_face, consumer_handle) = InProcFace::new(FaceId(1), 256);
     let (producer_face, producer_handle) = InProcFace::new(FaceId(2), 256);
+    let root: Name = "/".parse().unwrap();
+
+    // Producer first, so its registry can back the teardown PathControl hook and
+    // the introspection module.
+    let producer = PipeProducer::new(Producer::from_handle(producer_handle, root.clone()))
+        .serve_object(
+            &"/sensors/temp/v=42".parse().unwrap(),
+            b"unused",
+            &ndn_coding::FecPolicy::systematic(8, 12).unwrap(),
+            1,
+            &[],
+            &Confidentiality::None,
+        );
+    let registry = producer.registry();
+    let teardown = Arc::new(PipeTeardownControl::new(registry.clone()));
+
+    // Register the teardown adapter so a PathControl Teardown walk authorizes and
+    // reaps the producer's registry (the app never sees the teardown).
     let (engine, shutdown) = EngineBuilder::new(EngineConfig::default())
         .face(consumer_face)
         .face(producer_face)
+        .path_authorizer(teardown.clone())
+        .path_control_observer(teardown.clone())
         .build()
         .await
         .expect("engine build");
-    let root: Name = "/".parse().unwrap();
     engine.fib().add_nexthop(&root, FaceId(2), 0);
 
-    let producer = PipeProducer::new(Producer::from_handle(producer_handle, root)).serve_object(
-        &"/sensors/temp/v=42".parse().unwrap(),
-        b"unused",
-        &ndn_coding::FecPolicy::systematic(8, 12).unwrap(),
-        1,
-        &[],
-        &Confidentiality::None,
-    );
-    // Share the producer's live-pipe table with the introspection module before
-    // serve() consumes the producer.
-    let module = PipesModule::new(producer.registry());
+    let module = PipesModule::new(registry);
     let serve = tokio::spawn(async move { producer.serve().await });
 
     let cancel = CancellationToken::new();
