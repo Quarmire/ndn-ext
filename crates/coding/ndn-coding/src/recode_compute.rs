@@ -38,9 +38,9 @@ impl NcComputeHandler {
 }
 
 impl ComputeHandler for NcComputeHandler {
-    async fn compute(&self, interest: &Interest) -> Result<Data, ComputeError> {
+    async fn handle(&self, interest: &Interest) -> Result<Data, ComputeError> {
         let (object, generation_id, vector) = naming::parse_vector_request(&interest.name)
-            .ok_or_else(|| ComputeError::BadArguments("not a _nc/<vector> name".into()))?;
+            .ok_or_else(|| ComputeError::BadRequest("not a _nc/<vector> name".into()))?;
         if object != self.object || generation_id != self.generation_id {
             return Err(ComputeError::NotFound);
         }
@@ -53,7 +53,7 @@ impl ComputeHandler for NcComputeHandler {
             )
         };
         let combo =
-            combo.ok_or_else(|| ComputeError::ComputeFailed("generation not full rank".into()))?;
+            combo.ok_or_else(|| ComputeError::HandlerFailed("generation not full rank".into()))?;
         let meta = CodedMetadata {
             generation_id,
             k,
@@ -63,7 +63,7 @@ impl ComputeHandler for NcComputeHandler {
         let content = meta.prepend(&combo.payload);
         let name = (*interest.name).clone();
         let wire = DataBuilder::new(name, &content).sign_digest_sha256();
-        Data::decode(wire).map_err(|e| ComputeError::ComputeFailed(format!("encode: {e}")))
+        Data::decode(wire).map_err(|e| ComputeError::HandlerFailed(format!("encode: {e}")))
     }
 }
 
