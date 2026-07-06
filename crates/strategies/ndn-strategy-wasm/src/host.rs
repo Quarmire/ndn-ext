@@ -61,7 +61,7 @@ impl HostState {
 }
 
 /// Register the `ndn::*` import surface available to WASM strategies.
-pub(crate) fn add_host_functions(linker: &mut wasmtime::Linker<HostState>) -> anyhow::Result<()> {
+pub(crate) fn add_host_functions(linker: &mut wasmtime::Linker<HostState>) -> wasmtime::Result<()> {
     linker.func_wrap(
         "ndn",
         "get_in_face",

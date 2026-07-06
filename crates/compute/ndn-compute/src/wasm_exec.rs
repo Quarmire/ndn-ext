@@ -17,7 +17,7 @@
 
 use std::path::Path;
 
-use anyhow::Result;
+use wasmtime::Result;
 use bytes::Bytes;
 
 use crate::ComputeError;

@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use anyhow::Result;
+use wasmtime::Result;
 use smallvec::{SmallVec, smallvec};
 use tracing::warn;
 

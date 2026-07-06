@@ -15,8 +15,7 @@ ndn-strategy  = { workspace = true }
 ndn-engine    = { workspace = true }
 smallvec      = { workspace = true }
 tracing       = { workspace = true }
-anyhow        = { workspace = true }
-wasmtime      = { version = "31", default-features = false, features = ["cranelift", "runtime"] }
+wasmtime      = { version = "46", default-features = false, features = ["cranelift", "runtime"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
