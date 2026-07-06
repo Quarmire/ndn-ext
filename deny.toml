@@ -15,12 +15,24 @@ ignore = [
   "RUSTSEC-2025-0141",
   # lru `IterMut` unsoundness — the only caller never calls `iter_mut`.
   "RUSTSEC-2026-0002",
+  # rustls-pemfile unmaintained (now a thin wrapper over rustls-pki-types).
+  "RUSTSEC-2025-0134",
+  # quinn-proto out-of-order reassembly memory exhaustion. Reached only via
+  # the optional WebTransport/QUIC face; tracked for a quinn bump. SECURITY: revisit.
+  "RUSTSEC-2026-0185",
+  # `Error::downcast_mut` unsoundness in a transitive dep; no exploitation path
+  # in-tree. Revisit when the upstream fix lands.
+  "RUSTSEC-2026-0190",
 ]
 
 [licenses]
 private = { ignore = true }
 allow = [
   "MIT",
+  "CDLA-Permissive-2.0",
+  # xdpilone (AF_XDP lib, optional afxdp face) — copyleft EU license, used as an
+  # unmodified library dep. POLICY: confirm copyleft is acceptable here.
+  "EUPL-1.2",
   "Apache-2.0",
   "Apache-2.0 WITH LLVM-exception",
   "BSD-2-Clause",
@@ -41,3 +53,9 @@ wildcards = "warn"
 [sources]
 unknown-registry = "deny"
 unknown-git = "allow"
+
+# unescaper is dual GPL-3.0/MIT (deprecated `/` syntax); take the MIT arm.
+[[licenses.clarify]]
+crate = "unescaper"
+expression = "MIT"
+license-files = []
