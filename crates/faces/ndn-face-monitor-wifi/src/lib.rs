@@ -104,8 +104,8 @@ pub use ndn_frame_io::{
 #[cfg(feature = "libusb-backend")]
 pub use ndn_radio_drivers::{
     CHIP_ID_8822E, ChannelBw, ChipInfo, FwVersion, IqkResult, LibUsbRtl88xxBackend, MT7612U_PIDS,
-    Mt7612uBackend, REALTEK_VID, REG_SYS_CFG, RTL88XX_PIDS, RTL8812AU_PIDS, RTL8821CU_PIDS, RfPath,
-    Rtl8812auBackend, Rtl8821cuBackend,
+    Mt7612uBackend, REALTEK_VID, REG_SYS_CFG, RTL88XX_PIDS, RTL8733B_PIDS, RTL8812AU_PIDS,
+    RTL8821CU_PIDS, RfPath, Rtl8733buBackend, Rtl8812auBackend, Rtl8821cuBackend,
 };
 
 // The BW16 (RTL8720DN) serial-bridged backend — a dual-band 802.11 node driven
