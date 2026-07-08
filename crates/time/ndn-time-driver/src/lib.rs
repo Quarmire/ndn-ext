@@ -86,9 +86,17 @@ pub struct TimeService {
     transport: std::sync::Arc<dyn BeaconTransport>,
     auth: std::sync::Arc<dyn BeaconAuth>,
     clock: std::sync::Arc<dyn ClockSink>,
+    /// Count of inbound beacons that passed auth and were fed to the loop — lets a driver observe
+    /// that peer time is actually crossing the link (e.g. on-air 2-node convergence).
+    peer_ingests: std::sync::atomic::AtomicU64,
 }
 
 impl TimeService {
+    /// How many inbound peer beacons have passed [`BeaconAuth::open`] and been ingested so far.
+    pub fn peer_ingests(&self) -> u64 {
+        self.peer_ingests.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Build a service for `node_id` with its `self_key`, local clock `cap`ability and `policy`,
     /// over the given `sources`, `transport`, `auth`, and `clock` sink.
     #[allow(clippy::too_many_arguments)] // a composition root: each seam is an explicit dependency
@@ -110,6 +118,7 @@ impl TimeService {
             transport,
             auth,
             clock,
+            peer_ingests: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -124,6 +133,8 @@ impl TimeService {
         };
         let beacon = dec.into_beacon(now_mono_ns, vb.prov);
         self.tk.lock().unwrap().ingest_beacon(vb.peer_id, &beacon);
+        self.peer_ingests
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         true
     }
 
