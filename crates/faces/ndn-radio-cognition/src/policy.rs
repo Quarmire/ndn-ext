@@ -204,7 +204,7 @@ impl RadioPolicy {
             );
             // Heterogeneous + coded ⇒ second radio carries a distinct generation
             // subset (Split); otherwise it replicates the same content.
-            let role = if i > 0 && ctx.generation.is_some() && cap.band != tx[0].1.band {
+            let role = if i > 0 && ctx.generation.is_some() && cap.bands != tx[0].1.bands {
                 AllocRole::Split
             } else {
                 AllocRole::Replicate
@@ -243,7 +243,7 @@ impl RadioPolicy {
         // decides. Bulk wants rate; urgent/broad wants reach. Sub-GHz scores high on
         // reach, Wi-Fi high on rate — the homogeneous/heterogeneous switch falls out
         // of the descriptor, no special-casing.
-        let reach = cap.band.range_rank() as f32 / 4.0;
+        let reach = cap.range_rank() as f32 / 4.0;
         let rate = (cap.max_mcs as f32 / 9.0 + (cap.max_nss.saturating_sub(1)) as f32 / 3.0) / 2.0;
         let (w_reach, w_rate) = match ctx.priority {
             Priority::Bulk => (0.2, 1.0),
