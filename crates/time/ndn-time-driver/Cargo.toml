@@ -1,0 +1,21 @@
+[package]
+name = "ndn-time-driver"
+version = "0.1.0"
+edition = "2024"
+description = "Live driver that wires the sans-IO named-time Timekeeper onto a real transport (monitor-wifi face), sources, auth, and a clock sink — the I/O layer the pure ndn-time core lacks."
+
+[dependencies]
+ndn-time = { workspace = true }
+ndn-time-sources = { workspace = true }
+ndn-timekeeper = { workspace = true }
+bytes = { workspace = true, features = ["std"] }
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+ndn-frame-io = { workspace = true, optional = true }
+
+[features]
+# `wifi` adds a BeaconTransport over a monitor-wifi face's FrameIo — the on-air bridge.
+wifi = ["dep:ndn-frame-io"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
