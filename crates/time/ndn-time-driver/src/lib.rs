@@ -86,6 +86,10 @@ pub struct TimeService {
     transport: std::sync::Arc<dyn BeaconTransport>,
     auth: std::sync::Arc<dyn BeaconAuth>,
     clock: std::sync::Arc<dyn ClockSink>,
+    /// This node's own clock capability, stamped into every outbound heartbeat beacon.
+    local_cap: ClockCapability,
+    /// Monotone sequence for outbound heartbeat beacons.
+    beacon_seq: std::sync::atomic::AtomicU64,
     /// Count of inbound beacons that passed auth and were fed to the loop — lets a driver observe
     /// that peer time is actually crossing the link (e.g. on-air 2-node convergence).
     peer_ingests: std::sync::atomic::AtomicU64,
@@ -118,6 +122,8 @@ impl TimeService {
             transport,
             auth,
             clock,
+            local_cap: cap,
+            beacon_seq: std::sync::atomic::AtomicU64::new(0),
             peer_ingests: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -161,9 +167,17 @@ impl TimeService {
             self.clock.set_clock_ms(ms);
         }
         let _ = discipline_label(&out.discipline); // hook for a real clock-steering call
-        out.beacon.map(|b| {
-            let payload = beacon_wire::encode(b.seq, b.wall_ns, b.uncertainty_ns, &b.cap);
-            self.auth.seal(self.node_id, b.seq, &payload)
+        // Heartbeat: whenever we hold a usable fix, beacon the *current* estimate every tick — not
+        // only when it tightens (`out.beacon`). A broadcast time source must be continuously
+        // present, or a peer that joins late (or after a loss) never hears it.
+        out.clock_ms.map(|_| {
+            let seq = self
+                .beacon_seq
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let wall = local_wall + out.correction.offset_ns;
+            let payload =
+                beacon_wire::encode(seq, wall, out.correction.uncertainty_ns, &self.local_cap);
+            self.auth.seal(self.node_id, seq, &payload)
         })
     }
 
