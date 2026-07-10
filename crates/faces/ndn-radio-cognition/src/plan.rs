@@ -36,6 +36,13 @@ pub struct TxParams {
     /// plane only ever sets this to *reduce* power below the calibrated max when the
     /// demand set has SNR margin to spare (for spatial reuse), never to exceed it.
     pub tx_power: Option<u8>,
+    /// LoRa **spreading factor** (7–12) — the sub-GHz reach/rate dial, the LoRa analogue of `mcs`.
+    /// `None` for Wi-Fi radios (which have no SF). Cognition sets it low for close/bulk, high for
+    /// far/urgent, from the same demand-set RSSI it uses to pick MCS.
+    pub spreading_factor: Option<u8>,
+    /// LoRa **coding rate** (`1`=4/5 … `4`=4/8) — a robustness/FEC dial, raised under reach
+    /// pressure (urgent/broadcast). `None` for Wi-Fi radios.
+    pub coding_rate: Option<u8>,
 }
 
 /// How a radio's transmission relates to the others in the plan.

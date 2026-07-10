@@ -281,9 +281,28 @@ impl RadioPolicy {
         channel: Option<u8>,
         now_ms: u64,
     ) -> TxParams {
-        // LoRa-class radios have no Wi-Fi MCS/BW knobs — keep params minimal.
+        // LoRa-class radios have no Wi-Fi MCS/BW knobs; their reach/rate dial is the spreading
+        // factor. Pick it from the same demand-set RSSI (with the broad/unicast margin) that drives
+        // MCS below — a strong link runs low SF (fast), reach pressure runs high SF. Coding rate
+        // rises for urgent/broadcast robustness.
         if cap.kind == RadioKind::Lora {
+            let base = self.demand_set_rssi(radio, view, now_ms).unwrap_or(-105) as f32;
+            let eff = if broad {
+                base - BROAD_MARGIN_DB
+            } else if receivers <= 1 {
+                base + UNICAST_MARGIN_DB
+            } else {
+                base
+            };
+            let sf = pick_sf(eff.round().clamp(-130.0, 0.0) as i8);
+            let cr = if matches!(ctx.priority, Priority::Urgent) || broad {
+                2
+            } else {
+                1
+            };
             return TxParams {
+                spreading_factor: Some(sf),
+                coding_rate: Some(cr),
                 link_fec_redundancy: self.fec_redundancy(radio, ctx, view, receivers, deficit),
                 ..Default::default()
             };
@@ -352,6 +371,8 @@ impl RadioPolicy {
             link_fec_redundancy: self.fec_redundancy(radio, ctx, view, receivers, deficit),
             edcca_ignore: ctx.priority == Priority::Urgent && busy >= self.cfg.busy_high,
             tx_power: self.decide_power(cap, mcs, rssi),
+            spreading_factor: None, // Wi-Fi radios have no SF
+            coding_rate: None,
         }
     }
 
@@ -498,6 +519,20 @@ impl RadioStrategy for RadioPolicy {
 }
 
 // --- helpers ---
+
+/// Map a link margin (dBm) to a LoRa spreading factor: strong signal → SF7 (fast, short airtime),
+/// weak → SF12 (max range). Coarse thresholds roughly tracking SX126x per-SF sensitivity
+/// (~2.5 dB/step); refine via the calibrate module the way `pick_mcs` does once on-air data exists.
+fn pick_sf(rssi: i8) -> u8 {
+    match rssi {
+        r if r >= -80 => 7,
+        r if r >= -90 => 8,
+        r if r >= -100 => 9,
+        r if r >= -110 => 10,
+        r if r >= -118 => 11,
+        _ => 12,
+    }
+}
 
 /// RSSI margin (dB) subtracted for a broad broadcast — provision the rate for the
 /// weaker/more-numerous listeners, not the best single link.

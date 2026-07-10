@@ -641,6 +641,8 @@ struct AppliedKnobs {
     csd: Option<bool>,
     edcca: Option<bool>,
     power: Option<u8>,
+    sf: Option<u8>, // LoRa spreading factor
+    cr: Option<u8>, // LoRa coding rate
 }
 
 #[cfg(feature = "libusb-backend")]
@@ -712,6 +714,21 @@ impl RadioActuators for LibUsbActuator {
         {
             self.knobs.set_tx_power(idx as u32).map_err(to_err)?;
             last.power = Some(idx);
+        }
+        // LoRa reach/rate dials (no-op on Wi-Fi radios). Each change is a ~1s AT retune of the
+        // dongle, so gate strictly on a changed value — cognition emits these every decision, but
+        // we only actuate when the spreading factor / coding rate actually moves.
+        if let Some(sf) = p.spreading_factor
+            && last.sf != Some(sf)
+        {
+            self.knobs.set_spreading_factor(sf).map_err(to_err)?;
+            last.sf = Some(sf);
+        }
+        if let Some(cr) = p.coding_rate
+            && last.cr != Some(cr)
+        {
+            self.knobs.set_coding_rate(cr).map_err(to_err)?;
+            last.cr = Some(cr);
         }
         drop(last);
 
