@@ -153,7 +153,30 @@ pub struct MediumState {
     e2e: Ewma,
     neighbors: HashMap<u64, NeighborState>,
     demand: HashMap<u64, Demand>,
+    /// Per-radio on-air time records `(sent_ms, airtime_ms)` over the duty window, for enforcing
+    /// [`RadioCapability::duty_cycle_max`] (LoRa sub-GHz ≈ 1%).
+    airtime: HashMap<RadioId, Vec<(u64, f32)>>,
     stale_ms: u64,
+}
+
+/// Sliding window over which duty cycle is measured (1 h — the ETSI sub-GHz reference period).
+pub const DUTY_WINDOW_MS: u64 = 3_600_000;
+
+/// LoRa on-air time (ms) for `payload` bytes at the given spreading factor / bandwidth (kHz) /
+/// coding rate — the Semtech airtime formula (explicit header, 8-symbol preamble, CRC on, and the
+/// low-data-rate optimize engaged at SF ≥ 11). The input to duty-cycle accounting.
+pub fn lora_airtime_ms(sf: u8, bw_khz: u32, cr: u8, payload: usize) -> f32 {
+    let sf = sf.clamp(7, 12) as f32;
+    let bw = (bw_khz.max(1) as f32) * 1000.0; // Hz
+    let cr = cr.clamp(1, 4) as f32; // 1..4 → 4/5..4/8
+    let t_sym = 2.0_f32.powf(sf) / bw; // seconds per symbol
+    let de = if sf >= 11.0 { 1.0 } else { 0.0 }; // low-data-rate optimize
+    let t_preamble = (8.0 + 4.25) * t_sym;
+    let num = 8.0 * payload as f32 - 4.0 * sf + 28.0 + 16.0; // explicit header, CRC on
+    let den = 4.0 * (sf - 2.0 * de);
+    let payload_symb = 8.0 + ((num / den).ceil().max(0.0)) * (cr + 4.0);
+    let t_payload = payload_symb * t_sym;
+    (t_preamble + t_payload) * 1000.0
 }
 
 impl MediumState {
@@ -177,6 +200,15 @@ impl MediumState {
     pub fn register_radio(&mut self, id: RadioId, cap: RadioCapability) {
         self.radios.insert(id, cap);
         self.residual.entry(id).or_default();
+    }
+
+    /// Record `airtime_ms` of on-air time for `radio` at `now_ms` — call once per transmission on a
+    /// duty-cycled radio ([`lora_airtime_ms`] gives the value). Old records fall out of the window.
+    pub fn record_airtime(&mut self, radio: RadioId, airtime_ms: f32, now_ms: u64) {
+        let cutoff = now_ms.saturating_sub(DUTY_WINDOW_MS);
+        let recs = self.airtime.entry(radio).or_default();
+        recs.push((now_ms, airtime_ms));
+        recs.retain(|(t, _)| *t >= cutoff);
     }
 
     // ---- SENSE inputs (push) ----
@@ -305,6 +337,12 @@ pub trait MediumView {
     fn neighbors_holding(&self, prefix_hash: u64, now_ms: u64) -> usize;
     /// Demand for a prefix-hash, if known.
     fn demand(&self, prefix_hash: u64) -> Option<Demand>;
+    /// Fraction of the duty window `radio` has spent transmitting (0.0 when nothing is recorded,
+    /// e.g. an unrestricted Wi-Fi radio). The policy compares this to
+    /// [`RadioCapability::duty_cycle_max`] and skips a radio that has spent its budget.
+    fn duty_used(&self, _radio: RadioId, _now_ms: u64) -> f32 {
+        0.0
+    }
 }
 
 impl MediumView for MediumState {
@@ -315,6 +353,20 @@ impl MediumView for MediumState {
     }
     fn capability(&self, radio: RadioId) -> Option<RadioCapability> {
         self.radios.get(&radio).cloned()
+    }
+    fn duty_used(&self, radio: RadioId, now_ms: u64) -> f32 {
+        let cutoff = now_ms.saturating_sub(DUTY_WINDOW_MS);
+        let sum: f32 = self
+            .airtime
+            .get(&radio)
+            .map(|recs| {
+                recs.iter()
+                    .filter(|(t, _)| *t >= cutoff)
+                    .map(|(_, a)| *a)
+                    .sum()
+            })
+            .unwrap_or(0.0);
+        sum / DUTY_WINDOW_MS as f32
     }
     fn residual(&self, radio: RadioId) -> Option<LinkResidual> {
         self.residual.get(&radio).copied()
@@ -383,6 +435,28 @@ mod tests {
         m.register_radio(W, RadioCapability::wifi_monitor_5ghz(vec![149, 161, 165]));
         m.register_radio(L, RadioCapability::lora(vec![0]));
         m
+    }
+
+    #[test]
+    fn lora_airtime_grows_with_sf() {
+        // Airtime roughly doubles per SF step; SF12 is far slower than SF7 for the same payload.
+        let a7 = lora_airtime_ms(7, 125, 1, 40);
+        let a12 = lora_airtime_ms(12, 125, 1, 40);
+        assert!(a7 > 0.0 && a12 > a7 * 8.0, "SF12 ≫ SF7: {a7} vs {a12}");
+    }
+
+    #[test]
+    fn duty_used_accumulates_and_windows_out() {
+        let mut m = state();
+        // Charge 30 s of airtime → 30_000 / 3_600_000 ≈ 0.83% of the 1 h window.
+        m.record_airtime(L, 30_000.0, 1_000);
+        let used = m.duty_used(L, 2_000);
+        assert!((used - 30_000.0 / DUTY_WINDOW_MS as f32).abs() < 1e-6);
+        assert!(used < 0.01, "under the 1% LoRa ceiling: {used}");
+        // A Wi-Fi radio with nothing recorded reads zero.
+        assert_eq!(m.duty_used(W, 2_000), 0.0);
+        // Far past the window, the record ages out.
+        assert_eq!(m.duty_used(L, 1_000 + DUTY_WINDOW_MS + 1), 0.0);
     }
 
     #[test]

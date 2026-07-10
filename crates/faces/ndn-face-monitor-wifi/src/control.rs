@@ -31,7 +31,8 @@ use ndn_radio_cognition::{
     ARMS, ChannelOccupancy, Context, ContextualBandit, Demand, DemandTracker, MediumState,
     MediumView, NameContext, NeighborReport, PolicyConfig, RadioActuators, RadioCapability,
     RadioId, RadioPlan, RadioPolicy, RadioStrategy, RateCalibrator, SfCalibrator, TxParams,
-    apply_arm, decode_report, default_sf_thresholds, default_thresholds, encode_report, reward,
+    apply_arm, decode_report, default_sf_thresholds, default_thresholds, encode_report,
+    lora_airtime_ms, reward,
 };
 use ndn_signals_core::SignalView;
 use ndn_transport::link_service::{InboundLpFrame, IngressCtx, LinkServiceFeature, TickCtx};
@@ -42,10 +43,16 @@ use crate::FaceId;
 // to the sense bus, keyed by `FaceId.0`, until per-neighbour reception reports
 // exist (honest aggregate, documented limitation).
 
+/// Representative LoRa payload (bytes) for estimating per-transmission airtime in duty-cycle
+/// accounting — a typical small named-data frame. A coarse estimate; refine with real frame sizes.
+const NOMINAL_LORA_PAYLOAD: usize = 40;
+
 /// What a radio last transmitted, kept until its delivery outcome arrives.
 #[derive(Clone, Copy)]
 struct TxRecord {
-    mcs: u8,
+    /// The representative receiver RSSI this radio last sent at. The *rate* it was sent at is read
+    /// from `params` per bearer (MCS for Wi-Fi, spreading factor for LoRa) — no radio's rate concept
+    /// is privileged in the record.
     rssi: i8,
     params: TxParams,
 }
@@ -259,7 +266,9 @@ impl RadioControl {
     pub fn observe_delivery(&self, delivered: bool) {
         if let Some(cal) = &self.calibrator {
             for rec in self.last_tx.lock().unwrap().values() {
-                cal.observe(rec.mcs, rec.rssi, delivered);
+                if let Some(mcs) = rec.params.mcs {
+                    cal.observe(mcs, rec.rssi, delivered);
+                }
             }
         }
         // LoRa reach/rate cliff: attribute the outcome to the spreading factor it was sent at.
@@ -537,11 +546,21 @@ impl RadioControl {
                     self.last_tx.lock().unwrap().insert(
                         alloc.radio.0,
                         TxRecord {
-                            mcs: alloc.params.mcs.unwrap_or(0), // 0 for LoRa (no MCS)
                             rssi,
                             params: alloc.params,
                         },
                     );
+                }
+                // Duty-cycle accounting (independent of calibration): charge estimated LoRa airtime
+                // to this radio's budget. A Wi-Fi allocation carries no spreading_factor, so nothing
+                // is charged; a LoRa one is metered against RadioCapability::duty_cycle_max.
+                if let Some(sf) = alloc.params.spreading_factor {
+                    let cr = alloc.params.coding_rate.unwrap_or(1);
+                    let airtime = lora_airtime_ms(sf, 125, cr, NOMINAL_LORA_PAYLOAD);
+                    self.medium
+                        .lock()
+                        .unwrap()
+                        .record_airtime(alloc.radio, airtime, now_ms);
                 }
                 if let Some(a) = self.actuators.iter().find(|a| a.radio_id() == alloc.radio)
                     && let Err(e) = a.apply(alloc)

@@ -203,7 +203,14 @@ impl RadioPolicy {
         let mut tx: Vec<(RadioId, RadioCapability)> = view
             .radios()
             .into_iter()
-            .filter(|(_, c)| !c.rx_only && !c.channels.is_empty())
+            .filter(|(id, c)| {
+                // TX-capable, has a channel, and hasn't spent its duty-cycle budget (fail-closed:
+                // a sub-GHz radio over its ~1% ceiling drops out, so the packet waits rather than
+                // breaking the regulatory limit; Wi-Fi's duty_cycle_max = 1.0 never trips).
+                !c.rx_only
+                    && !c.channels.is_empty()
+                    && view.duty_used(*id, now_ms) < c.duty_cycle_max
+            })
             .collect();
         if tx.is_empty() {
             return RadioPlan::suppressed(self.consistency(ctx, &[], 0));
