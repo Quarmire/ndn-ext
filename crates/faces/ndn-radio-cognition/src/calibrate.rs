@@ -101,6 +101,95 @@ impl RateCalibrator {
     }
 }
 
+// --- LoRa spreading-factor calibration (the sub-GHz analogue of the MCS path above) ---
+
+/// Preset per-SF operating-point RSSI (dBm), indexed by spreading factor (7–12; 0–6 unused). The
+/// *initial* estimate the calibrator then refines from delivery. Monotone-decreasing in SF: a lower
+/// (faster) SF needs a stronger signal, so it carries a higher threshold.
+pub const STATIC_REQ_RSSI_SF: [f32; 13] = [
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, // SF0–6 unused
+    -80.0,  // SF7
+    -90.0,  // SF8
+    -100.0, // SF9
+    -110.0, // SF10
+    -118.0, // SF11
+    -125.0, // SF12 — always usable (max range)
+];
+
+/// Shared, mutable per-SF thresholds: the calibrator writes, the policy reads.
+pub type SfThresholds = Arc<RwLock<[f32; 13]>>;
+
+/// A fresh SF-threshold cell seeded with the static preset.
+pub fn default_sf_thresholds() -> SfThresholds {
+    Arc::new(RwLock::new(STATIC_REQ_RSSI_SF))
+}
+
+/// Lowest (fastest) spreading factor 7–12 whose operating threshold is met by `rssi_dbm`. A strong
+/// link runs SF7; as the margin falls the pick climbs toward SF12 (max range).
+pub fn pick_sf(rssi_dbm: i8, thresholds: &[f32; 13]) -> u8 {
+    let r = rssi_dbm as f32;
+    for sf in 7u8..=12 {
+        if thresholds[sf as usize] <= r {
+            return sf;
+        }
+    }
+    12
+}
+
+/// Adapts [`SfThresholds`] from measured delivery — the same control law as [`RateCalibrator`]:
+/// a near-boundary miss raises the SF's operating threshold (pushing the controller to a
+/// higher/more-robust SF), a success lowers it (a faster SF becomes usable at weaker signal).
+pub struct SfCalibrator {
+    thresholds: SfThresholds,
+    target_delivery: f32,
+    step: f32,
+    window: f32,
+}
+
+impl SfCalibrator {
+    pub fn new(thresholds: SfThresholds, target_delivery: f32, step: f32) -> Self {
+        Self {
+            thresholds,
+            target_delivery: target_delivery.clamp(0.5, 0.999),
+            step: step.max(0.01),
+            window: 10.0,
+        }
+    }
+
+    /// Feed one delivery outcome for a transmission at `sf` / `rssi_dbm`.
+    pub fn observe(&self, sf: u8, rssi_dbm: i8, delivered: bool) {
+        let sf = sf.clamp(7, 12) as usize;
+        let r = rssi_dbm as f32;
+        let mut t = self.thresholds.write().unwrap();
+        if (r - t[sf]).abs() > self.window {
+            return; // only near-boundary samples are informative
+        }
+        let delta = if delivered {
+            -self.step * (1.0 - self.target_delivery)
+        } else {
+            self.step * self.target_delivery
+        };
+        t[sf] = (t[sf] + delta).clamp(-130.0, 0.0);
+        // Preserve monotonicity: req[SF-1] ≥ req[SF] ≥ req[SF+1] (lower SF needs stronger signal).
+        if sf > 7 {
+            t[sf] = t[sf].min(t[sf - 1]);
+        }
+        if sf < 12 {
+            t[sf] = t[sf].max(t[sf + 1]);
+        }
+    }
+
+    /// Snapshot of the current thresholds (telemetry / tests).
+    pub fn thresholds(&self) -> [f32; 13] {
+        *self.thresholds.read().unwrap()
+    }
+
+    /// The shared cell, to hand to [`crate::RadioPolicy::with_learned_sf_thresholds`].
+    pub fn handle(&self) -> SfThresholds {
+        self.thresholds.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,5 +267,42 @@ mod tests {
             t0,
             "easy far-above success must not move the cliff"
         );
+    }
+
+    #[test]
+    fn pick_sf_climbs_as_signal_weakens() {
+        let t = STATIC_REQ_RSSI_SF;
+        assert_eq!(pick_sf(-70, &t), 7, "strong link → fastest SF");
+        assert_eq!(pick_sf(-85, &t), 8);
+        assert_eq!(pick_sf(-105, &t), 10);
+        assert_eq!(pick_sf(-128, &t), 12, "very weak → max range");
+    }
+
+    #[test]
+    fn sf_failures_push_to_a_more_robust_factor() {
+        let cell = default_sf_thresholds();
+        let cal = SfCalibrator::new(cell.clone(), 0.9, 2.0);
+        // SF7 keeps failing at -80 (its preset cliff) → its threshold should climb so we stop
+        // choosing SF7 at -80 and move to a higher SF.
+        let before = pick_sf(-80, &cal.thresholds());
+        for _ in 0..20 {
+            cal.observe(before, -80, false);
+        }
+        let after = pick_sf(-80, &cal.thresholds());
+        assert!(after > before, "persistent SF failure raises SF: {after} > {before}");
+    }
+
+    #[test]
+    fn sf_monotonicity_preserved() {
+        let cell = default_sf_thresholds();
+        let cal = SfCalibrator::new(cell.clone(), 0.9, 3.0);
+        for _ in 0..50 {
+            cal.observe(8, -90, false);
+            cal.observe(9, -100, true);
+        }
+        let t = cal.thresholds();
+        for sf in 8..=12 {
+            assert!(t[sf] <= t[sf - 1], "SF thresholds must be nonincreasing at {sf}: {t:?}");
+        }
     }
 }

@@ -21,7 +21,7 @@
 //! EWMA-smoothed in the sense bus and the demand record carries its own `ts_ms`, so
 //! a fast decision never reads a slow signal as fresh-per-frame.
 
-use crate::calibrate::{RateThresholds, STATIC_REQ_RSSI};
+use crate::calibrate::{RateThresholds, STATIC_REQ_RSSI, STATIC_REQ_RSSI_SF, SfThresholds};
 use crate::plan::{AllocRole, RadioAllocation, RadioPlan, TxParams};
 use crate::sense::{MediumView, RadioCapability, RadioId, RadioKind};
 use crate::strategy::RadioStrategy;
@@ -121,6 +121,9 @@ pub struct RadioPolicy {
     /// Learned per-MCS RSSI thresholds (shared with a [`crate::RateCalibrator`]).
     /// `None` ⇒ use the static preset.
     learned: Option<RateThresholds>,
+    /// Learned per-SF operating thresholds for LoRa (shared with a [`crate::SfCalibrator`]).
+    /// `None` ⇒ use the static preset.
+    learned_sf: Option<SfThresholds>,
 }
 
 impl Default for RadioPolicy {
@@ -131,13 +134,24 @@ impl Default for RadioPolicy {
 
 impl RadioPolicy {
     pub fn new(cfg: PolicyConfig) -> Self {
-        Self { cfg, learned: None }
+        Self {
+            cfg,
+            learned: None,
+            learned_sf: None,
+        }
     }
 
     /// Drive rate selection from a learned, online-calibrated threshold cell
     /// instead of the static preset.
     pub fn with_learned_thresholds(mut self, thresholds: RateThresholds) -> Self {
         self.learned = Some(thresholds);
+        self
+    }
+
+    /// Drive LoRa spreading-factor selection from a learned threshold cell (shared with a
+    /// [`crate::SfCalibrator`]) instead of the static preset.
+    pub fn with_learned_sf_thresholds(mut self, thresholds: SfThresholds) -> Self {
+        self.learned_sf = Some(thresholds);
         self
     }
 
@@ -149,6 +163,15 @@ impl RadioPolicy {
             None => STATIC_REQ_RSSI,
         };
         crate::calibrate::pick_mcs(r, max_mcs, &t)
+    }
+
+    /// Fastest LoRa spreading factor the current thresholds allow at `rssi` (learned if present).
+    fn pick_sf(&self, rssi: i8) -> u8 {
+        let t = match &self.learned_sf {
+            Some(cell) => *cell.read().unwrap(),
+            None => STATIC_REQ_RSSI_SF,
+        };
+        crate::calibrate::pick_sf(rssi, &t)
     }
 
     /// The closed loop. Reads demand + MRMC medium state, emits a multi-radio plan
@@ -294,7 +317,7 @@ impl RadioPolicy {
             } else {
                 base
             };
-            let sf = pick_sf(eff.round().clamp(-130.0, 0.0) as i8);
+            let sf = self.pick_sf(eff.round().clamp(-128.0, 0.0) as i8);
             let cr = if matches!(ctx.priority, Priority::Urgent) || broad {
                 2
             } else {
@@ -519,20 +542,6 @@ impl RadioStrategy for RadioPolicy {
 }
 
 // --- helpers ---
-
-/// Map a link margin (dBm) to a LoRa spreading factor: strong signal → SF7 (fast, short airtime),
-/// weak → SF12 (max range). Coarse thresholds roughly tracking SX126x per-SF sensitivity
-/// (~2.5 dB/step); refine via the calibrate module the way `pick_mcs` does once on-air data exists.
-fn pick_sf(rssi: i8) -> u8 {
-    match rssi {
-        r if r >= -80 => 7,
-        r if r >= -90 => 8,
-        r if r >= -100 => 9,
-        r if r >= -110 => 10,
-        r if r >= -118 => 11,
-        _ => 12,
-    }
-}
 
 /// RSSI margin (dB) subtracted for a broad broadcast — provision the rate for the
 /// weaker/more-numerous listeners, not the best single link.

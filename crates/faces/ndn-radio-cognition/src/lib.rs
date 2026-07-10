@@ -50,7 +50,10 @@ mod report;
 mod sense;
 mod strategy;
 
-pub use calibrate::{RateCalibrator, RateThresholds, STATIC_REQ_RSSI, default_thresholds};
+pub use calibrate::{
+    RateCalibrator, RateThresholds, STATIC_REQ_RSSI, STATIC_REQ_RSSI_SF, SfCalibrator,
+    SfThresholds, default_sf_thresholds, default_thresholds,
+};
 pub use contextual::{
     ARMS, Arm, Context, ContextualBandit, FOOTPRINT_LAMBDA, MISS_PENALTY, apply_arm, reward,
 };

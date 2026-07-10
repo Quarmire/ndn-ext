@@ -30,8 +30,8 @@ use ndn_radio_cognition::RadioAllocation;
 use ndn_radio_cognition::{
     ARMS, ChannelOccupancy, Context, ContextualBandit, Demand, DemandTracker, MediumState,
     MediumView, NameContext, NeighborReport, PolicyConfig, RadioActuators, RadioCapability,
-    RadioId, RadioPlan, RadioPolicy, RadioStrategy, RateCalibrator, TxParams, apply_arm,
-    decode_report, default_thresholds, encode_report, reward,
+    RadioId, RadioPlan, RadioPolicy, RadioStrategy, RateCalibrator, SfCalibrator, TxParams,
+    apply_arm, decode_report, default_sf_thresholds, default_thresholds, encode_report, reward,
 };
 use ndn_signals_core::SignalView;
 use ndn_transport::link_service::{InboundLpFrame, IngressCtx, LinkServiceFeature, TickCtx};
@@ -69,6 +69,7 @@ pub struct RadioControl {
     /// Online rate self-calibration (None ⇒ static thresholds). Learns per-MCS RSSI
     /// cliffs from delivery feedback.
     calibrator: Option<RateCalibrator>,
+    sf_calibrator: Option<SfCalibrator>,
     /// Joint-axis contextual bandit (None ⇒ off). Sits above the policy: learns the
     /// rate × power × FEC operating point per context from reward.
     bandit: Option<Mutex<ContextualBandit>>,
@@ -106,6 +107,7 @@ impl RadioControl {
             active: Mutex::new(Vec::new()),
             last_plans: Mutex::new(Vec::new()),
             calibrator: None,
+            sf_calibrator: None,
             bandit: None,
             last_tx: Mutex::new(HashMap::new()),
             last_arm: Mutex::new(HashMap::new()),
@@ -142,10 +144,15 @@ impl RadioControl {
     /// [`on_data`]: RadioControl::on_data
     pub fn new_calibrated(cfg: PolicyConfig, target_delivery: f32, step: f32) -> Self {
         let cell = default_thresholds();
-        let policy = RadioPolicy::new(cfg).with_learned_thresholds(cell.clone());
+        let sf_cell = default_sf_thresholds();
+        let policy = RadioPolicy::new(cfg)
+            .with_learned_thresholds(cell.clone())
+            .with_learned_sf_thresholds(sf_cell.clone());
         let calibrator = RateCalibrator::new(cell, target_delivery, step);
+        let sf_calibrator = SfCalibrator::new(sf_cell, target_delivery, step);
         Self {
             calibrator: Some(calibrator),
+            sf_calibrator: Some(sf_calibrator),
             probe_interval: 10, // ~10% probe budget, Minstrel-style
             ..Self::new(policy)
         }
@@ -253,6 +260,14 @@ impl RadioControl {
         if let Some(cal) = &self.calibrator {
             for rec in self.last_tx.lock().unwrap().values() {
                 cal.observe(rec.mcs, rec.rssi, delivered);
+            }
+        }
+        // LoRa reach/rate cliff: attribute the outcome to the spreading factor it was sent at.
+        if let Some(sf_cal) = &self.sf_calibrator {
+            for rec in self.last_tx.lock().unwrap().values() {
+                if let Some(sf) = rec.params.spreading_factor {
+                    sf_cal.observe(sf, rec.rssi, delivered);
+                }
             }
         }
         if let Some(bandit) = &self.bandit {
@@ -510,8 +525,8 @@ impl RadioControl {
             for alloc in &plan.allocations {
                 // Remember what this radio sent at, so a later delivery outcome can
                 // train the calibrator and/or the bandit.
-                if (self.calibrator.is_some() || self.bandit.is_some())
-                    && let Some(mcs) = alloc.params.mcs
+                if (self.calibrator.is_some() || self.sf_calibrator.is_some() || self.bandit.is_some())
+                    && (alloc.params.mcs.is_some() || alloc.params.spreading_factor.is_some())
                 {
                     let rssi = self
                         .medium
@@ -522,7 +537,7 @@ impl RadioControl {
                     self.last_tx.lock().unwrap().insert(
                         alloc.radio.0,
                         TxRecord {
-                            mcs,
+                            mcs: alloc.params.mcs.unwrap_or(0), // 0 for LoRa (no MCS)
                             rssi,
                             params: alloc.params,
                         },
