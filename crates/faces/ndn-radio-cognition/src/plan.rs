@@ -9,12 +9,44 @@
 
 use crate::sense::RadioId;
 
-/// Per-transmission PHY/link actuator settings for **one** radio. `None`/`false`
-/// means "leave at the actuator's current value". This is the actuator alphabet —
-/// every knob built into the monitor-wifi driver appears here as policy output,
-/// not as a standalone toggle.
+/// Per-transmission actuator settings for **one** radio. The **bearer-agnostic** knobs every radio
+/// understands live here directly; the PHY rate/robustness knobs live in [`RateParams`], a sum type
+/// keyed by bearer, so a consumer matches on the bearer it is driving and *cannot* read another
+/// bearer's fields. No radio's rate model is privileged — Wi-Fi's MCS and LoRa's spreading factor
+/// are peer variants, not a base struct with the other bolted on. Read the PHY knobs through the
+/// typed accessors ([`TxParams::mcs`], [`TxParams::spreading_factor`], …), which return a value only
+/// for the matching variant. `None`/`false` means "leave at the actuator's current value".
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct TxParams {
+    /// Link-FEC parity frames per generation (0/None = no link-FEC). Sized by the shared redundancy
+    /// budget, discounted by receiver multiplicity. Bearer-agnostic.
+    pub link_fec_redundancy: Option<u16>,
+    /// Transmit under contention (ignore EDCCA / LBT) — for priority named data only. Bearer-agnostic.
+    pub edcca_ignore: bool,
+    /// TX-power index (chip TXAGC scale, higher = more power). **`None` = leave the hard-won
+    /// calibrated/regulatory/PA-backoff power untouched** — only ever reduced below the calibrated
+    /// max for spatial reuse, never exceeded. Bearer-agnostic.
+    pub tx_power: Option<u8>,
+    /// Bearer-specific PHY rate/robustness knobs.
+    pub rate: RateParams,
+}
+
+/// The bearer-specific PHY knobs. A radio matches on its own variant; there is no cross-bearer field.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum RateParams {
+    /// No PHY knobs decided — leave the radio at its current values.
+    #[default]
+    None,
+    /// Wi-Fi (802.11).
+    Wifi(WifiRate),
+    /// LoRa (sub-GHz).
+    Lora(LoraRate),
+}
+
+/// Wi-Fi (802.11) PHY knobs — MCS, bandwidth, spatial streams, and robustness coding.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct WifiRate {
+    /// Modulation-and-coding-scheme index.
     pub mcs: Option<u8>,
     pub vht: bool,
     pub nss: Option<u8>,
@@ -26,23 +58,81 @@ pub struct TxParams {
     pub ldpc: bool,
     /// Target A-MSDU size in MSDUs (0/None = no aggregation).
     pub amsdu_msdus: Option<u16>,
-    /// Link-FEC parity frames per generation (0/None = no link-FEC). Sized by the
-    /// shared redundancy budget, discounted by receiver multiplicity.
-    pub link_fec_redundancy: Option<u16>,
-    /// Transmit under contention (ignore EDCCA) — for priority named data only.
-    pub edcca_ignore: bool,
-    /// TX-power index (chip TXAGC scale, higher = more power). **`None` = leave the
-    /// hard-won calibrated/regulatory/PA-backoff power untouched** — the control
-    /// plane only ever sets this to *reduce* power below the calibrated max when the
-    /// demand set has SNR margin to spare (for spatial reuse), never to exceed it.
-    pub tx_power: Option<u8>,
-    /// LoRa **spreading factor** (7–12) — the sub-GHz reach/rate dial, the LoRa analogue of `mcs`.
-    /// `None` for Wi-Fi radios (which have no SF). Cognition sets it low for close/bulk, high for
-    /// far/urgent, from the same demand-set RSSI it uses to pick MCS.
+}
+
+/// LoRa (sub-GHz) PHY knobs — the reach/rate dial (spreading factor) and coding rate.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LoraRate {
+    /// Spreading factor 7–12 — the reach/rate dial (the peer of Wi-Fi's `mcs`).
     pub spreading_factor: Option<u8>,
-    /// LoRa **coding rate** (`1`=4/5 … `4`=4/8) — a robustness/FEC dial, raised under reach
-    /// pressure (urgent/broadcast). `None` for Wi-Fi radios.
+    /// Coding rate `1`=4/5 … `4`=4/8 — a robustness/FEC dial.
     pub coding_rate: Option<u8>,
+}
+
+impl TxParams {
+    /// Bearer-agnostic knobs plus a Wi-Fi rate.
+    pub fn wifi(wifi: WifiRate) -> Self {
+        Self {
+            rate: RateParams::Wifi(wifi),
+            ..Default::default()
+        }
+    }
+    /// Bearer-agnostic knobs plus a LoRa rate.
+    pub fn lora(lora: LoraRate) -> Self {
+        Self {
+            rate: RateParams::Lora(lora),
+            ..Default::default()
+        }
+    }
+
+    /// Wi-Fi MCS, or `None` for a non-Wi-Fi radio.
+    pub fn mcs(&self) -> Option<u8> {
+        if let RateParams::Wifi(w) = &self.rate { w.mcs } else { None }
+    }
+    /// Wi-Fi spatial streams, or `None` for a non-Wi-Fi radio.
+    pub fn nss(&self) -> Option<u8> {
+        if let RateParams::Wifi(w) = &self.rate { w.nss } else { None }
+    }
+    /// Wi-Fi channel-bandwidth code, or `None` for a non-Wi-Fi radio.
+    pub fn bw(&self) -> Option<u8> {
+        if let RateParams::Wifi(w) = &self.rate { w.bw } else { None }
+    }
+    /// Wi-Fi VHT flag (false unless a Wi-Fi rate sets it).
+    pub fn vht(&self) -> bool {
+        matches!(self.rate, RateParams::Wifi(w) if w.vht)
+    }
+    /// Wi-Fi short-GI flag.
+    pub fn short_gi(&self) -> bool {
+        matches!(self.rate, RateParams::Wifi(w) if w.short_gi)
+    }
+    /// Wi-Fi STBC flag.
+    pub fn stbc(&self) -> bool {
+        matches!(self.rate, RateParams::Wifi(w) if w.stbc)
+    }
+    /// Wi-Fi cyclic-shift-diversity flag.
+    pub fn csd(&self) -> bool {
+        matches!(self.rate, RateParams::Wifi(w) if w.csd)
+    }
+    /// Wi-Fi LDPC flag.
+    pub fn ldpc(&self) -> bool {
+        matches!(self.rate, RateParams::Wifi(w) if w.ldpc)
+    }
+    /// Wi-Fi A-MSDU size, or `None` for a non-Wi-Fi radio.
+    pub fn amsdu_msdus(&self) -> Option<u16> {
+        if let RateParams::Wifi(w) = &self.rate { w.amsdu_msdus } else { None }
+    }
+    /// LoRa spreading factor, or `None` for a non-LoRa radio.
+    pub fn spreading_factor(&self) -> Option<u8> {
+        if let RateParams::Lora(l) = &self.rate { l.spreading_factor } else { None }
+    }
+    /// LoRa coding rate, or `None` for a non-LoRa radio.
+    pub fn coding_rate(&self) -> Option<u8> {
+        if let RateParams::Lora(l) = &self.rate { l.coding_rate } else { None }
+    }
+    /// Mutable access to the Wi-Fi rate (e.g. for the Minstrel-style probe bump), if this is Wi-Fi.
+    pub fn wifi_mut(&mut self) -> Option<&mut WifiRate> {
+        if let RateParams::Wifi(w) = &mut self.rate { Some(w) } else { None }
+    }
 }
 
 /// How a radio's transmission relates to the others in the plan.

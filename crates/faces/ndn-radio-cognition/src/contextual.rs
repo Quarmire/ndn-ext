@@ -68,8 +68,11 @@ pub const ARMS: [Arm; 5] = [
 
 /// Apply an arm to a baseline [`TxParams`], clamped to the radio's capability.
 pub fn apply_arm(arm: &Arm, p: &mut TxParams, max_mcs: u8, max_power: u8) {
-    if let Some(m) = p.mcs {
-        p.mcs = Some((m as i16 + arm.mcs_delta as i16).clamp(0, max_mcs as i16) as u8);
+    // The bandit's rate arm is a Wi-Fi MCS bump — only touch a Wi-Fi rate.
+    if let Some(w) = p.wifi_mut()
+        && let Some(m) = w.mcs
+    {
+        w.mcs = Some((m as i16 + arm.mcs_delta as i16).clamp(0, max_mcs as i16) as u8);
     }
     if arm.power_backoff_db != 0 {
         let cur = p.tx_power.unwrap_or(max_power) as i16;
@@ -85,14 +88,14 @@ pub fn apply_arm(arm: &Arm, p: &mut TxParams, max_mcs: u8, max_power: u8) {
 
 /// Relative airtime proxy (lower = faster): `(1+parity)/rate`. Monotone, not calibrated.
 fn relative_airtime(p: &TxParams) -> f32 {
-    let bw = match p.bw.unwrap_or(0) {
+    let bw = match p.bw().unwrap_or(0) {
         1 => 2.0,
         2 => 4.0,
         3 => 0.5,
         4 => 0.25,
         _ => 1.0,
     };
-    let rate = (p.mcs.unwrap_or(0) as f32 + 1.0) * bw * p.nss.unwrap_or(1).max(1) as f32;
+    let rate = (p.mcs().unwrap_or(0) as f32 + 1.0) * bw * p.nss().unwrap_or(1).max(1) as f32;
     (1.0 + p.link_fec_redundancy.unwrap_or(0) as f32) / rate.max(0.5)
 }
 
@@ -218,14 +221,15 @@ impl ContextualBandit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plan::WifiRate;
 
     fn params(mcs: u8) -> TxParams {
-        TxParams {
+        TxParams::wifi(WifiRate {
             mcs: Some(mcs),
             bw: Some(2),
             nss: Some(1),
             ..Default::default()
-        }
+        })
     }
 
     #[test]
@@ -246,16 +250,16 @@ mod tests {
     fn apply_arm_adjusts_and_clamps() {
         let mut p = params(7);
         apply_arm(&ARMS[2], &mut p, 9, 63); // +1 rate
-        assert_eq!(p.mcs, Some(8));
+        assert_eq!(p.mcs(), Some(8));
         let mut p = params(0);
         apply_arm(&ARMS[1], &mut p, 9, 63); // -1 rate clamps at 0
-        assert_eq!(p.mcs, Some(0));
+        assert_eq!(p.mcs(), Some(0));
         let mut p = params(5);
         apply_arm(&ARMS[3], &mut p, 9, 63); // power -6 dB = -12 idx
         assert_eq!(p.tx_power, Some(51));
         let mut p = params(5);
         apply_arm(&ARMS[4], &mut p, 9, 63); // -1 rate + fec
-        assert_eq!(p.mcs, Some(4));
+        assert_eq!(p.mcs(), Some(4));
         assert_eq!(p.link_fec_redundancy, Some(1));
     }
 

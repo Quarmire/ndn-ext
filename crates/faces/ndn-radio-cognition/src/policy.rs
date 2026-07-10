@@ -22,7 +22,7 @@
 //! a fast decision never reads a slow signal as fresh-per-frame.
 
 use crate::calibrate::{RateThresholds, STATIC_REQ_RSSI, STATIC_REQ_RSSI_SF, SfThresholds};
-use crate::plan::{AllocRole, RadioAllocation, RadioPlan, TxParams};
+use crate::plan::{AllocRole, LoraRate, RadioAllocation, RadioPlan, RateParams, TxParams, WifiRate};
 use crate::sense::{MediumView, RadioCapability, RadioId, RadioKind};
 use crate::strategy::RadioStrategy;
 
@@ -331,8 +331,10 @@ impl RadioPolicy {
                 1
             };
             return TxParams {
-                spreading_factor: Some(sf),
-                coding_rate: Some(cr),
+                rate: RateParams::Lora(LoraRate {
+                    spreading_factor: Some(sf),
+                    coding_rate: Some(cr),
+                }),
                 link_fec_redundancy: self.fec_redundancy(radio, ctx, view, receivers, deficit),
                 ..Default::default()
             };
@@ -389,20 +391,20 @@ impl RadioPolicy {
         };
 
         TxParams {
-            mcs: Some(mcs),
-            vht: cap.max_bw >= 2,
-            nss: Some(nss),
-            short_gi: good_snr,
-            bw: Some(bw),
-            stbc,
-            csd,
-            ldpc,
-            amsdu_msdus,
+            rate: RateParams::Wifi(WifiRate {
+                mcs: Some(mcs),
+                vht: cap.max_bw >= 2,
+                nss: Some(nss),
+                short_gi: good_snr,
+                bw: Some(bw),
+                stbc,
+                csd,
+                ldpc,
+                amsdu_msdus,
+            }),
             link_fec_redundancy: self.fec_redundancy(radio, ctx, view, receivers, deficit),
             edcca_ignore: ctx.priority == Priority::Urgent && busy >= self.cfg.busy_high,
             tx_power: self.decide_power(cap, mcs, rssi),
-            spreading_factor: None, // Wi-Fi radios have no SF
-            coding_rate: None,
         }
     }
 
@@ -533,7 +535,7 @@ impl RadioPolicy {
         for a in allocations {
             h.add(a.radio.0 as u64);
             h.add(a.channel.unwrap_or(0) as u64);
-            h.add(a.params.mcs.unwrap_or(0) as u64); // rate class
+            h.add(a.params.mcs().unwrap_or(0) as u64); // rate class
         }
         h.0
     }
@@ -566,16 +568,16 @@ const DB_PER_POWER_IDX: f32 = 0.5;
 /// Nominal PHY rate proxy (Mbps) for the objective estimate — monotone in the
 /// rate-affecting params, not a calibrated figure.
 fn phy_rate_proxy(p: &TxParams) -> f32 {
-    let mcs = p.mcs.unwrap_or(0) as f32;
-    let bw_factor = match p.bw.unwrap_or(0) {
+    let mcs = p.mcs().unwrap_or(0) as f32;
+    let bw_factor = match p.bw().unwrap_or(0) {
         1 => 2.0,
         2 => 4.0,
         3 => 0.5,
         4 => 0.25,
         _ => 1.0,
     };
-    let nss = p.nss.unwrap_or(1).max(1) as f32;
-    let sgi = if p.short_gi { 1.11 } else { 1.0 };
+    let nss = p.nss().unwrap_or(1).max(1) as f32;
+    let sgi = if p.short_gi() { 1.11 } else { 1.0 };
     ((mcs + 1.0) * 6.5 * bw_factor * nss * sgi).max(0.25)
 }
 
@@ -662,8 +664,8 @@ mod tests {
         m1.observe_rx(W, 0, Some(-55), 1_000); // single receiver ⇒ unicast
         let uni = RadioPolicy::default().decide(&NameContext::new(0xAA), &m1, 1_000);
 
-        let broad_mcs = broad.allocations[0].params.mcs.unwrap();
-        let uni_mcs = uni.allocations[0].params.mcs.unwrap();
+        let broad_mcs = broad.allocations[0].params.mcs().unwrap();
+        let uni_mcs = uni.allocations[0].params.mcs().unwrap();
         assert!(
             broad_mcs < uni_mcs,
             "broad {broad_mcs} should be < unicast {uni_mcs}"

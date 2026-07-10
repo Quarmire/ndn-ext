@@ -465,15 +465,15 @@ impl MonitorWifiFace {
         if let Some(cell) = &self.planned
             && let Ok(guard) = cell.read()
             && let Some(tp) = *guard
-            && let Some(index) = tp.mcs
+            && let Some(index) = tp.mcs()
         {
             return McsDescriptor {
                 index,
-                short_gi: tp.short_gi,
-                vht: tp.vht,
-                nss: tp.nss.unwrap_or(1),
-                stbc: tp.stbc,
-                ldpc: tp.ldpc,
+                short_gi: tp.short_gi(),
+                vht: tp.vht(),
+                nss: tp.nss().unwrap_or(1),
+                stbc: tp.stbc(),
+                ldpc: tp.ldpc(),
             };
         }
         match self.policy {

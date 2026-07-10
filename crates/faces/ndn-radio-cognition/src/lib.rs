@@ -58,7 +58,10 @@ pub use contextual::{
     ARMS, Arm, Context, ContextualBandit, FOOTPRINT_LAMBDA, MISS_PENALTY, apply_arm, reward,
 };
 pub use demand::DemandTracker;
-pub use plan::{AllocRole, RadioActuators, RadioAllocation, RadioError, RadioPlan, TxParams};
+pub use plan::{
+    AllocRole, LoraRate, RadioActuators, RadioAllocation, RadioError, RadioPlan, RateParams,
+    TxParams, WifiRate,
+};
 pub use policy::{NameContext, PolicyConfig, Priority, RadioPolicy};
 pub use report::{MAX_ENTRIES, REPORT_MAGIC, ReceptionReport, decode_report, encode_report};
 pub use sense::{

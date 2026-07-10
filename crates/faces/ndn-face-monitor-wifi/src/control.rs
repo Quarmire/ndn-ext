@@ -266,7 +266,7 @@ impl RadioControl {
     pub fn observe_delivery(&self, delivered: bool) {
         if let Some(cal) = &self.calibrator {
             for rec in self.last_tx.lock().unwrap().values() {
-                if let Some(mcs) = rec.params.mcs {
+                if let Some(mcs) = rec.params.mcs() {
                     cal.observe(mcs, rec.rssi, delivered);
                 }
             }
@@ -274,7 +274,7 @@ impl RadioControl {
         // LoRa reach/rate cliff: attribute the outcome to the spreading factor it was sent at.
         if let Some(sf_cal) = &self.sf_calibrator {
             for rec in self.last_tx.lock().unwrap().values() {
-                if let Some(sf) = rec.params.spreading_factor {
+                if let Some(sf) = rec.params.spreading_factor() {
                     sf_cal.observe(sf, rec.rssi, delivered);
                 }
             }
@@ -512,7 +512,7 @@ impl RadioControl {
             };
             if probe
                 && let Some(alloc) = plans.first_mut().and_then(|p| p.allocations.first_mut())
-                && let Some(mcs) = alloc.params.mcs
+                && let Some(mcs) = alloc.params.mcs()
             {
                 let max = self
                     .medium
@@ -521,8 +521,10 @@ impl RadioControl {
                     .capability(alloc.radio)
                     .map(|c| c.max_mcs)
                     .unwrap_or(9);
-                if mcs < max {
-                    alloc.params.mcs = Some(mcs + 1);
+                if mcs < max
+                    && let Some(w) = alloc.params.wifi_mut()
+                {
+                    w.mcs = Some(mcs + 1); // Minstrel-style probe bump, Wi-Fi only
                 }
             }
         }
@@ -535,7 +537,7 @@ impl RadioControl {
                 // Remember what this radio sent at, so a later delivery outcome can
                 // train the calibrator and/or the bandit.
                 if (self.calibrator.is_some() || self.sf_calibrator.is_some() || self.bandit.is_some())
-                    && (alloc.params.mcs.is_some() || alloc.params.spreading_factor.is_some())
+                    && (alloc.params.mcs().is_some() || alloc.params.spreading_factor().is_some())
                 {
                     let rssi = self
                         .medium
@@ -554,8 +556,8 @@ impl RadioControl {
                 // Duty-cycle accounting (independent of calibration): charge estimated LoRa airtime
                 // to this radio's budget. A Wi-Fi allocation carries no spreading_factor, so nothing
                 // is charged; a LoRa one is metered against RadioCapability::duty_cycle_max.
-                if let Some(sf) = alloc.params.spreading_factor {
-                    let cr = alloc.params.coding_rate.unwrap_or(1);
+                if let Some(sf) = alloc.params.spreading_factor() {
+                    let cr = alloc.params.coding_rate().unwrap_or(1);
                     let airtime = lora_airtime_ms(sf, 125, cr, NOMINAL_LORA_PAYLOAD);
                     self.medium
                         .lock()
@@ -590,12 +592,12 @@ impl RadioControl {
                     strategy = self.policy.name(),
                     radio = a.radio.0,
                     channel = ?a.channel,
-                    mcs = ?a.params.mcs,
-                    bw = ?a.params.bw,
-                    nss = ?a.params.nss,
-                    ldpc = a.params.ldpc,
-                    stbc = a.params.stbc,
-                    csd = a.params.csd,
+                    mcs = ?a.params.mcs(),
+                    bw = ?a.params.bw(),
+                    nss = ?a.params.nss(),
+                    ldpc = a.params.ldpc(),
+                    stbc = a.params.stbc(),
+                    csd = a.params.csd(),
                     tx_power = ?a.params.tx_power,
                     link_fec = ?a.params.link_fec_redundancy,
                     edcca_ignore = a.params.edcca_ignore,
@@ -722,7 +724,7 @@ impl RadioActuators for LibUsbActuator {
 
         // Stateful: retune channel + bandwidth together.
         if let Some(ch) = alloc.channel {
-            let bw_code = p.bw.unwrap_or(0);
+            let bw_code = p.bw().unwrap_or(0);
             if last.channel != Some((ch, bw_code)) {
                 let bw = crate::Bandwidth::from_code(bw_code);
                 self.knobs.set_channel(ch, bw).map_err(to_err)?;
@@ -731,9 +733,9 @@ impl RadioActuators for LibUsbActuator {
         }
         // Stateful: CSD (the 1-stream cyclic-shift antenna path; no-op on radios
         // without a per-frame CSD knob, e.g. mt76x2).
-        if last.csd != Some(p.csd) {
-            self.knobs.set_tx_csd(p.csd).map_err(to_err)?;
-            last.csd = Some(p.csd);
+        if last.csd != Some(p.csd()) {
+            self.knobs.set_tx_csd(p.csd()).map_err(to_err)?;
+            last.csd = Some(p.csd());
         }
         if last.edcca != Some(p.edcca_ignore) {
             self.knobs
@@ -752,13 +754,13 @@ impl RadioActuators for LibUsbActuator {
         // LoRa reach/rate dials (no-op on Wi-Fi radios). Each change is a ~1s AT retune of the
         // dongle, so gate strictly on a changed value — cognition emits these every decision, but
         // we only actuate when the spreading factor / coding rate actually moves.
-        if let Some(sf) = p.spreading_factor
+        if let Some(sf) = p.spreading_factor()
             && last.sf != Some(sf)
         {
             self.knobs.set_spreading_factor(sf).map_err(to_err)?;
             last.sf = Some(sf);
         }
-        if let Some(cr) = p.coding_rate
+        if let Some(cr) = p.coding_rate()
             && last.cr != Some(cr)
         {
             self.knobs.set_coding_rate(cr).map_err(to_err)?;
@@ -825,7 +827,7 @@ mod tests {
 
         let applied = mock.last.read().unwrap().expect("actuator applied");
         assert_eq!(applied.radio, W);
-        let mcs = applied.params.mcs.expect("mcs decided");
+        let mcs = applied.params.mcs().expect("mcs decided");
         assert!(
             mcs >= 7,
             "strong unicast link should pick a high MCS, got {mcs}"
@@ -839,13 +841,13 @@ mod tests {
         c.observe_rx(W, 99, Some(-85), 1_000); // weak receiver
         c.set_active(vec![NameContext::new(0xABCD)]);
         c.tick_now(1_000);
-        let weak_mcs = mock.last.read().unwrap().unwrap().params.mcs.unwrap();
+        let weak_mcs = mock.last.read().unwrap().unwrap().params.mcs().unwrap();
 
         let (c2, mock2) = control_with_mock();
         c2.observe_rx(W, 99, Some(-50), 1_000); // strong receiver
         c2.set_active(vec![NameContext::new(0xABCD)]);
         c2.tick_now(1_000);
-        let strong_mcs = mock2.last.read().unwrap().unwrap().params.mcs.unwrap();
+        let strong_mcs = mock2.last.read().unwrap().unwrap().params.mcs().unwrap();
 
         assert!(
             weak_mcs < strong_mcs,
@@ -915,13 +917,13 @@ mod tests {
             c_broad.on_interest(0xABCD, FaceId(face), 1_000); // 4 listeners
         }
         c_broad.tick_now(1_000);
-        let broad_mcs = mock_broad.last.read().unwrap().unwrap().params.mcs.unwrap();
+        let broad_mcs = mock_broad.last.read().unwrap().unwrap().params.mcs().unwrap();
 
         let (c_uni, mock_uni) = control_with_mock();
         c_uni.observe_rx(W, 50, Some(-50), 1_000);
         c_uni.on_interest(0xABCD, FaceId(1), 1_000); // 1 listener
         c_uni.tick_now(1_000);
-        let uni_mcs = mock_uni.last.read().unwrap().unwrap().params.mcs.unwrap();
+        let uni_mcs = mock_uni.last.read().unwrap().unwrap().params.mcs().unwrap();
 
         assert!(
             broad_mcs < uni_mcs,
@@ -959,7 +961,7 @@ mod tests {
         c.set_active(vec![NameContext::new(0xABCD)]);
         let mcs_before = c.tick_now(1_000).pop().unwrap().allocations[0]
             .params
-            .mcs
+            .mcs()
             .unwrap();
 
         // That rate keeps missing (downstream re-Interests) at this RSSI.
@@ -969,7 +971,7 @@ mod tests {
         }
         let mcs_after = c.tick_now(1_000).pop().unwrap().allocations[0]
             .params
-            .mcs
+            .mcs()
             .unwrap();
 
         assert!(
@@ -1005,7 +1007,7 @@ mod tests {
         // for B's demand picks a high MCS.
         a.set_active(vec![NameContext::new(0xF00D)]);
         let plan = a.tick_now(2_000).pop().unwrap();
-        let mcs = plan.allocations[0].params.mcs.unwrap();
+        let mcs = plan.allocations[0].params.mcs().unwrap();
         assert!(
             mcs >= 7,
             "measured -55 outbound link should yield a high MCS, got {mcs}"
@@ -1063,9 +1065,9 @@ mod tests {
         c.set_active(vec![NameContext::new(0xABCD)]);
 
         c.tick_now(1_000); // probe_count=1 (no probe)
-        let steady = mock.last.read().unwrap().unwrap().params.mcs.unwrap();
+        let steady = mock.last.read().unwrap().unwrap().params.mcs().unwrap();
         c.tick_now(1_000); // probe_count=2 (probe)
-        let probed = mock.last.read().unwrap().unwrap().params.mcs.unwrap();
+        let probed = mock.last.read().unwrap().unwrap().params.mcs().unwrap();
 
         assert_eq!(
             probed,
@@ -1128,7 +1130,7 @@ mod tests {
         for _ in 0..400 {
             c.tick_now(1_000);
             let p = mock.last.read().unwrap().unwrap().params;
-            c.observe_delivery(p.mcs.unwrap() <= CLIFF);
+            c.observe_delivery(p.mcs().unwrap() <= CLIFF);
         }
 
         // Sample the steady behavior over a window; UCB exploits the best arm most
@@ -1138,8 +1140,8 @@ mod tests {
         for _ in 0..60 {
             c.tick_now(1_000);
             let p = mock.last.read().unwrap().unwrap().params;
-            c.observe_delivery(p.mcs.unwrap() <= CLIFF);
-            if p.mcs == Some(CLIFF) {
+            c.observe_delivery(p.mcs().unwrap() <= CLIFF);
+            if p.mcs() == Some(CLIFF) {
                 if p.tx_power.is_some() {
                     at_cliff_trimmed += 1;
                 } else {

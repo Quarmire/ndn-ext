@@ -41,7 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         TxIntent, WifiRadio,
     };
     use ndn_radio_cognition::{
-        NameContext, PolicyConfig, RadioCapability, RadioId, TxParams, prefix_hash,
+        NameContext, PolicyConfig, RadioCapability, RadioId, TxParams, WifiRate, prefix_hash,
     };
 
     fn env_u32(k: &str, d: u32) -> u32 {
@@ -87,20 +87,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     control.observe_rx(radio, 1, Some(rssi), 0); // synthetic link for the adaptive arm
 
     let desc = |p: &TxParams| McsDescriptor {
-        index: p.mcs.unwrap_or(1),
-        short_gi: p.short_gi,
-        vht: p.vht,
-        nss: p.nss.unwrap_or(1),
-        stbc: p.stbc,
-        ldpc: p.ldpc,
+        index: p.mcs().unwrap_or(1),
+        short_gi: p.short_gi(),
+        vht: p.vht(),
+        nss: p.nss().unwrap_or(1),
+        stbc: p.stbc(),
+        ldpc: p.ldpc(),
     };
-    let template = |mcs: u8| TxParams {
-        mcs: Some(mcs),
-        vht: true,
-        nss: Some(1),
-        bw: Some(2),
-        ldpc: true,
-        ..Default::default()
+    let template = |mcs: u8| {
+        TxParams::wifi(WifiRate {
+            mcs: Some(mcs),
+            vht: true,
+            nss: Some(1),
+            bw: Some(2),
+            ldpc: true,
+            ..Default::default()
+        })
     };
     let mk_payload = |arm: u8, seq: u32| -> Bytes {
         let mut v = vec![0u8; payload];
@@ -166,7 +168,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .await?;
             airtime += frame_airtime_us(&p, payload) as f64;
-            mcs_sum += p.mcs.unwrap_or(0) as u64;
+            mcs_sum += p.mcs().unwrap_or(0) as u64;
         }
         println!(
             "{:>10}  {:>6}  {:>12.1}  {:>8.1}",

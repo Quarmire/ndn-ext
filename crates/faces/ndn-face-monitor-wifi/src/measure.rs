@@ -17,7 +17,7 @@
 //! [`RadioControl`]: crate::RadioControl
 //! [`RadioPolicy`]: ndn_radio_cognition::RadioPolicy
 
-use ndn_radio_cognition::{NameContext, RadioCapability, RadioId, RadioPolicy, TxParams};
+use ndn_radio_cognition::{NameContext, RadioCapability, RadioId, RadioPolicy, TxParams, WifiRate};
 
 use crate::FaceId;
 use crate::control::RadioControl;
@@ -30,16 +30,16 @@ pub const NOISE_FLOOR_DBM: f32 = -95.0;
 pub fn mcs_rate_mbps(p: &TxParams) -> f32 {
     // HT/VHT MCS0–9 (8–9 = VHT 256-QAM), 20 MHz, 1 SS, long GI.
     const BASE: [f32; 10] = [6.5, 13.0, 19.5, 26.0, 39.0, 52.0, 58.5, 65.0, 78.0, 87.75];
-    let idx = p.mcs.unwrap_or(0).min(9) as usize;
-    let bw = match p.bw.unwrap_or(0) {
+    let idx = p.mcs().unwrap_or(0).min(9) as usize;
+    let bw = match p.bw().unwrap_or(0) {
         1 => 2.0,  // 40 MHz
         2 => 4.0,  // 80 MHz
         3 => 0.5,  // 10 MHz
         4 => 0.25, // 5 MHz
         _ => 1.0,  // 20 MHz
     };
-    let nss = p.nss.unwrap_or(1).max(1) as f32;
-    let sgi = if p.short_gi { 1.0 / 0.9 } else { 1.0 }; // ~+11%
+    let nss = p.nss().unwrap_or(1).max(1) as f32;
+    let sgi = if p.short_gi() { 1.0 / 0.9 } else { 1.0 }; // ~+11%
     BASE[idx] * bw * nss * sgi
 }
 
@@ -82,8 +82,8 @@ pub struct LinkModel {
 impl LinkModel {
     /// Per-frame delivery probability at the frame's MCS (LDPC adds ~2 dB gain).
     pub fn frame_delivery(&self, p: &TxParams) -> f32 {
-        let req = required_snr_db(p.mcs.unwrap_or(0));
-        let gain = if p.ldpc { 2.0 } else { 0.0 };
+        let req = required_snr_db(p.mcs().unwrap_or(0));
+        let gain = if p.ldpc() { 2.0 } else { 0.0 };
         logistic((self.snr_db + gain - req) / 1.5) // ~1.5 dB transition width
     }
 }
@@ -114,7 +114,7 @@ pub fn score_arm(p: &TxParams, link: &LinkModel, payload: usize, max_attempts: u
     Score {
         airtime_per_satisfied_us: attempt_air / p_obj,
         delivery_frac: 1.0 - (1.0 - p_obj).powi(max_attempts as i32),
-        mcs: p.mcs.unwrap_or(0),
+        mcs: p.mcs().unwrap_or(0),
         redundancy: r,
     }
 }
@@ -134,7 +134,7 @@ pub fn adaptive_chosen_mcs(snr_db: f32) -> u8 {
     c.tick_now(1_000)
         .first()
         .and_then(|p| p.allocations.first())
-        .and_then(|a| a.params.mcs)
+        .and_then(|a| a.params.mcs())
         .unwrap_or(0)
 }
 
@@ -142,14 +142,14 @@ pub fn adaptive_chosen_mcs(snr_db: f32) -> u8 {
 /// (the value of adaptation), not bandwidth/coding differences. 80 MHz VHT + LDPC,
 /// single stream, long GI; every arm shares it.
 pub fn template(mcs: u8) -> TxParams {
-    TxParams {
+    TxParams::wifi(WifiRate {
         mcs: Some(mcs),
         vht: true,
         nss: Some(1),
         bw: Some(2),
         ldpc: true,
         ..Default::default()
-    }
+    })
 }
 
 /// Geometric mean (the fair average for ratios across regimes).
