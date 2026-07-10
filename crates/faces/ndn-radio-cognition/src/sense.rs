@@ -16,7 +16,7 @@ use crate::report::ReceptionReport;
 // reference (`Band::`, `RadioKind::`, `TimingModel`, `RadioCapability`, used by
 // this module, `policy.rs`, and the `lib.rs` re-export) still resolves through
 // `crate::sense::…` / `crate::…` unchanged.
-pub use ndn_radio_hal::{Band, RadioCapability, RadioKind, TimingModel};
+pub use ndn_radio_hal::{Band, RadioCapability, RadioKind, RateCapability, TimingModel};
 
 /// Identifies one physical radio / face on this node. The degenerate single-radio
 /// case is just one `RadioId`.
@@ -435,6 +435,26 @@ mod tests {
         m.register_radio(W, RadioCapability::wifi_monitor_5ghz(vec![149, 161, 165]));
         m.register_radio(L, RadioCapability::lora(vec![0]));
         m
+    }
+
+    #[test]
+    fn rate_capability_is_bearer_typed_and_ranks_across_bearers() {
+        let wifi = RadioCapability::wifi_monitor_5ghz(vec![149]);
+        let lora = RadioCapability::lora(vec![0]);
+        let sdr = RadioCapability::sdr_sensor(vec![36]);
+        // The rate ceiling is a bearer sum type — no privileged field.
+        assert!(matches!(wifi.rate, RateCapability::Wifi { max_mcs: 9, .. }));
+        assert_eq!(lora.rate, RateCapability::Lora { min_sf: 7, max_sf: 12 });
+        assert_eq!(sdr.rate, RateCapability::None);
+        // Bearer-agnostic rank: Wi-Fi ≫ LoRa > SDR-sensor, all comparable in [0,1].
+        assert!(wifi.rate_rank() > lora.rate_rank());
+        assert!(lora.rate_rank() > sdr.rate_rank());
+        assert_eq!(sdr.rate_rank(), 0.0);
+        // Typed accessors return only for the matching bearer.
+        assert_eq!(wifi.max_mcs(), 9);
+        assert_eq!(lora.max_mcs(), 0); // LoRa has no MCS
+        assert_eq!(lora.sf_range(), Some((7, 12)));
+        assert_eq!(wifi.sf_range(), None);
     }
 
     #[test]

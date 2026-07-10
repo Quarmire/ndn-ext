@@ -66,7 +66,8 @@ pub use policy::{NameContext, PolicyConfig, Priority, RadioPolicy};
 pub use report::{MAX_ENTRIES, REPORT_MAGIC, ReceptionReport, decode_report, encode_report};
 pub use sense::{
     Band, ChannelOccupancy, DUTY_WINDOW_MS, Demand, Ewma, LinkResidual, MediumState, MediumView,
-    NeighborReport, RadioCapability, RadioId, RadioKind, TimingModel, lora_airtime_ms,
+    NeighborReport, RadioCapability, RadioId, RadioKind, RateCapability, TimingModel,
+    lora_airtime_ms,
 };
 pub use strategy::RadioStrategy;
 

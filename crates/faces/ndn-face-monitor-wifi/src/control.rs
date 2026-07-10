@@ -491,7 +491,7 @@ impl RadioControl {
                                 .and_then(|ch| m.busy_pct(alloc.radio, ch))
                                 .unwrap_or(0),
                             m.receiver_count(now_ms),
-                            cap.as_ref().map(|c| c.max_mcs).unwrap_or(9),
+                            cap.as_ref().map(|c| c.max_mcs()).unwrap_or(9),
                             cap.as_ref().map(|c| c.max_tx_power).unwrap_or(63),
                         )
                     };
@@ -519,7 +519,7 @@ impl RadioControl {
                     .lock()
                     .unwrap()
                     .capability(alloc.radio)
-                    .map(|c| c.max_mcs)
+                    .map(|c| c.max_mcs())
                     .unwrap_or(9);
                 if mcs < max
                     && let Some(w) = alloc.params.wifi_mut()

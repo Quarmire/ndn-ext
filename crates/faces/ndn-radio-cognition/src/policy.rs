@@ -274,7 +274,7 @@ impl RadioPolicy {
         // reach, Wi-Fi high on rate — the homogeneous/heterogeneous switch falls out
         // of the descriptor, no special-casing.
         let reach = cap.range_rank() as f32 / 4.0;
-        let rate = (cap.max_mcs as f32 / 9.0 + (cap.max_nss.saturating_sub(1)) as f32 / 3.0) / 2.0;
+        let rate = cap.rate_rank(); // bearer-agnostic peak-throughput rank
         let (w_reach, w_rate) = match ctx.priority {
             Priority::Bulk => (0.2, 1.0),
             Priority::Urgent => (1.0, 0.2),
@@ -324,7 +324,9 @@ impl RadioPolicy {
             } else {
                 base
             };
+            // Clamp the pick to the radio's advertised SF span (from the capability, not a hardcode).
             let sf = self.pick_sf(eff.round().clamp(-128.0, 0.0) as i8);
+            let sf = cap.sf_range().map_or(sf, |(lo, hi)| sf.clamp(lo, hi));
             let cr = if matches!(ctx.priority, Priority::Urgent) || broad {
                 2
             } else {
@@ -356,17 +358,17 @@ impl RadioPolicy {
         } else {
             base
         };
-        let mcs = self.pick_mcs(Some(eff.round().clamp(-110.0, 0.0) as i8), cap.max_mcs);
+        let mcs = self.pick_mcs(Some(eff.round().clamp(-110.0, 0.0) as i8), cap.max_mcs());
 
         // Bandwidth: capability ceiling, narrowed under contention.
-        let mut bw = cap.max_bw;
+        let mut bw = cap.max_bw();
         if busy >= self.cfg.busy_high {
             bw = bw.saturating_sub(1);
         }
 
         let good_snr = rssi.unwrap_or(-90) >= -60;
         let nss = if ctx.priority == Priority::Bulk && good_snr {
-            cap.max_nss
+            cap.max_nss()
         } else {
             1
         };
@@ -379,7 +381,7 @@ impl RadioPolicy {
         let ldpc = robust;
         let weak = rssi.unwrap_or(-90) < -70;
         let div = self.cfg.enable_tx_diversity;
-        let stbc = div && robust && nss == 1 && cap.max_nss >= 2 && weak;
+        let stbc = div && robust && nss == 1 && cap.max_nss() >= 2 && weak;
         let csd = div && nss == 1 && weak && !stbc;
 
         // A-MSDU: aggregate only for bulk on a clean link (and it interleaves with
@@ -393,7 +395,7 @@ impl RadioPolicy {
         TxParams {
             rate: RateParams::Wifi(WifiRate {
                 mcs: Some(mcs),
-                vht: cap.max_bw >= 2,
+                vht: cap.max_bw() >= 2,
                 nss: Some(nss),
                 short_gi: good_snr,
                 bw: Some(bw),
