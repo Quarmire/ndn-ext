@@ -1,5 +1,5 @@
 #![cfg(feature = "engine")]
-//! Gate for [`ndn_ndnsf::over_face`]: the four-phase `NdnsfCarrier` runs over a
+//! Gate for [`ndnsf_rs::over_face`]: the four-phase `NdnsfCarrier` runs over a
 //! **real** `ndn-engine` forwarder/face — the same substrate `ndn-rpc`'s
 //! `FaceRpcCarrier` uses — instead of a private in-memory channel mesh. A
 //! provider and a user, each bound to the engine via `over_face`, complete a
@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use ndn_app::EngineBuilder;
 use ndn_engine::EngineConfig;
-use ndn_ndnsf::{NdnsfCarrier, over_face};
+use ndnsf_rs::{NdnsfCarrier, over_face};
 use ndn_packet::Name;
 use ndn_service_core::{Carrier, Dispatch, Invocation, OpId, ServiceError, ServiceId};
 use ndn_sync::{SvSyncConfig, SvsConfig};

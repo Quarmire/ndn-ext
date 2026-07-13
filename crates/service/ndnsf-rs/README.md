@@ -1,4 +1,4 @@
-# ndn-ndnsf
+# ndnsf-rs
 
 A faithful Rust port of the **NDN Service Framework (NDNSF)** four-phase service
 RPC, on the ndn-rs substrate. An NDNSF service request is a four-phase exchange
@@ -35,7 +35,7 @@ A weather service run over both the NDNSF four-phase and Tier-0, with a
 *parameterized request* and a *structured response*:
 
 ```bash
-cargo run -p ndn-ndnsf --example weather --features driver
+cargo run -p ndnsf-rs --example weather --features driver
 ```
 
 ### Walkthrough: `examples/weather.rs`

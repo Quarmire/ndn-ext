@@ -11,7 +11,7 @@
 use std::time::Duration;
 
 use bytes::Bytes;
-use ndn_ndnsf::roles::ServiceNode;
+use ndnsf_rs::roles::ServiceNode;
 use ndn_packet::Name;
 use ndn_sync::{SvSyncConfig, SvsConfig, SvsPubSub};
 use tokio::sync::mpsc;

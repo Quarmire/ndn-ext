@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use ndn_ndnsf::{NdnsfCarrier, ServicePolicy};
+use ndnsf_rs::{NdnsfCarrier, ServicePolicy};
 use ndn_packet::Name;
 use ndn_service_core::{
     Carrier, Dispatch, Invocation, OpId, SelectCarrier, ServiceError, ServiceId, Strategy,

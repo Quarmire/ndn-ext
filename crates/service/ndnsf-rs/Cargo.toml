@@ -1,5 +1,5 @@
 [package]
-name = "ndn-ndnsf"
+name = "ndnsf-rs"
 description = "Faithful NDN Service Framework (NDNSF) compat: four-phase service RPC over SVS, on the ndn-rs substrate"
 version.workspace = true
 edition.workspace = true
@@ -60,7 +60,7 @@ ndn-service-macro = { workspace = true }
 # Weather example: the same service definition over the Tier-0 carrier too.
 ndn-rpc = { workspace = true }
 
-# `cargo run -p ndn-ndnsf --example weather --features driver`
+# `cargo run -p ndnsf-rs --example weather --features driver`
 [[example]]
 name = "weather"
 required-features = ["driver"]

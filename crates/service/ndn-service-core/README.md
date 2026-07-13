@@ -22,7 +22,7 @@ assume an executor and a hash map). With `default-features = false` the crate is
 ## Two scales
 
 **Full node** — the seam the macro generates against and the carriers implement
-(`ndn-rpc`, `ndn-ndnsf`, `ndn-service`). One `#[ndn_service]` definition runs over
+(`ndn-rpc`, `ndnsf-rs`, `ndn-service`). One `#[ndn_service]` definition runs over
 any `Carrier` unchanged. See [`ndn-service`](../ndn-service) and the
 service-layer spec (`docs/specs/service-layer.md` §12).
 

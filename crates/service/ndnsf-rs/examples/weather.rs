@@ -4,12 +4,12 @@
 //! shows a *parameterized request* (`city`, `day`) and a *structured response*
 //! (`Forecast`), proving the typed surface fits both carriers unchanged.
 //!
-//! Run: `cargo run -p ndn-ndnsf --example weather --features driver`
+//! Run: `cargo run -p ndnsf-rs --example weather --features driver`
 
 use std::sync::Arc;
 
 use bytes::Bytes;
-use ndn_ndnsf::NdnsfCarrier;
+use ndnsf_rs::NdnsfCarrier;
 use ndn_packet::Name;
 use ndn_rpc::RpcCarrier;
 use ndn_service_core::{Carrier, ServiceId, Strategy};

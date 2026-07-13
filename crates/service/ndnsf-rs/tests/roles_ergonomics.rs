@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use ndn_ndnsf::roles::{ServiceProvider, ServiceUser};
+use ndnsf_rs::roles::{ServiceProvider, ServiceUser};
 use ndn_packet::Name;
 use ndn_security::KeyChain;
 use ndn_sync::{SvSyncConfig, SvsConfig, SvsPubSub};

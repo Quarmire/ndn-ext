@@ -7,7 +7,7 @@
 //! object, and content is symmetric-sealed under the CK. This crate builds that
 //! flow on the shared primitives — `ndn-security`'s ABE schemes (CP/KP/MA) and
 //! content-key confidentiality — and is the layer the faithful NDNSF compat
-//! (`ndn-ndnsf`) sits on.
+//! (`ndnsf-rs`) sits on.
 //!
 //! Interop is protocol-level: the names ([`names`]) match the C++ NAC-ABE stack,
 //! but the ABE ciphertext bytes do not interoperate (§7.3).

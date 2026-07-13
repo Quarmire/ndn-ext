@@ -9,10 +9,10 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use ndn_foundation_types::Hash;
-use ndn_ndnsf::access::{open_with, seal_for};
-use ndn_ndnsf::driver::{call, serve_provider};
-use ndn_ndnsf::tokens::PendingCoordination;
-use ndn_ndnsf::trust::TrustCtx;
+use ndnsf_rs::access::{open_with, seal_for};
+use ndnsf_rs::driver::{call, serve_provider};
+use ndnsf_rs::tokens::PendingCoordination;
+use ndnsf_rs::trust::TrustCtx;
 use ndn_packet::Name;
 use ndn_security::abe::{PolicyExpr, lsw_keygen, lsw_setup};
 use ndn_sync::{SvSyncConfig, SvsConfig, SvsPubSub};

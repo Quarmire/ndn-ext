@@ -68,7 +68,7 @@ impl<R> Session<R> {
     /// **`IngestValidator`** bound to the session's trust anchor, so only authorized
     /// members can publish and a forged/replayed publication is rejected at ingest.
     /// The default (unsecured) pub/sub is accept-all — acceptable only for a public
-    /// session. (`ndn-ndnsf::trust::{publisher_signer, ingest_validator}` adapt an
+    /// session. (`ndnsf-rs::trust::{publisher_signer, ingest_validator}` adapt an
     /// `ndn-security` signer/validator into those hooks.)
     pub fn new(name: Name, ps: Arc<SvsPubSub>, scope_key: ContentKey) -> Self {
         Self {

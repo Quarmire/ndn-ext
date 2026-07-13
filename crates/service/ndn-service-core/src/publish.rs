@@ -4,7 +4,7 @@
 //!
 //! # Why this lives here
 //!
-//! The full service layer ([`ndn-service`], [`ndn-ndnsf`]) and its `Topic<T>` feed
+//! The full service layer ([`ndn-service`], [`ndnsf-rs`]) and its `Topic<T>` feed
 //! assume an async runtime, an SVS sync group, and `std` — the right shape for a
 //! *capable* node, the wrong shape for a sensor. The service-layer role split (see
 //! `docs/specs/service-layer.md`) already puts the heavy machinery — ABE, policy
@@ -54,7 +54,7 @@
 //! ```
 //!
 //! [`ndn-service`]: https://docs.rs/ndn-service
-//! [`ndn-ndnsf`]: https://docs.rs/ndn-ndnsf
+//! [`ndnsf-rs`]: https://docs.rs/ndnsf-rs
 
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;

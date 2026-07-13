@@ -89,7 +89,7 @@ ABE-by-role distribution hands scope keys out in the v2 layer).
 ## Use with the service layer
 
 `ndn-nacabe` backs the confidentiality of both the compat and v2 service layers:
-`ndn-ndnsf::access` NAC-seals four-phase responses under service attributes, and
+`ndnsf-rs::access` NAC-seals four-phase responses under service attributes, and
 `ndn-service` uses it for the policy→issuance loop and ABE-by-role scope-key
 distribution. See `docs/specs/service-layer.md` §6.
 

@@ -1,4 +1,4 @@
-//! The same weather domain as `ndn-ndnsf`'s example, but over the **v2** layer —
+//! The same weather domain as `ndnsf-rs`'s example, but over the **v2** layer —
 //! showing what v2 adds beyond a plain call:
 //!
 //! 1. **Discovery** (Tier-1): the client doesn't know the stations; it *discovers*
@@ -26,7 +26,7 @@ use ndn_service_macro::{Frame, ndn_service};
 use ndn_sync::{SvSyncConfig, SvsConfig, SvsPubSub};
 use tokio::sync::mpsc;
 
-// --- The service + message types (same domain as the ndn-ndnsf example). ---
+// --- The service + message types (same domain as the ndnsf-rs example). ---
 
 #[derive(Frame, Debug, Clone)]
 struct Forecast {

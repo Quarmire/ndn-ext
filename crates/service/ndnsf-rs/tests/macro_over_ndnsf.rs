@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use ndn_ndnsf::NdnsfCarrier;
+use ndnsf_rs::NdnsfCarrier;
 use ndn_packet::Name;
 use ndn_service_core::{Carrier, ServiceId, Strategy};
 use ndn_service_macro::ndn_service;

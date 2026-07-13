@@ -8,7 +8,7 @@
 //! without the long positional argument lists.
 //!
 //! ```no_run
-//! # use ndn_ndnsf::roles::{ServiceProvider, ServiceUser};
+//! # use ndnsf_rs::roles::{ServiceProvider, ServiceUser};
 //! # use ndn_sync::SvsPubSub;
 //! # use ndn_packet::Name;
 //! # use bytes::Bytes;
@@ -320,7 +320,7 @@ impl ServiceUser {
 /// [`ServiceUser`].
 ///
 /// ```no_run
-/// # use ndn_ndnsf::roles::ServiceNode;
+/// # use ndnsf_rs::roles::ServiceNode;
 /// # use ndn_sync::SvsPubSub;
 /// # use bytes::Bytes;
 /// # async fn demo(ps: SvsPubSub) {
