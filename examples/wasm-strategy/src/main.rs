@@ -125,7 +125,10 @@ async fn main() -> Result<()> {
         Name::from_str("/localhost/nfd/strategy/wasm-minimal")?,
         &wasm_bytes,
         10_000, // fuel limit: 10k instructions per invocation
-    )?;
+    )
+    // wasmtime's Error no longer implements std::error::Error, so `?` can't
+    // auto-convert into anyhow::Error — bridge it via Display.
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     tracing::info!("Loaded WASM strategy from embedded WAT module");
 
