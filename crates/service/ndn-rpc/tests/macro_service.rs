@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use ndn_rpc::RpcCarrier;
-use ndn_service_core::{Carrier, ServiceId};
+use ndn_service_core::{Carrier, Metadata, ServiceId};
 use ndn_service_macro::{Frame, ndn_service};
 
 /// A structured response — `#[derive(Frame)]` makes typed "response with data"
@@ -73,6 +73,41 @@ async fn macro_service_round_trips_over_rpc_carrier() {
             label: "2+4".into()
         }
     );
+}
+
+#[tokio::test]
+async fn macro_client_meta_threads_the_trace_slot() {
+    let carrier = RpcCarrier::new();
+    let svc = ServiceId::new("/svc/calc".parse().unwrap());
+    carrier
+        .serve(&svc, Arc::new(CalcDispatch(Arc::new(CalcImpl))))
+        .await
+        .unwrap();
+    let client = CalcClient::new(carrier, svc);
+
+    let mut ctx = Metadata::new();
+    ctx.insert(
+        "traceparent".into(),
+        bytes::Bytes::from_static(b"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+    );
+
+    // The generated `_meta` method carries the opaque request slot and returns the
+    // decoded value paired with the carrier-reflected response slot — distributed
+    // tracing rides the typed client without touching the op's Frame.
+    let (sum, echoed) = client.add_meta(2, 3, ctx.clone()).await.unwrap();
+    assert_eq!(sum, 5);
+    assert_eq!(
+        echoed, ctx,
+        "the trace context must round-trip through the generated client"
+    );
+
+    // A `_meta` op returning a derived struct also surfaces the reflected slot.
+    let (stats, echoed) = client.summarize_meta(2, 4, ctx.clone()).await.unwrap();
+    assert_eq!(stats.sum, 6);
+    assert_eq!(echoed, ctx);
+
+    // The plain method is the empty-slot shorthand and still works.
+    assert_eq!(client.add(2, 3).await.unwrap(), 5);
 }
 
 #[tokio::test]

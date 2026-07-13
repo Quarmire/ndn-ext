@@ -16,7 +16,7 @@ use ndn_rpc::{RpcCarrier, RpcError, RpcHandler, RpcRegistry};
 use ndn_service::{
     DiscoveryCarrier, NamingConvention, ProviderDirectory, ServiceDiscoveryDirectory,
 };
-use ndn_service_core::{Carrier, OpId, ServiceId};
+use ndn_service_core::{Carrier, Metadata, OpId, ServiceId, framing};
 
 fn n(s: &str) -> Name {
     s.parse().unwrap()
@@ -30,7 +30,10 @@ impl RpcHandler for CaptureHint {
             .forwarding_hint()
             .and_then(|hs| hs.first())
             .map(|h| h.to_string());
-        let wire = DataBuilder::new((*interest.name).clone(), b"ok").sign_digest_sha256();
+        // The carrier's `invoke` expects the carrier-uniform metadata+payload
+        // envelope on the response, so this stand-in handler must produce one.
+        let body = framing::encode_envelope(&Metadata::new(), b"ok");
+        let wire = DataBuilder::new((*interest.name).clone(), body.as_ref()).sign_digest_sha256();
         Data::decode(wire).map_err(|e| RpcError::HandlerFailed(e.to_string()))
     }
 }

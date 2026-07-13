@@ -19,6 +19,10 @@
 //!   fields (never positional encoding), so services evolve by appending fields.
 //! - **Idempotent ops.** A carrier may retry or multicast; operations must be
 //!   idempotent (multi-provider carriers additionally enforce once-only).
+//! - **Carrier-uniform metadata.** An opaque [`Metadata`] slot rides beside every
+//!   message (a W3C trace context, a deadline, …); every carrier transports it
+//!   verbatim and reflects it onto the response, and the service never interprets
+//!   it — so cross-cutting context is not smuggled into each op's [`Frame`].
 
 #![deny(missing_docs)]
 #![cfg_attr(not(feature = "std"), no_std)]
@@ -35,6 +39,7 @@
 
 extern crate alloc;
 
+use alloc::collections::BTreeMap;
 #[cfg(not(feature = "std"))]
 use alloc::string::String;
 
@@ -53,6 +58,16 @@ pub use async_trait;
 pub use bytes;
 #[doc(hidden)]
 pub use ndn_packet;
+
+/// The opaque, carrier-uniform **metadata slot** carried alongside a service
+/// message: a map of string keys to raw bytes, threaded on both [`Invocation`]
+/// and [`Response`]. It is a general extension point — a W3C **trace context**
+/// (distributed OTLP tracing), a deadline, a tenant tag — that rides *beside* the
+/// message rather than being smuggled into every operation's [`Frame`]. Every
+/// [`Carrier`] transports it verbatim and **never interprets it**; a carrier that
+/// drops or mangles it is non-conformant. Keys are ordered (`BTreeMap`) so the
+/// envelope encoding is canonical.
+pub type Metadata = BTreeMap<String, Bytes>;
 
 /// A service identity: the name prefix the service is reached under
 /// (e.g. `/svc/echo`). Operations hang below it.
@@ -140,6 +155,10 @@ pub struct Response {
     pub producer: Name,
     /// The response payload (a [`Frame`]-encoded message, opaque to the carrier).
     pub payload: Bytes,
+    /// The opaque response-side [`Metadata`] slot. A carrier reflects the
+    /// invocation's slot here (context propagation), so e.g. a trace context set
+    /// on the call round-trips intact; the service never sets or reads it.
+    pub metadata: Metadata,
 }
 
 /// The server-side context a carrier hands each inbound invocation. The
@@ -153,6 +172,10 @@ pub struct Invocation {
     pub request: Bytes,
     /// The authenticated requester identity, if the carrier established one.
     pub requester: Option<Name>,
+    /// The opaque request-side [`Metadata`] slot the client set on the call
+    /// (e.g. a W3C trace context to continue). A handler may read it for tracing
+    /// or context, but is not required to; the carrier transports it verbatim.
+    pub metadata: Metadata,
 }
 
 /// A service's server side: route an [`Invocation`] to the matching typed handler
@@ -227,14 +250,19 @@ impl Dispatch for ScriptDispatch {
 #[cfg(feature = "std")]
 #[async_trait::async_trait]
 pub trait Carrier: Send + Sync {
-    /// Invoke `op` of `svc` with `request` bytes; return one provider's response.
-    /// For multi-provider backends this applies the carrier's default selection;
-    /// see [`SelectCarrier`] for explicit strategies.
-    async fn invoke(
+    /// Invoke `op` of `svc` with `request` bytes and a request-side [`Metadata`]
+    /// slot; return one provider's response (with its own reflected
+    /// [`Response::metadata`] slot). The carrier transports the slot opaquely
+    /// end-to-end and never interprets it. This is the primitive each carrier
+    /// implements; [`invoke`](Self::invoke) is the no-metadata shorthand. For
+    /// multi-provider backends this applies the carrier's default selection; see
+    /// [`SelectCarrier`] for explicit strategies.
+    async fn invoke_meta(
         &self,
         svc: &ServiceId,
         op: &OpId,
         request: Bytes,
+        metadata: Metadata,
     ) -> Result<Response, ServiceError>;
 
     /// Mount `dispatch` as the server for `svc`. Returns once the service is
@@ -242,6 +270,17 @@ pub trait Carrier: Send + Sync {
     /// based carriers spawn their receive loop). Errors if mounting fails.
     async fn serve(&self, svc: &ServiceId, dispatch: Arc<dyn Dispatch>)
     -> Result<(), ServiceError>;
+
+    /// Invoke `op` of `svc` with `request` bytes and no metadata (an empty slot).
+    /// Shorthand for [`invoke_meta`](Self::invoke_meta).
+    async fn invoke(
+        &self,
+        svc: &ServiceId,
+        op: &OpId,
+        request: Bytes,
+    ) -> Result<Response, ServiceError> {
+        self.invoke_meta(svc, op, request, Metadata::new()).await
+    }
 }
 
 /// How a multi-provider carrier selects among responders. Mirrors NDNSF's
@@ -263,14 +302,31 @@ pub enum Strategy {
 #[cfg(feature = "std")]
 #[async_trait::async_trait]
 pub trait SelectCarrier: Carrier {
-    /// Invoke `op` of `svc`, gathering responses per `strategy`.
+    /// Invoke `op` of `svc` with a request-side [`Metadata`] slot, gathering
+    /// responses per `strategy`. The primitive each multi-provider carrier
+    /// implements; [`invoke_select`](Self::invoke_select) is the no-metadata
+    /// shorthand.
+    async fn invoke_select_meta(
+        &self,
+        svc: &ServiceId,
+        op: &OpId,
+        request: Bytes,
+        strategy: Strategy,
+        metadata: Metadata,
+    ) -> Result<Vec<Response>, ServiceError>;
+
+    /// Invoke `op` of `svc` with no metadata, gathering responses per `strategy`.
+    /// Shorthand for [`invoke_select_meta`](Self::invoke_select_meta).
     async fn invoke_select(
         &self,
         svc: &ServiceId,
         op: &OpId,
         request: Bytes,
         strategy: Strategy,
-    ) -> Result<Vec<Response>, ServiceError>;
+    ) -> Result<Vec<Response>, ServiceError> {
+        self.invoke_select_meta(svc, op, request, strategy, Metadata::new())
+            .await
+    }
 }
 
 /// A [`Carrier`] refinement for backends that can steer an invocation toward a
@@ -281,15 +337,32 @@ pub trait SelectCarrier: Carrier {
 #[cfg(feature = "std")]
 #[async_trait::async_trait]
 pub trait HintedCarrier: Carrier {
-    /// Invoke `op` of `svc` with `request`, steering toward `hint` when given
-    /// (`None` is identical to [`Carrier::invoke`]).
+    /// Invoke `op` of `svc` with `request` and a request-side [`Metadata`] slot,
+    /// steering toward `hint` when given (`None` is identical to
+    /// [`Carrier::invoke_meta`]). The primitive each hinted carrier implements;
+    /// [`invoke_hinted`](Self::invoke_hinted) is the no-metadata shorthand.
+    async fn invoke_hinted_meta(
+        &self,
+        svc: &ServiceId,
+        op: &OpId,
+        request: Bytes,
+        hint: Option<&Name>,
+        metadata: Metadata,
+    ) -> Result<Response, ServiceError>;
+
+    /// Invoke `op` of `svc` with `request` and no metadata, steering toward
+    /// `hint` when given. Shorthand for
+    /// [`invoke_hinted_meta`](Self::invoke_hinted_meta).
     async fn invoke_hinted(
         &self,
         svc: &ServiceId,
         op: &OpId,
         request: Bytes,
         hint: Option<&Name>,
-    ) -> Result<Response, ServiceError>;
+    ) -> Result<Response, ServiceError> {
+        self.invoke_hinted_meta(svc, op, request, hint, Metadata::new())
+            .await
+    }
 }
 
 /// Length-delimited field framing used by `#[ndn_service]`-generated message
@@ -299,9 +372,57 @@ pub trait HintedCarrier: Carrier {
 /// older peer reads the fields it knows). Reordering/removing fields is a
 /// breaking change. (A tag-per-field TLV upgrade — full unordered skippability —
 /// is a later codec revision; it does not change the generated API.)
+///
+/// The [`encode_envelope`]/[`decode_envelope`] pair layers the carrier-uniform
+/// [`Metadata`](super::Metadata) slot on top of the same length-prefixing.
 pub mod framing {
-    use super::ServiceError;
+    #[cfg(not(feature = "std"))]
+    use alloc::string::{String, ToString};
+
+    use super::{Metadata, ServiceError};
     use bytes::{BufMut, Bytes, BytesMut};
+
+    /// Wrap an opaque [`Metadata`](super::Metadata) slot and a `payload` into one
+    /// self-delimiting envelope: the entry count, then each `(key, value)`
+    /// length-delimited (keys emitted in `BTreeMap` order, so the encoding is
+    /// canonical), then the raw `payload` as the remainder. This is the
+    /// carrier-uniform wrapping a [`Carrier`](super::Carrier) uses to transport
+    /// the extension slot beside a message; the service never sees it.
+    /// [`decode_envelope`] is the exact inverse.
+    pub fn encode_envelope(metadata: &Metadata, payload: &[u8]) -> Bytes {
+        let mut buf = BytesMut::new();
+        buf.put_u32_le(metadata.len() as u32);
+        for (key, value) in metadata {
+            buf.put_u32_le(key.len() as u32);
+            buf.put_slice(key.as_bytes());
+            buf.put_u32_le(value.len() as u32);
+            buf.put_slice(value.as_ref());
+        }
+        buf.put_slice(payload);
+        buf.freeze()
+    }
+
+    /// Recover the [`Metadata`](super::Metadata) slot and the trailing payload
+    /// from an [`encode_envelope`] frame. Fails only on a truncated slot header
+    /// (the signature of a carrier that mangles the slot); any payload is accepted.
+    pub fn decode_envelope(bytes: &[u8]) -> Result<(Metadata, Bytes), ServiceError> {
+        let mut pos = 0usize;
+        let count_end = pos
+            .checked_add(4)
+            .filter(|&e| e <= bytes.len())
+            .ok_or_else(|| ServiceError::Decode("truncated metadata count".into()))?;
+        let count = u32::from_le_bytes(bytes[pos..count_end].try_into().unwrap());
+        pos = count_end;
+        let mut metadata = Metadata::new();
+        for _ in 0..count {
+            let key = read_field(bytes, &mut pos)?;
+            let value = read_field(bytes, &mut pos)?;
+            let key = String::from_utf8(key.to_vec())
+                .map_err(|e| ServiceError::Decode(e.to_string()))?;
+            metadata.insert(key, Bytes::copy_from_slice(value));
+        }
+        Ok((metadata, Bytes::copy_from_slice(&bytes[pos..])))
+    }
 
     /// Concatenate already-encoded fields, each length-prefixed.
     pub fn encode_fields(fields: &[Bytes]) -> Bytes {
@@ -333,7 +454,9 @@ pub mod framing {
 pub mod publish;
 
 /// `Frame` for the primitive argument/return types `#[ndn_service]` supports out
-/// of the box. Custom types implement [`Frame`] themselves.
+/// of the box: `()`, `bool`, `String`, `Vec<u8>`, `Bytes`, the fixed-width
+/// integers, and the floats `f32`/`f64`. Custom types implement [`Frame`]
+/// themselves (usually via `#[derive(Frame)]`).
 mod frame_impls {
     #[cfg(not(feature = "std"))]
     use alloc::string::{String, ToString};
@@ -392,7 +515,12 @@ mod frame_impls {
         }
     }
 
-    macro_rules! frame_int {
+    // Fixed-width numeric scalars encode as their little-endian bytes; decoding
+    // requires the exact width (an appended TLV field is length-delimited by the
+    // framing layer). Floats (`f32`/`f64`) share the encoding — number-heavy
+    // contracts (e.g. flight telemetry) therefore frame each numeric field
+    // per-field and length-prefixed, with no whole-struct JSON fallback.
+    macro_rules! frame_le_scalar {
         ($($t:ty),*) => {$(
             impl Frame for $t {
                 fn encode(&self) -> Bytes {
@@ -407,5 +535,5 @@ mod frame_impls {
             }
         )*};
     }
-    frame_int!(u32, u64, i32, i64);
+    frame_le_scalar!(u32, u64, i32, i64, f32, f64);
 }

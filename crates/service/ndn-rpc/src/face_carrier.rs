@@ -20,7 +20,8 @@ use ndn_packet::Name;
 use ndn_packet::encode::{DataBuilder, InterestBuilder};
 use ndn_security::{InterestValidationOutcome, SignWith, Signer, ValidationResult, Validator};
 use ndn_service_core::{
-    Carrier, Dispatch, HintedCarrier, Invocation, OpId, Response, ServiceError, ServiceId,
+    Carrier, Dispatch, HintedCarrier, Invocation, Metadata, OpId, Response, ServiceError,
+    ServiceId, framing,
 };
 use tokio::sync::Mutex;
 
@@ -140,36 +141,47 @@ async fn handle_request(
             InterestValidationOutcome::Invalid(_) | InterestValidationOutcome::Pending => return,
         },
     };
-    let request = interest.app_parameters().cloned().unwrap_or_default();
+    // The request travels as an opaque metadata+payload envelope: recover the
+    // carrier-uniform slot (a trace context, etc.) and the inner request. A
+    // malformed envelope is dropped (the client fails closed on timeout).
+    let params = interest.app_parameters().cloned().unwrap_or_default();
+    let Ok((metadata, request)) = framing::decode_envelope(&params) else {
+        return;
+    };
     let invocation = Invocation {
         op,
         request,
         requester,
+        metadata: metadata.clone(),
     };
     let Ok(reply) = dispatch.dispatch(invocation).await else {
         return; // dispatch error — no response (fail closed)
     };
+    // Reflect the request's slot onto the response and frame it beside the reply.
+    let body = framing::encode_envelope(&metadata, &reply);
     // Sign the response with this node's identity when configured; else a digest.
     let name = (*interest.name).clone();
     let wire = match &signer {
-        Some(s) => match DataBuilder::new(name, reply.as_ref()).sign_with_sync(s.as_ref()) {
+        Some(s) => match DataBuilder::new(name, body.as_ref()).sign_with_sync(s.as_ref()) {
             Ok(w) => w,
             Err(_) => return, // can't sign the response — drop
         },
-        None => DataBuilder::new(name, reply.as_ref()).sign_digest_sha256(),
+        None => DataBuilder::new(name, body.as_ref()).sign_digest_sha256(),
     };
     let _ = responder.respond_bytes(wire).await;
 }
 
 #[async_trait]
 impl Carrier for FaceRpcCarrier {
-    async fn invoke(
+    async fn invoke_meta(
         &self,
         svc: &ServiceId,
         op: &OpId,
         request: Bytes,
+        metadata: Metadata,
     ) -> Result<Response, ServiceError> {
-        self.invoke_hinted(svc, op, request, None).await
+        self.invoke_hinted_meta(svc, op, request, None, metadata)
+            .await
     }
 
     async fn serve(
@@ -201,18 +213,21 @@ impl Carrier for FaceRpcCarrier {
 
 #[async_trait]
 impl HintedCarrier for FaceRpcCarrier {
-    async fn invoke_hinted(
+    async fn invoke_hinted_meta(
         &self,
         svc: &ServiceId,
         op: &OpId,
         request: Bytes,
         hint: Option<&Name>,
+        metadata: Metadata,
     ) -> Result<Response, ServiceError> {
         let consumer = self.consumer.as_ref().ok_or_else(|| {
             ServiceError::Transport("carrier has no consumer to invoke with".into())
         })?;
         let name = svc.name().clone().append(op.as_str());
-        let mut builder = InterestBuilder::new(name).app_parameters(request.to_vec());
+        // Carry the opaque metadata slot beside the request in one envelope.
+        let body = framing::encode_envelope(&metadata, &request);
+        let mut builder = InterestBuilder::new(name).app_parameters(body.to_vec());
         if let Some(h) = hint {
             builder = builder.forwarding_hint(vec![h.clone()]);
         }
@@ -247,9 +262,13 @@ impl HintedCarrier for FaceRpcCarrier {
                 }
             }
         }
+        // Recover the reflected metadata slot and the reply payload.
+        let content = data.content().cloned().unwrap_or_default();
+        let (metadata, payload) = framing::decode_envelope(&content)?;
         Ok(Response {
             producer: svc.name().clone(),
-            payload: data.content().cloned().unwrap_or_default(),
+            payload,
+            metadata,
         })
     }
 }

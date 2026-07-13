@@ -38,7 +38,8 @@ use ndn_security::{
     Validator,
 };
 use ndn_service_core::{
-    Carrier, Dispatch, HintedCarrier, Invocation, OpId, Response, ServiceError, ServiceId,
+    Carrier, Dispatch, HintedCarrier, Invocation, Metadata, OpId, Response, ServiceError,
+    ServiceId, framing,
 };
 
 use crate::{RpcError, RpcHandler, RpcRegistry};
@@ -176,11 +177,16 @@ impl RpcHandler for CarrierHandler {
                 RpcError::BadRequest("interest carries no operation component".into())
             })?;
         let requester = self.authenticate(interest).await?;
-        let request = interest.app_parameters().cloned().unwrap_or_default();
+        // The request travels as an opaque metadata+payload envelope: recover the
+        // carrier-uniform slot (a trace context, etc.) and the inner request.
+        let params = interest.app_parameters().cloned().unwrap_or_default();
+        let (metadata, request) = framing::decode_envelope(&params)
+            .map_err(|e| RpcError::BadRequest(e.to_string()))?;
         let invocation = Invocation {
             op,
             request,
             requester,
+            metadata: metadata.clone(),
         };
         let reply = self
             .dispatch
@@ -192,14 +198,17 @@ impl RpcHandler for CarrierHandler {
                 ServiceError::Unauthorized(m) => RpcError::Unauthorized(m),
                 other => RpcError::HandlerFailed(other.to_string()),
             })?;
+        // Reflect the request's slot onto the response (context propagation) and
+        // frame it back beside the reply payload — the same opaque envelope.
+        let body = framing::encode_envelope(&metadata, &reply);
         // Sign the response with this node's identity when configured; else a bare
         // digest (loopback integrity), as before.
         let name = (*interest.name).clone();
         let wire = match &self.signer {
-            Some(signer) => DataBuilder::new(name, reply.as_ref())
+            Some(signer) => DataBuilder::new(name, body.as_ref())
                 .sign_with_sync(signer.as_ref())
                 .map_err(|e| RpcError::HandlerFailed(format!("response sign failed: {e}")))?,
-            None => DataBuilder::new(name, reply.as_ref()).sign_digest_sha256(),
+            None => DataBuilder::new(name, body.as_ref()).sign_digest_sha256(),
         };
         Data::decode(wire)
             .map_err(|e| RpcError::HandlerFailed(format!("response encode failed: {e}")))
@@ -208,13 +217,15 @@ impl RpcHandler for CarrierHandler {
 
 #[async_trait]
 impl Carrier for RpcCarrier {
-    async fn invoke(
+    async fn invoke_meta(
         &self,
         svc: &ServiceId,
         op: &OpId,
         request: Bytes,
+        metadata: Metadata,
     ) -> Result<Response, ServiceError> {
-        self.invoke_hinted(svc, op, request, None).await
+        self.invoke_hinted_meta(svc, op, request, None, metadata)
+            .await
     }
 
     async fn serve(
@@ -236,15 +247,18 @@ impl Carrier for RpcCarrier {
 
 #[async_trait]
 impl HintedCarrier for RpcCarrier {
-    async fn invoke_hinted(
+    async fn invoke_hinted_meta(
         &self,
         svc: &ServiceId,
         op: &OpId,
         request: Bytes,
         hint: Option<&Name>,
+        metadata: Metadata,
     ) -> Result<Response, ServiceError> {
         let name = svc.name().clone().append(op.as_str());
-        let mut builder = InterestBuilder::new(name).app_parameters(request.to_vec());
+        // Carry the opaque metadata slot beside the request in one envelope.
+        let body = framing::encode_envelope(&metadata, &request);
+        let mut builder = InterestBuilder::new(name).app_parameters(body.to_vec());
         if let Some(h) = hint {
             // Steer the forwarder toward the selected provider while the content
             // name stays shared across providers (the data-centric convention).
@@ -280,9 +294,13 @@ impl HintedCarrier for RpcCarrier {
                         }
                     }
                 }
+                // Recover the reflected metadata slot and the reply payload.
+                let content = data.content().cloned().unwrap_or_default();
+                let (metadata, payload) = framing::decode_envelope(&content)?;
                 Ok(Response {
                     producer: svc.name().clone(),
-                    payload: data.content().cloned().unwrap_or_default(),
+                    payload,
+                    metadata,
                 })
             }
             Some(Err(RpcError::NotFound)) | None => Err(ServiceError::NotFound),

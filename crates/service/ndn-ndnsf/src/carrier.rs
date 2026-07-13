@@ -25,8 +25,8 @@ use bytes::{BufMut, Bytes, BytesMut};
 use ndn_packet::Name;
 use ndn_security::{Signer, Validator};
 use ndn_service_core::{
-    Carrier, Dispatch, Invocation, OpId, Response, SelectCarrier, ServiceError, ServiceId,
-    Strategy as CoreStrategy,
+    Carrier, Dispatch, Invocation, Metadata, OpId, Response, SelectCarrier, ServiceError,
+    ServiceId, Strategy as CoreStrategy, framing,
 };
 use ndn_sync::SvsPubSub;
 use std::sync::Arc;
@@ -34,6 +34,7 @@ use tokio::task::JoinHandle;
 
 use crate::driver::{self, AsyncResponder};
 use crate::messages::Strategy as NdnsfStrategy;
+use crate::policy::{ProviderAuthorizer, ServicePolicy};
 use crate::trust::TrustCtx;
 
 const DEFAULT_TTL_SECS: u64 = 3600;
@@ -69,6 +70,10 @@ pub struct NdnsfCarrier {
     ack_window: Duration,
     user_token: String,
     trust: TrustCtx,
+    /// When set, refuse an ACK from a provider the policy does not authorize for
+    /// the invoked service (per-service provider authorization). `None` ⇒ any
+    /// group member whose ACK verifies may serve (the legacy posture).
+    authorizer: Option<Arc<ProviderAuthorizer>>,
     next_id: AtomicU64,
     serving: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -90,6 +95,7 @@ impl NdnsfCarrier {
             ack_window: DEFAULT_ACK_WINDOW,
             user_token: String::new(),
             trust: TrustCtx::default(),
+            authorizer: None,
             next_id: AtomicU64::new(1),
             serving: Mutex::new(Vec::new()),
         }
@@ -125,6 +131,25 @@ impl NdnsfCarrier {
     /// (red-team SEC-02). Prefer [`signed`](Self::signed).
     pub fn insecure(mut self) -> Self {
         self.trust = TrustCtx::insecure();
+        self
+    }
+
+    /// Enforce per-service **provider authorization** from `policy`: on invocation,
+    /// an ACK from a provider the policy does not list for the invoked service is
+    /// refused before it can be selected — so a trusted-but-unauthorized group
+    /// member cannot serve (closes the SEC-05 gap where group membership was the
+    /// only provider authorization). Pair with [`signed`](Self::signed) so provider
+    /// identities are authenticated; under [`insecure`](Self::insecure) the names
+    /// are spoofable and this check is best-effort. Shorthand for
+    /// [`authorize`](Self::authorize) built from a [`ServicePolicy`](crate::policy::ServicePolicy).
+    pub fn with_provider_policy(self, policy: &ServicePolicy) -> Self {
+        self.authorize(ProviderAuthorizer::from_policy(policy))
+    }
+
+    /// Enforce provider authorization from a pre-compiled [`ProviderAuthorizer`]
+    /// (e.g. one shared across carriers). See [`with_provider_policy`](Self::with_provider_policy).
+    pub fn authorize(mut self, authorizer: ProviderAuthorizer) -> Self {
+        self.authorizer = Some(Arc::new(authorizer));
         self
     }
 
@@ -184,10 +209,15 @@ fn decode_response(producer: Name, bytes: Bytes) -> Result<Response, ServiceErro
         return Err(ServiceError::Transport("empty response payload".into()));
     };
     match status {
-        STATUS_OK => Ok(Response {
-            producer,
-            payload: bytes.slice(1..),
-        }),
+        STATUS_OK => {
+            // The OK body is a metadata+payload envelope: recover the reflected slot.
+            let (metadata, payload) = framing::decode_envelope(&bytes.slice(1..))?;
+            Ok(Response {
+                producer,
+                payload,
+                metadata,
+            })
+        }
         STATUS_NOT_FOUND => Err(ServiceError::NotFound),
         _ => Err(ServiceError::Handler(
             String::from_utf8_lossy(payload).into_owned(),
@@ -207,16 +237,24 @@ fn responder_for(dispatch: Arc<dyn Dispatch>) -> AsyncResponder {
         // default-open `TrustCtx` this identity is unauthenticated (red-team SEC-02).
         let requester = Some(coord.requester.clone());
         Box::pin(async move {
-            let Some((op, request)) = decode_request(&payload) else {
+            let Some((op, body)) = decode_request(&payload) else {
                 return encode_response(STATUS_ERROR, b"malformed request envelope");
+            };
+            // Recover the opaque metadata slot the client set (a trace context, etc.).
+            let Ok((metadata, request)) = framing::decode_envelope(&body) else {
+                return encode_response(STATUS_ERROR, b"malformed metadata envelope");
             };
             let inv = Invocation {
                 op,
                 request,
                 requester,
+                metadata: metadata.clone(),
             };
             match dispatch.dispatch(inv).await {
-                Ok(reply) => encode_response(STATUS_OK, &reply),
+                // Reflect the request's slot onto the response beside the reply.
+                Ok(reply) => {
+                    encode_response(STATUS_OK, &framing::encode_envelope(&metadata, &reply))
+                }
                 Err(ServiceError::NotFound) => encode_response(STATUS_NOT_FOUND, b""),
                 Err(e) => encode_response(STATUS_ERROR, e.to_string().as_bytes()),
             }
@@ -234,13 +272,16 @@ fn map_strategy(s: CoreStrategy) -> NdnsfStrategy {
 
 #[async_trait]
 impl Carrier for NdnsfCarrier {
-    async fn invoke(
+    async fn invoke_meta(
         &self,
         svc: &ServiceId,
         op: &OpId,
         request: Bytes,
+        metadata: Metadata,
     ) -> Result<Response, ServiceError> {
-        let payload = encode_request(op, &request);
+        // The opaque metadata slot rides beside the request inside the four-phase
+        // op envelope, transported verbatim to the provider and reflected back.
+        let payload = encode_request(op, &framing::encode_envelope(&metadata, &request));
         let raw = driver::select_and_call(
             self.ps.as_ref(),
             self.node.clone(),
@@ -252,6 +293,7 @@ impl Carrier for NdnsfCarrier {
             NdnsfStrategy::FirstResponding,
             self.ack_window,
             &self.trust,
+            self.authorizer.as_deref(),
         )
         .await;
         match raw.into_iter().next() {
@@ -282,14 +324,15 @@ impl Carrier for NdnsfCarrier {
 
 #[async_trait]
 impl SelectCarrier for NdnsfCarrier {
-    async fn invoke_select(
+    async fn invoke_select_meta(
         &self,
         svc: &ServiceId,
         op: &OpId,
         request: Bytes,
         strategy: CoreStrategy,
+        metadata: Metadata,
     ) -> Result<Vec<Response>, ServiceError> {
-        let payload = encode_request(op, &request);
+        let payload = encode_request(op, &framing::encode_envelope(&metadata, &request));
         let raw = driver::select_and_call(
             self.ps.as_ref(),
             self.node.clone(),
@@ -301,6 +344,7 @@ impl SelectCarrier for NdnsfCarrier {
             map_strategy(strategy),
             self.ack_window,
             &self.trust,
+            self.authorizer.as_deref(),
         )
         .await;
         // Keep the successful responses; a provider that can't serve the op

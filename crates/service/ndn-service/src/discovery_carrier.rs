@@ -28,7 +28,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use ndn_packet::Name;
 use ndn_service_core::{
-    Carrier, HintedCarrier, OpId, Response, SelectCarrier, ServiceError, ServiceId, Strategy,
+    Carrier, HintedCarrier, Metadata, OpId, Response, SelectCarrier, ServiceError, ServiceId,
+    Strategy,
 };
 
 /// How a provider of a logical service is named and addressed.
@@ -108,14 +109,16 @@ impl<C: HintedCarrier> DiscoveryCarrier<C> {
 
 #[async_trait]
 impl<C: HintedCarrier> Carrier for DiscoveryCarrier<C> {
-    async fn invoke(
+    async fn invoke_meta(
         &self,
         svc: &ServiceId,
         op: &OpId,
         request: Bytes,
+        metadata: Metadata,
     ) -> Result<Response, ServiceError> {
         // Best-first: invoke the top-ranked discovered provider over Tier-0,
         // steering with its forwarding hint when the shared-name convention applies.
+        // The opaque metadata slot passes straight through to the inner carrier.
         let provider = self
             .directory
             .providers(svc)
@@ -124,11 +127,12 @@ impl<C: HintedCarrier> Carrier for DiscoveryCarrier<C> {
             .next()
             .ok_or(ServiceError::NotFound)?;
         self.inner
-            .invoke_hinted(
+            .invoke_hinted_meta(
                 &ServiceId::new(provider.callable),
                 op,
                 request,
                 provider.forwarding_hint.as_ref(),
+                metadata,
             )
             .await
     }
@@ -148,12 +152,13 @@ impl<C: HintedCarrier> Carrier for DiscoveryCarrier<C> {
 
 #[async_trait]
 impl<C: HintedCarrier> SelectCarrier for DiscoveryCarrier<C> {
-    async fn invoke_select(
+    async fn invoke_select_meta(
         &self,
         svc: &ServiceId,
         op: &OpId,
         request: Bytes,
         strategy: Strategy,
+        metadata: Metadata,
     ) -> Result<Vec<Response>, ServiceError> {
         let providers = self.directory.providers(svc).await;
         if providers.is_empty() {
@@ -173,11 +178,12 @@ impl<C: HintedCarrier> SelectCarrier for DiscoveryCarrier<C> {
         for p in chosen {
             if let Ok(r) = self
                 .inner
-                .invoke_hinted(
+                .invoke_hinted_meta(
                     &ServiceId::new(p.callable),
                     op,
                     request.clone(),
                     p.forwarding_hint.as_ref(),
+                    metadata.clone(),
                 )
                 .await
             {

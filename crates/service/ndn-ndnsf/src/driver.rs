@@ -30,6 +30,7 @@ use crate::messages::{
     AckMessage, RequestMessage, RequestMode, ResponseMessage, SelectionMessage, Strategy,
 };
 use crate::names;
+use crate::policy::ProviderAuthorizer;
 use crate::tokens::PendingCoordination;
 use crate::trust::TrustCtx;
 
@@ -494,8 +495,13 @@ pub async fn call(
 /// collect over `ack_window`), SELECT the chosen provider(s), and return each
 /// selected provider's `(name, response)`. The empty vec means no provider
 /// responded in time.
+///
+/// When `authorizer` is `Some`, an ACK from a provider **not authorized to serve
+/// `service`** is dropped *before selection* — so a trusted-but-unlisted group
+/// member can never be selected (per-service provider authorization, SEC-05).
+/// `None` keeps the legacy behavior: any provider whose ACK verifies may serve.
 #[allow(clippy::too_many_arguments)]
-#[instrument(skip(ps, payload, trust), fields(requester = %requester, service = %service, strategy = ?strategy))]
+#[instrument(skip(ps, payload, trust, authorizer), fields(requester = %requester, service = %service, strategy = ?strategy))]
 pub async fn select_and_call(
     ps: &SvsPubSub,
     requester: Name,
@@ -507,6 +513,7 @@ pub async fn select_and_call(
     strategy: Strategy,
     ack_window: Duration,
     trust: &TrustCtx,
+    authorizer: Option<&ProviderAuthorizer>,
 ) -> Vec<(Name, Bytes)> {
     let mut rx = ps.subscribe(group_prefix).await;
 
@@ -547,6 +554,10 @@ pub async fn select_and_call(
                 let provider = before_ndnsf(&pubn.name);
                 if phase_of(&pubn.name) == Some(Phase::Ack)
                     && request_id_of(&pubn.name) == request_id
+                    // Per-service provider authorization: refuse an ACK from a
+                    // provider the policy does not list for this service, before it
+                    // can be selected (SEC-05). `None` ⇒ membership is authorization.
+                    && authorizer.is_none_or(|a| a.allows(&service, &provider))
                     && let Some(payload) = trust.unseal(pubn.payload, &provider, &pubn.name).await
                     && let Ok(ack) = AckMessage::decode(payload)
                 {

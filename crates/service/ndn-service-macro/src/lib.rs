@@ -11,13 +11,23 @@
 //!     async fn ping(&self) -> u64;
 //! }
 //! // emits: EchoEchoRequest / EchoPingRequest (Frame), EchoDispatch<S: Echo>,
-//! // EchoClient<C: Carrier> { echo(..), echo_select(.., Strategy) where C: SelectCarrier, ping(..), .. }
+//! // EchoClient<C: Carrier> {
+//! //   echo(..), echo_meta(.., Metadata) -> (String, Metadata),
+//! //   echo_select(.., Strategy) / echo_select_meta(.., Strategy, Metadata) where C: SelectCarrier,
+//! //   ping(..), ..
+//! // }
 //! ```
+//!
+//! Each op gets a `_meta` variant that carries the opaque request `Metadata` slot
+//! (a W3C trace context, …) and returns the carrier-reflected response slot beside
+//! the value — so distributed tracing rides the generated client, not each op's
+//! `Frame`. The plain methods are the empty-slot shorthands.
 //!
 //! The trait's `async fn`s are rewritten to `-> impl Future + Send` (RPITIT), so
 //! an implementor writes a plain `async fn` impl — no `#[async_trait]`. Argument
 //! and return types must implement `ndn_service_core::Frame` (provided for
-//! `String`, `Vec<u8>`, `Bytes`, the fixed-width integers, `bool`, and `()`).
+//! `String`, `Vec<u8>`, `Bytes`, the fixed-width integers, the floats `f32`/`f64`,
+//! `bool`, and `()`).
 //!
 //! Requires `ndn-service-core` in the consuming crate; everything else
 //! (`async_trait`, `bytes`, `ndn_packet`) is referenced through it.
@@ -194,20 +204,54 @@ pub fn ndn_service(_attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         });
 
+        let meta_name = format_ident!("{}_meta", m.name);
         let select_name = format_ident!("{}_select", m.name);
+        let select_meta_name = format_ident!("{}_select_meta", m.name);
+        let plain_doc = format!("Invoke the `{op}` operation.");
+        let meta_doc = format!(
+            "Invoke `{op}` with an opaque request `Metadata` slot (e.g. a W3C trace \
+             context to propagate). Returns the decoded response paired with the \
+             carrier-reflected response slot — the same slot round-tripped, which \
+             the service never interprets."
+        );
+        let select_doc =
+            format!("Invoke `{op}` across many providers per `strategy` (requires `C: SelectCarrier`).");
+        let select_meta_doc = format!(
+            "Invoke `{op}` across many providers per `strategy`, carrying an opaque \
+             request `Metadata` slot. Each result is `(provider, value, response_slot)`."
+        );
         client_methods.push(quote! {
+            #[doc = #plain_doc]
             pub async fn #mname(&self, #( #names: #types ),* )
                 -> ::core::result::Result<#ret, ::ndn_service_core::ServiceError>
             {
+                let (__value, _) = self
+                    .#meta_name(#( #names, )* ::ndn_service_core::Metadata::new())
+                    .await?;
+                ::core::result::Result::Ok(__value)
+            }
+
+            #[doc = #meta_doc]
+            pub async fn #meta_name(
+                &self,
+                #( #names: #types, )*
+                __metadata: ::ndn_service_core::Metadata,
+            ) -> ::core::result::Result<
+                (#ret, ::ndn_service_core::Metadata),
+                ::ndn_service_core::ServiceError,
+            > {
                 let __req = #req_ident { #( #names ),* };
-                let __resp = ::ndn_service_core::Carrier::invoke(
+                let __resp = ::ndn_service_core::Carrier::invoke_meta(
                     &self.carrier, &self.svc,
                     &::ndn_service_core::OpId::new(#op),
                     ::ndn_service_core::Frame::encode(&__req),
+                    __metadata,
                 ).await?;
-                <#ret as ::ndn_service_core::Frame>::decode(&__resp.payload)
+                let __value = <#ret as ::ndn_service_core::Frame>::decode(&__resp.payload)?;
+                ::core::result::Result::Ok((__value, __resp.metadata))
             }
 
+            #[doc = #select_doc]
             pub async fn #select_name(
                 &self,
                 #( #names: #types, )*
@@ -219,16 +263,38 @@ pub fn ndn_service(_attr: TokenStream, item: TokenStream) -> TokenStream {
             where
                 C: ::ndn_service_core::SelectCarrier,
             {
+                let __results = self
+                    .#select_meta_name(#( #names, )* __strategy, ::ndn_service_core::Metadata::new())
+                    .await?;
+                ::core::result::Result::Ok(
+                    __results.into_iter().map(|(__n, __v, _)| (__n, __v)).collect()
+                )
+            }
+
+            #[doc = #select_meta_doc]
+            pub async fn #select_meta_name(
+                &self,
+                #( #names: #types, )*
+                __strategy: ::ndn_service_core::Strategy,
+                __metadata: ::ndn_service_core::Metadata,
+            ) -> ::core::result::Result<
+                ::std::vec::Vec<(::ndn_service_core::ndn_packet::Name, #ret, ::ndn_service_core::Metadata)>,
+                ::ndn_service_core::ServiceError,
+            >
+            where
+                C: ::ndn_service_core::SelectCarrier,
+            {
                 let __req = #req_ident { #( #names ),* };
-                let __resps = ::ndn_service_core::SelectCarrier::invoke_select(
+                let __resps = ::ndn_service_core::SelectCarrier::invoke_select_meta(
                     &self.carrier, &self.svc,
                     &::ndn_service_core::OpId::new(#op),
                     ::ndn_service_core::Frame::encode(&__req),
                     __strategy,
+                    __metadata,
                 ).await?;
                 __resps.into_iter()
                     .map(|__r| <#ret as ::ndn_service_core::Frame>::decode(&__r.payload)
-                        .map(|__v| (__r.producer, __v)))
+                        .map(|__v| (__r.producer, __v, __r.metadata)))
                     .collect()
             }
         });
@@ -254,8 +320,10 @@ pub fn ndn_service(_attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         }
 
-        /// Typed client, generic over any [`Carrier`]. Methods reaching many
-        /// providers (`*_select`) require `C: SelectCarrier`.
+        /// Typed client, generic over any [`Carrier`]. Each op has a `*_meta`
+        /// variant carrying the opaque request [`Metadata`] slot (trace context,
+        /// …) and returning the reflected response slot. Methods reaching many
+        /// providers (`*_select` / `*_select_meta`) require `C: SelectCarrier`.
         pub struct #client_ident<C: ::ndn_service_core::Carrier> {
             carrier: C,
             svc: ::ndn_service_core::ServiceId,

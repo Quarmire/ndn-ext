@@ -35,6 +35,8 @@ pub mod access;
 pub mod carrier;
 #[cfg(feature = "driver")]
 pub mod driver;
+#[cfg(feature = "engine")]
+pub mod engine;
 pub mod flow;
 pub mod messages;
 pub mod names;
@@ -54,6 +56,10 @@ pub use tokens::{PendingCoordination, PendingProviderTokens, ProviderToken, Toke
 
 #[cfg(feature = "driver")]
 pub use carrier::NdnsfCarrier;
+#[cfg(feature = "driver")]
+pub use policy::{ProviderAuthorizer, ServicePolicy};
+#[cfg(feature = "engine")]
+pub use engine::over_face;
 #[cfg(feature = "driver")]
 pub use roles::{ServiceNode, ServiceProvider, ServiceUser};
 #[cfg(feature = "driver")]

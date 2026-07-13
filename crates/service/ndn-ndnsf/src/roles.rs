@@ -38,6 +38,7 @@ use ndn_sync::SvsPubSub;
 
 use crate::driver;
 use crate::messages::Strategy;
+use crate::policy::{ProviderAuthorizer, ServicePolicy};
 use crate::tokens::PendingCoordination;
 use crate::trust::TrustCtx;
 
@@ -147,6 +148,9 @@ pub struct ServiceUser {
     group: Name,
     trust: TrustCtx,
     user_token: String,
+    /// When set, refuse an ACK from a provider the policy does not authorize for
+    /// `service` (per-service provider authorization); `None` ⇒ any group member.
+    authorizer: Option<Arc<ProviderAuthorizer>>,
     next_id: AtomicU64,
 }
 
@@ -172,6 +176,7 @@ impl ServiceUser {
             group,
             trust,
             user_token: String::new(),
+            authorizer: None,
             next_id: AtomicU64::new(1),
         }
     }
@@ -194,6 +199,21 @@ impl ServiceUser {
     /// Set the user capability token presented on each request.
     pub fn token(mut self, token: impl Into<String>) -> Self {
         self.user_token = token.into();
+        self
+    }
+
+    /// Enforce per-service **provider authorization** from `policy`: in
+    /// [`select_and_call`](Self::select_and_call), an ACK from a provider the
+    /// policy does not list for this service is refused before selection (SEC-05).
+    /// Pair with [`signed`](Self::signed) so provider identities are authenticated.
+    pub fn with_provider_policy(self, policy: &ServicePolicy) -> Self {
+        self.authorize(ProviderAuthorizer::from_policy(policy))
+    }
+
+    /// Enforce provider authorization from a pre-compiled [`ProviderAuthorizer`].
+    /// See [`with_provider_policy`](Self::with_provider_policy).
+    pub fn authorize(mut self, authorizer: ProviderAuthorizer) -> Self {
+        self.authorizer = Some(Arc::new(authorizer));
         self
     }
 
@@ -242,6 +262,7 @@ impl ServiceUser {
             strategy,
             ack_window,
             &self.trust,
+            self.authorizer.as_deref(),
         )
         .await
     }

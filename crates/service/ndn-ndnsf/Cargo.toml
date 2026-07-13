@@ -13,6 +13,10 @@ classification = "extension"
 ## ndn-sync's SvsPubSub) + KP-ABE access control (NAC-sealed payloads). Off by
 ## default so the sans-IO core (tokens, messages, flow) stays light.
 driver = ["dep:ndn-sync", "dep:ndn-nacabe", "dep:ndn-security", "dep:ndn-foundation-types", "dep:tokio", "dep:serde", "dep:toml", "dep:ndn-service-core", "dep:async-trait", "dep:ndn-ratelimit"]
+## Bind an `SvsPubSub` group (and thus `NdnsfCarrier`) to a real `ndn-engine`
+## forwarder/face instead of raw channels — `over_face` / `NdnsfCarrier::over_face`.
+## Off by default so the driver stays engine-agnostic (raw-channel core).
+engine = ["driver", "dep:ndn-app", "dep:ndn-engine", "dep:ndn-strategy", "dep:tokio-util"]
 
 [dependencies]
 ndn-packet = { workspace = true, features = ["std"] }
@@ -29,6 +33,11 @@ ndn-service-core = { workspace = true, optional = true }
 async-trait = { workspace = true, optional = true }
 # Per-requester admission control (token bucket) on the four-phase request path.
 ndn-ratelimit = { workspace = true, optional = true }
+# `engine` feature: bind the SVS group to a real forwarder/face (over_face).
+ndn-app      = { workspace = true, optional = true }
+ndn-engine   = { workspace = true, optional = true }
+ndn-strategy = { workspace = true, optional = true }
+tokio-util   = { workspace = true, optional = true }
 # ACK-collection window for the selection strategies.
 tokio      = { workspace = true, optional = true, features = ["time", "rt"] }
 # Policy-file model (ServiceController access policy → KP-ABE grants).
