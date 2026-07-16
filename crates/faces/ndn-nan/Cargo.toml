@@ -15,6 +15,9 @@ ndn-frame-io        = { workspace = true }
 # plane can drive the engine's channel without this driver knowing the device.
 ndn-radio-hal       = { workspace = true }
 ndn-face-wifi-aware = { workspace = true }
+ndn-transport      = { workspace = true }
+# The NDI is a TAP netdev: raw ioctls, no crate wraps this the way we need.
+libc         = { workspace = true }
 bytes        = { workspace = true, features = ["std"] }
 tracing      = { workspace = true }
 async-trait  = { workspace = true }

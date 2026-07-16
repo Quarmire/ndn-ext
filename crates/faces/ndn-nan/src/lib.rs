@@ -45,6 +45,8 @@ use ndn_nan_core::{NanConfig, NanEngine, NanEvent, RxFrame, ServiceId, service_i
 use ndn_radio_hal::{Bandwidth, RadioKnobs};
 use tokio::sync::mpsc;
 
+pub mod ndi;
+
 pub use ndn_nan_core::NanConfig as Config;
 
 /// The slow control-plane knob the engine needs: tune the radio to a channel.

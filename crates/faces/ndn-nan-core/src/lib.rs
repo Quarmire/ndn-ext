@@ -55,7 +55,10 @@ pub use attr::{
     Attribute, AttributeId, Attributes, Cluster, CommittedAvailability, DeviceCapability,
     MasterIndication, Sdea, ServiceControl, ServiceControlType, ServiceDescriptor, ServiceIdList,
 };
-pub use engine::{NanConfig, NanEngine, NanEvent, RxFrame, Step, TxFrame, Usec, master_rank};
+pub use engine::{
+    NDP_MAX_ATTEMPTS, NDP_RETRY_USEC, NanConfig, NanEngine, NanEvent, NdpFailure, NdpRole, RxFrame,
+    Step, TxFrame, Usec, eui64_iid, master_rank,
+};
 pub use frame::{Dot11Frame, Dot11Header, FrameType, NanBeacon, ServiceDiscoveryFrame, classify};
 pub use rendezvous::{AlwaysOn, DiscoveryWindow, Rendezvous};
 pub use service::service_id;
