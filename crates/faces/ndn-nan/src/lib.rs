@@ -39,7 +39,9 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use ndn_face_wifi_aware::{FaceError, FollowupFrame, NanBackend, NanMatch, NanServiceName};
+use ndn_face_wifi_aware::{
+    FaceError, FollowupFrame, NanBackend, NanMatch, NanServiceName, NdpLink,
+};
 use ndn_frame_io::{BROADCAST, CapturedFrame, FrameIo, InjectFrame, TxIntent};
 use ndn_nan_core::{NanConfig, NanEngine, NanEvent, RxFrame, ServiceId, service_id};
 use ndn_radio_hal::{Bandwidth, RadioKnobs};
@@ -87,11 +89,29 @@ pub fn knobs_channel<K: RadioKnobs + 'static>(knobs: Arc<K>) -> Arc<dyn RadioCha
     Arc::new(KnobsChannel(knobs))
 }
 
+/// The UDP port a data path's traffic uses.
+///
+/// A well-known port rather than a negotiated one. NDPE *does* carry a transport
+/// port — in its Service Info TLV — but the Wi-Fi Aware sub-TLV layout for that
+/// body is not in the open dissector (it is the paywalled part), and inventing
+/// bytes there would put a fabricated claim of WFA semantics on the air. A fixed
+/// port needs no wire format at all.
+///
+/// The cost is one data path per node: the socket is bound to *this* port on our
+/// NDI, so a second concurrent path would collide. Multiple peers need the real
+/// per-path port exchange.
+pub const NDP_PORT: u16 = 6363;
+
+/// Who to hand a negotiated data path back to.
+type NdpReply = tokio::sync::oneshot::Sender<Result<NdpLink, FaceError>>;
+
 /// A command from a [`NanBackend`] method to the engine task.
 enum Command {
     Publish(String, Vec<u8>),
     Subscribe(String, bool),
     Broadcast(Bytes),
+    /// Ask for a data path to a peer; the reply carries the bound socket.
+    RequestNdp([u8; 6], NdpReply),
 }
 
 /// State shared between the engine task (writer) and the [`NanDriver`] handle
@@ -154,6 +174,7 @@ pub fn spawn_with(
         cmd_rx,
         fu_tx,
         shared: Arc::clone(&shared),
+        ndp_waiters: HashMap::new(),
     };
     tokio::spawn(task.run());
     Arc::new(NanDriver {
@@ -206,6 +227,24 @@ impl NanBackend for NanDriver {
             .map_err(|_| FaceError::Closed)
     }
 
+    /// Negotiate a NAN data path to `peer` and return a socket bound over the NDI.
+    ///
+    /// Runs the M1-M4 exchange, then binds our end of the link-local pair the
+    /// handshake settled. Wrap the result in a `UdpFace` for bulk transfer.
+    ///
+    /// Requires an NDI (see [`spawn_with`]) — without one there is nothing to bind
+    /// a socket to. Errors if the peer refuses or never answers.
+    async fn request_ndp(&self, peer: [u8; 6]) -> Result<NdpLink, FaceError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(Command::RequestNdp(peer, tx))
+            .map_err(|_| FaceError::Closed)?;
+        // The engine task answers when the handshake settles — or when it gives
+        // up, which it always eventually does (the initiator's request has a
+        // bounded attempt budget), so this cannot wait forever.
+        rx.await.map_err(|_| FaceError::Closed)?
+    }
+
     fn drain_matches(&self) -> Vec<NanMatch> {
         std::mem::take(&mut self.shared.matches.lock().unwrap())
     }
@@ -225,6 +264,8 @@ struct EngineTask {
     cmd_rx: mpsc::UnboundedReceiver<Command>,
     fu_tx: mpsc::UnboundedSender<FollowupFrame>,
     shared: Arc<Shared>,
+    /// Callers blocked in `request_ndp`, keyed by the path they asked for.
+    ndp_waiters: HashMap<([u8; 6], u8), NdpReply>,
 }
 
 impl EngineTask {
@@ -392,6 +433,7 @@ impl EngineTask {
             }
         }
         for ev in step.events {
+            self.settle_ndp(&ev).await;
             self.route_event(ev);
         }
         base + Duration::from_micros(step.wake_at_usec)
@@ -410,6 +452,93 @@ impl EngineTask {
             Command::Broadcast(frame) => {
                 self.engine.broadcast_followup(frame.to_vec());
             }
+            Command::RequestNdp(peer, reply) => {
+                if self.ndi.is_none() {
+                    let _ = reply.send(Err(FaceError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "no NAN Data Interface bridged — a path would have nothing to carry \
+                         traffic over (see ndn_nan::spawn_with)",
+                    ))));
+                    return;
+                }
+                let ndp_id = self.engine.request_ndp(peer);
+                // Keyed by the path, so a second request for a peer we already
+                // have in flight joins the same negotiation.
+                self.ndp_waiters.insert((peer, ndp_id), reply);
+            }
+        }
+    }
+
+    /// Turn an established path into something an application can send over.
+    ///
+    /// The engine settled the addresses; this binds our end and names the peer's.
+    /// A link-local address means nothing without its interface, so both ends
+    /// carry the NDI's scope id.
+    ///
+    /// Takes the interface by value rather than borrowing `self`: the engine's
+    /// rendezvous strategy is `Send` but not `Sync`, so holding a shared borrow of
+    /// the task across this `await` would make the whole engine future non-`Send`.
+    async fn ndp_link(
+        ndi: Arc<dyn DataInterface>,
+        peer_iid: [u8; 8],
+    ) -> Result<NdpLink, FaceError> {
+        let scope = ndi.index();
+        let local = std::net::SocketAddrV6::new(
+            ndi::link_local_addr(ndn_nan_core::eui64_iid(ndi.mac())),
+            NDP_PORT,
+            0,
+            scope,
+        );
+        let socket = tokio::net::UdpSocket::bind(local).await.map_err(|e| {
+            FaceError::Io(std::io::Error::new(
+                e.kind(),
+                format!("bind {local} on the NDI: {e}"),
+            ))
+        })?;
+        let peer_addr = std::net::SocketAddrV6::new(
+            ndi::link_local_addr(peer_iid),
+            NDP_PORT,
+            0,
+            scope,
+        );
+        Ok(NdpLink {
+            socket,
+            peer_addr: peer_addr.into(),
+        })
+    }
+
+    /// Resolve whoever is blocked in `request_ndp` for this path.
+    async fn settle_ndp(&mut self, ev: &NanEvent) {
+        match ev {
+            NanEvent::NdpEstablished {
+                peer,
+                ndp_id,
+                peer_iid,
+                ..
+            } => {
+                if let Some(reply) = self.ndp_waiters.remove(&(*peer, *ndp_id)) {
+                    let link = match self.ndi.as_ref().map(Arc::clone) {
+                        Some(ndi) => Self::ndp_link(ndi, *peer_iid).await,
+                        None => Err(FaceError::Io(std::io::Error::new(
+                            std::io::ErrorKind::Unsupported,
+                            "no NAN Data Interface",
+                        ))),
+                    };
+                    let _ = reply.send(link);
+                }
+            }
+            NanEvent::NdpFailed {
+                peer,
+                ndp_id,
+                reason,
+            } => {
+                if let Some(reply) = self.ndp_waiters.remove(&(*peer, *ndp_id)) {
+                    let _ = reply.send(Err(FaceError::Io(std::io::Error::other(format!(
+                        "NAN data path to {peer:02x?} failed: {reason:?}"
+                    )))));
+                }
+            }
+            _ => {}
         }
     }
 
@@ -576,6 +705,9 @@ mod tests {
         fn mac(&self) -> [u8; 6] {
             self.mac
         }
+        fn index(&self) -> u32 {
+            0 // no kernel interface behind this one
+        }
         fn read_frame(&self, buf: &mut [u8]) -> std::io::Result<usize> {
             // Block like a real fd would, instead of spinning the pump thread.
             loop {
@@ -686,6 +818,60 @@ mod tests {
         // ...and no beacon/SDF was mistaken for data-path traffic.
         assert!(b_ndi.delivered.lock().unwrap().is_empty());
         assert!(a_ndi.delivered.lock().unwrap().is_empty());
+    }
+
+    /// Without an NDI a "path" would have nothing to carry traffic over, so the
+    /// request must fail loudly rather than hand back a link that cannot work.
+    #[tokio::test]
+    async fn request_ndp_without_an_ndi_is_refused() {
+        let bus = LoopbackMonitorBus::new();
+        let a = spawn(
+            Arc::new(bus.endpoint(1, -50)),
+            Config::new(NMI_A, 6, 200),
+            None,
+        );
+        let err = a
+            .request_ndp(NMI_B)
+            .await
+            .err()
+            .expect("no NDI → no link");
+        assert!(
+            format!("{err}").contains("Data Interface"),
+            "the error should say what is missing, got: {err}"
+        );
+    }
+
+    /// A peer that refuses must surface as an error on the caller's `request_ndp`,
+    /// not as a hang.
+    #[tokio::test]
+    async fn request_ndp_reports_a_refusing_peer() {
+        const A_NDI: [u8; 6] = [0x02, 0xaa, 0xaa, 0x00, 0x00, 0x01];
+        const B_NDI: [u8; 6] = [0x02, 0xbb, 0xbb, 0x00, 0x00, 0x02];
+        let bus = LoopbackMonitorBus::new();
+        let a_ndi = Arc::new(FakeNdi::new(A_NDI));
+        let b_ndi = Arc::new(FakeNdi::new(B_NDI));
+
+        let a = spawn_with(
+            Arc::new(bus.endpoint(1, -50)),
+            Config::new(NMI_A, 6, 200).with_ndi(A_NDI),
+            None,
+            Some(a_ndi as Arc<dyn DataInterface>),
+        );
+        let mut b_cfg = Config::new(NMI_B, 6, 180).with_ndi(B_NDI);
+        b_cfg.ndp_auto_accept = false;
+        let _b = spawn_with(
+            Arc::new(bus.endpoint(2, -50)),
+            b_cfg,
+            None,
+            Some(b_ndi as Arc<dyn DataInterface>),
+        );
+
+        let err = timeout(Duration::from_secs(10), a.request_ndp(NMI_B))
+            .await
+            .expect("request_ndp must not hang on a refusal")
+            .err()
+            .expect("B refuses data paths");
+        assert!(format!("{err}").contains("failed"), "got: {err}");
     }
 
     /// A radio whose only job is to record what it was tuned to.

@@ -30,6 +30,10 @@ pub trait DataInterface: Send + Sync + 'static {
     /// Our NDI — the MAC the kernel gave this interface, and the addr1 a peer
     /// puts on frames meant for us.
     fn mac(&self) -> [u8; 6];
+    /// The kernel's interface index. An IPv6 link-local address is only
+    /// meaningful together with the interface it is scoped to — `fe80::x` alone
+    /// does not say *which* link — so a socket bound to one needs this.
+    fn index(&self) -> u32;
     /// Read one Ethernet frame. **Blocking**: the bridge calls this on its own
     /// thread, because a TAP fd has no async story worth the ceremony here.
     fn read_frame(&self, buf: &mut [u8]) -> std::io::Result<usize>;
@@ -200,6 +204,16 @@ mod linux {
     /// path would silently carry nothing.
     const ADDR_GEN_MODE_EUI64: &str = "0";
 
+    /// Skip Duplicate Address Detection on this interface.
+    ///
+    /// A fresh link-local starts **tentative** while the kernel probes for a
+    /// clash, and a tentative address cannot be bound — `request_ndp` would fail
+    /// with EADDRNOTAVAIL for the first second of the interface's life. DAD has
+    /// nothing to find here anyway: the address is the EUI-64 of an NDI that NAN
+    /// itself allocates, and the probe would go out over a data path that does not
+    /// exist until a handshake completes.
+    const ACCEPT_DAD_OFF: &str = "0";
+
     #[repr(C)]
     #[derive(Clone, Copy)]
     struct IfReq {
@@ -269,8 +283,10 @@ mod linux {
             }
 
             me.set_mac(mac)?;
-            // Before `up`: the link-local is generated at that moment.
-            me.set_addr_gen_mode_eui64()?;
+            // Both of these must precede `up`: that is when the kernel generates
+            // the link-local address and decides whether to probe for it.
+            me.sysctl("addr_gen_mode", ADDR_GEN_MODE_EUI64)?;
+            me.sysctl("accept_dad", ACCEPT_DAD_OFF)?;
             me.set_up()?;
             Ok(me)
         }
@@ -298,14 +314,10 @@ mod linux {
             Ok(())
         }
 
-        fn set_addr_gen_mode_eui64(&self) -> Result<(), FaceError> {
-            let path = format!("/proc/sys/net/ipv6/conf/{}/addr_gen_mode", self.name);
-            std::fs::write(&path, ADDR_GEN_MODE_EUI64).map_err(|e| {
-                err(format!(
-                    "write {path}: {e} — without EUI-64 generation the kernel's \
-                     link-local will not match the interface identifier NDPE advertised"
-                ))
-            })
+        fn sysctl(&self, knob: &str, value: &str) -> Result<(), FaceError> {
+            let path = format!("/proc/sys/net/ipv6/conf/{}/{knob}", self.name);
+            std::fs::write(&path, value)
+                .map_err(|e| err(format!("write {path} = {value}: {e}")))
         }
 
         fn set_up(&self) -> Result<(), FaceError> {
@@ -343,6 +355,15 @@ mod linux {
             self.fd
         }
 
+        /// The kernel's index for this interface — the scope a link-local socket
+        /// binds to. Zero if the name lookup fails (the netdev vanished).
+        pub fn index(&self) -> u32 {
+            let Ok(cname) = std::ffi::CString::new(self.name.as_str()) else {
+                return 0;
+            };
+            unsafe { libc::if_nametoindex(cname.as_ptr()) }
+        }
+
         /// Read one Ethernet frame from the interface (blocking).
         pub fn read_frame(&self, buf: &mut [u8]) -> std::io::Result<usize> {
             let n = unsafe { libc::read(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
@@ -365,6 +386,9 @@ mod linux {
     impl super::DataInterface for NdiInterface {
         fn mac(&self) -> [u8; 6] {
             self.mac
+        }
+        fn index(&self) -> u32 {
+            NdiInterface::index(self)
         }
         fn read_frame(&self, buf: &mut [u8]) -> std::io::Result<usize> {
             NdiInterface::read_frame(self, buf)
