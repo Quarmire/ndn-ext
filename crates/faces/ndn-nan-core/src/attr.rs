@@ -615,6 +615,316 @@ impl CommittedAvailability {
     }
 }
 
+/// NDP message type — which of the M1–M4 data-path exchange this attribute is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NdpType {
+    /// M1: the initiator asks for a data path.
+    Request = 0,
+    /// M2: the responder answers (see [`NdpStatus`]).
+    Response = 1,
+    /// M3: the initiator confirms.
+    Confirm = 2,
+    /// M4: key installment (security-enabled paths).
+    SecurityInstall = 3,
+    Terminate = 4,
+}
+
+impl NdpType {
+    pub fn from_bits(b: u8) -> Option<Self> {
+        Some(match b & 0x0f {
+            0 => Self::Request,
+            1 => Self::Response,
+            2 => Self::Confirm,
+            3 => Self::SecurityInstall,
+            4 => Self::Terminate,
+            _ => return None,
+        })
+    }
+}
+
+/// The responder's verdict, in the high nibble of the type/status byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NdpStatus {
+    Continue = 0,
+    Accepted = 1,
+    Rejected = 2,
+}
+
+impl NdpStatus {
+    pub fn from_bits(b: u8) -> Option<Self> {
+        Some(match (b >> 4) & 0x0f {
+            0 => Self::Continue,
+            1 => Self::Accepted,
+            2 => Self::Rejected,
+            _ => return None,
+        })
+    }
+}
+
+/// NDPE Control bits (one byte).
+pub mod ndpe_control {
+    pub const CONFIRM_REQUIRED: u8 = 0x01;
+    pub const SECURITY_PRESENT: u8 = 0x04;
+    pub const PUBLISH_ID_PRESENT: u8 = 0x08;
+    pub const RESPONDER_NDI_PRESENT: u8 = 0x10;
+    pub const GTK_REQUIRED: u8 = 0x20;
+}
+
+/// An NDPE TLV — the payload list at the end of the attribute.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NdpeTlv {
+    /// Type 0: the 8-byte IPv6 interface identifier of the sender's NDI. This is
+    /// the whole point of NDPE — it carries the address the data path will use,
+    /// so a peer can form `fe80::<iid>` without any out-of-band exchange.
+    Ipv6LinkLocal([u8; 8]),
+    /// Type 1: Service Info — a 3-byte OUI plus a vendor-defined body (where a
+    /// transport port/protocol descriptor rides).
+    ServiceInfo { oui: [u8; 3], body: Vec<u8> },
+    /// Anything else, kept verbatim so an unknown TLV round-trips.
+    Unknown { tlv_type: u8, body: Vec<u8> },
+}
+
+impl NdpeTlv {
+    fn tlv_type(&self) -> u8 {
+        match self {
+            Self::Ipv6LinkLocal(_) => 0,
+            Self::ServiceInfo { .. } => 1,
+            Self::Unknown { tlv_type, .. } => *tlv_type,
+        }
+    }
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        out.put_u8(self.tlv_type());
+        match self {
+            Self::Ipv6LinkLocal(iid) => {
+                out.put_le16(8);
+                out.put_bytes(iid);
+            }
+            Self::ServiceInfo { oui, body } => {
+                out.put_le16((3 + body.len()) as u16);
+                out.put_bytes(oui);
+                out.put_bytes(body);
+            }
+            Self::Unknown { body, .. } => {
+                out.put_le16(body.len() as u16);
+                out.put_bytes(body);
+            }
+        }
+    }
+
+    fn decode(r: &mut Reader<'_>) -> Result<Self, WireError> {
+        let tlv_type = r.u8()?;
+        let len = r.le16()? as usize;
+        let body = r.take(len)?;
+        Ok(match tlv_type {
+            0 => {
+                if body.len() != 8 {
+                    return Err(WireError::Invalid);
+                }
+                let mut iid = [0u8; 8];
+                iid.copy_from_slice(body);
+                Self::Ipv6LinkLocal(iid)
+            }
+            1 => {
+                if body.len() < 3 {
+                    return Err(WireError::Invalid);
+                }
+                let mut oui = [0u8; 3];
+                oui.copy_from_slice(&body[..3]);
+                Self::ServiceInfo {
+                    oui,
+                    body: body[3..].to_vec(),
+                }
+            }
+            other => Self::Unknown {
+                tlv_type: other,
+                body: body.to_vec(),
+            },
+        })
+    }
+}
+
+/// NAN Data Path Extension attribute (NDPE, `0x29`) — the M1–M4 data-path
+/// negotiation, carrying each side's NDI and IPv6 interface identifier.
+///
+/// Body layout (from the Wi-Fi Aware NAN dissector, whose field offsets and bit
+/// masks this mirrors — the design doc flagged these codepoints as needing
+/// verification before Phase 2 could be byte-compatible):
+///
+/// ```text
+/// dialog(1) | type:status(1) | reason(1) | initiator_ndi(6) | ndp_id(1) | control(1)
+///   [ publish_id(1)    if control & PUBLISH_ID_PRESENT and type == Request ]
+///   [ responder_ndi(6) if type == Response and status in {Continue, Accepted} ]
+///   TLV*   where TLV = type(1) | length(2 LE) | value
+/// ```
+///
+/// The type/status byte packs `type` in the low nibble and `status` in the high
+/// nibble. Minimum body is 11 bytes (through `control`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Ndpe {
+    pub dialog_token: u8,
+    pub ndp_type: NdpType,
+    pub status: NdpStatus,
+    pub reason_code: u8,
+    /// The **initiator's** NDI (data-interface MAC), always present — even in a
+    /// response, this names the initiator, not the sender.
+    pub initiator_ndi: [u8; 6],
+    pub ndp_id: u8,
+    pub control: u8,
+    /// Present on a Request that references a publish session.
+    pub publish_id: Option<u8>,
+    /// The responder's NDI — only on an accepted/continuing Response.
+    pub responder_ndi: Option<[u8; 6]>,
+    pub tlvs: Vec<NdpeTlv>,
+}
+
+impl Ndpe {
+    /// An M1 Data Path Request from `initiator_ndi`, advertising our NDI's IPv6
+    /// interface identifier so the responder can address us.
+    pub fn request(dialog_token: u8, ndp_id: u8, initiator_ndi: [u8; 6], iid: [u8; 8]) -> Self {
+        Self {
+            dialog_token,
+            ndp_type: NdpType::Request,
+            status: NdpStatus::Continue,
+            reason_code: 0,
+            initiator_ndi,
+            ndp_id,
+            control: ndpe_control::CONFIRM_REQUIRED,
+            publish_id: None,
+            responder_ndi: None,
+            tlvs: alloc::vec![NdpeTlv::Ipv6LinkLocal(iid)],
+        }
+    }
+
+    /// An M2 Response accepting `initiator_ndi`'s request, carrying our own NDI
+    /// and interface identifier.
+    pub fn accept(
+        dialog_token: u8,
+        ndp_id: u8,
+        initiator_ndi: [u8; 6],
+        responder_ndi: [u8; 6],
+        iid: [u8; 8],
+    ) -> Self {
+        Self {
+            dialog_token,
+            ndp_type: NdpType::Response,
+            status: NdpStatus::Accepted,
+            reason_code: 0,
+            initiator_ndi,
+            ndp_id,
+            control: ndpe_control::RESPONDER_NDI_PRESENT,
+            publish_id: None,
+            responder_ndi: Some(responder_ndi),
+            tlvs: alloc::vec![NdpeTlv::Ipv6LinkLocal(iid)],
+        }
+    }
+
+    /// An M3 Confirm closing the handshake.
+    pub fn confirm(dialog_token: u8, ndp_id: u8, initiator_ndi: [u8; 6]) -> Self {
+        Self {
+            dialog_token,
+            ndp_type: NdpType::Confirm,
+            status: NdpStatus::Accepted,
+            reason_code: 0,
+            initiator_ndi,
+            ndp_id,
+            control: 0,
+            publish_id: None,
+            responder_ndi: None,
+            tlvs: Vec::new(),
+        }
+    }
+
+    /// The IPv6 interface identifier the peer advertised, if any.
+    pub fn ipv6_iid(&self) -> Option<[u8; 8]> {
+        self.tlvs.iter().find_map(|t| match t {
+            NdpeTlv::Ipv6LinkLocal(iid) => Some(*iid),
+            _ => None,
+        })
+    }
+
+    /// Append the NDPE TLV (3-byte header + body).
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        let mut body = Vec::new();
+        body.put_u8(self.dialog_token);
+        body.put_u8((self.ndp_type as u8 & 0x0f) | ((self.status as u8 & 0x0f) << 4));
+        body.put_u8(self.reason_code);
+        body.put_bytes(&self.initiator_ndi);
+        body.put_u8(self.ndp_id);
+        // Keep the control byte's presence bits honest about what we actually
+        // append below, rather than trusting the caller to have set them.
+        let mut control = self.control;
+        if self.publish_id.is_some() {
+            control |= ndpe_control::PUBLISH_ID_PRESENT;
+        } else {
+            control &= !ndpe_control::PUBLISH_ID_PRESENT;
+        }
+        if self.responder_ndi.is_some() {
+            control |= ndpe_control::RESPONDER_NDI_PRESENT;
+        } else {
+            control &= !ndpe_control::RESPONDER_NDI_PRESENT;
+        }
+        body.put_u8(control);
+        if let Some(id) = self.publish_id
+            && self.ndp_type == NdpType::Request
+        {
+            body.put_u8(id);
+        }
+        if let Some(ndi) = self.responder_ndi
+            && self.ndp_type == NdpType::Response
+            && matches!(self.status, NdpStatus::Continue | NdpStatus::Accepted)
+        {
+            body.put_bytes(&ndi);
+        }
+        for tlv in &self.tlvs {
+            tlv.encode(&mut body);
+        }
+
+        out.put_u8(AttributeId::NdpExtension as u8);
+        out.put_le16(body.len() as u16);
+        out.put_bytes(&body);
+    }
+
+    /// Decode from an NDPE attribute body.
+    pub fn decode(body: &[u8]) -> Result<Self, WireError> {
+        let mut r = Reader::new(body);
+        let dialog_token = r.u8()?;
+        let type_status = r.u8()?;
+        let ndp_type = NdpType::from_bits(type_status).ok_or(WireError::Invalid)?;
+        let status = NdpStatus::from_bits(type_status).ok_or(WireError::Invalid)?;
+        let reason_code = r.u8()?;
+        let initiator_ndi = r.take_array::<6>()?;
+        let ndp_id = r.u8()?;
+        let control = r.u8()?;
+
+        let publish_id = (control & ndpe_control::PUBLISH_ID_PRESENT != 0
+            && ndp_type == NdpType::Request)
+            .then(|| r.u8())
+            .transpose()?;
+        let responder_ndi = (ndp_type == NdpType::Response
+            && matches!(status, NdpStatus::Continue | NdpStatus::Accepted))
+        .then(|| r.take_array::<6>())
+        .transpose()?;
+
+        let mut tlvs = Vec::new();
+        while !r.is_empty() {
+            tlvs.push(NdpeTlv::decode(&mut r)?);
+        }
+        Ok(Self {
+            dialog_token,
+            ndp_type,
+            status,
+            reason_code,
+            initiator_ndi,
+            ndp_id,
+            control,
+            publish_id,
+            responder_ndi,
+            tlvs,
+        })
+    }
+}
+
 /// The header + first entry of a NAN Availability attribute body.
 ///
 /// Exists to *prove* the encoder's layout: the same reader parses our bytes and a
@@ -808,6 +1118,115 @@ mod tests {
         assert_eq!(u16::from_le_bytes([buf[1], buf[2]]), 3);
         let attr = Attributes::find(&buf, AttributeId::ServiceDescriptorExtension).unwrap();
         assert_eq!(Sdea::decode(attr.body).unwrap(), s);
+    }
+
+    /// The M1→M2→M3 exchange, in the bytes each side would actually put on air.
+    /// Field order and the type/status nibble packing follow the NAN dissector.
+    #[test]
+    fn ndpe_handshake_round_trips() {
+        const INIT_NDI: [u8; 6] = [0x02, 0x4e, 0x41, 0x4e, 0x00, 0x31];
+        const RESP_NDI: [u8; 6] = [0x02, 0x26, 0x23, 0xef, 0xbe, 0x2f];
+        const INIT_IID: [u8; 8] = [0x00, 0x4e, 0x41, 0xff, 0xfe, 0x4e, 0x00, 0x31];
+        const RESP_IID: [u8; 8] = [0x00, 0x26, 0x23, 0xff, 0xfe, 0xef, 0xbe, 0x2f];
+
+        // --- M1: request ---
+        let m1 = Ndpe::request(0x42, 7, INIT_NDI, INIT_IID);
+        let mut buf = Vec::new();
+        m1.encode(&mut buf);
+        assert_eq!(buf[0], AttributeId::NdpExtension as u8);
+        let body = Attributes::find(&buf, AttributeId::NdpExtension).unwrap().body;
+        // Minimum body is 11 bytes through the control byte; ours adds the IID TLV.
+        assert!(body.len() >= 11);
+        // type in the low nibble, status in the high nibble, of one byte.
+        assert_eq!(body[1] & 0x0f, NdpType::Request as u8);
+        let back = Ndpe::decode(body).unwrap();
+        assert_eq!(back, m1);
+        assert_eq!(back.ipv6_iid(), Some(INIT_IID), "M1 advertises our NDI's IID");
+        assert_eq!(back.responder_ndi, None, "a request has no responder NDI");
+
+        // --- M2: accept ---
+        let m2 = Ndpe::accept(0x42, 7, INIT_NDI, RESP_NDI, RESP_IID);
+        let mut buf = Vec::new();
+        m2.encode(&mut buf);
+        let body = Attributes::find(&buf, AttributeId::NdpExtension).unwrap().body;
+        assert_eq!(body[1] & 0x0f, NdpType::Response as u8);
+        assert_eq!((body[1] >> 4) & 0x0f, NdpStatus::Accepted as u8);
+        let back = Ndpe::decode(body).unwrap();
+        assert_eq!(back, m2);
+        // The initiator's NDI still names the initiator, even in the response.
+        assert_eq!(back.initiator_ndi, INIT_NDI);
+        assert_eq!(back.responder_ndi, Some(RESP_NDI));
+        assert_eq!(back.ipv6_iid(), Some(RESP_IID));
+        assert_eq!(back.ndp_id, 7, "the NDP id ties the exchange together");
+
+        // --- M3: confirm ---
+        let m3 = Ndpe::confirm(0x42, 7, INIT_NDI);
+        let mut buf = Vec::new();
+        m3.encode(&mut buf);
+        let body = Attributes::find(&buf, AttributeId::NdpExtension).unwrap().body;
+        assert_eq!(Ndpe::decode(body).unwrap(), m3);
+    }
+
+    /// The control byte must describe what actually follows it. If it claims a
+    /// responder NDI that was never appended, a peer reads 6 bytes of the next
+    /// field as a MAC and the rest of the attribute shears — the same class of
+    /// bug the Availability Sequence ID caused.
+    #[test]
+    fn ndpe_control_bits_track_the_optional_fields() {
+        const NDI: [u8; 6] = [1, 2, 3, 4, 5, 6];
+        // Claim both optional fields are present without supplying either.
+        let mut lying = Ndpe::confirm(1, 1, NDI);
+        lying.control = ndpe_control::PUBLISH_ID_PRESENT | ndpe_control::RESPONDER_NDI_PRESENT;
+        let mut buf = Vec::new();
+        lying.encode(&mut buf);
+        let body = Attributes::find(&buf, AttributeId::NdpExtension).unwrap().body;
+        // The encoder corrects the claim rather than emitting an unreadable body.
+        assert_eq!(body[10] & ndpe_control::PUBLISH_ID_PRESENT, 0);
+        assert_eq!(body[10] & ndpe_control::RESPONDER_NDI_PRESENT, 0);
+        let back = Ndpe::decode(body).unwrap();
+        assert_eq!(back.publish_id, None);
+        assert_eq!(back.responder_ndi, None);
+
+        // And when a publish id IS set on a request, the bit appears with it.
+        let mut req = Ndpe::request(1, 1, NDI, [0; 8]);
+        req.publish_id = Some(0x09);
+        let mut buf = Vec::new();
+        req.encode(&mut buf);
+        let body = Attributes::find(&buf, AttributeId::NdpExtension).unwrap().body;
+        assert_eq!(body[10] & ndpe_control::PUBLISH_ID_PRESENT, ndpe_control::PUBLISH_ID_PRESENT);
+        assert_eq!(Ndpe::decode(body).unwrap().publish_id, Some(0x09));
+    }
+
+    #[test]
+    fn ndpe_keeps_unknown_tlvs_and_service_info() {
+        const NDI: [u8; 6] = [1, 2, 3, 4, 5, 6];
+        let mut m = Ndpe::request(1, 1, NDI, [9; 8]);
+        m.tlvs.push(NdpeTlv::ServiceInfo {
+            oui: [0x50, 0x6f, 0x9a],
+            body: alloc::vec![0xde, 0xad],
+        });
+        m.tlvs.push(NdpeTlv::Unknown {
+            tlv_type: 0x77,
+            body: alloc::vec![0x01, 0x02, 0x03],
+        });
+        let mut buf = Vec::new();
+        m.encode(&mut buf);
+        let body = Attributes::find(&buf, AttributeId::NdpExtension).unwrap().body;
+        // An unknown TLV survives a decode/encode cycle unchanged.
+        assert_eq!(Ndpe::decode(body).unwrap(), m);
+    }
+
+    #[test]
+    fn ndpe_rejects_truncated_and_reserved_values() {
+        assert!(Ndpe::decode(&[0u8; 10]).is_err(), "shorter than the 11-byte minimum");
+        // Reserved NDP type (5..=15).
+        let mut body = [0u8; 11];
+        body[1] = 0x05;
+        assert!(Ndpe::decode(&body).is_err());
+        // Reserved status (3..=15).
+        let mut body = [0u8; 11];
+        body[1] = 0x30;
+        assert!(Ndpe::decode(&body).is_err());
     }
 
     /// The layout proof: the *same* reader that parses our encoder's output must

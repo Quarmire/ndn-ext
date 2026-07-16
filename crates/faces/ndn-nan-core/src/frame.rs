@@ -15,7 +15,7 @@ use alloc::vec::Vec;
 
 use crate::attr::{Attribute, Attributes};
 use crate::wire::{Reader, WireError, WriteExt};
-use crate::{NAN_OUI, NAN_OUI_TYPE};
+use crate::{NAN_OUI, NAN_OUI_TYPE, NAN_OUI_TYPE_ACTION};
 
 /// 802.11 frame-control value for a **beacon** management frame
 /// (type=management, subtype=beacon). On the wire (LE) this is bytes `80 00`.
@@ -114,7 +114,11 @@ impl Dot11Header {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameType {
     Beacon,
+    /// A Service Discovery Frame (action OUI type `0x13`).
     Action,
+    /// A NAN Action Frame (action OUI type `0x18`) — data path, ranging, or
+    /// schedule. Carries the raw subtype byte; [`NafSubtype::from_byte`] names it.
+    Naf { subtype: u8 },
     Other,
 }
 
@@ -263,8 +267,113 @@ impl ServiceDiscoveryFrame {
     }
 }
 
-/// Classify a captured frame buffer and, when it's a NAN beacon or SDF, surface
-/// its attribute bytes — the single entry point a receive loop calls.
+/// NAN Action Frame subtypes (the byte after the action OUI type).
+///
+/// Same public-action envelope as an SDF, but OUI type [`NAN_OUI_TYPE_ACTION`]
+/// (`0x18`) rather than [`NAN_OUI_TYPE`] (`0x13`) — this is the frame that
+/// carries data-path setup, ranging, and schedule negotiation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+#[repr(u8)]
+pub enum NafSubtype {
+    RangingRequest = 1,
+    RangingResponse = 2,
+    RangingTermination = 3,
+    RangingReport = 4,
+    /// NDP M1 — the initiator asks for a data path.
+    DataPathRequest = 5,
+    /// NDP M2 — the responder accepts / rejects / continues.
+    DataPathResponse = 6,
+    /// NDP M3 — the initiator confirms the accepted path.
+    DataPathConfirm = 7,
+    /// NDP M4 — key installment (security-enabled paths only).
+    DataPathKeyInstallment = 8,
+    DataPathTermination = 9,
+    ScheduleRequest = 10,
+    ScheduleResponse = 11,
+    ScheduleConfirm = 12,
+    ScheduleUpdateNotification = 13,
+}
+
+impl NafSubtype {
+    /// Map the on-air subtype byte. Unknown/reserved values are `None` rather
+    /// than an error: an unrecognised NAF is a frame to ignore, not a malformed
+    /// one.
+    pub fn from_byte(b: u8) -> Option<Self> {
+        Some(match b {
+            1 => Self::RangingRequest,
+            2 => Self::RangingResponse,
+            3 => Self::RangingTermination,
+            4 => Self::RangingReport,
+            5 => Self::DataPathRequest,
+            6 => Self::DataPathResponse,
+            7 => Self::DataPathConfirm,
+            8 => Self::DataPathKeyInstallment,
+            9 => Self::DataPathTermination,
+            10 => Self::ScheduleRequest,
+            11 => Self::ScheduleResponse,
+            12 => Self::ScheduleConfirm,
+            13 => Self::ScheduleUpdateNotification,
+            _ => return None,
+        })
+    }
+}
+
+/// A NAN Action Frame (NAF): the data-path / ranging / schedule carrier.
+///
+/// Wire shape — a public action frame, like an SDF, diverging at the OUI type:
+///
+/// ```text
+/// dot11 hdr | 0x04 | 0x09 | 50:6F:9A | 0x18 | subtype | attributes...
+///             cat    vend    OUI       type
+/// ```
+pub struct NanActionFrame {
+    pub header: Dot11Header,
+    pub subtype: u8,
+}
+
+impl NanActionFrame {
+    /// A NAF to `dst` (a peer's NMI — data-path setup is unicast).
+    pub fn new(subtype: NafSubtype, dst: [u8; 6], src: [u8; 6], cluster_id: [u8; 6], seq: u16) -> Self {
+        Self {
+            header: Dot11Header::new(FC_ACTION, dst, src, cluster_id, seq),
+            subtype: subtype as u8,
+        }
+    }
+
+    /// Serialize the full NAF wrapping `attributes` (pre-encoded TLV bytes).
+    pub fn encode(&self, attributes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.header.encode(&mut out);
+        out.put_u8(ACTION_CATEGORY_PUBLIC);
+        out.put_u8(ACTION_PUBLIC_VENDOR_SPECIFIC);
+        out.put_bytes(&NAN_OUI);
+        out.put_u8(NAN_OUI_TYPE_ACTION);
+        out.put_u8(self.subtype);
+        out.put_bytes(attributes);
+        out
+    }
+
+    /// Parse a captured NAF, returning the header + subtype and the carried NAN
+    /// attribute bytes.
+    pub fn parse(buf: &[u8]) -> Result<(Self, &[u8]), WireError> {
+        let (header, mut r) = Dot11Header::decode(buf)?;
+        if header.frame_control != FC_ACTION {
+            return Err(WireError::Invalid);
+        }
+        if r.u8()? != ACTION_CATEGORY_PUBLIC || r.u8()? != ACTION_PUBLIC_VENDOR_SPECIFIC {
+            return Err(WireError::Invalid);
+        }
+        if r.take(3)? != NAN_OUI || r.u8()? != NAN_OUI_TYPE_ACTION {
+            return Err(WireError::Invalid);
+        }
+        let subtype = r.u8()?;
+        Ok((Self { header, subtype }, r.rest()))
+    }
+}
+
+/// Classify a captured frame buffer and, when it's a NAN beacon, SDF, or NAF,
+/// surface its attribute bytes — the single entry point a receive loop calls.
 pub fn classify(buf: &[u8]) -> Result<Dot11Frame<'_>, WireError> {
     let (header, _) = Dot11Header::decode(buf)?;
     match header.frame_control {
@@ -276,14 +385,26 @@ pub fn classify(buf: &[u8]) -> Result<Dot11Frame<'_>, WireError> {
                 attributes,
             })
         }
-        FC_ACTION => {
-            let (s, attributes) = ServiceDiscoveryFrame::parse(buf)?;
-            Ok(Dot11Frame {
+        // An action frame is an SDF or a NAF depending on its OUI type, so try
+        // the SDF shape and fall back — treating every action frame as an SDF
+        // would reject NAFs outright and lose the whole data-path channel.
+        FC_ACTION => match ServiceDiscoveryFrame::parse(buf) {
+            Ok((s, attributes)) => Ok(Dot11Frame {
                 header: s.header,
                 kind: FrameType::Action,
                 attributes,
-            })
-        }
+            }),
+            Err(_) => {
+                let (n, attributes) = NanActionFrame::parse(buf)?;
+                Ok(Dot11Frame {
+                    header: n.header,
+                    kind: FrameType::Naf {
+                        subtype: n.subtype,
+                    },
+                    attributes,
+                })
+            }
+        },
         _ => Ok(Dot11Frame {
             header,
             kind: FrameType::Other,
@@ -433,5 +554,58 @@ mod tests {
             ServiceDiscoveryFrame::parse(&bad).err(),
             Some(WireError::Invalid)
         );
+    }
+
+    #[test]
+    fn naf_roundtrips_and_carries_its_subtype() {
+        const PEER: [u8; 6] = [0x02, 0x26, 0x23, 0xef, 0xbe, 0x2f];
+        let naf = NanActionFrame::new(
+            NafSubtype::DataPathRequest,
+            PEER,
+            SRC,
+            NAN_CLUSTER_ID_BASE,
+            7,
+        );
+        let wire = naf.encode(&[0xAA, 0xBB]);
+
+        // The envelope diverges from an SDF only at the OUI type, then a subtype.
+        assert_eq!(wire[24], ACTION_CATEGORY_PUBLIC);
+        assert_eq!(wire[25], ACTION_PUBLIC_VENDOR_SPECIFIC);
+        assert_eq!(&wire[26..29], &NAN_OUI);
+        assert_eq!(wire[29], NAN_OUI_TYPE_ACTION);
+        assert_eq!(wire[30], NafSubtype::DataPathRequest as u8);
+
+        let (parsed, attrs) = NanActionFrame::parse(&wire).unwrap();
+        assert_eq!(parsed.header.addr1, PEER, "data-path setup is unicast");
+        assert_eq!(parsed.subtype, 5);
+        assert_eq!(NafSubtype::from_byte(parsed.subtype), Some(NafSubtype::DataPathRequest));
+        assert_eq!(attrs, &[0xAA, 0xBB]);
+    }
+
+    /// An SDF and a NAF are both public action frames; only the OUI type tells
+    /// them apart. Classifying every action frame as an SDF would reject NAFs and
+    /// silently lose the entire data-path channel.
+    #[test]
+    fn classify_separates_sdf_from_naf() {
+        let sdf = ServiceDiscoveryFrame::new(NAN_NETWORK_ID, SRC, NAN_CLUSTER_ID_BASE, 1)
+            .encode(&[]);
+        assert_eq!(classify(&sdf).unwrap().kind, FrameType::Action);
+
+        let naf = NanActionFrame::new(
+            NafSubtype::DataPathResponse,
+            SRC,
+            SRC,
+            NAN_CLUSTER_ID_BASE,
+            1,
+        )
+        .encode(&[]);
+        assert_eq!(classify(&naf).unwrap().kind, FrameType::Naf { subtype: 6 });
+    }
+
+    #[test]
+    fn unknown_naf_subtype_is_none_not_an_error() {
+        assert_eq!(NafSubtype::from_byte(0), None);
+        assert_eq!(NafSubtype::from_byte(200), None);
+        assert_eq!(NafSubtype::from_byte(9), Some(NafSubtype::DataPathTermination));
     }
 }

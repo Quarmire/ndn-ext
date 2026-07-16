@@ -379,6 +379,9 @@ impl NanEngine {
         match frame.kind {
             FrameType::Beacon => self.handle_beacon(rx),
             FrameType::Action => self.handle_sdf(rx, frame.attributes, step),
+            // Data-path / ranging / schedule frames are Phase 2 territory; the
+            // engine parses them but does not yet act on them.
+            FrameType::Naf { .. } => {}
             FrameType::Other => {}
         }
     }
