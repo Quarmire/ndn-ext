@@ -39,6 +39,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let radio_arg = std::env::args().nth(1).unwrap_or_else(|| "8812au".into());
     let node = std::env::args().nth(2).unwrap_or_else(|| "a".into());
+    // `measure` reports how well we hear the peer, without running the stack:
+    // link quality is the thing to establish before blaming anything above it.
+    let measure = std::env::args().nth(3).as_deref() == Some("measure");
     let (nmi, ndi_mac, peer_nmi) = if node == "a" {
         (NMI_A, NDI_A, NMI_B)
     } else {
@@ -69,6 +72,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("[{node}] ✓ 8812AU up (fw {ver}.{sub}) on ch6, TX max, RX live");
         Arc::new(b)
     };
+
+    if measure {
+        return measure_link(radio, peer_nmi, &node).await;
+    }
 
     // ── The data interface ──
     let ndi = Arc::new(NdiInterface::open("nan0", ndi_mac)?);
@@ -142,6 +149,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     println!("[{node}] data path carried {got} datagram(s) inbound");
+    Ok(())
+}
+
+/// Report the peer's signal and how many of its frames actually reach us.
+///
+/// The peer beacons once per Discovery Window (512 TU ≈ 524 ms), so ~11 frames
+/// should arrive in 6 s. Anything far below that is the link, not the stack.
+#[cfg(feature = "libusb-backend")]
+async fn measure_link(
+    radio: std::sync::Arc<dyn ndn_frame_io::FrameIo>,
+    peer_nmi: [u8; 6],
+    node: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use ndn_nan_core::frame::classify;
+    use std::time::{Duration, Instant};
+
+    println!("[{node}] measuring {} for 30s …", mac(&peer_nmi));
+    let start = Instant::now();
+    let (mut heard, mut rssi_sum, mut rssi_n, mut worst, mut best) = (0u32, 0i32, 0u32, 0i8, -128i8);
+    let mut window = Instant::now();
+    let mut in_window = 0u32;
+
+    while start.elapsed() < Duration::from_secs(30) {
+        let Ok(cf) = radio.recv_frame().await else { break };
+        let Ok(f) = classify(&cf.payload) else { continue };
+        if f.header.addr2 != peer_nmi {
+            continue;
+        }
+        heard += 1;
+        in_window += 1;
+        if let Some(r) = cf.rssi_dbm {
+            rssi_sum += r as i32;
+            rssi_n += 1;
+            if r < worst || worst == 0 {
+                worst = r;
+            }
+            if r > best {
+                best = r;
+            }
+        }
+        if window.elapsed() >= Duration::from_secs(6) {
+            let avg = if rssi_n > 0 { rssi_sum / rssi_n as i32 } else { 0 };
+            println!(
+                "[{node}] 6s window: {in_window} frames from peer (expect ~11 beacons) | \
+                 rssi avg {avg} best {best} worst {worst} dBm"
+            );
+            window = Instant::now();
+            in_window = 0;
+        }
+    }
+    let avg = if rssi_n > 0 { rssi_sum / rssi_n as i32 } else { 0 };
+    println!(
+        "[{node}] TOTAL: {heard} frames from the peer in 30s (expect ~57) | rssi avg {avg} dBm"
+    );
     Ok(())
 }
 
