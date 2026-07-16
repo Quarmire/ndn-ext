@@ -11,6 +11,9 @@ classification = "extension"
 [dependencies]
 ndn-nan-core        = { workspace = true }
 ndn-frame-io        = { workspace = true }
+# The bearer-agnostic radio contract — for RadioKnobs, so any radio's control
+# plane can drive the engine's channel without this driver knowing the device.
+ndn-radio-hal       = { workspace = true }
 ndn-face-wifi-aware = { workspace = true }
 bytes        = { workspace = true, features = ["std"] }
 tracing      = { workspace = true }

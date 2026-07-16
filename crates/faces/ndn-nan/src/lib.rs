@@ -42,16 +42,45 @@ use bytes::Bytes;
 use ndn_face_wifi_aware::{FaceError, FollowupFrame, NanBackend, NanMatch, NanServiceName};
 use ndn_frame_io::{BROADCAST, CapturedFrame, FrameIo, InjectFrame, TxIntent};
 use ndn_nan_core::{NanConfig, NanEngine, NanEvent, RxFrame, ServiceId, service_id};
+use ndn_radio_hal::{Bandwidth, RadioKnobs};
 use tokio::sync::mpsc;
 
 pub use ndn_nan_core::NanConfig as Config;
 
 /// The slow control-plane knob the engine needs: tune the radio to a channel.
-/// Kept as a tiny local trait so this driver doesn't pull in a specific radio
-/// crate; a monitor backend's `RadioKnobs` is adapted to it (or pass `None` for
-/// a loopback / fixed-channel radio).
+///
+/// A tiny trait of its own because the engine wants *only* this one verb — but
+/// any radio exposing the HAL's [`RadioKnobs`] control plane satisfies it via
+/// [`knobs_channel`], so a real device needs no bespoke adapter.
 pub trait RadioChannel: Send + Sync + 'static {
     fn set_channel(&self, channel: u8) -> Result<(), FaceError>;
+}
+
+/// Adapts the HAL's control-plane contract to the one verb the engine needs.
+///
+/// NAN discovery is a 20 MHz affair (operating class 81 on 2.4 GHz, and the
+/// 5 GHz discovery channels likewise), so the width is pinned rather than
+/// plumbed: a caller who needs a different width is not doing NAN discovery.
+struct KnobsChannel<K>(Arc<K>);
+
+impl<K: RadioKnobs + 'static> RadioChannel for KnobsChannel<K> {
+    fn set_channel(&self, channel: u8) -> Result<(), FaceError> {
+        self.0.set_channel(channel, Bandwidth::Bw20)
+    }
+}
+
+/// Drive the engine's channel through any radio's [`RadioKnobs`].
+///
+/// Pass the result as [`spawn`]'s `channel` argument. This is what lets the
+/// sans-I/O engine retune a real device — a USB monitor dongle, an AF_PACKET
+/// port — without `ndn-nan` depending on any particular driver.
+///
+/// ```ignore
+/// let radio = Arc::new(Rtl8812auBackend::open()?);
+/// let nan = ndn_nan::spawn(radio.clone(), cfg, Some(knobs_channel(radio)));
+/// ```
+pub fn knobs_channel<K: RadioKnobs + 'static>(knobs: Arc<K>) -> Arc<dyn RadioChannel> {
+    Arc::new(KnobsChannel(knobs))
 }
 
 /// A command from a [`NanBackend`] method to the engine task.
@@ -378,5 +407,46 @@ mod tests {
             .expect("follow-up channel open");
         assert_eq!(got.frame, Bytes::from_static(b"interest-wire"));
         assert_eq!(got.peer, Some(NMI_A));
+    }
+
+    /// A radio whose only job is to record what it was tuned to.
+    struct SpyKnobs(Mutex<Vec<(u8, Bandwidth)>>);
+
+    impl RadioKnobs for SpyKnobs {
+        fn set_channel(&self, channel: u8, bw: Bandwidth) -> Result<(), FaceError> {
+            self.0.lock().unwrap().push((channel, bw));
+            Ok(())
+        }
+    }
+
+    /// The engine's `set_channel` has to actually reach the radio. Before the
+    /// adapter existed nothing implemented `RadioChannel`, so every caller passed
+    /// `None` and the engine's tuning request went nowhere — a real device only
+    /// worked because it happened to be parked on the right channel already.
+    #[tokio::test]
+    async fn knobs_channel_tunes_the_radio_the_engine_asked_for() {
+        let spy = Arc::new(SpyKnobs(Mutex::new(Vec::new())));
+        let bus = LoopbackMonitorBus::new();
+        let radio: Arc<dyn FrameIo> = Arc::new(bus.endpoint(1, -50));
+        let _driver = spawn(
+            radio,
+            Config::new(NMI_A, 6, 200),
+            Some(knobs_channel(Arc::clone(&spy))),
+        );
+
+        // The engine tunes on start-up; give the task a moment to run.
+        let tuned = timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(&first) = spy.0.lock().unwrap().first() {
+                    return first;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the engine should tune the radio through the adapter");
+
+        // Channel 6 is what the config asked for, at NAN's 20 MHz discovery width.
+        assert_eq!(tuned, (6, Bandwidth::Bw20));
     }
 }

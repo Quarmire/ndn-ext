@@ -539,11 +539,22 @@ impl Sdea {
 /// NAN Availability attribute (`0x12`) — when/where a node is available. This
 /// encodes a single **committed** entry advertising availability across a 2.4
 /// GHz channel's Discovery Windows, matching the on-air time-bitmap geometry the
-/// S23 uses (16 TU bit duration, 512 TU period). Decoding the full attribute is
-/// out of scope (we only need to *emit* a valid one); a peer's availability is
-/// not needed for discovery.
+/// S23 uses (16 TU bit duration, 512 TU period).
+///
+/// Body layout, as verified against a real S23's on-air bytes (see
+/// `s23_availability_bytes_decode_with_our_layout`):
+///
+/// ```text
+/// 8c | 02 00 | 0e 00 | 0a 10 | 18 00 | 04 | fc ff ff 3f | 11 51 ff 07 00
+/// ^^   ^^^^^   ^^^^^   ^^^^^   ^^^^^   ^^   ^^^^^^^^^^^   ^^^^^^^^^^^^^^
+/// seq  ctrl    length  entry   bitmap  len  time bitmap   band/channel
+///                      ctrl    ctrl
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommittedAvailability {
+    /// Bumped whenever the advertised schedule changes; peers use it to notice a
+    /// stale cached availability.
+    pub sequence_id: u8,
     pub map_id: u8,
     /// Operating class (`81` = 2.4 GHz 20 MHz) and the channel within it.
     pub operating_class: u8,
@@ -554,6 +565,7 @@ impl CommittedAvailability {
     /// Committed availability on a 2.4 GHz `channel` (operating class 81).
     pub fn ch_2ghz(map_id: u8, channel: u8) -> Self {
         Self {
+            sequence_id: 0,
             map_id,
             operating_class: 81,
             channel,
@@ -565,6 +577,10 @@ impl CommittedAvailability {
     pub fn encode(&self, out: &mut Vec<u8>) {
         // Build the body first so we can length-prefix it.
         let mut body = Vec::new();
+        // Sequence ID precedes Attribute Control. Omitting it shifts every field
+        // that follows by one byte, which is what made a real dissector read this
+        // attribute as Malformed.
+        body.put_u8(self.sequence_id);
         // Attribute Control: Map ID in bits[3:0], Committed-Changed bit 4.
         body.put_le16((self.map_id as u16 & 0x0f) | 0x0010);
         // --- one Availability Entry ---
@@ -596,6 +612,63 @@ impl CommittedAvailability {
         out.put_u8(AttributeId::NanAvailability as u8);
         out.put_le16(body.len() as u16);
         out.put_bytes(&body);
+    }
+}
+
+/// The header + first entry of a NAN Availability attribute body.
+///
+/// Exists to *prove* the encoder's layout: the same reader parses our bytes and a
+/// real S23's, so a field-order mistake shows up as a failing test instead of a
+/// Malformed frame on air. Discovery does not need a peer's availability, so this
+/// deliberately stops after the first entry's fixed fields.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AvailabilityHeader {
+    pub sequence_id: u8,
+    pub attribute_control: u16,
+    pub map_id: u8,
+    /// First Availability Entry: its declared length, control word, and time-bitmap
+    /// geometry.
+    pub entry_length: u16,
+    pub entry_control: u16,
+    pub time_bitmap_control: u16,
+    pub time_bitmap: Vec<u8>,
+    /// Band/channel entry: control byte, operating class, channel bitmap.
+    pub band_channel_control: u8,
+    pub operating_class: u8,
+    pub channel_bitmap: u16,
+}
+
+impl AvailabilityHeader {
+    /// Decode from a NAN Availability attribute body (the bytes after id + length).
+    pub fn decode(body: &[u8]) -> Result<Self, WireError> {
+        let mut r = Reader::new(body);
+        let sequence_id = r.u8()?;
+        let attribute_control = r.le16()?;
+        let entry_length = r.le16()?;
+        let entry_control = r.le16()?;
+        let time_bitmap_control = r.le16()?;
+        let tb_len = r.u8()? as usize;
+        let time_bitmap = r.take(tb_len)?.to_vec();
+        let band_channel_control = r.u8()?;
+        let operating_class = r.u8()?;
+        let channel_bitmap = r.le16()?;
+        Ok(Self {
+            sequence_id,
+            attribute_control,
+            map_id: (attribute_control & 0x0f) as u8,
+            entry_length,
+            entry_control,
+            time_bitmap_control,
+            time_bitmap,
+            band_channel_control,
+            operating_class,
+            channel_bitmap,
+        })
+    }
+
+    /// Is the first entry's Time Bitmap Present bit set?
+    pub fn time_bitmap_present(&self) -> bool {
+        self.entry_control & (1 << 12) != 0
     }
 }
 
@@ -737,24 +810,59 @@ mod tests {
         assert_eq!(Sdea::decode(attr.body).unwrap(), s);
     }
 
+    /// The layout proof: the *same* reader that parses our encoder's output must
+    /// parse a real S23's Availability bytes into the values a dissector reported
+    /// for that capture. If the field order is wrong, this fails — which is how the
+    /// missing Sequence ID byte hid for so long (the old test only checked that the
+    /// TLV length matched its body, which a misaligned body satisfies happily).
     #[test]
-    fn committed_availability_well_formed_for_ch6() {
+    fn s23_availability_bytes_decode_with_our_layout() {
+        // The first Availability attribute a real S23 emits in its publish SDF.
+        const S23_AVAIL_A: [u8; 35] = [
+            0x8c, 0x02, 0x00, 0x0e, 0x00, 0x0a, 0x10, 0x18, 0x00, 0x04, 0xfc, 0xff, 0xff, 0x3f,
+            0x11, 0x51, 0xff, 0x07, 0x00, 0x0e, 0x00, 0x0a, 0x10, 0x18, 0x00, 0x04, 0xfe, 0xff,
+            0xff, 0xff, 0x11, 0x51, 0x20, 0x00, 0x00,
+        ];
+        let h = AvailabilityHeader::decode(&S23_AVAIL_A).expect("S23 bytes parse");
+        assert_eq!(h.sequence_id, 0x8c);
+        assert_eq!(h.attribute_control, 0x0002, "Map ID 2, as captured");
+        assert_eq!(h.map_id, 2);
+        assert_eq!(h.entry_length, 14);
+        assert_eq!(h.entry_control, 0x100a);
+        assert!(h.time_bitmap_present());
+        // Bit Duration 16 TU, Period 512 TU — the geometry our DW clock assumes.
+        assert_eq!(h.time_bitmap_control, 0x0018);
+        assert_eq!(h.time_bitmap, [0xfc, 0xff, 0xff, 0x3f]);
+        // Band/channel: one operating-class entry, class 81 (2.4 GHz), ch 1–11.
+        assert_eq!(h.band_channel_control, 0x11);
+        assert_eq!(h.operating_class, 81);
+        assert_eq!(h.channel_bitmap, 0x07ff);
+    }
+
+    #[test]
+    fn committed_availability_round_trips_for_ch6() {
         let av = CommittedAvailability::ch_2ghz(0, 6);
         let mut buf = Vec::new();
         av.encode(&mut buf);
-        // Valid TLV whose declared length matches the body, and it parses as the
-        // NAN Availability attribute (well-formedness — exact scheduling is
-        // on-air-validated against the S23 via tshark).
         assert_eq!(buf[0], AttributeId::NanAvailability as u8);
         let len = u16::from_le_bytes([buf[1], buf[2]]) as usize;
         assert_eq!(buf.len(), 3 + len);
-        let attr = Attributes::find(&buf, AttributeId::NanAvailability).unwrap();
-        // Attribute Control: map id 0, committed-changed bit set.
-        assert_eq!(
-            u16::from_le_bytes([attr.body[0], attr.body[1]]) & 0x10,
-            0x10
-        );
-        // The whole frame still iterates cleanly as one attribute.
         assert_eq!(Attributes::new(&buf).flatten().count(), 1);
+
+        let attr = Attributes::find(&buf, AttributeId::NanAvailability).unwrap();
+        let h = AvailabilityHeader::decode(attr.body).expect("our own bytes parse");
+        assert_eq!(h.sequence_id, 0);
+        assert_eq!(h.map_id, 0);
+        assert_eq!(h.attribute_control & 0x10, 0x10, "committed-changed set");
+        // Committed (bit 0), with a time bitmap — and the S23's 16 TU / 512 TU
+        // geometry, so our schedule is expressed in the same terms as the peer's.
+        assert_eq!(h.entry_control, 0x1001);
+        assert!(h.time_bitmap_present());
+        assert_eq!(h.time_bitmap_control, 0x0018);
+        assert_eq!(h.operating_class, 81);
+        // ch 6 → bit 5.
+        assert_eq!(h.channel_bitmap, 1 << 5);
+        // The entry's declared length must match what actually follows it.
+        assert_eq!(h.entry_length as usize, attr.body.len() - 5);
     }
 }
