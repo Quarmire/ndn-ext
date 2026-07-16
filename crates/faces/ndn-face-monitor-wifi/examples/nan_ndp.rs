@@ -120,24 +120,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // ── Carry traffic over it ──
-    let msg = format!("hello-from-{node}");
-    for i in 0..10 {
+    // Keep sending for the whole window rather than stopping at the first
+    // receive: the peer only hears us while it is still running, so an early
+    // return would starve it and make a working link look one-directional.
+    let mut got = 0u32;
+    for i in 0..20 {
+        let msg = format!("hello-from-{node}-{i}");
         let _ = link.socket.send_to(msg.as_bytes(), link.peer_addr).await;
         let mut buf = [0u8; 256];
-        match tokio::time::timeout(Duration::from_millis(800), link.socket.recv_from(&mut buf)).await
+        match tokio::time::timeout(Duration::from_millis(700), link.socket.recv_from(&mut buf)).await
         {
             Ok(Ok((n, from))) => {
+                got += 1;
                 println!(
                     "[{node}] ★★ RECEIVED over the NDP: {:?} from {from}",
                     String::from_utf8_lossy(&buf[..n])
                 );
-                return Ok(());
             }
             Ok(Err(e)) => println!("[{node}] recv error: {e}"),
-            Err(_) => println!("[{node}] tx {i}: no reply yet"),
+            Err(_) => {}
         }
     }
-    println!("[{node}] no traffic came back over the data path");
+    println!("[{node}] data path carried {got} datagram(s) inbound");
     Ok(())
 }
 
