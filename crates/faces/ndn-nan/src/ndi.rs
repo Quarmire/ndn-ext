@@ -150,6 +150,47 @@ pub fn dot11_to_eth(frame: &[u8], our_ndi: [u8; 6]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Suppresses 802.11 retransmissions, which a monitor radio hands up as fresh
+/// frames because it does no duplicate filtering of its own.
+///
+/// A retry carries the transmitter's *original* sequence number — that is what
+/// makes it identifiable — so remembering the last sequence seen per sender is
+/// enough. This is the same duplicate cache any 802.11 stack keeps; a userspace
+/// monitor stack has to keep its own.
+#[derive(Default)]
+pub struct DuplicateFilter {
+    /// sender → last accepted sequence number.
+    last_seq: std::collections::HashMap<[u8; 6], u16>,
+}
+
+impl DuplicateFilter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// True if this frame is a retransmission of the one before it from the same
+    /// sender, and should not be handed up twice.
+    pub fn is_duplicate(&mut self, frame: &[u8]) -> bool {
+        if frame.len() < DOT11_HEADER_LEN {
+            return false;
+        }
+        let src = mac_at(frame, 10);
+        let seq_ctrl = u16::from_le_bytes([frame[22], frame[23]]);
+        let seq = seq_ctrl >> 4; // the low 4 bits are the fragment number
+        // Only ever suppress a frame the sender itself marked as a retry. Two
+        // genuinely distinct frames can share a sequence number after it wraps,
+        // and dropping one of those would be silent data loss.
+        let is_retry = frame[1] & 0x08 != 0;
+        match self.last_seq.get(&src) {
+            Some(&prev) if prev == seq && is_retry => true,
+            _ => {
+                self.last_seq.insert(src, seq);
+                false
+            }
+        }
+    }
+}
+
 /// The IPv6 link-local address the kernel will give an interface whose MAC is
 /// `mac` — i.e. `fe80::<modified EUI-64>`. This must equal what NDPE advertised,
 /// or the peer addresses a host that does not exist.
@@ -498,6 +539,55 @@ mod tests {
 
         let back = dot11_to_eth(&qos, PEER_NDI).unwrap();
         assert_eq!(back, eth(PEER_NDI, OUR_NDI, b"payload"));
+    }
+
+    /// A retry must not reach the kernel twice — that is what turned one datagram
+    /// into 20 receives on air.
+    #[test]
+    fn a_retransmission_is_suppressed() {
+        let mut f = DuplicateFilter::new();
+        let frame = eth_to_dot11(&eth(OUR_NDI, PEER_NDI, b"once"), CLUSTER, 5).unwrap();
+        assert!(!f.is_duplicate(&frame), "the first copy is not a duplicate");
+
+        // The MAC's retransmission: same sequence number, retry bit set.
+        let mut retry = frame.clone();
+        retry[1] |= 0x08;
+        assert!(f.is_duplicate(&retry));
+        assert!(f.is_duplicate(&retry), "and every further retry too");
+    }
+
+    /// Suppressing a frame the sender did not mark as a retry would be silent data
+    /// loss — sequence numbers wrap, so two real frames can share one.
+    #[test]
+    fn a_fresh_frame_is_never_suppressed() {
+        let mut f = DuplicateFilter::new();
+        let a = eth_to_dot11(&eth(OUR_NDI, PEER_NDI, b"one"), CLUSTER, 5).unwrap();
+        assert!(!f.is_duplicate(&a));
+
+        // Same sequence, but NOT flagged as a retry: a distinct frame.
+        let b = eth_to_dot11(&eth(OUR_NDI, PEER_NDI, b"two"), CLUSTER, 5).unwrap();
+        assert!(!f.is_duplicate(&b), "same seq without the retry bit is not a dup");
+
+        // A new sequence is obviously fresh.
+        let c = eth_to_dot11(&eth(OUR_NDI, PEER_NDI, b"three"), CLUSTER, 6).unwrap();
+        assert!(!f.is_duplicate(&c));
+    }
+
+    /// The filter is per sender: two peers can be mid-sequence independently.
+    #[test]
+    fn senders_are_tracked_separately() {
+        const OTHER: [u8; 6] = [0x02, 0xcc, 0xcc, 0x00, 0x00, 0x03];
+        let mut f = DuplicateFilter::new();
+        let from_peer = eth_to_dot11(&eth(OUR_NDI, PEER_NDI, b"p"), CLUSTER, 9).unwrap();
+        let from_other = eth_to_dot11(&eth(OUR_NDI, OTHER, b"o"), CLUSTER, 9).unwrap();
+        assert!(!f.is_duplicate(&from_peer));
+        assert!(
+            !f.is_duplicate(&from_other),
+            "another sender's seq 9 is not a duplicate of this one's"
+        );
+        let mut retry = from_peer.clone();
+        retry[1] |= 0x08;
+        assert!(f.is_duplicate(&retry), "the peer's own retry still is");
     }
 
     /// The address a peer computes from our advertised IID must be the address the

@@ -46,7 +46,7 @@ use ndn_frame_io::{BROADCAST, CapturedFrame, FrameIo, InjectFrame, TxIntent};
 use ndn_nan_core::{NanConfig, NanEngine, NanEvent, RxFrame, ServiceId, service_id};
 use ndn_radio_hal::{Bandwidth, RadioKnobs};
 
-use crate::ndi::{DataInterface, MAX_ETHERNET_FRAME, dot11_to_eth, eth_to_dot11};
+use crate::ndi::{DataInterface, DuplicateFilter, MAX_ETHERNET_FRAME, dot11_to_eth, eth_to_dot11};
 use tokio::sync::mpsc;
 
 pub mod ndi;
@@ -171,6 +171,7 @@ pub fn spawn_with(
         channel,
         ndi,
         ndi_seq: 0,
+        ndi_dupes: DuplicateFilter::new(),
         cmd_rx,
         fu_tx,
         shared: Arc::clone(&shared),
@@ -261,6 +262,8 @@ struct EngineTask {
     /// Sequence counter for the data frames we put on air (the engine owns its
     /// own for management frames).
     ndi_seq: u16,
+    /// Drops 802.11 retransmissions before they reach the kernel twice.
+    ndi_dupes: DuplicateFilter,
     cmd_rx: mpsc::UnboundedReceiver<Command>,
     fu_tx: mpsc::UnboundedSender<FollowupFrame>,
     shared: Arc<Shared>,
@@ -378,13 +381,18 @@ impl EngineTask {
     ///
     /// Returns true when the frame was the NDI's, so the caller does not also feed
     /// it to the engine — one radio, one reader, demuxed by what the frame is.
-    fn deliver_to_ndi(&self, cf: &CapturedFrame) -> bool {
+    fn deliver_to_ndi(&mut self, cf: &CapturedFrame) -> bool {
         let Some(ndi) = &self.ndi else {
             return false;
         };
         let Some(eth) = dot11_to_eth(&cf.payload, ndi.mac()) else {
             return false;
         };
+        // A retransmission is still ours — claim it so it never reaches the
+        // engine, but do not hand the kernel the same packet twice.
+        if self.ndi_dupes.is_duplicate(&cf.payload) {
+            return true;
+        }
         if let Err(e) = ndi.write_frame(&eth) {
             tracing::warn!(error = %e, "NDI: write failed");
         }
