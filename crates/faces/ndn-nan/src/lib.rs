@@ -337,6 +337,36 @@ impl EngineTask {
                     rssi_dbm,
                 });
             }
+            // The engine negotiates data paths (Phase 2's M1–M4); turning an
+            // established one into a bound socket for `request_ndp` needs the NDI
+            // virtual interface, which does not exist yet. Trace the outcome so a
+            // negotiated path is observable rather than silently dropped.
+            NanEvent::NdpEstablished {
+                peer,
+                ndp_id,
+                role,
+                peer_ndi,
+                peer_iid,
+            } => {
+                tracing::info!(
+                    ?role,
+                    ndp_id,
+                    peer = ?peer,
+                    peer_ndi = ?peer_ndi,
+                    peer_iid = ?peer_iid,
+                    "NAN data path established (no NDI to bind it to yet)"
+                );
+            }
+            NanEvent::NdpFailed {
+                peer,
+                ndp_id,
+                reason,
+            } => {
+                tracing::warn!(ndp_id, peer = ?peer, ?reason, "NAN data path failed");
+            }
+            NanEvent::NdpTerminated { peer, ndp_id } => {
+                tracing::info!(ndp_id, peer = ?peer, "NAN data path terminated");
+            }
         }
     }
 }

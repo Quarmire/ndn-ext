@@ -8,26 +8,33 @@
 //! That keeps the timing-critical, interop-critical logic deterministically
 //! testable (fake clock + synthetic frames → exact output bytes).
 //!
-//! ## MVP scope
+//! ## Scope
 //!
-//! Enough to discover and exchange follow-ups with a stock Wi-Fi Aware device:
-//! a 512/16-TU Discovery-Window clock; software-TSF sync to received beacons
-//! (one-shot jam to a higher-ranked cluster); per-DW emission of a sync beacon
-//! (Master Indication + Cluster) plus a Service Discovery Frame carrying our
-//! active publish/subscribe Service Descriptors; service-ID matching of received
-//! SDAs; and unicast follow-up send/receive. Full master/anchor election,
-//! multi-channel DWs, Device-Capability/Availability attributes, and NDP land in
-//! later phases — the structure here grows into them.
+//! Discovery + coordination with a stock Wi-Fi Aware device: a 512/16-TU
+//! Discovery-Window clock; software-TSF sync to received beacons (one-shot jam to
+//! a higher-ranked cluster); per-DW emission of a sync beacon (Master Indication +
+//! Cluster) plus a Service Discovery Frame carrying our active publish/subscribe
+//! Service Descriptors; service-ID matching of received SDAs; and unicast
+//! follow-up send/receive.
+//!
+//! Plus the **data path**: the M1-M4 NDP handshake ([`NanEngine::request_ndp`] ->
+//! [`NanEvent::NdpEstablished`]), which negotiates each side's NAN Data Interface
+//! and IPv6 interface identifier over NAFs. The engine settles *which* addresses a
+//! data path uses; binding a socket to them is the driver's job (and needs an NDI
+//! virtual interface, which does not exist yet).
+//!
+//! Full master/anchor election role transitions and multi-channel DWs land in a
+//! later phase - the structure here grows into them.
 
 use alloc::boxed::Box;
 use alloc::collections::{BTreeSet, VecDeque};
 use alloc::vec::Vec;
 
 use crate::attr::{
-    AttributeId, Cluster, DeviceCapability, MasterIndication, Sdea, ServiceControlType,
-    ServiceDescriptor, ServiceIdList,
+    AttributeId, Cluster, DeviceCapability, MasterIndication, Ndpe, NdpStatus, NdpType, Sdea,
+    ServiceControlType, ServiceDescriptor, ServiceIdList,
 };
-use crate::frame::{FrameType, NanBeacon, ServiceDiscoveryFrame, classify};
+use crate::frame::{FrameType, NafSubtype, NanActionFrame, NanBeacon, ServiceDiscoveryFrame, classify};
 use crate::rendezvous::{DiscoveryWindow, Rendezvous};
 use crate::service::service_id;
 use crate::{BROADCAST, NAN_CLUSTER_ID_BASE, NAN_NETWORK_ID, SYNC_BEACON_INTERVAL_TU, ServiceId};
@@ -49,6 +56,15 @@ pub struct NanConfig {
     pub random_factor: u8,
     /// The 2.4/5 GHz discovery channel to park on (MVP: a single channel, e.g. 6).
     pub channel: u8,
+    /// Our NAN Data Interface MAC — the address the **data path** uses, as
+    /// opposed to the NMI that carries discovery. A real stack gives the NDI its
+    /// own MAC (and rotates it); [`new`](Self::new) defaults it to the NMI, which
+    /// is honest for a single-interface node. Its EUI-64 becomes the IPv6
+    /// interface identifier we advertise in NDPE — see [`eui64_iid`].
+    pub ndi: [u8; 6],
+    /// Accept incoming data-path requests automatically (open NDP). Set false to
+    /// reject every request — a node that publishes but serves no data path.
+    pub ndp_auto_accept: bool,
 }
 
 impl NanConfig {
@@ -60,8 +76,35 @@ impl NanConfig {
             master_preference: pref,
             random_factor: 0,
             channel,
+            ndi: nmi,
+            ndp_auto_accept: true,
         }
     }
+
+    /// Give the data path its own interface MAC, distinct from the NMI.
+    pub fn with_ndi(mut self, ndi: [u8; 6]) -> Self {
+        self.ndi = ndi;
+        self
+    }
+}
+
+/// The modified EUI-64 interface identifier of a MAC — the low 64 bits of the
+/// IPv6 link-local address `fe80::<iid>` that a NAN data interface answers on.
+///
+/// Insert `ff:fe` in the middle and flip the universal/local bit, per RFC 4291.
+/// This is what makes NDPE self-sufficient: the peer derives our address from
+/// the identifier we advertise, with no out-of-band exchange.
+pub fn eui64_iid(mac: [u8; 6]) -> [u8; 8] {
+    [
+        mac[0] ^ 0x02,
+        mac[1],
+        mac[2],
+        0xff,
+        0xfe,
+        mac[3],
+        mac[4],
+        mac[5],
+    ]
 }
 
 /// One captured frame handed to [`poll`](NanEngine::poll).
@@ -100,6 +143,84 @@ pub enum NanEvent {
         ssi: Vec<u8>,
         rssi_dbm: Option<i8>,
     },
+    /// A data path is up: the M1–M4 exchange completed. The driver can now bind a
+    /// socket to our NDI and reach the peer at `fe80::<peer_iid>` — everything
+    /// needed to carry bulk traffic is here, with no out-of-band exchange.
+    NdpEstablished {
+        /// The peer's NMI (the discovery identity that negotiated the path).
+        peer: [u8; 6],
+        ndp_id: u8,
+        role: NdpRole,
+        /// The peer's data-interface MAC.
+        peer_ndi: [u8; 6],
+        /// The peer's IPv6 interface identifier — `fe80::<peer_iid>` addresses it.
+        peer_iid: [u8; 8],
+    },
+    /// A data path could not be set up: rejected by the peer, or unanswered.
+    NdpFailed {
+        peer: [u8; 6],
+        ndp_id: u8,
+        reason: NdpFailure,
+    },
+    /// An established data path was torn down.
+    NdpTerminated { peer: [u8; 6], ndp_id: u8 },
+}
+
+/// Why a data path did not come up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NdpFailure {
+    /// The peer answered with status Rejected.
+    Rejected { reason_code: u8 },
+    /// The peer never answered within [`NDP_MAX_ATTEMPTS`] requests.
+    TimedOut,
+}
+
+/// Which side of a data-path exchange we are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NdpRole {
+    /// We sent M1 — we asked for the path.
+    Initiator,
+    /// We answered someone else's M1.
+    Responder,
+}
+
+/// How far along a data-path handshake is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NdpState {
+    /// Initiator: M1 sent, waiting for M2.
+    AwaitingResponse,
+    /// Responder: M2 sent, waiting for M3.
+    AwaitingConfirm,
+    /// The path is up.
+    Established,
+}
+
+/// How long to wait for a data-path reply before re-sending. Two Discovery
+/// Windows: a peer only listens during its DW, so a shorter timer would just
+/// retransmit into a sleeping radio.
+pub const NDP_RETRY_USEC: Usec = 2 * 512 * 1024;
+
+/// How many times the initiator sends M1 before giving up.
+pub const NDP_MAX_ATTEMPTS: u8 = 4;
+
+/// One in-flight or established data path.
+#[derive(Clone, Debug)]
+struct NdpSession {
+    /// The peer's NMI — data-path NAFs are addressed to the discovery identity,
+    /// while the NDIs inside the NDPE name the data interfaces.
+    peer: [u8; 6],
+    ndp_id: u8,
+    dialog_token: u8,
+    role: NdpRole,
+    state: NdpState,
+    peer_ndi: Option<[u8; 6]>,
+    peer_iid: Option<[u8; 8]>,
+    /// The NAF subtype we owe the peer on the next transmit window, if any.
+    pending_tx: Option<NafSubtype>,
+    /// M1 sends so far (initiator only).
+    attempts: u8,
+    /// When to re-send M1 if M2 hasn't arrived.
+    retry_at_usec: Usec,
 }
 
 /// The result of one [`poll`](NanEngine::poll): frames to send, an optional
@@ -193,6 +314,12 @@ pub struct NanEngine {
     /// [`with_rendezvous`](NanEngine::with_rendezvous). The engine's timing is
     /// neutral — this strategy owns "when."
     rendezvous: Box<dyn Rendezvous>,
+    /// In-flight and established data paths, keyed by (peer NMI, ndp id).
+    ndps: Vec<NdpSession>,
+    /// Next data-path id to hand out (ids are per-initiator, so ours need only be
+    /// unique among the paths *we* start).
+    next_ndp_id: u8,
+    next_dialog_token: u8,
 }
 
 impl NanEngine {
@@ -215,6 +342,9 @@ impl NanEngine {
             base_initialized: false,
             cluster_amr: own_rank,
             rendezvous: Box::new(DiscoveryWindow),
+            ndps: Vec::new(),
+            next_ndp_id: 1,
+            next_dialog_token: 1,
         }
     }
 
@@ -304,6 +434,67 @@ impl NanEngine {
         peers.len()
     }
 
+    /// Ask `peer` (by NMI) for a data path — the M1 of the M1–M4 exchange.
+    ///
+    /// Returns the data-path id identifying this exchange; the outcome arrives as
+    /// [`NanEvent::NdpEstablished`] or [`NanEvent::NdpFailed`]. The request rides
+    /// the next transmit window, because that is when the peer is listening.
+    ///
+    /// A second request to a peer we already have a path to returns the existing
+    /// id rather than starting a duplicate negotiation.
+    pub fn request_ndp(&mut self, peer: [u8; 6]) -> u8 {
+        if let Some(s) = self
+            .ndps
+            .iter()
+            .find(|s| s.peer == peer && s.role == NdpRole::Initiator)
+        {
+            return s.ndp_id;
+        }
+        let ndp_id = self.next_ndp_id;
+        self.next_ndp_id = self.next_ndp_id.wrapping_add(1).max(1);
+        let dialog_token = self.next_dialog_token;
+        self.next_dialog_token = self.next_dialog_token.wrapping_add(1).max(1);
+        self.ndps.push(NdpSession {
+            peer,
+            ndp_id,
+            dialog_token,
+            role: NdpRole::Initiator,
+            state: NdpState::AwaitingResponse,
+            peer_ndi: None,
+            peer_iid: None,
+            pending_tx: Some(NafSubtype::DataPathRequest),
+            attempts: 0,
+            retry_at_usec: 0,
+        });
+        ndp_id
+    }
+
+    /// Tear down a data path, telling the peer.
+    pub fn terminate_ndp(&mut self, peer: [u8; 6], ndp_id: u8) {
+        if let Some(s) = self
+            .ndps
+            .iter_mut()
+            .find(|s| s.peer == peer && s.ndp_id == ndp_id)
+        {
+            s.pending_tx = Some(NafSubtype::DataPathTermination);
+            s.state = NdpState::Established; // stop retrying; the frame still goes out
+        }
+    }
+
+    /// Our data-interface MAC and its IPv6 interface identifier — what a peer
+    /// will address us by once a path is up.
+    pub fn local_ndp_identity(&self) -> ([u8; 6], [u8; 8]) {
+        (self.cfg.ndi, eui64_iid(self.cfg.ndi))
+    }
+
+    /// Number of data paths currently established.
+    pub fn established_ndps(&self) -> usize {
+        self.ndps
+            .iter()
+            .filter(|s| s.state == NdpState::Established)
+            .count()
+    }
+
     /// Synced software TSF (microseconds since this cluster's epoch).
     fn synced_usec(&self, now: Usec) -> Usec {
         now.wrapping_sub(self.base_time_usec)
@@ -361,6 +552,9 @@ impl NanEngine {
             }
             // Follow-ups also ride the DW (the peer is only listening then).
             self.emit_followups(&mut step);
+            // Data-path setup likewise: an M2 answering an M1 that arrived in this
+            // same window goes out while the initiator is still awake.
+            self.emit_ndp(now, &mut step);
         }
 
         step.wake_at_usec = self.next_dw_start_usec(now);
@@ -379,9 +573,9 @@ impl NanEngine {
         match frame.kind {
             FrameType::Beacon => self.handle_beacon(rx),
             FrameType::Action => self.handle_sdf(rx, frame.attributes, step),
-            // Data-path / ranging / schedule frames are Phase 2 territory; the
-            // engine parses them but does not yet act on them.
-            FrameType::Naf { .. } => {}
+            FrameType::Naf { subtype } => {
+                self.handle_naf(rx, subtype, frame.attributes, step);
+            }
             FrameType::Other => {}
         }
     }
@@ -575,6 +769,252 @@ impl NanEngine {
         });
     }
 
+    /// The M1–M4 receive half. Data-path setup is unicast, so a NAF not addressed
+    /// to us is someone else's negotiation — reacting to it would answer a request
+    /// that was never made of us.
+    fn handle_naf(&mut self, rx: RxFrame, subtype: u8, attrs: &[u8], step: &mut Step) {
+        if rx_addr1(rx.bytes) != Some(self.cfg.nmi) {
+            return;
+        }
+        let Some(sub) = NafSubtype::from_byte(subtype) else {
+            return;
+        };
+        let Some(attr) = crate::attr::Attributes::find(attrs, AttributeId::NdpExtension) else {
+            return;
+        };
+        let Ok(ndpe) = Ndpe::decode(attr.body) else {
+            return;
+        };
+        let peer = rx_addr2(rx.bytes);
+
+        match sub {
+            NafSubtype::DataPathRequest => self.on_ndp_request(peer, &ndpe),
+            NafSubtype::DataPathResponse => self.on_ndp_response(peer, &ndpe, step),
+            NafSubtype::DataPathConfirm => self.on_ndp_confirm(peer, &ndpe, step),
+            NafSubtype::DataPathTermination => {
+                if let Some(i) = self.ndp_index(peer, ndpe.ndp_id) {
+                    let s = self.ndps.remove(i);
+                    step.events.push(NanEvent::NdpTerminated {
+                        peer,
+                        ndp_id: s.ndp_id,
+                    });
+                }
+            }
+            // Ranging, schedule negotiation, and key installment are out of scope
+            // for an open data path.
+            _ => {}
+        }
+    }
+
+    fn ndp_index(&self, peer: [u8; 6], ndp_id: u8) -> Option<usize> {
+        self.ndps
+            .iter()
+            .position(|s| s.peer == peer && s.ndp_id == ndp_id)
+    }
+
+    /// M1 in: become the responder for a path this peer wants.
+    fn on_ndp_request(&mut self, peer: [u8; 6], ndpe: &Ndpe) {
+        if ndpe.ndp_type != NdpType::Request {
+            return;
+        }
+        // A repeat of an M1 we already answered means our M2 was lost — re-send
+        // it rather than starting a second session for the same path.
+        if let Some(i) = self.ndp_index(peer, ndpe.ndp_id) {
+            if self.ndps[i].role == NdpRole::Responder
+                && self.ndps[i].state == NdpState::AwaitingConfirm
+            {
+                self.ndps[i].pending_tx = Some(NafSubtype::DataPathResponse);
+            }
+            return;
+        }
+        self.ndps.push(NdpSession {
+            peer,
+            ndp_id: ndpe.ndp_id,
+            dialog_token: ndpe.dialog_token,
+            role: NdpRole::Responder,
+            // A rejection still needs the session to carry the outbound M2; it is
+            // dropped once sent.
+            state: NdpState::AwaitingConfirm,
+            peer_ndi: Some(ndpe.initiator_ndi),
+            peer_iid: ndpe.ipv6_iid(),
+            pending_tx: Some(NafSubtype::DataPathResponse),
+            attempts: 0,
+            retry_at_usec: 0,
+        });
+    }
+
+    /// M2 in: the peer answered our request.
+    fn on_ndp_response(&mut self, peer: [u8; 6], ndpe: &Ndpe, step: &mut Step) {
+        let Some(i) = self.ndp_index(peer, ndpe.ndp_id) else {
+            return;
+        };
+        if self.ndps[i].role != NdpRole::Initiator || self.ndps[i].state != NdpState::AwaitingResponse
+        {
+            return;
+        }
+        match ndpe.status {
+            NdpStatus::Rejected => {
+                let s = self.ndps.remove(i);
+                step.events.push(NanEvent::NdpFailed {
+                    peer,
+                    ndp_id: s.ndp_id,
+                    reason: NdpFailure::Rejected {
+                        reason_code: ndpe.reason_code,
+                    },
+                });
+            }
+            NdpStatus::Accepted => {
+                // The responder's NDI + IID are the whole payoff: they are what we
+                // address the data path to.
+                let (Some(ndi), Some(iid)) = (ndpe.responder_ndi, ndpe.ipv6_iid()) else {
+                    // Accepted but unusable — without both we cannot address the
+                    // peer, so treat it as a rejection rather than report a path
+                    // that can't carry anything.
+                    let s = self.ndps.remove(i);
+                    step.events.push(NanEvent::NdpFailed {
+                        peer,
+                        ndp_id: s.ndp_id,
+                        reason: NdpFailure::Rejected { reason_code: 0 },
+                    });
+                    return;
+                };
+                let s = &mut self.ndps[i];
+                s.peer_ndi = Some(ndi);
+                s.peer_iid = Some(iid);
+                s.state = NdpState::Established;
+                s.pending_tx = Some(NafSubtype::DataPathConfirm);
+                let (ndp_id, role) = (s.ndp_id, s.role);
+                step.events.push(NanEvent::NdpEstablished {
+                    peer,
+                    ndp_id,
+                    role,
+                    peer_ndi: ndi,
+                    peer_iid: iid,
+                });
+            }
+            // Continue = "still deciding": keep waiting for a terminal answer.
+            NdpStatus::Continue => {}
+        }
+    }
+
+    /// M3 in: the initiator confirmed the path we accepted.
+    fn on_ndp_confirm(&mut self, peer: [u8; 6], ndpe: &Ndpe, step: &mut Step) {
+        let Some(i) = self.ndp_index(peer, ndpe.ndp_id) else {
+            return;
+        };
+        let s = &mut self.ndps[i];
+        if s.role != NdpRole::Responder || s.state != NdpState::AwaitingConfirm {
+            return;
+        }
+        s.state = NdpState::Established;
+        let (Some(ndi), Some(iid)) = (s.peer_ndi, s.peer_iid) else {
+            // The initiator never told us how to address it (no IID in M1).
+            let s = self.ndps.remove(i);
+            step.events.push(NanEvent::NdpFailed {
+                peer,
+                ndp_id: s.ndp_id,
+                reason: NdpFailure::Rejected { reason_code: 0 },
+            });
+            return;
+        };
+        let (ndp_id, role) = (s.ndp_id, s.role);
+        step.events.push(NanEvent::NdpEstablished {
+            peer,
+            ndp_id,
+            role,
+            peer_ndi: ndi,
+            peer_iid: iid,
+        });
+    }
+
+    /// The M1–M4 transmit half: send whatever each session owes, and re-send an
+    /// unanswered M1 until the attempt budget runs out.
+    fn emit_ndp(&mut self, now: Usec, step: &mut Step) {
+        let (our_ndi, our_iid) = (self.cfg.ndi, eui64_iid(self.cfg.ndi));
+        let auto_accept = self.cfg.ndp_auto_accept;
+        let mut timed_out: Vec<([u8; 6], u8)> = Vec::new();
+        let mut frames: Vec<([u8; 6], NafSubtype, Vec<u8>)> = Vec::new();
+
+        for s in &mut self.ndps {
+            // Re-arm an unanswered request.
+            if s.pending_tx.is_none()
+                && s.role == NdpRole::Initiator
+                && s.state == NdpState::AwaitingResponse
+                && now >= s.retry_at_usec
+            {
+                if s.attempts >= NDP_MAX_ATTEMPTS {
+                    timed_out.push((s.peer, s.ndp_id));
+                    continue;
+                }
+                s.pending_tx = Some(NafSubtype::DataPathRequest);
+            }
+            let Some(sub) = s.pending_tx.take() else {
+                continue;
+            };
+
+            let mut attrs = Vec::new();
+            match sub {
+                NafSubtype::DataPathRequest => {
+                    Ndpe::request(s.dialog_token, s.ndp_id, our_ndi, our_iid).encode(&mut attrs);
+                    s.attempts = s.attempts.saturating_add(1);
+                    s.retry_at_usec = now.wrapping_add(NDP_RETRY_USEC);
+                }
+                NafSubtype::DataPathResponse => {
+                    // The initiator's NDI, not ours: it names who asked.
+                    let init_ndi = s.peer_ndi.unwrap_or(s.peer);
+                    let mut m2 = if auto_accept {
+                        Ndpe::accept(s.dialog_token, s.ndp_id, init_ndi, our_ndi, our_iid)
+                    } else {
+                        let mut r = Ndpe::confirm(s.dialog_token, s.ndp_id, init_ndi);
+                        r.ndp_type = NdpType::Response;
+                        r.status = NdpStatus::Rejected;
+                        r
+                    };
+                    if !auto_accept {
+                        m2.responder_ndi = None;
+                        m2.tlvs.clear();
+                    }
+                    m2.encode(&mut attrs);
+                }
+                NafSubtype::DataPathConfirm => {
+                    Ndpe::confirm(s.dialog_token, s.ndp_id, our_ndi).encode(&mut attrs);
+                }
+                NafSubtype::DataPathTermination => {
+                    let mut t = Ndpe::confirm(s.dialog_token, s.ndp_id, our_ndi);
+                    t.ndp_type = NdpType::Terminate;
+                    t.encode(&mut attrs);
+                }
+                _ => continue,
+            }
+            frames.push((s.peer, sub, attrs));
+            // A rejected request leaves no session behind.
+            if matches!(sub, NafSubtype::DataPathResponse) && !auto_accept {
+                timed_out.push((s.peer, s.ndp_id));
+            }
+        }
+
+        for (peer, sub, attrs) in frames {
+            let seq = self.next_seq();
+            let naf = NanActionFrame::new(sub, peer, self.cfg.nmi, self.cluster_id, seq);
+            step.tx.push(TxFrame {
+                bytes: naf.encode(&attrs),
+            });
+        }
+
+        for (peer, ndp_id) in timed_out {
+            if let Some(i) = self.ndp_index(peer, ndp_id) {
+                let s = self.ndps.remove(i);
+                if s.role == NdpRole::Initiator {
+                    step.events.push(NanEvent::NdpFailed {
+                        peer,
+                        ndp_id,
+                        reason: NdpFailure::TimedOut,
+                    });
+                }
+            }
+        }
+    }
+
     fn emit_followups(&mut self, step: &mut Step) {
         while let Some(fu) = self.followups.pop_front() {
             let mut attrs = Vec::new();
@@ -722,6 +1162,210 @@ mod tests {
         }
         assert!(a_found, "A should discover B");
         assert!(b_found, "B should discover A");
+    }
+
+    /// The whole point: two engines negotiate a path over the medium and BOTH
+    /// end up knowing how to address the other, with no out-of-band exchange.
+    #[test]
+    fn two_nodes_establish_a_data_path() {
+        const A_NDI: [u8; 6] = [0x02, 0xaa, 0xaa, 0x00, 0x00, 0x01];
+        const B_NDI: [u8; 6] = [0x02, 0xbb, 0xbb, 0x00, 0x00, 0x02];
+        let a = NanEngine::new(NanConfig::new(A, 6, 200).with_ndi(A_NDI));
+        let b = NanEngine::new(NanConfig::new(B, 6, 180).with_ndi(B_NDI));
+        let mut m = Medium::new(a, b);
+
+        let ndp_id = m.a.request_ndp(B);
+        let (mut a_up, mut b_up) = (None, None);
+        for _ in 0..200 {
+            let (ae, be) = m.tick(8 * USEC_PER_TU);
+            for e in ae {
+                if let NanEvent::NdpEstablished { .. } = e {
+                    a_up = Some(e);
+                }
+            }
+            for e in be {
+                if let NanEvent::NdpEstablished { .. } = e {
+                    b_up = Some(e);
+                }
+            }
+        }
+
+        // The initiator learns the responder's data interface + address.
+        assert_eq!(
+            a_up.expect("A should establish the path it asked for"),
+            NanEvent::NdpEstablished {
+                peer: B,
+                ndp_id,
+                role: NdpRole::Initiator,
+                peer_ndi: B_NDI,
+                peer_iid: eui64_iid(B_NDI),
+            }
+        );
+        // And the responder learns the initiator's, from M1's NDPE.
+        assert_eq!(
+            b_up.expect("B should accept and confirm"),
+            NanEvent::NdpEstablished {
+                peer: A,
+                ndp_id,
+                role: NdpRole::Responder,
+                peer_ndi: A_NDI,
+                peer_iid: eui64_iid(A_NDI),
+            }
+        );
+        assert_eq!(m.a.established_ndps(), 1);
+        assert_eq!(m.b.established_ndps(), 1);
+    }
+
+    /// The IID a peer derives our address from must be the modified EUI-64 of our
+    /// NDI: `ff:fe` inserted and the universal/local bit flipped (RFC 4291). Get
+    /// this wrong and the handshake still "succeeds" while the data path
+    /// addresses a host that does not exist.
+    #[test]
+    fn eui64_matches_the_rfc_4291_construction() {
+        assert_eq!(
+            eui64_iid([0x02, 0x26, 0x23, 0xef, 0xbe, 0x2f]),
+            [0x00, 0x26, 0x23, 0xff, 0xfe, 0xef, 0xbe, 0x2f]
+        );
+        // The bit flips both ways: a universally-administered MAC gains it.
+        assert_eq!(eui64_iid([0x00, 0x11, 0x22, 0x33, 0x44, 0x55])[0], 0x02);
+        let e = NanEngine::new(NanConfig::new(A, 6, 200).with_ndi([0x02, 1, 2, 3, 4, 5]));
+        assert_eq!(
+            e.local_ndp_identity(),
+            ([0x02, 1, 2, 3, 4, 5], eui64_iid([0x02, 1, 2, 3, 4, 5]))
+        );
+    }
+
+    #[test]
+    fn a_rejecting_peer_fails_the_path_rather_than_hanging() {
+        let a = NanEngine::new(NanConfig::new(A, 6, 200));
+        let mut cfg = NanConfig::new(B, 6, 180);
+        cfg.ndp_auto_accept = false; // publishes, but serves no data path
+        let b = NanEngine::new(cfg);
+        let mut m = Medium::new(a, b);
+
+        let ndp_id = m.a.request_ndp(B);
+        let mut failed = None;
+        for _ in 0..200 {
+            let (ae, _) = m.tick(8 * USEC_PER_TU);
+            for e in ae {
+                if let NanEvent::NdpFailed { .. } = e {
+                    failed = Some(e);
+                }
+            }
+        }
+        assert_eq!(
+            failed.expect("A should be told the path was refused"),
+            NanEvent::NdpFailed {
+                peer: B,
+                ndp_id,
+                reason: NdpFailure::Rejected { reason_code: 0 },
+            }
+        );
+        assert_eq!(m.a.established_ndps(), 0);
+        assert_eq!(m.b.established_ndps(), 0, "a refused path leaves no session");
+    }
+
+    /// An unanswered request must give up, not retry forever — and must say so.
+    #[test]
+    fn an_unanswered_request_times_out_after_a_bounded_number_of_attempts() {
+        let mut a = NanEngine::new(NanConfig::new(A, 6, 200));
+        const ABSENT: [u8; 6] = [0x02, 0x00, 0x00, 0xde, 0xad, 0x00];
+        let ndp_id = a.request_ndp(ABSENT);
+
+        let mut now = 1_000_000u64;
+        let mut m1_count = 0;
+        let mut failed = None;
+        // Long enough to cover NDP_MAX_ATTEMPTS retries at NDP_RETRY_USEC apart
+        // (~1.05 s each) plus the final timeout.
+        for _ in 0..800 {
+            now += 8 * USEC_PER_TU;
+            let step = a.poll(now, &[]);
+            m1_count += step
+                .tx
+                .iter()
+                .filter(|f| {
+                    crate::frame::NanActionFrame::parse(&f.bytes)
+                        .map(|(n, _)| n.subtype == NafSubtype::DataPathRequest as u8)
+                        .unwrap_or(false)
+                })
+                .count();
+            for e in step.events {
+                if let NanEvent::NdpFailed { .. } = e {
+                    failed = Some(e);
+                }
+            }
+        }
+        assert_eq!(
+            failed.expect("an unanswered request must fail, not hang"),
+            NanEvent::NdpFailed {
+                peer: ABSENT,
+                ndp_id,
+                reason: NdpFailure::TimedOut,
+            }
+        );
+        assert_eq!(
+            m1_count, NDP_MAX_ATTEMPTS as usize,
+            "exactly the attempt budget, then stop"
+        );
+        assert_eq!(a.established_ndps(), 0);
+    }
+
+    /// Data-path setup is unicast. Answering an M1 aimed at another node would
+    /// mean accepting a request nobody made of us.
+    #[test]
+    fn a_request_addressed_elsewhere_is_ignored() {
+        const OTHER: [u8; 6] = [0x02, 0x00, 0x00, 0x11, 0x22, 0x33];
+        let mut attrs = Vec::new();
+        Ndpe::request(1, 1, A, eui64_iid(A)).encode(&mut attrs);
+        // Addressed to OTHER, sent by A; B merely overhears it.
+        let naf =
+            NanActionFrame::new(NafSubtype::DataPathRequest, OTHER, A, NAN_CLUSTER_ID_BASE, 1)
+                .encode(&attrs);
+
+        let mut b = NanEngine::new(NanConfig::new(B, 6, 180));
+        let step = b.poll(
+            1_000_000,
+            &[RxFrame {
+                bytes: &naf,
+                rssi_dbm: Some(-50),
+                now_usec: 1_000_000,
+            }],
+        );
+        assert!(step.tx.iter().all(|f| {
+            crate::frame::NanActionFrame::parse(&f.bytes).is_err() // beacons/SDFs only
+        }));
+        assert_eq!(b.established_ndps(), 0);
+    }
+
+    /// A lost M2 must not spawn a second session for the same path.
+    #[test]
+    fn a_repeated_request_re_sends_the_response_without_duplicating_state() {
+        let mut b = NanEngine::new(NanConfig::new(B, 6, 180));
+        let mut attrs = Vec::new();
+        Ndpe::request(1, 7, A, eui64_iid(A)).encode(&mut attrs);
+        let naf = NanActionFrame::new(NafSubtype::DataPathRequest, B, A, NAN_CLUSTER_ID_BASE, 1)
+            .encode(&attrs);
+        let rx = |t| RxFrame {
+            bytes: &naf,
+            rssi_dbm: Some(-50),
+            now_usec: t,
+        };
+
+        let count_m2 = |step: &Step| {
+            step.tx
+                .iter()
+                .filter(|f| {
+                    crate::frame::NanActionFrame::parse(&f.bytes)
+                        .map(|(n, _)| n.subtype == NafSubtype::DataPathResponse as u8)
+                        .unwrap_or(false)
+                })
+                .count()
+        };
+        let s1 = b.poll(1_000_000, &[rx(1_000_000)]);
+        assert_eq!(count_m2(&s1), 1, "M1 → one M2");
+        let s2 = b.poll(1_000_100, &[rx(1_000_100)]);
+        assert_eq!(count_m2(&s2), 1, "a repeated M1 re-sends M2");
+        assert_eq!(b.ndps.len(), 1, "still one session, not two");
     }
 
     #[test]
