@@ -799,7 +799,7 @@ impl NanEngine {
             NafSubtype::DataPathResponse => self.on_ndp_response(peer, &ndpe, step),
             NafSubtype::DataPathConfirm => self.on_ndp_confirm(peer, &ndpe, step),
             NafSubtype::DataPathTermination => {
-                if let Some(i) = self.ndp_index(peer, ndpe.ndp_id) {
+                if let Some(i) = self.ndp_index(peer, &ndpe) {
                     let s = self.ndps.remove(i);
                     step.events.push(NanEvent::NdpTerminated {
                         peer,
@@ -813,10 +813,34 @@ impl NanEngine {
         }
     }
 
-    fn ndp_index(&self, peer: [u8; 6], ndp_id: u8) -> Option<usize> {
+    /// Which of our sessions an inbound NDPE refers to.
+    ///
+    /// The NDP id is chosen by the **initiator** and is only unique within that
+    /// initiator's own scope, so `(peer, ndp_id)` is ambiguous: when two nodes each
+    /// request a path from the other they both allocate id 1, and each node then
+    /// mistakes the peer's session for its own. That is not hypothetical — it is
+    /// the symmetric case (both sides call `request_ndp`), and it deadlocked one
+    /// direction on air: the node that requested second had its M1 read as a
+    /// duplicate of the responder's own request and never answered.
+    ///
+    /// The NDPE's initiator NDI says which side started the exchange, which is
+    /// exactly the disambiguator: if it is ours we are the initiator, otherwise we
+    /// are the responder.
+    fn ndp_index(&self, peer: [u8; 6], ndpe: &Ndpe) -> Option<usize> {
+        let role = if ndpe.initiator_ndi == self.cfg.ndi {
+            NdpRole::Initiator
+        } else {
+            NdpRole::Responder
+        };
+        self.ndp_index_role(peer, ndpe.ndp_id, role)
+    }
+
+    /// A session by its full identity. The role is part of the key for the reason
+    /// above: a peer's id 1 and ours are different paths.
+    fn ndp_index_role(&self, peer: [u8; 6], ndp_id: u8, role: NdpRole) -> Option<usize> {
         self.ndps
             .iter()
-            .position(|s| s.peer == peer && s.ndp_id == ndp_id)
+            .position(|s| s.peer == peer && s.ndp_id == ndp_id && s.role == role)
     }
 
     /// M1 in: become the responder for a path this peer wants.
@@ -826,7 +850,7 @@ impl NanEngine {
         }
         // A repeat of an M1 we already answered means our M2 was lost — re-send
         // it rather than starting a second session for the same path.
-        if let Some(i) = self.ndp_index(peer, ndpe.ndp_id) {
+        if let Some(i) = self.ndp_index(peer, ndpe) {
             if self.ndps[i].role == NdpRole::Responder
                 && self.ndps[i].state == NdpState::AwaitingConfirm
             {
@@ -852,7 +876,7 @@ impl NanEngine {
 
     /// M2 in: the peer answered our request.
     fn on_ndp_response(&mut self, peer: [u8; 6], ndpe: &Ndpe, step: &mut Step) {
-        let Some(i) = self.ndp_index(peer, ndpe.ndp_id) else {
+        let Some(i) = self.ndp_index(peer, ndpe) else {
             return;
         };
         if self.ndps[i].role != NdpRole::Initiator || self.ndps[i].state != NdpState::AwaitingResponse
@@ -906,7 +930,7 @@ impl NanEngine {
 
     /// M3 in: the initiator confirmed the path we accepted.
     fn on_ndp_confirm(&mut self, peer: [u8; 6], ndpe: &Ndpe, step: &mut Step) {
-        let Some(i) = self.ndp_index(peer, ndpe.ndp_id) else {
+        let Some(i) = self.ndp_index(peer, ndpe) else {
             return;
         };
         let s = &mut self.ndps[i];
@@ -939,7 +963,7 @@ impl NanEngine {
     fn emit_ndp(&mut self, now: Usec, step: &mut Step) {
         let (our_ndi, our_iid) = (self.cfg.ndi, eui64_iid(self.cfg.ndi));
         let auto_accept = self.cfg.ndp_auto_accept;
-        let mut timed_out: Vec<([u8; 6], u8)> = Vec::new();
+        let mut timed_out: Vec<([u8; 6], u8, NdpRole)> = Vec::new();
         let mut frames: Vec<([u8; 6], NafSubtype, Vec<u8>)> = Vec::new();
 
         for s in &mut self.ndps {
@@ -950,7 +974,7 @@ impl NanEngine {
                 && now >= s.retry_at_usec
             {
                 if s.attempts >= NDP_MAX_ATTEMPTS {
-                    timed_out.push((s.peer, s.ndp_id));
+                    timed_out.push((s.peer, s.ndp_id, s.role));
                     continue;
                 }
                 s.pending_tx = Some(NafSubtype::DataPathRequest);
@@ -996,7 +1020,7 @@ impl NanEngine {
             frames.push((s.peer, sub, attrs));
             // A rejected request leaves no session behind.
             if matches!(sub, NafSubtype::DataPathResponse) && !auto_accept {
-                timed_out.push((s.peer, s.ndp_id));
+                timed_out.push((s.peer, s.ndp_id, s.role));
             }
         }
 
@@ -1008,8 +1032,8 @@ impl NanEngine {
             });
         }
 
-        for (peer, ndp_id) in timed_out {
-            if let Some(i) = self.ndp_index(peer, ndp_id) {
+        for (peer, ndp_id, role) in timed_out {
+            if let Some(i) = self.ndp_index_role(peer, ndp_id, role) {
                 let s = self.ndps.remove(i);
                 if s.role == NdpRole::Initiator {
                     step.events.push(NanEvent::NdpFailed {
@@ -1221,6 +1245,51 @@ mod tests {
         );
         assert_eq!(m.a.established_ndps(), 1);
         assert_eq!(m.b.established_ndps(), 1);
+    }
+
+    /// Both sides asking each other for a path at once — the symmetric case, and
+    /// the one a real deployment produces (there is no accept side in the backend
+    /// trait, so each node requests).
+    ///
+    /// Both allocate NDP id 1, because the id is only unique within its
+    /// *initiator's* scope. Keying a session on (peer, id) alone made each node
+    /// mistake the peer's request for its own and refuse to answer it — on air,
+    /// whichever node requested second timed out while the other came up.
+    #[test]
+    fn both_nodes_requesting_at_once_both_get_a_path() {
+        const A_NDI: [u8; 6] = [0x02, 0xaa, 0xaa, 0x00, 0x00, 0x01];
+        const B_NDI: [u8; 6] = [0x02, 0xbb, 0xbb, 0x00, 0x00, 0x02];
+        let a = NanEngine::new(NanConfig::new(A, 6, 200).with_ndi(A_NDI));
+        let b = NanEngine::new(NanConfig::new(B, 6, 180).with_ndi(B_NDI));
+        let mut m = Medium::new(a, b);
+
+        let a_id = m.a.request_ndp(B);
+        let b_id = m.b.request_ndp(A);
+        assert_eq!((a_id, b_id), (1, 1), "both allocate id 1 — that is the trap");
+
+        let (mut a_up, mut b_up) = (0, 0);
+        for _ in 0..300 {
+            let (ae, be) = m.tick(8 * USEC_PER_TU);
+            a_up += ae
+                .iter()
+                .filter(|e| matches!(e, NanEvent::NdpEstablished { .. }))
+                .count();
+            b_up += be
+                .iter()
+                .filter(|e| matches!(e, NanEvent::NdpEstablished { .. }))
+                .count();
+        }
+        // Each node ends up on both sides of a path: initiator of its own, and
+        // responder to the peer's.
+        assert!(a_up >= 2, "A should establish both directions, got {a_up}");
+        assert!(b_up >= 2, "B should establish both directions, got {b_up}");
+        assert_eq!(m.a.established_ndps(), 2);
+        assert_eq!(m.b.established_ndps(), 2);
+        assert!(
+            m.a.ndps.iter().any(|s| s.role == NdpRole::Initiator)
+                && m.a.ndps.iter().any(|s| s.role == NdpRole::Responder),
+            "A holds its own session and the peer's, distinctly"
+        );
     }
 
     /// The IID a peer derives our address from must be the modified EUI-64 of our
