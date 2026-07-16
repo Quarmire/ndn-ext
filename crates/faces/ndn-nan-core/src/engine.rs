@@ -481,6 +481,13 @@ impl NanEngine {
         }
     }
 
+    /// The cluster we are currently a member of. A data path's frames carry this
+    /// as their BSSID: the path lives inside the cluster whose timeline it was
+    /// negotiated on, and a merge moves it.
+    pub fn cluster_id(&self) -> [u8; 6] {
+        self.cluster_id
+    }
+
     /// Our data-interface MAC and its IPv6 interface identifier — what a peer
     /// will address us by once a path is up.
     pub fn local_ndp_identity(&self) -> ([u8; 6], [u8; 8]) {

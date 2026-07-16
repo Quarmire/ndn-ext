@@ -43,6 +43,8 @@ use ndn_face_wifi_aware::{FaceError, FollowupFrame, NanBackend, NanMatch, NanSer
 use ndn_frame_io::{BROADCAST, CapturedFrame, FrameIo, InjectFrame, TxIntent};
 use ndn_nan_core::{NanConfig, NanEngine, NanEvent, RxFrame, ServiceId, service_id};
 use ndn_radio_hal::{Bandwidth, RadioKnobs};
+
+use crate::ndi::{DataInterface, MAX_ETHERNET_FRAME, dot11_to_eth, eth_to_dot11};
 use tokio::sync::mpsc;
 
 pub mod ndi;
@@ -123,6 +125,22 @@ pub fn spawn(
     cfg: NanConfig,
     channel: Option<Arc<dyn RadioChannel>>,
 ) -> Arc<NanDriver> {
+    spawn_with(frame_io, cfg, channel, None)
+}
+
+/// Like [`spawn`], but also **bridges a NAN Data Interface** to the radio.
+///
+/// With an `ndi`, a negotiated data path carries real traffic: Ethernet frames
+/// the kernel writes to the interface go out as 802.11 data frames addressed to
+/// the peer's NDI, and data frames off the air addressed to ours are handed back
+/// up. Without one, the engine still negotiates paths — they just have nothing to
+/// carry traffic over.
+pub fn spawn_with(
+    frame_io: Arc<dyn FrameIo>,
+    cfg: NanConfig,
+    channel: Option<Arc<dyn RadioChannel>>,
+    ndi: Option<Arc<dyn DataInterface>>,
+) -> Arc<NanDriver> {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (fu_tx, fu_rx) = mpsc::unbounded_channel();
     let shared = Arc::new(Shared::default());
@@ -131,6 +149,8 @@ pub fn spawn(
         engine: NanEngine::new(cfg),
         frame_io,
         channel,
+        ndi,
+        ndi_seq: 0,
         cmd_rx,
         fu_tx,
         shared: Arc::clone(&shared),
@@ -197,6 +217,11 @@ struct EngineTask {
     engine: NanEngine,
     frame_io: Arc<dyn FrameIo>,
     channel: Option<Arc<dyn RadioChannel>>,
+    /// The data interface a negotiated path carries traffic over, if bridged.
+    ndi: Option<Arc<dyn DataInterface>>,
+    /// Sequence counter for the data frames we put on air (the engine owns its
+    /// own for management frames).
+    ndi_seq: u16,
     cmd_rx: mpsc::UnboundedReceiver<Command>,
     fu_tx: mpsc::UnboundedSender<FollowupFrame>,
     shared: Arc<Shared>,
@@ -220,6 +245,35 @@ impl EngineTask {
             });
         }
 
+        // NDI pump: the kernel's Ethernet frames, off the interface's blocking fd
+        // on its own thread, into the loop below.
+        let (mut ndi_rx, _pump) = match &self.ndi {
+            Some(ndi) => {
+                let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+                let ndi = Arc::clone(ndi);
+                let h = std::thread::spawn(move || {
+                    let mut buf = [0u8; MAX_ETHERNET_FRAME];
+                    loop {
+                        match ndi.read_frame(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                if tx.send(buf[..n].to_vec()).is_err() {
+                                    break; // engine task gone
+                                }
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "NDI read failed; bridge stopping");
+                                break;
+                            }
+                        }
+                    }
+                });
+                (Some(rx), Some(h))
+            }
+            None => (None, None),
+        };
+
         // Prime: set the channel and schedule the first Discovery Window.
         let mut next_wake = self.poll(base, None).await;
 
@@ -238,6 +292,14 @@ impl EngineTask {
                     Some(cf) => next_wake = self.poll(base, Some(cf)).await,
                     None => break, // reader ended (radio closed)
                 },
+                // `recv()` on an Option<Receiver>: with no NDI this branch is
+                // disabled rather than resolving instantly and spinning the loop.
+                eth = async { ndi_rx.as_mut().unwrap().recv().await }, if ndi_rx.is_some() => {
+                    match eth {
+                        Some(frame) => self.send_ndi_frame(&frame).await,
+                        None => { ndi_rx = None; } // pump thread ended
+                    }
+                }
                 _ = sleep => {
                     next_wake = self.poll(base, None).await;
                 }
@@ -245,11 +307,61 @@ impl EngineTask {
         }
     }
 
+    /// An Ethernet frame the kernel wrote to the NDI → the air.
+    ///
+    /// Data-path traffic is *not* gated on the Discovery Window: a DW is the
+    /// discovery rendezvous, while a negotiated path has its own schedule and the
+    /// peer's NDI is listening. Holding bulk traffic for the next DW would cap it
+    /// at one burst per 512 TU.
+    async fn send_ndi_frame(&mut self, eth: &[u8]) {
+        let cluster = self.engine.cluster_id();
+        self.ndi_seq = self.ndi_seq.wrapping_add(1);
+        let Some(bytes) = eth_to_dot11(eth, cluster, self.ndi_seq) else {
+            return; // not a frame we can carry
+        };
+        let src = self.ndi.as_ref().map(|n| n.mac()).unwrap_or(self.nmi);
+        let frame = InjectFrame {
+            payload: Bytes::from(bytes),
+            // Bulk over a negotiated path: let the radio pick its rate rather
+            // than pinning the most-robust one discovery uses.
+            tx: TxIntent::CONSERVATIVE,
+            dst: BROADCAST,
+            src,
+        };
+        if let Err(e) = self.frame_io.inject(frame).await {
+            tracing::debug!(error = %e, "NDI: inject failed");
+        }
+    }
+
+    /// Hand a captured frame to the NDI if it is data-path traffic for us.
+    ///
+    /// Returns true when the frame was the NDI's, so the caller does not also feed
+    /// it to the engine — one radio, one reader, demuxed by what the frame is.
+    fn deliver_to_ndi(&self, cf: &CapturedFrame) -> bool {
+        let Some(ndi) = &self.ndi else {
+            return false;
+        };
+        let Some(eth) = dot11_to_eth(&cf.payload, ndi.mac()) else {
+            return false;
+        };
+        if let Err(e) = ndi.write_frame(&eth) {
+            tracing::warn!(error = %e, "NDI: write failed");
+        }
+        true
+    }
+
     /// Run one engine `poll`: feed time + an optional captured frame, inject the
     /// resulting frames, apply a channel change, route events, and return the
     /// next wake instant.
     async fn poll(&mut self, base: Instant, inbound: Option<CapturedFrame>) -> Instant {
         let now = base.elapsed().as_micros() as u64;
+        // Demux first: a data frame for our NDI is the data path's, not the
+        // engine's. The engine would ignore it anyway, but the NDI would never
+        // see it — the radio has one reader.
+        let inbound = match inbound {
+            Some(cf) if self.deliver_to_ndi(&cf) => None,
+            other => other,
+        };
         let rx_vec: Vec<RxFrame> = match &inbound {
             Some(cf) => vec![RxFrame {
                 bytes: &cf.payload,
@@ -439,6 +551,141 @@ mod tests {
             .expect("follow-up channel open");
         assert_eq!(got.frame, Bytes::from_static(b"interest-wire"));
         assert_eq!(got.peer, Some(NMI_A));
+    }
+
+    /// A stand-in NDI: no kernel, no root — just the two ends of the bridge.
+    struct FakeNdi {
+        mac: [u8; 6],
+        /// Frames the kernel would be writing out (fed to `read_frame`).
+        outbound: Mutex<std::collections::VecDeque<Vec<u8>>>,
+        /// Frames the bridge handed up to the kernel.
+        delivered: Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl FakeNdi {
+        fn new(mac: [u8; 6]) -> Self {
+            Self {
+                mac,
+                outbound: Mutex::new(std::collections::VecDeque::new()),
+                delivered: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl DataInterface for FakeNdi {
+        fn mac(&self) -> [u8; 6] {
+            self.mac
+        }
+        fn read_frame(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+            // Block like a real fd would, instead of spinning the pump thread.
+            loop {
+                if let Some(f) = self.outbound.lock().unwrap().pop_front() {
+                    buf[..f.len()].copy_from_slice(&f);
+                    return Ok(f.len());
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        fn write_frame(&self, eth: &[u8]) -> std::io::Result<usize> {
+            self.delivered.lock().unwrap().push(eth.to_vec());
+            Ok(eth.len())
+        }
+    }
+
+    /// The bridge's whole purpose: a frame the kernel writes to one node's NDI
+    /// comes out of the other node's NDI, unchanged, over the radio.
+    #[tokio::test]
+    async fn a_frame_written_to_one_ndi_arrives_at_the_peers_ndi() {
+        const A_NDI: [u8; 6] = [0x02, 0xaa, 0xaa, 0x00, 0x00, 0x01];
+        const B_NDI: [u8; 6] = [0x02, 0xbb, 0xbb, 0x00, 0x00, 0x02];
+
+        let bus = LoopbackMonitorBus::new();
+        let a_ndi = Arc::new(FakeNdi::new(A_NDI));
+        let b_ndi = Arc::new(FakeNdi::new(B_NDI));
+        let _a = spawn_with(
+            Arc::new(bus.endpoint(1, -50)),
+            Config::new(NMI_A, 6, 200).with_ndi(A_NDI),
+            None,
+            Some(a_ndi.clone() as Arc<dyn DataInterface>),
+        );
+        let _b = spawn_with(
+            Arc::new(bus.endpoint(2, -50)),
+            Config::new(NMI_B, 6, 180).with_ndi(B_NDI),
+            None,
+            Some(b_ndi.clone() as Arc<dyn DataInterface>),
+        );
+
+        // The kernel on A sends an IPv6 packet to B's NDI.
+        let mut eth = Vec::new();
+        eth.extend_from_slice(&B_NDI);
+        eth.extend_from_slice(&A_NDI);
+        eth.extend_from_slice(&[0x86, 0xdd]);
+        eth.extend_from_slice(b"an ipv6 packet");
+        a_ndi.outbound.lock().unwrap().push_back(eth.clone());
+
+        let got = timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(f) = b_ndi.delivered.lock().unwrap().first().cloned() {
+                    return f;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("B's NDI should receive what A's NDI sent");
+        assert_eq!(got, eth, "the frame arrives byte-identical");
+
+        // And A must not be handed back its own transmission.
+        assert!(
+            a_ndi.delivered.lock().unwrap().is_empty(),
+            "a node's own frames must not come back up its NDI"
+        );
+    }
+
+    /// The radio has one reader. A data frame belongs to the NDI; a management
+    /// frame to the engine. Mixing them would either starve the NDI or feed the
+    /// kernel someone's beacons.
+    #[tokio::test]
+    async fn the_ndi_does_not_swallow_discovery_frames() {
+        const A_NDI: [u8; 6] = [0x02, 0xaa, 0xaa, 0x00, 0x00, 0x01];
+        const B_NDI: [u8; 6] = [0x02, 0xbb, 0xbb, 0x00, 0x00, 0x02];
+        let bus = LoopbackMonitorBus::new();
+        let a_ndi = Arc::new(FakeNdi::new(A_NDI));
+        let b_ndi = Arc::new(FakeNdi::new(B_NDI));
+        let svc = NanServiceName("org.ndn.coord".into());
+
+        let a = spawn_with(
+            Arc::new(bus.endpoint(1, -50)),
+            Config::new(NMI_A, 6, 200).with_ndi(A_NDI),
+            None,
+            Some(a_ndi.clone() as Arc<dyn DataInterface>),
+        );
+        let b = spawn_with(
+            Arc::new(bus.endpoint(2, -50)),
+            Config::new(NMI_B, 6, 180).with_ndi(B_NDI),
+            None,
+            Some(b_ndi.clone() as Arc<dyn DataInterface>),
+        );
+        a.publish(&svc).await.unwrap();
+        a.subscribe(&svc).await.unwrap();
+        b.publish(&svc).await.unwrap();
+        b.subscribe(&svc).await.unwrap();
+
+        // Discovery still works with the bridge in the path...
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if b.drain_matches().iter().any(|m| m.peer == NMI_A) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("discovery must survive the NDI demux");
+
+        // ...and no beacon/SDF was mistaken for data-path traffic.
+        assert!(b_ndi.delivered.lock().unwrap().is_empty());
+        assert!(a_ndi.delivered.lock().unwrap().is_empty());
     }
 
     /// A radio whose only job is to record what it was tuned to.

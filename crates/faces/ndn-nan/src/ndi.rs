@@ -21,8 +21,27 @@
 //! monitor-mode stack has to do it here: on the air a data path is 802.11 data
 //! frames between NDIs, and the kernel's IP stack wants Ethernet.
 
+/// What the bridge needs from a data interface.
+///
+/// A trait rather than the concrete [`NdiInterface`] so the driver's seam stays
+/// platform-neutral (the TAP is Linux-only) and so a test can stand a fake in its
+/// place — the bridge is worth testing without root and a kernel netdev.
+pub trait DataInterface: Send + Sync + 'static {
+    /// Our NDI — the MAC the kernel gave this interface, and the addr1 a peer
+    /// puts on frames meant for us.
+    fn mac(&self) -> [u8; 6];
+    /// Read one Ethernet frame. **Blocking**: the bridge calls this on its own
+    /// thread, because a TAP fd has no async story worth the ceremony here.
+    fn read_frame(&self, buf: &mut [u8]) -> std::io::Result<usize>;
+    /// Write one Ethernet frame up to the kernel.
+    fn write_frame(&self, eth: &[u8]) -> std::io::Result<usize>;
+}
+
 /// `dst(6) | src(6) | ethertype(2)`.
 pub const ETHERNET_HEADER_LEN: usize = 14;
+
+/// An Ethernet frame is at most this big on a 1500-MTU interface (+ header).
+pub const MAX_ETHERNET_FRAME: usize = 1514;
 /// A non-QoS 802.11 data header: `fc(2) dur(2) addr1(6) addr2(6) addr3(6) seq(2)`.
 const DOT11_HEADER_LEN: usize = 24;
 /// QoS data frames carry two more bytes of QoS control.
@@ -340,6 +359,18 @@ mod linux {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(n as usize)
+        }
+    }
+
+    impl super::DataInterface for NdiInterface {
+        fn mac(&self) -> [u8; 6] {
+            self.mac
+        }
+        fn read_frame(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+            NdiInterface::read_frame(self, buf)
+        }
+        fn write_frame(&self, eth: &[u8]) -> std::io::Result<usize> {
+            NdiInterface::write_frame(self, eth)
         }
     }
 
