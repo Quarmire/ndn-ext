@@ -20,8 +20,13 @@
 //! Plus the **data path**: the M1-M4 NDP handshake ([`NanEngine::request_ndp`] ->
 //! [`NanEvent::NdpEstablished`]), which negotiates each side's NAN Data Interface
 //! and IPv6 interface identifier over NAFs. The engine settles *which* addresses a
-//! data path uses; binding a socket to them is the driver's job (and needs an NDI
-//! virtual interface, which does not exist yet).
+//! data path uses; binding a socket to them is the driver's job (`ndn-nan`'s NDI).
+//!
+//! **The data path is an INTEROP bearer, not our data path** — see
+//! `ndn-face-wifi-aware/docs/NAMED_RADIO_COURSE_CORRECTION.md`. NDP addresses by
+//! host (NDI MAC, `fe80::`, UDP port); our own traffic rides `FrameFormat::RawNdn`,
+//! where the name is the addressing. Keep this module name-clean: it settles
+//! addresses and never binds one.
 //!
 //! Full master/anchor election role transitions and multi-channel DWs land in a
 //! later phase - the structure here grows into them.

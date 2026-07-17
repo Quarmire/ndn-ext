@@ -125,6 +125,143 @@ bearer went the wrong way.
 
 ---
 
+## 2.1 The precedent that decides it
+
+This is not a new judgement call. **We already made it, against a bigger prize.**
+
+`ndn-face-monitor-wifi/docs/AMPDU_PORT_SCOPE.md` records rejecting **A-MPDU — a
+proven 179 Mb/s** — on architectural grounds:
+
+> 1. **A-MPDU is unicast + ARQ; the NDN bearer is broadcast + no-ARQ.** … A
+>    broadcast NDN bearer has **no peer and no ACKs**.
+> 2. **It changes the communication model.** Real aggregation ties TX to *one* peer
+>    station, not "any monitor receiver." That breaks the open broadcast/multicast
+>    property that makes named-radio attractive.
+>
+> This is a **bearer-architecture decision** (broadcast vs unicast-with-BA), not
+> just reverse-engineering.
+
+Every clause applies to NDP verbatim: it ties TX to one peer station (NDI MACs +
+negotiated path), it has ACKs (well — it *wants* them; see the retry storm), and it
+is unicast. We turned down 179 Mb/s to protect the broadcast property, then built
+NDP, which spends it. **Same decision, opposite conclusion, three weeks apart.**
+
+And the status table in `named-radio.md:129` lists:
+
+> `| No-host-addressing / verify-on-decode doctrine | built (doctrine) |`
+
+The doctrine is recorded as **built** while a shipped bearer violates it.
+
+## 2.2 The ratified doctrine that pre-empts "regression" — and why it does not cover NAN
+
+The strongest objection is not in the NAN docs; it is in `ndn-rs/ARCHITECTURE.md`,
+and it is **ratified doctrine**, not drift. Two parts.
+
+**(a) The two-tier design is a considered answer to a real limit** (`:357-363`):
+
+> The named-radio faces above are connectionless and small-frame (NAN follow-ups
+> ≤255 B, BLE advertisements ≤~245 B) — fine for presence, discovery, and small
+> Interest/Data, but **lossy for multi-fragment objects**. The high-throughput tier
+> is a **NAN NDP**: a real IPv6 link-local Wi-Fi connection between two peers, over
+> which the node runs UDP.
+
+**(b) The below-the-Face defence** (`:385-388`):
+
+> **It stays data-centric:** once the group forms it is just a multi-access IP
+> subnet … so the host-centric group-owner election lives *below* the Face. Above
+> it, `FaceKind::WifiDirect` faces carry only names —
+
+That is coherent: host-centricity below the Face is invisible above it, so who
+cares. **Attack the doctrine on its own terms, not the artifact.**
+
+**The defence is sound for Wi-Fi Direct and unsound for NAN**, for one reason: with
+Wi-Fi Direct the IP subnet is *the kernel's, and free* — you get a working
+multi-access link by asking. Using it is pragmatism, and the host-centric parts
+genuinely are below a seam we did not write.
+
+With NAN **we wrote the state machine ourselves.** Nobody handed us a subnet. We
+*synthesised* the host addressing by hand — a TAP netdev, an EUI-64, DAD, a
+`fe80::`, a port allocation scheme — while `RawNdn` and `name_group_mac` sat in the
+same workspace. Below-the-Face is a defence for *inheriting* a host-centric layer.
+It is not a licence to *build* one.
+
+And (a)'s premise does not survive contact either: the ≤255 B limit is a property
+of **NAN follow-ups**, not of the radio. `RawNdn` is an 802.11 **data** frame —
+~2300 B, with A-MSDU already shipping on the 8822E. The bulk tier never needed IP;
+it needed a data frame. We reached for a socket because a socket was familiar.
+
+The tell is that `ARCHITECTURE.md` cannot hold both claims at once. At `:327-334`
+it lists `ndn-face-wifi-aware` in the family where:
+
+> the NDN *name* is the only addressing — **no association, no pairing, no host
+> addresses**
+
+and at `:357` it gives that same face an IPv6 link-local and a UDP socket. Both
+sentences are in one document. Only the coordination tier satisfies the first.
+
+## 2.3 The fair counter-argument
+
+The regression was an **explicit trade, not an oversight**, and the note must say
+so. `ndn-face-wifi-aware/src/lib.rs:8-12` designs the split deliberately:
+
+> 1. **service publish/subscribe** → an NDN `DiscoveryProtocol`;
+> 2. **follow-up messages** (small, connectionless) → *this* face, the name-native
+>    **coordination** channel …;
+> 3. **NDP** (NAN data path, IPv6 link-local) → a plain `UdpFace` for **bulk**
+>    (no new transport code — reuses `ndn-face-native`).
+
+The justification is economy: *"no new transport code"*, and
+`NAMED_RADIO_EXPANSION_DESIGN.md:127` — *"the seam is untouched."* That is a real
+argument and it bought a real result.
+
+Note the tell, though: **only #2 is called "name-native."** The doc knew.
+
+**Two things make the correction cheap rather than a rewrite:**
+
+- The regression is **contained in one module**. `ndi.rs`'s own header concedes the
+  cause honestly — *"A kernel/firmware NAN stack does this conversion in the
+  device… **the kernel's IP stack wants Ethernet**"* — i.e. the host-centrism is
+  imposed by the borrowed standard, at the adapter. Meanwhile the engine stays
+  name-clean: it *"settles which addresses a data path uses"* and never binds one.
+  So NDI is a **swappable adapter, not a foundation**.
+- `RawNdn` already exists and needs none of it.
+
+## 2.3 The constructive alternative already ships
+
+The answer to "then what *is* the link-layer address?" is in
+`named-radio-vision-frontier.md:44-51` — a three-layer naming scheme:
+
+> Layer 0 *listen-by-signal-space* (zero bytes — interest = where you tune);
+> Layer 1 *match-by-hash* (truncated BLAKE3 commitment per droplet, for PIT/CS
+> match + hardware filtering, à la name-group MAC); Layer 2 *resolve-by-name* (full
+> name rides the signed Data)
+> … Layer 1 has a real analog already (**`name_group_mac`**).
+
+The link-layer address is a **truncation of the name**, not a host identity — and
+`name_group_mac` ships today. `RADIO_SUBSYSTEM.md:143` states it plainly:
+*"`dst`/`src` are name-derived group MACs, not host IDs."*
+
+And the same doc gives the template for adopting a host-centric standard without
+importing its model (`named-radio-vision-frontier.md:65-70`, on TSCH):
+
+> keep 802.15.4e TSCH machinery but **invert the host-centric parts**: a **cell
+> belongs to a name** … the hop grid is name-keyed
+
+That is the prescription for NAN: **keep sync/DW/SDF, invert NDP.**
+
+Finally, the frontier doc states the thesis in the form the instinct reached for
+(`named-radio-vision-frontier.md:11-19`):
+
+> You don't join a network; you stand where certain names are bright and read by
+> name / write by emitting. *Peers are data too* — a node publishes
+> capability/observation as named signed Data (`/can-serve/…`, reception/spectrum
+> reports), **never "I am device X."**
+
+NDPE advertises *"I am device X, at `fe80::<my EUI-64>`, on port P."* The doctrinal
+violation was written down in advance.
+
+---
+
 ## 3. What was already right (do not rebuild)
 
 - **`FrameFormat::RawNdn`** — the data-centric bearer, already shipped, its own
@@ -263,7 +400,47 @@ which is worth a great deal and is not the same as the differentiated research.
    data-centric thing we have. The rule of three exists so a trait is not "that
    backend's API in a costume".
 
-## 8. The pattern to watch for
+## 8. Why the doctrine did not guard anything
+
+The sweep turned up a structural cause worth more than any single argument here.
+
+**The named-radio doctrine is homeless.** `docs/named-radio.md` and
+`docs/named-radio-vision-frontier.md` — which carry nearly every quote in §1–§3 —
+are **gitignored staging docs**, and the "eventual home" they name
+(`.claude/notes/named-radio/`) **does not exist in the workspace**. Meanwhile
+`NAMED_RADIO_EXPANSION_DESIGN.md` — the phase plan that specified NDP — sits
+in-tree, versioned, and reviewed.
+
+So the doctrine that forbids host addressing is unversioned and unfindable, while
+the plan that violates it is the durable artifact. A doctrine that is not in the
+repo cannot guard the repo. **That asymmetry is the mechanism of the drift**, and
+it is more fixable than any argument: give the doctrine a home in-tree.
+
+Two supporting gaps:
+
+- **`RADIO_SUBSYSTEM.md` never mentions NAN.** The crate doc that contains the
+  "IP radio vs named radio" argument and the NAN data path have never been
+  reconciled in writing — which is likely why nobody noticed.
+- **The `//!` docs of `ndn-nan` and `ndn-nan-core` contain no data-centric framing
+  at all** — pure protocol mechanics — while `ndn-face-monitor-wifi` is saturated
+  with it. The asymmetry in the *code* mirrors the asymmetry in the docs.
+
+## 9. Scope discipline — this is not "start over"
+
+`named-radio-vision-frontier.md:100-108` sets the house style, and it binds this
+note:
+
+> Every grand piece lands on something built: the field's *law* is the suppress
+> predicate (`policy.rs`); its *eyes* are the reception/spectrum reports
+> (`control.rs`) … The vision is **"notice the built pieces are facets of one
+> object," not "start over."**
+
+Accordingly, nothing here proposes deleting working code. NDP/NDI stays, proven, as
+the interop bearer. `RawNdn`, `Rendezvous`, `RadioCapability`, `cclf_elect`,
+`name_group_mac` all already exist — the correction is mostly **re-pointing**, plus
+one honest demotion.
+
+## 10. The pattern to watch for
 
 The rationale caught the engine hardcoding `in_dw`/`dw_index` and called it
 *"foundation-by-accident"*, noting:

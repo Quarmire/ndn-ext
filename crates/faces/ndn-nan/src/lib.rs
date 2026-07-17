@@ -588,10 +588,9 @@ impl EngineTask {
                     rssi_dbm,
                 });
             }
-            // The engine negotiates data paths (Phase 2's M1–M4); turning an
-            // established one into a bound socket for `request_ndp` needs the NDI
-            // virtual interface, which does not exist yet. Trace the outcome so a
-            // negotiated path is observable rather than silently dropped.
+            // `request_ndp` resolves these into a bound socket (see `ndp_link`);
+            // this arm reports paths nobody is waiting on — e.g. one a peer
+            // initiated, which we answered but never asked for.
             NanEvent::NdpEstablished {
                 peer,
                 ndp_id,
