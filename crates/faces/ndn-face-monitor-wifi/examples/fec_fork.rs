@@ -46,6 +46,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mode = std::env::args().nth(1).unwrap_or_else(|| "rx".into());
     let secs: u64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(260);
+    // FK_CH lets a liveness sweep try channels when ch6 looks jammed. Both ends
+    // must agree; monitor-mode injection needs no association, so any channel works.
+    let ch: u8 = std::env::var("FK_CH").ok().and_then(|s| s.parse().ok()).unwrap_or(6);
 
     let b = Rtl8812auBackend::open()?.with_format(FrameFormat::default());
     b.power_on()?;
@@ -56,14 +59,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     b.mac_init_queues()?;
     b.bb_config()?;
     b.rf_config()?;
-    b.set_channel(6)?;
+    b.set_channel(ch)?;
     b.iq_calibrate()?;
     b.lc_calibrate()?;
     b.set_tx_power(0x3f)?;
     b.start_rx_dma()?;
     let b = Arc::new(b);
     b.spawn_rx_pump(1);
-    println!("8812AU pid={:#06x} up on ch6", b.pid());
+    println!("8812AU pid={:#06x} up on ch{ch}", b.pid());
 
     // The face is built with R=0. All parity comes from the plan cell — so a
     // non-zero count on air is proof the plan reached the air, not the constructor.
