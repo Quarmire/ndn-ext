@@ -210,7 +210,35 @@ mod imp {
                 std::process::exit(2);
             }
         };
-        let backend = Arc::new(AfPacketBackend::new(&iface, FrameFormat::default())?);
+        // `<iface>` is a kernel monitor interface; `8812au[:ch]` drives our own
+        // userspace driver instead, so the bench can run on rigs with no kernel
+        // monitor path — and on the exact radios the NAN data path was proved on,
+        // which is what makes a RawNdn-vs-NDP comparison apples-to-apples.
+        let backend: Arc<dyn ndn_frame_io::WifiRadio> = if let Some(rest) =
+            iface.strip_prefix("8812au")
+        {
+            let ch: u8 = rest.strip_prefix(':').and_then(|s| s.parse().ok()).unwrap_or(6);
+            let b = ndn_face_monitor_wifi::Rtl8812auBackend::open()?
+                .with_format(FrameFormat::default());
+            eprintln!("bringing up RTL8812AU pid={:#06x} on ch{ch} …", b.pid());
+            b.power_on()?;
+            b.mac_enable_dma()?;
+            b.init_llt()?;
+            b.download_firmware()?;
+            b.mac_config()?;
+            b.mac_init_queues()?;
+            b.bb_config()?;
+            b.rf_config()?;
+            b.set_channel(ch)?;
+            b.iq_calibrate()?;
+            b.lc_calibrate()?;
+            b.set_tx_power(0x3f)?;
+            b.start_rx_dma()?; // last: calibration re-pauses RX DMA
+            eprintln!("✓ 8812AU up on ch{ch}");
+            Arc::new(b)
+        } else {
+            Arc::new(AfPacketBackend::new(&iface, FrameFormat::default())?)
+        };
         let prefix_name = Name::from_str(&prefix)?;
 
         match mode.as_str() {

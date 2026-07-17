@@ -440,7 +440,56 @@ the interop bearer. `RawNdn`, `Rendezvous`, `RadioCapability`, `cclf_elect`,
 `name_group_mac` all already exist — the correction is mostly **re-pointing**, plus
 one honest demotion.
 
-## 10. The pattern to watch for
+## 10. What I tried to prove — and did not
+
+§2.2 asserts *"the bulk tier needed a data frame, not IP"*, on the grounds that
+`RawNdn` is a ~2300 B data frame. **That assertion is not established.** It was
+tested the same day and the test did not support it.
+
+`monitor_roundtrip bench` (an instrument that already existed — real
+Interest/Data over `MonitorWifiFace` + `LpLinkService`, so NDNLPv2
+fragmentation/reassembly runs on air) was pointed at the two 8812AUs that carry
+the NAN stack, ch6, MCS1:
+
+```
+   size  frags   delivery        run 1 (producer MTU 2296)
+    256      1     12/12
+    800      1     12/12
+   1400      1     12/12
+   2200      1      0/12          ← cliff, and 2200 B is still ONE fragment
+   4000      2      0/12
+   8000      4      0/12
+```
+
+Run 1 reads as a clean **frame-size cliff between 1400 and 2200 B** — note it is
+*not* a fragmentation cliff: 2200 B is a single fragment and it fails. But a second
+run with the producer forced to fragment below the cliff (MTU 1200) **contradicts
+it**: 800 B fell to 0/12 where run 1 delivered 12/12, while 8000 B (8 fragments)
+delivered 1/12. Same sizes, opposite results.
+
+Two runs that disagree measure the rig, not the architecture. So:
+
+- **`ARCHITECTURE.md`'s claim** — connectionless small-frame faces are *"lossy for
+  multi-fragment objects"* — is **not confirmed** (run 2 delivered an 8-fragment
+  object; run 1's failures were not fragmentation).
+- **My counter-claim** — that `RawNdn` carries bulk and therefore NDP was never
+  needed for it — is **not confirmed either**. On this radio, right now, `RawNdn`
+  did not carry >1400 B at all.
+- **Neither bearer is proven for bulk on this hardware.** The NDP path's own on-air
+  proof used ~14-byte datagrams; it has never carried a full-size frame either. The
+  "bulk tier" justification is untested in *both* directions.
+
+This does not rescue NDP — §1's survival test, §2.1's precedent, and §2.2's
+"we built the host addressing ourselves" all stand on their own, and none of them
+depend on throughput. But the *specific* sentence "the bulk tier needed a data
+frame, not IP" is a hypothesis, and is marked as one until the rig is stable enough
+to settle it (see the >1400 B task).
+
+Recorded here because it is the whole method: the same day produced four defects
+that survived reasoning and died on contact with hardware. An architecture note
+that exempts *itself* from that standard is just a nicer-sounding assertion.
+
+## 11. The pattern to watch for
 
 The rationale caught the engine hardcoding `in_dw`/`dw_index` and called it
 *"foundation-by-accident"*, noting:
