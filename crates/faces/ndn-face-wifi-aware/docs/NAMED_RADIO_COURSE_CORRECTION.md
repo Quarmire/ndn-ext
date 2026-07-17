@@ -489,6 +489,51 @@ Recorded here because it is the whole method: the same day produced four defects
 that survived reasoning and died on contact with hardware. An architecture note
 that exempts *itself* from that standard is just a nicer-sounding assertion.
 
+### 10.1 Settled, later the same night — and it inverts the finding
+
+Both failures were **ours**, in our own code, and neither was the bearer:
+
+1. **`MONITOR_MTU` was 24 bytes over the 802.11 ceiling** (`2304 - 8` for LLC/SNAP,
+   forgetting the 24-byte MAC header). A full-MTU LP fragment went on air as 2328 B
+   and the radio dropped it, silently. Objects that fit one short frame were fine;
+   anything that *fragmented* emitted full-size fragments and lost every one.
+   Fixed: 2272 (ndn-rs `e81c9922`). The radio itself is blameless — measured, frames
+   of 2200/2260/2300 B deliver **100%**, and 2312 B+ never arrive, i.e. the cliff is
+   exactly the 802.11 2304 ceiling, correct hardware behaviour.
+2. **The 8812AU never ran its RX pump.** A bulk-IN read was in flight only *during* a
+   `recv_frame` call, so a back-to-back burst of fragments arrived with nothing
+   draining the FIFO. The MT7612 has done this since it was ported; this backend
+   never got it (ndn-ext `7d65d80`).
+
+Result — every row from 2200 B up had been 0/12 in **all four** prior runs, at every
+MTU tried:
+
+```
+   size  frags   delivery
+    800      1     12/12
+   1400      1     12/12
+   2200      2      6/12
+   4000      2      9/12
+   8000      4      5/12
+  16000      8      3/12     <- an 8-fragment object, never delivered before
+```
+
+**So §2.2's premise was right for the wrong reason.** `ARCHITECTURE.md:357` justifies
+the host-centric NDP/IP bulk tier by observing that connectionless small-frame faces
+are *"lossy for multi-fragment objects"* — and they **were**, catastrophically. But
+that was an off-by-24 and a missing reader thread in our own stack, not anything
+intrinsic to name-addressed broadcast. The evidence for importing IP was an artifact
+of two bugs.
+
+What remains is honest physics, not architecture: fitting the multi-fragment rows to
+one per-frame delivery `p` gives `p ~= 0.83` at 2272 B vs `p ~= 1.0` at 1432 B —
+length-dependent PER on an unACKed broadcast with zero retries. That is a
+rate/MTU/FEC tuning question the cognitive plane already exists to answer, and it is
+the same question any broadcast bearer faces. It is not a reason to run IP.
+
+The sentence in §2.2 therefore stands, now with numbers: **the bulk tier needed a
+data frame, not IP.** What it did *not* need was our arithmetic.
+
 ## 11. The pattern to watch for
 
 The rationale caught the engine hardcoding `in_dw`/`dw_index` and called it
