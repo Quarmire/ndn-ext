@@ -17,10 +17,12 @@
 //! consumed each other's blobs; no persistence.
 
 pub mod client;
+pub mod dialer;
 pub mod listener;
 pub mod server;
 
 pub use client::{ClientError, RelayClient};
+pub use dialer::{DialerError, WebRtcDialer};
 pub use listener::{ListenerError, WebRtcListener};
 pub use server::{RelayServer, ServerError};
 
