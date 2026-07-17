@@ -90,6 +90,8 @@ pub mod field;
 pub mod link_fec;
 #[cfg(feature = "link-fec-feature")]
 pub mod link_fec_feature;
+#[cfg(feature = "link-fec-bridge")]
+pub mod link_fec_bridge;
 pub mod metadata;
 #[cfg(feature = "mgmt")]
 pub mod mgmt;

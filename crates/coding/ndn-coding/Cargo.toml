@@ -42,6 +42,12 @@ f2-recode = ["dep:sha2"]
 # is the deployment seam, not in this crate. See the design memo and the
 # doctrine's F3 placement note.
 f3-link = []
+# Bearer-agnostic link-FEC bridge (`LinkFecBridge`): owns generation batching +
+# plan-driven redundancy actuation over any `FrameIo`, so a face (Wi-Fi, LoRa, …)
+# gets plan-driven link FEC without re-hand-rolling the batching task. Pulls
+# ndn-frame-io + tokio; the codec core and the plain feature stay lighter.
+link-fec-bridge = ["link-fec-feature", "dep:ndn-frame-io", "dep:tokio"]
+
 # Link-FEC as a composable `LinkServiceFeature` (`LinkFecFeature`): wraps the
 # `link_fec` codec with generation batching + enable/status so a lossy face can
 # compose FEC alongside reliability + congestion-marking, instead of hand-rolling
@@ -86,6 +92,7 @@ serde                = { workspace = true, features = ["derive"] }
 # endpoint-only runtime deps (optional; enabled by the `endpoint` feature)
 ndn-app              = { workspace = true, optional = true }
 ndn-transport        = { workspace = true, optional = true }
+ndn-frame-io         = { workspace = true, optional = true }
 tokio                = { workspace = true, features = ["rt", "sync", "time", "macros"], optional = true }
 # F2 deps (optional; enabled by `f2-recode` / `f2-recode-face`)
 sha2                 = { workspace = true, optional = true }

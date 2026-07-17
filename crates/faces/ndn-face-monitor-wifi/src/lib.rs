@@ -86,7 +86,7 @@ use std::sync::atomic::{AtomicI8, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
-use ndn_coding::LinkFecFeature;
+use ndn_coding::link_fec_bridge::{GenerationSink, LinkFecBridge};
 use ndn_radio_cognition::TxParams;
 use ndn_signals_core::{LinkSignals, SignalStore};
 use ndn_transport::{
@@ -189,19 +189,33 @@ impl TxBatcher {
     }
 }
 
-/// Link-layer FEC over the radio (see [`MonitorWifiFace::with_link_fec`]). The codec +
-/// generation batching live in `ndn_coding`'s reusable [`LinkFecFeature`] (G7); this face
-/// only adds the radio specifics — pinning each generation's MCS to its first frame and
-/// injecting each coded frame as its **own** MPDU (interleaved — never one generation per
-/// A-MSDU). The RX side feeds captured frames through the feature, recovering up to R
-/// losses per generation without ARQ.
+/// The Wi-Fi radio specifics of link FEC — the one part the bearer-agnostic
+/// [`LinkFecBridge`] delegates: inject each coded frame of a generation as its
+/// **own** MPDU (interleaved — never one generation per A-MSDU), at the MCS pinned
+/// to the frame that opened the generation.
+struct WifiFecSink {
+    backend: Arc<dyn WifiRadio>,
+    dst: [u8; 6],
+    src: [u8; 6],
+}
+
+impl GenerationSink for WifiFecSink {
+    type Pin = McsDescriptor;
+
+    async fn emit(&self, coded: Vec<Bytes>, mcs: &McsDescriptor) {
+        inject_coded(&self.backend, &coded, Some(*mcs), self.dst, self.src).await;
+    }
+}
+
+/// Link-layer FEC over the radio (see [`MonitorWifiFace::with_link_fec`]). The codec,
+/// generation batching, and the plan-driven redundancy actuation live in
+/// `ndn_coding`'s reusable [`LinkFecBridge`]; this face supplies only the Wi-Fi
+/// [`GenerationSink`] (MCS-pinned per-MPDU injection). The RX side feeds captured
+/// frames through the bridge's decoder, recovering up to R losses per generation
+/// without ARQ.
 struct FaceFec {
-    /// Outbound wire frames + the per-frame decided params (MCS, parity count),
-    /// handed to the batching task. Both travel *with* the frame rather than being
-    /// read by the task, so the plan's decision cannot depend on builder call order.
-    tx: tokio::sync::mpsc::UnboundedSender<(Bytes, McsDescriptor, Option<u16>)>,
-    /// The shared FEC feature (decoder side, driven by `recv_bytes`).
-    feature: Arc<LinkFecFeature>,
+    /// Batching + plan-R actuation over the radio; the pin is the per-generation MCS.
+    bridge: LinkFecBridge<McsDescriptor>,
     /// Payloads recovered/delivered by the decoder, awaiting `recv_bytes`.
     pending: std::sync::Mutex<VecDeque<(Bytes, Option<FaceAddr>)>>,
 }
@@ -215,55 +229,17 @@ impl FaceFec {
         redundancy: u16,
         window: Duration,
     ) -> Self {
-        let feature = Arc::new(LinkFecFeature::new(k, redundancy, window));
-        feature.set_enabled(true);
-        let (tx, mut rx_ch) =
-            tokio::sync::mpsc::unbounded_channel::<(Bytes, McsDescriptor, Option<u16>)>();
-        let tx_feature = Arc::clone(&feature);
-        tokio::spawn(async move {
-            // The whole generation rides the MCS of the frame that opened it (parity must
-            // match), and the window is anchored at that frame, not reset per arrival.
-            let mut gen_mcs: Option<McsDescriptor> = None;
-            let mut gen_deadline: Option<tokio::time::Instant> = None;
-            loop {
-                let coded = match gen_deadline {
-                    None => match rx_ch.recv().await {
-                        Some((w, mcs, parity)) => {
-                            gen_mcs = Some(mcs);
-                            gen_deadline = Some(tokio::time::Instant::now() + window);
-                            // Pin the plan's parity count for exactly the same reason the
-                            // MCS is pinned: R is a property of the whole generation (the
-                            // receiver recovers K from any K of N), so it may only move at
-                            // a generation boundary — which is here, the frame that opens
-                            // one. Mid-generation frames carry their own decided parity and
-                            // it is deliberately ignored, like their MCS.
-                            if let Some(r) = parity {
-                                tx_feature.set_redundancy(r);
-                            }
-                            tx_feature.on_send(w)
-                        }
-                        None => break, // sender dropped
-                    },
-                    Some(deadline) => match tokio::time::timeout_at(deadline, rx_ch.recv()).await {
-                        Ok(Some((w, _, _))) => tx_feature.on_send(w),
-                        Ok(None) => {
-                            // Sender dropped mid-generation — flush the remainder and exit.
-                            let last = tx_feature.flush();
-                            inject_coded(&backend, &last, gen_mcs, dst, src).await;
-                            break;
-                        }
-                        Err(_) => tx_feature.flush(), // window elapsed → tail flush
-                    },
-                };
-                inject_coded(&backend, &coded, gen_mcs, dst, src).await;
-                // A completed/flushed generation empties the buffer → start fresh.
-                gen_deadline = (tx_feature.pending_len() > 0)
-                    .then(|| gen_deadline.unwrap_or_else(|| tokio::time::Instant::now() + window));
-            }
-        });
+        // The generation loop, the window flush, and the plan-driven R actuation
+        // are all in the bearer-agnostic bridge now (task #33); this face supplies
+        // only the Wi-Fi injection (MCS pinned per generation).
+        let bridge = LinkFecBridge::spawn(
+            WifiFecSink { backend, dst, src },
+            k,
+            redundancy,
+            window,
+        );
         FaceFec {
-            tx,
-            feature,
+            bridge,
             pending: std::sync::Mutex::new(VecDeque::new()),
         }
     }
@@ -631,10 +607,7 @@ impl Transport for MonitorWifiFace {
         // Link-FEC: enqueue the wire frame; the flush task groups a generation,
         // emits K+R coded frames (one MPDU each, interleaved), recovers losses.
         if let Some(fec) = &self.fec {
-            return fec
-                .tx
-                .send((wire, mcs, self.planned_redundancy()))
-                .map_err(|_| FaceError::Closed);
+            return fec.bridge.send(wire, mcs, self.planned_redundancy());
         }
         // The exact resolved rate travels alongside the frame (via inject_at /
         // the batcher), not on the intent — the frame's tx is a placeholder.
@@ -670,7 +643,7 @@ impl Transport for MonitorWifiFace {
                 let addr = f.addr.map(FaceAddr::Ether);
                 // The feature delivers a plain frame as-is, a source frame immediately,
                 // and recovered sources when parity completes a generation (0, 1, or many).
-                let delivered = fec.feature.on_recv(f.payload);
+                let delivered = fec.bridge.decode(f.payload);
                 if delivered.is_empty() {
                     continue; // parity that didn't complete a generation yet
                 }
