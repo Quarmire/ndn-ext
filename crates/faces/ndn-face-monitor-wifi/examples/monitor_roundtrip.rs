@@ -6,14 +6,18 @@
 //!
 //!   # board A — producer: answers /bench/rt/<size>/<seq> with <size> bytes,
 //!   # the size is read from the name so one producer serves the whole sweep.
-//!   sudo ./monitor_roundtrip <iface> respond /bench/rt [mtu=2296]
+//!   # `mcs` sets the rate the *Data* goes out at — the only rate a p(len, mcs)
+//!   # sweep can learn anything from. Omit it to keep the face's default.
+//!   sudo ./monitor_roundtrip <iface> respond /bench/rt [mtu=2272] [mcs]
 //!
 //!   # board B — consumer (ad-hoc): fetch COUNT objects of one SIZE
 //!   sudo ./monitor_roundtrip <iface> fetch /bench/rt [size=4000] [count=20] [mcs=1]
 //!
 //!   # board B — consumer (goodput sweep): sweep object sizes, print a table of
 //!   # delivery% / RTT / goodput / est. fragments — the MTU-bump A/B instrument.
-//!   sudo ./monitor_roundtrip <iface> bench /bench/rt [count=40] [mcs=1] [prod_mtu=2296]
+//!   # NOTE its `mcs` is the CONSUMER's (Interests only); set the producer's on
+//!   # board A. Judge by delivery%, not the goodput column — see below.
+//!   sudo ./monitor_roundtrip <iface> bench /bench/rt [count=40] [mcs=1] [prod_mtu=2272]
 //!
 //! There is no forwarder in the path — this drives the Face directly. The
 //! bytes on the air are spec NDN-over-NDNLPv2: `LpLinkService::send` LP-wraps
@@ -49,7 +53,17 @@ mod imp {
         }
         if let Some(h) = extract_fragment(raw) {
             let frag = raw.slice(h.frag_start..h.frag_end);
-            return reasm.process(0, h.sequence, h.frag_index, h.frag_count, frag);
+            // Key on the GROUP's base sequence, not the raw wire one. Fragment `i`
+            // carries `base + i`, so keying on the raw value files every fragment
+            // of one packet under its own key and the group never completes — and
+            // because a sender's sequence ranges used to overlap between packets,
+            // the collisions instead completed groups stitched out of two
+            // different objects, which decode fine and were counted as delivered.
+            // That is what made every multi-fragment number this bench ever
+            // printed a fiction (found 2026-07-16). The engine's decode stage does
+            // this correctly; see ndn-packet/tests/reassembly_key.rs.
+            let base_seq = h.sequence.checked_sub(h.frag_index)?;
+            return reasm.process(0, base_seq, h.frag_index, h.frag_count, frag);
         }
         // Single-fragment LpPacket: pull the inner Fragment (0x50) TLV value.
         let (_t, tn) = ndn_tlv::read_varu64(raw).ok()?;
@@ -256,12 +270,30 @@ mod imp {
                     .get(3)
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(ndn_face_monitor_wifi::MONITOR_MTU);
-                let face = MonitorWifiFace::new(FaceId(1), backend)
-                    .with_mtu(mtu)
-                    .into_face();
+                // The producer's MCS is the one that matters for a p(len, mcs)
+                // sweep: the Data frames are the big ones. `bench`'s mcs arg sets
+                // the *consumer's* rate, which only ever carries small Interests —
+                // sweeping that alone moves nothing and yields a flat curve that
+                // reads like "rate doesn't matter".
+                let mcs: Option<u8> = args.get(4).and_then(|s| s.parse().ok());
+                let mut f = MonitorWifiFace::new(FaceId(1), backend).with_mtu(mtu);
+                if let Some(index) = mcs {
+                    f = f.with_fixed_mcs(McsDescriptor {
+                        index,
+                        short_gi: false,
+                        vht: false,
+                        nss: 1,
+                        stbc: false,
+                        ldpc: false,
+                    });
+                }
+                let face = f.into_face();
                 let mut reasm = ReassemblyBuffer::new(Duration::from_secs(2));
                 let prefix_len = prefix_name.components().len();
-                println!("responding under {prefix}/<size>/<seq> at MTU {mtu} on {iface} …");
+                println!(
+                    "responding under {prefix}/<size>/<seq> at MTU {mtu}, MCS {} on {iface} …",
+                    mcs.map(|m| m.to_string()).unwrap_or_else(|| "default".into())
+                );
                 loop {
                     let frame = face.link_service.recv(face.transport.as_ref()).await?;
                     let Some(pkt) = decapsulate(&frame.wire, &mut reasm) else {

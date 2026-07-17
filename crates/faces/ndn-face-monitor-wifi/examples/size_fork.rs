@@ -108,11 +108,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (b0, n) in &parsed_hist {
         println!("    ~{b0:>5} B  x{n}");
     }
-    if raw_hist.keys().any(|k| *k >= 2000) && !parsed_hist.keys().any(|k| *k >= 2000) {
-        println!("\n  => big frames ARRIVE but do not parse: the bug is RX PARSE.");
-    } else if !raw_hist.keys().any(|k| *k >= 2000) {
-        println!("\n  => nothing big ever arrives: the bug is TX (or RX DMA).");
-    }
+    // Only one histogram is populated per run (one reader), so a verdict can only
+    // come from comparing two runs — `rxraw` then `rx`. Printing one here read
+    // "big frames ARRIVE but do not parse" on EVERY rxraw run, because the parsed
+    // histogram is empty by construction. A probe that always reaches the same
+    // conclusion is not evidence (found 2026-07-16).
+    let hist = if raw_mode { &raw_hist } else { &parsed_hist };
+    let big = hist.keys().any(|k| *k >= 2000);
+    println!(
+        "\n  {} saw {} big (>=2000 B) frames. Run the other mode and compare:\n  \
+         big in rxraw but not in rx -> the bug is RX PARSE.\n  \
+         big in neither             -> the bug is TX (or RX DMA).",
+        if raw_mode { "rxraw" } else { "rx" },
+        if big { "SOME" } else { "NO" },
+    );
     Ok(())
 }
 

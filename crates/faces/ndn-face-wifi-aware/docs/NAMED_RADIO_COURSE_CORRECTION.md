@@ -472,6 +472,13 @@ the NAN stack, ch6, MCS1:
    8000      4      0/12
 ```
 
+> **Read this table as history, not data (see §10.2).** Its single-fragment rows
+> (256/800/1400 B) are sound, and the 2200 B cliff was real — that one was the
+> `MONITOR_MTU` off-by-24. But every *multi-fragment* row here came from a bench
+> that could not reassemble correctly, so those numbers measured the instrument.
+> The narrative below is kept because the reasoning it triggered was right; the
+> figures were not.
+
 Run 1 reads as a clean **frame-size cliff between 1400 and 2200 B** — note it is
 *not* a fragmentation cliff: 2200 B is a single fragment and it fails. But a second
 run with the producer forced to fragment below the cliff (MTU 1200) **contradicts
@@ -516,31 +523,65 @@ Both failures were **ours**, in our own code, and neither was the bearer:
    draining the FIFO. The MT7612 has done this since it was ported; this backend
    never got it (ndn-ext `7d65d80`).
 
-Result — every row from 2200 B up had been 0/12 in **all four** prior runs, at every
-MTU tried:
-
-```
-   size  frags   delivery
-    800      1     12/12
-   1400      1     12/12
-   2200      2      6/12
-   4000      2      9/12
-   8000      4      5/12
-  16000      8      3/12     <- an 8-fragment object, never delivered before
-```
-
 **So §2.2's premise was right for the wrong reason.** `ARCHITECTURE.md:357` justifies
 the host-centric NDP/IP bulk tier by observing that connectionless small-frame faces
 are *"lossy for multi-fragment objects"* — and they **were**, catastrophically. But
 that was an off-by-24 and a missing reader thread in our own stack, not anything
 intrinsic to name-addressed broadcast. The evidence for importing IP was an artifact
-of two bugs.
+of our own bugs.
 
-What remains is honest physics, not architecture: fitting the multi-fragment rows to
-one per-frame delivery `p` gives `p ~= 0.83` at 2272 B vs `p ~= 1.0` at 1432 B —
-length-dependent PER on an unACKed broadcast with zero retries. That is a
-rate/MTU/FEC tuning question the cognitive plane already exists to answer, and it is
-the same question any broadcast bearer faces. It is not a reason to run IP.
+### 10.2 Then the instrument turned out to be lying too (2026-07-16, task #27)
+
+The first version of this section printed a delivery table and fit it to a
+*length-dependent* per-frame `p` — `0.83` at 2272 B vs `1.0` at 1432 B — and called
+that "honest physics, not architecture". **It was neither.** Two more bugs, both
+ours, both in the fragmentation path:
+
+3. **`LpLinkService::send` advanced its fragment sequence counter by 1 per packet**,
+   though `fragment_packet` stamps `base + i` on fragment `i` and so consumes `n`
+   sequences. Consecutive fragmented packets overlapped in sequence space. NDNLPv2
+   requires `Sequence` unique per link, and `LpReliability` Acks *are* those numbers.
+4. **`monitor_roundtrip`'s own `decapsulate` keyed reassembly on the raw wire
+   sequence**, not `sequence - frag_index`. The engine's decode stage always did this
+   correctly; the bench never did.
+
+Together they are worse than either alone: the overlap made fragments of *different
+objects* collide on one key and complete a group that was never sent — a packet
+stitched from two objects, which decodes fine and counts as a delivery. So every
+multi-fragment row this bench ever printed was fiction, and the "length-dependent
+PER" it implied was an artifact of the measurement, not a property of the radio.
+`ndn-packet/tests/reassembly_key.rs` proves both, including the stitching.
+
+Re-measured with all four fixed — two OPis at -52 dBm, 3 runs/cell, the producer's
+MTU verified from its own log rather than from the argument passed to it:
+
+```
+   size  frags@2272   delivery /30      (MTU 1024 -> 1450 -> 2272)
+   1400      1          29/30           30/30  30/30  29/30
+   2200      2          29/30           27/30  27/30  29/30
+   4000      2          29/30           24/30  27/30  29/30
+   8000      4          22/30           18/30  25/30  22/30
+  16000      8          17/30           15/30  16/30  17/30
+```
+
+**There is no length-dependent PER.** `burst_fork` fixed the size and varied only the
+inter-frame gap: 26-30/30 in every cell, 800 B and 2260 B alike, a 30-frame
+back-to-back burst as good as one paced 4 ms apart. Fitted per-frame `p ~= 0.93-0.98`
+independent of both frame length and MTU. Delivery is just `p^n`, so fewer fragments
+always wins and a bigger MTU is better-or-equal in every row — no crossover, hence no
+name-dependent MTU optimum. Task #27 was written to build that knob; the knob does
+not exist to be built, and `ndn-radio-cognition/src/plan.rs` records why.
+
+The conclusion of §10.1 stands and is now on real evidence: **name-addressed
+broadcast carries multi-fragment objects**, and the residual loss is ordinary
+per-frame PER on an unACKed bearer — what `link_fec_redundancy` is for, and not a
+reason to run IP.
+
+The lesson generalizes past this bearer. Four times now the argument for host-centric
+machinery has rested on a measurement of our own defects, and twice the defect was in
+the instrument rather than the thing measured. Before any future tier, transport, or
+knob is justified by "the named path can't do X" — check that the thing reporting X
+can be trusted.
 
 The sentence in §2.2 therefore stands, now with numbers: **the bulk tier needed a
 data frame, not IP.** What it did *not* need was our arithmetic.

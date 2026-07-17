@@ -31,6 +31,34 @@ pub struct TxParams {
     pub rate: RateParams,
 }
 
+// NO per-name frame-length / MTU knob lives here, and that is a measured decision
+// (2026-07-16, task #27) rather than an omission.
+//
+// The case for one was a length-dependent PER: if longer frames are likelier to
+// die, an `Urgent` name should ask for short frames and a `Bulk` name for long
+// ones, and no single MTU serves both. On air, between two OPis at -52 dBm:
+//
+//   * `burst_fork` fixed the frame size and varied only the inter-frame gap.
+//     Every cell landed 26-30/30 — 800 B and 2260 B alike, a 30-frame
+//     back-to-back burst as well as one paced 4 ms apart. Per-frame p ~= 0.93
+//     with no length term and no burst term.
+//   * The object sweep then fit p ~= 0.93-0.98 per frame at BOTH a 1024 B and a
+//     2272 B MTU. Delivery is p^n, so the only lever is minimizing n, and a
+//     bigger MTU was better-or-equal in every row (4000 B: 24/30 at MTU 1024 ->
+//     29/30 at 2272). There is no crossover, so there is no name-dependent
+//     optimum: max MTU always wins.
+//
+// The 0.83 that motivated the knob was an artifact of the bench, which keyed
+// reassembly on the raw LP sequence and stitched fragments of different objects
+// together (ndn-packet/tests/reassembly_key.rs). Building this knob would have
+// been building a control surface to dodge our own bug — the NDP bulk tier again
+// (NAMED_RADIO_COURSE_CORRECTION.md §10.1). Add it if a weak-link test ever shows
+// a real length term at the margin; the strong-link regime does not have one.
+//
+// The name-dependent lever that IS real for multi-fragment objects is
+// `link_fec_redundancy` above: at 8-17 fragments even p = 0.95 leaves 40-66%
+// delivery, and an outer code fixes that with no peer to ACK.
+
 /// The bearer-specific PHY knobs. A radio matches on its own variant; there is no cross-bearer field.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum RateParams {
