@@ -6,7 +6,10 @@
 //! *best-of-both*: faithful to the thesis message set and crypto, over a modern
 //! substrate (reflexive forwarding for the reverse route, `ndn-coding` FEC for
 //! the no-ARQ bearer, `ndn-signals-core` for adaptation, name-group MAC
-//! couplings). See `.claude/notes/named-radio/ndn-pipes-v2-best-of-both-*.md`.
+//! couplings). The note this used to cite
+//! (`.claude/notes/named-radio/ndn-pipes-v2-best-of-both-*.md`) was never in the
+//! workspace — that directory does not exist and the file is not recoverable
+//! (checked 2026-07-16); the message set below is the durable record.
 //!
 //! The message set (Tables 3–10): SEEK / HIDE / JOIN / CONTEXT / LINK / PIPE /
 //! CHECK / TEARDOWN. This crate currently lands the **foundation** — the

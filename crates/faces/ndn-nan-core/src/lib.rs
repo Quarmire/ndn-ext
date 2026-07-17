@@ -11,9 +11,9 @@
 //! laptop and on an ESP32. See the design doc
 //! (`ndn-face-wifi-aware/docs/NAMED_RADIO_EXPANSION_DESIGN.md`).
 //!
-//! ## Phase 0 scope (this module set)
+//! ## Scope (this module set)
 //!
-//! The wire layer only:
+//! The wire layer:
 //! - [`wire`] — little-endian read/write primitives over byte buffers.
 //! - [`attr`] — the NAN attribute TLV format (`id | len_le16 | body`) and the
 //!   sync/discovery-critical typed attributes (Master Indication, Cluster,
@@ -24,8 +24,20 @@
 //! - [`service`] — the NAN service-ID hash (first 6 bytes of SHA-256 of the
 //!   lowercased service name), byte-identical to Android `WifiAwareManager`.
 //!
-//! The sans-I/O sync/election/discovery state machine lands in Phase 1 on top of
-//! this layer.
+//! And the state machine that sits on top of it:
+//! - [`engine`] — the sans-I/O sync/discovery/data-path state machine. Discovery
+//!   and coordination against a stock Wi-Fi Aware device are shipped (proven on
+//!   air, mutually, against a Samsung S23), as is the M1-M4 NDP handshake that
+//!   settles a data path's addresses. Full master/anchor election role
+//!   transitions and multi-channel Discovery Windows are not yet built.
+//! - [`rendezvous`] — the pluggable rendezvous strategy the engine schedules
+//!   against ([`rendezvous::DiscoveryWindow`] for NAN's 512/16-TU clock,
+//!   [`rendezvous::AlwaysOn`] for radios that never sleep). Lifted out of the
+//!   engine so the DW clock is a choice rather than a hardcoded assumption.
+//!
+//! Note that the NDP data path the engine negotiates is an **interop bearer**,
+//! not this stack's own data path — see
+//! `ndn-face-wifi-aware/docs/NAMED_RADIO_COURSE_CORRECTION.md`.
 //!
 //! ## Wire facts (interop-critical; verified against opennan + the Wireshark
 //! `wifi_nan` dissector)

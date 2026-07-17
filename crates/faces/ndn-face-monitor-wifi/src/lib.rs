@@ -1,10 +1,23 @@
 //! Connectionless **802.11 monitor-mode** face — a named-radio bearer over raw
 //! WiFi injection.
 //!
-//! **Architecture & concepts: see [`docs/RADIO_SUBSYSTEM.md`](../docs/RADIO_SUBSYSTEM.md)** —
-//! the two seams ([`FrameIo`] data plane / [`RadioKnobs`] control plane), how a
-//! radio is a *pool of capability* rather than an IP interface, how this binds to
-//! `ndn-rs`, the per-chip device details, and the recipe for adding a backend.
+//! **Architecture & concepts: see `docs/RADIO_SUBSYSTEM.md`** — the two seams
+//! ([`FrameIo`] data plane / [`RadioKnobs`] control plane), how a radio is a
+//! *pool of capability* rather than an IP interface, how this binds to `ndn-rs`,
+//! the per-chip device details, and the recipe for adding a backend. (That file
+//! is a local staging note and is gitignored — it is not in a clone.)
+//!
+//! **Doctrine: see `docs/named-radio.md`** (tracked), with the frontier ideas in
+//! `docs/named-radio-vision-frontier.md` and the authoritative correction in
+//! `../ndn-face-wifi-aware/docs/NAMED_RADIO_COURSE_CORRECTION.md`. Those three
+//! carry the rules this crate exists to honour: the NDN *name* is the addressing,
+//! you do not join a network, and a peer publishes capability as named signed
+//! Data (`/can-serve/…`) — never "I am device X." Read them before adding a
+//! bearer. A design that reintroduces host addressing (MAC/EUI-64/IP/ports) is
+//! legitimate only as an **interop** bearer for peers we do not control, and must
+//! say so; our own traffic rides [`FrameFormat::RawNdn`]. This doctrine was
+//! gitignored until 2026-07-16, which is exactly how an in-tree, reviewed design
+//! came to contradict it unremarked.
 //!
 //! This is the data-centric reframing of wfb-ng: monitor mode + raw frame
 //! injection, with the host-centric parts (association, MAC addressing, ARQ)

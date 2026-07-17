@@ -416,6 +416,17 @@ the plan that violates it is the durable artifact. A doctrine that is not in the
 repo cannot guard the repo. **That asymmetry is the mechanism of the drift**, and
 it is more fixable than any argument: give the doctrine a home in-tree.
 
+*Fixed (2026-07-16), task #24.* The culprit was a single directory-local
+`crates/faces/ndn-face-monitor-wifi/docs/.gitignore` containing a bare `*`, which
+ignored the whole docs dir including itself. Both doctrine files, and
+`RADIO_SUBSYSTEM.md` (which carries the §2 "IP radio vs named radio" argument), are
+now tracked by explicit negations; `*` still covers the captures, blobs, and
+bring-up logs the rule exists for. The two paragraphs above are kept as the
+diagnosis — the asymmetry was real and is the best structural argument in this
+note — but they no longer describe the tree. `.claude/notes/named-radio/` still
+does not exist and is no longer anyone's "eventual home"; the doctrine's home is
+the docs dir it was already sitting in.
+
 Two supporting gaps:
 
 - **`RADIO_SUBSYSTEM.md` never mentions NAN.** The crate doc that contains the
@@ -541,6 +552,15 @@ The rationale caught the engine hardcoding `in_dw`/`dw_index` and called it
 
 > The real foundation is the seam we already have **and then immediately
 > violated**: `poll(now, heard) → { tx, wake_at }`
+
+*That specific one is fixed (2026-07-16):* rendezvous was lifted out of the engine
+into a strategy — `ndn-nan-core/src/rendezvous.rs` defines a `Rendezvous` trait
+(`in_window` / `window_index` / `next_window_start`) over the cluster-synced clock,
+with `DiscoveryWindow` (the duty-cycled NAN default) and `AlwaysOn` (mains/SDR,
+never sleeps) as two deliberately dissimilar implementations. The schedule is now
+policy plugged into `poll(now, heard) → {tx, wake_at}`, which is what the rationale
+asked for. It is cited here as the *pattern*, not as an open defect — and the
+pattern is what survives the fix:
 
 Same shape, again: we built `RawNdn` (name-addressed), then built a second bearer
 that host-addresses. **Building the right seam does not prevent violating it.** The

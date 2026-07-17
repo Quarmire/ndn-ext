@@ -27,9 +27,32 @@
 //! - `broadcast` → queue a follow-up to every matched peer.
 //! - `next_followup` → await the next follow-up the task delivered.
 //! - `drain_matches` → take the discovered peers the task accumulated.
+//! - `request_ndp` → run the M1-M4 NDP handshake to a peer and return an
+//!   [`NdpLink`] whose socket is **already bound** to our end of the link-local
+//!   pair the handshake settled. Wrap it in a `UdpFace` to reach a stock Wi-Fi
+//!   Aware peer, which speaks IPv6/UDP and nothing else. This is an interop
+//!   bearer, not this stack's data path — our own traffic rides
+//!   `FrameFormat::RawNdn`, where the name is the addressing.
 //!
 //! A separate reader task forwards captured frames into the engine task, so the
 //! engine loop's `select!` never has to cancel a half-completed `recv_frame`.
+//!
+//! ## The data path (NDP / NDI)
+//!
+//! [`spawn_with`] takes an optional [`ndi::DataInterface`] — a TAP device whose
+//! MAC *is* our NAN Data Interface, so the kernel gives it exactly the `fe80::`
+//! address the handshake advertised. The engine task bridges it both ways:
+//! Ethernet frames the kernel writes to the interface go on the air as 802.11
+//! data frames addressed to the peer's NDI, and data frames off the air addressed
+//! to ours are handed back up. That conversion is what a kernel/firmware NAN stack
+//! does inside the device; a userspace monitor-mode stack does it in [`ndi`].
+//! Without an NDI the engine still negotiates paths — they just have nothing to
+//! carry traffic over, and `request_ndp` is refused.
+//!
+//! **NDP is an interop bearer, not our data path.** It addresses by host (NDI MAC,
+//! `fe80::`, UDP port); our own traffic rides `FrameFormat::RawNdn`, where the NDN
+//! name is the addressing. See
+//! `ndn-face-wifi-aware/docs/NAMED_RADIO_COURSE_CORRECTION.md`.
 //!
 //! [`drain_matches`]: ndn_face_wifi_aware::NanBackend::drain_matches
 

@@ -6,7 +6,12 @@
 //! name-driven control plane — a *data-centric MAC* — rather than a drawer of
 //! static point-to-point knobs (which would make the radio wfb-ng).
 //!
-//! Design: `.claude/notes/named-radio/cross-layer-cognitive-stack-2026-06-15.md`.
+//! Design: the note this used to cite
+//! (`.claude/notes/named-radio/cross-layer-cognitive-stack-2026-06-15.md`) was never
+//! in the workspace — that directory does not exist and the file is not recoverable
+//! (checked 2026-07-16). The surviving statement of the argument is
+//! `ndn-face-monitor-wifi/docs/RADIO_SUBSYSTEM.md` §2-§3, and the doctrine it
+//! answers to is `ndn-face-wifi-aware/docs/NAMED_RADIO_COURSE_CORRECTION.md`.
 //!
 //! ## The loop
 //! - **SENSE** ([`MediumState`]) — the unified, **MRMC-native** cross-layer medium

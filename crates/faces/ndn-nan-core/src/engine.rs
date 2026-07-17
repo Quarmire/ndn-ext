@@ -1,4 +1,4 @@
-//! The sans-I/O NAN state machine (Phase 1 MVP).
+//! The sans-I/O NAN state machine.
 //!
 //! [`NanEngine`] is a pure function of (time, inbound frames) → (outbound
 //! frames, channel, events, next-wake). It owns **no** sockets, async, or clock:
@@ -10,12 +10,18 @@
 //!
 //! ## Scope
 //!
-//! Discovery + coordination with a stock Wi-Fi Aware device: a 512/16-TU
-//! Discovery-Window clock; software-TSF sync to received beacons (one-shot jam to
-//! a higher-ranked cluster); per-DW emission of a sync beacon (Master Indication +
+//! Discovery + coordination with a stock Wi-Fi Aware device — shipped, and proven
+//! mutually on air against a Samsung S23 over our own userspace RTL8812AU driver:
+//! software-TSF sync to received beacons (one-shot jam to a higher-ranked
+//! cluster); per-rendezvous emission of a sync beacon (Master Indication +
 //! Cluster) plus a Service Discovery Frame carrying our active publish/subscribe
 //! Service Descriptors; service-ID matching of received SDAs; and unicast
 //! follow-up send/receive.
+//!
+//! *When* to wake is not the engine's to decide: the rendezvous schedule is a
+//! strategy ([`crate::rendezvous`]) — [`DiscoveryWindow`] for NAN's 512/16-TU
+//! clock, `AlwaysOn` for a radio that never sleeps. The engine asks it, so the
+//! DW clock is interop with NAN rather than an assumption baked into the core.
 //!
 //! Plus the **data path**: the M1-M4 NDP handshake ([`NanEngine::request_ndp`] ->
 //! [`NanEvent::NdpEstablished`]), which negotiates each side's NAN Data Interface
@@ -28,8 +34,8 @@
 //! where the name is the addressing. Keep this module name-clean: it settles
 //! addresses and never binds one.
 //!
-//! Full master/anchor election role transitions and multi-channel DWs land in a
-//! later phase - the structure here grows into them.
+//! Full master/anchor election role transitions and multi-channel DWs are still
+//! unbuilt - the structure here grows into them.
 
 use alloc::boxed::Box;
 use alloc::collections::{BTreeSet, VecDeque};
@@ -54,8 +60,8 @@ pub struct NanConfig {
     /// Our NAN management-interface MAC (the addr2 of every frame we send). NMIs
     /// rotate for privacy in a full stack; here it's a stable local identifier.
     pub nmi: [u8; 6],
-    /// Master preference (0–255). Higher wins election; the MVP advertises this
-    /// but does not run role transitions.
+    /// Master preference (0–255). Higher wins election; the engine advertises
+    /// this but does not yet run role transitions.
     pub master_preference: u8,
     /// Random factor (0–255), the election tiebreak below preference.
     pub random_factor: u8,

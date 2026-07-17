@@ -3,21 +3,44 @@
 //! Wi-Fi Aware / Neighbor Awareness Networking is AP-less, association-less, and
 //! its native primitive is publish/subscribe by service *name* — NDN's model in
 //! silicon. NAN exposes three primitives that map to three different NDN seams
-//! (see `.claude/notes/named-radio/wifi-aware-face-design-2026-05-23.md`):
+//! (see `docs/NAMED_RADIO_EXPANSION_DESIGN.md` for the phase plan and
+//! `docs/NAMED_RADIO_COURSE_CORRECTION.md` for the doctrine it is reviewed
+//! against):
 //!
-//! 1. **service publish/subscribe** → an NDN `DiscoveryProtocol` (later phase);
+//! 1. **service publish/subscribe** → an NDN `DiscoveryProtocol` — built:
+//!    [`NanDiscovery`] turns service matches into FIB routes;
 //! 2. **follow-up messages** (small, connectionless) → *this* face, the
 //!    name-native **coordination** channel carrying Interests + small Data;
-//! 3. **NDP** (NAN data path, IPv6 link-local) → a plain `UdpFace` for **bulk**
-//!    (later phase; no new transport code — reuses `ndn-face-native`).
+//! 3. **NDP** (NAN data path, IPv6 link-local) → a plain `UdpFace` — built:
+//!    [`NanBackend::request_ndp`] runs the M1-M4 handshake and returns an
+//!    [`NdpLink`] with a bound socket, and no new transport code was needed (it
+//!    reuses `ndn-face-native`). Read the proof narrowly: two OPis exchanged
+//!    ~14-byte datagrams over `ndn-nan`'s NDI. No bulk transfer has crossed an NDP,
+//!    NCS-SK security is not built (open NDP only), and it has never been tested
+//!    against a stock device's NDP — the S23 proof covers discovery only.
+//!
+//! Split 2/3 was a deliberate one — name-native for coordination, host-addressed
+//! for bulk — and it is **under reconsideration as of 2026-07-16**. Its stated
+//! justification was that a connectionless small-frame face is lossy for
+//! multi-fragment objects; that loss turned out to be two bugs in our own stack (a
+//! monitor MTU 24 B over the 802.11 ceiling, and a missing RX pump in the 8812AU
+//! driver), not something intrinsic to name-addressed broadcast. Both are fixed and
+//! fragmented objects now deliver. Treat NDP as an **interop bearer** — the way to
+//! talk to a stock Wi-Fi Aware peer — rather than as this stack's data path; our
+//! own traffic rides `FrameFormat::RawNdn`, where the name is the addressing. See
+//! `docs/NAMED_RADIO_COURSE_CORRECTION.md`.
 //!
 //! This crate provides the coordination face. Like
 //! [`ndn-face-ble-adv`](https://docs.rs/ndn-face-ble-adv), it is a
 //! **`LinkType::AdHoc`** broadcast bearer — the engine forwards on the *name*
 //! inside each frame, broadcast/self-learning strategy does the rest. The radio
-//! lives behind the [`NanBackend`] trait, supplied by the platform (Android
-//! `WifiAwareManager` via JNI; Linux nl80211 later). A hardware-free
-//! [`LoopbackNanBus`] exercises the face in tests.
+//! lives behind the [`NanBackend`] trait, supplied by the platform. The shipped
+//! backend is **userspace monitor-mode**: `ndn-nan` drives the sans-I/O
+//! `ndn-nan-core` engine over a `FrameIo` radio, so a commodity adapter is a NAN
+//! radio with no kernel NAN support (mutual discovery with a stock Samsung S23 is
+//! proven on air). Android `WifiAwareManager` via JNI and Linux nl80211 are
+//! alternative backends, not yet built. A hardware-free [`LoopbackNanBus`]
+//! exercises the face in tests.
 //!
 //! Faces report [`FaceKind::WifiAware`] (NonLocal scope, LP-framed) with
 //! `link_type() == AdHoc` marking the connectionless cluster medium.
