@@ -91,6 +91,31 @@ impl LinkFecFeature {
     pub fn generation_size(&self) -> usize {
         self.k
     }
+
+    /// Parity frames per generation (R) currently in force.
+    pub fn redundancy(&self) -> u16 {
+        self.tx.lock().unwrap().redundancy()
+    }
+
+    /// Retune R for **subsequent** generations, so a control plane can spend more or
+    /// less airtime on parity as the medium and the demand set move.
+    ///
+    /// Clamped to keep `K + R ≤ 255`, matching [`new`](Self::new): an out-of-range N
+    /// makes *every* generation fail to encode, i.e. silently dropped traffic, so this
+    /// clamps rather than letting a bad setting surface later as loss. Returns the value
+    /// actually adopted.
+    ///
+    /// **Call between generations.** R is a property of a whole generation (the receiver
+    /// recovers K from any K of N), so this is a no-op-by-convention mid-fill: it will
+    /// take effect at the next `encode`, which for a partially-filled generation means
+    /// that generation gets the new R despite having been opened under the old one. A
+    /// face should retune only when `pending_len() == 0` — the same generation boundary
+    /// at which it pins the radio MCS.
+    pub fn set_redundancy(&self, redundancy: u16) -> u16 {
+        let r = redundancy.min(MAX_N - 1).min(MAX_N - self.k as u16);
+        self.tx.lock().unwrap().set_redundancy(r);
+        r
+    }
     /// Window before a partial generation is tail-flushed.
     pub fn window(&self) -> Duration {
         self.window
@@ -229,6 +254,40 @@ mod tests {
             "a clamped config still encodes + emits a generation"
         );
         assert!(f.generations_encoded() >= 1);
+    }
+
+    #[test]
+    fn set_redundancy_retunes_generation_size_and_clamps() {
+        let f = LinkFecFeature::new(3, 1, Duration::from_millis(20));
+        f.set_enabled(true);
+        assert_eq!(f.redundancy(), 1);
+
+        // Retune up: the next full generation emits K + the new R.
+        assert_eq!(f.set_redundancy(4), 4);
+        let mut coded = 0usize;
+        for i in 0..3 {
+            coded += f.on_send(b(&format!("s{i}"))).len();
+        }
+        assert_eq!(coded, 3 + 4, "K=3 + retuned R=4");
+
+        // Retune down works too.
+        assert_eq!(f.set_redundancy(0), 0);
+        let mut coded = 0usize;
+        for i in 0..3 {
+            coded += f.on_send(b(&format!("t{i}"))).len();
+        }
+        assert_eq!(coded, 3, "K=3 + R=0 = the source frames only");
+
+        // Out-of-range R is clamped so K + R ≤ MAX_N — a huge R must not silently
+        // drop the generation. Returns the value actually adopted.
+        let adopted = f.set_redundancy(u16::MAX);
+        assert_eq!(adopted, MAX_N - f.generation_size() as u16);
+        let mut coded = 0usize;
+        for i in 0..3 {
+            coded += f.on_send(b(&format!("u{i}"))).len();
+        }
+        assert_eq!(coded, f.generation_size() + adopted as usize);
+        assert!(coded <= MAX_N as usize, "K + R stays within the codec bound");
     }
 
     #[test]

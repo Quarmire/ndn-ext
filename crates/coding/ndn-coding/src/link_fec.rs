@@ -98,6 +98,21 @@ impl LinkFecTx {
         self.redundancy
     }
 
+    /// Retune the parity count for **subsequent** generations.
+    ///
+    /// The redundancy budget is a decision about how much airtime a name is worth
+    /// spending to survive loss without an ACK, and that answer moves as the medium
+    /// and the demand set move — so it cannot be fixed at construction.
+    ///
+    /// Takes effect at the next [`encode`](Self::encode). It must not change *within*
+    /// a generation: the receiver recovers K from any K of N, so the parity count is a
+    /// property of the generation as a whole, and a caller that retunes mid-fill would
+    /// encode a generation whose N disagrees with the one it announced. Call this only
+    /// when no generation is buffered (see `LinkFecFeature::pending_len`).
+    pub fn set_redundancy(&mut self, redundancy: u16) {
+        self.redundancy = redundancy;
+    }
+
     /// Encode `payloads` (the generation's K source frames) into K+R tagged
     /// frames — the K source frames then R parity. **Spread these across
     /// separate transmissions** (the face sends one MPDU each); never put a whole

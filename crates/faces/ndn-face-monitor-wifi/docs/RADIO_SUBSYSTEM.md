@@ -269,27 +269,32 @@ sum (`None | Wifi(WifiRate) | Lora(LoraRate)`) — so the three knobs that are
 genuinely bearer-agnostic sit at the top level and the PHY-specific ones are
 quarantined in the arm.
 
-> **How much of that actually reaches the air, as of 2026-07-16: less than this
-> section implies.** Two of those axes are decided and then dropped on this path
-> (task #32):
+> **How much of that reaches the air, as of 2026-07-17.** `RadioControl::apply`
+> (`control.rs`) actuates channel+bandwidth, CSD, `edcca_ignore`, `tx_power`, and
+> LoRa's SF/CR, then hands the whole `TxParams` to the face's `planned` cell, where
+> `select_mcs` reads the rate fields per frame. So `rate`, `tx_power`, and
+> `edcca_ignore` are wired.
 >
-> - **`link_fec_redundancy` has no consumer at all.** `RadioPolicy::fec_redundancy`
->   decides it well — measured `phy_per`, re-Interest rate, receiver pooling
->   (`phy^n`), deficit gating — and `grep -rna` across both repos finds it read only
->   by cognition's own airtime cost model and its tests. No face, no driver. The FEC
->   that demonstrably works on air is application-layer `ndn-coding`, driven by the
->   bench rather than by the plan (coded beat uncoded at every object size measured
->   contemporaneously: 800 B 23/30 vs 10/30, 2200 B 6/30 vs 1/30).
-> - **`WifiRate::mcs` is mostly unemittable.** The 8812AU puts only DESC `0x04`
->   (legacy 6M) and `0x0c` (HT MCS0) on air; `0x0b`, `0x10`, `0x13` measured 0/90 at
->   *every* frame size, shortest included (task #31).
+> **`link_fec_redundancy` is not.** It rides into that same `planned` cell and
+> nothing in the send path ever reads it: no code emits a parity frame or otherwise
+> changes a transmission because of it. Of its 16 references across both repos,
+> `policy.rs` decides it, `contextual.rs` mutates it, `measure.rs::score_arm`
+> *models* it offline (as repetition, for scoring arms), and `control.rs:602` logs
+> it. None actuate. Meanwhile FEC demonstrably works: coded beat uncoded at every
+> object size, measured contemporaneously (800 B 23/30 vs 10/30, 2200 B 6/30 vs
+> 1/30) — but that is application-layer `ndn-coding`, driven by the bench's
+> `coded_shape`, not by the plan. Task #32.
 >
-> So for this backend the honest list of axes that reach the air today is
-> `tx_power`, `edcca_ignore`, and MCS within a two-value range. The decision side is
-> real and worth keeping; the actuator side is the gap. Nothing above is wrong about
-> the *design* — it is wrong about the present tense, which is the failure this
-> document set has already made once (§4.1, and
-> `ndn-face-wifi-aware/docs/NAMED_RADIO_COURSE_CORRECTION.md` §10.2).
+> Separately, the rate axis is wired but **mostly unemittable on this part**: the
+> 8812AU puts only DESC `0x04` (legacy 6M) and `0x0c` (HT MCS0) on air; `0x0b`,
+> `0x10`, `0x13` measured 0/90 at *every* frame size, shortest included (task #31).
+> That is a driver gap, not a wiring gap — do not conflate them.
+>
+> *(An earlier revision of this note claimed `grep` found `link_fec_redundancy`
+> "read only by cognition and its tests. No face, no driver." That was produced by a
+> grep truncated with `head -10`, which cut off the two references in this very
+> crate. The conclusion survived; the evidence for it did not. Corrected 2026-07-17
+> — and it is precisely the truncated-evidence trap this project keeps re-learning.)*
 
 ---
 

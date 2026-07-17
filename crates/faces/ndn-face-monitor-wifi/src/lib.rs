@@ -195,8 +195,10 @@ impl TxBatcher {
 /// A-MSDU). The RX side feeds captured frames through the feature, recovering up to R
 /// losses per generation without ARQ.
 struct FaceFec {
-    /// Outbound wire frames + the MCS, handed to the batching task.
-    tx: tokio::sync::mpsc::UnboundedSender<(Bytes, McsDescriptor)>,
+    /// Outbound wire frames + the per-frame decided params (MCS, parity count),
+    /// handed to the batching task. Both travel *with* the frame rather than being
+    /// read by the task, so the plan's decision cannot depend on builder call order.
+    tx: tokio::sync::mpsc::UnboundedSender<(Bytes, McsDescriptor, Option<u16>)>,
     /// The shared FEC feature (decoder side, driven by `recv_bytes`).
     feature: Arc<LinkFecFeature>,
     /// Payloads recovered/delivered by the decoder, awaiting `recv_bytes`.
@@ -214,7 +216,8 @@ impl FaceFec {
     ) -> Self {
         let feature = Arc::new(LinkFecFeature::new(k, redundancy, window));
         feature.set_enabled(true);
-        let (tx, mut rx_ch) = tokio::sync::mpsc::unbounded_channel::<(Bytes, McsDescriptor)>();
+        let (tx, mut rx_ch) =
+            tokio::sync::mpsc::unbounded_channel::<(Bytes, McsDescriptor, Option<u16>)>();
         let tx_feature = Arc::clone(&feature);
         tokio::spawn(async move {
             // The whole generation rides the MCS of the frame that opened it (parity must
@@ -224,15 +227,24 @@ impl FaceFec {
             loop {
                 let coded = match gen_deadline {
                     None => match rx_ch.recv().await {
-                        Some((w, mcs)) => {
+                        Some((w, mcs, parity)) => {
                             gen_mcs = Some(mcs);
                             gen_deadline = Some(tokio::time::Instant::now() + window);
+                            // Pin the plan's parity count for exactly the same reason the
+                            // MCS is pinned: R is a property of the whole generation (the
+                            // receiver recovers K from any K of N), so it may only move at
+                            // a generation boundary — which is here, the frame that opens
+                            // one. Mid-generation frames carry their own decided parity and
+                            // it is deliberately ignored, like their MCS.
+                            if let Some(r) = parity {
+                                tx_feature.set_redundancy(r);
+                            }
                             tx_feature.on_send(w)
                         }
                         None => break, // sender dropped
                     },
                     Some(deadline) => match tokio::time::timeout_at(deadline, rx_ch.recv()).await {
-                        Ok(Some((w, _))) => tx_feature.on_send(w),
+                        Ok(Some((w, _, _))) => tx_feature.on_send(w),
                         Ok(None) => {
                             // Sender dropped mid-generation — flush the remainder and exit.
                             let last = tx_feature.flush();
@@ -470,6 +482,23 @@ impl MonitorWifiFace {
         Face::from_transport(self)
     }
 
+    /// Parity frames the plan wants on the next generation, if a control plane has
+    /// decided one. `None` leaves the link-FEC feature at its configured `R`.
+    ///
+    /// This is the actuator for [`TxParams::link_fec_redundancy`], which until
+    /// 2026-07-17 was decided by `RadioPolicy::fec_redundancy`, carried all the way
+    /// into this face's `planned` cell — and then read by nobody, so the redundancy
+    /// budget was fixed at `with_link_fec` construction time and no name ever moved
+    /// it (task #32). A knob reaching the face is not a knob reaching the air.
+    ///
+    /// [`TxParams::link_fec_redundancy`]: ndn_radio_cognition::TxParams::link_fec_redundancy
+    fn planned_redundancy(&self) -> Option<u16> {
+        self.planned
+            .as_ref()
+            .and_then(|cell| cell.read().ok().and_then(|g| *g))
+            .and_then(|tp| tp.link_fec_redundancy)
+    }
+
     /// The rate to inject the next frame at. A control-plane plan
     /// ([`with_planned_params`]) wins when present; otherwise the static policy.
     ///
@@ -575,7 +604,10 @@ impl Transport for MonitorWifiFace {
         // Link-FEC: enqueue the wire frame; the flush task groups a generation,
         // emits K+R coded frames (one MPDU each, interleaved), recovers losses.
         if let Some(fec) = &self.fec {
-            return fec.tx.send((wire, mcs)).map_err(|_| FaceError::Closed);
+            return fec
+                .tx
+                .send((wire, mcs, self.planned_redundancy()))
+                .map_err(|_| FaceError::Closed);
         }
         // The exact resolved rate travels alongside the frame (via inject_at /
         // the batcher), not on the intent — the frame's tx is a placeholder.
@@ -694,6 +726,71 @@ mod tests {
         let mut want = sent;
         want.sort();
         assert_eq!(got, want, "FEC face round-trips the generation");
+    }
+
+    /// The plan's `link_fec_redundancy` must change **what hits the air**, not just
+    /// what the policy decided. This is the regression test for task #32: the knob
+    /// was decided, logged, and carried into the face's `planned` cell, and then no
+    /// send-path code read it, so R stayed frozen at `with_link_fec` construction.
+    ///
+    /// Asserting the decision (as the policy's own tests do) would have passed the
+    /// whole time. So this asserts the **effect**: a passive third radio counts the
+    /// frames actually on the bus. A K=2 generation with the plan forcing R=5 must
+    /// put 7 frames on air; the same face with an empty plan cell must put K+R_ctor.
+    #[tokio::test]
+    async fn planned_redundancy_changes_frames_on_air() {
+        use ndn_frame_io::FrameIo;
+        use ndn_transport::Transport;
+
+        const K: usize = 2;
+        const R_CTOR: u16 = 1;
+
+        // Send one K-frame generation through `face` and count the frames a passive
+        // third radio hears — i.e. what actually hit the air, K + R.
+        async fn frames_on_air(bus: &LoopbackMonitorBus, face: &MonitorWifiFace) -> usize {
+            let sniffer = Arc::new(bus.endpoint(99, -70));
+            let counter = tokio::spawn(async move {
+                let mut n = 0usize;
+                while tokio::time::timeout(Duration::from_millis(150), sniffer.recv_frame())
+                    .await
+                    .is_ok()
+                {
+                    n += 1;
+                }
+                n
+            });
+            tokio::time::sleep(Duration::from_millis(10)).await; // let the sniffer subscribe
+            for i in 0..K as u8 {
+                face.send_bytes(Bytes::from(vec![i; 12])).await.unwrap();
+            }
+            counter.await.unwrap()
+        }
+
+        // Baseline: no plan cell, so R stays at the constructed value → K + R_CTOR.
+        let bus = LoopbackMonitorBus::new();
+        let base = MonitorWifiFace::new(FaceId(1), Arc::new(bus.endpoint(1, -50)))
+            .with_link_fec(K, R_CTOR, Duration::from_millis(20));
+        assert_eq!(
+            frames_on_air(&bus, &base).await,
+            K + R_CTOR as usize,
+            "baseline generation is K + constructed R"
+        );
+
+        // Same construction, but the plan forces R=5. If the knob reaches the air,
+        // the generation grows to K + 5; if it is still decorative, it stays K + 1.
+        let bus = LoopbackMonitorBus::new();
+        let cell = Arc::new(RwLock::new(Some(TxParams {
+            link_fec_redundancy: Some(5),
+            ..Default::default()
+        })));
+        let planned = MonitorWifiFace::new(FaceId(2), Arc::new(bus.endpoint(2, -50)))
+            .with_link_fec(K, R_CTOR, Duration::from_millis(20))
+            .with_planned_params(cell);
+        assert_eq!(
+            frames_on_air(&bus, &planned).await,
+            K + 5,
+            "the plan's link_fec_redundancy must change frames on air, not just the decision"
+        );
     }
 
     #[derive(Default)]
