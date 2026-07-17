@@ -234,8 +234,17 @@ mod imp {
             b.lc_calibrate()?;
             b.set_tx_power(0x3f)?;
             b.start_rx_dma()?; // last: calibration re-pauses RX DMA
-            eprintln!("✓ 8812AU up on ch{ch}");
-            Arc::new(b)
+            let b = Arc::new(b);
+            // Keep a bulk-IN read ALWAYS in flight. Without this the 8812AU reads
+            // once per `recv_frame` call, so between calls — while the face parses,
+            // reassembles, and the app works — nothing is draining the dongle's RX
+            // FIFO and a back-to-back burst is simply lost. That hurts exactly in
+            // proportion to fragments per object, which is what the MTU sweep
+            // showed. Depth 1: one continuous reader, so no gap and no reordering
+            // (several threads on one endpoint would race and interleave).
+            b.spawn_rx_pump(1);
+            eprintln!("✓ 8812AU up on ch{ch}, RX pump running");
+            b
         } else {
             Arc::new(AfPacketBackend::new(&iface, FrameFormat::default())?)
         };

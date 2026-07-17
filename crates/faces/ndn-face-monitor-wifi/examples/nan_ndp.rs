@@ -69,8 +69,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         b.lc_calibrate()?;
         b.set_tx_power(0x3f)?;
         b.start_rx_dma()?; // last: calibration re-pauses RX DMA
-        println!("[{node}] ✓ 8812AU up (fw {ver}.{sub}) on ch6, TX max, RX live");
-        Arc::new(b)
+        let b = Arc::new(b);
+        // Keep a bulk-IN read always in flight; without it we only read during a
+        // recv_frame call and lose whatever arrives in between (see
+        // Rtl8812auBackend::spawn_rx_pump). Depth 1 — one reader, so ordered.
+        b.spawn_rx_pump(1);
+        println!("[{node}] ✓ 8812AU up (fw {ver}.{sub}) on ch6, TX max, RX pumped");
+        b
     };
 
     if measure {
