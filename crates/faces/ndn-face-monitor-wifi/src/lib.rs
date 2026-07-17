@@ -105,8 +105,9 @@ pub use ndn_frame_io::AfPacketBackend;
 pub use ndn_frame_io::{
     BROADCAST, CapturedFrame, DEFAULT_SRC, ESPNOW_MAX_BODY, ESPNOW_OUI, FaceError, FaceId,
     FrameFormat, FrameIo, InjectFrame, LEGACY_ETHER_MTU, LoopbackEndpoint, LoopbackMonitorBus,
-    MAX_RELIABLE_MCS, MONITOR_MTU, McsDescriptor, McsPolicy, Reach, Reliability, TxIntent,
-    WifiRadio, frame, mcs_for_rssi, mcs_phy_rate_bps, name_group_mac, name_group_uni, radiotap,
+    MAX_RELIABLE_MCS, MONITOR_MTU, McsDescriptor, McsPolicy, RadioCapability, Reach, Reliability,
+    TxIntent, WifiRadio, frame, mcs_for_rssi, mcs_phy_rate_bps, name_group_mac, name_group_uni,
+    radiotap,
 };
 
 // The four userspace USB Wi-Fi driver backends (RTL8812EU/8822E, RTL8821CU,
@@ -361,6 +362,32 @@ impl MonitorWifiFace {
     /// [`with_link_fec`](Self::with_link_fec), etc.
     pub fn espnow(id: FaceId, backend: Arc<dyn WifiRadio>) -> Self {
         Self::new(id, backend).with_mtu(ESPNOW_MTU)
+    }
+
+    /// Open a **Wi-Fi HaLow (802.11ah / S1G)** monitor face on the kernel monitor
+    /// interface `iface` — e.g. `"halow0"`, a Newracom NRC7292 sub-GHz radio.
+    ///
+    /// This pools the HaLow radio uniformly with the 2.4/5 GHz monitor faces:
+    /// same [`FrameIo`] data plane, same [`MonitorWifiFace`], same engine. It
+    /// sets [`FrameFormat::RawNdnS1g`], so injected frames carry the S1G radiotap
+    /// header that names *no* 11n/ac MCS — the NRC7292's on-chip MAC picks the
+    /// sub-GHz rate. NDN-over-HaLow injection was verified on-air between two
+    /// NRC7292s (a monitor-injected frame received by a second chip, payload
+    /// intact), which needs the driver's `inject_monitor` patch that forwards
+    /// `IEEE80211_TX_CTL_INJECTED` (see the minidronesys configs).
+    ///
+    /// The interface must already be in monitor mode on an S1G channel
+    /// (`iw dev <iface> set type monitor; iw dev <iface> set channel 161`) and the
+    /// process needs `CAP_NET_RAW`. `channels` are the driver's US S1G alias
+    /// numbers (e.g. `vec![161]`, 925 MHz) for the advertised capability.
+    #[cfg(target_os = "linux")]
+    pub fn halow(id: FaceId, iface: &str, channels: Vec<u8>) -> Result<Self, FaceError> {
+        // 0x8624 = the NDN-over-Ethernet ethertype used across the stack; both
+        // ends must agree on it (the RX parse validates the LLC/SNAP ethertype).
+        let backend = AfPacketBackend::new(iface, FrameFormat::RawNdnS1g { ethertype: 0x8624 })
+            .map_err(FaceError::Io)?
+            .with_capability(RadioCapability::wifi_halow_s1g(channels));
+        Ok(Self::new(id, Arc::new(backend)))
     }
 
     /// Open the RTL8812EU USB dongle in 5 GHz monitor mode on `channel` and
