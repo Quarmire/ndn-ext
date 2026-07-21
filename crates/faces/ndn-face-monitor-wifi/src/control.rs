@@ -35,6 +35,7 @@ use ndn_radio_cognition::{
     encode_report, lora_airtime_ms, reward,
 };
 use ndn_signals_core::SignalView;
+use tracing::Instrument;
 use ndn_transport::link_service::{InboundLpFrame, IngressCtx, LinkServiceFeature, TickCtx};
 
 use crate::FaceId;
@@ -477,47 +478,110 @@ impl RadioControl {
     /// One iteration of the loop: SENSE (pull RSSI) → DECIDE → ACT. Returns the
     /// plans (also stored for telemetry). Public so tests / a manual driver can
     /// run it without the engine tick pump.
-    pub fn tick_now(&self, now_ms: u64) -> Vec<RadioPlan> {
-        let _span = tracing::debug_span!(target: "named_radio", "radio_tick", now_ms).entered();
-        // SENSE: fold per-face RSSI from the signal store into the medium.
-        if let Some(sig) = &self.signals {
-            let mut m = self.medium.lock().unwrap();
-            for (&face, &radio) in &self.face_radio {
-                if let Some(ls) = sig.link(FaceId(face)) {
-                    m.observe_rx(radio, face, ls.rssi_dbm, now_ms);
+    /// DECIDE stage — run the policy over each active object, returning plans and
+    /// their rationales. Its own `decide` span so the phase latency is measurable.
+    #[tracing::instrument(target = "named_radio", name = "decide", skip_all, fields(objects = active.len()))]
+    fn decide_all(
+        &self,
+        active: &[NameContext],
+        now_ms: u64,
+    ) -> (Vec<RadioPlan>, Vec<DecisionRationale>) {
+        let m = self.medium.lock().unwrap();
+        active
+            .iter()
+            .map(|ctx| self.policy.decide_traced(ctx, &*m, now_ms))
+            .unzip()
+    }
+
+    /// ACT stage — apply each radio's decided slice to its actuator (last-writer-
+    /// wins on a radio when several managed objects target it). Its own `actuate`
+    /// span, with each actuator's `apply` timed beneath it.
+    #[tracing::instrument(target = "named_radio", name = "actuate", skip_all, fields(plans = plans.len()))]
+    fn actuate(&self, plans: &[RadioPlan], now_ms: u64) {
+        for plan in plans {
+            for alloc in &plan.allocations {
+                // Remember what this radio sent at, so a later delivery outcome can
+                // train the calibrator and/or the bandit.
+                if (self.calibrator.is_some()
+                    || self.sf_calibrator.is_some()
+                    || self.bandit.is_some())
+                    && (alloc.params.mcs().is_some() || alloc.params.spreading_factor().is_some())
+                {
+                    let rssi = self
+                        .medium
+                        .lock()
+                        .unwrap()
+                        .weakest_rssi(alloc.radio, now_ms)
+                        .unwrap_or(-90);
+                    self.last_tx.lock().unwrap().insert(
+                        alloc.radio.0,
+                        TxRecord {
+                            rssi,
+                            params: alloc.params,
+                        },
+                    );
+                }
+                // Duty-cycle accounting (independent of calibration): charge estimated LoRa airtime
+                // to this radio's budget. A Wi-Fi allocation carries no spreading_factor, so nothing
+                // is charged; a LoRa one is metered against RadioCapability::duty_cycle_max.
+                if let Some(sf) = alloc.params.spreading_factor() {
+                    let cr = alloc.params.coding_rate().unwrap_or(1);
+                    let airtime = lora_airtime_ms(sf, 125, cr, NOMINAL_LORA_PAYLOAD);
+                    self.medium
+                        .lock()
+                        .unwrap()
+                        .record_airtime(alloc.radio, airtime, now_ms);
+                }
+                if let Some(a) = self.actuators.iter().find(|a| a.radio_id() == alloc.radio)
+                    && let Err(e) = a.apply(alloc)
+                {
+                    tracing::warn!(target: "named_radio", radio = alloc.radio.0, error = %e, "actuator apply failed");
                 }
             }
         }
+    }
 
-        // SENSE: fold PIT-shadow demand into the medium, and derive the managed-
-        // object set from live demand when the forwarder is driving the plane.
-        let tracked = {
-            let mut t = self.demand_tracker.lock().unwrap();
-            t.prune(now_ms);
-            let mut m = self.medium.lock().unwrap();
-            for (ph, d) in t.snapshot(now_ms) {
-                m.observe_demand(ph, d);
+    pub fn tick_now(&self, now_ms: u64) -> Vec<RadioPlan> {
+        let _span = tracing::debug_span!(target: "named_radio", "radio_tick", now_ms).entered();
+        // SENSE: fold per-face RSSI and PIT-shadow demand into the medium, then
+        // derive the managed-object set (live demand drives the plane, else the
+        // manual set). One `sense` span so its latency is a sibling of decide/act.
+        let active = {
+            let _sense = tracing::debug_span!(target: "named_radio", "sense").entered();
+            if let Some(sig) = &self.signals {
+                let mut m = self.medium.lock().unwrap();
+                for (&face, &radio) in &self.face_radio {
+                    if let Some(ls) = sig.link(FaceId(face)) {
+                        m.observe_rx(radio, face, ls.rssi_dbm, now_ms);
+                    }
+                }
             }
-            t.active_contexts(now_ms)
+            let tracked = {
+                let mut t = self.demand_tracker.lock().unwrap();
+                t.prune(now_ms);
+                let mut m = self.medium.lock().unwrap();
+                for (ph, d) in t.snapshot(now_ms) {
+                    m.observe_demand(ph, d);
+                }
+                t.active_contexts(now_ms)
+            };
+            if tracked.is_empty() {
+                self.active.lock().unwrap().clone()
+            } else {
+                tracked
+            }
         };
 
-        // DECIDE: PIT-driven objects if any, else the manual set.
-        let active = if tracked.is_empty() {
-            self.active.lock().unwrap().clone()
-        } else {
-            tracked
-        };
-        let (mut plans, rationales): (Vec<RadioPlan>, Vec<DecisionRationale>) = {
-            let m = self.medium.lock().unwrap();
-            active
-                .iter()
-                .map(|ctx| self.policy.decide_traced(ctx, &*m, now_ms))
-                .unzip()
-        };
+        // DECIDE: run the policy over each active object (own timed span).
+        let (mut plans, rationales) = self.decide_all(&active, now_ms);
 
         // REFINE the joint operating point. The bandit (if on) selects + applies an
         // arm per managed object and remembers it for reward; otherwise calibration
-        // probing (if on) occasionally samples the next rung up.
+        // probing (if on) occasionally samples the next rung up. Spanned so its
+        // latency is visible beside sense / decide / act.
+        let _refine =
+            tracing::debug_span!(target: "named_radio", "refine", bandit = self.bandit.is_some())
+                .entered();
         self.last_arm.lock().unwrap().clear();
         if let Some(bandit) = &self.bandit {
             for (name_ctx, plan) in active.iter().zip(plans.iter_mut()) {
@@ -570,48 +634,11 @@ impl RadioControl {
             }
         }
 
-        // ACT: apply each radio's slice. (Last-writer-wins on a radio when several
-        // managed objects target it — fine for the single-managed-prefix first cut;
-        // a per-egress-name apply is the next refinement.)
-        for plan in &plans {
-            for alloc in &plan.allocations {
-                // Remember what this radio sent at, so a later delivery outcome can
-                // train the calibrator and/or the bandit.
-                if (self.calibrator.is_some() || self.sf_calibrator.is_some() || self.bandit.is_some())
-                    && (alloc.params.mcs().is_some() || alloc.params.spreading_factor().is_some())
-                {
-                    let rssi = self
-                        .medium
-                        .lock()
-                        .unwrap()
-                        .weakest_rssi(alloc.radio, now_ms)
-                        .unwrap_or(-90);
-                    self.last_tx.lock().unwrap().insert(
-                        alloc.radio.0,
-                        TxRecord {
-                            rssi,
-                            params: alloc.params,
-                        },
-                    );
-                }
-                // Duty-cycle accounting (independent of calibration): charge estimated LoRa airtime
-                // to this radio's budget. A Wi-Fi allocation carries no spreading_factor, so nothing
-                // is charged; a LoRa one is metered against RadioCapability::duty_cycle_max.
-                if let Some(sf) = alloc.params.spreading_factor() {
-                    let cr = alloc.params.coding_rate().unwrap_or(1);
-                    let airtime = lora_airtime_ms(sf, 125, cr, NOMINAL_LORA_PAYLOAD);
-                    self.medium
-                        .lock()
-                        .unwrap()
-                        .record_airtime(alloc.radio, airtime, now_ms);
-                }
-                if let Some(a) = self.actuators.iter().find(|a| a.radio_id() == alloc.radio)
-                    && let Err(e) = a.apply(alloc)
-                {
-                    tracing::warn!(target: "named_radio", radio = alloc.radio.0, error = %e, "actuator apply failed");
-                }
-            }
-        }
+        // ACT: apply each radio's decided slice (own timed span, with per-actuator
+        // `apply` spans nested under it). End the refine span first so act is a
+        // sibling, not a child.
+        drop(_refine);
+        self.actuate(&plans, now_ms);
 
         // OBSERVE: emit an input→output span tree per decision so a trace shows
         // *why* each plan came out this way. Under `radio_tick`, each object opens a
@@ -779,6 +806,7 @@ impl RadioActuators for LibUsbActuator {
         self.radio
     }
 
+    #[tracing::instrument(target = "named_radio", name = "apply", skip_all, fields(radio = alloc.radio.0, channel = ?alloc.channel))]
     fn apply(&self, alloc: &RadioAllocation) -> Result<(), ndn_radio_cognition::RadioError> {
         let to_err = |e: crate::FaceError| ndn_radio_cognition::RadioError(e.to_string());
         let p = &alloc.params;
@@ -873,7 +901,11 @@ pub fn spawn_occupancy_sampler(
         loop {
             ticker.tick().await;
             let k = knobs.clone();
-            let read = tokio::task::spawn_blocking(move || k.read_channel_activity()).await;
+            // Time the frame-free counter read (a USB control transfer, off the hot
+            // path) as its own span under the sampler.
+            let read = tokio::task::spawn_blocking(move || k.read_channel_activity())
+                .instrument(tracing::debug_span!(target: "named_radio", "occupancy_read", radio = radio.0))
+                .await;
             let cur = match read {
                 Ok(Ok(Some(v))) => v,
                 Ok(Ok(None)) => return, // this radio can't sense occupancy — stop

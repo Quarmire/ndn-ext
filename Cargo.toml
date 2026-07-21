@@ -13,6 +13,7 @@ members = [
     "crates/service/ndn-service-macro",
     "crates/service/ndn-service",
     "crates/service/ndn-rpc",
+    "crates/service/ndn-radio-node",
     "crates/service/ndn-nacabe",
     "crates/service/ndnsf-rs",
     "crates/onboarding/ndn-trust-envelope",
@@ -65,6 +66,7 @@ default-members = [
     "crates/service/ndn-service-macro",
     "crates/service/ndn-service",
     "crates/service/ndn-rpc",
+    "crates/service/ndn-radio-node",
     "crates/service/ndn-nacabe",
     "crates/service/ndnsf-rs",
     "crates/faces/ndn-face-serial",
@@ -149,6 +151,7 @@ ndn-store     = { path = "../ndn-rs/crates/forwarding/ndn-store" }
 ndn-runtime   = { path = "../ndn-rs/crates/core/ndn-runtime" }
 ndn-face-local        = { path = "../ndn-rs/crates/faces/ndn-face-local" }
 ndn-face             = { path = "../ndn-rs/crates/faces/ndn-face" }
+ndn-observability     = { path = "../ndn-rs/crates/platform/ndn-observability" }
 ndn-face-shm         = { path = "crates/faces/ndn-face-shm" }
 ndn-face-bluetooth   = { path = "crates/faces/ndn-face-bluetooth" }
 ndn-face-webrtc       = { path = "crates/faces/ndn-face-webrtc" }

@@ -1,0 +1,30 @@
+[package]
+name = "ndn-radio-node"
+description = "A named-data radio node with NDN-native observability — runs the cognitive control plane and serves its OpenTelemetry span tree as Interest-able Data"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "extension"
+
+[[bin]]
+name = "ndn-radio-node"
+path = "src/main.rs"
+
+[dependencies]
+ndn-engine          = { workspace = true }
+ndn-face-local      = { workspace = true }
+ndn-face-monitor-wifi = { workspace = true }
+ndn-radio-cognition = { workspace = true }
+ndn-observability   = { workspace = true, features = ["layer"] }
+ndn-packet          = { workspace = true }
+ndn-transport       = { workspace = true }
+bytes               = { workspace = true, features = ["std"] }
+tokio               = { workspace = true, features = ["rt-multi-thread", "macros", "time", "signal"] }
+tokio-util          = { workspace = true }
+tracing             = { workspace = true }
+tracing-subscriber  = { workspace = true }
+
+[lints]
+workspace = true
