@@ -14,7 +14,7 @@
 //! promiscuous baseline receives both.
 #[cfg(feature = "libusb-backend")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use ndn_face_monitor_wifi::{LibUsbRtl88xxBackend, name_group_mac};
+    use ndn_face_monitor_wifi::{LibUsbRtl88xxBackend, OPEN_GROUP_KEY, name_group_mac};
 
     // argv[1] may be a comma-separated list of prefixes (multi-prefix DCNLA).
     let prefixes_arg = std::env::args()
@@ -32,7 +32,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let prefixes: Vec<&str> = prefixes_arg.split(',').collect();
     let groups: Vec<[u8; 6]> = prefixes
         .iter()
-        .map(|p| name_group_mac(p.as_bytes()))
+        .map(|p| name_group_mac(&OPEN_GROUP_KEY, p.as_bytes()))
         .collect();
     let fmt = |m: &[u8; 6]| {
         m.iter()

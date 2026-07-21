@@ -104,10 +104,10 @@ use std::collections::VecDeque;
 pub use ndn_frame_io::AfPacketBackend;
 pub use ndn_frame_io::{
     BROADCAST, CapturedFrame, DEFAULT_SRC, ESPNOW_MAX_BODY, ESPNOW_OUI, FaceError, FaceId,
-    FrameFormat, FrameIo, InjectFrame, LEGACY_ETHER_MTU, LoopbackEndpoint, LoopbackMonitorBus,
-    MAX_RELIABLE_MCS, MONITOR_MTU, McsDescriptor, McsPolicy, RadioCapability, Reach, Reliability,
-    TxIntent, WifiRadio, frame, mcs_for_rssi, mcs_phy_rate_bps, name_group_mac, name_group_uni,
-    radiotap,
+    FrameFormat, FrameIo, GroupKey, InjectFrame, LEGACY_ETHER_MTU, LoopbackEndpoint,
+    LoopbackMonitorBus, MAX_RELIABLE_MCS, MONITOR_MTU, McsDescriptor, McsPolicy, OPEN_GROUP_KEY,
+    RadioCapability, Reach, Reliability, TxIntent, WifiRadio, frame, mcs_for_rssi, mcs_phy_rate_bps,
+    name_group, name_group_mac, name_group_uni, prefix_key, radiotap,
 };
 
 // The four userspace USB Wi-Fi driver backends (RTL8812EU/8822E, RTL8821CU,
@@ -431,14 +431,34 @@ impl MonitorWifiFace {
         Ok(Self::new(id, Arc::new(backend)))
     }
 
-    /// Bind this face to a **name-group**: TX frames are addressed to/from the
-    /// name-derived group MAC (`name_group_mac`/`name_group_uni`) instead of
-    /// broadcast, and RX drops frames for other groups (a name pre-filter before
-    /// NDN decode). *"The prefix is the group address."* Verify-on-decode stays
-    /// authoritative — the group MAC is a fast hint, not a security boundary.
-    pub fn with_name_group(mut self, prefix: impl AsRef<[u8]>) -> Self {
-        let p = prefix.as_ref();
-        self.group = Some((name_group_mac(p), name_group_uni(p)));
+    /// Bind this face to a **name-group** under the **open** trust context: TX frames
+    /// are addressed to/from the name-derived group MAC instead of broadcast, and RX
+    /// drops frames for other groups (a name pre-filter before NDN decode). *"The
+    /// routable prefix is the group address."* Open receiver set — anyone can compute
+    /// the group and join. For a private trust domain, use
+    /// [`with_name_group_keyed`](Self::with_name_group_keyed).
+    pub fn with_name_group(self, routable_prefix: impl AsRef<[u8]>) -> Self {
+        self.with_name_group_keyed(&OPEN_GROUP_KEY, routable_prefix)
+    }
+
+    /// Bind this face to a name-group under an explicit **trust context** ([`GroupKey`]):
+    /// the group MAC is `siphash(key, routable_prefix)`, so under a shared-secret key
+    /// the group is unforgeable/unlinkable to outsiders (they cannot compute it to
+    /// target the pre-parse filter), and under [`OPEN_GROUP_KEY`] it is a public open
+    /// receiver set. Verify-on-decode stays authoritative — the group MAC is a fast
+    /// hint, not a security boundary.
+    ///
+    /// `routable_prefix` is the prefix this face serves/consumes; every frame shares
+    /// this one prefix-group address (the flat keyed hash). Per-Data-name addressing
+    /// with prefix-match-by-masking ([`ndn_frame_io::name_group`] + `prefix_key`) is a
+    /// producer-side follow-on, not the face's fixed-group model.
+    pub fn with_name_group_keyed(
+        mut self,
+        key: &GroupKey,
+        routable_prefix: impl AsRef<[u8]>,
+    ) -> Self {
+        let p = routable_prefix.as_ref();
+        self.group = Some((name_group_mac(key, p), name_group_uni(key, p)));
         self
     }
 
@@ -957,8 +977,8 @@ mod tests {
         peer.inject(InjectFrame {
             payload: Bytes::from_static(b"x"),
             tx,
-            dst: name_group_mac(b"/other/feed"),
-            src: name_group_uni(b"/other/feed"),
+            dst: name_group_mac(&OPEN_GROUP_KEY, b"/other/feed"),
+            src: name_group_uni(&OPEN_GROUP_KEY, b"/other/feed"),
         })
         .await
         .unwrap();
@@ -969,8 +989,8 @@ mod tests {
         peer.inject(InjectFrame {
             payload: Bytes::from_static(b"mine"),
             tx,
-            dst: name_group_mac(b"/sensors/temp"),
-            src: name_group_uni(b"/sensors/temp"),
+            dst: name_group_mac(&OPEN_GROUP_KEY, b"/sensors/temp"),
+            src: name_group_uni(&OPEN_GROUP_KEY, b"/sensors/temp"),
         })
         .await
         .unwrap();
@@ -989,5 +1009,45 @@ mod tests {
             .expect("broadcast frame should arrive")
             .unwrap();
         assert_eq!(got, Bytes::from_static(b"bcast"));
+    }
+
+    /// Trust-context isolation: a face keyed to a private domain does NOT match a
+    /// frame for the SAME routable prefix under the open key — an outsider who knows
+    /// the (public) name cannot address the private group's pre-parse filter.
+    #[tokio::test]
+    async fn keyed_name_group_isolates_trust_domains() {
+        let secret = GroupKey(*b"trust-domain-42!");
+        let bus = LoopbackMonitorBus::new();
+        let face = MonitorWifiFace::new(FaceId(1), Arc::new(bus.endpoint(1, -50)))
+            .with_name_group_keyed(&secret, "/sensors/temp");
+        let peer = Arc::new(bus.endpoint(2, -50));
+        let tx = TxIntent::CONSERVATIVE;
+
+        // Same prefix, but the OPEN key → a different group hash → dropped.
+        peer.inject(InjectFrame {
+            payload: Bytes::from_static(b"outsider"),
+            tx,
+            dst: name_group_mac(&OPEN_GROUP_KEY, b"/sensors/temp"),
+            src: name_group_uni(&OPEN_GROUP_KEY, b"/sensors/temp"),
+        })
+        .await
+        .unwrap();
+        let got = tokio::time::timeout(Duration::from_millis(120), face.recv_bytes()).await;
+        assert!(got.is_err(), "same prefix under the open key must not match the private group");
+
+        // Same prefix under the SAME secret key → delivered.
+        peer.inject(InjectFrame {
+            payload: Bytes::from_static(b"insider"),
+            tx,
+            dst: name_group_mac(&secret, b"/sensors/temp"),
+            src: name_group_uni(&secret, b"/sensors/temp"),
+        })
+        .await
+        .unwrap();
+        let got = tokio::time::timeout(Duration::from_millis(200), face.recv_bytes())
+            .await
+            .expect("same-key frame should arrive")
+            .unwrap();
+        assert_eq!(got, Bytes::from_static(b"insider"));
     }
 }
