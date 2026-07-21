@@ -20,6 +20,10 @@ bw16 = ["dep:ndn-radio-drivers", "ndn-radio-drivers/bw16"]
 [dependencies]
 ndn-transport    = { workspace = true }
 ndn-frame-io     = { workspace = true }
+# LP fragment + TLV parsing: the producer's per-Data-name split addressing peeks the
+# inner NDN Name to derive addr1 (bounded, name-only — see with_split_producer).
+ndn-packet       = { workspace = true }
+ndn-tlv          = { workspace = true }
 # The shared radio HAL contract — home of the `RadioKnobs` control-plane trait +
 # `Bandwidth` (re-exported through `src/radio.rs`).
 ndn-radio-hal    = { workspace = true }

@@ -92,7 +92,8 @@ use ndn_signals_core::{LinkSignals, SignalStore};
 use ndn_transport::{
     Face, FaceAddr, FaceKind, FacePersistency, LinkType, MtuError, PersistencyError, Transport,
 };
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::sync::Mutex;
 
 // The frame-I/O substrate — the `FrameIo` trait, the inject/capture frame
 // types, the on-air framing (`frame`/`radiotap`), and the reusable AF_PACKET +
@@ -269,6 +270,116 @@ async fn inject_coded(
     }
 }
 
+/// **How outgoing frames get their addr1** — a composable, configurable capability
+/// (set independently of the RX filter, the FEC bridge, the MCS policy, the trust
+/// key). See `docs/mac-addressing-doctrine.md` §8.
+#[derive(Clone)]
+pub enum TxAddr {
+    /// No name addressing: broadcast — every receiver in range hears it.
+    Broadcast,
+    /// One flat prefix-group address for all traffic (coarse — every frame shares it).
+    Group([u8; 6], [u8; 6]),
+    /// Per-Data-name **split**: derive `addr1 = H(prefix)‖H(name)` from each object's
+    /// inner NDN name (all fragments of one object share it), so relays prefix-match
+    /// by masking and consumers exact-match the full width.
+    SplitByName {
+        /// Trust context.
+        key: GroupKey,
+        /// The routable prefix (its hash is the high, aggregatable half).
+        prefix: Vec<u8>,
+    },
+}
+
+/// **Which received frames pass the pre-decode filter** — the RX-side capability,
+/// independent of [`TxAddr`]. A consumer sets `Exact`, a relay `Prefix`, a
+/// promiscuous/broadcast node `Open`. Broadcast frames always pass.
+#[derive(Clone, Copy)]
+pub enum RxFilter {
+    /// Keep every frame (promiscuous / broadcast join).
+    Open,
+    /// Consumer: keep only this exact `addr1` (+ broadcast).
+    Exact([u8; 6]),
+    /// Relay: keep any frame whose prefix bytes ([`prefix_key`]) match this (+ broadcast).
+    Prefix([u8; 6]),
+}
+
+/// The coarse prefix-match key for `routable_prefix` under `key` — what a relay's
+/// [`RxFilter::Prefix`] holds, and what `prefix_key` of any split frame under that
+/// prefix reduces to (the high, aggregatable half).
+pub fn group_prefix_key(key: &GroupKey, routable_prefix: &[u8]) -> [u8; 6] {
+    prefix_key(name_group(key, routable_prefix, routable_prefix, true))
+}
+
+/// Extract the NDN **Name** TLV bytes from an LP-framed wire frame's inner packet,
+/// for [`TxAddr::SplitByName`]. Returns `None` for a non-first fragment (the name is
+/// only in fragment 0) or a parse miss. The face's one bounded NDN-structure peek —
+/// a producer compiling its own Data's name into the address, as V-MAC does.
+fn inner_name(wire: &[u8]) -> Option<&[u8]> {
+    // The network packet bytes: the LP `Fragment` (0x50) value. A multi-fragment
+    // frame exposes it via extract_fragment (only fragment 0 has the name); a
+    // single LP packet we scan for the 0x50 TLV; a bare packet is used as-is.
+    let pkt: &[u8] = if let Some(h) = ndn_packet::lp::extract_fragment(wire) {
+        if h.frag_index != 0 {
+            return None;
+        }
+        wire.get(h.frag_start..h.frag_end)?
+    } else if wire.first() == Some(&0x64) {
+        lp_fragment_value(wire)?
+    } else {
+        wire
+    };
+    // pkt = Interest(0x05) | Data(0x06) { Name(0x07){…}, … } — return the Name TLV.
+    named_tlv(pkt, 0x07)
+}
+
+/// The value bytes of the LP `Fragment` (0x50) TLV inside a single LP packet (0x64).
+fn lp_fragment_value(lp: &[u8]) -> Option<&[u8]> {
+    let (_, tn) = ndn_tlv::read_varu64(lp).ok()?;
+    let (outer_len, ln) = ndn_tlv::read_varu64(lp.get(tn..)?).ok()?;
+    let body = lp.get(tn + ln..tn + ln + outer_len as usize)?;
+    named_tlv_value(body, 0x50)
+}
+
+/// Find the first sub-TLV of type `want` inside `parent`'s value and return it
+/// **including** its type+length header (the hash input for a name is the whole
+/// Name TLV). `parent` starts with an outer type+len wrapping the sub-TLVs.
+fn named_tlv(parent: &[u8], want: u64) -> Option<&[u8]> {
+    let (_, tn) = ndn_tlv::read_varu64(parent).ok()?;
+    let (len, ln) = ndn_tlv::read_varu64(parent.get(tn..)?).ok()?;
+    let body = parent.get(tn + ln..tn + ln + len as usize)?;
+    let mut pos = 0;
+    while pos < body.len() {
+        let start = pos;
+        let (t, a) = ndn_tlv::read_varu64(body.get(pos..)?).ok()?;
+        pos += a;
+        let (l, b) = ndn_tlv::read_varu64(body.get(pos..)?).ok()?;
+        pos += b + l as usize;
+        if t == want {
+            return body.get(start..pos);
+        }
+    }
+    None
+}
+
+/// Like [`named_tlv`] but returns the sub-TLV's **value** (no header).
+fn named_tlv_value(parent: &[u8], want: u64) -> Option<&[u8]> {
+    let (_, tn) = ndn_tlv::read_varu64(parent).ok()?;
+    let (len, ln) = ndn_tlv::read_varu64(parent.get(tn..)?).ok()?;
+    let body = parent.get(tn + ln..tn + ln + len as usize)?;
+    let mut pos = 0;
+    while pos < body.len() {
+        let (t, a) = ndn_tlv::read_varu64(body.get(pos..)?).ok()?;
+        pos += a;
+        let (l, b) = ndn_tlv::read_varu64(body.get(pos..)?).ok()?;
+        pos += b;
+        if t == want {
+            return body.get(pos..pos + l as usize);
+        }
+        pos += l as usize;
+    }
+    None
+}
+
 pub struct MonitorWifiFace {
     id: FaceId,
     backend: Arc<dyn WifiRadio>,
@@ -278,12 +389,13 @@ pub struct MonitorWifiFace {
     /// Most-recently-observed RSSI, fed by every captured frame; the input to
     /// [`McsPolicy::Adaptive`]. Initialised to the conservative-default RSSI.
     last_rssi: AtomicI8,
-    /// Name-group binding `(group_mac, group_uni)` from [`with_name_group`].
-    /// When set, frames are addressed to/from the name-derived group and the
-    /// receive path drops frames for other groups. `None` = broadcast.
-    ///
-    /// [`with_name_group`]: MonitorWifiFace::with_name_group
-    group: Option<([u8; 6], [u8; 6])>,
+    /// TX name-addressing capability (how outgoing `addr1` is chosen).
+    tx_addr: TxAddr,
+    /// RX name-filtering capability (which frames pass before decode).
+    rx_filter: RxFilter,
+    /// For [`TxAddr::SplitByName`]: the per-object `addr1` cached by LP base-sequence,
+    /// so every fragment of one object (only the first carries the name) shares it.
+    split_cache: Mutex<HashMap<u64, [u8; 6]>>,
     /// Optional A-MSDU batcher ([`with_amsdu_batching`]). When set, `send_bytes`
     /// enqueues outbound frames here and they are coalesced into A-MSDU bursts
     /// instead of injected one at a time.
@@ -319,7 +431,9 @@ impl MonitorWifiFace {
             policy: McsPolicy::default(),
             signal_sink: None,
             last_rssi: AtomicI8::new(-70),
-            group: None,
+            tx_addr: TxAddr::Broadcast,
+            rx_filter: RxFilter::Open,
+            split_cache: Mutex::new(HashMap::new()),
             batcher: None,
             fec: None,
             planned: None,
@@ -392,10 +506,9 @@ impl MonitorWifiFace {
     /// generation; batching would bundle a whole generation into one MPDU).
     /// Both ends must enable FEC. Call before mounting (spawns the flush task).
     pub fn with_link_fec(mut self, k: usize, redundancy: u16, window: Duration) -> Self {
-        let (dst, src) = match self.group {
-            Some((mac, uni)) => (mac, uni),
-            None => (BROADCAST, DEFAULT_SRC),
-        };
+        // FEC batches generations across frames, so it uses the face's static group
+        // address (per-object split addressing is not applied on the coded path).
+        let (dst, src) = self.static_addr();
         self.fec = Some(FaceFec::spawn(
             self.backend.clone(),
             dst,
@@ -449,17 +562,69 @@ impl MonitorWifiFace {
     /// hint, not a security boundary.
     ///
     /// `routable_prefix` is the prefix this face serves/consumes; every frame shares
-    /// this one prefix-group address (the flat keyed hash). Per-Data-name addressing
-    /// with prefix-match-by-masking ([`ndn_frame_io::name_group`] + `prefix_key`) is a
-    /// producer-side follow-on, not the face's fixed-group model.
+    /// this one flat prefix-group address. For per-Data-name addressing (relays
+    /// prefix-match, consumers exact-match), see [`with_split_producer`],
+    /// [`with_prefix_relay`], [`with_exact_consumer`] — or compose [`with_tx_addr`] +
+    /// [`with_rx_filter`] directly.
+    ///
+    /// [`with_split_producer`]: Self::with_split_producer
+    /// [`with_prefix_relay`]: Self::with_prefix_relay
+    /// [`with_exact_consumer`]: Self::with_exact_consumer
+    /// [`with_tx_addr`]: Self::with_tx_addr
+    /// [`with_rx_filter`]: Self::with_rx_filter
     pub fn with_name_group_keyed(
-        mut self,
+        self,
         key: &GroupKey,
         routable_prefix: impl AsRef<[u8]>,
     ) -> Self {
         let p = routable_prefix.as_ref();
-        self.group = Some((name_group_mac(key, p), name_group_uni(key, p)));
+        self.with_tx_addr(TxAddr::Group(name_group_mac(key, p), name_group_uni(key, p)))
+            .with_rx_filter(RxFilter::Exact(name_group_mac(key, p)))
+    }
+
+    /// Set the TX name-addressing capability directly (compose with [`with_rx_filter`]).
+    pub fn with_tx_addr(mut self, tx: TxAddr) -> Self {
+        self.tx_addr = tx;
         self
+    }
+
+    /// Set the RX name-filtering capability directly (compose with [`with_tx_addr`]).
+    pub fn with_rx_filter(mut self, rx: RxFilter) -> Self {
+        self.rx_filter = rx;
+        self
+    }
+
+    /// **Producer** with per-Data-name split addressing: each object is sent to
+    /// `H(prefix)‖H(name)` so relays prefix-match and consumers exact-match. RX keeps
+    /// its own prefix family (overhearing). Convenience = `with_tx_addr(SplitByName) +
+    /// with_rx_filter(Prefix)`.
+    pub fn with_split_producer(self, key: &GroupKey, routable_prefix: impl AsRef<[u8]>) -> Self {
+        let p = routable_prefix.as_ref().to_vec();
+        let pk = group_prefix_key(key, &p);
+        self.with_tx_addr(TxAddr::SplitByName { key: *key, prefix: p })
+            .with_rx_filter(RxFilter::Prefix(pk))
+    }
+
+    /// **Relay** for a prefix family: RX keeps every frame whose prefix bytes match,
+    /// so it hears all names under `routable_prefix` from a split producer with one
+    /// filter entry (the aggregation win). TX is left as configured (a relay
+    /// re-radiates whatever it forwards).
+    pub fn with_prefix_relay(self, key: &GroupKey, routable_prefix: impl AsRef<[u8]>) -> Self {
+        let pk = group_prefix_key(key, routable_prefix.as_ref());
+        self.with_rx_filter(RxFilter::Prefix(pk))
+    }
+
+    /// **Consumer** for one exact name: RX keeps only the split address of
+    /// `full_name` under `routable_prefix` — it hears `/x/y` from a split producer but
+    /// not its sibling `/x/z`.
+    pub fn with_exact_consumer(
+        self,
+        key: &GroupKey,
+        routable_prefix: impl AsRef<[u8]>,
+        full_name: impl AsRef<[u8]>,
+    ) -> Self {
+        let addr = name_group(key, routable_prefix.as_ref(), full_name.as_ref(), true);
+        self.with_rx_filter(RxFilter::Exact(addr))
     }
 
     /// Inject every frame at a fixed MCS (e.g. for a known-good link or a bench).
@@ -522,6 +687,66 @@ impl MonitorWifiFace {
             .and_then(|tp| tp.link_fec_redundancy)
     }
 
+    /// The face's fixed group `(dst, src)` — for broadcast, the flat group, or (as a
+    /// fallback where per-object split isn't applied, e.g. the FEC path) a split
+    /// producer's flat prefix group.
+    fn static_addr(&self) -> ([u8; 6], [u8; 6]) {
+        match &self.tx_addr {
+            TxAddr::Broadcast => (BROADCAST, DEFAULT_SRC),
+            TxAddr::Group(d, s) => (*d, *s),
+            TxAddr::SplitByName { key, prefix } => {
+                (name_group_mac(key, prefix), name_group_uni(key, prefix))
+            }
+        }
+    }
+
+    /// Resolve the `(dst, src)` for one outgoing wire frame, applying
+    /// [`TxAddr::SplitByName`] per Data object: the first fragment carries the name,
+    /// from which `addr1 = H(prefix)‖H(name)` is derived and cached by LP
+    /// base-sequence so the object's other fragments share it.
+    fn resolve_addr(&self, wire: &[u8]) -> ([u8; 6], [u8; 6]) {
+        let TxAddr::SplitByName { key, prefix } = &self.tx_addr else {
+            return self.static_addr();
+        };
+        let src = name_group_uni(key, prefix);
+        // Fragmented: key the per-object addr by the LP base sequence.
+        if let Some(h) = ndn_packet::lp::extract_fragment(wire) {
+            let base = h.sequence.wrapping_sub(h.frag_index);
+            if h.frag_index == 0 {
+                let dst = match inner_name(wire) {
+                    Some(name) => name_group(key, prefix, name, true),
+                    None => name_group_mac(key, prefix), // no name → flat prefix group
+                };
+                self.split_cache.lock().unwrap().insert(base, dst);
+                return (dst, src);
+            }
+            if let Some(dst) = self.split_cache.lock().unwrap().get(&base).copied() {
+                return (dst, src);
+            }
+            return (name_group_mac(key, prefix), src); // cache miss → flat prefix
+        }
+        // Single (unfragmented) packet: derive directly from its name.
+        let dst = match inner_name(wire) {
+            Some(name) => name_group(key, prefix, name, true),
+            None => name_group_mac(key, prefix),
+        };
+        (dst, src)
+    }
+
+    /// Does a captured frame's `addr1` (`f.group`) pass this face's [`RxFilter`]?
+    /// Broadcast always passes.
+    fn rx_accepts(&self, addr1: Option<[u8; 6]>) -> bool {
+        let Some(a) = addr1 else { return true };
+        if a == BROADCAST {
+            return true;
+        }
+        match self.rx_filter {
+            RxFilter::Open => true,
+            RxFilter::Exact(g) => a == g,
+            RxFilter::Prefix(pk) => prefix_key(a) == pk,
+        }
+    }
+
     /// The rate to inject the next frame at. A control-plane plan
     /// ([`with_planned_params`]) wins when present; otherwise the static policy.
     ///
@@ -556,10 +781,7 @@ impl MonitorWifiFace {
     async fn recv_inner(&self) -> Result<CapturedFrame, FaceError> {
         loop {
             let f = self.backend.recv_frame().await?;
-            if let (Some((mac, _)), Some(g)) = (self.group, f.group)
-                && g != mac
-                && g != BROADCAST
-            {
+            if !self.rx_accepts(f.group) {
                 continue; // a different name-group — drop before decoding
             }
             if let Some(rssi) = f.rssi_dbm {
@@ -618,11 +840,9 @@ impl Transport for MonitorWifiFace {
 
     async fn send_bytes(&self, wire: Bytes) -> Result<(), FaceError> {
         // The LpLinkService already framed/fragmented; each call is one frame.
-        // Address it to the name-group (or broadcast) — never a host MAC.
-        let (dst, src) = match self.group {
-            Some((mac, uni)) => (mac, uni),
-            None => (BROADCAST, DEFAULT_SRC),
-        };
+        // Address it per the TX capability (broadcast / flat group / per-Data-name
+        // split) — never a host MAC.
+        let (dst, src) = self.resolve_addr(&wire);
         let mcs = self.select_mcs();
         // Link-FEC: enqueue the wire frame; the flush task groups a generation,
         // emits K+R coded frames (one MPDU each, interleaved), recovers losses.
@@ -1049,5 +1269,70 @@ mod tests {
             .expect("same-key frame should arrive")
             .unwrap();
         assert_eq!(got, Bytes::from_static(b"insider"));
+    }
+
+    /// One NDN Name TLV (`0x07 { 0x08 comp … }`) and a minimal Data packet wrapping it.
+    fn name_tlv(comps: &[&[u8]]) -> Vec<u8> {
+        let mut inner = Vec::new();
+        for c in comps {
+            inner.push(0x08);
+            inner.push(c.len() as u8);
+            inner.extend_from_slice(c);
+        }
+        let mut t = vec![0x07, inner.len() as u8];
+        t.extend_from_slice(&inner);
+        t
+    }
+    fn data_pkt(name: &[u8]) -> Bytes {
+        let mut d = vec![0x06, name.len() as u8];
+        d.extend_from_slice(name);
+        Bytes::from(d)
+    }
+
+    /// Per-Data-name split addressing, end to end: a split **producer** sends `/x/y`
+    /// and `/x/z`; a **relay** filtering on the prefix `/x` hears BOTH (one filter
+    /// entry, the family) while a **consumer** for exactly `/x/y` hears only `/x/y`.
+    /// This is the payoff of the split — coarse for relays, fine for consumers, from
+    /// the same address the producer compiles from each object's name.
+    #[tokio::test]
+    async fn split_addressing_relay_prefix_matches_consumer_exact_matches() {
+        let key = OPEN_GROUP_KEY;
+        let bus = LoopbackMonitorBus::new();
+        let xy = name_tlv(&[b"x", b"y"]);
+        let xz = name_tlv(&[b"x", b"z"]);
+
+        let producer = MonitorWifiFace::new(FaceId(1), Arc::new(bus.endpoint(1, -50)))
+            .with_split_producer(&key, "/x");
+        let relay = MonitorWifiFace::new(FaceId(2), Arc::new(bus.endpoint(2, -50)))
+            .with_prefix_relay(&key, "/x");
+        let consumer = MonitorWifiFace::new(FaceId(3), Arc::new(bus.endpoint(3, -50)))
+            .with_exact_consumer(&key, "/x", &xy);
+
+        producer.send_bytes(data_pkt(&xy)).await.unwrap();
+        producer.send_bytes(data_pkt(&xz)).await.unwrap();
+
+        // The relay hears BOTH /x/y and /x/z (prefix aggregation).
+        let mut relayed = Vec::new();
+        for _ in 0..2 {
+            let (b, _) = tokio::time::timeout(Duration::from_millis(300), relay.recv_bytes_with_addr())
+                .await
+                .expect("relay should hear both names under /x")
+                .unwrap();
+            relayed.push(b);
+        }
+        relayed.sort();
+        let mut want = vec![data_pkt(&xy), data_pkt(&xz)];
+        want.sort();
+        assert_eq!(relayed, want, "relay prefix-matches the whole /x family");
+
+        // The consumer hears /x/y (its exact name) …
+        let (got, _) = tokio::time::timeout(Duration::from_millis(300), consumer.recv_bytes_with_addr())
+            .await
+            .expect("consumer should hear its exact name")
+            .unwrap();
+        assert_eq!(got, data_pkt(&xy));
+        // … but NOT the sibling /x/z (different full address).
+        let none = tokio::time::timeout(Duration::from_millis(150), consumer.recv_bytes_with_addr()).await;
+        assert!(none.is_err(), "consumer must NOT hear the sibling /x/z");
     }
 }
