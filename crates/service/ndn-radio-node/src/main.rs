@@ -27,10 +27,9 @@ use ndn_observability::{
 };
 use ndn_packet::encode::InterestBuilder;
 use ndn_packet::{Data, Name, NameComponent};
-use ndn_radio_cognition::{
-    NameContext, RadioActuators, RadioAllocation, RadioCapability, RadioError, RadioId, RadioPolicy,
-    prefix_hash,
-};
+use ndn_radio_cognition::{NameContext, RadioCapability, RadioId, RadioPolicy, prefix_hash};
+#[cfg(not(feature = "libusb-backend"))]
+use ndn_radio_cognition::{RadioActuators, RadioAllocation, RadioError};
 use ndn_transport::FaceId as TransportFaceId;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::Layer;
@@ -47,7 +46,9 @@ fn obs_prefix() -> Name {
 }
 
 /// A no-op actuator so the ACT stage's `apply` span emits without real hardware.
+#[cfg(not(feature = "libusb-backend"))]
 struct NoopActuator(RadioId);
+#[cfg(not(feature = "libusb-backend"))]
 impl RadioActuators for NoopActuator {
     fn radio_id(&self) -> RadioId {
         self.0
@@ -57,9 +58,14 @@ impl RadioActuators for NoopActuator {
     }
 }
 
+fn env_u64(k: &str, d: u64) -> u64 {
+    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let ticks: u32 = std::env::var("TICKS").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+    let ticks = env_u64("TICKS", 5) as u32;
+    let tick_ms = env_u64("NODE_TICK_MS", 200);
 
     // --- Observability: capture tracing spans → OTLP protobufs (published as
     //     Data), and mirror the human-readable events to the console. ---
@@ -82,24 +88,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     mount_observability(&engine, cancel.clone(), Arc::clone(&publisher));
     tokio::time::sleep(Duration::from_millis(20)).await; // let the producer register
 
-    // --- Cognitive radio control plane: one wifi radio + a no-op actuator + an
-    //     active object, so every tick emits the full sense→decide→act span tree. ---
+    // --- Cognitive radio control plane. On-air (feature `libusb-backend`) it binds
+    //     a real RTL8822E as BOTH actuator and frame-free occupancy sensor; else a
+    //     no-op actuator so the span tree still emits without hardware. Either way
+    //     an active object makes every tick a real decision. ---
     let radio = RadioId(0);
+    let ch = env_u64("NODE_CH", 149) as u8;
     let mut control = RadioControl::new(RadioPolicy::default());
-    control.register_radio(
-        radio,
-        FaceId(0),
-        RadioCapability::wifi_monitor_5ghz(vec![149, 161, 165]),
-    );
+    // Single operating channel so channel selection never tunes to an untested one.
+    control.register_radio(radio, FaceId(0), RadioCapability::wifi_monitor_5ghz(vec![ch]));
+
+    #[cfg(feature = "libusb-backend")]
+    let backend = {
+        use ndn_face_monitor_wifi::LibUsbRtl88xxBackend;
+        let pid = env_u64("NODE_PID", 0xa81a) as u16;
+        let b = Arc::new(LibUsbRtl88xxBackend::open_monitor_pid(pid, ch)?);
+        control.libusb_actuator(radio, b.clone()); // ACT: real radio applies the plan
+        println!("radio: RTL8822E 0bda:{pid:04x} bound as actuator + sensor on ch{ch}");
+        b
+    };
+    #[cfg(not(feature = "libusb-backend"))]
     control.add_actuator(Arc::new(NoopActuator(radio)));
+
     control.set_active(vec![NameContext::new(prefix_hash(&[b"named-radio", b"demo"]))]);
     let control = Arc::new(control);
+
+    // SENSE: on-air, spawn the frame-free occupancy sampler over the same handle.
+    #[cfg(feature = "libusb-backend")]
+    let _sampler =
+        control.start_occupancy_sampling(radio, ch, backend, Duration::from_millis(500));
 
     println!("named-radio node up — observability prefix = {}", obs_prefix());
     println!("ticking the control plane {ticks}× (each tick emits the decision span tree)…");
     for _ in 0..ticks {
         control.tick_now(control.now_ms());
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(tick_ms)).await;
     }
     println!("published {} OTLP spans to the observability ring", publisher.len());
 

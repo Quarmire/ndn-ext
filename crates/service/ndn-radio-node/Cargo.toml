@@ -12,6 +12,11 @@ classification = "extension"
 name = "ndn-radio-node"
 path = "src/main.rs"
 
+[features]
+# Bind a real userspace USB Wi-Fi backend (RTL8822E) as the node's radio, so the
+# control plane ACTs + SENSEs on-air instead of via the no-op actuator.
+libusb-backend = ["ndn-face-monitor-wifi/libusb-backend"]
+
 [dependencies]
 ndn-engine          = { workspace = true }
 ndn-face-local      = { workspace = true }
