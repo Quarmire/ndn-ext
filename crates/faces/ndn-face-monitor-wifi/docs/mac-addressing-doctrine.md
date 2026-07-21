@@ -319,3 +319,91 @@ group; prefix aggregation (same-prefix → same coarse key, distinct full addrs)
 flat-46-bit vs split-24-bit-within-prefix collision behaviour. Migrating the faces to
 pass a real `GroupKey` + routable prefix (instead of `name_group_mac` on the whole
 string) is the follow-on; the primitive and the decision are settled here.
+
+---
+
+## 9. Composing addressing with coding — and where RLNC recoding fits (F1/F2/F3)
+
+Split addressing (§8) was built so relays prefix-match and consumers exact-match; the
+coded path pins the per-object split address to each generation (`WifiPin{mcs,dst}`).
+That pinning is not just a tidiness fix — **the generation's on-air address is the
+substrate that lets RLNC recoding work on a broadcast mesh.** This section places the
+coding axes and says honestly what is built vs. what the recoding upgrade needs.
+
+### The four coding axes (grounded in `ndn-coding`)
+
+| axis | module | flow | unit | trust |
+|---|---|---|---|---|
+| **F1** end-to-end | `fec.rs` (`CodedAssembler`) | intra | named, signed Data segments | above trust (each segment is signed Data) |
+| **F2** in-network RLNC recode | `recode.rs` | intra | named Data segments | **crosses trust** — a recoder re-delegates; needs the recoding-trust model |
+| **F3** COPE | `cope.rs` | **inter** | opaque link frames | below trust (XOR of different next-hops; overhearing gain) |
+| **link-FEC** (what the bridge uses) | `link_fec.rs` | intra | opaque link frames, one hop | below trust (transparent framing, like NDNLP) |
+
+"F2 and F3" ≈ *RLNC at the network layer* (F2, named Data) and *RLNC at the link
+layer*. Note the naming subtlety: the codebase's **F3 is COPE (inter-flow XOR)**, not
+RLNC; *link-layer RLNC* is a distinct thing — an **intra-flow** upgrade of the
+systematic `link-FEC` to random linear combinations, which is what enables **relay
+recoding at the link layer**.
+
+### Why RLNC, and why it needs the generation address
+
+A systematic K-of-N code (today's `link-FEC`) delivers the K sources plus fixed
+parity; a relay **cannot** manufacture new innovative parity without the whole
+generation. RLNC's defining move is exactly that: an intermediate node combines the
+coded packets it *overheard* into a fresh random linear combination — adding **rank**
+(innovation) downstream **without decoding**. On a broadcast mesh that is the relay
+superpower: overhear a partial generation, recode, rebroadcast.
+
+Three already-built pieces are precisely what make that composable, and they are the
+same primitives split addressing and cooperative forwarding produced:
+
+1. **The generation address** (§8 pinning) is the generation's on-air identity. A
+   relay **prefix-matches** the family to *hear* a generation it does not consume, and
+   its recoded frames carry the **same** address so they land in the *same* generation
+   for downstream receivers. Without a stable generation address, a recoded frame has
+   nowhere to go.
+2. **CCLF innovation-aware suppression** (`RadioPolicy`, §4 / #45) **is** RLNC
+   rank-aware admission — recode-and-rebroadcast only if you add rank; go quiet when
+   the neighbourhood is full-rank. The suppress predicate and the coding-admission
+   predicate are one mechanism pointed two ways.
+3. **The cooperative-forwarding projection** (#45) already gives a relay the
+   role-scoped listening and the overhear-cancel timers; recoding slots in as *what*
+   the relay rebroadcasts (a fresh combination) instead of a verbatim duplicate.
+
+So *cooperative coded broadcast* = coop-forwarding (#45) + a recoding codec + the
+generation address (§8) + rank-aware CCLF. The addressing work is the part that was
+missing; it is now in place.
+
+### The trust seam — the real difference between the two RLNC layers
+
+- **Link-layer RLNC (intra-flow, below trust).** Like `link-FEC` and `cope`, a
+  recovered frame is whatever signed bytes it always was; coding is transparent
+  framing that never crosses the signing boundary. A relay recoding here signs
+  **nothing** — cheap, and the natural first target: generalise `link_fec.rs` from
+  systematic RS to RLNC (coding vectors + random GF(2^8) combinations), and the FEC
+  bridge + `WifiPin` generation address carry it unchanged.
+- **Network-layer RLNC (F2, crosses trust).** A recoded *Data* object is a new object
+  a consumer must verify; the recoder must be **delegated** to combine (see
+  `docs/doctrine/nc-recoding-trust-model-2026-05-23.md`, `coding-f2-wire-spec`).
+  `recode.rs` has the pure core (GF(2^8) linear combination, rank-aware admission) but
+  the engine hook (`PitKeyDiscriminator::CodedGeneration`) and the descriptor/vector
+  TLV codec are `unimplemented!` seams. Split addressing composes here too — coded
+  segments are named `/x/y/<gen>/<idx>`, so a caching relay prefix-matches the family
+  and re-serves recoded segments under the same names — but the trust delegation is the
+  gating work, not the addressing.
+
+### Status (honest)
+
+- **Built:** systematic `link-FEC`; per-object split-address **generation pinning**
+  (`WifiPin`, this change); **rank-aware CCLF** (`RadioPolicy`); the coop-forwarding
+  relay prototype (#45).
+- **The link-RLNC upgrade:** replace the systematic codec with RLNC (coding vectors);
+  everything above it — the bridge, the generation address, the relay/CCLF — is ready.
+  This is below trust, so it is the tractable next step.
+- **F2 network RLNC:** `recode.rs` is scaffolding; the blocker is the recoding **trust
+  delegation**, not the addressing.
+
+The through-line: keep the codec swappable (systematic ↔ RLNC) under the same
+`LinkFecBridge`/generation-address seam, so "add relay recoding" is a codec change, not
+an addressing or forwarding change — exactly the composable-capability posture §8/§4
+argue for.
