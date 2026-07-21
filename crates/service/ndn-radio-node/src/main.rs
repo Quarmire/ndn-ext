@@ -27,6 +27,8 @@ use ndn_observability::{
 };
 use ndn_packet::encode::InterestBuilder;
 use ndn_packet::{Data, Name, NameComponent};
+#[cfg(feature = "libusb-backend")]
+use ndn_packet::{Interest, encode::encode_data_unsigned};
 use ndn_radio_cognition::{NameContext, RadioCapability, RadioId, RadioPolicy, prefix_hash};
 #[cfg(not(feature = "libusb-backend"))]
 use ndn_radio_cognition::{RadioActuators, RadioAllocation, RadioError};
@@ -39,6 +41,9 @@ use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 
 const APP_FACE_ID: TransportFaceId = TransportFaceId(10_000);
+/// The radio, when wired as an NDN face carrying LP traffic (not just an actuator).
+#[cfg(feature = "libusb-backend")]
+const RADIO_FACE_ID: TransportFaceId = TransportFaceId(1);
 
 fn obs_prefix() -> Name {
     Name::from_components([
@@ -46,6 +51,27 @@ fn obs_prefix() -> Name {
         NameComponent::generic(Bytes::from_static(b"named-radio")),
         NameComponent::generic(Bytes::from_static(b"observability")),
     ])
+}
+
+/// The demo content prefix a consumer Interests and a producer serves over the radio.
+#[cfg(feature = "libusb-backend")]
+fn radio_demo_prefix() -> Name {
+    Name::from_components([NameComponent::generic(Bytes::from_static(b"radio-demo"))])
+}
+
+#[cfg(feature = "libusb-backend")]
+fn demo_name(seq: u64) -> Name {
+    Name::from_components([
+        NameComponent::generic(Bytes::from_static(b"radio-demo")),
+        NameComponent::generic(Bytes::copy_from_slice(seq.to_string().as_bytes())),
+    ])
+}
+
+/// Low 8 bytes of a trace-id as hex — where the seed's entropy lives (the id is a
+/// big-endian nanos timestamp), so this distinguishes two nodes' traces.
+#[cfg(feature = "libusb-backend")]
+fn trace8(id: [u8; 16]) -> String {
+    id[8..].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// A no-op actuator so the ACT stage's `apply` span emits without real hardware.
@@ -91,29 +117,107 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Cross-node stitching: outbound frames carry our trace-id, inbound frames
     // adopt the peer's — one trace across the radio hop.
     bind_global_trace_stitch(&layer);
+    #[cfg(feature = "libusb-backend")]
+    let trace_layer = layer.clone(); // read the current (possibly stitched) trace-id
     let console = tracing_subscriber::fmt::layer().with_filter(
         tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| "named_radio=info".into()),
     );
     tracing::subscriber::set_global_default(tracing_subscriber::registry().with(layer).with(console))?;
 
-    // --- Engine + app face; mount the publisher's Producer so spans are served
-    //     as Data (Interest by trace-id/span-id; PIT/CS/NAC/signing all apply). ---
+    // --- Engine + app face (+ the radio as a real NDN Face when a role is set). ---
+    let ch = env_u64("NODE_CH", 149) as u8;
     let (app_face, app_handle) = InProcFace::new(APP_FACE_ID, 64);
-    let (engine, _shutdown) = EngineBuilder::new(EngineConfig::default())
-        .face(app_face)
-        .build()
-        .await?;
+    #[allow(unused_mut)] // `builder` is reassigned only when the radio face is added
+    let mut builder = EngineBuilder::new(EngineConfig::default()).face(app_face);
+
+    // NODE_ROLE=consumer|producer wires the radio into the engine as an NDN face and
+    // runs a real Interest/Data exchange over the air; unset = the control-plane demo.
+    #[cfg(feature = "libusb-backend")]
+    let role = std::env::var("NODE_ROLE").unwrap_or_default();
+    #[cfg(feature = "libusb-backend")]
+    let _radio_backend = if role == "consumer" || role == "producer" {
+        use ndn_face_monitor_wifi::{FaceId, LibUsbRtl88xxBackend, MonitorWifiFace};
+        let pid = env_u64("NODE_PID", 0xa81a) as u16;
+        let backend = Arc::new(LibUsbRtl88xxBackend::open_monitor_pid(pid, ch)?);
+        // Broadcast/open by default — the paired LpLinkService fragments NDN packets
+        // across injected frames and runs the per-frame feature pipeline (incl. the
+        // TraceContextFeature that carries our stitch TLV).
+        let radio_face = MonitorWifiFace::new(FaceId(RADIO_FACE_ID.0), backend.clone()).into_face();
+        builder = builder.face_composed(radio_face);
+        println!("radio: RTL8822E 0bda:{pid:04x} wired as NDN face {} on ch{ch}", RADIO_FACE_ID.0);
+        Some(backend)
+    } else {
+        None
+    };
+
+    let (engine, _shutdown) = builder.build().await?;
     let cancel = CancellationToken::new();
     mount_observability(&engine, cancel.clone(), Arc::clone(&publisher));
-    tokio::time::sleep(Duration::from_millis(20)).await; // let the producer register
+    tokio::time::sleep(Duration::from_millis(50)).await; // let producers register
+
+    // --- Radio-face NDN exchange (the on-air cross-node path). ---
+    #[cfg(feature = "libusb-backend")]
+    if role == "consumer" || role == "producer" {
+        let prefix = radio_demo_prefix();
+        println!(
+            "node up [{role}] — my trace = {}",
+            trace8(trace_layer.current_outbound_context().trace_id.0)
+        );
+        if role == "consumer" {
+            // Route the demo prefix out the radio face; express Interests over the air.
+            engine.fib().add_nexthop(&prefix, RADIO_FACE_ID, 0);
+            for seq in 0..ticks as u64 {
+                let name = demo_name(seq);
+                app_handle
+                    .send(InterestBuilder::new(name.clone()).must_be_fresh().build())
+                    .await?;
+                match tokio::time::timeout(Duration::from_millis(1500), app_handle.recv()).await {
+                    Ok(Some(wire)) => {
+                        let d = Data::decode(wire)?;
+                        println!(
+                            "  seq {seq}: got Data {} ({} B) back over the radio",
+                            *d.name,
+                            d.content().map(|c| c.len()).unwrap_or(0)
+                        );
+                    }
+                    _ => println!("  seq {seq}: no Data within 1.5s"),
+                }
+                tokio::time::sleep(Duration::from_millis(tick_ms)).await;
+            }
+        } else {
+            // Deliver incoming Interests to this producer app; serve Data back.
+            engine.fib().add_nexthop(&prefix, APP_FACE_ID, 0);
+            let run = Duration::from_millis(ticks as u64 * tick_ms + 4000);
+            let start = tokio::time::Instant::now();
+            let mut served = 0u32;
+            while start.elapsed() < run {
+                match tokio::time::timeout(Duration::from_millis(500), app_handle.recv()).await {
+                    Ok(Some(wire)) => {
+                        let name = (*Interest::decode(wire)?.name).clone();
+                        let body = format!("hello from producer, {name}");
+                        app_handle.send(encode_data_unsigned(&name, body.as_bytes())).await?;
+                        served += 1;
+                        println!(
+                            "  served {name}; trace now = {} (adopted the peer's on ingress)",
+                            trace8(trace_layer.current_outbound_context().trace_id.0)
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            println!("producer served {served} Data over the radio");
+        }
+        println!("published {} OTLP spans (trace stitched across the hop)", publisher.len());
+        cancel.cancel();
+        return Ok(());
+    }
 
     // --- Cognitive radio control plane. On-air (feature `libusb-backend`) it binds
     //     a real RTL8822E as BOTH actuator and frame-free occupancy sensor; else a
     //     no-op actuator so the span tree still emits without hardware. Either way
     //     an active object makes every tick a real decision. ---
     let radio = RadioId(0);
-    let ch = env_u64("NODE_CH", 149) as u8;
     let mut control = RadioControl::new(RadioPolicy::default());
     // Single operating channel so channel selection never tunes to an untested one.
     control.register_radio(radio, FaceId(0), RadioCapability::wifi_monitor_5ghz(vec![ch]));
