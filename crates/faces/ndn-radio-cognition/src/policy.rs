@@ -116,6 +116,62 @@ impl Default for PolicyConfig {
     }
 }
 
+/// Why a [`RadioPlan`] came out the way it did — the inputs [`RadioPolicy::decide`]
+/// read and the key intermediate choices, as plain data. Returned alongside the
+/// plan by [`RadioPolicy::decide_traced`] so an observer (the face) can render the
+/// decision's *why* to a trace span, while this pure crate stays sans-IO (no
+/// tracing/OpenTelemetry dependency — observability is computed as a value here and
+/// rendered at the I/O boundary).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DecisionRationale {
+    /// This node originates the content (always transmits — it IS the rank).
+    pub is_origin: bool,
+    /// Live PIT/demand existed for the prefix (vs the manual active set).
+    pub had_demand: bool,
+    /// Effective wanted-receiver count driving diversity/redundancy.
+    pub receivers: usize,
+    /// Neighbours already holding the content (the CCLF suppression input).
+    pub holders: usize,
+    /// Post-pooling rank deficit — the core "does transmitting add rank?" quantity.
+    pub deficit: f32,
+    /// Broadcast regime (receivers ≥ threshold) → robust defaults.
+    pub broad: bool,
+    /// A second radio replicates for diversity (deficit ≥ threshold, ≥2 radios).
+    pub replicate: bool,
+    /// Set when the plan is a suppression, with the reason it stayed quiet.
+    pub suppress: Option<SuppressReason>,
+    /// Per chosen radio: the measured inputs behind its allocation.
+    pub radios: Vec<RadioRationale>,
+}
+
+/// Why a decision suppressed rather than transmitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SuppressReason {
+    /// A relay whose transmission would add no rank downstream (CCLF ∪ stop-at-rank-N).
+    RelayAddsNoRank,
+    /// No TX-capable radio with a channel and remaining duty budget was available.
+    NoTxRadio,
+}
+
+/// The measured inputs behind one radio's allocation — the "why this radio, this
+/// channel, this rate" a trace consumer needs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RadioRationale {
+    pub radio: RadioId,
+    /// Capability-fit score that ranked this radio (higher = preferred).
+    pub score: f32,
+    /// Chosen channel (the least-busy one this radio offers).
+    pub channel: Option<u8>,
+    /// Sensed busy% of the chosen channel — the frame-free occupancy input (#30).
+    pub channel_busy_pct: Option<u8>,
+    /// Weakest wanted-receiver RSSI (dBm) driving the MCS + power pick.
+    pub rssi_dbm: Option<i8>,
+    /// Post-link-FEC residual erasure driving the redundancy budget.
+    pub link_per: Option<f32>,
+    /// Replicate vs Split role of this allocation.
+    pub role: AllocRole,
+}
+
 pub struct RadioPolicy {
     cfg: PolicyConfig,
     /// Learned per-MCS RSSI thresholds (shared with a [`crate::RateCalibrator`]).
@@ -181,12 +237,32 @@ impl RadioPolicy {
     ///
     /// [`RadioStrategy::decide`]: crate::RadioStrategy::decide
     pub fn decide(&self, ctx: &NameContext, view: &dyn MediumView, now_ms: u64) -> RadioPlan {
+        self.decide_traced(ctx, view, now_ms).0
+    }
+
+    /// [`decide`](Self::decide) plus a [`DecisionRationale`] — the inputs read and
+    /// the key intermediate choices, so an observer can render *why* the plan came
+    /// out this way to a trace span. Pure: the rationale is data, not a side effect.
+    pub fn decide_traced(
+        &self,
+        ctx: &NameContext,
+        view: &dyn MediumView,
+        now_ms: u64,
+    ) -> (RadioPlan, DecisionRationale) {
         let demand = view.demand(ctx.prefix_hash);
         let receivers = self.effective_receivers(ctx, view, now_ms);
         let holders = view.neighbors_holding(ctx.prefix_hash, now_ms);
         let deficit = demand
             .map(|d| d.rank_deficit.get_or(receivers as f32))
             .unwrap_or(receivers as f32);
+        let mut why = DecisionRationale {
+            is_origin: ctx.is_origin,
+            had_demand: demand.is_some(),
+            receivers,
+            holders,
+            deficit,
+            ..Default::default()
+        };
 
         // --- Innovation-aware suppression (CCLF ∪ stop-at-rank-N) ---
         // A relay stays quiet unless its transmission adds rank to a downstream
@@ -195,7 +271,8 @@ impl RadioPolicy {
         if !ctx.is_origin {
             let adds_rank = deficit > f32::EPSILON && holders < receivers.max(1);
             if !adds_rank {
-                return RadioPlan::suppressed(self.consistency(ctx, &[], 0));
+                why.suppress = Some(SuppressReason::RelayAddsNoRank);
+                return (RadioPlan::suppressed(self.consistency(ctx, &[], 0)), why);
             }
         }
 
@@ -213,7 +290,8 @@ impl RadioPolicy {
             })
             .collect();
         if tx.is_empty() {
-            return RadioPlan::suppressed(self.consistency(ctx, &[], 0));
+            why.suppress = Some(SuppressReason::NoTxRadio);
+            return (RadioPlan::suppressed(self.consistency(ctx, &[], 0)), why);
         }
         let broad = receivers >= self.cfg.broad_receivers;
         tx.sort_by(|(_, a), (_, b)| {
@@ -225,6 +303,8 @@ impl RadioPolicy {
         // post-pooling deficit is high and a TX-capable alternative exists.
         let replicate = deficit >= self.cfg.replicate_deficit && tx.len() >= 2;
         let chosen = if replicate { 2 } else { 1 };
+        why.broad = broad;
+        why.replicate = replicate;
 
         let mut allocations = Vec::with_capacity(chosen);
         for (i, (radio, cap)) in tx.iter().take(chosen).enumerate() {
@@ -239,6 +319,17 @@ impl RadioPolicy {
             } else {
                 AllocRole::Replicate
             };
+            // The inputs behind this allocation, for the trace (same view the
+            // params were computed from, so the "why" is faithful).
+            why.radios.push(RadioRationale {
+                radio: *radio,
+                score: self.radio_score(cap, ctx, broad),
+                channel,
+                channel_busy_pct: channel.and_then(|ch| view.busy_pct(*radio, ch)),
+                rssi_dbm: self.demand_set_rssi(*radio, view, now_ms),
+                link_per: view.residual(*radio).and_then(|r| r.link_per.get()),
+                role,
+            });
             allocations.push(RadioAllocation {
                 radio: *radio,
                 channel,
@@ -249,13 +340,16 @@ impl RadioPolicy {
 
         let objective = self.estimate_objective(&allocations, receivers.max(1));
         let consistency = self.consistency(ctx, &allocations, receivers);
-        RadioPlan {
-            relay: !ctx.is_origin,
-            suppress: false,
-            allocations,
-            objective,
-            consistency,
-        }
+        (
+            RadioPlan {
+                relay: !ctx.is_origin,
+                suppress: false,
+                allocations,
+                objective,
+                consistency,
+            },
+            why,
+        )
     }
 
     // --- effective demand-set size ---
@@ -758,6 +852,31 @@ mod tests {
             a.consistency, b.consistency,
             "same name+demand ⇒ same plan digest"
         );
+    }
+
+    #[test]
+    fn rationale_captures_the_why_of_a_decision() {
+        let mut m = wifi_only();
+        m.observe_occupancy(ChannelOccupancy { radio: W, channel: 149, busy_pct: 80, ts_ms: 1 });
+        m.observe_occupancy(ChannelOccupancy { radio: W, channel: 161, busy_pct: 10, ts_ms: 1 });
+        m.observe_occupancy(ChannelOccupancy { radio: W, channel: 165, busy_pct: 50, ts_ms: 1 });
+
+        // Origin transmits: the rationale explains the plan — the picked channel and
+        // the occupancy that picked it are both in the "why".
+        let (plan, why) = RadioPolicy::default().decide_traced(&NameContext::new(0xAA), &m, 1_000);
+        assert_eq!(why.suppress, None);
+        assert!(why.is_origin, "origin transmits regardless of receiver count");
+        assert!(!why.radios.is_empty());
+        assert_eq!(why.radios.len(), plan.allocations.len());
+        let r0 = why.radios[0];
+        assert_eq!(r0.channel, Some(161), "chose least-busy");
+        assert_eq!(r0.channel_busy_pct, Some(10), "and the trace records why (10% busy)");
+        assert_eq!(r0.channel, plan.allocations[0].channel, "input matches the output");
+
+        // A relay with nothing to add is suppressed — and the trace says *why*.
+        let (plan, why) = RadioPolicy::default().decide_traced(&NameContext::relayed(0xBB), &m, 1_000);
+        assert!(plan.suppress);
+        assert_eq!(why.suppress, Some(SuppressReason::RelayAddsNoRank));
     }
 
     #[test]

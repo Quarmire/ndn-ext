@@ -24,7 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::time::Duration;
 
     use ndn_face_monitor_wifi::{ChannelBw, FaceId, LibUsbRtl88xxBackend, RadioControl};
-    use ndn_radio_cognition::{RadioCapability, RadioId, RadioPolicy};
+    use ndn_radio_cognition::{NameContext, RadioCapability, RadioId, RadioPolicy, prefix_hash};
 
     // Show the frame-free `occupancy_sample` + `decision` events (target
     // `named_radio*`) — the exact tracing spans/events the OTLP publisher exports.
@@ -56,11 +56,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut control = RadioControl::new(RadioPolicy::default());
     control.register_radio(radio, FaceId(0), RadioCapability::wifi_monitor_5ghz(vec![ch]));
     let _cell = control.libusb_actuator(radio, backend.clone());
+    // An active object so each tick makes a real decision — its `decision` span
+    // tree then shows the sensed occupancy as a decision INPUT beside the chosen
+    // OUTPUT params ("why").
+    control.set_active(vec![NameContext::new(prefix_hash(&[b"occupancy-onair"]))]);
     let control = Arc::new(control);
     let _sampler = control.start_occupancy_sampling(radio, ch, backend.clone(), interval);
 
     for _ in 0..secs {
         tokio::time::sleep(Duration::from_secs(1)).await;
+        // Run a decision so the input→output span tree emits with live occupancy.
+        control.tick_now(control.now_ms());
         match control.busy_pct(radio, ch) {
             Some(b) => println!("  ch{ch}: sensed busy = {b}%"),
             None => println!("  ch{ch}: (no sample yet)"),

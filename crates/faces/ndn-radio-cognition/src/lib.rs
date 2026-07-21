@@ -68,7 +68,10 @@ pub use plan::{
     AllocRole, LoraRate, RadioActuators, RadioAllocation, RadioError, RadioPlan, RateParams,
     TxParams, WifiRate,
 };
-pub use policy::{NameContext, PolicyConfig, Priority, RadioPolicy};
+pub use policy::{
+    DecisionRationale, NameContext, PolicyConfig, Priority, RadioPolicy, RadioRationale,
+    SuppressReason,
+};
 pub use report::{MAX_ENTRIES, REPORT_MAGIC, ReceptionReport, decode_report, encode_report};
 pub use sense::{
     Band, ChannelOccupancy, DEFAULT_SATURATION_FPS, DUTY_WINDOW_MS, Demand, Ewma, LinkResidual,

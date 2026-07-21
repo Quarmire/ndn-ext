@@ -28,8 +28,8 @@ use bytes::Bytes;
 #[cfg(any(test, feature = "libusb-backend"))]
 use ndn_radio_cognition::RadioAllocation;
 use ndn_radio_cognition::{
-    ARMS, ChannelOccupancy, Context, ContextualBandit, DEFAULT_SATURATION_FPS, Demand,
-    DemandTracker, MediumState, MediumView, NameContext, NeighborReport, PolicyConfig,
+    ARMS, ChannelOccupancy, Context, ContextualBandit, DEFAULT_SATURATION_FPS, DecisionRationale,
+    Demand, DemandTracker, MediumState, MediumView, NameContext, NeighborReport, PolicyConfig,
     RadioActuators, RadioCapability, RadioId, RadioPlan, RadioPolicy, RadioStrategy, RateCalibrator,
     SfCalibrator, TxParams, apply_arm, decode_report, default_sf_thresholds, default_thresholds,
     encode_report, lora_airtime_ms, reward,
@@ -507,12 +507,12 @@ impl RadioControl {
         } else {
             tracked
         };
-        let mut plans: Vec<RadioPlan> = {
+        let (mut plans, rationales): (Vec<RadioPlan>, Vec<DecisionRationale>) = {
             let m = self.medium.lock().unwrap();
             active
                 .iter()
-                .map(|ctx| self.policy.decide(ctx, &*m, now_ms))
-                .collect()
+                .map(|ctx| self.policy.decide_traced(ctx, &*m, now_ms))
+                .unzip()
         };
 
         // REFINE the joint operating point. The bandit (if on) selects + applies an
@@ -613,25 +613,49 @@ impl RadioControl {
             }
         }
 
-        // OBSERVE: emit one structured event per decision. Zero-cost without a
-        // subscriber; a `tracing` subscriber (incl. tracing-opentelemetry) turns
-        // these fields into logs / metrics / spans — the hook for dashboards and
-        // research numbers. Target `named_radio::decision`.
-        for (name_ctx, plan) in active.iter().zip(plans.iter()) {
+        // OBSERVE: emit an input→output span tree per decision so a trace shows
+        // *why* each plan came out this way. Under `radio_tick`, each object opens a
+        // `decision` span carrying the measured INPUTS the policy read (from the
+        // `DecisionRationale`); nested `named_radio::decision` events carry the
+        // per-radio input drivers + the chosen OUTPUT params. Zero-cost without a
+        // subscriber; a `tracing` subscriber (incl. the ndn-observability OTLP layer)
+        // turns the tree into spans consumers can Interest by trace-id.
+        for ((name_ctx, plan), why) in active.iter().zip(plans.iter()).zip(rationales.iter()) {
+            let _decision = tracing::debug_span!(
+                target: "named_radio", "decision",
+                prefix = name_ctx.prefix_hash,
+                origin = why.is_origin,
+                demand = why.had_demand,
+                receivers = why.receivers,
+                holders = why.holders,
+                deficit = why.deficit,
+                broad = why.broad,
+                replicate = why.replicate,
+            )
+            .entered();
             if plan.suppress {
                 tracing::debug!(
                     target: "named_radio::decision",
-                    prefix = name_ctx.prefix_hash,
                     suppress = true,
+                    reason = ?why.suppress,
                     consistency = plan.consistency,
                     "radio: suppress (no rank to add)"
                 );
-            } else if let Some(a) = plan.allocations.first() {
+                continue;
+            }
+            // One event per allocation: the INPUTS that set it beside the OUTPUT.
+            for (a, r) in plan.allocations.iter().zip(why.radios.iter()) {
                 tracing::debug!(
                     target: "named_radio::decision",
-                    prefix = name_ctx.prefix_hash,
-                    strategy = self.policy.name(),
+                    // inputs — the "why this radio / channel / rate"
                     radio = a.radio.0,
+                    score = r.score,
+                    channel_busy_pct = ?r.channel_busy_pct,
+                    rssi_dbm = ?r.rssi_dbm,
+                    link_per = ?r.link_per,
+                    role = ?r.role,
+                    // outputs — what was chosen
+                    strategy = self.policy.name(),
                     channel = ?a.channel,
                     mcs = ?a.params.mcs(),
                     bw = ?a.params.bw(),
