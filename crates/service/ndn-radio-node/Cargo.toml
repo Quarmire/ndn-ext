@@ -31,5 +31,9 @@ tokio-util          = { workspace = true }
 tracing             = { workspace = true }
 tracing-subscriber  = { workspace = true }
 
+[dev-dependencies]
+# For the cross-node stitch proof: build a minimal LP wire to run on_egress/on_ingress.
+ndn-tlv = { workspace = true, features = ["std"] }
+
 [lints]
 workspace = true

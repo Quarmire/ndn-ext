@@ -31,6 +31,9 @@ use ndn_radio_cognition::{NameContext, RadioCapability, RadioId, RadioPolicy, pr
 #[cfg(not(feature = "libusb-backend"))]
 use ndn_radio_cognition::{RadioActuators, RadioAllocation, RadioError};
 use ndn_transport::FaceId as TransportFaceId;
+use ndn_transport::link_service::features::{
+    install_global_egress_source, install_global_ingress_sink,
+};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
@@ -62,6 +65,20 @@ fn env_u64(k: &str, d: u64) -> u64 {
     std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
 }
 
+/// Bind this node's observability layer to the process-global TraceContext hooks
+/// (present on every network face's `LpLinkService` by default): outbound frames
+/// carry this node's current trace context in the 0x520 LP TLV, and inbound frames
+/// adopt the peer's trace-id (`set_inbound_trace_id`). So a frame that crosses the
+/// radio hop carries its trace with it — one OTLP trace spans both nodes, and the
+/// receiver's spans stitch under the sender's trace-id. No opentelemetry/tonic dep:
+/// the TLV is the only wire artifact.
+fn bind_global_trace_stitch(layer: &NdnObservabilityLayer) {
+    let egress = layer.clone();
+    install_global_egress_source(Arc::new(move || Some(egress.current_outbound_context())));
+    let ingress = layer.clone();
+    install_global_ingress_sink(Arc::new(move |tc| ingress.set_inbound_trace_id(tc.trace_id.0)));
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ticks = env_u64("TICKS", 5) as u32;
@@ -70,12 +87,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Observability: capture tracing spans → OTLP protobufs (published as
     //     Data), and mirror the human-readable events to the console. ---
     let publisher = SpanPublisher::new(obs_prefix(), SpanRetention::default());
-    let obs = NdnObservabilityLayer::new(Arc::clone(&publisher), ratio_sampler(1.0));
+    let layer = NdnObservabilityLayer::new(Arc::clone(&publisher), ratio_sampler(1.0));
+    // Cross-node stitching: outbound frames carry our trace-id, inbound frames
+    // adopt the peer's — one trace across the radio hop.
+    bind_global_trace_stitch(&layer);
     let console = tracing_subscriber::fmt::layer().with_filter(
         tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| "named_radio=info".into()),
     );
-    tracing::subscriber::set_global_default(tracing_subscriber::registry().with(obs).with(console))?;
+    tracing::subscriber::set_global_default(tracing_subscriber::registry().with(layer).with(console))?;
 
     // --- Engine + app face; mount the publisher's Producer so spans are served
     //     as Data (Interest by trace-id/span-id; PIT/CS/NAC/signing all apply). ---
@@ -152,4 +172,78 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     cancel.cancel();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndn_observability::{NdnObservabilityLayer, SpanPublisher, SpanRetention, ratio_sampler};
+    use ndn_transport::link_service::{
+        EgressCtx, IngressCtx, InboundLpFrame, LinkServiceFeature, OutboundLpFrame,
+        TraceContextFeature,
+    };
+
+    fn a_node() -> NdnObservabilityLayer {
+        NdnObservabilityLayer::new(
+            SpanPublisher::new(obs_prefix(), SpanRetention::default()),
+            ratio_sampler(1.0),
+        )
+    }
+
+    /// A minimal well-formed LP wire (LP_PACKET wrapping an LP_FRAGMENT) to run the
+    /// egress/ingress splice against.
+    fn lp_wire() -> Bytes {
+        use ndn_packet::tlv_type;
+        let mut w = ndn_tlv::TlvWriter::new();
+        w.write_nested(tlv_type::LP_PACKET, |w| {
+            // A tiny inner NDN packet — content is irrelevant to the TraceContext TLV.
+            w.write_tlv(tlv_type::LP_FRAGMENT, &[0x05, 0x02, 0x07, 0x00]);
+        });
+        w.finish()
+    }
+
+    #[test]
+    fn one_trace_spans_two_nodes_across_a_hop() {
+        // Two independent nodes, each with its own observability layer + the
+        // trace-context feature its LpLinkService carries by default.
+        let node_a = a_node();
+        let node_b = a_node();
+        // Put A on a known trace so the stitch is observable (both layers seed the
+        // same process-wide root otherwise).
+        node_a.set_inbound_trace_id([0xA1; 16]);
+        let trace_a = node_a.current_outbound_context().trace_id;
+        assert_eq!(trace_a.0, [0xA1; 16]);
+        assert_ne!(
+            node_b.current_outbound_context().trace_id,
+            trace_a,
+            "B starts on a different trace than A"
+        );
+
+        // Wire each node's feature to its layer — the same binding the node binary
+        // installs process-globally, here per-feature so two nodes coexist in-process.
+        let feat_a = TraceContextFeature::new();
+        {
+            let a = node_a.clone();
+            feat_a.set_egress_source(Some(Arc::new(move || Some(a.current_outbound_context()))));
+        }
+        let feat_b = TraceContextFeature::new();
+        {
+            let b = node_b.clone();
+            feat_b.set_ingress_sink(Some(Arc::new(move |tc| b.set_inbound_trace_id(tc.trace_id.0))));
+        }
+
+        // Node A transmits a frame: on_egress splices A's trace context (0x520 TLV).
+        let mut out = OutboundLpFrame::new(lp_wire(), true);
+        feat_a.on_egress(&mut out, &EgressCtx::new(APP_FACE_ID, None));
+
+        // Node B receives it: on_ingress → sink → B adopts A's trace-id.
+        feat_b.on_ingress(&InboundLpFrame::bare(out.wire), &IngressCtx::new(APP_FACE_ID));
+
+        // B's subsequent spans now share A's trace-id — one trace, two nodes.
+        assert_eq!(
+            node_b.current_outbound_context().trace_id,
+            trace_a,
+            "the receiver stitched onto the sender's trace"
+        );
+    }
 }
