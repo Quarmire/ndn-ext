@@ -29,6 +29,10 @@ use ndn_packet::encode::InterestBuilder;
 use ndn_packet::{Data, Name, NameComponent};
 #[cfg(feature = "libusb-backend")]
 use ndn_packet::{Interest, encode::encode_data_unsigned};
+#[cfg(feature = "libusb-backend")]
+use ndn_radio_cognition::{PolicyConfig, TxParams};
+#[cfg(feature = "libusb-backend")]
+use std::sync::RwLock;
 use ndn_radio_cognition::{NameContext, RadioCapability, RadioId, RadioPolicy, prefix_hash};
 #[cfg(not(feature = "libusb-backend"))]
 use ndn_radio_cognition::{RadioActuators, RadioAllocation, RadioError};
@@ -59,12 +63,22 @@ fn radio_demo_prefix() -> Name {
     Name::from_components([NameComponent::generic(Bytes::from_static(b"radio-demo"))])
 }
 
+/// `/radio-demo/<seq>/<rssi>` — the consumer carries its measured link RSSI to the
+/// producer in the Interest name, closing the cognition loop over the radio itself.
 #[cfg(feature = "libusb-backend")]
-fn demo_name(seq: u64) -> Name {
+fn demo_name(seq: u64, rssi: i8) -> Name {
     Name::from_components([
         NameComponent::generic(Bytes::from_static(b"radio-demo")),
         NameComponent::generic(Bytes::copy_from_slice(seq.to_string().as_bytes())),
+        NameComponent::generic(Bytes::copy_from_slice(rssi.to_string().as_bytes())),
     ])
+}
+
+/// Pull the reported RSSI out of the last name component.
+#[cfg(feature = "libusb-backend")]
+fn parse_rssi(name: &Name) -> Option<i8> {
+    let comps = name.components();
+    std::str::from_utf8(comps.last()?.value.as_ref()).ok()?.parse().ok()
 }
 
 /// Low 8 bytes of a trace-id as hex — where the seed's entropy lives (the id is a
@@ -135,8 +149,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // runs a real Interest/Data exchange over the air; unset = the control-plane demo.
     #[cfg(feature = "libusb-backend")]
     let role = std::env::var("NODE_ROLE").unwrap_or_default();
+    // The producer's cognition writes its decided TX params here; the face reads the
+    // cell per send. Actuating the cell directly (not via libusb_actuator) keeps the
+    // control plane off the USB bus, so it never contends with the face's RX/TX.
     #[cfg(feature = "libusb-backend")]
-    let _radio_backend = if role == "consumer" || role == "producer" {
+    let planned_cell: Arc<RwLock<Option<TxParams>>> = Arc::new(RwLock::new(None));
+    #[cfg(feature = "libusb-backend")]
+    let radio_backend = if role == "consumer" || role == "producer" {
         use ndn_face_monitor_wifi::{FaceId, LibUsbRtl88xxBackend, MonitorWifiFace};
         let pid = env_u64("NODE_PID", 0xa81a) as u16;
         let backend = Arc::new(LibUsbRtl88xxBackend::open_monitor_pid(pid, ch)?);
@@ -144,7 +163,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // loss) so the FEC A/B has something to recover. Unset = bring-up default.
         if let Ok(p) = std::env::var("NODE_TXPWR") {
             if let Ok(idx) = p.parse::<u32>() {
-                use ndn_face_monitor_wifi::RadioKnobs;
                 backend.set_tx_power(idx)?;
                 println!("tx power set to {idx:#04x}");
             }
@@ -160,6 +178,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if fec_r > 0 {
             mf = mf.with_link_fec(1, fec_r, Duration::from_millis(50));
         }
+        // The face sends at the cognition-decided MCS when the cell is populated
+        // (producer), else its static policy (consumer).
+        mf = mf.with_planned_params(planned_cell.clone());
         let radio_face = mf.into_face();
         builder = builder.face_composed(radio_face);
         println!(
@@ -187,9 +208,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if role == "consumer" {
             // Route the demo prefix out the radio face; express Interests over the air.
             engine.fib().add_nexthop(&prefix, RADIO_FACE_ID, 0);
+            // Report our measured link RSSI (bench link ≈ -55 dBm; NODE_RSSI_BIAS
+            // shifts it to characterize the loop's response to a degraded link).
+            let bias: i32 = std::env::var("NODE_RSSI_BIAS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+            let reported = (-55 + bias).clamp(-110, -30) as i8;
+            println!("consumer: reporting link RSSI {reported} dBm to the producer (bench ≈ -55, bias {bias})");
             let mut got = 0u32;
             for seq in 0..ticks as u64 {
-                let name = demo_name(seq);
+                let name = demo_name(seq, reported);
                 app_handle
                     .send(InterestBuilder::new(name.clone()).must_be_fresh().build())
                     .await?;
@@ -205,24 +231,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             println!("DELIVERY: {got}/{ticks} Interest→Data round-trips completed over the radio");
         } else {
-            // Deliver incoming Interests to this producer app; serve Data back.
+            // PRODUCER: close the cognition loop — fold the consumer's REPORTED link
+            // RSSI into the medium, let the policy decide, and write the decided TX
+            // params so the next Data goes out at the adapted rate. Actuation is the
+            // shared cell (no USB), so the plane never contends with the face.
             engine.fib().add_nexthop(&prefix, APP_FACE_ID, 0);
-            // Serve for NODE_SECS (default 60) — long enough to cover the consumer's
-            // launch + bring-up offset, so an early shutdown never masquerades as loss.
+            let radio = RadioId(0);
+            const CONSUMER_NODE: u64 = 0xC0;
+            const FULL_PWR: u8 = 0x3f; // decide_power returns None = "keep full power"
+            // NODE_BANDIT=1 → joint rate×power×FEC multi-arm bandit (the cooperative
+            // dynamic-power learner from the 8812EU work); else the rule policy.
+            let mut control = if env_u64("NODE_BANDIT", 0) == 1 {
+                RadioControl::new_bandit(PolicyConfig::default(), 0.3)
+            } else {
+                RadioControl::new(RadioPolicy::default())
+            };
+            control.register_radio(radio, FaceId(0), RadioCapability::wifi_monitor_5ghz(vec![ch]));
+            control.set_active(vec![NameContext::new(prefix_hash(&[b"radio-demo"]))]);
             let run = Duration::from_secs(env_u64("NODE_SECS", 60));
             let start = tokio::time::Instant::now();
             let mut served = 0u32;
+            let mut last: (Option<u8>, u8) = (None, 0); // (mcs, power)
             while start.elapsed() < run {
                 match tokio::time::timeout(Duration::from_millis(500), app_handle.recv()).await {
                     Ok(Some(wire)) => {
                         let name = (*Interest::decode(wire)?.name).clone();
+                        // SENSE (real reported link) → DECIDE → ACT: MCS via the planned
+                        // cell (per-frame, no USB), TX power via the TXAGC (RadioKnobs).
+                        if let Some(rssi) = parse_rssi(&name) {
+                            let now = control.now_ms();
+                            control.observe_rx(radio, CONSUMER_NODE, Some(rssi), now);
+                            let plans = control.tick_now(now);
+                            if let Some(a) = plans.first().and_then(|p| p.allocations.first()) {
+                                *planned_cell.write().unwrap() = Some(a.params);
+                                let pwr = a.params.tx_power.unwrap_or(FULL_PWR);
+                                if let Some(be) = &radio_backend {
+                                    let _ = be.set_tx_power(pwr as u32);
+                                }
+                                let now_pair = (a.params.mcs(), pwr);
+                                if now_pair != last {
+                                    println!(
+                                        "  reported RSSI {rssi} dBm → MCS {:?}, TX power {:#04x}",
+                                        now_pair.0, pwr
+                                    );
+                                    last = now_pair;
+                                }
+                            }
+                            // Feedback for the bandit's reward (bench link is reliable).
+                            control.observe_delivery(true);
+                        }
                         let body = format!("hello from producer, {name}");
                         app_handle.send(encode_data_unsigned(&name, body.as_bytes())).await?;
                         served += 1;
-                        println!(
-                            "  served {name}; trace now = {} (adopted the peer's on ingress)",
-                            trace8(trace_layer.current_outbound_context().trace_id.0)
-                        );
                     }
                     _ => {}
                 }
