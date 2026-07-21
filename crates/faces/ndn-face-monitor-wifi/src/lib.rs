@@ -194,17 +194,27 @@ impl TxBatcher {
 /// [`LinkFecBridge`] delegates: inject each coded frame of a generation as its
 /// **own** MPDU (interleaved — never one generation per A-MSDU), at the MCS pinned
 /// to the frame that opened the generation.
+/// What a coded generation pins to the frame that opened it: the MCS **and** the
+/// per-Data-name destination. So a generation carrying object `/x/y` is addressed to
+/// `/x/y`'s split address — relays prefix-match it, the consumer exact-matches it —
+/// exactly as an uncoded object is (composing split addressing with the coded path).
+#[derive(Clone, Copy)]
+struct WifiPin {
+    mcs: McsDescriptor,
+    dst: [u8; 6],
+}
+
 struct WifiFecSink {
     backend: Arc<dyn WifiRadio>,
-    dst: [u8; 6],
+    /// The source (name-derived, fixed for the face); the dst is pinned per generation.
     src: [u8; 6],
 }
 
 impl GenerationSink for WifiFecSink {
-    type Pin = McsDescriptor;
+    type Pin = WifiPin;
 
-    async fn emit(&self, coded: Vec<Bytes>, mcs: &McsDescriptor) {
-        inject_coded(&self.backend, &coded, Some(*mcs), self.dst, self.src).await;
+    async fn emit(&self, coded: Vec<Bytes>, pin: &WifiPin) {
+        inject_coded(&self.backend, &coded, Some(pin.mcs), pin.dst, self.src).await;
     }
 }
 
@@ -215,8 +225,9 @@ impl GenerationSink for WifiFecSink {
 /// frames through the bridge's decoder, recovering up to R losses per generation
 /// without ARQ.
 struct FaceFec {
-    /// Batching + plan-R actuation over the radio; the pin is the per-generation MCS.
-    bridge: LinkFecBridge<McsDescriptor>,
+    /// Batching + plan-R actuation over the radio; the pin is the per-generation
+    /// (MCS, split dst) — see [`WifiPin`].
+    bridge: LinkFecBridge<WifiPin>,
     /// Payloads recovered/delivered by the decoder, awaiting `recv_bytes`.
     pending: std::sync::Mutex<VecDeque<(Bytes, Option<FaceAddr>)>>,
 }
@@ -224,21 +235,16 @@ struct FaceFec {
 impl FaceFec {
     fn spawn(
         backend: Arc<dyn WifiRadio>,
-        dst: [u8; 6],
         src: [u8; 6],
         k: usize,
         redundancy: u16,
         window: Duration,
     ) -> Self {
         // The generation loop, the window flush, and the plan-driven R actuation
-        // are all in the bearer-agnostic bridge now (task #33); this face supplies
-        // only the Wi-Fi injection (MCS pinned per generation).
-        let bridge = LinkFecBridge::spawn(
-            WifiFecSink { backend, dst, src },
-            k,
-            redundancy,
-            window,
-        );
+        // are all in the bearer-agnostic bridge (task #33); this face supplies only
+        // the Wi-Fi injection (MCS + split dst pinned per generation). The dst rides
+        // in the per-frame pin so per-Data-name addressing composes with coding.
+        let bridge = LinkFecBridge::spawn(WifiFecSink { backend, src }, k, redundancy, window);
         FaceFec {
             bridge,
             pending: std::sync::Mutex::new(VecDeque::new()),
@@ -506,12 +512,11 @@ impl MonitorWifiFace {
     /// generation; batching would bundle a whole generation into one MPDU).
     /// Both ends must enable FEC. Call before mounting (spawns the flush task).
     pub fn with_link_fec(mut self, k: usize, redundancy: u16, window: Duration) -> Self {
-        // FEC batches generations across frames, so it uses the face's static group
-        // address (per-object split addressing is not applied on the coded path).
-        let (dst, src) = self.static_addr();
+        // The source is the face's fixed name-derived identity; the per-generation
+        // destination rides the pin (composes split addressing with the coded path).
+        let (_dst, src) = self.static_addr();
         self.fec = Some(FaceFec::spawn(
             self.backend.clone(),
-            dst,
             src,
             k.max(1),
             redundancy,
@@ -845,9 +850,15 @@ impl Transport for MonitorWifiFace {
         let (dst, src) = self.resolve_addr(&wire);
         let mcs = self.select_mcs();
         // Link-FEC: enqueue the wire frame; the flush task groups a generation,
-        // emits K+R coded frames (one MPDU each, interleaved), recovers losses.
+        // emits K+R coded frames (one MPDU each, interleaved), recovers losses. The
+        // per-object split `dst` rides in the pin, so the generation is addressed to
+        // the object that opened it — split addressing composes with coding. (K should
+        // align with an object's fragments; a generation spanning objects takes the
+        // opening object's address, same as it takes the opening frame's MCS.)
         if let Some(fec) = &self.fec {
-            return fec.bridge.send(wire, mcs, self.planned_redundancy());
+            return fec
+                .bridge
+                .send(wire, WifiPin { mcs, dst }, self.planned_redundancy());
         }
         // The exact resolved rate travels alongside the frame (via inject_at /
         // the batcher), not on the intent — the frame's tx is a placeholder.
@@ -1334,5 +1345,54 @@ mod tests {
         // … but NOT the sibling /x/z (different full address).
         let none = tokio::time::timeout(Duration::from_millis(150), consumer.recv_bytes_with_addr()).await;
         assert!(none.is_err(), "consumer must NOT hear the sibling /x/z");
+    }
+
+    /// Split addressing composed with **link FEC**: each object is a coded generation
+    /// addressed to its own split address (pinned to the generation, like the MCS), so
+    /// the relay prefix-matches and decodes the whole `/x` family while the `/x/y`
+    /// consumer decodes only `/x/y`. This is the coded path no longer using a static
+    /// group address.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn split_addressing_composes_with_link_fec() {
+        let key = OPEN_GROUP_KEY;
+        let win = Duration::from_millis(50);
+        let bus = LoopbackMonitorBus::new();
+        let xy = name_tlv(&[b"x", b"y"]);
+        let xz = name_tlv(&[b"x", b"z"]);
+
+        // k=1 so each object is its own generation → its own split address.
+        let producer = MonitorWifiFace::new(FaceId(1), Arc::new(bus.endpoint(1, -50)))
+            .with_split_producer(&key, "/x")
+            .with_link_fec(1, 1, win);
+        let relay = MonitorWifiFace::new(FaceId(2), Arc::new(bus.endpoint(2, -50)))
+            .with_prefix_relay(&key, "/x")
+            .with_link_fec(1, 1, win);
+        let consumer = MonitorWifiFace::new(FaceId(3), Arc::new(bus.endpoint(3, -50)))
+            .with_exact_consumer(&key, "/x", &xy)
+            .with_link_fec(1, 1, win);
+
+        producer.send_bytes(data_pkt(&xy)).await.unwrap();
+        producer.send_bytes(data_pkt(&xz)).await.unwrap();
+
+        let mut relayed = Vec::new();
+        for _ in 0..2 {
+            let b = tokio::time::timeout(Duration::from_secs(2), relay.recv_bytes())
+                .await
+                .expect("relay decodes both coded objects under /x")
+                .unwrap();
+            relayed.push(b);
+        }
+        relayed.sort();
+        let mut want = vec![data_pkt(&xy), data_pkt(&xz)];
+        want.sort();
+        assert_eq!(relayed, want, "relay prefix-matches + decodes the whole coded family");
+
+        let got = tokio::time::timeout(Duration::from_secs(2), consumer.recv_bytes())
+            .await
+            .expect("consumer decodes its exact coded object")
+            .unwrap();
+        assert_eq!(got, data_pkt(&xy));
+        let none = tokio::time::timeout(Duration::from_millis(200), consumer.recv_bytes()).await;
+        assert!(none.is_err(), "consumer must not decode the sibling /x/z");
     }
 }
