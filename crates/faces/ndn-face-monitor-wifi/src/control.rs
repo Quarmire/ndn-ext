@@ -418,6 +418,25 @@ impl RadioControl {
     pub fn busy_pct(&self, radio: RadioId, channel: u8) -> Option<u8> {
         self.medium.lock().unwrap().busy_pct(radio, channel)
     }
+
+    /// Start **frame-free occupancy sensing** on a radio at bring-up: spawn the
+    /// background sampler ([`spawn_occupancy_sampler`]) over the actuator's own
+    /// `knobs` handle, so the same radio that ACTs also SENSEs its medium. Call
+    /// once the control plane is shared (`Arc`), typically right after
+    /// [`libusb_actuator`](Self::libusb_actuator). Timestamps come from the
+    /// control's own start clock. Returns the task handle (drop to detach).
+    pub fn start_occupancy_sampling(
+        self: &Arc<Self>,
+        radio: RadioId,
+        channel: u8,
+        knobs: Arc<dyn crate::RadioKnobs>,
+        interval: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let started = self.started;
+        spawn_occupancy_sampler(Arc::clone(self), radio, channel, knobs, interval, move || {
+            started.elapsed().as_millis() as u64
+        })
+    }
     pub fn observe_demand(&self, prefix_hash: u64, demand: Demand) {
         self.medium
             .lock()
@@ -589,7 +608,7 @@ impl RadioControl {
                 if let Some(a) = self.actuators.iter().find(|a| a.radio_id() == alloc.radio)
                     && let Err(e) = a.apply(alloc)
                 {
-                    tracing::warn!(target: "named-radio", radio = alloc.radio.0, error = %e, "actuator apply failed");
+                    tracing::warn!(target: "named_radio", radio = alloc.radio.0, error = %e, "actuator apply failed");
                 }
             }
         }
@@ -839,7 +858,20 @@ pub fn spawn_occupancy_sampler(
             let now = Instant::now();
             if let Some((p, t)) = prev {
                 let dt = now.duration_since(t).as_secs_f32();
-                control.observe_activity(radio, channel, activity_rate(p, cur, dt), now_ms());
+                let fps = activity_rate(p, cur, dt);
+                let ts = now_ms();
+                control.observe_activity(radio, channel, fps, ts);
+                // Frame-free occupancy is a first-class sensed signal — trace it so
+                // the OTLP span pipeline (ndn-observability) can carry "what the
+                // radio saw" alongside the DECIDE that consumes it.
+                tracing::debug!(
+                    target: "named_radio",
+                    radio = radio.0,
+                    channel,
+                    frames_per_s = fps,
+                    busy_pct = control.busy_pct(radio, channel),
+                    "occupancy_sample"
+                );
             }
             prev = Some((cur, now));
         }

@@ -50,6 +50,9 @@ libc = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["sync", "rt", "macros", "rt-multi-thread", "time"] }
+# For the occupancy_onair example: show the frame-free `occupancy_sample` /
+# `decision` tracing events (the OTLP-span pipeline's input) on the console.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ndn-packet = { workspace = true }
 ndn-tlv = { workspace = true }
 # Core FEC codec only (no `endpoint` → no engine/ndn-app pulled in): the
