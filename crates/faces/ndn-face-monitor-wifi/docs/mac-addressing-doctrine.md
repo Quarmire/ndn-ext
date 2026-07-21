@@ -94,11 +94,29 @@ longest-prefix-match, signature verify). It (a) exists independent of MAC addres
 (b) is gated behind the same filter, (c) is amortised by caching, (d) falls on
 producers/forwarders more than consumers. Keeping MACs would not reduce it.
 
-**Falsifiable claim to settle it:** on an OPi under rising ambient load, compare
-CPU/power for monitor-mode process-everything vs a filter (BPF/multicast) keyed on the
-name-group hash that drops non-matching frames before the userspace read. Expected:
-the filtered path is flat with load, like MAC filtering. This separates "the
-architecture is expensive" from "monitor mode is expensive." (Queued as a task.)
+**Measured, 2026-07-21 (task #43, `filter_cpu` on the real 8812au — the chip's own
+RX filter, `set_rx_group_filter`, not a BPF proxy).** A peer injected at a fixed
+total rate; the receiver read host CPU with the chip promiscuous ("process
+everything") vs the chip dropping frames not addressed to the name-group (RCR AAP
+cleared + APM exact-match). Idle baseline 0.0%. At ~1800 frames/s of *ambient*
+(non-matching) load on top of the wanted traffic:
+
+| injected total | Arm A promiscuous (delivered, host CPU) | Arm B chip-filtered (delivered, CPU) |
+|---|---|---|
+| 200/s (0 ambient) | 147/s, 1.4% | 44/s, 0.5% |
+| 2000/s (~1800 ambient) | 1443/s, **8.9%** | 143/s, **1.4%** |
+
+The chip-filtered node's CPU stays flat at its *wanted-traffic* cost (~1.4%,
+independent of ambient — the chip dropped the ~1800/s of "not for me" frames before
+USB); the promiscuous node's CPU climbs with total ambient (6.4× here, and it scales
+linearly toward core saturation at ~10⁴ frames/s). Per-delivered-frame cost is the
+same in both arms (~60–120 µs) — the *only* difference is how many frames reach the
+host, which the name-group filter controls. **This is the MAC-filter power profile,
+re-keyed to content: the "listen to everything" tax is a monitor-mode artifact, not
+the architecture.** (Caveat: absolute delivery was link-limited and noisy between
+runs, 22–72%; the load-invariance claim rests on the same-injection 2000/s cell,
+where the filter's drop is unambiguous. A real forwarder adds name-LPM + verify per
+delivered frame, but those are gated behind this same filter.)
 
 ### 3.2 "How is this different from MAC filtering, and you need the filter anyway for DoS"
 
