@@ -200,13 +200,32 @@ filter, high power). Forwarding capacity is a **declared contribution**, per the
 named-radio thesis that a radio publishes what it can contribute — a constrained node
 declines the relay role and stays cheap.
 
-**The honest open problem:** how a node decides *which* prefixes to volunteer / how the
-FIB gets populated on an ad-hoc broadcast mesh with no routing server. Options —
-structured routing (a protocol builds FIB), reactive on-demand (listen within a scope,
-CCLF-suppress), or contribution-based anchoring (a node advertises relay capability by
-name). The design leans on CCLF + demand-driven, but relay-role/FIB formation is
-genuinely unsolved here and is the same question as anchoring/election (task #19). This
-doc does not pretend it is closed.
+**The open problem — how the FIB forms — evaluated (task #45).** Three models, a
+spectrum of how much state you spend to avoid flooding: **(a) structured routing** (a
+protocol builds `prefix → nexthop`; efficient on a stable topology, but heavy under
+mobility and a "nexthop" is degenerate where the ether is the only face); **(b)
+reactive/demand-driven** (no FIB — listen within a trust scope, CCLF-suppressed
+rebroadcast, PIT breadcrumb as the return path; zero-config, mobility-robust,
+broadcast-native, costs flooding bounded by scope + CCLF + hop-limit); **(c)
+contribution-anchored** (advertise relay capability *by name*, peers form soft gradients
+— the thesis applied to forwarding and the power dial made explicit, but it needs a
+bootstrap and is really an optimisation layer over (b)).
+
+**Decision: (b) is the baseline** — it always works (no convergence, no bootstrap), it
+is what (a) and (c) refine, and it composes directly with the CCLF suppression already
+in `RadioPolicy` and the name-group filter. (c) is the optimisation layer and ties the
+anchoring/election work (#19); (a) is the stable-topology specialisation.
+
+**Prototyped and tested** in `ndn-radio-cognition/src/coop.rs` (`CoopRelay`): the
+reactive relay state machine — ephemeral PIT projection, CCLF timer-suppression
+(jittered rebroadcast + overhear-cancel), the reverse-path, scope bounding — with a
+modelled multi-hop broadcast+adjacency medium. Four tests assert the four claims that
+answer the objection: an Interest reaches a producer **two hops** away and the Data
+returns along the breadcrumbs; **redundant relays are CCLF-suppressed** (only the
+better-placed one forwards); an **out-of-scope node hears the Interest but does not
+relay** (the filter is roles, and its width is a choice — the cooperation-vs-power
+dial); **unsolicited Data is dropped** (the DoS gate). Not yet done: on-air multi-hop
+(needs ≥3 spatially-separated radios) and the (c) contribution-advertisement layer.
 
 ---
 

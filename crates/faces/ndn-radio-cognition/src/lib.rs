@@ -47,6 +47,7 @@
 //! face-agnostic.
 
 mod calibrate;
+pub mod coop;
 mod contextual;
 mod demand;
 mod plan;
