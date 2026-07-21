@@ -140,12 +140,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         use ndn_face_monitor_wifi::{FaceId, LibUsbRtl88xxBackend, MonitorWifiFace};
         let pid = env_u64("NODE_PID", 0xa81a) as u16;
         let backend = Arc::new(LibUsbRtl88xxBackend::open_monitor_pid(pid, ch)?);
+        // NODE_TXPWR: lower the TXAGC to make the bench link marginal (induce real
+        // loss) so the FEC A/B has something to recover. Unset = bring-up default.
+        if let Ok(p) = std::env::var("NODE_TXPWR") {
+            if let Ok(idx) = p.parse::<u32>() {
+                use ndn_face_monitor_wifi::RadioKnobs;
+                backend.set_tx_power(idx)?;
+                println!("tx power set to {idx:#04x}");
+            }
+        }
         // Broadcast/open by default — the paired LpLinkService fragments NDN packets
         // across injected frames and runs the per-frame feature pipeline (incl. the
         // TraceContextFeature that carries our stitch TLV).
-        let radio_face = MonitorWifiFace::new(FaceId(RADIO_FACE_ID.0), backend.clone()).into_face();
+        let mut mf = MonitorWifiFace::new(FaceId(RADIO_FACE_ID.0), backend.clone());
+        // NODE_FEC=R: link-layer FEC (K=1 ⇒ repetition, R redundant frames) — the
+        // broadcast reliability lever with no ARQ. Both ends must match. Encodes
+        // below the LP features, so it wraps (and preserves) the stitch TLV. 0 = off.
+        let fec_r = env_u64("NODE_FEC", 0) as u16;
+        if fec_r > 0 {
+            mf = mf.with_link_fec(1, fec_r, Duration::from_millis(50));
+        }
+        let radio_face = mf.into_face();
         builder = builder.face_composed(radio_face);
-        println!("radio: RTL8822E 0bda:{pid:04x} wired as NDN face {} on ch{ch}", RADIO_FACE_ID.0);
+        println!(
+            "radio: RTL8822E 0bda:{pid:04x} as NDN face {} on ch{ch}; link-FEC R={fec_r}",
+            RADIO_FACE_ID.0
+        );
         Some(backend)
     } else {
         None
@@ -167,6 +187,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if role == "consumer" {
             // Route the demo prefix out the radio face; express Interests over the air.
             engine.fib().add_nexthop(&prefix, RADIO_FACE_ID, 0);
+            let mut got = 0u32;
             for seq in 0..ticks as u64 {
                 let name = demo_name(seq);
                 app_handle
@@ -174,21 +195,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .await?;
                 match tokio::time::timeout(Duration::from_millis(1500), app_handle.recv()).await {
                     Ok(Some(wire)) => {
+                        got += 1;
                         let d = Data::decode(wire)?;
-                        println!(
-                            "  seq {seq}: got Data {} ({} B) back over the radio",
-                            *d.name,
-                            d.content().map(|c| c.len()).unwrap_or(0)
-                        );
+                        println!("  seq {seq}: got {} ({} B)", *d.name, d.content().map(|c| c.len()).unwrap_or(0));
                     }
-                    _ => println!("  seq {seq}: no Data within 1.5s"),
+                    _ => println!("  seq {seq}: LOST"),
                 }
                 tokio::time::sleep(Duration::from_millis(tick_ms)).await;
             }
+            println!("DELIVERY: {got}/{ticks} Interest→Data round-trips completed over the radio");
         } else {
             // Deliver incoming Interests to this producer app; serve Data back.
             engine.fib().add_nexthop(&prefix, APP_FACE_ID, 0);
-            let run = Duration::from_millis(ticks as u64 * tick_ms + 4000);
+            // Serve for NODE_SECS (default 60) — long enough to cover the consumer's
+            // launch + bring-up offset, so an early shutdown never masquerades as loss.
+            let run = Duration::from_secs(env_u64("NODE_SECS", 60));
             let start = tokio::time::Instant::now();
             let mut served = 0u32;
             while start.elapsed() < run {
