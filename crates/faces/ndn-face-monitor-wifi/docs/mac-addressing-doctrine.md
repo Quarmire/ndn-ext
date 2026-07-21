@@ -271,3 +271,51 @@ layer into NDN is wrong even though monitor mode gives the control to do it: cha
 access, sync, and coding need microsecond reaction and fixed-width fields; names are
 variable-length and semantic; keeping the bearer semantically thin is what preserves
 one forwarder over WiFi, SDR, and wire.
+
+---
+
+## 8. The name-hash function (decided + implemented, task #44)
+
+The name-group hash is the *compiled form of the name* and the **same key** filters,
+forwards, caches, and suppresses — so the hash function is a shared-keyspace design,
+not a detail. Implemented in `ndn-frame-io` (`frame.rs`), replacing the previous FNV-1a.
+
+**Keyed, not plain — SipHash-2-4.** The old FNV hash was unkeyed: since a name is
+public, an outsider could compute (or cheaply collide) a victim's group hash and flood
+its pre-parse filter. The hash is now keyed SipHash-2-4 (`siphash24`, vendored, shared
+with the FHSS rendezvous #40, verified against the reference vector). A `GroupKey` is
+the trust context: the well-known `OPEN_GROUP_KEY` gives an **open receiver set**
+(anyone computes the hash and joins — zero-config public rendezvous); a shared secret
+scopes a group to a **private trust domain** so its hashes are unforgeable/unlinkable
+to outsiders. Keying is *not* the last line of DoS defence (that is PIT-gated verify +
+rate-limiting, §3.2 and §4) — it just denies outsiders a cheap way to target a private
+group's filter, and gives unlinkability.
+
+**Prefix vs full name — one field, split, matched by masking.** Interest reception must
+filter coarsely (a relay routes for `/x/*`, one aggregatable entry) while Data
+reception filters finely (the exact PIT name). `name_group(key, routable_prefix,
+full_name, group)` packs `H(prefix)` in the high 3 bytes ‖ `H(full_name)` in the low 3,
+so a FIB relay matches the whole family by masking the low bytes (`prefix_key`) — the
+IP-prefix-match trick — while a consumer/PIT compares the full 46 bits. The routable
+prefix boundary is a naming convention. The **flat** `name_group_mac` (46-bit
+full-name hash, no split) stays for the leaf/producer case that does not need
+aggregation.
+
+**Width + collision, stated honestly.** 46 usable bits (48 minus the I/G + U/L
+structural bits). The flat hash gives 46-bit discrimination — 20k names collide
+essentially never. The split *trades* entropy for aggregation: within one prefix, names
+are discriminated by the low 24 bits (a 24-bit birthday, ~4096 names/prefix before a
+likely collision). This is acceptable because **the hash accelerates, the name
+authorises**: a collision at *any* role only wastes a wake (filter) or a lookup
+(FIB/CS), caught by the full name + signature above the hash — it never mis-delivers.
+The one role where a collision would corrupt (dedup/reassembly) does **not** use this
+keyspace: generation/block IDs live in the coding metadata (`FecMetadata`), scoped by
+the already-identified name, so they need no global collision resistance. A producer of
+a huge flat namespace uses `name_group_mac` (46-bit); relays that need family-match use
+the split.
+
+Tests (`ndn-frame-io/src/frame.rs`): SipHash reference vector; keying hides a private
+group; prefix aggregation (same-prefix → same coarse key, distinct full addrs); and the
+flat-46-bit vs split-24-bit-within-prefix collision behaviour. Migrating the faces to
+pass a real `GroupKey` + routable prefix (instead of `name_group_mac` on the whole
+string) is the follow-on; the primitive and the decision are settled here.
