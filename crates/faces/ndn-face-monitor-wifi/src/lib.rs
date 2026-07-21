@@ -132,6 +132,7 @@ mod control;
 #[cfg(feature = "libusb-backend")]
 pub use control::LibUsbActuator;
 pub use control::RadioControl;
+pub use control::{activity_rate, spawn_occupancy_sampler};
 
 pub mod radio;
 pub use radio::{Bandwidth, RadioKnobs};

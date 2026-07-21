@@ -70,6 +70,42 @@ pub struct ChannelOccupancy {
     pub ts_ms: u64,
 }
 
+/// Frame-activity rate (frames/s) at which the channel is treated as fully
+/// occupied (`busy_pct` = 100). Anchored on measurement (#30/#36/#37): the
+/// 8812au's `REG_RXERR_RPT` delta read ~100 frames/s on the ch6 that behaved as
+/// saturated (EDCCA starved TX, heavy loss), and ~19/s on the same channel when
+/// it was merely mid-load. Calibratable per environment/radio.
+pub const DEFAULT_SATURATION_FPS: f32 = 100.0;
+
+impl ChannelOccupancy {
+    /// Build occupancy from a measured **frame-activity rate** (`frames_per_s`) —
+    /// e.g. the 8812au frame-free sensor (`REG_RXERR_RPT` delta / window, #30).
+    /// The rate is interpreted as airtime occupancy that saturates at `sat_fps`
+    /// frames/s → 100% busy: `busy_pct = round(100 · frames_per_s / sat_fps)`,
+    /// clamped to 0..=100. A monotone, calibrated load signal — deliberately not a
+    /// physics-exact airtime integral, since per-frame length/rate isn't sensed.
+    /// Pass [`DEFAULT_SATURATION_FPS`] for `sat_fps` unless calibrated otherwise.
+    pub fn from_activity(
+        radio: RadioId,
+        channel: u8,
+        frames_per_s: f32,
+        sat_fps: f32,
+        ts_ms: u64,
+    ) -> Self {
+        let busy_pct = if sat_fps > 0.0 && frames_per_s > 0.0 {
+            (100.0 * frames_per_s / sat_fps).round().clamp(0.0, 100.0) as u8
+        } else {
+            0
+        };
+        ChannelOccupancy {
+            radio,
+            channel,
+            busy_pct,
+            ts_ms,
+        }
+    }
+}
+
 /// Residual loss *below* a layer on one radio (fraction 0..1), EWMA-smoothed. The
 /// budget allocator sizes each layer's redundancy from the residual left below it.
 #[derive(Clone, Copy, Debug)]
@@ -435,6 +471,29 @@ mod tests {
         m.register_radio(W, RadioCapability::wifi_monitor_5ghz(vec![149, 161, 165]));
         m.register_radio(L, RadioCapability::lora(vec![0]));
         m
+    }
+
+    #[test]
+    fn occupancy_from_activity_maps_frames_per_s_to_busy_pct() {
+        let sat = DEFAULT_SATURATION_FPS; // 100 fps → 100% busy
+        let busy = |fps: f32| ChannelOccupancy::from_activity(W, 6, fps, sat, 0).busy_pct;
+        assert_eq!(busy(0.0), 0, "quiet channel");
+        assert_eq!(busy(19.0), 19, "mid-load ~ the measured ch6 mid case");
+        assert_eq!(busy(50.0), 50);
+        assert_eq!(busy(100.0), 100, "saturated ~ the measured ch6 heavy case");
+        assert_eq!(busy(250.0), 100, "clamps, never exceeds 100");
+        // The policy's least-busy channel selection reads exactly this busy_pct.
+        let occ = ChannelOccupancy::from_activity(W, 6, 30.0, sat, 1234);
+        assert_eq!((occ.radio, occ.channel, occ.ts_ms), (W, 6, 1234));
+    }
+
+    #[test]
+    fn occupancy_from_activity_tolerates_zero_saturation() {
+        assert_eq!(
+            ChannelOccupancy::from_activity(W, 6, 50.0, 0.0, 0).busy_pct,
+            0,
+            "no divide-by-zero; degenerate sat_fps → 0"
+        );
     }
 
     #[test]

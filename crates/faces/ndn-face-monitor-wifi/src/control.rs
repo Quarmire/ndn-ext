@@ -28,11 +28,11 @@ use bytes::Bytes;
 #[cfg(any(test, feature = "libusb-backend"))]
 use ndn_radio_cognition::RadioAllocation;
 use ndn_radio_cognition::{
-    ARMS, ChannelOccupancy, Context, ContextualBandit, Demand, DemandTracker, MediumState,
-    MediumView, NameContext, NeighborReport, PolicyConfig, RadioActuators, RadioCapability,
-    RadioId, RadioPlan, RadioPolicy, RadioStrategy, RateCalibrator, SfCalibrator, TxParams,
-    apply_arm, decode_report, default_sf_thresholds, default_thresholds, encode_report,
-    lora_airtime_ms, reward,
+    ARMS, ChannelOccupancy, Context, ContextualBandit, DEFAULT_SATURATION_FPS, Demand,
+    DemandTracker, MediumState, MediumView, NameContext, NeighborReport, PolicyConfig,
+    RadioActuators, RadioCapability, RadioId, RadioPlan, RadioPolicy, RadioStrategy, RateCalibrator,
+    SfCalibrator, TxParams, apply_arm, decode_report, default_sf_thresholds, default_thresholds,
+    encode_report, lora_airtime_ms, reward,
 };
 use ndn_signals_core::SignalView;
 use ndn_transport::link_service::{InboundLpFrame, IngressCtx, LinkServiceFeature, TickCtx};
@@ -395,6 +395,28 @@ impl RadioControl {
     }
     pub fn observe_occupancy(&self, occ: ChannelOccupancy) {
         self.medium.lock().unwrap().observe_occupancy(occ);
+    }
+
+    /// Feed a **frame-free occupancy sample** (#30): a measured channel-activity
+    /// rate (`frames_per_s`, e.g. the 8812au `REG_RXERR_RPT` delta / window) is
+    /// mapped to channel-busy% ([`ChannelOccupancy::from_activity`]) and fed to the
+    /// sense bus, so `RadioPolicy::decide` sees real medium load — it steers
+    /// least-busy channel selection, narrow-BW/EDCCA under load, and the redundancy
+    /// budget. Saturation uses [`DEFAULT_SATURATION_FPS`] (calibratable per site).
+    pub fn observe_activity(&self, radio: RadioId, channel: u8, frames_per_s: f32, now_ms: u64) {
+        self.observe_occupancy(ChannelOccupancy::from_activity(
+            radio,
+            channel,
+            frames_per_s,
+            DEFAULT_SATURATION_FPS,
+            now_ms,
+        ));
+    }
+
+    /// Current sensed busy% for `(radio, channel)`, if observed — telemetry and the
+    /// observable end of the occupancy wire.
+    pub fn busy_pct(&self, radio: RadioId, channel: u8) -> Option<u8> {
+        self.medium.lock().unwrap().busy_pct(radio, channel)
     }
     pub fn observe_demand(&self, prefix_hash: u64, demand: Demand) {
         self.medium
@@ -776,6 +798,54 @@ impl RadioActuators for LibUsbActuator {
     }
 }
 
+/// frames/s from two `REG_RXERR_RPT`-style counter samples `dt_s` apart, u16
+/// wrap-aware (the counter is a 16-bit hardware accumulator that rolls over).
+/// The pure core of frame-free occupancy sensing (#30).
+pub fn activity_rate(prev: u16, cur: u16, dt_s: f32) -> f32 {
+    if dt_s <= 0.0 {
+        return 0.0;
+    }
+    cur.wrapping_sub(prev) as f32 / dt_s
+}
+
+/// Spawn a background **frame-free occupancy sampler**: every `interval`, read the
+/// radio's activity counter ([`RadioKnobs::read_channel_activity`](crate::RadioKnobs::read_channel_activity))
+/// off the inject hot path, difference it into frames/s ([`activity_rate`]), and
+/// feed it to the sense bus ([`RadioControl::observe_activity`]) so the policy
+/// decides on real medium load. A radio that returns `None` (no such counter) is
+/// polled once and the task exits — nothing to sample. `now_ms` supplies the
+/// sense-bus timestamp. The blocking USB read runs on `spawn_blocking`, so the
+/// sampler never stalls the runtime.
+pub fn spawn_occupancy_sampler(
+    control: Arc<RadioControl>,
+    radio: RadioId,
+    channel: u8,
+    knobs: Arc<dyn crate::RadioKnobs>,
+    interval: Duration,
+    now_ms: impl Fn() -> u64 + Send + 'static,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        let mut prev: Option<(u16, Instant)> = None;
+        loop {
+            ticker.tick().await;
+            let k = knobs.clone();
+            let read = tokio::task::spawn_blocking(move || k.read_channel_activity()).await;
+            let cur = match read {
+                Ok(Ok(Some(v))) => v,
+                Ok(Ok(None)) => return, // this radio can't sense occupancy — stop
+                _ => continue,          // transient read / join error — retry next tick
+            };
+            let now = Instant::now();
+            if let Some((p, t)) = prev {
+                let dt = now.duration_since(t).as_secs_f32();
+                control.observe_activity(radio, channel, activity_rate(p, cur, dt), now_ms());
+            }
+            prev = Some((cur, now));
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -783,6 +853,24 @@ mod tests {
     use std::sync::RwLock;
 
     const W: RadioId = RadioId(0);
+
+    #[test]
+    fn frame_free_activity_maps_into_the_sense_bus() {
+        // Wrap-aware rate: counter 65530 → 10 over 1 s is 16 frames/s, not a
+        // negative spike.
+        assert_eq!(activity_rate(65530, 10, 1.0), 16.0);
+        assert_eq!(activity_rate(1000, 1000, 1.0), 0.0);
+        assert_eq!(activity_rate(0, 100, 0.0), 0.0, "no divide-by-zero");
+
+        let c = RadioControl::new(RadioPolicy::default());
+        // 50 frames/s at the default 100-fps saturation → 50% busy, and the policy
+        // reads exactly this busy_pct for least-busy channel selection / EDCCA.
+        c.observe_activity(W, 6, activity_rate(1000, 1050, 1.0), 0);
+        assert_eq!(c.busy_pct(W, 6), Some(50));
+        // A quiet channel reads 0% — the whole point of sensing without decoding.
+        c.observe_activity(W, 11, 0.0, 0);
+        assert_eq!(c.busy_pct(W, 11), Some(0));
+    }
 
     /// Records the last allocation it was asked to apply.
     struct MockActuator {
