@@ -292,6 +292,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if role == "consumer" {
             // Route the demo prefix out the radio face; express Interests over the air.
             engine.fib().add_nexthop(&prefix, RADIO_FACE_ID, 0);
+
+            // NODE_CACHE: the caching demo. Request the SAME content repeatedly — the
+            // first fetch goes over the radio and the VERIFIED Data lands in the
+            // Content Store; every later request for that name is served from the CS
+            // with NO second air round-trip (verify once, cache, re-serve). Only the
+            // signature makes this safe: the CS admits verified Data only.
+            if env_u64("NODE_CACHE", 0) == 1 {
+                let producer_pubkey =
+                    Ed25519Signer::from_seed(&PRODUCER_SEED, producer_key_name()).public_key_bytes();
+                let cname = Name::from_components([
+                    NameComponent::generic(Bytes::from_static(b"radio-demo")),
+                    NameComponent::generic(Bytes::from_static(b"content")),
+                    NameComponent::generic(Bytes::from_static(b"42")),
+                ]);
+                println!("consumer: caching demo — {ticks} repeated Interests for {cname}");
+                for i in 0..ticks {
+                    let t0 = tokio::time::Instant::now();
+                    app_handle
+                        .send(InterestBuilder::new(cname.clone()).must_be_fresh().build())
+                        .await?;
+                    match tokio::time::timeout(Duration::from_millis(1500), app_handle.recv()).await
+                    {
+                        Ok(Some(wire)) => {
+                            let dt = t0.elapsed();
+                            let d = Data::decode(wire)?;
+                            let ok = Ed25519Verifier.verify_sync(
+                                d.signed_region(),
+                                d.sig_value(),
+                                &producer_pubkey,
+                            ) == VerifyOutcome::Valid;
+                            // A local CS hit returns in microseconds; an air round-trip
+                            // (radio → producer → radio) is milliseconds.
+                            let src = if dt < Duration::from_millis(3) {
+                                "CS HIT — no air round-trip"
+                            } else {
+                                "fetched over the radio (cache miss)"
+                            };
+                            println!(
+                                "  req {i}: {} in {dt:?}  [{src}]",
+                                if ok { "got ✓ verified" } else { "BAD SIG" }
+                            );
+                        }
+                        _ => println!("  req {i}: LOST"),
+                    }
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                }
+                cancel.cancel();
+                return Ok(());
+            }
+
             // Self-running loop: report the REAL RSSI the face measured for the last
             // producer frame; when nothing was heard (loss), report a conservative
             // floor so the producer backs off. NODE_RSSI_BIAS is an optional offset.
