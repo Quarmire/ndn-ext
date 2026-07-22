@@ -63,22 +63,31 @@ fn radio_demo_prefix() -> Name {
     Name::from_components([NameComponent::generic(Bytes::from_static(b"radio-demo"))])
 }
 
-/// `/radio-demo/<seq>/<rssi>` — the consumer carries its measured link RSSI to the
-/// producer in the Interest name, closing the cognition loop over the radio itself.
+/// `/radio-demo/<seq>/<rssi>/<ack>` — the consumer carries its measured link RSSI
+/// AND whether it received the PREVIOUS Data (the real delivery reward) to the
+/// producer in the Interest name, closing the loop over the radio itself.
 #[cfg(feature = "libusb-backend")]
-fn demo_name(seq: u64, rssi: i8) -> Name {
+fn demo_name(seq: u64, rssi: i8, ack: u8) -> Name {
     Name::from_components([
         NameComponent::generic(Bytes::from_static(b"radio-demo")),
         NameComponent::generic(Bytes::copy_from_slice(seq.to_string().as_bytes())),
         NameComponent::generic(Bytes::copy_from_slice(rssi.to_string().as_bytes())),
+        NameComponent::generic(Bytes::copy_from_slice(ack.to_string().as_bytes())),
     ])
 }
 
-/// Pull the reported RSSI out of the last name component.
+#[cfg(feature = "libusb-backend")]
+fn comp_i32(name: &Name, i: usize) -> Option<i32> {
+    std::str::from_utf8(name.components().get(i)?.value.as_ref()).ok()?.parse().ok()
+}
+/// Reported RSSI = component [2]; delivery-ack of the previous frame = component [3].
 #[cfg(feature = "libusb-backend")]
 fn parse_rssi(name: &Name) -> Option<i8> {
-    let comps = name.components();
-    std::str::from_utf8(comps.last()?.value.as_ref()).ok()?.parse().ok()
+    comp_i32(name, 2).map(|v| v.clamp(-110, -20) as i8)
+}
+#[cfg(feature = "libusb-backend")]
+fn parse_ack(name: &Name) -> Option<bool> {
+    comp_i32(name, 3).map(|v| v != 0)
 }
 
 /// A tiny signal store: the consumer's face pushes the per-frame RSSI it measures
@@ -257,27 +266,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // floor so the producer backs off. NODE_RSSI_BIAS is an optional offset.
             let bias: i32 = std::env::var("NODE_RSSI_BIAS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
             let floor: i32 = std::env::var("NODE_RSSI_FLOOR").ok().and_then(|v| v.parse().ok()).unwrap_or(-90);
+            // NODE_FIX_RSSI pins the report (ignoring measurement) so the policy stays
+            // over-aggressive and the BANDIT must correct the rate from real reward.
+            let fixed: Option<i32> = std::env::var("NODE_FIX_RSSI").ok().and_then(|v| v.parse().ok());
             let face_id = FaceId(RADIO_FACE_ID.0);
-            println!("consumer: reporting MEASURED link RSSI (floor {floor} on silence, bias {bias})");
+            println!("consumer: reporting {} link RSSI (floor {floor}, bias {bias})",
+                if fixed.is_some() { "FIXED" } else { "MEASURED" });
             let mut got = 0u32;
+            let mut got_prev = true; // ack of the previous Data (real bandit reward)
             for seq in 0..ticks as u64 {
                 let measured = signal_store.take_rssi(face_id);
-                let reported = (measured.map(i32::from).unwrap_or(floor) + bias).clamp(-110, -20) as i8;
-                let name = demo_name(seq, reported);
+                let reported =
+                    (fixed.unwrap_or_else(|| measured.map(i32::from).unwrap_or(floor)) + bias)
+                        .clamp(-110, -20) as i8;
+                let name = demo_name(seq, reported, got_prev as u8);
                 app_handle
                     .send(InterestBuilder::new(name.clone()).must_be_fresh().build())
                     .await?;
                 match tokio::time::timeout(Duration::from_millis(1500), app_handle.recv()).await {
                     Ok(Some(wire)) => {
                         got += 1;
+                        got_prev = true;
                         let d = Data::decode(wire)?;
                         println!(
-                            "  seq {seq}: reported {reported} (measured {measured:?}) → got {} ({} B)",
-                            *d.name,
+                            "  seq {seq}: reported {reported} (measured {measured:?}) → got ({} B)",
                             d.content().map(|c| c.len()).unwrap_or(0)
                         );
                     }
-                    _ => println!("  seq {seq}: reported {reported} (measured {measured:?}) → LOST"),
+                    _ => {
+                        got_prev = false;
+                        println!("  seq {seq}: reported {reported} (measured {measured:?}) → LOST");
+                    }
                 }
                 tokio::time::sleep(Duration::from_millis(tick_ms)).await;
             }
@@ -300,6 +319,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             control.register_radio(radio, FaceId(0), RadioCapability::wifi_monitor_5ghz(vec![ch]));
             control.set_active(vec![NameContext::new(prefix_hash(&[b"radio-demo"]))]);
+            let fake_reward = env_u64("NODE_FAKE_REWARD", 0) == 1;
             let run = Duration::from_secs(env_u64("NODE_SECS", 60));
             let start = tokio::time::Instant::now();
             let mut served = 0u32;
@@ -308,6 +328,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match tokio::time::timeout(Duration::from_millis(500), app_handle.recv()).await {
                     Ok(Some(wire)) => {
                         let name = (*Interest::decode(wire)?.name).clone();
+                        // REWARD FIRST: the ack is for the PREVIOUS Data, so feeding it
+                        // before the tick attributes it to the arm that served it (the
+                        // current last_arm) — correct delayed-feedback attribution.
+                        // NODE_FAKE_REWARD=1 forces the old always-true reward (A/B).
+                        if let Some(delivered) = parse_ack(&name) {
+                            let reward = fake_reward || delivered;
+                            control.observe_delivery(reward);
+                        }
                         // SENSE (real reported link) → DECIDE → ACT: MCS via the planned
                         // cell (per-frame, no USB), TX power via the TXAGC (RadioKnobs).
                         if let Some(rssi) = parse_rssi(&name) {
@@ -334,8 +362,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     last = now_pair;
                                 }
                             }
-                            // Feedback for the bandit's reward (bench link is reliable).
-                            control.observe_delivery(true);
                         }
                         let body = format!("hello from producer, {name}");
                         app_handle.send(encode_data_unsigned(&name, body.as_bytes())).await?;
