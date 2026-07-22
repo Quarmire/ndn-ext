@@ -28,9 +28,11 @@ use ndn_observability::{
 use ndn_packet::encode::InterestBuilder;
 use ndn_packet::{Data, Name, NameComponent};
 #[cfg(feature = "libusb-backend")]
-use ndn_packet::{Interest, encode::encode_data_unsigned};
+use ndn_packet::{Interest, encode::DataBuilder, encode::encode_data_unsigned};
 #[cfg(feature = "libusb-backend")]
 use ndn_radio_cognition::{PolicyConfig, TxParams};
+#[cfg(feature = "libusb-backend")]
+use ndn_security::{Ed25519Signer, Ed25519Verifier, SecurityManager, SignWith, VerifyOutcome};
 #[cfg(feature = "libusb-backend")]
 use std::sync::RwLock;
 use ndn_radio_cognition::{NameContext, RadioCapability, RadioId, RadioPolicy, prefix_hash};
@@ -135,6 +137,23 @@ fn trace8(id: [u8; 16]) -> String {
     id[8..].iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// The producer's known keypair seed (shared out-of-band; the consumer derives the
+/// producer's public key from it to verify). NODE_FORGE flips the producer to a
+/// different key so its signatures fail verification (forgery-rejection demo).
+#[cfg(feature = "libusb-backend")]
+const PRODUCER_SEED: [u8; 32] = *b"named-radio/producer/ed25519-key";
+#[cfg(feature = "libusb-backend")]
+const FORGED_SEED: [u8; 32] = *b"impostor-key-not-real-producer!!";
+
+#[cfg(feature = "libusb-backend")]
+fn producer_key_name() -> Name {
+    Name::from_components([
+        NameComponent::generic(Bytes::from_static(b"radio-demo")),
+        NameComponent::generic(Bytes::from_static(b"KEY")),
+        NameComponent::generic(Bytes::from_static(b"producer")),
+    ])
+}
+
 /// A no-op actuator so the ACT stage's `apply` span emits without real hardware.
 #[cfg(not(feature = "libusb-backend"))]
 struct NoopActuator(RadioId);
@@ -189,7 +208,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Engine + app face (+ the radio as a real NDN Face when a role is set). ---
     let ch = env_u64("NODE_CH", 149) as u8;
     let (app_face, app_handle) = InProcFace::new(APP_FACE_ID, 64);
-    #[allow(unused_mut)] // `builder` is reassigned only when the radio face is added
+    #[allow(unused_mut)] // reassigned when the radio face / trust anchor are added
     let mut builder = EngineBuilder::new(EngineConfig::default()).face(app_face);
 
     // NODE_ROLE=consumer|producer wires the radio into the engine as an NDN face and
@@ -236,6 +255,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mf = mf.with_signal_sink(signal_store.clone());
         let radio_face = mf.into_face();
         builder = builder.face_composed(radio_face);
+        // Trust anchor: the producer's Ed25519 key (a self-signed cert over the
+        // shared public key). The forwarder now VERIFIES every Data against it and
+        // drops any it can't verify — so a forged-key producer's Data never reaches
+        // the consumer. Real named-data trust: authenticity by name, not by source.
+        let mgr = SecurityManager::new();
+        let pubkey = Bytes::copy_from_slice(
+            &Ed25519Signer::from_seed(&PRODUCER_SEED, producer_key_name()).public_key_bytes(),
+        );
+        if let Ok(cert) = mgr.issue_self_signed(&producer_key_name(), pubkey, u64::MAX) {
+            mgr.add_trust_anchor(cert);
+        }
+        builder = builder.security(mgr);
         println!(
             "radio: RTL8822E 0bda:{pid:04x} as NDN face {} on ch{ch}; link-FEC R={fec_r}",
             RADIO_FACE_ID.0
@@ -272,7 +303,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let face_id = FaceId(RADIO_FACE_ID.0);
             println!("consumer: reporting {} link RSSI (floor {floor}, bias {bias})",
                 if fixed.is_some() { "FIXED" } else { "MEASURED" });
+            // The producer's public key, derived from the shared seed (out-of-band).
+            let producer_pubkey = Ed25519Signer::from_seed(&PRODUCER_SEED, producer_key_name())
+                .public_key_bytes();
+            println!("consumer: will verify Data signatures against the producer's Ed25519 key");
             let mut got = 0u32;
+            let mut rejected = 0u32;
             let mut got_prev = true; // ack of the previous Data (real bandit reward)
             for seq in 0..ticks as u64 {
                 let measured = signal_store.take_rssi(face_id);
@@ -285,13 +321,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .await?;
                 match tokio::time::timeout(Duration::from_millis(1500), app_handle.recv()).await {
                     Ok(Some(wire)) => {
-                        got += 1;
-                        got_prev = true;
                         let d = Data::decode(wire)?;
-                        println!(
-                            "  seq {seq}: reported {reported} (measured {measured:?}) → got ({} B)",
-                            d.content().map(|c| c.len()).unwrap_or(0)
-                        );
+                        // VERIFY before accepting — name-based trust: reject any Data
+                        // whose signature doesn't check against the producer's key,
+                        // no matter which forwarder/radio it arrived from.
+                        let ok = Ed25519Verifier.verify_sync(
+                            d.signed_region(),
+                            d.sig_value(),
+                            &producer_pubkey,
+                        ) == VerifyOutcome::Valid;
+                        if ok {
+                            got += 1;
+                            got_prev = true;
+                            println!("  seq {seq}: reported {reported} → got ({} B) ✓ verified", d.content().map(|c| c.len()).unwrap_or(0));
+                        } else {
+                            rejected += 1;
+                            got_prev = false;
+                            println!("  seq {seq}: reported {reported} → REJECTED (bad signature)");
+                        }
                     }
                     _ => {
                         got_prev = false;
@@ -300,7 +347,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 tokio::time::sleep(Duration::from_millis(tick_ms)).await;
             }
-            println!("DELIVERY: {got}/{ticks} Interest→Data round-trips completed over the radio");
+            println!("DELIVERY: {got}/{ticks} verified round-trips over the radio ({rejected} rejected as forgeries)");
         } else {
             // PRODUCER: close the cognition loop — fold the consumer's REPORTED link
             // RSSI into the medium, let the policy decide, and write the decided TX
@@ -320,6 +367,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             control.register_radio(radio, FaceId(0), RadioCapability::wifi_monitor_5ghz(vec![ch]));
             control.set_active(vec![NameContext::new(prefix_hash(&[b"radio-demo"]))]);
             let fake_reward = env_u64("NODE_FAKE_REWARD", 0) == 1;
+            // Sign every Data with the producer's Ed25519 key (NODE_FORGE=1 uses an
+            // impostor key so the consumer rejects it — the trust demo).
+            let seed = if env_u64("NODE_FORGE", 0) == 1 { FORGED_SEED } else { PRODUCER_SEED };
+            let signer = Ed25519Signer::from_seed(&seed, producer_key_name());
+            println!("producer: signing Data with Ed25519 ({})", if env_u64("NODE_FORGE", 0) == 1 { "FORGED key" } else { "real key" });
             let run = Duration::from_secs(env_u64("NODE_SECS", 60));
             let start = tokio::time::Instant::now();
             let mut served = 0u32;
@@ -363,8 +415,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                         }
-                        let body = format!("hello from producer, {name}");
-                        app_handle.send(encode_data_unsigned(&name, body.as_bytes())).await?;
+                        let mut body = format!("hi, {name}").into_bytes();
+                        let pad = env_u64("NODE_PAD", 0) as usize;
+                        if pad > body.len() {
+                            body.resize(pad, b'.'); // pad to size (A/B: isolate size vs sig)
+                        }
+                        // NODE_UNSIGNED=1 A/Bs the old unsigned path to isolate signing.
+                        let data = if env_u64("NODE_UNSIGNED", 0) == 1 {
+                            encode_data_unsigned(&name, &body)
+                        } else {
+                            DataBuilder::new(name.clone(), &body)
+                                .freshness(Duration::from_secs(10))
+                                .sign_with_sync(&signer)
+                                .map_err(|e| format!("sign: {e}"))?
+                        };
+                        if served == 0 {
+                            println!("  (first Data is {} bytes)", data.len());
+                        }
+                        app_handle.send(data).await?;
                         served += 1;
                     }
                     _ => {}
