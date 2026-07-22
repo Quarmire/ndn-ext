@@ -81,6 +81,44 @@ fn parse_rssi(name: &Name) -> Option<i8> {
     std::str::from_utf8(comps.last()?.value.as_ref()).ok()?.parse().ok()
 }
 
+/// A tiny signal store: the consumer's face pushes the per-frame RSSI it measures
+/// on the a81a's RX descriptor here, and the consumer reads (and clears) it each
+/// round — so the RSSI it reports is the REAL link it heard the producer at, and
+/// a round where it heard nothing reads `None` (→ back off).
+#[cfg(feature = "libusb-backend")]
+#[derive(Default)]
+struct RssiStore(std::sync::Mutex<std::collections::HashMap<FaceId, ndn_signals_core::LinkSignals>>);
+
+#[cfg(feature = "libusb-backend")]
+impl ndn_signals_core::SignalView<FaceId> for RssiStore {
+    fn link(&self, f: FaceId) -> Option<ndn_signals_core::LinkSignals> {
+        self.0.lock().unwrap().get(&f).copied()
+    }
+    fn node(&self) -> ndn_signals_core::NodeSignals {
+        ndn_signals_core::NodeSignals::default()
+    }
+    fn neighbor(&self, _: FaceId) -> Option<ndn_signals_core::NodeSignals> {
+        None
+    }
+}
+
+#[cfg(feature = "libusb-backend")]
+impl ndn_signals_core::SignalStore<FaceId> for RssiStore {
+    fn set_link(&self, f: FaceId, s: ndn_signals_core::LinkSignals) {
+        self.0.lock().unwrap().insert(f, s);
+    }
+    fn set_node(&self, _: ndn_signals_core::NodeSignals) {}
+    fn set_neighbor(&self, _: FaceId, _: ndn_signals_core::NodeSignals) {}
+}
+
+#[cfg(feature = "libusb-backend")]
+impl RssiStore {
+    /// Take (read + clear) the RSSI heard since the last call; `None` if nothing.
+    fn take_rssi(&self, f: FaceId) -> Option<i8> {
+        self.0.lock().unwrap().remove(&f).and_then(|l| l.rssi_dbm)
+    }
+}
+
 /// Low 8 bytes of a trace-id as hex — where the seed's entropy lives (the id is a
 /// big-endian nanos timestamp), so this distinguishes two nodes' traces.
 #[cfg(feature = "libusb-backend")]
@@ -154,6 +192,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // control plane off the USB bus, so it never contends with the face's RX/TX.
     #[cfg(feature = "libusb-backend")]
     let planned_cell: Arc<RwLock<Option<TxParams>>> = Arc::new(RwLock::new(None));
+    // The consumer's face pushes the RSSI it measures for each received producer
+    // frame here; the consumer reads it to report the REAL link (self-running loop).
+    #[cfg(feature = "libusb-backend")]
+    let signal_store: Arc<RssiStore> = Arc::new(RssiStore::default());
     #[cfg(feature = "libusb-backend")]
     let radio_backend = if role == "consumer" || role == "producer" {
         use ndn_face_monitor_wifi::{FaceId, LibUsbRtl88xxBackend, MonitorWifiFace};
@@ -179,8 +221,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             mf = mf.with_link_fec(1, fec_r, Duration::from_millis(50));
         }
         // The face sends at the cognition-decided MCS when the cell is populated
-        // (producer), else its static policy (consumer).
+        // (producer), else its static policy (consumer); and it publishes the RSSI
+        // it measures per RX frame to the signal store (consumer reads it).
         mf = mf.with_planned_params(planned_cell.clone());
+        mf = mf.with_signal_sink(signal_store.clone());
         let radio_face = mf.into_face();
         builder = builder.face_composed(radio_face);
         println!(
@@ -208,13 +252,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if role == "consumer" {
             // Route the demo prefix out the radio face; express Interests over the air.
             engine.fib().add_nexthop(&prefix, RADIO_FACE_ID, 0);
-            // Report our measured link RSSI (bench link ≈ -55 dBm; NODE_RSSI_BIAS
-            // shifts it to characterize the loop's response to a degraded link).
+            // Self-running loop: report the REAL RSSI the face measured for the last
+            // producer frame; when nothing was heard (loss), report a conservative
+            // floor so the producer backs off. NODE_RSSI_BIAS is an optional offset.
             let bias: i32 = std::env::var("NODE_RSSI_BIAS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-            let reported = (-55 + bias).clamp(-110, -30) as i8;
-            println!("consumer: reporting link RSSI {reported} dBm to the producer (bench ≈ -55, bias {bias})");
+            let floor: i32 = std::env::var("NODE_RSSI_FLOOR").ok().and_then(|v| v.parse().ok()).unwrap_or(-90);
+            let face_id = FaceId(RADIO_FACE_ID.0);
+            println!("consumer: reporting MEASURED link RSSI (floor {floor} on silence, bias {bias})");
             let mut got = 0u32;
             for seq in 0..ticks as u64 {
+                let measured = signal_store.take_rssi(face_id);
+                let reported = (measured.map(i32::from).unwrap_or(floor) + bias).clamp(-110, -20) as i8;
                 let name = demo_name(seq, reported);
                 app_handle
                     .send(InterestBuilder::new(name.clone()).must_be_fresh().build())
@@ -223,9 +271,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(Some(wire)) => {
                         got += 1;
                         let d = Data::decode(wire)?;
-                        println!("  seq {seq}: got {} ({} B)", *d.name, d.content().map(|c| c.len()).unwrap_or(0));
+                        println!(
+                            "  seq {seq}: reported {reported} (measured {measured:?}) → got {} ({} B)",
+                            *d.name,
+                            d.content().map(|c| c.len()).unwrap_or(0)
+                        );
                     }
-                    _ => println!("  seq {seq}: LOST"),
+                    _ => println!("  seq {seq}: reported {reported} (measured {measured:?}) → LOST"),
                 }
                 tokio::time::sleep(Duration::from_millis(tick_ms)).await;
             }
