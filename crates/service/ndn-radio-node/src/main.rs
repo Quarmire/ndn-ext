@@ -32,7 +32,7 @@ use ndn_packet::{Interest, encode::DataBuilder, encode::encode_data_unsigned};
 #[cfg(feature = "libusb-backend")]
 use ndn_radio_cognition::{PolicyConfig, TxParams};
 #[cfg(feature = "libusb-backend")]
-use ndn_security::{Ed25519Signer, Ed25519Verifier, SecurityManager, SignWith, VerifyOutcome};
+use ndn_security::{Certificate, Ed25519Signer, SecurityManager, SignWith, encode_cert_data};
 #[cfg(feature = "libusb-backend")]
 use std::sync::RwLock;
 use ndn_radio_cognition::{NameContext, RadioCapability, RadioId, RadioPolicy, prefix_hash};
@@ -137,21 +137,55 @@ fn trace8(id: [u8; 16]) -> String {
     id[8..].iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// The producer's known keypair seed (shared out-of-band; the consumer derives the
-/// producer's public key from it to verify). NODE_FORGE flips the producer to a
-/// different key so its signatures fail verification (forgery-rejection demo).
+// Trust hierarchy (hierarchical schema: signer's first name component == data's).
+// The CA is the single out-of-band root the consumer trusts; the producer's key is
+// certified by the CA and distributed over the radio (fetched on first contact) —
+// so the consumer never hard-codes the producer's key.
+#[cfg(feature = "libusb-backend")]
+const CA_SEED: [u8; 32] = *b"named-radio-ca:ed25519-trust-key";
 #[cfg(feature = "libusb-backend")]
 const PRODUCER_SEED: [u8; 32] = *b"named-radio/producer/ed25519-key";
 #[cfg(feature = "libusb-backend")]
 const FORGED_SEED: [u8; 32] = *b"impostor-key-not-real-producer!!";
 
 #[cfg(feature = "libusb-backend")]
-fn producer_key_name() -> Name {
+fn key_name(who: &'static [u8]) -> Name {
     Name::from_components([
         NameComponent::generic(Bytes::from_static(b"radio-demo")),
         NameComponent::generic(Bytes::from_static(b"KEY")),
-        NameComponent::generic(Bytes::from_static(b"producer")),
+        NameComponent::generic(Bytes::copy_from_slice(who)),
     ])
+}
+#[cfg(feature = "libusb-backend")]
+fn ca_key_name() -> Name {
+    key_name(b"ca")
+}
+#[cfg(feature = "libusb-backend")]
+fn producer_key_name() -> Name {
+    key_name(b"producer")
+}
+
+/// Build a certificate (subject's public key certified by `issuer`) as both the
+/// servable Data wire and a decoded [`Certificate`]. Self-signed when issuer==subject.
+#[cfg(feature = "libusb-backend")]
+async fn build_cert(
+    subject_key: &Name,
+    subject_pubkey: [u8; 32],
+    issuer: &Ed25519Signer,
+) -> Result<(Bytes, Certificate), Box<dyn std::error::Error>> {
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos() as u64;
+    let wire = encode_cert_data(
+        subject_key,
+        &Bytes::copy_from_slice(&subject_pubkey),
+        issuer,
+        now_ns,
+        u64::MAX,
+    )
+    .await?;
+    let cert = Certificate::decode(&Data::decode(wire.clone())?)?;
+    Ok((wire, cert))
 }
 
 /// A no-op actuator so the ACT stage's `apply` span emits without real hardware.
@@ -255,16 +289,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mf = mf.with_signal_sink(signal_store.clone());
         let radio_face = mf.into_face();
         builder = builder.face_composed(radio_face);
-        // Trust anchor: the producer's Ed25519 key (a self-signed cert over the
-        // shared public key). The forwarder now VERIFIES every Data against it and
-        // drops any it can't verify — so a forged-key producer's Data never reaches
-        // the consumer. Real named-data trust: authenticity by name, not by source.
+        // Trust ROOT: the CA's self-signed cert is the single out-of-band anchor.
+        // The producer's key is CERTIFIED by the CA and DISTRIBUTED over the radio
+        // (fetched below), so the consumer never hard-codes the producer's key — it
+        // trusts only the CA, and the forwarder chain-validates producer→CA.
         let mgr = SecurityManager::new();
-        let pubkey = Bytes::copy_from_slice(
-            &Ed25519Signer::from_seed(&PRODUCER_SEED, producer_key_name()).public_key_bytes(),
-        );
-        if let Ok(cert) = mgr.issue_self_signed(&producer_key_name(), pubkey, u64::MAX) {
-            mgr.add_trust_anchor(cert);
+        let ca_signer = Ed25519Signer::from_seed(&CA_SEED, ca_key_name());
+        if let Ok((_, ca_cert)) =
+            build_cert(&ca_key_name(), ca_signer.public_key_bytes(), &ca_signer).await
+        {
+            mgr.add_trust_anchor(ca_cert);
         }
         builder = builder.security(mgr);
         println!(
@@ -293,14 +327,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Route the demo prefix out the radio face; express Interests over the air.
             engine.fib().add_nexthop(&prefix, RADIO_FACE_ID, 0);
 
+            // CERT DISTRIBUTION bootstrap: fetch the producer's cert over the radio
+            // (CanBePrefix on its key name) and cache it. The engine chain-validates
+            // it against the CA anchor on the way in; then producer Data validates
+            // producer→CA. The consumer never hard-coded the producer's key.
+            {
+                let ci = InterestBuilder::new(producer_key_name()).can_be_prefix().build();
+                app_handle.send(ci).await?;
+                match tokio::time::timeout(Duration::from_millis(2500), app_handle.recv()).await {
+                    Ok(Some(w)) => match Certificate::decode(&Data::decode(w)?) {
+                        Ok(cert) => {
+                            if let Some(sec) = engine.security() {
+                                sec.cert_cache_arc().insert(cert);
+                            }
+                            println!(
+                                "consumer: fetched the producer's cert over the radio, chain-verified vs the CA ✓"
+                            );
+                        }
+                        Err(e) => println!("consumer: producer cert decode failed: {e}"),
+                    },
+                    _ => println!("consumer: producer cert fetch FAILED — Data will not validate"),
+                }
+            }
+
             // NODE_CACHE: the caching demo. Request the SAME content repeatedly — the
             // first fetch goes over the radio and the VERIFIED Data lands in the
             // Content Store; every later request for that name is served from the CS
             // with NO second air round-trip (verify once, cache, re-serve). Only the
             // signature makes this safe: the CS admits verified Data only.
             if env_u64("NODE_CACHE", 0) == 1 {
-                let producer_pubkey =
-                    Ed25519Signer::from_seed(&PRODUCER_SEED, producer_key_name()).public_key_bytes();
                 let cname = Name::from_components([
                     NameComponent::generic(Bytes::from_static(b"radio-demo")),
                     NameComponent::generic(Bytes::from_static(b"content")),
@@ -316,23 +371,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     {
                         Ok(Some(wire)) => {
                             let dt = t0.elapsed();
-                            let d = Data::decode(wire)?;
-                            let ok = Ed25519Verifier.verify_sync(
-                                d.signed_region(),
-                                d.sig_value(),
-                                &producer_pubkey,
-                            ) == VerifyOutcome::Valid;
-                            // A local CS hit returns in microseconds; an air round-trip
-                            // (radio → producer → radio) is milliseconds.
+                            let n = Data::decode(wire)?.content().map(|c| c.len()).unwrap_or(0);
+                            // The engine already chain-validated it (only valid Data
+                            // reaches the app), so receipt == verified. A local CS hit
+                            // returns in microseconds; an air round-trip is milliseconds.
                             let src = if dt < Duration::from_millis(3) {
                                 "CS HIT — no air round-trip"
                             } else {
                                 "fetched over the radio (cache miss)"
                             };
-                            println!(
-                                "  req {i}: {} in {dt:?}  [{src}]",
-                                if ok { "got ✓ verified" } else { "BAD SIG" }
-                            );
+                            println!("  req {i}: got ✓ ({n} B) in {dt:?}  [{src}]");
                         }
                         _ => println!("  req {i}: LOST"),
                     }
@@ -353,10 +401,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let face_id = FaceId(RADIO_FACE_ID.0);
             println!("consumer: reporting {} link RSSI (floor {floor}, bias {bias})",
                 if fixed.is_some() { "FIXED" } else { "MEASURED" });
-            // The producer's public key, derived from the shared seed (out-of-band).
-            let producer_pubkey = Ed25519Signer::from_seed(&PRODUCER_SEED, producer_key_name())
-                .public_key_bytes();
-            println!("consumer: will verify Data signatures against the producer's Ed25519 key");
+            println!("consumer: engine chain-validates Data producer→CA (only valid Data reaches here)");
             let mut got = 0u32;
             let mut rejected = 0u32;
             let mut got_prev = true; // ack of the previous Data (real bandit reward)
@@ -371,33 +416,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .await?;
                 match tokio::time::timeout(Duration::from_millis(1500), app_handle.recv()).await {
                     Ok(Some(wire)) => {
+                        // The engine forwarded it, so it chain-validated producer→CA.
                         let d = Data::decode(wire)?;
-                        // VERIFY before accepting — name-based trust: reject any Data
-                        // whose signature doesn't check against the producer's key,
-                        // no matter which forwarder/radio it arrived from.
-                        let ok = Ed25519Verifier.verify_sync(
-                            d.signed_region(),
-                            d.sig_value(),
-                            &producer_pubkey,
-                        ) == VerifyOutcome::Valid;
-                        if ok {
-                            got += 1;
-                            got_prev = true;
-                            println!("  seq {seq}: reported {reported} → got ({} B) ✓ verified", d.content().map(|c| c.len()).unwrap_or(0));
-                        } else {
-                            rejected += 1;
-                            got_prev = false;
-                            println!("  seq {seq}: reported {reported} → REJECTED (bad signature)");
-                        }
+                        got += 1;
+                        got_prev = true;
+                        println!("  seq {seq}: reported {reported} → got ({} B) ✓ chain-verified", d.content().map(|c| c.len()).unwrap_or(0));
                     }
                     _ => {
+                        // A forged producer's Data is DROPPED by the engine (no valid
+                        // chain to the CA), so it never arrives — it reads as a loss.
+                        rejected += 1;
                         got_prev = false;
-                        println!("  seq {seq}: reported {reported} (measured {measured:?}) → LOST");
+                        println!("  seq {seq}: reported {reported} → no valid Data (forgery dropped or lost)");
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(tick_ms)).await;
             }
-            println!("DELIVERY: {got}/{ticks} verified round-trips over the radio ({rejected} rejected as forgeries)");
+            println!("DELIVERY: {got}/{ticks} chain-verified round-trips over the radio ({rejected} lost/dropped)");
         } else {
             // PRODUCER: close the cognition loop — fold the consumer's REPORTED link
             // RSSI into the medium, let the policy decide, and write the decided TX
@@ -422,6 +457,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let seed = if env_u64("NODE_FORGE", 0) == 1 { FORGED_SEED } else { PRODUCER_SEED };
             let signer = Ed25519Signer::from_seed(&seed, producer_key_name());
             println!("producer: signing Data with Ed25519 ({})", if env_u64("NODE_FORGE", 0) == 1 { "FORGED key" } else { "real key" });
+            // Publish this producer's cert — its REAL key certified by the CA — to
+            // serve when a consumer fetches it. (A forged producer still serves the
+            // real cert but signs Data with the impostor key, so it fails validation.)
+            let ca_signer = Ed25519Signer::from_seed(&CA_SEED, ca_key_name());
+            let real_pubkey =
+                Ed25519Signer::from_seed(&PRODUCER_SEED, producer_key_name()).public_key_bytes();
+            let (cert_wire, _) = build_cert(&producer_key_name(), real_pubkey, &ca_signer)
+                .await
+                .map_err(|e| format!("cert: {e}"))?;
+            println!("producer: published CA-signed cert for {}", producer_key_name());
             let run = Duration::from_secs(env_u64("NODE_SECS", 60));
             let start = tokio::time::Instant::now();
             let mut served = 0u32;
@@ -430,6 +475,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match tokio::time::timeout(Duration::from_millis(500), app_handle.recv()).await {
                     Ok(Some(wire)) => {
                         let name = (*Interest::decode(wire)?.name).clone();
+                        // Cert request (/radio-demo/KEY/…) → serve the CA-signed cert.
+                        if name.components().get(1).map(|c| c.value.as_ref()) == Some(&b"KEY"[..]) {
+                            app_handle.send(cert_wire.clone()).await?;
+                            continue;
+                        }
                         // REWARD FIRST: the ack is for the PREVIOUS Data, so feeding it
                         // before the tick attributes it to the arm that served it (the
                         // current last_arm) — correct delayed-feedback attribution.
