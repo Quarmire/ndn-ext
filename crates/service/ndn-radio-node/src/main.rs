@@ -264,7 +264,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let plans = control.tick_now(now);
                             if let Some(a) = plans.first().and_then(|p| p.allocations.first()) {
                                 *planned_cell.write().unwrap() = Some(a.params);
-                                let pwr = a.params.tx_power.unwrap_or(FULL_PWR);
+                                // NODE_FORCE_PWR overrides the decided power (stress test:
+                                // force minimum to try to induce RF loss at close range).
+                                let pwr = std::env::var("NODE_FORCE_PWR")
+                                    .ok()
+                                    .and_then(|v| v.parse::<u8>().ok())
+                                    .unwrap_or_else(|| a.params.tx_power.unwrap_or(FULL_PWR));
                                 if let Some(be) = &radio_backend {
                                     let _ = be.set_tx_power(pwr as u32);
                                 }
