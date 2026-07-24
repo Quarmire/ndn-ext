@@ -133,6 +133,21 @@ mod control;
 pub use control::LibUsbActuator;
 pub use control::RadioControl;
 pub use control::{activity_rate, spawn_occupancy_sampler};
+/// Advertised RX-capability sentinels for the worst-overheard-receiver rate cap.
+pub use ndn_radio_cognition::{FULL_RX_MCS, LEGACY_ONLY_RX};
+
+// "The medium is the face": one NDN face over N radio *capabilities* (RX union +
+// TX fan-out), the data plane matching the already-medium-shaped `RadioControl`.
+mod medium;
+pub use medium::{
+    ContextSource, LinkSignalStore, LossMeter, MediumActuator, RadioBearer, RadioId,
+    RadioMediumFace, RunningMedium, StaticContexts, spawn_control_loop,
+};
+
+// The `FaceFactory` for the medium: stand the radio face up from `FaceParams` data,
+// so a connectivity resolver / config row can `add_face_of_kind(Wfb, ..)` it.
+mod factory;
+pub use factory::RadioMediumFaceFactory;
 
 pub mod radio;
 pub use radio::{Bandwidth, RadioKnobs};
@@ -462,21 +477,29 @@ impl MonitorWifiFace {
     }
 
     /// Open a **Wi-Fi HaLow (802.11ah / S1G)** monitor face on the kernel monitor
-    /// interface `iface` — e.g. `"halow0"`, a Newracom NRC7292 sub-GHz radio.
+    /// interface `iface` — e.g. `"halow0"` (Newracom NRC7292) or `"mon0"` (Morse
+    /// Micro MM6108). Drives **both** HaLow chips uniformly; the driver-side
+    /// differences are invisible here.
     ///
     /// This pools the HaLow radio uniformly with the 2.4/5 GHz monitor faces:
     /// same [`FrameIo`] data plane, same [`MonitorWifiFace`], same engine. It
     /// sets [`FrameFormat::RawNdnS1g`], so injected frames carry the S1G radiotap
-    /// header that names *no* 11n/ac MCS — the NRC7292's on-chip MAC picks the
-    /// sub-GHz rate. NDN-over-HaLow injection was verified on-air between two
-    /// NRC7292s (a monitor-injected frame received by a second chip, payload
-    /// intact), which needs the driver's `inject_monitor` patch that forwards
-    /// `IEEE80211_TX_CTL_INJECTED` (see the minidronesys configs).
+    /// header that names *no* 11n/ac MCS — the chip's own MAC picks the sub-GHz
+    /// rate, so the same minimal radiotap suits both chips.
+    ///
+    /// Verified on-air, including cross-vendor: an NRC7292 received frames a
+    /// second NRC7292 injected, and a Morse MM6108 injected NDN-over-HaLow frames
+    /// that an NRC7292 decoded on 904.5 MHz. Each chip needs a driver patch for
+    /// monitor injection (see the minidronesys configs): NRC7292 forwards
+    /// `IEEE80211_TX_CTL_INJECTED`; the MM6108 driver routes vif-less injected
+    /// frames through its firmware monitor vif with a fixed S1G rate.
     ///
     /// The interface must already be in monitor mode on an S1G channel
-    /// (`iw dev <iface> set type monitor; iw dev <iface> set channel 161`) and the
-    /// process needs `CAP_NET_RAW`. `channels` are the driver's US S1G alias
-    /// numbers (e.g. `vec![161]`, 925 MHz) for the advertised capability.
+    /// (`iw dev <iface> set type monitor; iw dev <iface> set channel 161`; for the
+    /// MM6108 add the vif with `iw phy <phy> interface add mon0 type monitor`,
+    /// per its NixOS `services.morseMonitor`) and the process needs `CAP_NET_RAW`.
+    /// `channels` are the driver's fake channel numbers for the advertised
+    /// capability (they differ per vendor; align on real frequency for interop).
     #[cfg(target_os = "linux")]
     pub fn halow(id: FaceId, iface: &str, channels: Vec<u8>) -> Result<Self, FaceError> {
         // 0x8624 = the NDN-over-Ethernet ethertype used across the stack; both
