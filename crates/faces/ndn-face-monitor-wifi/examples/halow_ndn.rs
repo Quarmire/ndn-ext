@@ -24,7 +24,9 @@
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use bytes::Bytes;
-    use ndn_face_monitor_wifi::{AfPacketBackend, FrameFormat, FrameIo, InjectFrame, TxIntent};
+    use ndn_face_monitor_wifi::{
+        AfPacketBackend, FrameFormat, FrameIo, InjectFrame, McsDescriptor, TxIntent, WifiRadio,
+    };
     use std::time::Duration;
 
     let role = std::env::args().nth(1).unwrap_or_else(|| "rx".into());
@@ -42,15 +44,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match role.as_str() {
         "tx" => {
-            for i in 0..count {
+            // Pacing is a *test* affordance, not a property of the face: the
+            // fixed 50 ms sleep that used to be here capped this path at <20
+            // frames/s, which measures the sleep rather than the radio. Default
+            // to no delay so a rate measured here is the real injection rate;
+            // NDN_HALOW_DELAY_MS restores pacing when a slow drip is wanted.
+            let delay_ms: u64 = std::env::var("NDN_HALOW_DELAY_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            // NDN_HALOW_BATCH=N bundles N packets per inject_batch_at call, which
+            // the af_packet backend packs into A-MSDUs (one PHY preamble, one
+            // MPDU, many NDN packets). The per-frame cost on this radio is ~25 ms
+            // regardless of size, so batching is the lever that actually moves
+            // packets/s. 0 = one inject() per packet, the old behaviour.
+            let batch: usize = std::env::var("NDN_HALOW_BATCH")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            let mk = |i: u32| {
                 let mut p = MARKER.to_vec();
                 p.extend_from_slice(&i.to_le_bytes());
-                backend
-                    .inject(InjectFrame::broadcast(Bytes::from(p), TxIntent::CONSERVATIVE))
-                    .await?;
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                InjectFrame::broadcast(Bytes::from(p), TxIntent::CONSERVATIVE)
+            };
+            let start = std::time::Instant::now();
+            if batch > 0 {
+                let mut sent = 0u32;
+                while sent < count {
+                    let n = batch.min((count - sent) as usize);
+                    let frames: Vec<(InjectFrame, McsDescriptor)> =
+                        (0..n).map(|k| (mk(sent + k as u32), McsDescriptor::ht(0))).collect();
+                    backend.inject_batch_at(frames).await?;
+                    sent += n as u32;
+                    if delay_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    }
+                }
+            } else {
+                for i in 0..count {
+                    backend.inject(mk(i)).await?;
+                    if delay_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    }
+                }
             }
-            println!("injected {count} NDN-over-HaLow frames on {iface}");
+            let el = start.elapsed();
+            let fps = if el.as_secs_f64() > 0.0 {
+                count as f64 / el.as_secs_f64()
+            } else {
+                0.0
+            };
+            println!(
+                "injected {count} NDN-over-HaLow frames on {iface} in {:.2}s ({fps:.0} frames/s)",
+                el.as_secs_f64()
+            );
         }
         "rx" => {
             println!("listening on {iface} for NDN-over-HaLow frames (Ctrl-C to stop)…");
