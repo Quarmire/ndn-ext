@@ -65,8 +65,8 @@ pub use contextual::{
 };
 pub use demand::DemandTracker;
 pub use plan::{
-    AllocRole, LoraRate, RadioActuators, RadioAllocation, RadioError, RadioPlan, RateParams,
-    TxParams, WifiRate,
+    AllocRole, DataPlaneConfig, LoraRate, RadioActuators, RadioAllocation, RadioError, RadioPlan,
+    RateParams, TxParams, WifiRate,
 };
 pub use policy::{
     DecisionRationale, NameContext, PolicyConfig, Priority, RadioPolicy, RadioRationale,

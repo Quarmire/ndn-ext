@@ -202,6 +202,33 @@ pub struct RadioAllocation {
     pub role: AllocRole,
 }
 
+/// Data-centric offload directives — the on-device NDN data plane cognition turns on for a face
+/// (the firmware `ndn.rs` mechanisms: dedup, Content-Store serve, name-keyed hopping). These are the
+/// MECHANISM toggles cognition owns (how to spend duty-limited airtime well); the NAME sets that go
+/// with them (filter / relay PREFIXES) come from the forwarder's FIB, merged in by the caller — a
+/// clean split of "which mechanism" (radio policy) from "which names" (forwarding table).
+///
+/// This is a face-level directive (applied once per face / on role change), distinct from the
+/// per-object [`RadioPlan`]. FEC/RLNC live in [`RadioPlan`] (redundancy budget + Split generations);
+/// named-time lives in the RadioTime plane. See the crate docs for the full offload map.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DataPlaneConfig {
+    /// Suppress duplicate names at the antenna — a repeat never crosses the host link twice.
+    pub dedup: bool,
+    /// Answer a repeat Interest from the on-device Content Store instead of re-fetching it end-to-end
+    /// (in-network caching — the airtime-per-content win a flood mesh cannot make).
+    pub cs_serve: bool,
+    /// Name-keyed frequency hopping (#40): the carrier for a name is `H(name)`-derived, so both ends
+    /// compute it with no negotiation. The hop FUNCTION only — a listener still needs common-view time
+    /// (#41) to know WHEN to sit on a name's channel, so this stays off until that lands.
+    pub hop: bool,
+}
+
+impl DataPlaneConfig {
+    /// Everything inert — a plain smart-modem (matches a freshly-flashed dongle).
+    pub const OFF: Self = Self { dedup: false, cs_serve: false, hop: false };
+}
+
 /// The full cross-layer, multi-radio decision for one named object.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RadioPlan {
