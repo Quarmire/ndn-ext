@@ -136,6 +136,36 @@ pub fn pick_sf(rssi_dbm: i8, thresholds: &[f32; 13]) -> u8 {
     12
 }
 
+/// Hysteretic spreading-factor pick: like [`pick_sf`] but biased to HOLD `current_sf` unless the
+/// signal has moved a full `margin_db` out of the current SF's operating band. Without a deadband,
+/// an RSSI parked on a threshold (e.g. −92 dBm on the −90 SF8/SF9 line) re-picks every tick, and two
+/// peers dialing independently land on *mismatched* SFs — and LoRa SFs are quasi-orthogonal, so a
+/// mismatch is a total decode loss, not a slow link. The deadband makes the controller leave
+/// `current_sf` only when the medium is decisively out of band, so a converged pair stays converged.
+///
+/// Climb (to a more robust, higher SF) only once RSSI falls `margin_db` below what the current SF
+/// needs; drop (to a faster, lower SF) only once RSSI rises `margin_db` above the next-faster SF's
+/// threshold. Inside the band, hold. The climb never drops and the drop never climbs, so a single
+/// call moves at most in one direction.
+pub fn pick_sf_hysteretic(
+    rssi_dbm: i8,
+    current_sf: u8,
+    thresholds: &[f32; 13],
+    margin_db: f32,
+) -> u8 {
+    let r = rssi_dbm as f32;
+    let c = current_sf.clamp(7, 12) as usize;
+    // Current SF decisively inadequate → climb toward the ideal, but never below where we are.
+    if r < thresholds[c] - margin_db {
+        return pick_sf(rssi_dbm, thresholds).max(current_sf);
+    }
+    // Decisively into the next-faster SF's band → drop toward the ideal, but never above where we are.
+    if c > 7 && r > thresholds[c - 1] + margin_db {
+        return pick_sf(rssi_dbm, thresholds).min(current_sf);
+    }
+    current_sf // inside the deadband: hold
+}
+
 /// Adapts [`SfThresholds`] from measured delivery — the same control law as [`RateCalibrator`]:
 /// a near-boundary miss raises the SF's operating threshold (pushing the controller to a
 /// higher/more-robust SF), a success lowers it (a faster SF becomes usable at weaker signal).
@@ -276,6 +306,31 @@ mod tests {
         assert_eq!(pick_sf(-85, &t), 8);
         assert_eq!(pick_sf(-105, &t), 10);
         assert_eq!(pick_sf(-128, &t), 12, "very weak → max range");
+    }
+
+    #[test]
+    fn hysteresis_holds_sf_on_a_boundary() {
+        let t = STATIC_REQ_RSSI_SF;
+        let m = 4.0;
+        // −92/−94 sit right on the −90 SF8/SF9 line — the on-air chatter case. A node already at
+        // SF9 must HOLD SF9 (not flip to SF8) across the wiggle, so a converged pair stays paired.
+        assert_eq!(pick_sf_hysteretic(-92, 9, &t, m), 9, "hold SF9 in the deadband");
+        assert_eq!(pick_sf_hysteretic(-94, 9, &t, m), 9);
+        assert_eq!(pick_sf_hysteretic(-88, 9, &t, m), 9, "still hold: not a full margin past −90");
+        // And a node at SF8 must not chatter up either until decisively out of band.
+        assert_eq!(pick_sf_hysteretic(-92, 8, &t, m), 8, "hold SF8 inside its deadband");
+    }
+
+    #[test]
+    fn hysteresis_still_moves_when_signal_moves_decisively() {
+        let t = STATIC_REQ_RSSI_SF;
+        let m = 4.0;
+        // From a strong-link SF7, a decisively weak reading jumps straight to the robust SF.
+        assert_eq!(pick_sf_hysteretic(-105, 7, &t, m), 10, "climb SF7→SF10 on a strong drop");
+        // A node stuck robust at SF11 with the link recovered drops toward the faster SF.
+        assert!(pick_sf_hysteretic(-70, 11, &t, m) < 11, "recovered link drops SF");
+        // A single call never overshoots the ideal in either direction.
+        assert_eq!(pick_sf_hysteretic(-94, 7, &t, m), 9, "climb lands on the RSSI's ideal");
     }
 
     #[test]

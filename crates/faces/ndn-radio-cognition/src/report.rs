@@ -19,13 +19,20 @@
 
 /// Reception-report content magic (first byte).
 pub const REPORT_MAGIC: u8 = 0xCD;
-/// Report wire version.
-pub const REPORT_VERSION: u8 = 1;
+/// Report wire version. v2 appends `max_rx_mcs` after `ts_ms` (v1 reports decode with
+/// `max_rx_mcs = FULL_RX_MCS`, i.e. assume a fully-capable receiver).
+pub const REPORT_VERSION: u8 = 2;
 /// Max entries encoded/accepted per list (bounded state).
 pub const MAX_ENTRIES: usize = 32;
+/// `max_rx_mcs` value meaning "decodes any HT/VHT MCS" — the fully-capable default.
+pub const FULL_RX_MCS: u8 = 9;
+/// `max_rx_mcs` value meaning "decodes legacy OFDM only, no HT/VHT" — e.g. the 8812au on
+/// 5 GHz (measured 2026-07-24). A transmitter reaching such a neighbour must use a legacy
+/// basic rate for the whole content group (the doctrine's worst-overheard-receiver rate).
+pub const LEGACY_ONLY_RX: u8 = 0;
 
 /// A node's snapshot of what it observes, shared with neighbors.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ReceptionReport {
     /// The reporting node's id.
     pub node_id: u64,
@@ -33,6 +40,11 @@ pub struct ReceptionReport {
     pub seq: u32,
     /// Reporter's timestamp (ms); receivers re-stamp with their own clock.
     pub ts_ms: u64,
+    /// The highest HT/VHT MCS the reporter's **best** radio can *decode*, or
+    /// [`LEGACY_ONLY_RX`] (0) if it can only decode legacy OFDM. Advertised so a peer
+    /// caps the *data* rate for any group reaching this node — a legacy-only receiver
+    /// cannot decode HT at any index, so the group drops to a legacy basic rate.
+    pub max_rx_mcs: u8,
     /// Neighbors the reporter hears, and at what RSSI (dBm). The entry where the
     /// neighbour id == *your* node id is your measured outbound link to the reporter.
     pub heard_neighbors: Vec<(u64, i8)>,
@@ -40,6 +52,20 @@ pub struct ReceptionReport {
     pub heard_prefixes: Vec<u64>,
     /// The reporter's per-channel busy% view: `(channel, busy_pct)`.
     pub spectrum: Vec<(u8, u8)>,
+}
+
+impl Default for ReceptionReport {
+    fn default() -> Self {
+        Self {
+            node_id: 0,
+            seq: 0,
+            ts_ms: 0,
+            max_rx_mcs: FULL_RX_MCS,
+            heard_neighbors: Vec::new(),
+            heard_prefixes: Vec::new(),
+            spectrum: Vec::new(),
+        }
+    }
 }
 
 /// Encode a report to its content bytes (lists truncated to [`MAX_ENTRIES`]).
@@ -50,6 +76,7 @@ pub fn encode_report(r: &ReceptionReport) -> Vec<u8> {
     b.extend_from_slice(&r.node_id.to_le_bytes());
     b.extend_from_slice(&r.seq.to_le_bytes());
     b.extend_from_slice(&r.ts_ms.to_le_bytes());
+    b.push(r.max_rx_mcs); // v2
 
     let nn = r.heard_neighbors.len().min(MAX_ENTRIES);
     b.push(nn as u8);
@@ -99,12 +126,18 @@ impl<'a> Reader<'a> {
 /// version / truncation. Entry counts are capped at [`MAX_ENTRIES`].
 pub fn decode_report(bytes: &[u8]) -> Option<ReceptionReport> {
     let mut r = Reader { b: bytes, i: 0 };
-    if r.u8()? != REPORT_MAGIC || r.u8()? != REPORT_VERSION {
+    if r.u8()? != REPORT_MAGIC {
+        return None;
+    }
+    // Accept v1 (no max_rx_mcs → assume fully capable) and v2 (reads the byte).
+    let version = r.u8()?;
+    if version != 1 && version != REPORT_VERSION {
         return None;
     }
     let node_id = r.u64()?;
     let seq = r.u32()?;
     let ts_ms = r.u64()?;
+    let max_rx_mcs = if version >= 2 { r.u8()? } else { FULL_RX_MCS };
 
     let nn = (r.u8()? as usize).min(MAX_ENTRIES);
     let mut heard_neighbors = Vec::with_capacity(nn);
@@ -129,6 +162,7 @@ pub fn decode_report(bytes: &[u8]) -> Option<ReceptionReport> {
         node_id,
         seq,
         ts_ms,
+        max_rx_mcs,
         heard_neighbors,
         heard_prefixes,
         spectrum,
@@ -144,6 +178,7 @@ mod tests {
             node_id: 0xABCD,
             seq: 7,
             ts_ms: 12345,
+            max_rx_mcs: LEGACY_ONLY_RX,
             heard_neighbors: vec![(1, -55), (2, -80)],
             heard_prefixes: vec![0x11, 0x22, 0x33],
             spectrum: vec![(149, 40), (165, 5)],
@@ -180,5 +215,33 @@ mod tests {
     fn negative_rssi_survives() {
         let dec = decode_report(&encode_report(&sample())).unwrap();
         assert_eq!(dec.heard_neighbors, vec![(1, -55), (2, -80)]);
+    }
+
+    #[test]
+    fn max_rx_mcs_round_trips() {
+        let dec = decode_report(&encode_report(&sample())).unwrap();
+        assert_eq!(dec.max_rx_mcs, LEGACY_ONLY_RX, "legacy-only advert survives");
+        let mut hi = sample();
+        hi.max_rx_mcs = FULL_RX_MCS;
+        assert_eq!(decode_report(&encode_report(&hi)).unwrap().max_rx_mcs, FULL_RX_MCS);
+    }
+
+    #[test]
+    fn v1_report_decodes_as_fully_capable() {
+        // A legacy v1 report (no max_rx_mcs byte) must decode with the fully-capable
+        // default so old peers are never mistaken for legacy-only receivers.
+        let r = sample();
+        let mut v1 = Vec::new();
+        v1.push(REPORT_MAGIC);
+        v1.push(1); // version 1
+        v1.extend_from_slice(&r.node_id.to_le_bytes());
+        v1.extend_from_slice(&r.seq.to_le_bytes());
+        v1.extend_from_slice(&r.ts_ms.to_le_bytes());
+        v1.push(0); // 0 heard_neighbors
+        v1.push(0); // 0 heard_prefixes
+        v1.push(0); // 0 spectrum
+        let dec = decode_report(&v1).expect("v1 decodes");
+        assert_eq!(dec.max_rx_mcs, FULL_RX_MCS);
+        assert_eq!(dec.node_id, r.node_id);
     }
 }

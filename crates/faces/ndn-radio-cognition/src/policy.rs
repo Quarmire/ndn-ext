@@ -426,12 +426,30 @@ impl RadioPolicy {
             } else {
                 1
             };
+            // Bandwidth is a rendezvous parameter (both ends must match to decode), so it is dialed
+            // ONLY from a REAL, shared measurement — the measured weakest RSSI, never the synthetic
+            // proxy (which reads strong at low PER and would trip one end into 250 kHz while the other
+            // stayed at 125, a decode split). Widen to 250 kHz for Bulk on a genuinely strong, non-
+            // reach link: ~2× rate and half the airtime (duty relief) at ~3 dB less sensitivity, which
+            // the margin affords. No measured peer ⇒ hold the 125 kHz reach default.
+            let strong = !broad && view.weakest_rssi(radio, now_ms).is_some_and(|r| r >= -85);
+            let bandwidth_khz = if matches!(ctx.priority, Priority::Bulk) && strong {
+                Some(250)
+            } else {
+                Some(125)
+            };
             return TxParams {
                 rate: RateParams::Lora(LoraRate {
                     spreading_factor: Some(sf),
                     coding_rate: Some(cr),
+                    bandwidth_khz,
                 }),
                 link_fec_redundancy: self.fec_redundancy(radio, ctx, view, receivers, deficit),
+                // Minimum-sufficient power (spatial reuse) off the SF operating threshold, same
+                // reciprocity as the Wi-Fi path — power is NOT a rendezvous parameter, so each end
+                // sets its own freely. Dial off the REAL measured weakest RSSI (not the proxy), so it
+                // holds the ceiling until a genuine peer margin is seen, then hands back the surplus.
+                tx_power_dbm: self.decide_lora_power_dbm(cap, sf, view.weakest_rssi(radio, now_ms)),
                 ..Default::default()
             };
         }
@@ -501,6 +519,7 @@ impl RadioPolicy {
             link_fec_redundancy: self.fec_redundancy(radio, ctx, view, receivers, deficit),
             edcca_ignore: ctx.priority == Priority::Urgent && busy >= self.cfg.busy_high,
             tx_power: self.decide_power(cap, mcs, rssi),
+            tx_power_dbm: self.decide_power_dbm(cap, mcs, rssi),
         }
     }
 
@@ -519,16 +538,61 @@ impl RadioPolicy {
     /// max** (returns `None` ⇒ leave the hard-won power alone when there's no margin
     /// to give back).
     fn decide_power(&self, cap: &RadioCapability, mcs: u8, rssi: Option<i8>) -> Option<u8> {
-        let r = rssi? as f32;
-        let req = self.threshold_for(mcs);
-        let headroom = r - req; // dB of margin the weakest peer has (reciprocity)
-        let backoff_db = (headroom - POWER_SAFETY_MARGIN_DB).clamp(0.0, MAX_BACKOFF_DB);
+        let backoff_db = self.power_backoff_db(mcs, rssi)?;
         let backoff_idx = (backoff_db / DB_PER_POWER_IDX).round() as u8;
         if backoff_idx == 0 {
             None // no surplus margin → keep calibrated full power
         } else {
             Some(cap.max_tx_power.saturating_sub(backoff_idx))
         }
+    }
+
+    /// The same back-off, expressed on the **absolute dBm scale** for a radio that
+    /// has one ([`RadioCapability::tx_power_dbm`]).
+    ///
+    /// This is the more faithful of the two: the policy above reasons natively in
+    /// dB and only converts to an index at the end, through a single
+    /// chip-independent `DB_PER_POWER_IDX` fudge that no real TXAGC table obeys.
+    /// When the radio takes dBm directly, that lossy step is skipped and the
+    /// decided margin is what the hardware is actually told.
+    ///
+    /// `None` when the radio has no absolute control, or there is no surplus
+    /// margin to give back — never a guess.
+    fn decide_power_dbm(&self, cap: &RadioCapability, mcs: u8, rssi: Option<i8>) -> Option<i8> {
+        let range = cap.tx_power_dbm?;
+        let backoff_db = self.power_backoff_db(mcs, rssi)?;
+        let target = i16::from(range.max) - backoff_db.round() as i16;
+        Some(range.clamp(target.clamp(i16::from(i8::MIN), i16::from(i8::MAX)) as i8))
+    }
+
+    /// LoRa TX power (absolute dBm): the same minimum-sufficient / spatial-reuse policy as
+    /// [`decide_power_dbm`], but the decode threshold comes from the **SF** operating table
+    /// ([`STATIC_REQ_RSSI_SF`](crate::calibrate::STATIC_REQ_RSSI_SF)) rather than the Wi-Fi MCS one.
+    /// A weak link keeps the ceiling (power-first); surplus margin over what the chosen SF needs is
+    /// handed back for reuse, keeping [`POWER_SAFETY_MARGIN_DB`] in hand. `None` ⇒ no measured peer,
+    /// leave power alone.
+    fn decide_lora_power_dbm(&self, cap: &RadioCapability, sf: u8, rssi: Option<i8>) -> Option<i8> {
+        let range = cap.tx_power_dbm?;
+        let r = rssi? as f32;
+        let req = crate::calibrate::STATIC_REQ_RSSI_SF[sf.clamp(7, 12) as usize];
+        let headroom = r - req; // dB the weakest peer has over what this SF needs (reciprocity)
+        let backoff = (headroom - POWER_SAFETY_MARGIN_DB).clamp(0.0, MAX_BACKOFF_DB);
+        let target = i16::from(range.max) - backoff.round() as i16;
+        Some(range.clamp(target.clamp(i16::from(i8::MIN), i16::from(i8::MAX)) as i8))
+    }
+
+    /// dB of power the weakest wanted receiver can spare, after keeping
+    /// [`POWER_SAFETY_MARGIN_DB`] in hand and capping at [`MAX_BACKOFF_DB`].
+    /// `None` = no measured peer, or no surplus — leave the power alone.
+    ///
+    /// Shared by both power knobs so the index and dBm paths can never drift into
+    /// two different policies.
+    fn power_backoff_db(&self, mcs: u8, rssi: Option<i8>) -> Option<f32> {
+        let r = rssi? as f32;
+        let req = self.threshold_for(mcs);
+        let headroom = r - req; // dB of margin the weakest peer has (reciprocity)
+        let backoff_db = (headroom - POWER_SAFETY_MARGIN_DB).clamp(0.0, MAX_BACKOFF_DB);
+        (backoff_db > 0.0).then_some(backoff_db)
     }
 
     /// The (learned-or-static) RSSI decode threshold for an MCS.
@@ -688,6 +752,75 @@ impl Fnv {
             self.0 ^= b as u64;
             self.0 = self.0.wrapping_mul(0x100000001b3);
         }
+    }
+}
+
+#[cfg(test)]
+mod power_dbm_tests {
+    use super::*;
+    use ndn_radio_hal::DbmRange;
+
+    /// A radio with absolute control gets an absolute decision, backed off from
+    /// its own ceiling — the same margin the index path would have spent.
+    #[test]
+    fn advertised_range_yields_a_dbm_decision() {
+        let p = RadioPolicy::default();
+        let cap = RadioCapability::wifi_halow_s1g(vec![36]).with_tx_power_dbm(DbmRange::new(1, 27));
+        // A very strong peer: lots of surplus margin to give back.
+        let dbm = p.decide_power_dbm(&cap, 0, Some(-30)).expect("surplus margin");
+        assert!(dbm < 27, "must back off below the ceiling, got {dbm}");
+        assert!(dbm >= 1, "must stay inside the advertised range, got {dbm}");
+    }
+
+    /// The two scales must express the *same* policy: whenever one backs off, so
+    /// does the other. This is what stops them drifting apart.
+    #[test]
+    fn both_scales_agree_on_when_to_back_off() {
+        let p = RadioPolicy::default();
+        let cap = RadioCapability::wifi_halow_s1g(vec![36]).with_tx_power_dbm(DbmRange::new(1, 27));
+        for rssi in [-30i8, -50, -70, -90] {
+            let idx = p.decide_power(&cap, 0, Some(rssi));
+            let dbm = p.decide_power_dbm(&cap, 0, Some(rssi));
+            assert_eq!(
+                idx.is_some(),
+                dbm.is_some(),
+                "index and dBm disagreed at rssi {rssi}"
+            );
+        }
+    }
+
+    /// A radio that advertises no dBm range gets no dBm decision — the planner
+    /// must not invent absolute power for hardware that cannot take it.
+    #[test]
+    fn no_advertised_range_means_no_dbm_decision() {
+        let p = RadioPolicy::default();
+        let cap = RadioCapability::wifi_monitor_5ghz(vec![149]); // index-only
+        assert!(cap.tx_power_dbm.is_none());
+        assert_eq!(p.decide_power_dbm(&cap, 0, Some(-30)), None);
+        // ...but the index path still decides, so such a radio is not left un-actuated.
+        assert!(p.decide_power(&cap, 0, Some(-30)).is_some());
+    }
+
+    /// No measured peer = no surplus to give back = leave the power alone.
+    #[test]
+    fn no_rssi_leaves_power_untouched() {
+        let p = RadioPolicy::default();
+        let cap = RadioCapability::wifi_halow_s1g(vec![36]).with_tx_power_dbm(DbmRange::new(1, 27));
+        assert_eq!(p.decide_power_dbm(&cap, 0, None), None);
+    }
+
+    /// The back-off is bounded, so a wildly optimistic RSSI cannot drive power
+    /// below what the radio can actually be commanded to.
+    #[test]
+    fn decision_stays_inside_the_range_under_extreme_margin() {
+        let p = RadioPolicy::default();
+        let range = DbmRange::new(20, 27); // a narrow-range radio
+        let cap = RadioCapability::wifi_halow_s1g(vec![36]).with_tx_power_dbm(range);
+        let dbm = p.decide_power_dbm(&cap, 0, Some(0)).expect("huge margin");
+        assert!(
+            (range.min..=range.max).contains(&dbm),
+            "{dbm} escaped {range:?}"
+        );
     }
 }
 

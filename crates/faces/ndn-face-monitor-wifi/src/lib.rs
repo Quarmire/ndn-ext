@@ -129,6 +129,11 @@ pub use ndn_radio_drivers::{
 pub use ndn_radio_drivers::Bw16SerialBackend;
 
 mod control;
+
+/// Absolute dBm TX-power control for Linux mac80211 radios (driver-agnostic).
+/// Portable code — it compiles anywhere, but discovery only finds anything on a
+/// Linux host with debugfs/nl80211, and is inert elsewhere.
+pub mod dbm_power;
 #[cfg(feature = "libusb-backend")]
 pub use control::LibUsbActuator;
 pub use control::RadioControl;
@@ -150,7 +155,7 @@ mod factory;
 pub use factory::RadioMediumFaceFactory;
 
 pub mod radio;
-pub use radio::{Bandwidth, RadioKnobs};
+pub use radio::{Bandwidth, DbmRange, RadioKnobs};
 
 pub mod measure;
 
@@ -504,9 +509,17 @@ impl MonitorWifiFace {
     pub fn halow(id: FaceId, iface: &str, channels: Vec<u8>) -> Result<Self, FaceError> {
         // 0x8624 = the NDN-over-Ethernet ethertype used across the stack; both
         // ends must agree on it (the RX parse validates the LLC/SNAP ethertype).
+        // Advertise absolute dBm power control when this interface actually has it
+        // (Morse and Newracom S1G parts both expose a dBm knob), so a control plane
+        // registering this capability decides power in link budget rather than in
+        // chip index units. Absent on a radio where nothing was found.
+        let mut cap = RadioCapability::wifi_halow_s1g(channels);
+        if let Some(r) = crate::dbm_power::Mac80211Knobs::discover(iface).tx_power_range() {
+            cap = cap.with_tx_power_dbm(r);
+        }
         let backend = AfPacketBackend::new(iface, FrameFormat::RawNdnS1g { ethertype: 0x8624 })
             .map_err(FaceError::Io)?
-            .with_capability(RadioCapability::wifi_halow_s1g(channels));
+            .with_capability(cap);
         Ok(Self::new(id, Arc::new(backend)))
     }
 

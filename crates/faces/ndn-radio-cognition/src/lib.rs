@@ -58,7 +58,7 @@ mod strategy;
 
 pub use calibrate::{
     RateCalibrator, RateThresholds, STATIC_REQ_RSSI, STATIC_REQ_RSSI_SF, SfCalibrator,
-    SfThresholds, default_sf_thresholds, default_thresholds,
+    SfThresholds, default_sf_thresholds, default_thresholds, pick_sf, pick_sf_hysteretic,
 };
 pub use contextual::{
     ARMS, Arm, Context, ContextualBandit, FOOTPRINT_LAMBDA, MISS_PENALTY, apply_arm, reward,
@@ -72,7 +72,10 @@ pub use policy::{
     DecisionRationale, NameContext, PolicyConfig, Priority, RadioPolicy, RadioRationale,
     SuppressReason,
 };
-pub use report::{MAX_ENTRIES, REPORT_MAGIC, ReceptionReport, decode_report, encode_report};
+pub use report::{
+    FULL_RX_MCS, LEGACY_ONLY_RX, MAX_ENTRIES, REPORT_MAGIC, ReceptionReport, decode_report,
+    encode_report,
+};
 pub use sense::{
     Band, ChannelOccupancy, DEFAULT_SATURATION_FPS, DUTY_WINDOW_MS, Demand, Ewma, LinkResidual,
     MediumState, MediumView, NeighborReport, RadioCapability, RadioId, RadioKind, RateCapability,

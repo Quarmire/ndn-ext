@@ -19,7 +19,7 @@
 // shared HAL crate (`ndn-radio-hal`) so a driver depends on one contract crate.
 // Re-exported here so `crate::radio::Bandwidth` / `crate::radio::RadioKnobs` (and
 // the `super::*` in the tests below) still resolve unchanged.
-pub use ndn_radio_hal::{Bandwidth, RadioKnobs};
+pub use ndn_radio_hal::{Bandwidth, DbmRange, RadioKnobs};
 
 // The `RadioKnobs` impls for the driver backends (`LibUsbRtl88xxBackend`,
 // `Mt7612uBackend`) moved into `ndn-radio-drivers` alongside the backend types —

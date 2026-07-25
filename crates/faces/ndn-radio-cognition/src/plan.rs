@@ -27,6 +27,17 @@ pub struct TxParams {
     /// calibrated/regulatory/PA-backoff power untouched** — only ever reduced below the calibrated
     /// max for spatial reuse, never exceeded. Bearer-agnostic.
     pub tx_power: Option<u8>,
+    /// TX power on the **absolute dBm scale**, for radios that expose one
+    /// ([`RadioCapability::tx_power_dbm`](ndn_radio_hal::RadioCapability::tx_power_dbm)).
+    /// Same policy and same meaning as [`tx_power`](Self::tx_power) — only ever a
+    /// back-off below the radio's ceiling, never an increase above it — but stated in
+    /// dB of link budget rather than opaque chip index units, so it actuates
+    /// identically on any bearer.
+    ///
+    /// The two are alternatives, not a pair to reconcile: an actuator applies this
+    /// when its radio has absolute control and falls back to the index otherwise.
+    /// `None` = leave the radio's current power untouched.
+    pub tx_power_dbm: Option<i8>,
     /// Bearer-specific PHY rate/robustness knobs.
     pub rate: RateParams,
 }
@@ -88,13 +99,17 @@ pub struct WifiRate {
     pub amsdu_msdus: Option<u16>,
 }
 
-/// LoRa (sub-GHz) PHY knobs — the reach/rate dial (spreading factor) and coding rate.
+/// LoRa (sub-GHz) PHY knobs — the reach/rate dial (spreading factor), coding rate, and bandwidth.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct LoraRate {
     /// Spreading factor 7–12 — the reach/rate dial (the peer of Wi-Fi's `mcs`).
     pub spreading_factor: Option<u8>,
     /// Coding rate `1`=4/5 … `4`=4/8 — a robustness/FEC dial.
     pub coding_rate: Option<u8>,
+    /// Bandwidth in kHz (125/250/500). Wider = higher rate + shorter airtime (less duty) but ~3 dB
+    /// less sensitivity per doubling. Like the SF, it is a **rendezvous** parameter: both ends must
+    /// use the same bandwidth to decode, so it is only widened on a decision both peers reach alike.
+    pub bandwidth_khz: Option<u32>,
 }
 
 impl TxParams {
@@ -156,6 +171,10 @@ impl TxParams {
     /// LoRa coding rate, or `None` for a non-LoRa radio.
     pub fn coding_rate(&self) -> Option<u8> {
         if let RateParams::Lora(l) = &self.rate { l.coding_rate } else { None }
+    }
+    /// LoRa bandwidth in kHz, or `None` for a non-LoRa radio.
+    pub fn bandwidth_khz(&self) -> Option<u32> {
+        if let RateParams::Lora(l) = &self.rate { l.bandwidth_khz } else { None }
     }
     /// Mutable access to the Wi-Fi rate (e.g. for the Minstrel-style probe bump), if this is Wi-Fi.
     pub fn wifi_mut(&mut self) -> Option<&mut WifiRate> {

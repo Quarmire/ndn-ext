@@ -136,6 +136,10 @@ pub struct NeighborReport {
     pub quality_dbm: Option<i8>,
     /// The neighbor's per-channel busy% view: `(channel, busy_pct)`.
     pub spectrum: Vec<(u8, u8)>,
+    /// Highest HT/VHT MCS this neighbour can *decode* (its advertised RX capability), or
+    /// [`crate::report::LEGACY_ONLY_RX`] (0) if it decodes legacy OFDM only. Drives the
+    /// worst-overheard-receiver data-rate cap.
+    pub max_rx_mcs: u8,
     pub ts_ms: u64,
 }
 
@@ -187,12 +191,22 @@ pub struct MediumState {
     occupancy: HashMap<(RadioId, u8), ChannelOccupancy>,
     residual: HashMap<RadioId, LinkResidual>,
     e2e: Ewma,
+    /// Ambient inbound RSSI per radio — the level at which this radio hears the medium,
+    /// with no neighbour-node attribution. A cold-start fallback for `weakest_rssi`
+    /// before reception reports establish per-neighbour links; deliberately kept out of
+    /// `neighbors` so it never affects `receiver_count`/multiplicity.
+    ambient_rssi: HashMap<RadioId, Ewma>,
     neighbors: HashMap<u64, NeighborState>,
     demand: HashMap<u64, Demand>,
     /// Per-radio on-air time records `(sent_ms, airtime_ms)` over the duty window, for enforcing
     /// [`RadioCapability::duty_cycle_max`] (LoRa sub-GHz ≈ 1%).
     airtime: HashMap<RadioId, Vec<(u64, f32)>>,
     stale_ms: u64,
+    /// This node's own advertised RX capability — the highest HT/VHT MCS our *best* radio
+    /// decodes ([`crate::report::LEGACY_ONLY_RX`] = legacy OFDM only). Stamped into every
+    /// outgoing [`snapshot_report`](Self::snapshot_report) so peers can cap the data rate
+    /// they reach us at. Defaults to fully-capable.
+    self_rx_mcs: u8,
 }
 
 /// Sliding window over which duty cycle is measured (1 h — the ETSI sub-GHz reference period).
@@ -220,8 +234,27 @@ impl MediumState {
         Self {
             e2e: Ewma::new(0.2),
             stale_ms: 10_000,
+            self_rx_mcs: crate::report::FULL_RX_MCS,
             ..Default::default()
         }
+    }
+
+    /// Declare this node's own RX capability (highest HT/VHT MCS the best local radio
+    /// decodes, or [`crate::report::LEGACY_ONLY_RX`]). Advertised in outgoing reports.
+    pub fn set_self_rx_mcs(&mut self, max_rx_mcs: u8) {
+        self.self_rx_mcs = max_rx_mcs;
+    }
+
+    /// The worst (lowest) RX capability across fresh neighbours — the ceiling a broadcast
+    /// data rate must respect to reach every neighbour (the doctrine's worst-overheard
+    /// receiver). `None` when no neighbour has reported one. `Some(LEGACY_ONLY_RX)` means
+    /// at least one neighbour decodes legacy OFDM only, so the group must drop to legacy.
+    pub fn worst_neighbor_rx_mcs(&self, now_ms: u64) -> Option<u8> {
+        self.neighbors
+            .values()
+            .filter(|s| self.fresh(s.last_seen_ms, now_ms))
+            .filter_map(|s| s.report.as_ref().map(|r| r.max_rx_mcs))
+            .min()
     }
 
     /// Maximum age (ms) before a neighbor is dropped as a live receiver.
@@ -254,6 +287,18 @@ impl MediumState {
         st.last_seen_ms = now_ms;
         if let Some(r) = rssi_dbm {
             st.rssi
+                .entry(radio)
+                .or_insert_with(|| Ewma::new(0.3))
+                .update(r as f32);
+        }
+    }
+
+    /// Fold a per-radio ambient inbound RSSI reading (no neighbour identity). Unlike
+    /// [`observe_rx`] this creates no neighbour entry — it feeds only the cold-start
+    /// `weakest_rssi` fallback, never `receiver_count`.
+    pub fn observe_radio_rssi(&mut self, radio: RadioId, rssi_dbm: Option<i8>, _now_ms: u64) {
+        if let Some(r) = rssi_dbm {
+            self.ambient_rssi
                 .entry(radio)
                 .or_insert_with(|| Ewma::new(0.3))
                 .update(r as f32);
@@ -339,6 +384,7 @@ impl MediumState {
             node_id,
             seq,
             ts_ms: now_ms,
+            max_rx_mcs: self.self_rx_mcs,
             heard_neighbors,
             heard_prefixes,
             spectrum: spec.into_iter().collect(),
@@ -452,6 +498,9 @@ impl MediumView for MediumState {
             .filter(|s| self.fresh(s.last_seen_ms, now_ms))
             .filter_map(|s| s.rssi.get(&radio).and_then(|e| e.get()))
             .min_by(|a, b| a.total_cmp(b))
+            // Cold start (no per-neighbour link yet): fall back to the radio's ambient
+            // inbound level so rate/power has a signal before the first report lands.
+            .or_else(|| self.ambient_rssi.get(&radio).and_then(|e| e.get()))
             .map(|v| v.round().clamp(-128.0, 0.0) as i8)
     }
     fn demand(&self, prefix_hash: u64) -> Option<Demand> {
@@ -570,6 +619,20 @@ mod tests {
     }
 
     #[test]
+    fn ambient_rssi_feeds_rate_not_receiver_count() {
+        // Regression (found on air): per-radio ambient RSSI must inform `weakest_rssi`
+        // for cold-start rate/power, but must NOT invent a neighbour — else a lone peer
+        // over-counts. `observe_radio_rssi` creates no neighbour entry.
+        let mut m = state();
+        m.observe_radio_rssi(W, Some(-58), 1_000);
+        assert_eq!(m.receiver_count(1_000), 0, "ambient RSSI is not a neighbour");
+        assert_eq!(m.weakest_rssi(W, 1_000), Some(-58), "but it feeds the rate floor");
+        // A real report then establishes exactly one neighbour; ambient still adds none.
+        m.observe_rx(W, 42, Some(-70), 1_000);
+        assert_eq!(m.receiver_count(1_000), 1, "one real neighbour, ambient adds none");
+    }
+
+    #[test]
     fn occupancy_and_holding_mrmc() {
         let mut m = state();
         m.observe_occupancy(ChannelOccupancy {
@@ -588,6 +651,7 @@ mod tests {
                 heard_prefixes: vec![0xABCD],
                 quality_dbm: Some(-55),
                 spectrum: vec![(149, 40)],
+                max_rx_mcs: crate::report::FULL_RX_MCS,
                 ts_ms: 100,
             },
         );

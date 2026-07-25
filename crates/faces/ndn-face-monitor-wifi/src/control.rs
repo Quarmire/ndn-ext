@@ -32,11 +32,13 @@ use ndn_radio_cognition::{
     Demand, DemandTracker, MediumState, MediumView, NameContext, NeighborReport, PolicyConfig,
     RadioActuators, RadioCapability, RadioId, RadioPlan, RadioPolicy, RadioStrategy, RateCalibrator,
     SfCalibrator, TxParams, apply_arm, decode_report, default_sf_thresholds, default_thresholds,
-    encode_report, lora_airtime_ms, reward,
+    encode_report, lora_airtime_ms, prefix_hash, reward,
 };
 use ndn_signals_core::SignalView;
 use tracing::Instrument;
-use ndn_transport::link_service::{InboundLpFrame, IngressCtx, LinkServiceFeature, TickCtx};
+use ndn_transport::link_service::{
+    EgressCtx, InboundLpFrame, IngressCtx, LinkServiceFeature, OutboundLpFrame, TickCtx,
+};
 
 use crate::FaceId;
 
@@ -101,7 +103,17 @@ pub struct RadioControl {
     report_seq: Mutex<u32>,
     tick_interval: Duration,
     started: Instant,
+    /// Host-supplied name→demand-key mapper. Maps a peeked Interest/Data name to the
+    /// per-prefix demand key, `None` to skip (name not routed via this face). The host
+    /// wires the FIB longest-prefix match here so demand aggregates at the *routable*
+    /// prefix (aligning with `FibContextSource`'s contexts); absent, a coarse
+    /// first-component fallback is used. Set once at mount (before the `Arc`), then
+    /// read-only on the send/recv fast path.
+    prefix_key: Option<PrefixKeyFn>,
 }
+
+/// Maps a peeked name (components) to its per-prefix demand key, or `None` to skip.
+pub type PrefixKeyFn = Box<dyn Fn(&[&[u8]]) -> Option<u64> + Send + Sync>;
 
 impl RadioControl {
     pub fn new(policy: RadioPolicy) -> Self {
@@ -127,6 +139,22 @@ impl RadioControl {
             report_seq: Mutex::new(0),
             tick_interval: Duration::from_millis(500),
             started: Instant::now(),
+            prefix_key: None,
+        }
+    }
+
+    /// Install the host's name→demand-key mapper (typically FIB longest-prefix match).
+    /// Call once at mount, before wrapping in an `Arc`. See [`PrefixKeyFn`].
+    pub fn set_prefix_key(&mut self, f: PrefixKeyFn) {
+        self.prefix_key = Some(f);
+    }
+
+    /// The per-prefix demand key for a peeked name — the host mapper if installed
+    /// (routable-prefix aggregation), else the coarse first-component fallback.
+    fn demand_key(&self, components: &[&[u8]]) -> Option<u64> {
+        match &self.prefix_key {
+            Some(f) => f(components),
+            None => Some(demand_key_default(components)),
         }
     }
 
@@ -356,15 +384,41 @@ impl RadioControl {
         Some(Bytes::from(encode_report(&rep)))
     }
 
+    /// A due reception report, wrapped as a DigestSha256 Data on
+    /// `/localhop/radio/report/<node>` and LP-framed, ready to hand to the medium's
+    /// `send_bytes`. `None` when no report is due (interval not elapsed / reports off).
+    /// The name here is the same prefix [`is_report_name`] matches on ingress, so a
+    /// neighbour routes it to [`ingest_report`] rather than the demand path. Reports
+    /// are bounded, so this is always a single LP fragment.
+    pub fn broadcast_report_frame(&self) -> Option<Bytes> {
+        let content = self.outgoing_report(self.now_ms())?;
+        let name = ndn_packet::Name::from_components([
+            ndn_packet::NameComponent::generic(Bytes::from_static(b"localhop")),
+            ndn_packet::NameComponent::generic(Bytes::from_static(b"radio")),
+            ndn_packet::NameComponent::generic(Bytes::from_static(b"report")),
+            ndn_packet::NameComponent::generic(Bytes::copy_from_slice(&self.node_id.to_be_bytes())),
+        ]);
+        let data = ndn_packet::encode::encode_data_digest_sha256(&name, &content);
+        Some(ndn_packet::lp::encode_lp_packet(&data))
+    }
+
     /// Ingest a neighbour's reception report heard on `radio`: record what they hold
     /// plus their spectrum view (cooperative sensing), and — when they reported
     /// hearing this node — feed that as our **measured outbound** link quality to
     /// them, closing the rate/power loop with real data instead of reciprocity.
-    /// Returns false on undecodable bytes.
+    /// Returns false on undecodable bytes or a self-report.
     pub fn ingest_report(&self, radio: RadioId, bytes: &[u8], now_ms: u64) -> bool {
         let Some(rep) = decode_report(bytes) else {
             return false;
         };
+        // On a broadcast medium a monitor-mode radio hears its own transmissions, so our
+        // report comes back to us. Never count ourselves as a radio neighbour — it would
+        // inflate `receiver_count`/`effective_receivers` and over-pool the phy^n gain.
+        // (Observed on air: the RTL8822E on o5p-0 looped its own report; o5p-1's did not.)
+        if self.node_id != 0 && rep.node_id == self.node_id {
+            return false;
+        }
+        tracing::debug!(target: "face.radio", neighbor = rep.node_id, seq = rep.seq, "report from neighbour");
         {
             let mut m = self.medium.lock().unwrap();
             m.observe_report(
@@ -373,6 +427,7 @@ impl RadioControl {
                     heard_prefixes: rep.heard_prefixes.clone(),
                     quality_dbm: None,
                     spectrum: rep.spectrum.clone(),
+                    max_rx_mcs: rep.max_rx_mcs,
                     ts_ms: now_ms,
                 },
             );
@@ -393,6 +448,20 @@ impl RadioControl {
             .lock()
             .unwrap()
             .observe_rx(radio, neighbour, rssi_dbm, now_ms);
+    }
+
+    /// Declare this node's own RX capability (highest HT/VHT MCS the best local radio
+    /// decodes, or [`ndn_radio_cognition::report::LEGACY_ONLY_RX`]). Stamped into
+    /// outgoing reception reports so peers cap the data rate they reach us at.
+    pub fn set_self_rx_mcs(&self, max_rx_mcs: u8) {
+        self.medium.lock().unwrap().set_self_rx_mcs(max_rx_mcs);
+    }
+
+    /// The worst RX capability across fresh neighbours — `Some(LEGACY_ONLY_RX)` when a
+    /// neighbour can only decode legacy OFDM, so broadcast data must drop to a legacy
+    /// basic rate to reach it (the doctrine's worst-overheard-receiver rate).
+    pub fn worst_neighbor_rx_mcs(&self, now_ms: u64) -> Option<u8> {
+        self.medium.lock().unwrap().worst_neighbor_rx_mcs(now_ms)
     }
     pub fn observe_occupancy(&self, occ: ChannelOccupancy) {
         self.medium.lock().unwrap().observe_occupancy(occ);
@@ -549,10 +618,19 @@ impl RadioControl {
         let active = {
             let _sense = tracing::debug_span!(target: "named_radio", "sense").entered();
             if let Some(sig) = &self.signals {
+                // Per-face RSSI from the signal store, folded onto the medium *keyed by the
+                // radio* — never by a fabricated neighbour id. The earlier placeholder here
+                // keyed a "neighbour" by the local medium-face id (`face.0`), which is not a
+                // node identity at all: it invented a phantom neighbour and inflated
+                // `receiver_count`/`effective_receivers` (measured on air — o5p-0 counted 2
+                // with a single peer). True per-neighbour, per-radio RSSI now arrives from
+                // reception reports (`ingest_report` → `observe_rx(radio, node_id, rssi)`),
+                // so this only records the radio's *ambient* inbound level for cold-start
+                // rate floors, with no neighbour multiplicity side effect.
                 let mut m = self.medium.lock().unwrap();
                 for (&face, &radio) in &self.face_radio {
                     if let Some(ls) = sig.link(FaceId(face)) {
-                        m.observe_rx(radio, face, ls.rssi_dbm, now_ms);
+                        m.observe_radio_rssi(radio, ls.rssi_dbm, now_ms);
                     }
                 }
             }
@@ -568,6 +646,11 @@ impl RadioControl {
             if tracked.is_empty() {
                 self.active.lock().unwrap().clone()
             } else {
+                tracing::debug!(
+                    target: "face.radio",
+                    contexts = tracked.len(),
+                    "cognition deciding on live PIT demand (not the FIB fallback)"
+                );
                 tracked
             }
         };
@@ -736,12 +819,87 @@ pub struct RadioTelemetry {
     pub plans: Vec<RadioPlan>,
 }
 
+/// Aggregate a peeked Interest/Data name to its per-prefix demand key.
+///
+/// **Granularity decision (interim):** keys on the FIRST name component (the top-level
+/// namespace), so per-object names (`/radio-demo/ping/42`) fold into one demand context
+/// (`/radio-demo`) instead of exploding the demand table with a context per sequence
+/// number. This matches [`prefix_hash`] and therefore aligns with `FibContextSource`
+/// when the registered prefix is a single component (the common radio case). The
+/// principled key is the **longest-matching FIB prefix** — a follow-up once the host
+/// threads the FIB (or a configured prefix set) into the feed, since the radio control
+/// plane deliberately holds no forwarding deps.
+fn demand_key_default(components: &[&[u8]]) -> u64 {
+    let depth = components.len().min(1);
+    prefix_hash(&components[..depth])
+}
+
+/// A reception report broadcast lands on `/localhop/radio/report/<node>`; match the
+/// fixed prefix so ingress can route it to cooperative sensing instead of demand.
+fn is_report_name(components: &[&[u8]]) -> bool {
+    components.len() >= 3
+        && components[0] == b"localhop"
+        && components[1] == b"radio"
+        && components[2] == b"report"
+}
+
 impl LinkServiceFeature for RadioControl {
     fn name(&self) -> &'static str {
         "named-radio-control"
     }
 
+    fn on_egress(&self, frame: &mut OutboundLpFrame, ctx: &EgressCtx) {
+        // Interest transmitted on this radio = the forwarder expressing demand for a
+        // prefix reachable via the medium (a PIT in-record). Feed the demand shadow so
+        // the joint policy sees real fan-out + re-Interest (the ARQ/loss signal) rather
+        // than the zeros it decides on today.
+        if let Some(p) = ndn_packet::lp::peek_lp_name(&frame.wire) {
+            if p.is_interest {
+                if let Some(ph) = self.demand_key(&p.components) {
+                    let downstream = ctx.source.unwrap_or(ctx.face_id);
+                    self.on_interest(ph, downstream, self.now_ms());
+                }
+            }
+        }
+    }
+
     fn on_ingress(&self, frame: &InboundLpFrame, _ctx: &IngressCtx) {
+        // Data received on this radio satisfies our expressed demand for that prefix.
+        if let Some(p) = ndn_packet::lp::peek_lp_name(&frame.wire) {
+            // Cooperative-sensing report heard from a neighbour: /localhop/radio/report/<node>.
+            // It is not demand-satisfying traffic — it is the radio-neighbour multiplicity
+            // (distinct from PIT fan-out) feeding `receiver_count`/`effective_receivers` for
+            // the phy^n pooling. Reports are bounded → single-fragment, so the Content decodes
+            // straight from this frame without forwarder reassembly. Handle and return.
+            if !p.is_interest && is_report_name(&p.components) {
+                if let Some(ndn) = ndn_packet::lp::lp_ndn_packet_bytes(&frame.wire) {
+                    if let Ok(data) = ndn_packet::Data::decode(Bytes::copy_from_slice(ndn)) {
+                        if let Some(content) = data.content() {
+                            // Attribute the report to the radio that actually received it
+                            // (threaded from the medium's per-bearer reader). Falls back to
+                            // radio 0 for single-bearer transports that carry no tag.
+                            let rx_radio = frame.radio_id.map(RadioId).unwrap_or(RadioId(0));
+                            let now = self.now_ms();
+                            if self.ingest_report(rx_radio, content, now) {
+                                let recv = self.medium.lock().unwrap().receiver_count(now);
+                                tracing::debug!(
+                                    target: "face.radio",
+                                    rx_radio = rx_radio.0,
+                                    receivers = recv,
+                                    "reception report ingested — attributed to receiving radio (phy^n pooling)"
+                                );
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+            if !p.is_interest {
+                if let Some(ph) = self.demand_key(&p.components) {
+                    self.on_data(ph, self.now_ms());
+                }
+            }
+        }
         // Liveness: note we heard a peer on this face (RSSI itself is read from the
         // signal store in `tick`). The address, when present, is the seed for
         // per-neighbour sensing once reception reports land.
@@ -751,9 +909,14 @@ impl LinkServiceFeature for RadioControl {
     }
 
     fn tick(&self, _ctx: &TickCtx) -> Option<Duration> {
-        let now = self.now_ms();
-        self.tick_now(now);
-        Some(self.tick_interval)
+        // Opt out: no LP-link-service driver invokes feature `tick` today, and the
+        // cognition loop is driven by `spawn_control_loop` (which also refreshes the
+        // FIB-derived active contexts the feature has no source for). Ticking here too
+        // would double-decide once a feature-tick driver exists — so the single driver
+        // stays `spawn_control_loop`. The feature's live contribution is the demand
+        // feed in `on_egress`/`on_ingress`. (Collapsing onto a feature-tick driver +
+        // moving context-refresh in is a follow-up once such a driver is added.)
+        None
     }
 }
 
@@ -1206,6 +1369,110 @@ mod tests {
         let mut c = RadioControl::new(RadioPolicy::default()).with_report_interval(500);
         c.register_radio(W, FaceId(10), RadioCapability::wifi_monitor_5ghz(vec![149]));
         assert!(c.outgoing_report(1_000).is_none(), "node_id 0 ⇒ no reports");
+    }
+
+    #[test]
+    fn report_rssi_attributed_to_receiving_radio() {
+        // The medium stamps each captured frame with its receiving RadioId; on_ingress
+        // must attribute the report's link to *that* radio, not a hardcoded 0 — so a
+        // multi-radio node keys per-neighbour RSSI on the radio that actually heard it.
+        let mut b = RadioControl::new(RadioPolicy::default())
+            .with_node_id(2)
+            .with_report_interval(1);
+        b.register_radio(W, FaceId(20), RadioCapability::wifi_monitor_5ghz(vec![149]));
+        b.observe_rx(W, 1, Some(-55), 0); // B hears A(1) at -55
+        let frame = b.broadcast_report_frame().expect("report due");
+
+        // A has a *second* radio (id 3); the frame is tagged as received on radio 3.
+        let mut a = RadioControl::new(RadioPolicy::default()).with_node_id(1);
+        a.register_radio(RadioId(3), FaceId(10), RadioCapability::wifi_monitor_5ghz(vec![149]));
+        a.on_ingress(
+            &InboundLpFrame::with_meta(frame, None, Some(3)),
+            &IngressCtx::new(FaceId(10)),
+        );
+        assert_eq!(a.neighbor_rssi(RadioId(3), 2), Some(-55), "keyed on the RX radio");
+        assert_eq!(a.neighbor_rssi(RadioId(0), 2), None, "not on the fallback radio 0");
+    }
+
+    #[test]
+    fn self_report_is_not_a_neighbour() {
+        // A broadcast-medium radio in monitor mode hears its own report; ingesting it
+        // must not count us as our own receiver (observed on air: o5p-0 looped back).
+        let mut c = RadioControl::new(RadioPolicy::default())
+            .with_node_id(7)
+            .with_report_interval(1);
+        c.register_radio(W, FaceId(10), RadioCapability::wifi_monitor_5ghz(vec![149]));
+        let frame = c.broadcast_report_frame().expect("report due");
+        // Feed our own frame back through ingress: rejected, no neighbour learned.
+        c.on_ingress(&InboundLpFrame::bare(frame), &IngressCtx::new(FaceId(10)));
+        assert_eq!(
+            c.neighbor_rssi(W, 7),
+            None,
+            "must not record self as a radio neighbour"
+        );
+    }
+
+    #[test]
+    fn legacy_only_neighbour_advert_drives_worst_rx() {
+        // A legacy-only-RX node (e.g. an 8812au-only node on 5 GHz) advertises
+        // LEGACY_ONLY_RX in its report; a peer ingests it and its worst-neighbour RX
+        // capability drops to legacy — the signal that flips the data plane to a legacy
+        // basic rate (fix #2, the doctrine §5 worst-overheard-receiver cap).
+        use ndn_radio_cognition::{FULL_RX_MCS, LEGACY_ONLY_RX};
+        let mut legacy = RadioControl::new(RadioPolicy::default())
+            .with_node_id(2)
+            .with_report_interval(1);
+        legacy.register_radio(W, FaceId(20), RadioCapability::wifi_monitor_5ghz(vec![149]));
+        legacy.set_self_rx_mcs(LEGACY_ONLY_RX);
+        let frame = legacy.broadcast_report_frame().expect("report due");
+
+        let mut a = RadioControl::new(RadioPolicy::default()).with_node_id(1);
+        a.register_radio(W, FaceId(10), RadioCapability::wifi_monitor_5ghz(vec![149]));
+        assert_eq!(a.worst_neighbor_rx_mcs(0), None, "no neighbours yet");
+        a.on_ingress(&InboundLpFrame::bare(frame), &IngressCtx::new(FaceId(10)));
+        assert_eq!(
+            a.worst_neighbor_rx_mcs(a.now_ms()),
+            Some(LEGACY_ONLY_RX),
+            "the legacy-only neighbour caps the group to legacy"
+        );
+        // A fully-capable neighbour would not force legacy.
+        let mut hi = RadioControl::new(RadioPolicy::default())
+            .with_node_id(3)
+            .with_report_interval(1);
+        hi.register_radio(W, FaceId(30), RadioCapability::wifi_monitor_5ghz(vec![149]));
+        hi.set_self_rx_mcs(FULL_RX_MCS);
+        let hi_frame = hi.broadcast_report_frame().expect("report due");
+        let mut b = RadioControl::new(RadioPolicy::default()).with_node_id(1);
+        b.register_radio(W, FaceId(10), RadioCapability::wifi_monitor_5ghz(vec![149]));
+        b.on_ingress(&InboundLpFrame::bare(hi_frame), &IngressCtx::new(FaceId(10)));
+        assert_eq!(b.worst_neighbor_rx_mcs(b.now_ms()), Some(FULL_RX_MCS));
+    }
+
+    #[test]
+    fn broadcast_frame_reaches_ingest_through_on_ingress() {
+        // The full wire path the mount wires: B produces an LP-framed report Data via
+        // `broadcast_report_frame`; A receives it through the `LinkServiceFeature` ingress
+        // hook (name peek → is_report_name → Data decode → ingest_report), learning its
+        // measured outbound link to B. Exercises the new plumbing end to end, not just
+        // `ingest_report` in isolation.
+        let mut b = RadioControl::new(RadioPolicy::default())
+            .with_node_id(2)
+            .with_report_interval(1);
+        b.register_radio(W, FaceId(20), RadioCapability::wifi_monitor_5ghz(vec![149]));
+        b.observe_rx(W, 1, Some(-55), 0); // B hears A(1) at -55
+        let frame = b.broadcast_report_frame().expect("report frame due");
+
+        // The frame is a Data on /localhop/radio/report/* the ingress matcher recognises.
+        let peeked = ndn_packet::lp::peek_lp_name(&frame).expect("peekable name");
+        assert!(!peeked.is_interest, "a report is Data, not Interest");
+        assert!(is_report_name(&peeked.components), "on /localhop/radio/report");
+
+        let mut a = RadioControl::new(RadioPolicy::default()).with_node_id(1);
+        a.register_radio(W, FaceId(10), RadioCapability::wifi_monitor_5ghz(vec![149]));
+        a.on_ingress(&InboundLpFrame::bare(frame), &IngressCtx::new(FaceId(10)));
+        // A learned its measured outbound link to node 2 — proof the report was decoded
+        // and ingested via the ingress hook (which keys the single medium as RadioId(0)).
+        assert_eq!(a.neighbor_rssi(W, 2), Some(-55));
     }
 
     #[test]
