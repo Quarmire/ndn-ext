@@ -633,6 +633,12 @@ impl RadioControl {
                         m.observe_radio_rssi(radio, ls.rssi_dbm, now_ms);
                     }
                 }
+                // §2 CCLF density term: distinct source nonces heard recently (the per-neighbour map
+                // that the ephemeral-nonce RX path fills) → the medium's `receiver_count`. This counts
+                // silent neighbours that transmit frames but never send a reception report — the
+                // report set alone under-counts. `max`-folded in `MediumState`, so no double-count.
+                const NONCE_FRESH_MS: u64 = 10_000;
+                m.set_nonce_density(sig.neighbour_count(NONCE_FRESH_MS, now_ms), now_ms);
             }
             let tracked = {
                 let mut t = self.demand_tracker.lock().unwrap();

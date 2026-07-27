@@ -207,6 +207,11 @@ pub struct MediumState {
     /// outgoing [`snapshot_report`](Self::snapshot_report) so peers can cap the data rate
     /// they reach us at. Defaults to fully-capable.
     self_rx_mcs: u8,
+    /// Per-frame neighbour density `(count, updated_ms)` from the §2 source-nonce map (the doctrine's
+    /// CCLF density term) — every neighbour that put a frame on air, including silent ones that never
+    /// sent a reception report. Folded into `receiver_count` by `max` so it never under-counts and
+    /// never double-counts the report-based set. Set each tick by the bearer via `set_nonce_density`.
+    nonce_density: (usize, u64),
 }
 
 /// Sliding window over which duty cycle is measured (1 h — the ETSI sub-GHz reference period).
@@ -237,6 +242,14 @@ impl MediumState {
             self_rx_mcs: crate::report::FULL_RX_MCS,
             ..Default::default()
         }
+    }
+
+    /// Publish the per-frame neighbour density (distinct source nonces heard recently) from the §2
+    /// source-nonce map. The bearer calls this each tick with `SignalView::neighbour_count`; it feeds
+    /// CCLF's density term (`receiver_count`) so a silent neighbour that transmits but never reports
+    /// is still counted.
+    pub fn set_nonce_density(&mut self, count: usize, now_ms: u64) {
+        self.nonce_density = (count, now_ms);
     }
 
     /// Declare this node's own RX capability (highest HT/VHT MCS the best local radio
@@ -460,10 +473,16 @@ impl MediumView for MediumState {
         self.occupancy.get(&(radio, channel)).map(|o| o.busy_pct)
     }
     fn receiver_count(&self, now_ms: u64) -> usize {
-        self.neighbors
+        let reports = self
+            .neighbors
             .values()
             .filter(|s| self.fresh(s.last_seen_ms, now_ms))
-            .count()
+            .count();
+        // Fold in the §2 per-frame nonce density (CCLF density term). `max`, not sum: the two sets
+        // overlap (a neighbour that both reports and transmits), so max avoids double-counting while
+        // still catching a silent framer the report set misses. Stale nonce density is ignored.
+        let nonce = if self.fresh(self.nonce_density.1, now_ms) { self.nonce_density.0 } else { 0 };
+        reports.max(nonce)
     }
     fn neighbor_rssi(&self, radio: RadioId, neighbor: u64) -> Option<i8> {
         self.neighbors
@@ -616,6 +635,21 @@ mod tests {
         assert_eq!(m.receiver_count(20_000), 0);
         m.prune(20_000);
         assert_eq!(m.receiver_count(20_000), 0);
+    }
+
+    #[test]
+    fn nonce_density_feeds_receiver_count() {
+        // §2 CCLF density: a silent framer heard via the source-nonce map (no reception report) must
+        // still count. Folded by `max`, so it lifts the count but never double-counts the report set.
+        let mut m = state();
+        m.observe_rx(W, 1, Some(-50), 1_000); // one reporting neighbour
+        assert_eq!(m.receiver_count(1_000), 1);
+        m.set_nonce_density(3, 1_000); // the nonce map heard 3 distinct sources
+        assert_eq!(m.receiver_count(1_000), 3, "nonce density lifts the count past the report set");
+        m.set_nonce_density(0, 1_000);
+        assert_eq!(m.receiver_count(1_000), 1, "max ⇒ reports still count when the nonce map is empty");
+        m.set_nonce_density(5, 1_000);
+        assert_eq!(m.receiver_count(20_000), 0, "stale nonce density (and stale reports) drop out");
     }
 
     #[test]

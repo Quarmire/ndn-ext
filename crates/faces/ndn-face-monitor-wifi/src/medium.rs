@@ -249,6 +249,16 @@ impl SignalView<FaceId> for LinkSignalStore {
     fn source_link(&self, src: [u8; 6]) -> Option<LinkSignals> {
         self.per_source.lock().unwrap().get(&src).copied()
     }
+    fn neighbour_count(&self, fresh_within_ms: u64, now_ms: u64) -> usize {
+        // Distinct source nonces heard recently — the per-frame density the doctrine's §2 map buys,
+        // catching neighbours that transmit frames but never send a reception report.
+        self.per_source
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|ls| now_ms.saturating_sub(ls.updated_ms as u64) <= fresh_within_ms)
+            .count()
+    }
 }
 
 impl SignalStore<FaceId> for LinkSignalStore {
