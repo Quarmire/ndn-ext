@@ -61,7 +61,7 @@ pub use calibrate::{
     SfThresholds, default_sf_thresholds, default_thresholds, pick_sf, pick_sf_hysteretic,
 };
 pub use contextual::{
-    ARMS, Arm, Context, ContextualBandit, FOOTPRINT_LAMBDA, MISS_PENALTY, apply_arm, reward,
+    ARMS, Arm, ArmChoice, Context, ContextualBandit, FOOTPRINT_LAMBDA, MISS_PENALTY, apply_arm, reward,
 };
 pub use demand::DemandTracker;
 pub use plan::{

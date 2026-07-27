@@ -37,6 +37,18 @@ pub struct Arm {
     pub fec_delta: i8,
 }
 
+/// The reasoning behind one [`ContextualBandit::select_traced`] decision — the decision-observability
+/// record. `scores` is the per-arm UCB value at decision time (`+∞` marks an unpulled arm forced by
+/// exploration); `cold_start` is true whenever any arm was still unpulled; `pulls` is how many times
+/// this context has been seen. Emit it as a span/event to watch the bandit learn.
+#[derive(Clone, Copy, Debug)]
+pub struct ArmChoice {
+    pub arm: usize,
+    pub scores: [f32; ARMS.len()],
+    pub cold_start: bool,
+    pub pulls: u32,
+}
+
 /// The arm set spanning the rate × power × FEC tradeoff around the baseline.
 pub const ARMS: [Arm; 5] = [
     Arm {
@@ -165,25 +177,44 @@ impl ContextualBandit {
     /// Choose an arm for `ctx`: any unpulled arm first, then UCB1
     /// (`mean + c·√(ln N / n)`). Deterministic — no RNG.
     pub fn select(&self, ctx: &Context) -> usize {
+        self.select_traced(ctx).arm
+    }
+
+    /// Like [`select`](Self::select) but returns the decision's *reasoning* as data — the chosen
+    /// arm, the per-arm UCB scores at decision time, whether it was a cold-start (an unpulled arm,
+    /// scored `+∞`), and the pull count for this context. This is the decision-observability surface
+    /// (no `tracing` dependency, `no_std`-friendly): a caller emits it as a span/event/metric, and a
+    /// convergence view can watch the scores separate. `select` is exactly `select_traced(ctx).arm`.
+    pub fn select_traced(&self, ctx: &Context) -> ArmChoice {
         let arms = match self.stats.get(&ctx.key()) {
             Some(a) => a,
-            None => return 0, // unseen ⇒ baseline; updates then populate it
+            None => {
+                return ArmChoice { arm: 0, scores: [f32::INFINITY; ARMS.len()], cold_start: true, pulls: 0 };
+            }
         };
-        if let Some(i) = arms.iter().position(|a| a.n == 0) {
-            return i;
-        }
         let total: u32 = arms.iter().map(|a| a.n).sum();
-        let lnt = (total as f32).ln();
-        let mut best = 0;
-        let mut best_score = f32::NEG_INFINITY;
+        let lnt = (total.max(1) as f32).ln();
+        let mut scores = [f32::NEG_INFINITY; ARMS.len()];
+        let mut cold = false;
         for (i, a) in arms.iter().enumerate() {
-            let ucb = a.mean + self.explore_c * (lnt / a.n as f32).sqrt();
-            if ucb > best_score {
-                best_score = ucb;
-                best = i;
+            scores[i] = if a.n == 0 {
+                cold = true;
+                f32::INFINITY // force exploration of an unpulled arm (matches `select`'s first-unpulled rule)
+            } else {
+                a.mean + self.explore_c * (lnt / a.n as f32).sqrt()
+            };
+        }
+        // First-max wins (strictly-greater), so a leading `+∞` picks the first unpulled arm — identical
+        // to the original `position(n==0)` then argmax path.
+        let mut arm = 0;
+        let mut best = f32::NEG_INFINITY;
+        for (i, &s) in scores.iter().enumerate() {
+            if s > best {
+                best = s;
+                arm = i;
             }
         }
-        best
+        ArmChoice { arm, scores, cold_start: cold, pulls: total }
     }
 
     /// Record a reward for `(ctx, arm)` (incremental mean).
