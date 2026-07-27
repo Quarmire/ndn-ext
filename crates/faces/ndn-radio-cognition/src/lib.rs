@@ -49,6 +49,7 @@
 mod calibrate;
 pub mod coop;
 mod contextual;
+pub mod dos;
 mod demand;
 mod plan;
 mod policy;
