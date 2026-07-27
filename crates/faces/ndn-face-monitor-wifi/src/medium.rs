@@ -56,8 +56,8 @@ use ndn_transport::{
 };
 
 use crate::{
-    Bandwidth, BROADCAST, CapturedFrame, DbmRange, DEFAULT_SRC, FaceError, FaceId, FrameIo,
-    InjectFrame,
+    Bandwidth, BROADCAST, CapturedFrame, DbmRange, EphemeralSource, FaceError, FaceId,
+    FrameIo, InjectFrame,
     McsDescriptor, MONITOR_MTU, RadioCapability, RadioKnobs, Reliability, TxIntent, WifiRadio,
     mcs_phy_rate_bps,
 };
@@ -217,11 +217,22 @@ impl RadioBearer {
 #[derive(Default)]
 pub struct LinkSignalStore {
     links: Mutex<HashMap<FaceId, LinkSignals>>,
+    /// Per-**neighbour** link signals, keyed by the frame's ephemeral source tag (the rotating nonce
+    /// in the 802.11 source field — mac-addressing-doctrine §2). This is the per-neighbour RSSI map
+    /// the doctrine wants in place of the ambient per-face scalar `links` holds: two neighbours heard
+    /// on one radio get distinct RSSI, which CCLF density and macro-diversity need.
+    per_source: Mutex<HashMap<[u8; 6], LinkSignals>>,
 }
 
 impl LinkSignalStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Every neighbour currently known, by source nonce → its last link signals. The per-frame
+    /// RSSI-per-neighbour map the doctrine's §2 nonce buys (density / macro-diversity input).
+    pub fn neighbours(&self) -> Vec<([u8; 6], LinkSignals)> {
+        self.per_source.lock().unwrap().iter().map(|(k, v)| (*k, *v)).collect()
     }
 }
 
@@ -235,6 +246,9 @@ impl SignalView<FaceId> for LinkSignalStore {
     fn neighbor(&self, _face: FaceId) -> Option<NodeSignals> {
         None
     }
+    fn source_link(&self, src: [u8; 6]) -> Option<LinkSignals> {
+        self.per_source.lock().unwrap().get(&src).copied()
+    }
 }
 
 impl SignalStore<FaceId> for LinkSignalStore {
@@ -243,6 +257,9 @@ impl SignalStore<FaceId> for LinkSignalStore {
     }
     fn set_node(&self, _signals: NodeSignals) {}
     fn set_neighbor(&self, _face: FaceId, _signals: NodeSignals) {}
+    fn set_source_link(&self, src: [u8; 6], signals: LinkSignals) {
+        self.per_source.lock().unwrap().insert(src, signals);
+    }
 }
 
 /// The last knob values pushed to a radio, so an unchanged knob is not re-applied
@@ -609,6 +626,10 @@ struct TxBearer {
     /// Shared legacy-rate gate: when true, data injects at the basic legacy rate to reach
     /// a legacy-only-RX neighbour (worst-overheard-receiver cap). `None` = decided rate.
     legacy_gate: Option<Arc<AtomicBool>>,
+    /// This node's ephemeral rotating source nonce (mac-addressing-doctrine §2) — stamped into the
+    /// 802.11 source field of every frame, replacing the old fixed `DEFAULT_SRC` constant. Shared
+    /// (one identity per node) across all bearers.
+    source: Arc<EphemeralSource>,
 }
 
 impl TxBearer {
@@ -654,7 +675,9 @@ impl TxBearer {
             payload: wire,
             tx: intent,
             dst: BROADCAST,
-            src: DEFAULT_SRC,
+            // Doctrine §2: the source field carries this node's ephemeral rotating nonce, not a
+            // fixed host tag — inert to real networks, no routing meaning, per-frame RSSI key.
+            src: self.source.current(super::now_ms() as u64),
         };
         self.radio.inject(frame).await
     }
@@ -718,6 +741,20 @@ impl RunningMedium {
         let mut tx = Vec::with_capacity(bearers.len());
         let mut tasks = Vec::with_capacity(bearers.len());
 
+        // This node's ephemeral source identity (mac-addressing-doctrine §2): one per-boot random
+        // nonce, shared across bearers, rotating every 5 minutes to bound linkability. Seeded from
+        // wall-clock nanos ⊕ pid ⊕ face id — non-cryptographic per-boot entropy (a stronger RNG is a
+        // drop-in replacement for `boot_seed` without touching anything downstream).
+        const NONCE_ROTATION_MS: u64 = 5 * 60 * 1000;
+        let boot_seed = {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            nanos ^ ((std::process::id() as u64) << 32) ^ (id.0 as u64).wrapping_mul(0x9E37_79B9)
+        };
+        let source = Arc::new(EphemeralSource::new(boot_seed, NONCE_ROTATION_MS));
+
         for b in bearers {
             // One link-FEC bridge per bearer (shared TX-encode / RX-decode) when
             // enabled: the sink injects each coded frame on this bearer, and the
@@ -727,7 +764,9 @@ impl RunningMedium {
                     FrameIoSink::new(
                         ArcRadio(b.radio.clone()),
                         BROADCAST,
-                        DEFAULT_SRC,
+                        // Doctrine §2 nonce snapshot for this bridge's lifetime (the FEC sink holds a
+                        // fixed src; it re-snapshots on rebuild). The main data path rotates per-frame.
+                        source.current(super::now_ms() as u64),
                         TxIntent::CONSERVATIVE,
                     ),
                     fc.k,
@@ -742,6 +781,7 @@ impl RunningMedium {
                     .zip(fec.as_ref().map(|fc| fc.redundancy.clone())),
                 eligible: fec.as_ref().and_then(|fc| fc.eligible.clone()),
                 legacy_gate: legacy_gate.clone(),
+                source: source.clone(),
             });
 
             // One reader per radio → the RX union. A frame heard on any capability is
@@ -770,6 +810,12 @@ impl RunningMedium {
                                     ls.ext_set("mcs", mcs as f32);
                                 }
                                 sink.set_link(id, ls);
+                                // Doctrine §2: also attribute this RSSI to the *neighbour* by its
+                                // ephemeral source nonce, so the store is a per-neighbour map, not an
+                                // ambient per-face scalar. `ls` is `Copy`, so both keyings are cheap.
+                                if let Some(src) = f.addr {
+                                    sink.set_source_link(src, ls);
+                                }
                             }
                             let addr = f.addr.map(FaceAddr::Ether);
                             match &rx_bridge {
@@ -1021,7 +1067,7 @@ mod power_actuation_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{LoopbackMonitorBus, WifiRadio};
+    use crate::{DEFAULT_SRC, LoopbackMonitorBus, WifiRadio};
     use ndn_transport::Transport;
     use std::time::Duration;
 

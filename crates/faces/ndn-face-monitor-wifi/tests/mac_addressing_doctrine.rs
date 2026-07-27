@@ -9,14 +9,15 @@
 //!     `redundant_relays_are_cclf_suppressed`, `unsolicited_data_is_dropped`,
 //!     `pit_projection_is_soft_state_loss_costs_performance_not_correctness`, …).
 //!
-//! Two §2 sub-claims are DECIDED BUT UNACTUATED — the doctrine asserts an ephemeral *rotating*
-//! source nonce and *nonce-keyed* per-neighbour RSSI, but the code ships a fixed source constant and
-//! keys RSSI on `FaceId`. They are pinned below as `#[ignore]`d tests so the doctrine↔code drift is
-//! tracked, not silently papered over.
+//! The two §2 sub-claims that were once decided-but-unactuated are now ACTUATED and asserted here:
+//! the ephemeral *rotating* source nonce (`EphemeralSource`, stamped in the TX path) and the
+//! *nonce-keyed* per-neighbour RSSI map (`LinkSignalStore::set_source_link`, fed by the live RX path).
 
 use ndn_face_monitor_wifi::{
-    DEFAULT_SRC, GroupKey, OPEN_GROUP_KEY, name_group, name_group_mac, prefix_key,
+    DEFAULT_SRC, EphemeralSource, GroupKey, LinkSignalStore, OPEN_GROUP_KEY, name_group,
+    name_group_mac, prefix_key,
 };
+use ndn_signals_core::{LinkSignals, SignalStore, SignalView};
 
 /// §0/§2 — the DESTINATION field carries a name-group hash: a locally-administered *multicast*
 /// address ("the name is the group address"), derived from the name, never a host MAC.
@@ -63,25 +64,42 @@ fn prefix_aggregation_matches_a_family_doctrine_s8() {
     assert_eq!(prefix_key(a), prefix_key(b), "same routable prefix → one aggregatable filter entry");
 }
 
-// ---- §2 DECIDED-BUT-UNACTUATED: pinned so the doctrine↔code drift is tracked, not hidden --------
+// ---- §2 NOW ACTUATED (was decided-but-unactuated; commit made both real) ------------------------
 
-/// §2 — the source field is supposed to be an EPHEMERAL, per-boot, ROTATING nonce (it buys per-frame
-/// RSSI attribution, DoS attribution, and producer scoping). Today it is `DEFAULT_SRC`, a
-/// compile-time constant that never rotates. When the nonce generator lands (in `ndn-frame-io`),
-/// remove `#[ignore]` and assert two frames from one boot share a nonce that differs across
-/// boots/rotations, and that no forwarder state keys on it.
+/// §2 — the source field is now an EPHEMERAL, per-boot, ROTATING nonce (`EphemeralSource`), no longer
+/// the fixed `DEFAULT_SRC` constant. It is locally-administered + individual (inert to real networks,
+/// never a host MAC), stable within a rotation period (so a receiver can attribute a burst's RSSI to
+/// one neighbour), and differs across periods and boots (bounded linkability, no persistent identity).
 #[test]
-#[ignore = "doctrine §2: ephemeral rotating source nonce is decided but unactuated (src = DEFAULT_SRC constant)"]
 fn source_nonce_rotates_per_boot() {
-    unimplemented!("no per-boot rotating nonce exists yet; see mac-addressing-doctrine.md §2");
+    let boot = EphemeralSource::new(0xA5A5_1234, 60_000); // 60 s rotation
+    let n0 = boot.current(0);
+    assert_eq!(n0[0] & 0x02, 0x02, "locally administered — not a globally-unique host MAC");
+    assert_eq!(n0[0] & 0x01, 0x00, "individual — it is a source address");
+    assert_eq!(n0, boot.current(59_999), "stable within one rotation period");
+    assert_ne!(n0, boot.current(60_000), "rotates into the next period");
+    assert_ne!(n0, EphemeralSource::new(0x0000_9999, 60_000).current(0), "differs across boots");
+    assert_ne!(n0, DEFAULT_SRC, "no longer the fixed DEFAULT_SRC constant");
 }
 
-/// §2 — RSSI should be attributed PER NEIGHBOUR, keyed on the source nonce (a per-neighbour map, not
-/// the ambient scalar the doctrine wants to replace). Today `LinkSignalStore` keys on `FaceId` and
-/// discards the captured source address. When re-keyed, remove `#[ignore]` and assert two
-/// `CapturedFrame`s with distinct `addr2` store distinct RSSI under distinct keys.
+/// §2 — RSSI is now attributed PER NEIGHBOUR, keyed on the source nonce: `LinkSignalStore` keeps a
+/// per-source map (`set_source_link`/`source_link`/`neighbours`) alongside the per-face one, so two
+/// neighbours heard on one radio get distinct RSSI — the per-neighbour map the doctrine wants for
+/// CCLF density / macro-diversity, in place of an ambient per-face scalar. The live RX path calls
+/// `set_source_link(f.addr, ..)` for every captured frame (medium.rs).
 #[test]
-#[ignore = "doctrine §2: nonce-keyed per-neighbour RSSI is decided but unactuated (keyed on FaceId)"]
 fn rssi_is_attributed_per_source_nonce() {
-    unimplemented!("RSSI is keyed on FaceId, not the source nonce; see mac-addressing-doctrine.md §2");
+    let store = LinkSignalStore::new();
+    let a = [0x02, 1, 1, 1, 1, 1];
+    let b = [0x02, 2, 2, 2, 2, 2];
+    store.set_source_link(a, LinkSignals { rssi_dbm: Some(-40), ..LinkSignals::default() });
+    store.set_source_link(b, LinkSignals { rssi_dbm: Some(-80), ..LinkSignals::default() });
+    assert_eq!(store.source_link(a).and_then(|s| s.rssi_dbm), Some(-40));
+    assert_eq!(
+        store.source_link(b).and_then(|s| s.rssi_dbm),
+        Some(-80),
+        "distinct neighbours → distinct RSSI (per-neighbour map, not an ambient scalar)"
+    );
+    assert!(store.source_link([0x02, 9, 9, 9, 9, 9]).is_none(), "unknown neighbour → no signal");
+    assert_eq!(store.neighbours().len(), 2, "both neighbours visible in the per-source map");
 }

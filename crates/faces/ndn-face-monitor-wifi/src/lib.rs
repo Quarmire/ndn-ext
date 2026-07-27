@@ -104,7 +104,7 @@ use std::sync::Mutex;
 #[cfg(target_os = "linux")]
 pub use ndn_frame_io::AfPacketBackend;
 pub use ndn_frame_io::{
-    BROADCAST, CapturedFrame, DEFAULT_SRC, ESPNOW_MAX_BODY, ESPNOW_OUI, FaceError, FaceId,
+    BROADCAST, CapturedFrame, DEFAULT_SRC, EphemeralSource, ESPNOW_MAX_BODY, ESPNOW_OUI, FaceError, FaceId,
     FrameFormat, FrameIo, GroupKey, InjectFrame, LEGACY_ETHER_MTU, LoopbackEndpoint,
     LoopbackMonitorBus, MAX_RELIABLE_MCS, MONITOR_MTU, McsDescriptor, McsPolicy, OPEN_GROUP_KEY,
     RadioCapability, Reach, Reliability, TxIntent, WifiRadio, frame, mcs_for_rssi, mcs_phy_rate_bps,
