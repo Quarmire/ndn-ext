@@ -182,6 +182,14 @@ impl CoopRelay {
     pub fn pending_len(&self) -> usize {
         self.pending.len()
     }
+
+    /// Drop the entire PIT projection — models soft-state loss (a crash, an eviction, a deliberate
+    /// recompile). Per the §7 invariant of the MAC-addressing doctrine this must only cost
+    /// *performance*: live demand (re-expressed Interests) rebuilds it, and no in-flight loss can
+    /// corrupt state or mis-deliver. The `pit_projection_is_soft_state` test exercises exactly that.
+    pub fn clear_projection(&mut self) {
+        self.pending.clear();
+    }
 }
 
 #[cfg(test)]
@@ -345,5 +353,57 @@ mod tests {
         n.rx_data(XY, 0); // no pending Interest for XY
         assert!(n.tick(5).is_empty());
         assert_eq!(n.pending_len(), 0);
+    }
+
+    /// **Doctrine §7 — the keystone invariant.** Everything below the network layer is soft state: a
+    /// projection the forwarder can recompile at any time, whose loss costs *performance*, never
+    /// *correctness*. Wipe the PIT projection mid-flight and show both halves of that claim: the
+    /// in-flight Data round is lost (the performance cost) but nothing is mis-delivered, and a
+    /// re-expressed Interest recompiles the breadcrumb so forwarding resumes (correctness preserved).
+    #[test]
+    fn pit_projection_is_soft_state_loss_costs_performance_not_correctness() {
+        let mut r = relay(1);
+
+        // Baseline: an Interest lays a breadcrumb, so the returning Data is forwarded.
+        r.rx_interest(XY, 0);
+        let _ = r.tick(5); // relay the Interest
+        r.rx_data(XY, 6);
+        assert!(r.tick(10).contains(&(XY, Dir::Data)), "with the breadcrumb, Data is forwarded");
+
+        // Soft-state LOSS: the whole projection is wiped (crash / eviction / recompile).
+        r.clear_projection();
+        assert_eq!(r.pending_len(), 0, "projection gone");
+
+        // PERFORMANCE cost: Data arriving now has no breadcrumb → dropped as unsolicited. That round
+        // is wasted — but it is NOT a correctness failure: nothing is forwarded wrongly.
+        r.rx_data(XY, 20);
+        assert!(r.tick(25).is_empty(), "post-loss Data is dropped (perf cost), never mis-forwarded");
+
+        // CORRECTNESS preserved: a re-expressed Interest recompiles the projection from live demand,
+        // and forwarding resumes exactly as before the loss.
+        r.rx_interest(XY, 30);
+        let _ = r.tick(35);
+        r.rx_data(XY, 36);
+        assert!(
+            r.tick(40).contains(&(XY, Dir::Data)),
+            "the projection recompiled from re-expressed demand; Data flows again"
+        );
+    }
+
+    /// **Doctrine §4 — the receive filter is *roles*, and its width is a soft-state choice.** The
+    /// scope (name-group filter) is itself recomputable: drop a prefix and the node stops relaying
+    /// for it (a deliberate narrowing / a lost filter entry — performance), re-add it and relaying
+    /// resumes. No correctness depends on the filter persisting.
+    #[test]
+    fn scope_filter_is_soft_state_and_recompilable() {
+        let mut r = relay(1); // scope = {/x}
+        r.set_scope(vec![]); // lose the filter set (leaf node / eviction)
+        r.rx_interest(XY, 0);
+        assert!(r.tick(5).is_empty(), "with no scope, the Interest is heard but not relayed");
+        assert_eq!(r.pending_len(), 0, "no forwarding state without the role");
+
+        r.set_scope(vec![SCOPE_X]); // recompile the filter from roles
+        r.rx_interest(XY, 10);
+        assert!(r.tick(15).contains(&(XY, Dir::Interest)), "filter recompiled; relaying resumes");
     }
 }
