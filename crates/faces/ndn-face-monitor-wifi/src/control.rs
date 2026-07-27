@@ -684,7 +684,24 @@ impl RadioControl {
                         )
                     };
                     let ctx = Context::new(rssi, busy, recv, name_ctx.priority.rank());
-                    let arm = bandit.lock().unwrap().select(&ctx);
+                    let choice = bandit.lock().unwrap().select_traced(&ctx);
+                    let arm = choice.arm;
+                    // Decision observability: emit WHY the bandit chose this arm — the per-arm UCB
+                    // scores, the pull count for this context, and whether it was a cold-start
+                    // exploration. This is the reasoning the `decision` span previously lacked; a trace
+                    // consumer (or the sim dashboard) can now watch the bandit learn per context.
+                    tracing::debug!(
+                        target: "named_radio::decision",
+                        radio = alloc.radio.0,
+                        arm,
+                        cold_start = choice.cold_start,
+                        pulls = choice.pulls,
+                        scores = ?choice.scores,
+                        rssi,
+                        busy,
+                        recv,
+                        "bandit: arm selected"
+                    );
                     apply_arm(&ARMS[arm], &mut alloc.params, max_mcs, max_power);
                     self.last_arm
                         .lock()
