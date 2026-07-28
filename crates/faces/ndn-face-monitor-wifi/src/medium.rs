@@ -831,6 +831,7 @@ impl RunningMedium {
             let loss = fec.as_ref().map(|fc| fc.loss.clone());
             let sched_rx = sched.clone();
             tasks.push(tokio::spawn(async move {
+                let mut last_mesh_cv = 0u64; // last mesh common-view observation count ingested (#74)
                 loop {
                     match radio.recv_frame().await {
                         Ok(f) => {
@@ -839,6 +840,18 @@ impl RunningMedium {
                             // shared RadioHwClock was built to close. Cheap; only when scheduling is on.
                             if let (Some(sched), Some(stamp)) = (sched_rx.as_ref(), f.stamp.as_ref()) {
                                 sched.on_rx_stamp(stamp);
+                            }
+                            // #74: the MESH hardware common-view — discipline the scheduler's clock to a
+                            // neighbour's HW-TSF-stamped timing beacon (pair (peer_tsf, our_rxtsfl), both
+                            // hardware) → self-contained sub-µs `CommonView` epoch, no AP. This is the
+                            // face consuming the µs hardware clock (upgrading `cv` mode from the ms
+                            // software beacon). Poll the driver's mesh side channel; ingest fresh obs.
+                            if let Some(sched) = sched_rx.as_ref()
+                                && let Some((peer_tsf, our_rxtsfl, count, _bssid)) = radio.mesh_common_view()
+                                && count != last_mesh_cv
+                            {
+                                last_mesh_cv = count;
+                                sched.ingest_common_view(peer_tsf, our_rxtsfl);
                             }
                             // Time-beacon (#41 common-view): discipline the common-view clock to the
                             // master's reference and SUPPRESS the frame — it is a clock signal, not NDN

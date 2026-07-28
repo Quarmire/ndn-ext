@@ -69,9 +69,14 @@ pub struct FaceScheduler {
     /// The disciplined hardware clock, fed by the RX reader. Behind a mutex: the reader writes stamps,
     /// the (wall-clock-default) gate only reads it in `hw` mode.
     hw: Mutex<RadioHwClock>,
-    /// The radio-native common-view clock, disciplined to a clock-master's time-beacon (`CommonView`
-    /// mode). The master feeds its own reference each broadcast; slaves feed the received one.
+    /// The radio-native common-view clock, disciplined to a clock-master's SOFTWARE time-beacon
+    /// (`CommonView` mode, ms). The master feeds its own reference each broadcast; slaves feed received.
     cv: Mutex<RadioHwClock>,
+    /// The **hardware** common-view offset (µs), from a neighbour's HW-TSF-stamped beacon: `peer_tsf −
+    /// our_rxtsfl`, both hardware clocks. When set, `CommonView` mode reads `hw.now() + this` — the peer's
+    /// timeline at the RX-stamp floor (~0.5 µs), the #74 self-contained µs path — falling back to the
+    /// software `cv` clock (ms) until a hardware beacon is heard. Fed by [`ingest_common_view`](Self::ingest_common_view).
+    cv_hw: Mutex<Option<i64>>,
     /// This node broadcasts the time-beacon (the clock master). At most one master per timeline.
     master: bool,
     /// Monotonic base for the hardware clock's host reference and the master's reference timeline.
@@ -108,6 +113,7 @@ impl FaceScheduler {
             current_ch: AtomicU8::new(u8::MAX), // sentinel: first hop always retunes
             hw: Mutex::new(RadioHwClock::realtek()),
             cv: Mutex::new(RadioHwClock::common_view()),
+            cv_hw: Mutex::new(None),
             master,
             base: Instant::now(),
         })
@@ -158,6 +164,24 @@ impl FaceScheduler {
         }
     }
 
+    /// Discipline the **hardware** common-view clock from a neighbour's HW-TSF-stamped beacon (#74): the
+    /// pair `(peer_tsf, our_rxtsfl)` — the transmitter's hardware TSF from the beacon body and OUR
+    /// hardware RX stamp of that same on-air event. The transmitter's TX latency cancels (one shared
+    /// event), so the offset `peer_tsf − our_rxtsfl` maps our local hardware clock onto the peer's
+    /// timeline at the RX-stamp floor. Every node disciplining to the same neighbour's beacon converges
+    /// to sub-µs — the self-contained µs common-view. Called by the RX reader for each mesh time-beacon.
+    pub fn ingest_common_view(&self, peer_tsf: u64, our_rxtsfl: u64) {
+        // Keep our local hardware clock disciplined to the RX TSF (so `hw.now()` tracks it between
+        // beacons even without other traffic), then set the offset onto the peer's timeline.
+        let host_now = self.base.elapsed().as_micros() as u64;
+        if let Ok(mut hw) = self.hw.lock() {
+            hw.on_raw(our_rxtsfl, host_now);
+        }
+        if let Ok(mut o) = self.cv_hw.lock() {
+            *o = Some((peer_tsf as i64).wrapping_sub(our_rxtsfl as i64));
+        }
+    }
+
     /// A one-line description of the active schedule, for the face's startup log.
     pub fn describe(&self) -> String {
         let mut parts = Vec::new();
@@ -194,7 +218,15 @@ impl FaceScheduler {
             }
             ClockSource::CommonView => {
                 let host_now = self.base.elapsed().as_micros() as u64;
-                self.cv.lock().map(|cv| cv.now(host_now)).unwrap_or(host_now)
+                // Prefer the HARDWARE common-view (#74, ~0.5 µs) once a neighbour's HW-stamped beacon has
+                // been heard: our local hardware clock projected onto the peer's timeline. Fall back to
+                // the software beacon (ms) until then.
+                if let Some(off) = self.cv_hw.lock().ok().and_then(|o| *o) {
+                    let local = self.hw.lock().map(|hw| hw.now(host_now)).unwrap_or(host_now);
+                    (local as i64).wrapping_add(off) as u64
+                } else {
+                    self.cv.lock().map(|cv| cv.now(host_now)).unwrap_or(host_now)
+                }
             }
         }
     }
@@ -326,6 +358,37 @@ mod tests {
     }
 
     #[test]
+    fn hardware_common_view_beats_software_and_aligns_the_epoch() {
+        // A scheduler in CommonView mode. Before any HW beacon it uses the software cv clock; after a
+        // HW beacon it reads the peer's hardware timeline (the #74 µs path). Two nodes fed the SAME
+        // peer beacon (same peer_tsf) land on the same epoch regardless of their own RX-stamp domain.
+        let mk = || FaceScheduler {
+            slot: parse_slot("8:3000"),
+            hop: None,
+            group_depth: 1,
+            clock_source: ClockSource::CommonView,
+            knobs: None,
+            bw: crate::Bandwidth::default(),
+            current_ch: super::AtomicU8::new(u8::MAX),
+            hw: super::Mutex::new(RadioHwClock::realtek()),
+            cv: super::Mutex::new(RadioHwClock::common_view()),
+            cv_hw: super::Mutex::new(None),
+            master: false,
+            base: super::Instant::now(),
+        };
+        let a = mk();
+        let b = mk();
+        // Both hear one peer beacon: peer_tsf = 5_000_000 µs. Node A's RX TSF domain reads 1_000_000 at
+        // that beacon; node B's independent counter reads 8_000_000 — different domains, same event.
+        a.ingest_common_view(5_000_000, 1_000_000);
+        b.ingest_common_view(5_000_000, 8_000_000);
+        // Both now read the peer's timeline (~5_000_000 + their small elapsed) → same slot epoch.
+        let (ea, eb) = (a.now_us() / 3000, b.now_us() / 3000);
+        assert_eq!(ea, eb, "hardware common-view did not align the two nodes' epochs");
+        assert!(a.now_us() >= 5_000_000, "should read the peer's hardware timeline, not the fallback");
+    }
+
+    #[test]
     fn group_depth_changes_the_key() {
         // Two names sharing the top prefix collapse to one group at depth 1, split at depth 2.
         let h1 = prefix_hash(&[&b"ndn"[..]]);
@@ -348,6 +411,7 @@ mod tests {
             current_ch: super::AtomicU8::new(u8::MAX),
             hw: super::Mutex::new(RadioHwClock::realtek()),
             cv: super::Mutex::new(RadioHwClock::common_view()),
+            cv_hw: super::Mutex::new(None),
             master: true,
             base: super::Instant::now(),
         };
