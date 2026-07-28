@@ -73,11 +73,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             sched.on_rx_stamp(s);
         }
-        if let Some((peer_tsf, our_rxtsfl, count, _bssid)) = d.mesh_common_view()
+        if let Some((peer_tsf, our_rxtsfl, count, bssid)) = d.mesh_common_view()
             && count != last_cv
         {
             last_cv = count;
-            sched.ingest_common_view(peer_tsf, our_rxtsfl);
+            sched.ingest_mesh_beacon(peer_tsf, our_rxtsfl, bssid);
             if Instant::now() >= warmup
                 && let Some(off) = sched.cv_offset_us()
             {

@@ -37,7 +37,7 @@ use ndn_radio_cognition::{HopSchedule, SlotSchedule, prefix_hash};
 
 use crate::radio::{Bandwidth, RadioKnobs};
 use ndn_frame_io::LinkStamp;
-use ndn_time::RadioHwClock;
+use ndn_time::{NetworkTime, RadioHwClock, RefBelief};
 
 /// Which clock feeds `epoch(t)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,6 +94,13 @@ pub struct FaceScheduler {
     cv_hw: Mutex<Option<i64>>,
     /// This node broadcasts the time-beacon (the clock master). At most one master per timeline.
     master: bool,
+    /// Multi-hop network-time state (#75): elects the lowest-id node as the network reference and
+    /// composes this node's offset onto its timeline hop-by-hop. Fed by [`ingest_common_view`]. The
+    /// `CommonView` epoch reads the offset to the *network reference*, not just the nearest neighbour, so
+    /// nodes out of the reference's range still converge (each hop adds only the ~0.5 µs RX-stamp jitter).
+    ///
+    /// [`ingest_common_view`]: Self::ingest_common_view
+    net: Mutex<NetworkTime>,
     /// Claimable slots (named-token-scheduling.md): a slot is OWNED by name but if its owner is idle
     /// (nothing overheard since the slot began) another name with data may CLAIM it via a CCLF election.
     /// `false` = fixed name-TDMA (owner-only). On when `NDN_SCHED_CLAIM=1`.
@@ -126,6 +133,10 @@ impl FaceScheduler {
         };
         let master = std::env::var("NDN_SCHED_MASTER").ok().as_deref() == Some("1");
         let claimable = std::env::var("NDN_SCHED_CLAIM").ok().as_deref() == Some("1");
+        // Our node id for the network-reference election (#75): lowest id wins. Default u64::MAX = "never
+        // the reference, always sync to a neighbour" (a pure follower); a node meant to be a candidate
+        // sets its ephemeral nonce here via NDN_SCHED_NODE_ID.
+        let node_id: u64 = std::env::var("NDN_SCHED_NODE_ID").ok().and_then(|s| s.parse().ok()).unwrap_or(u64::MAX);
         Some(Self {
             slot,
             hop,
@@ -138,6 +149,7 @@ impl FaceScheduler {
             cv: Mutex::new(RadioHwClock::common_view()),
             cv_hw: Mutex::new(None),
             master,
+            net: Mutex::new(NetworkTime::new(node_id)),
             claimable,
             last_rx: AtomicU64::new(0),
             base: Instant::now(),
@@ -195,16 +207,39 @@ impl FaceScheduler {
     /// event), so the offset `peer_tsf − our_rxtsfl` maps our local hardware clock onto the peer's
     /// timeline at the RX-stamp floor. Every node disciplining to the same neighbour's beacon converges
     /// to sub-µs — the self-contained µs common-view. Called by the RX reader for each mesh time-beacon.
-    pub fn ingest_common_view(&self, peer_tsf: u64, our_rxtsfl: u64) {
+    pub fn ingest_common_view(&self, peer_tsf: u64, our_rxtsfl: u64, nbr: RefBelief) {
         // Keep our local hardware clock disciplined to the RX TSF (so `hw.now()` tracks it between
-        // beacons even without other traffic), then set the offset onto the peer's timeline.
+        // beacons even without other traffic).
         let host_now = self.base.elapsed().as_micros() as u64;
         if let Ok(mut hw) = self.hw.lock() {
             hw.on_raw(our_rxtsfl, host_now);
         }
+        // Compose through the network-time election (#75): our hardware offset to this neighbour plus
+        // the neighbour's advertised offset to its reference. For a direct beacon that carries no belief,
+        // the caller passes the neighbour as its own stratum-0 reference → single-hop offset, and the
+        // lowest-id neighbour is elected. The scheduler epoch then reads our offset to the *network*
+        // reference (0 if we are it).
+        let hw_offset = (peer_tsf as i64).wrapping_sub(our_rxtsfl as i64);
+        let off = if let Ok(mut n) = self.net.lock() {
+            n.observe(hw_offset, nbr);
+            n.offset_to_ref()
+        } else {
+            hw_offset
+        };
         if let Ok(mut o) = self.cv_hw.lock() {
-            *o = Some((peer_tsf as i64).wrapping_sub(our_rxtsfl as i64));
+            *o = Some(off);
         }
+    }
+
+    /// RX-reader convenience: ingest a **direct** neighbour beacon whose frame carries no advertised
+    /// belief yet — treat the neighbour as a stratum-0 reference identified by its BSSID (the ephemeral
+    /// nonce). Single-hop today; multi-hop (belief-carrying beacons) calls [`ingest_common_view`] with
+    /// the parsed belief. The lowest-id neighbour wins the reference election.
+    ///
+    /// [`ingest_common_view`]: Self::ingest_common_view
+    pub fn ingest_mesh_beacon(&self, peer_tsf: u64, our_rxtsfl: u64, bssid: [u8; 6]) {
+        let ref_id = u64::from_le_bytes([bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5], 0, 0]);
+        self.ingest_common_view(peer_tsf, our_rxtsfl, RefBelief { ref_id, stratum: 0, offset_to_ref: 0 });
     }
 
     /// A one-line description of the active schedule, for the face's startup log.
@@ -466,6 +501,7 @@ mod tests {
             cv: super::Mutex::new(RadioHwClock::common_view()),
             cv_hw: super::Mutex::new(None),
             master: false,
+            net: super::Mutex::new(ndn_time::NetworkTime::new(u64::MAX)),
             claimable: false,
             last_rx: super::AtomicU64::new(0),
             base: super::Instant::now(),
@@ -474,8 +510,9 @@ mod tests {
         let b = mk();
         // Both hear one peer beacon: peer_tsf = 5_000_000 µs. Node A's RX TSF domain reads 1_000_000 at
         // that beacon; node B's independent counter reads 8_000_000 — different domains, same event.
-        a.ingest_common_view(5_000_000, 1_000_000);
-        b.ingest_common_view(5_000_000, 8_000_000);
+        let bssid = [0x02, 1, 2, 3, 4, 5]; // same reference beacon → both elect the same reference
+        a.ingest_mesh_beacon(5_000_000, 1_000_000, bssid);
+        b.ingest_mesh_beacon(5_000_000, 8_000_000, bssid);
         // Both now read the peer's timeline (~5_000_000 + their small elapsed) → same slot epoch.
         let (ea, eb) = (a.now_us() / 3000, b.now_us() / 3000);
         assert_eq!(ea, eb, "hardware common-view did not align the two nodes' epochs");
@@ -496,6 +533,7 @@ mod tests {
             cv: super::Mutex::new(RadioHwClock::common_view()),
             cv_hw: super::Mutex::new(None),
             master: false,
+            net: super::Mutex::new(ndn_time::NetworkTime::new(u64::MAX)),
             claimable: true,
             last_rx: super::AtomicU64::new(0),
             base: super::Instant::now(),
@@ -535,6 +573,7 @@ mod tests {
             cv: super::Mutex::new(RadioHwClock::common_view()),
             cv_hw: super::Mutex::new(None),
             master: true,
+            net: super::Mutex::new(ndn_time::NetworkTime::new(u64::MAX)),
             claimable: false,
             last_rx: super::AtomicU64::new(0),
             base: super::Instant::now(),

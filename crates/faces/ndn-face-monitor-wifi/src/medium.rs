@@ -847,11 +847,11 @@ impl RunningMedium {
                             // face consuming the µs hardware clock (upgrading `cv` mode from the ms
                             // software beacon). Poll the driver's mesh side channel; ingest fresh obs.
                             if let Some(sched) = sched_rx.as_ref()
-                                && let Some((peer_tsf, our_rxtsfl, count, _bssid)) = radio.mesh_common_view()
+                                && let Some((peer_tsf, our_rxtsfl, count, bssid)) = radio.mesh_common_view()
                                 && count != last_mesh_cv
                             {
                                 last_mesh_cv = count;
-                                sched.ingest_common_view(peer_tsf, our_rxtsfl);
+                                sched.ingest_mesh_beacon(peer_tsf, our_rxtsfl, bssid);
                             }
                             // Time-beacon (#41 common-view): discipline the common-view clock to the
                             // master's reference and SUPPRESS the frame — it is a clock signal, not NDN
