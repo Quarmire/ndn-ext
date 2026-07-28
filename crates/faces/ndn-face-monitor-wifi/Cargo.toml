@@ -69,5 +69,9 @@ ndn-nan = { workspace = true }
 ndn-nan-core = { workspace = true }
 ndn-face-wifi-aware = { workspace = true }
 
+[[example]]
+name = "slot_airtest"
+required-features = ["libusb-backend"]
+
 [lints]
 workspace = true
