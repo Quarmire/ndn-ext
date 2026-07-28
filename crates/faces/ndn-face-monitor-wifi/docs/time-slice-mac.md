@@ -85,11 +85,23 @@ namelessness, and self-healing — and pins the clock accuracy as the one thing 
 
 ## Status & how to use it
 
-- **Realized:** the name/class time-slice over the software common-view clock (#61), validated in sim.
-- **Designed + measured, not yet in the face:** the claimable (demand-adaptive) slot — implement as a
-  radio plan/strategy that transmits the owner's pending data collision-free, else runs the existing CCLF
-  election among other pending name-groups. Reuses the slot clock + CCLF already present; the only new
-  logic is the owner-idle → open-to-election branch.
-- **Blocked on:** hardware TSF (#41) for tight, collision-free slots at scale.
+- **Actuated on the real face (2026-07-28, #72):** the fixed name-owned slot gate is wired into the
+  deployed `RunningMedium` TX path. `ndn_radio_cognition::SlotSchedule` is the pure decision
+  (`owner_slot = prefix_hash % N`, `wait_us` = µs to the name's next owned slot); the face's
+  `FaceScheduler` (`src/sched.rs`) gates every outbound *data* frame at the one TX choke point
+  (`TxBearer::inject_with_intent`) on it, keyed on the frame's own first name components. Robust control
+  frames bypass. Enable with `NDN_SCHED_SLOT=N:slot_us` (e.g. `8:3000`); unset ⇒ send path unchanged.
+  The epoch is wall-clock µs by default (common-view across NTP-synced nodes at ~ms, proportionate to
+  ms-scale data-frame slots); `NDN_SCHED_CLOCK=hw` rides the hardware `RadioHwClock` (fed from RX
+  stamps) for µs slots — cross-node phase then needs a clock-master TimeBeacon (see below).
+- **Designed + measured, not yet actuated:** the *claimable* (demand-adaptive) slot — the owner-idle →
+  CCLF-election branch. The fixed gate is live; adding the claim means the face checks "did the owner
+  transmit this slot?" (overhear) and, if not, runs the existing `coop.rs` CCLF election among other
+  pending name-groups. Reuses the slot clock + CCLF already present.
+- **Cross-node phase (the remaining honest gap):** the wall-clock epoch is common-view at ~ms; tight
+  µs-slot operation on the hardware clock additionally needs a shared reference (a clock-master's
+  periodic broadcast / common AP beacon) disciplined via `ndn_time`'s `CommonViewPool`/`TimeBeacon` —
+  the local RX-TSF is precise but not itself cross-node-aligned. Wired hook (`on_rx_stamp`), not yet the
+  full discipline.
 - **Do not** introduce a slot-owner roster, a join/leave protocol, or any per-station schedule state —
   ownership must stay a pure function of (name, clock).
