@@ -247,8 +247,11 @@ impl RadioPolicy {
     /// BLE) airtime is THE scarce resource, so both mechanisms earn their keep: dedup keeps a repeated
     /// name off the host link, and CS-serve answers a repeat Interest locally (one hop) instead of
     /// re-fetching it end-to-end — the airtime-per-satisfied-Interest win a flood mesh can't make.
-    /// Name-keyed hopping is left OFF until common-view time (#41) gives a listener the *when*; the
-    /// firmware carries the hop function regardless. Mains-powered always-on Wi-Fi (`duty_cycle_max`
+    /// Name-keyed *firmware* hopping is left OFF until the firmware carries its own common-view clock;
+    /// the firmware carries the hop function regardless. (#41's clock landed host-side as
+    /// `ndn_time::RadioHwClock`, and the host monitor-wifi face already actuates FHSS from it via
+    /// `FaceScheduler`/`NDN_SCHED_HOP` — a separate path from this firmware flag.) Mains-powered
+    /// always-on Wi-Fi (`duty_cycle_max`
     /// == 1.0, monitor) stays conservative — its host PIT/CS already dedups and airtime is cheap.
     pub fn data_plane(&self, cap: &RadioCapability) -> DataPlaneConfig {
         let duty_limited_broadcast = matches!(

@@ -218,9 +218,13 @@ pub struct DataPlaneConfig {
     /// Answer a repeat Interest from the on-device Content Store instead of re-fetching it end-to-end
     /// (in-network caching — the airtime-per-content win a flood mesh cannot make).
     pub cs_serve: bool,
-    /// Name-keyed frequency hopping (#40): the carrier for a name is `H(name)`-derived, so both ends
-    /// compute it with no negotiation. The hop FUNCTION only — a listener still needs common-view time
-    /// (#41) to know WHEN to sit on a name's channel, so this stays off until that lands.
+    /// Name-keyed frequency hopping (#40) **in the on-device (LoRa/embedded) firmware data plane**: the
+    /// carrier for a name is `H(name)`-derived, so both ends compute it with no negotiation. The hop
+    /// FUNCTION only — a listener still needs common-view time to know WHEN to sit on a name's channel.
+    /// #41's common-view clock landed as the host-side `ndn_time::RadioHwClock`, and the *host*
+    /// monitor-wifi face now actuates FHSS from it (`ndn_face_monitor_wifi::FaceScheduler`,
+    /// `NDN_SCHED_HOP`). This firmware flag stays off until the *firmware* carries its own common-view
+    /// clock (a separate port), not the host's — hence still gated here.
     pub hop: bool,
 }
 

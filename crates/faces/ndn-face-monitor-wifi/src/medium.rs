@@ -640,6 +640,10 @@ struct TxBearer {
     /// 802.11 source field of every frame, replacing the old fixed `DEFAULT_SRC` constant. Shared
     /// (one identity per node) across all bearers.
     source: Arc<EphemeralSource>,
+    /// The data-centric time-slice (#61) + FHSS (#40) transmit scheduler, when configured
+    /// (`NDN_SCHED_*`). `None` ⇒ no gating, the historical send path. Per-bearer so a hop retunes its
+    /// own radio; the slot timing is identical on every bearer (one common-view clock per node).
+    sched: Option<Arc<crate::FaceScheduler>>,
 }
 
 impl TxBearer {
@@ -666,6 +670,13 @@ impl TxBearer {
     /// legacy rate every neighbour can decode (the worst-overheard-receiver reach).
     async fn inject_with_intent(&self, wire: Bytes, intent: TxIntent) -> Result<(), FaceError> {
         let robust = intent.reliability == Reliability::MostRobust;
+        // Data-centric time-slice/FHSS gate (#61/#40): wait for this name-group's owned slot and/or
+        // retune to its hop channel, from the name + the common-view clock. Robust control frames
+        // (reports / discovery) bypass — they must reach the worst receiver now, not wait on a data
+        // slot (they already ride the basic legacy rate). Off unless `NDN_SCHED_*` is set.
+        if !robust && let Some(sched) = &self.sched {
+            sched.gate(&wire).await;
+        }
         // Only route through the FEC coder when there is parity to add AND this frame
         // is FEC-eligible (appropriate-traffic-only) AND it is not a robust control frame.
         // At R=0 the generation batching would cost the tail-flush latency for no recovery;
@@ -784,6 +795,16 @@ impl RunningMedium {
                     fc.window,
                 ))
             });
+            // The data-centric time-slice/FHSS scheduler (#61/#40), per bearer so a hop retunes its own
+            // radio via that bearer's knobs. Constructed from `NDN_SCHED_*`; `None` ⇒ send path
+            // unchanged. Shared (Arc) with this bearer's RX reader so inbound hardware stamps feed the
+            // scheduler's disciplined clock (#41). Bandwidth defaults to 20 MHz for hops across
+            // non-overlapping channels.
+            let sched = crate::FaceScheduler::from_env(b.knobs.clone(), crate::Bandwidth::default())
+                .map(Arc::new);
+            if let Some(s) = &sched {
+                tracing::info!(target: "monitor-wifi", face = id.0, "{}", s.describe());
+            }
             tx.push(TxBearer {
                 radio: b.radio.clone(),
                 fec: bridge
@@ -792,6 +813,7 @@ impl RunningMedium {
                 eligible: fec.as_ref().and_then(|fc| fc.eligible.clone()),
                 legacy_gate: legacy_gate.clone(),
                 source: source.clone(),
+                sched: sched.clone(),
             });
 
             // One reader per radio → the RX union. A frame heard on any capability is
@@ -803,10 +825,17 @@ impl RunningMedium {
             let sink = signal_sink.clone();
             let rx_bridge = bridge;
             let loss = fec.as_ref().map(|fc| fc.loss.clone());
+            let sched_rx = sched.clone();
             tasks.push(tokio::spawn(async move {
                 loop {
                     match radio.recv_frame().await {
                         Ok(f) => {
+                            // #41: feed the frame's hardware RX timestamp into the scheduler's
+                            // disciplined clock — this is the face consuming `.stamp`, the gap the
+                            // shared RadioHwClock was built to close. Cheap; only when scheduling is on.
+                            if let (Some(sched), Some(stamp)) = (sched_rx.as_ref(), f.stamp.as_ref()) {
+                                sched.on_rx_stamp(stamp);
+                            }
                             if (f.rssi_dbm.is_some() || f.mcs_index.is_some())
                                 && let Some(sink) = sink.as_ref()
                             {

@@ -157,6 +157,10 @@ pub use factory::RadioMediumFaceFactory;
 pub mod radio;
 pub use radio::{Bandwidth, DbmRange, RadioKnobs};
 
+// The data-centric time-slice (#61) + FHSS (#40) transmit scheduler, actuated at the TX path.
+mod sched;
+pub use sched::FaceScheduler;
+
 pub mod measure;
 
 // nl80211 Wi-Fi channel control (Linux), folded in from the former ndn-research
@@ -341,7 +345,7 @@ pub fn group_prefix_key(key: &GroupKey, routable_prefix: &[u8]) -> [u8; 6] {
 /// for [`TxAddr::SplitByName`]. Returns `None` for a non-first fragment (the name is
 /// only in fragment 0) or a parse miss. The face's one bounded NDN-structure peek —
 /// a producer compiling its own Data's name into the address, as V-MAC does.
-fn inner_name(wire: &[u8]) -> Option<&[u8]> {
+pub(crate) fn inner_name(wire: &[u8]) -> Option<&[u8]> {
     // The network packet bytes: the LP `Fragment` (0x50) value. A multi-fragment
     // frame exposes it via extract_fragment (only fragment 0 has the name); a
     // single LP packet we scan for the 0x50 TLV; a bare packet is used as-is.

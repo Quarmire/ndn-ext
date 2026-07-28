@@ -2,7 +2,7 @@
 //! name may transmit, computed from `(name, common-view epoch)` — the data-centric time-slice MAC
 //! (#61) and name-keyed FHSS (#40). Both were validated in sim (`ndn-sim/examples/token_schedule.rs`,
 //! `fhss_rendezvous.rs`) and gated on hardware common-view time (#41), which has now landed as the
-//! shared [`ndn_time::RadioHwClock`]. This module is the pure decision logic; the face gates its TX
+//! shared `ndn_time::RadioHwClock`. This module is the pure decision logic; the face gates its TX
 //! choke point on it, reading the epoch from the disciplined hardware clock.
 //!
 //! Everything here keys on the name-group's [`prefix_hash`](crate::prefix_hash) — the *one* shared
@@ -79,6 +79,16 @@ impl SlotSchedule {
     /// The superframe length in microseconds — the worst-case wait between a name's turns.
     pub fn superframe_us(&self) -> u64 {
         self.slot_us * self.slots
+    }
+
+    /// The number of slots per superframe (the per-name access period, in slots).
+    pub fn slots(&self) -> u64 {
+        self.slots
+    }
+
+    /// The width of one slot, in microseconds.
+    pub fn slot_us(&self) -> u64 {
+        self.slot_us
     }
 }
 

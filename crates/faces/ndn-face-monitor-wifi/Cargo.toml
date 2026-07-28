@@ -27,6 +27,9 @@ ndn-tlv          = { workspace = true }
 # The shared radio HAL contract — home of the `RadioKnobs` control-plane trait +
 # `Bandwidth` (re-exported through `src/radio.rs`).
 ndn-radio-hal    = { workspace = true }
+# The shared disciplined hardware clock (RadioHwClock) + LinkStamp — the scheduler's
+# µs-precision epoch source, fed from CapturedFrame.stamp (see src/sched.rs, #41).
+ndn-time         = { workspace = true }
 ndn-signals-core = { workspace = true }
 # The four userspace USB Wi-Fi driver backends, lifted into their own crate.
 # Pulled only by the `libusb-backend` feature; re-exported from `lib.rs`.
