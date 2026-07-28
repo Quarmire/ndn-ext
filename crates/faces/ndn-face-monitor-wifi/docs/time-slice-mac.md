@@ -94,10 +94,16 @@ namelessness, and self-healing — and pins the clock accuracy as the one thing 
   The epoch is wall-clock µs by default (common-view across NTP-synced nodes at ~ms, proportionate to
   ms-scale data-frame slots); `NDN_SCHED_CLOCK=hw` rides the hardware `RadioHwClock` (fed from RX
   stamps) for µs slots — cross-node phase then needs a clock-master TimeBeacon (see below).
-- **Designed + measured, not yet actuated:** the *claimable* (demand-adaptive) slot — the owner-idle →
-  CCLF-election branch. The fixed gate is live; adding the claim means the face checks "did the owner
-  transmit this slot?" (overhear) and, if not, runs the existing `coop.rs` CCLF election among other
-  pending name-groups. Reuses the slot clock + CCLF already present.
+- **Claimable slot ACTUATED (2026-07-28, #76):** the owner-idle → CCLF-claim branch is live in
+  `FaceScheduler::gate` (`NDN_SCHED_CLAIM=1`). When a frame's name does not own the current slot, the
+  gate checks whether the slot is **idle** (nothing overheard since it began — `last_rx < slot_start`,
+  `last_rx` updated by the RX reader) and, if the name's own turn is not imminent, contends via a
+  deterministic per-name **CCLF jitter** (`cclf_jitter_us`, front-half of the slot): wait the jitter, and
+  if the slot is *still* idle, claim it (transmit); otherwise a lower-jitter claimant was overheard first,
+  so cancel and fall back to the owned slot. Coordinator-free, keyed on the name, doctrine §7 soft-state.
+- **µs slots now sized properly:** `SlotSchedule::from_airtime(airtime_us, guard_us, slots)` — the guard
+  only has to cover the common-view clock jitter, so on the sub-µs hardware clock (#74, ~0.5 µs) it is a
+  few µs, not the ms a software clock forced. More slots per superframe, lower per-name access latency.
 - **Cross-node phase (the remaining honest gap):** the wall-clock epoch is common-view at ~ms; tight
   µs-slot operation on the hardware clock additionally needs a shared reference (a clock-master's
   periodic broadcast / common AP beacon) disciplined via `ndn_time`'s `CommonViewPool`/`TimeBeacon` —

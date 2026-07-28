@@ -24,10 +24,13 @@
 //!   clock disciplined to a clock-master's time-beacon (cross-node aligned with no NTP/AP).
 //! - `NDN_SCHED_MASTER=1` — this node is the clock master: it broadcasts the time-beacon that `cv`
 //!   nodes discipline to. Exactly one master per timeline; the master also runs `cv` (off its own ref).
+//! - `NDN_SCHED_CLAIM=1` — claimable slots: a name may claim an idle slot (owner overheard silent) via a
+//!   CCLF election, instead of wasting it — the demand-adaptive token that beats fixed name-TDMA. Off ⇒
+//!   fixed owner-only slots. Best on the sub-µs `cv` clock, where µs slots + µs guards make it tight.
 //! Unset ⇒ scheduler disabled ⇒ the send path is byte-for-byte unchanged.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ndn_radio_cognition::{HopSchedule, SlotSchedule, prefix_hash};
@@ -91,6 +94,13 @@ pub struct FaceScheduler {
     cv_hw: Mutex<Option<i64>>,
     /// This node broadcasts the time-beacon (the clock master). At most one master per timeline.
     master: bool,
+    /// Claimable slots (named-token-scheduling.md): a slot is OWNED by name but if its owner is idle
+    /// (nothing overheard since the slot began) another name with data may CLAIM it via a CCLF election.
+    /// `false` = fixed name-TDMA (owner-only). On when `NDN_SCHED_CLAIM=1`.
+    claimable: bool,
+    /// Common-view µs of the last overheard frame — the claimable decision's "is this slot idle?" input
+    /// (idle ⇔ `last_rx < slot_start`). Updated by [`on_rx_stamp`](Self::on_rx_stamp). `0` = nothing yet.
+    last_rx: AtomicU64,
     /// Monotonic base for the hardware clock's host reference and the master's reference timeline.
     base: Instant,
 }
@@ -115,6 +125,7 @@ impl FaceScheduler {
             _ => ClockSource::Wall,
         };
         let master = std::env::var("NDN_SCHED_MASTER").ok().as_deref() == Some("1");
+        let claimable = std::env::var("NDN_SCHED_CLAIM").ok().as_deref() == Some("1");
         Some(Self {
             slot,
             hop,
@@ -127,6 +138,8 @@ impl FaceScheduler {
             cv: Mutex::new(RadioHwClock::common_view()),
             cv_hw: Mutex::new(None),
             master,
+            claimable,
+            last_rx: AtomicU64::new(0),
             base: Instant::now(),
         })
     }
@@ -215,6 +228,22 @@ impl FaceScheduler {
         if let Ok(mut hw) = self.hw.lock() {
             hw.on_stamp(stamp, host_now);
         }
+        // Mark the medium busy "now" (common-view µs) for the claimable-slot idle test — overhearing a
+        // frame means the current slot's owner (or a claimer) is using it, so we must not claim it.
+        if self.claimable {
+            self.last_rx.store(self.now_us(), Ordering::Relaxed);
+        }
+    }
+
+    /// A deterministic within-slot CCLF jitter (µs) for this name — the demand-adaptive election among
+    /// names contending for an idle slot (named-token-scheduling.md §CCLF). The smallest-jitter claimant
+    /// transmits first and the rest overhear-and-cancel. Keyed on the name so it is stable and
+    /// coordinator-free; bounded to the front `frac` of the slot so a claim still fits with a guard.
+    fn cclf_jitter_us(&self, prefix_hash: u64, slot_us: u64) -> u64 {
+        // Spread claimants over the first ~half of the slot; a 64→16-bit fold decorrelates from owner_slot.
+        let window = (slot_us / 2).max(1);
+        let j = (prefix_hash ^ (prefix_hash >> 32)) % window;
+        j
     }
 
     // ---- Public time API: the essentials any consumer needs from the ndn-time hardware-clock plane ----
@@ -287,9 +316,32 @@ impl FaceScheduler {
             self.retune(ch).await;
         }
 
-        // Then time: wait out the slots until this name owns the medium.
+        // Then time: the token grant.
         if let Some(slot) = &self.slot {
-            let wait = slot.wait_us(hash, now);
+            if slot.owns_now(hash, now) {
+                return; // our owned slot — a guaranteed, collision-free turn; transmit now.
+            }
+            let owned_wait = slot.wait_us(hash, now);
+            // Claimable slot (named-token-scheduling.md): if this is NOT our slot but the current slot's
+            // owner is IDLE (nothing overheard since it began), contend for it via a CCLF election rather
+            // than wasting it — the demand-adaptive form that beats fixed-TDMA. Only worth claiming when
+            // our own turn is not imminent, and only with room left in the slot for a jittered claim.
+            if self.claimable {
+                let slot_start = slot.slot_start_us(now);
+                let idle = self.last_rx.load(Ordering::Relaxed) < slot_start;
+                let remaining = slot.slot_remaining_us(now);
+                let jitter = self.cclf_jitter_us(hash, slot.slot_us());
+                if idle && owned_wait > slot.slot_us() && remaining > jitter {
+                    // CCLF: wait our jitter; if the slot is STILL idle (no one claimed first), take it.
+                    tokio::time::sleep(Duration::from_micros(jitter)).await;
+                    let still_idle = self.last_rx.load(Ordering::Relaxed) < slot_start;
+                    if still_idle {
+                        return; // claimed the idle slot — transmit now.
+                    }
+                    // Overheard a claimant first → cancel and fall through to wait our owned slot.
+                }
+            }
+            let wait = slot.wait_us(hash, self.now_us());
             if wait > 0 {
                 tokio::time::sleep(Duration::from_micros(wait)).await;
             }
@@ -414,6 +466,8 @@ mod tests {
             cv: super::Mutex::new(RadioHwClock::common_view()),
             cv_hw: super::Mutex::new(None),
             master: false,
+            claimable: false,
+            last_rx: super::AtomicU64::new(0),
             base: super::Instant::now(),
         };
         let a = mk();
@@ -426,6 +480,34 @@ mod tests {
         let (ea, eb) = (a.now_us() / 3000, b.now_us() / 3000);
         assert_eq!(ea, eb, "hardware common-view did not align the two nodes' epochs");
         assert!(a.now_us() >= 5_000_000, "should read the peer's hardware timeline, not the fallback");
+    }
+
+    #[test]
+    fn cclf_jitter_is_deterministic_and_bounded() {
+        let s = FaceScheduler {
+            slot: parse_slot("8:3000"),
+            hop: None,
+            group_depth: 1,
+            clock_source: ClockSource::CommonView,
+            knobs: None,
+            bw: crate::Bandwidth::default(),
+            current_ch: super::AtomicU8::new(u8::MAX),
+            hw: super::Mutex::new(RadioHwClock::realtek()),
+            cv: super::Mutex::new(RadioHwClock::common_view()),
+            cv_hw: super::Mutex::new(None),
+            master: false,
+            claimable: true,
+            last_rx: super::AtomicU64::new(0),
+            base: super::Instant::now(),
+        };
+        let a = prefix_hash(&[b"ndn", b"alarm"]);
+        let b = prefix_hash(&[b"ndn", b"bulk"]);
+        // Same name → same jitter (coordinator-free, stable); bounded to the front half of the slot.
+        assert_eq!(s.cclf_jitter_us(a, 3000), s.cclf_jitter_us(a, 3000));
+        assert!(s.cclf_jitter_us(a, 3000) < 1500);
+        assert!(s.cclf_jitter_us(b, 3000) < 1500);
+        // Different names generally draw different jitter → an ordering for the election.
+        assert_ne!(s.cclf_jitter_us(a, 3000), s.cclf_jitter_us(b, 3000));
     }
 
     #[test]
@@ -453,6 +535,8 @@ mod tests {
             cv: super::Mutex::new(RadioHwClock::common_view()),
             cv_hw: super::Mutex::new(None),
             master: true,
+            claimable: false,
+            last_rx: super::AtomicU64::new(0),
             base: super::Instant::now(),
         };
         let wire = sched.build_beacon();

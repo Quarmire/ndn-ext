@@ -40,6 +40,26 @@ impl SlotSchedule {
         Self { slot_us: slot_us.max(1), slots: slots.max(1) }
     }
 
+    /// Size a slot from the PHY **airtime** plus a **guard band**, over `slots` slots. The guard only
+    /// has to cover the common-view clock's alignment jitter (plus a little slack) — so once nodes share
+    /// a **sub-µs hardware clock** (#74, ~0.5 µs) the guard can be a few µs, not the milliseconds a
+    /// software clock forced. `slot_us = airtime_us + guard_us`. This is what lets the token grant run at
+    /// µs granularity: more slots fit a superframe, and the per-name access latency drops accordingly.
+    pub fn from_airtime(airtime_us: u64, guard_us: u64, slots: u64) -> Self {
+        Self::new(airtime_us + guard_us, slots)
+    }
+
+    /// The start of the slot live at `now_us` (µs) — the slot-boundary flooring of `now`. Used to ask
+    /// "has anything been heard *since this slot began*?" for the claimable (owner-idle) decision.
+    pub fn slot_start_us(&self, now_us: u64) -> u64 {
+        self.epoch(now_us) * self.slot_us
+    }
+
+    /// Microseconds left in the slot live at `now_us`.
+    pub fn slot_remaining_us(&self, now_us: u64) -> u64 {
+        self.slot_us - (now_us % self.slot_us)
+    }
+
     /// The common-view epoch (slot index since the clock origin) at `now_us`.
     pub fn epoch(&self, now_us: u64) -> u64 {
         now_us / self.slot_us
@@ -182,6 +202,19 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn us_slot_sizing_and_boundaries() {
+        // A µs-scale slot now that the clock is sub-µs: airtime 150 µs + 6 µs guard, 16 slots.
+        let s = SlotSchedule::from_airtime(150, 6, 16);
+        assert_eq!(s.slot_us(), 156);
+        assert_eq!(s.superframe_us(), 156 * 16);
+        // slot_start floors to the slot boundary; remaining counts down to the next.
+        let now = 156 * 3 + 40; // 40 µs into slot-epoch 3
+        assert_eq!(s.slot_start_us(now), 156 * 3);
+        assert_eq!(s.slot_remaining_us(now), 156 - 40);
+        assert_eq!(s.slot_remaining_us(156 * 3), 156); // exactly on a boundary
     }
 
     #[test]
