@@ -54,6 +54,7 @@ mod demand;
 mod plan;
 mod policy;
 mod report;
+pub mod schedule;
 mod sense;
 mod strategy;
 
@@ -77,6 +78,7 @@ pub use report::{
     FULL_RX_MCS, LEGACY_ONLY_RX, MAX_ENTRIES, REPORT_MAGIC, ReceptionReport, decode_report,
     encode_report,
 };
+pub use schedule::{HopSchedule, SlotSchedule};
 pub use sense::{
     Band, ChannelOccupancy, DEFAULT_SATURATION_FPS, DUTY_WINDOW_MS, Demand, Ewma, LinkResidual,
     MediumState, MediumView, NeighborReport, RadioCapability, RadioId, RadioKind, RateCapability,
