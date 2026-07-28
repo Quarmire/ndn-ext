@@ -20,7 +20,10 @@
 //!   `dwell_us` µs each (e.g. `1,6,11:120000` for non-overlapping 2.4 GHz).
 //! - `NDN_SCHED_GROUP_DEPTH=k` — name-group granularity: hash the first `k` name components (default 1,
 //!   so all data under a top prefix shares a slot/channel — the *group*, not each object).
-//! - `NDN_SCHED_CLOCK=wall|hw` — epoch source (default `wall`).
+//! - `NDN_SCHED_CLOCK=wall|hw|cv` — epoch source (default `wall`). `cv` = the radio-native common-view
+//!   clock disciplined to a clock-master's time-beacon (cross-node aligned with no NTP/AP).
+//! - `NDN_SCHED_MASTER=1` — this node is the clock master: it broadcasts the time-beacon that `cv`
+//!   nodes discipline to. Exactly one master per timeline; the master also runs `cv` (off its own ref).
 //! Unset ⇒ scheduler disabled ⇒ the send path is byte-for-byte unchanged.
 
 use std::sync::Mutex;
@@ -40,7 +43,15 @@ enum ClockSource {
     Wall,
     /// The disciplined hardware TSF (`RadioHwClock`) — µs-local; cross-node phase needs a shared ref.
     Hardware,
+    /// A radio-native common-view clock disciplined to a clock-master's [`TimeBeacon`] — cross-node
+    /// aligned with NO infrastructure (no NTP, no AP). The doctrine time source.
+    CommonView,
 }
+
+/// The 3-byte tag that marks a [`FaceScheduler`] time-beacon on the wire, chosen to not collide with
+/// an NDN packet's first byte (Interest `0x05` / Data `0x06` / LP `0x64`). Followed by the master's
+/// monotonic reference time in microseconds, 8 bytes little-endian.
+pub const TIME_BEACON_MAGIC: [u8; 3] = [0x7E, b'T', b'B'];
 
 /// The face's transmit scheduler: the temporal (slot) and frequency (hop) grants, actuated.
 pub struct FaceScheduler {
@@ -58,7 +69,12 @@ pub struct FaceScheduler {
     /// The disciplined hardware clock, fed by the RX reader. Behind a mutex: the reader writes stamps,
     /// the (wall-clock-default) gate only reads it in `hw` mode.
     hw: Mutex<RadioHwClock>,
-    /// Monotonic base for the hardware clock's host reference.
+    /// The radio-native common-view clock, disciplined to a clock-master's time-beacon (`CommonView`
+    /// mode). The master feeds its own reference each broadcast; slaves feed the received one.
+    cv: Mutex<RadioHwClock>,
+    /// This node broadcasts the time-beacon (the clock master). At most one master per timeline.
+    master: bool,
+    /// Monotonic base for the hardware clock's host reference and the master's reference timeline.
     base: Instant,
 }
 
@@ -78,8 +94,10 @@ impl FaceScheduler {
             .max(1);
         let clock_source = match std::env::var("NDN_SCHED_CLOCK").ok().as_deref() {
             Some("hw") | Some("hardware") => ClockSource::Hardware,
+            Some("cv") | Some("common-view") => ClockSource::CommonView,
             _ => ClockSource::Wall,
         };
+        let master = std::env::var("NDN_SCHED_MASTER").ok().as_deref() == Some("1");
         Some(Self {
             slot,
             hop,
@@ -89,8 +107,55 @@ impl FaceScheduler {
             bw,
             current_ch: AtomicU8::new(u8::MAX), // sentinel: first hop always retunes
             hw: Mutex::new(RadioHwClock::realtek()),
+            cv: Mutex::new(RadioHwClock::common_view()),
+            master,
             base: Instant::now(),
         })
+    }
+
+    /// Whether this node is the clock master (broadcasts the time-beacon). The face spawns the beacon
+    /// task iff this is true.
+    pub fn is_master(&self) -> bool {
+        self.master
+    }
+
+    /// Build the next time-beacon wire (called by the master's beacon task): advances the master's own
+    /// common-view clock to `now` and returns `MAGIC ‖ ref_us(le64)` for direct injection. Injected
+    /// raw (not through the slot gate) so the clock signal never waits on a data slot.
+    pub fn build_beacon(&self) -> bytes::Bytes {
+        let ref_us = self.base.elapsed().as_micros() as u64;
+        // The master reads its own reference the same way a slave reads the received one, so master and
+        // slaves share the `cv.now` code path and land on the same timeline.
+        let host_now = self.base.elapsed().as_micros() as u64;
+        if let Ok(mut cv) = self.cv.lock() {
+            cv.on_raw(ref_us, host_now);
+        }
+        let mut out = Vec::with_capacity(TIME_BEACON_MAGIC.len() + 8);
+        out.extend_from_slice(&TIME_BEACON_MAGIC);
+        out.extend_from_slice(&ref_us.to_le_bytes());
+        bytes::Bytes::from(out)
+    }
+
+    /// If `payload` is a time-beacon, its master reference time (µs). The RX reader uses this to (a)
+    /// discipline the common-view clock and (b) suppress the frame (it is not NDN traffic).
+    pub fn parse_beacon(payload: &[u8]) -> Option<u64> {
+        if payload.len() >= TIME_BEACON_MAGIC.len() + 8 && payload[..3] == TIME_BEACON_MAGIC {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&payload[3..11]);
+            Some(u64::from_le_bytes(b))
+        } else {
+            None
+        }
+    }
+
+    /// Discipline the common-view clock to a received master reference time (called by the RX reader
+    /// for every time-beacon). After a few beacons `now_us` in `CommonView` mode reads the master's
+    /// timeline, so this node's slot epochs agree with the master's and every other slave's.
+    pub fn ingest_time_ref(&self, ref_us: u64) {
+        let host_now = self.base.elapsed().as_micros() as u64;
+        if let Ok(mut cv) = self.cv.lock() {
+            cv.on_raw(ref_us, host_now);
+        }
     }
 
     /// A one-line description of the active schedule, for the face's startup log.
@@ -102,7 +167,8 @@ impl FaceScheduler {
         if let Some(h) = &self.hop {
             parts.push(format!("hop({:?}, dwell {}µs)", h.classes(), h.dwell_remaining_us(0)));
         }
-        format!("scheduler: {} clock={:?} group_depth={}", parts.join(" + "), self.clock_source, self.group_depth)
+        let role = if self.master { " [clock-master]" } else { "" };
+        format!("scheduler: {} clock={:?}{} group_depth={}", parts.join(" + "), self.clock_source, role, self.group_depth)
     }
 
     /// Feed a hardware RX timestamp into the disciplined clock (called from the RX reader for every
@@ -125,6 +191,10 @@ impl FaceScheduler {
             ClockSource::Hardware => {
                 let host_now = self.base.elapsed().as_micros() as u64;
                 self.hw.lock().map(|hw| hw.now(host_now)).unwrap_or(host_now)
+            }
+            ClockSource::CommonView => {
+                let host_now = self.base.elapsed().as_micros() as u64;
+                self.cv.lock().map(|cv| cv.now(host_now)).unwrap_or(host_now)
             }
         }
     }
@@ -263,6 +333,31 @@ mod tests {
         let h2b = prefix_hash(&[&b"ndn"[..], &b"bulk"[..]]);
         assert_ne!(h2a, h2b);
         assert_ne!(h1, h2a);
+    }
+
+    #[test]
+    fn beacon_round_trips_and_ignores_ndn() {
+        // A built beacon parses back to a plausible reference; NDN first-bytes are not beacons.
+        let sched = FaceScheduler {
+            slot: parse_slot("4:3000"),
+            hop: None,
+            group_depth: 1,
+            clock_source: ClockSource::CommonView,
+            knobs: None,
+            bw: crate::Bandwidth::default(),
+            current_ch: super::AtomicU8::new(u8::MAX),
+            hw: super::Mutex::new(RadioHwClock::realtek()),
+            cv: super::Mutex::new(RadioHwClock::common_view()),
+            master: true,
+            base: super::Instant::now(),
+        };
+        let wire = sched.build_beacon();
+        assert!(FaceScheduler::parse_beacon(&wire).is_some());
+        assert_eq!(FaceScheduler::parse_beacon(&[0x06, 0x0c, 0x07]), None); // an NDN Data
+        assert_eq!(FaceScheduler::parse_beacon(&[0x64, 0x00]), None); // an LP packet
+        // After ingesting a reference the common-view clock reads that timeline.
+        sched.ingest_time_ref(9_000_000);
+        assert!(sched.now_us() >= 9_000_000);
     }
 
     #[test]

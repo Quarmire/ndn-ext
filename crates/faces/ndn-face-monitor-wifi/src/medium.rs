@@ -623,6 +623,10 @@ impl RadioMediumFace {
     }
 }
 
+/// How often the clock master broadcasts its time-beacon (#41 common-view). Frequent enough that a
+/// slave's clock never drifts a slot between beacons, cheap enough to be negligible airtime.
+const TIME_BEACON_MS: u64 = 100;
+
 /// The send half of one bearer: the bearer-agnostic data plane and, when link-FEC is
 /// on, the generation bridge + the shared parity count. The transmit rate is bearer
 /// state (held in the driver), so this carries no rate — only the frame.
@@ -836,6 +840,15 @@ impl RunningMedium {
                             if let (Some(sched), Some(stamp)) = (sched_rx.as_ref(), f.stamp.as_ref()) {
                                 sched.on_rx_stamp(stamp);
                             }
+                            // Time-beacon (#41 common-view): discipline the common-view clock to the
+                            // master's reference and SUPPRESS the frame — it is a clock signal, not NDN
+                            // traffic, so it never reaches the engine.
+                            if let Some(sched) = sched_rx.as_ref()
+                                && let Some(ref_us) = crate::FaceScheduler::parse_beacon(&f.payload)
+                            {
+                                sched.ingest_time_ref(ref_us);
+                                continue;
+                            }
                             if (f.rssi_dbm.is_some() || f.mcs_index.is_some())
                                 && let Some(sink) = sink.as_ref()
                             {
@@ -882,6 +895,31 @@ impl RunningMedium {
                         // A transient per-radio RX error must not kill the union.
                         Err(_) => tokio::task::yield_now().await,
                     }
+                }
+            }));
+        }
+
+        // The clock master broadcasts the time-beacon (#41 common-view) on its first bearer, so every
+        // `cv` node disciplines its slot clock to one shared timeline — no NTP, no AP. Injected raw
+        // (bypasses the slot gate: the clock signal must never wait on a data slot).
+        if let Some(first) = tx.first()
+            && let Some(sched) = first.sched.clone()
+            && sched.is_master()
+        {
+            let radio = first.radio.clone();
+            let src = source.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut tick =
+                    tokio::time::interval(std::time::Duration::from_millis(TIME_BEACON_MS));
+                loop {
+                    tick.tick().await;
+                    let frame = InjectFrame {
+                        payload: sched.build_beacon(),
+                        tx: TxIntent::ROBUST,
+                        dst: BROADCAST,
+                        src: src.current(super::now_ms() as u64),
+                    };
+                    let _ = radio.inject(frame).await; // transient errors: keep the clock alive
                 }
             }));
         }
