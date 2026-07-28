@@ -131,23 +131,29 @@ survives on the two sides we control:
 existing `dl_rsvd_page` (`ENSWBCN` + `REG_FIFOPAGE_CTRL_2 0x0204` + poll `BCN_VALID 0x8000`). Place the
 TimeToken at body offset 24 (bytes 24–31) so the hardware writes it.
 
-## Status (#74, 2026-07-28)
+## Status (#74, 2026-07-28) — SELF-CONTAINED µs, PROVEN ON AIR
 
-- **Measured & proven:** the RX common-view floor is sub-µs through our own driver (0.26–1.15 µs, both
-  OPis, same reference). The receive side and the whole per-source `DomainMap` model are ready.
-- **Hardware truth established:** the 8822E can only insert a TX TSF via the **beacon engine** (no
-  per-data-frame descriptor bit; C2H-TXTSFL unimplemented). So "any data frame carries a TimeToken" is
-  not reachable on *this* silicon — the RX side and abstraction generalize; the emitter is beacon-engine
-  bound here.
-- **Emitter — on-demand single-shot: LOADS but does NOT yet AIR.** `emit_timing_frame`
-  (`libusb_rtl88xx.rs`) arms the stamp path (`EN_BCN_FUNCTION` on, `DIS_TSF_UDT` off), sets AdHoc + the
-  interval, and loads our frame to the beacon page armed. BCN_VALID sets cleanly (371 loads, 0 errors),
-  but a peer's `beacon_cv` never sees our BSSID: the MAC's beacon timer does not transmit the loaded page.
-  **The remaining gap is full beacon-function bring-up** — persistent beacon-queue head/boundary, the
-  TBTT hold timer, and likely firmware-owned beacon transmission that a monitor/inject driver never sets
-  up. The TSF-insertion hardware is confirmed present (the driver disables it to protect rsvd pages).
-- **The clean on-demand refinement is still open too:** even once airing works via the TBTT path, a
-  *direct* "beacon now" trigger (vs the periodic timer) is what makes it truly demand-driven per the
-  design; that trigger has not been located.
-- **Do not** reintroduce a periodic beacon or key the per-source clock map on anything but the ephemeral
-  nonce; and do not treat `emit_timing_frame` as a working clock source until a peer confirms it airs.
+- **The self-contained µs clock source works, no AP.** o5p-0 armed a timing beacon on our own BSSID
+  (`02:4e:44:4e:ca:fe`); o5p-1's `beacon_cv` received it at **0.52 µs** first-diff jitter (2 µs spread) —
+  our own node is a sub-µs common-view reference for its neighbours, with zero infrastructure. This is
+  the ms→µs jump the software beacon could not make.
+- **The fix (rtw88/rtl8xxxu sequence).** The beacon *loaded* (BCN_VALID) all along; it did not *air*
+  because `emit_timing_frame` never armed the beacon queue for TBTT DMA — and in fact cleared the arm
+  bit. Three corrections: (1) **SET `EN_BCNQ_DL`** (`REG_FWHW_TXQ_CTRL 0x0422` bit6) — the "make it fire"
+  arm (`rtw_core_enable_beacon`); (2) **load to `RSVD_BOUNDARY` (1946)**, where the beacon queue DMAs
+  from post-init, not page 0; (3) `REG_BCN_CTRL = EN_BCN_FUNCTION | DIS_TSF_UDT` (both) — and the
+  TX-Timestamp insertion is a *separate always-on* HW function, so `DIS_TSF_UDT` set is correct and still
+  stamps.
+- **On-demand = arm/disarm WINDOW, not per-frame single-shot.** `emit_timing_frame` arms;
+  `stop_timing_beacon` (clears `EN_BCNQ_DL`) closes. A node beacons only while it has armed a window —
+  demand-driven, never a blind free-running beacon. A *single-frame* pulse (rapid arm→one→disarm) does
+  NOT work on this silicon (measured): the beacon engine must stay stably armed across a couple of TBTTs
+  to fire (the BCNDMATIM/DRVERLYINT prep pipeline + TSF-phase settling), so the controllable unit is the
+  window (≥ a few TBTTs), not one frame. Within a window the MAC re-stamps + re-airs at TBTT.
+- **Hardware truth (unchanged):** insertion is beacon-engine only on the 8822E — "any data frame carries
+  a TimeToken" needs different silicon or the C2H-TXTSFL path; the RX side + `DomainMap` abstraction
+  generalize regardless.
+- **Still open:** wire `tx_stamp` on `CapturedFrame` + generalize the RX side channel beyond `FC==0x80`
+  so *any* TimeToken-bearing frame feeds the per-source `DomainMap` (the abstraction is ready); feed the
+  disciplined clock from our own neighbour beacons into the scheduler's `cv` mode (replacing the AP
+  instrument). **Do not** key the per-source clock map on anything but the ephemeral nonce.
