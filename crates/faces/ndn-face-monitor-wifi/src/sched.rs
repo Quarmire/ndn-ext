@@ -309,6 +309,12 @@ impl FaceScheduler {
         TimeStatus { now_us: self.now_us(), hw_synced: offset_us.is_some(), offset_us }
     }
 
+    /// This node's current network-time belief (#75) — what it advertises in its own timing beacon so
+    /// the next hop composes off it (`ref_id`, `stratum`, `offset_to_ref`).
+    pub fn my_belief(&self) -> RefBelief {
+        self.net.lock().map(|n| n.belief()).unwrap_or(RefBelief { ref_id: u64::MAX, stratum: 0, offset_to_ref: 0 })
+    }
+
     /// The common-view epoch clock, in microseconds.
     fn now_us(&self) -> u64 {
         match self.clock_source {
