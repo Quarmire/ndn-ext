@@ -65,6 +65,14 @@ transmits in the wrong slot and collides. So the enabling resource is a **shared
 - **Needed:** hardware TSF common-view timing (**task #41**) — sub-µs agreement across nodes lets the
   slots shrink, the guard bands narrow, and the computed token stay collision-free at scale. This note's
   scheme is exactly why #41 is the enabling hardware task, not a nicety.
+- **Measured on air (2026-07-28):** the hardware RX TSF *is* that clock. Over 204 shared AP beacons, the
+  hardware RXTSFL (`radiotap.mactime`, the RX-descriptor `dword5` field the driver already parses via
+  `realtek_rx::rx_stamp`) tracked the common beacon reference to **~0.4 µs** (µs-resolution floor), versus
+  **55 µs** for the software (pcap) arrival time — **135×**, and the real userspace software TSF is worse
+  still. So a node syncing to a shared beacon (an AP, or one node's clock-master broadcast) holds sub-µs
+  common view. **Remaining integration:** the driver produces the hardware `LinkStamp`, but the face still
+  fills nan-core's anchor `rx.now_usec` with a *software* time (`engine.rs:1137`); thread the hardware
+  stamp through and the DiscoveryWindow / slot boundaries become sub-µs. See [[hardware-tsf-common-view]].
 
 The trade against a self-timed scheme (a passed token needs no clock because the token frame *is* the
 sync) is deliberate: named-data radio takes the clock dependency in exchange for statelessness,
