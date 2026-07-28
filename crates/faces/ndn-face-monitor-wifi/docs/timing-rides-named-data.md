@@ -88,15 +88,66 @@ learn *their own* mutual offset from it, even out of each other's range.
 
 ## Hardware realization (RTL8822E / 88xx, our userspace driver)
 
-*(filled from the #74 silicon research — the register-level mechanism for making the MAC insert its TSF
-into a transmitted frame, generalized beyond the beacon queue where the hardware allows, and the frame
-layout that places the TimeToken where the hardware writes it.)*
+**The honest silicon boundary (#74 register survey).** On the RTL8822E — and the 8812au/8821c/8733b
+family — the MAC has exactly **one** mechanism to write its TSF into an outgoing frame: the **beacon
+engine**. A frame transmitted from the **beacon queue** (`QSEL = 0x10`) with `REG_BCN_CTRL (0x0550)`
+bit 3 `EN_BCN_FUNCTION = 1` and bit 4 `DIS_TSF_UDT = 0` gets its body **bytes 24–31** (the first 8 bytes
+after the 24-byte MAC header — the 802.11 beacon Timestamp slot) overwritten with the live 64-bit TSF at
+the instant of transmission. The driver already *proves* this hardware is active by default: it explicitly
+sets `DIS_TSF_UDT` while downloading reserved pages (`download_firmware`, `libusb_rtl88xx.rs:1398`) so the
+page bytes are *not* clobbered, and it harvests other nodes' beacon-body TSF the same way (the #41 RX side
+channel). `EN_BCN_FUNCTION` is left on in `init_edca_cfg:2110`, so the TSF free-runs.
 
-## Status
+**So the full "any data frame carries a TimeToken" is NOT reachable on this silicon.** There is no
+per-descriptor "insert TSF" bit (`build_tx_body` sets no such field, and `EN_HWSEQ` is deliberately left
+clear); and the only per-frame TX-time feedback, a **C2H TX report with TXTSFL**, is *not implemented*
+(only `WLAN_TXQ_RPT_EN` at `0x0421` is set; C2H frames are detected and dropped at `:5007`) and it is
+unknown whether this firmware even reports a TSF. Two honest routes to true per-frame stamping exist, both
+out of scope here: (a) **different silicon** with a TX-descriptor timestamp-insert bit; (b) implement the
+**C2H-TXTSFL** path — set `SPE_RPT` + a packet id in the descriptor, decode the dropped C2H reports, and
+carry "my last frame aired at TSF X" in a follow-up named frame (PTP-follow-up style, itself named data).
 
-- **Measured:** the RX common-view floor is sub-µs through our own driver (0.26–1.15 µs, both OPis, same
-  reference) — the receive side is proven.
-- **Building (#74):** the transmit side — hardware TSF insertion on our own frames, generalized to any
-  frame per this note, so a self-contained mesh reaches µs common-view with no AP.
-- **Do not** reintroduce a dedicated timekeeper node or a beacon-only timing frame if the hardware can
-  stamp general frames; and **do not** key the per-source clock map on anything but the ephemeral nonce.
+**What IS reachable, and is doctrine-clean: an ON-DEMAND, software-triggered single stamped frame — never
+a periodic hardware beacon.** A fixed-interval beacon timer is host-centric (an AP announces on a schedule
+regardless of need) and spends airtime when no one is listening. Instead we drive the beacon engine in its
+**software-beacon** mode (`ENSWBCN`, `REG_CR+1 0x0101` bit 0) as a **one-shot**: the node emits a single
+hardware-stamped timing frame *when it decides one is useful* — piggybacked with a data burst it is
+sending anyway, at a slot boundary the scheduler is about to use, or when a neighbour signals it needs to
+sync. Demand-driven, under full software control, zero airtime when idle — the same rule as every other
+named-data transmission. It is a *beacon* only in the 802.11-framing sense; semantically it is the node's
+on-demand named-data timing emission, our content, our ephemeral-nonce BSSID, no AP. The generalization
+survives on the two sides we control:
+
+- **RX generalizes fully.** A receiver extracts the TimeToken → `CapturedFrame.tx_stamp` from *any* frame
+  carrying it at the known offset, not only `FC == 0x80` — so the moment silicon (or the C2H path) can
+  stamp data frames, the receive pipeline already common-views them. The per-source `DomainMap` fusion is
+  frame-type-agnostic.
+- **The abstraction generalizes fully.** `tx_stamp` + `DomainMap` + nonce-keying are the model; the
+  beacon engine is merely the one *emitter* this chip offers. A node on better silicon drops in a
+  per-frame emitter with no change above the driver.
+
+**Registers for the emitter:** `REG_MBSSID_BCN_SPACE (0x0554)` = beacon interval (TU); `REG_BCN_CTRL
+(0x0550)` = `EN_BCN_FUNCTION` set, `DIS_TSF_UDT` clear; load the frame to the beacon reserved page via the
+existing `dl_rsvd_page` (`ENSWBCN` + `REG_FIFOPAGE_CTRL_2 0x0204` + poll `BCN_VALID 0x8000`). Place the
+TimeToken at body offset 24 (bytes 24–31) so the hardware writes it.
+
+## Status (#74, 2026-07-28)
+
+- **Measured & proven:** the RX common-view floor is sub-µs through our own driver (0.26–1.15 µs, both
+  OPis, same reference). The receive side and the whole per-source `DomainMap` model are ready.
+- **Hardware truth established:** the 8822E can only insert a TX TSF via the **beacon engine** (no
+  per-data-frame descriptor bit; C2H-TXTSFL unimplemented). So "any data frame carries a TimeToken" is
+  not reachable on *this* silicon — the RX side and abstraction generalize; the emitter is beacon-engine
+  bound here.
+- **Emitter — on-demand single-shot: LOADS but does NOT yet AIR.** `emit_timing_frame`
+  (`libusb_rtl88xx.rs`) arms the stamp path (`EN_BCN_FUNCTION` on, `DIS_TSF_UDT` off), sets AdHoc + the
+  interval, and loads our frame to the beacon page armed. BCN_VALID sets cleanly (371 loads, 0 errors),
+  but a peer's `beacon_cv` never sees our BSSID: the MAC's beacon timer does not transmit the loaded page.
+  **The remaining gap is full beacon-function bring-up** — persistent beacon-queue head/boundary, the
+  TBTT hold timer, and likely firmware-owned beacon transmission that a monitor/inject driver never sets
+  up. The TSF-insertion hardware is confirmed present (the driver disables it to protect rsvd pages).
+- **The clean on-demand refinement is still open too:** even once airing works via the TBTT path, a
+  *direct* "beacon now" trigger (vs the periodic timer) is what makes it truly demand-driven per the
+  design; that trigger has not been located.
+- **Do not** reintroduce a periodic beacon or key the per-source clock map on anything but the ephemeral
+  nonce; and do not treat `emit_timing_frame` as a working clock source until a peer confirms it airs.
