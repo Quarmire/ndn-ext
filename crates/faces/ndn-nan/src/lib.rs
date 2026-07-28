@@ -199,6 +199,7 @@ pub fn spawn_with(
         fu_tx,
         shared: Arc::clone(&shared),
         ndp_waiters: HashMap::new(),
+        hw_clock: HwClock::default(),
     };
     tokio::spawn(task.run());
     Arc::new(NanDriver {
@@ -292,6 +293,53 @@ struct EngineTask {
     shared: Arc<Shared>,
     /// Callers blocked in `request_ndp`, keyed by the path they asked for.
     ndp_waiters: HashMap<([u8; 6], u8), NdpReply>,
+    /// Disciplines the engine's clock onto the hardware RX TSF (#41), so the TSF / Discovery-Window
+    /// slots anchor on sub-µs hardware time instead of the ~55-µs-jittery userspace clock.
+    hw_clock: HwClock,
+}
+
+/// Disciplines a hardware-domain clock from per-frame RX [`LinkStamp`](ndn_frame_io) `raw` values (the
+/// free-run RX TSF) so the NAN engine anchors on hardware time — the #41 sub-µs common-view clock —
+/// rather than the userspace software clock (measured ~55 µs jitter on air, vs the hardware TSF's ~0.4
+/// µs). The host monotonic clock carries continuity between frames (≈2 µs drift over a 102 ms beacon
+/// interval); each hardware stamp re-phases the offset to the µs-precise hardware value. Until the
+/// first hardware stamp — and for software-timestamped backends (loopback, coarse LoRa) that never set
+/// [`CapturedFrame::stamp`] — it falls through to the plain software clock, so nothing regresses.
+#[derive(Default)]
+struct HwClock {
+    /// `hw_now = host_now + offset` (µs). `None` until the first hardware stamp arrives.
+    offset: Option<i64>,
+}
+
+/// The Realtek free-run RX TSF (`RXTSFL`) is a 32-bit microsecond counter (~71 min wrap); we unwrap it
+/// against the continuous host clock so the engine's 64-bit modular TSF arithmetic stays consistent.
+const RXTSF_PERIOD_US: i64 = 1 << 32;
+
+impl HwClock {
+    /// Re-phase from a hardware stamp `raw` captured at `host_now`; returns the disciplined hw time.
+    fn on_stamp(&mut self, raw: u64, host_now: u64) -> u64 {
+        let mut phase = (raw as i64).wrapping_sub(host_now as i64).rem_euclid(RXTSF_PERIOD_US);
+        if phase > RXTSF_PERIOD_US / 2 {
+            phase -= RXTSF_PERIOD_US;
+        }
+        self.offset = Some(phase);
+        (host_now as i64 + phase) as u64
+    }
+    /// Hardware time now, extrapolated from the last stamp via the host clock; software fallback until
+    /// the first stamp.
+    fn now(&self, host_now: u64) -> u64 {
+        match self.offset {
+            Some(o) => (host_now as i64 + o) as u64,
+            None => host_now,
+        }
+    }
+    /// Map an engine-domain (hardware) instant back to the host-elapsed domain for the tokio sleep.
+    fn to_host(&self, hw_usec: u64) -> u64 {
+        match self.offset {
+            Some(o) => (hw_usec as i64 - o) as u64,
+            None => hw_usec,
+        }
+    }
 }
 
 impl EngineTask {
@@ -426,10 +474,16 @@ impl EngineTask {
     /// resulting frames, apply a channel change, route events, and return the
     /// next wake instant.
     async fn poll(&mut self, base: Instant, inbound: Option<CapturedFrame>) -> Instant {
-        let now = base.elapsed().as_micros() as u64;
-        // Demux first: a data frame for our NDI is the data path's, not the
-        // engine's. The engine would ignore it anyway, but the NDI would never
-        // see it — the radio has one reader.
+        let host_now = base.elapsed().as_micros() as u64;
+        // #41: discipline the engine's clock onto the hardware RX TSF. Do it from ANY captured frame's
+        // stamp (before the NDI demux drops data frames) — every frame is a fresh sub-µs time fix — so
+        // the TSF anchor and Discovery-Window slots ride hardware time, not the userspace clock.
+        if let Some(stamp) = inbound.as_ref().and_then(|cf| cf.stamp) {
+            self.hw_clock.on_stamp(stamp.raw, host_now);
+        }
+        let now = self.hw_clock.now(host_now);
+        // Demux: a data frame for our NDI is the data path's, not the engine's. The engine would ignore
+        // it anyway, but the NDI would never see it — the radio has one reader.
         let inbound = match inbound {
             Some(cf) if self.deliver_to_ndi(&cf) => None,
             other => other,
@@ -438,6 +492,8 @@ impl EngineTask {
             Some(cf) => vec![RxFrame {
                 bytes: &cf.payload,
                 rssi_dbm: cf.rssi_dbm,
+                // The frame's hardware capture time (≈ its RXTSFL) in the engine's clock domain; equals
+                // `now` since it just arrived. Falls back to the software clock when unstamped.
                 now_usec: now,
             }],
             None => Vec::new(),
@@ -467,7 +523,8 @@ impl EngineTask {
             self.settle_ndp(&ev).await;
             self.route_event(ev);
         }
-        base + Duration::from_micros(step.wake_at_usec)
+        // `wake_at_usec` is in the engine's (hardware) domain; map it back to host-elapsed for the sleep.
+        base + Duration::from_micros(self.hw_clock.to_host(step.wake_at_usec))
     }
 
     fn apply(&mut self, cmd: Command) {
