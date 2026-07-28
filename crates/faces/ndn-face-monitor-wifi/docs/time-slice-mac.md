@@ -70,9 +70,14 @@ transmits in the wrong slot and collides. So the enabling resource is a **shared
   `realtek_rx::rx_stamp`) tracked the common beacon reference to **~0.4 µs** (µs-resolution floor), versus
   **55 µs** for the software (pcap) arrival time — **135×**, and the real userspace software TSF is worse
   still. So a node syncing to a shared beacon (an AP, or one node's clock-master broadcast) holds sub-µs
-  common view. **Remaining integration:** the driver produces the hardware `LinkStamp`, but the face still
-  fills nan-core's anchor `rx.now_usec` with a *software* time (`engine.rs:1137`); thread the hardware
-  stamp through and the DiscoveryWindow / slot boundaries become sub-µs. See [[hardware-tsf-common-view]].
+  common view. **Shared clock, not nan-buried (2026-07-28):** the disciplining logic now lives in
+  `ndn_time::RadioHwClock` (next to `LinkStamp`/`Discipline`) — a shared substrate any face consumes, not
+  a property of the nan runtime. It disciplines a hardware-domain clock from each `CapturedFrame.stamp`
+  (per-domain, 32-bit `RXTSFL` unwrapped against the host clock, software fallback until the first stamp).
+  The nan runtime is now one *consumer* of it; **this scheduler is the next consumer** — when the
+  claimable-slot strategy lands in the face, it reads `RadioHwClock::now()` for `epoch(t)` so the slots
+  ride the same sub-µs hardware clock. See [[hardware-tsf-common-view]] ("why nan only") for the full
+  radio-`LinkStamp` → shared clock → all-consumers architecture (incl. the cross-node `CommonViewPool`).
 
 The trade against a self-timed scheme (a passed token needs no clock because the token frame *is* the
 sync) is deliberate: named-data radio takes the clock dependency in exchange for statelessness,

@@ -68,6 +68,7 @@ use ndn_face_wifi_aware::{
 use ndn_frame_io::{BROADCAST, CapturedFrame, FrameIo, InjectFrame, TxIntent};
 use ndn_nan_core::{NanConfig, NanEngine, NanEvent, RxFrame, ServiceId, service_id};
 use ndn_radio_hal::{Bandwidth, RadioKnobs};
+use ndn_time::RadioHwClock;
 
 use crate::ndi::{DataInterface, DuplicateFilter, MAX_ETHERNET_FRAME, dot11_to_eth, eth_to_dot11};
 use tokio::sync::mpsc;
@@ -199,7 +200,7 @@ pub fn spawn_with(
         fu_tx,
         shared: Arc::clone(&shared),
         ndp_waiters: HashMap::new(),
-        hw_clock: HwClock::default(),
+        hw_clock: RadioHwClock::realtek(),
     };
     tokio::spawn(task.run());
     Arc::new(NanDriver {
@@ -295,52 +296,14 @@ struct EngineTask {
     ndp_waiters: HashMap<([u8; 6], u8), NdpReply>,
     /// Disciplines the engine's clock onto the hardware RX TSF (#41), so the TSF / Discovery-Window
     /// slots anchor on sub-µs hardware time instead of the ~55-µs-jittery userspace clock.
-    hw_clock: HwClock,
+    hw_clock: RadioHwClock,
 }
 
-/// Disciplines a hardware-domain clock from per-frame RX [`LinkStamp`](ndn_frame_io) `raw` values (the
-/// free-run RX TSF) so the NAN engine anchors on hardware time — the #41 sub-µs common-view clock —
-/// rather than the userspace software clock (measured ~55 µs jitter on air, vs the hardware TSF's ~0.4
-/// µs). The host monotonic clock carries continuity between frames (≈2 µs drift over a 102 ms beacon
-/// interval); each hardware stamp re-phases the offset to the µs-precise hardware value. Until the
-/// first hardware stamp — and for software-timestamped backends (loopback, coarse LoRa) that never set
-/// [`CapturedFrame::stamp`] — it falls through to the plain software clock, so nothing regresses.
-#[derive(Default)]
-struct HwClock {
-    /// `hw_now = host_now + offset` (µs). `None` until the first hardware stamp arrives.
-    offset: Option<i64>,
-}
-
-/// The Realtek free-run RX TSF (`RXTSFL`) is a 32-bit microsecond counter (~71 min wrap); we unwrap it
-/// against the continuous host clock so the engine's 64-bit modular TSF arithmetic stays consistent.
-const RXTSF_PERIOD_US: i64 = 1 << 32;
-
-impl HwClock {
-    /// Re-phase from a hardware stamp `raw` captured at `host_now`; returns the disciplined hw time.
-    fn on_stamp(&mut self, raw: u64, host_now: u64) -> u64 {
-        let mut phase = (raw as i64).wrapping_sub(host_now as i64).rem_euclid(RXTSF_PERIOD_US);
-        if phase > RXTSF_PERIOD_US / 2 {
-            phase -= RXTSF_PERIOD_US;
-        }
-        self.offset = Some(phase);
-        (host_now as i64 + phase) as u64
-    }
-    /// Hardware time now, extrapolated from the last stamp via the host clock; software fallback until
-    /// the first stamp.
-    fn now(&self, host_now: u64) -> u64 {
-        match self.offset {
-            Some(o) => (host_now as i64 + o) as u64,
-            None => host_now,
-        }
-    }
-    /// Map an engine-domain (hardware) instant back to the host-elapsed domain for the tokio sleep.
-    fn to_host(&self, hw_usec: u64) -> u64 {
-        match self.offset {
-            Some(o) => (hw_usec as i64 - o) as u64,
-            None => hw_usec,
-        }
-    }
-}
+// The disciplined hardware clock is the shared `ndn_time::RadioHwClock` (#41). It used to be a private
+// `HwClock` here, but the disciplined hardware clock is a *shared substrate* — the named-radio
+// time-slice/FHSS scheduler, cognition, and the cross-node common-view pool are the other consumers —
+// so it now lives in `ndn-time` next to `LinkStamp`/`Discipline`, and the nan runtime is one consumer
+// of it. See the "why nan only" note in hardware-tsf-common-view.
 
 impl EngineTask {
     async fn run(mut self) {
@@ -479,7 +442,7 @@ impl EngineTask {
         // stamp (before the NDI demux drops data frames) — every frame is a fresh sub-µs time fix — so
         // the TSF anchor and Discovery-Window slots ride hardware time, not the userspace clock.
         if let Some(stamp) = inbound.as_ref().and_then(|cf| cf.stamp) {
-            self.hw_clock.on_stamp(stamp.raw, host_now);
+            self.hw_clock.on_stamp(&stamp, host_now);
         }
         let now = self.hw_clock.now(host_now);
         // Demux: a data frame for our NDI is the data path's, not the engine's. The engine would ignore

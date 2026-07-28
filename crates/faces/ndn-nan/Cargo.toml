@@ -14,6 +14,9 @@ ndn-frame-io        = { workspace = true }
 # The bearer-agnostic radio contract — for RadioKnobs, so any radio's control
 # plane can drive the engine's channel without this driver knowing the device.
 ndn-radio-hal       = { workspace = true }
+# The shared disciplined hardware clock (RadioHwClock) + LinkStamp live here; the
+# nan runtime is one consumer of it, not its owner (see hardware-tsf-common-view).
+ndn-time            = { workspace = true }
 ndn-face-wifi-aware = { workspace = true }
 ndn-transport      = { workspace = true }
 # The NDI is a TAP netdev: raw ioctls, no crate wraps this the way we need.
