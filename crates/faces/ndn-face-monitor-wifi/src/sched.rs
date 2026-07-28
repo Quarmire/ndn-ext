@@ -53,6 +53,18 @@ enum ClockSource {
 /// monotonic reference time in microseconds, 8 bytes little-endian.
 pub const TIME_BEACON_MAGIC: [u8; 3] = [0x7E, b'T', b'B'];
 
+/// A snapshot of a face's common-view time state — the essentials a consumer reads from the
+/// ndn-time hardware-clock plane (see [`FaceScheduler::time_status`]).
+#[derive(Clone, Copy, Debug)]
+pub struct TimeStatus {
+    /// Current common-view time, µs — sub-µs when `hw_synced`, else software/wall fallback.
+    pub now_us: u64,
+    /// Disciplined to a neighbour's **hardware** timing beacon (sub-µs, self-contained, no AP/NTP).
+    pub hw_synced: bool,
+    /// The hardware common-view offset onto the mesh timeline (`peer_tsf − our_rxtsfl`, µs), if synced.
+    pub offset_us: Option<i64>,
+}
+
 /// The face's transmit scheduler: the temporal (slot) and frequency (hop) grants, actuated.
 pub struct FaceScheduler {
     slot: Option<SlotSchedule>,
@@ -203,6 +215,34 @@ impl FaceScheduler {
         if let Ok(mut hw) = self.hw.lock() {
             hw.on_stamp(stamp, host_now);
         }
+    }
+
+    // ---- Public time API: the essentials any consumer needs from the ndn-time hardware-clock plane ----
+    // (the token/slot scheduler, telemetry, a fusion layer). The low-level types — RadioHwClock,
+    // LinkStamp, DomainMap, CommonViewPool — live in `ndn_time`; this is the ready-to-use radio view.
+
+    /// The current **common-view time**, microseconds — the one clock every node in range agrees on.
+    /// Sub-µs and self-contained when disciplined to a neighbour's hardware timing beacon (#74), else the
+    /// software/wall fallback. This is the value a computed token/slot schedule reads for `epoch(t)`.
+    pub fn common_view_now_us(&self) -> u64 {
+        self.now_us()
+    }
+
+    /// Whether the clock is disciplined to a neighbour's **hardware** timing beacon — i.e. sub-µs,
+    /// self-contained common-view (no AP, no NTP). `false` = still on the ms software/wall fallback.
+    pub fn is_hw_synced(&self) -> bool {
+        self.cv_hw.lock().ok().and_then(|o| *o).is_some()
+    }
+
+    /// The hardware common-view offset (`peer_tsf − our_rxtsfl`, µs) onto the mesh timeline, if synced.
+    pub fn cv_offset_us(&self) -> Option<i64> {
+        self.cv_hw.lock().ok().and_then(|o| *o)
+    }
+
+    /// A one-shot snapshot of the common-view time state — `(now_us, hw_synced, offset_us)`.
+    pub fn time_status(&self) -> TimeStatus {
+        let offset_us = self.cv_offset_us();
+        TimeStatus { now_us: self.now_us(), hw_synced: offset_us.is_some(), offset_us }
     }
 
     /// The common-view epoch clock, in microseconds.

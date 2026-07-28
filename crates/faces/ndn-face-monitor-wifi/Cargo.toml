@@ -73,5 +73,9 @@ ndn-face-wifi-aware = { workspace = true }
 name = "slot_airtest"
 required-features = ["libusb-backend"]
 
+[[example]]
+name = "sched_cv_airtest"
+required-features = ["libusb-backend"]
+
 [lints]
 workspace = true

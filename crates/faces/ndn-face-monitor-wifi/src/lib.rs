@@ -159,7 +159,7 @@ pub use radio::{Bandwidth, DbmRange, RadioKnobs};
 
 // The data-centric time-slice (#61) + FHSS (#40) transmit scheduler, actuated at the TX path.
 mod sched;
-pub use sched::{FaceScheduler, TIME_BEACON_MAGIC};
+pub use sched::{FaceScheduler, TIME_BEACON_MAGIC, TimeStatus};
 
 pub mod measure;
 
