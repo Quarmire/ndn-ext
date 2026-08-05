@@ -292,3 +292,128 @@ what gap 3 (demand-aware claiming) needs, so the two land together.
    monitor-mode frame? If yes, §5's free external coexistence is real; if no, the lease needs its own
    bits. This is a one-afternoon SDR/second-radio measurement and it gates a design choice — do it
    early.
+
+---
+
+## 8. Amendments — corrections, modernization, and the custom-hardware question
+
+*Added 2026-08-05 in the same session, in response to review. Two claims in §3 were overstated and are
+corrected here rather than quietly edited, because the overstatement is instructive.*
+
+### 8.1 Correction: "99.6% in 12 bytes vs 96.30% in 16 KB" is not a fair comparison
+
+That side-by-side is rhetorically neat and misleading. The two numbers describe different things:
+
+- The paper's **16 KB is receiver-side table memory** summarizing 10⁵⁺ names — *"here is a compressed
+  picture of everything I want; check the incoming name against it."* It needs the incoming name, so it
+  needs a parse.
+- Our **12 bytes is per-frame space** carrying **one name's** prefix set — *"here is a compressed picture
+  of what this frame is; check your wants against it."* It needs no parse.
+
+Tier 0 is not "the same result with a thousand times less memory." It is **the same job moved earlier in
+the pipeline**, and it is not free: those 12 bytes are spent on every frame's airtime forever, and the
+receiver-side cost is **O(E)** in registered prefixes rather than O(name depth). §8.3 removes the O(E)
+limit; the airtime cost is permanent and is the honest price of zero-parse filtering.
+
+### 8.2 Correction: on commodity Wi-Fi we get the CPU win but *not* the wakeup win
+
+NDN-NIC's headline is a **95.92% CPU reduction *and* a power reduction from not waking the host**. In
+monitor mode a commodity NIC delivers **everything** — the USB RX pump has already woken us and copied
+the frame before any filter of ours can run. So on the current hardware Tier 0 buys host CPU (skip the
+parse, the LP reassembly, the name decode) and buys **nothing in energy at the radio**.
+
+The exception is real and already in our hands: **the LoRa firmware's on-device filter drops frames
+before the host serial transfer**, which is the paper's actual win. Task #43 must therefore measure the
+two paths separately and must not report a Wi-Fi CPU saving as if it were the paper's power result.
+
+### 8.3 Ten years on — what to modernize, aspect by aspect
+
+| NDN-NIC (2016) | 2026 | Why |
+|---|---|---|
+| One structure (BF + CBF mirror) for FIB, PIT and CS | **One structure per table** | FIB is near-static and small → an **immutable xor / binary-fuse / ribbon filter** (~10–25% smaller at equal FP, faster queries, rebuilt on the rare FIB change). PIT and CS churn per packet → a **cuckoo filter**, which supports deletion *natively* and thereby **deletes the entire CBF-mirror machinery**. They used one hammer because that was the 2016 toolkit. |
+| Flat BF layout | **Blocked layout** | All k probes in one cache line — the standard modern engineering win for a mutable filter. |
+| k = 2, chosen because parallel hash logic was expensive | **k ≈ 6, cheap hashing** | ARMv8 crypto extensions (the OPi's A76/A55) make AES-based keyed hashing nearly free, and double hashing (Kirsch–Mitzenmacher) derives k probes from 2 hashes. The constraint that forced k=2 no longer exists. |
+| Active CS (Transformation / Aggregation / Reversion) | **Skip; also skip learned filters** | Already rejected on cost-model grounds (§2). Learned Bloom filters are the modern temptation and are worse for us: they need a trained model and a stable key distribution, and they reintroduce false negatives unless sandwiched. The *goal* — adaptively choose which prefixes to insert — is better served by a demand-driven policy we already have the inputs for. |
+| Receiver scan proportional to table size | **Bitslice the Tier-0 scan** | Store entry masks **transposed** (one bit-plane per filter bit): one pass of ~94 AND/OR ops tests **every** entry at once — **O(m) instead of O(E)**. This is the classic packet-classification trick and it removes §3.2's scaling limit outright. |
+| Filter on a NIC (never actually built — simulated) | **eBPF/XDP is the modern kernel-adjacent location** | Did not exist for them. Relevant if we ever run a kernel-driver path; not for our userspace driver. And note their hardware was never built, which is a standing caution on their numbers. |
+
+### 8.4 GPU / NPU backends — the honest answer is no
+
+The paper's future work mentions GPU Bloom filters, and pluggable accelerator backends are an appealing
+idea. For the **per-frame MAC filter, reject it**:
+
+- It is **latency-bound with a batch size of one**. GPU BF results win on millions of batched queries;
+  we have one frame with a budget measured in microseconds, and kernel-dispatch/PCIe latency alone is
+  tens of microseconds — longer than an entire slot.
+- An **NPU does dense low-precision matmul**. Bitwise approximate-membership testing is not that shape.
+  Forcing it there costs more than the scalar loop it replaces.
+
+A **backend trait is still worth having**, just for the right backends: **scalar** (baseline, portable),
+**NEON/AVX SIMD**, **bitsliced** (§8.3), and **MCU** (the LoRa firmware). Selection belongs in the
+existing capability model. The only defensible GPU use is **offline**: bulk-rebuilding an immutable
+xor/ribbon filter over a large CS — not the data path.
+
+### 8.5 Is this design as good as it gets, or is it Wi-Fi accommodation?
+
+Both. Sorting them matters, because it tells us what to build when we control the PHY.
+
+**Artifacts of commodity 802.11**, in descending cost:
+
+1. **No hardware-scheduled TX.** This is the biggest loss — **larger than any filter improvement**. We
+   approximate a slot with a host-side sleep plus EDCCA-off, which is *why* guard bands must be large.
+   A TSF-scheduled transmit shrinks the guard from milliseconds to microseconds, which is what makes
+   short slots possible at all. `TxDiscipline::ScheduledAt` already models this and no commodity part
+   delivers it.
+2. **94 bits, in address fields.** The MAC header is the only space a receiver can examine cheaply.
+   A real header field at 256 bits with k=8 gives FP ~10⁻⁵ even at depth 12.
+3. **No early-abort receive** (§8.2) — the energy win is unreachable.
+4. **32 bytes/frame** of 802.11 header + LLC/SNAP we do not need. 3.5% at a 900 B payload; brutal at
+   LoRa's 256 B.
+5. **CSMA is something we fight** (`set_cca_ignore`) rather than compose with.
+
+**What custom hardware buys — the prize is a *named wake-up radio*.** 802.11ba (Wake-Up Radio) is the
+standardized shape: a low-power companion receiver decodes a tiny OOK frame and wakes the main radio.
+Put the prefix-set Bloom filter **in the wake-up frame** and the node's entire duty cycle keys on
+**name matching**. That is the one *qualitative* change in the whole analysis: the filter stops being a
+CPU optimization and becomes **the energy architecture** — and it is finally a consumer for
+`TimingModel::DutyCycled` (#90).
+
+**Would we keep the design? Yes.** Prefix-set filter in the frame, grants computed as `f(name, clock)`,
+no host identity — all survive unchanged. Only **sizing and enforcement** change (bigger filter, guards
+in µs, leases enforced rather than advisory). That is the reassuring result: **the commodity-hardware
+version is a faithful degradation of the custom-hardware design, not a different design.**
+
+### 8.6 The name-keyed hop sequence needs re-evaluation — and not because of the filter
+
+`channel = hop(H(name), epoch)` is presented as the frequency-axis twin of the time token, the two
+"composing" so a name owns `(slot, channel)`. **On this hardware they do not compose.**
+
+**`set_channel` is a ~16 ms blocking call** (`sched.rs:82,392`). Against the scheduler's own example
+dwell of 120 ms that is **13% of airtime burned retuning**; against the 3 ms slots the slot schedule
+uses, a retune spans *five slots* and destroys the slot structure outright. Worse, `NDN_SCHED_HOP`'s
+`dwell_us` and `NDN_SCHED_SLOT`'s `slot_us` are independent environment values with **nothing requiring
+dwell to be a multiple of the slot**, and nothing stopping a frame or lease from straddling a hop
+boundary.
+
+Three consequences:
+
+1. **Drop the jam-evasion claim.** A 120 ms dwell is trivially followed by any adversary. What we have
+   is slow *channel assignment*, and it should be called that.
+2. **With multiple radios you do not hop — you occupy.** Assign `name → (radio, channel)` per epoch and
+   the retune cost vanishes; the "hop" becomes which bearer serves the name. This is the real answer,
+   it ties directly to per-bearer gating (#89), and it is what the measured MRMC result already
+   argues for (~90% held at 3 hops vs single-radio collapse to ~1/5).
+3. **The actual threat is co-band interference from ourselves and our neighbours** (HaLow/LoRa
+   co-banding, Wi-Fi contention) — measured, repeatedly. For that, **occupancy-driven channel avoidance
+   beats blind hopping**, which is already the recorded co-band cognition design. The hop schedule
+   should be demoted from "the frequency token" to *one input* to a mostly occupancy-driven channel
+   assignment.
+
+Supporting defect: **`RadioCapability.agile: bool`** ("fast-FHSS-capable") is `true` for every Wi-Fi
+preset — radios that take 16 ms to retune — and is **read by nothing**. It should be a *measured*
+`retune_us`, so a schedule that cannot be met is rejected at plan time instead of silently burning
+airtime. (#97, #98)
+
+And the filter redesign does touch the hop key: `hop(prefix_hash(name, group_depth))` inherits exactly
+the same one-granularity-fits-all defect as the slot key, and takes the same fix — key on the longest
+*registered* prefix (§6.2).
