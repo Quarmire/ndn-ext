@@ -417,3 +417,51 @@ airtime. (#97, #98)
 And the filter redesign does touch the hop key: `hop(prefix_hash(name, group_depth))` inherits exactly
 the same one-granularity-fits-all defect as the slot key, and takes the same fix — key on the longest
 *registered* prefix (§6.2).
+
+
+---
+
+## 9. Amendment — the sizing above is WRONG, measured. k = 4, not 6.
+
+*Added 2026-08-05 after building the filter and measuring it on hardware
+(`ndn-radio-drivers/firmware/lr2021-nrf54l15-rs/src/tier0.rs` + `src/bin/m7_filter_test.rs`,
+20 000 trials per point on an nRF54L15).*
+
+§3.1 picked **k = 6** from `p ≈ (1 − e^(−kn/M))^k`, whose optimum `(M/n)·ln2` is ~7 at these sizes.
+Measured at the depth cap, the optimum is **k = 4**:
+
+| k | bits set | FP at depth 8 |
+|---|---|---|
+| 3 | 25/94 | 1.99% |
+| **4** | **29/94** | **0.94%** ← measured optimum |
+| 5 | 35/94 | 0.98% |
+| 6 | 42/94 | 1.09% |
+| 8 | 53/94 | 1.50% |
+
+**Why the formula fails here.** It assumes a query's k positions are *independent*. With only 94
+bits they are not: k=6 positions collide **with each other** roughly 15% of the time, and a query
+whose 6 positions collapse to 3 distinct bits has the false-positive rate of k=3, not k=6. That
+effect is invisible to the closed form and **grows with k**, so the true optimum sits below the
+predicted one. **Small-m Bloom filters are their own regime — do not size this one from the
+asymptotic formula.** Lower k is cheaper too.
+
+Ruled out first: deriving `h1`/`h2` by splitting one FNV-1a-64 output was the prime suspect for
+correlated positions (FNV's high bits are its weak half). Two **independent** keyed hashes measured
+no better, which is what isolates the cause to small-m rather than hash quality.
+
+**The measured curve at k = 4** (this replaces the predicted table in §3.1):
+
+| name depth | bits set | false positive | zero-parse rejection |
+|---|---|---|---|
+| 2 | 12/94 | 0.095% | 99.9% |
+| 4 | 19/94 | 0.24% | 99.8% |
+| 6 | 27/94 | 0.80% | 99.2% |
+| 8 (cap) | 29/94 | **0.94%** | **99.06%** |
+
+**Zero false negatives at every depth**, checked on every iteration rather than sampled — the
+property the whole design rests on holds.
+
+The §3.1 conclusion survives with a slightly weaker constant: worst case **0.94% FP ⇒ 99.06%
+zero-parse rejection in 12 bytes**, not the 0.41% predicted. Still the right design; still far better
+than the ~2.4% that copying NDN-NIC's k=2 would have given. Validation item 1 of §7 ("the FP model on
+real names") is now **closed by measurement** — and the answer was that the model was optimistic.
