@@ -391,14 +391,21 @@ with E while NDN-NIC's shrinks as its table fills out.
 
 At **equal receiver state** (the baseline gets exactly the bytes Tier-0's masks occupy, 12 B each):
 
-| E | state | Tier-0 reject / FP | NDN-NIC reject / FP |
-|---|---|---|---|
-| 2 | 24 B | 98.59% / 0.617% | 98.97% / 0.227% |
-| 8 | 96 B | 95.15% / 1.705% | 96.65% / 0.155% |
-| 32 | 384 B | 70.03% / **19.7%** | 87.09% / 0.129% |
-| 128 | 1536 B | 31.64% / **36.2%** | 49.56% / 0.076% |
+| E | state | wanted | max reject | Tier-0 reject (of max) / FP | NDN-NIC reject (of max) / FP |
+|---|---|---|---|---|---|
+| 2 | 24 B | 0.8% | 99.20% | 98.59% (99.4%) / 0.617% | 98.97% (99.8%) / 0.227% |
+| 8 | 96 B | 3.2% | 96.80% | 95.15% (98.3%) / 1.705% | 96.65% (99.8%) / 0.155% |
+| 32 | 384 B | 12.8% | 87.20% | 70.03% (**80.3%**) / **19.7%** | 87.09% (99.9%) / 0.129% |
+| 128 | 1536 B | 50.4% | 49.60% | 31.64% (**63.8%**) / **36.2%** | 49.56% (99.9%) / 0.076% |
 
 Zero false negatives for both at every point.
+
+> **Read the "of max" column, not the raw reject.** Registering more prefixes makes more of the
+> traffic genuinely wanted, so a *perfect* filter's reject rate falls — the ceiling drops from 99.2%
+> at E=2 to 49.6% at E=128. The first version of this table omitted that and made a moving ceiling
+> look like filter degradation. NDN-NIC holds 99.8–99.9% of achievable at every E; Tier-0 falls to
+> 80.3% and then 63.8%. **And none of these numbers is comparable to the paper's 96.30%** — different
+> traffic, BF-FIB only rather than BF-FIB+PIT+CS, and a completely different bits-per-key regime.
 
 **This is a real limit on Tier-0, not a tuning issue.** A 94-bit filter tested against E masks
 saturates: past roughly 8–32 registered prefixes the reject rate collapses and the filter stops

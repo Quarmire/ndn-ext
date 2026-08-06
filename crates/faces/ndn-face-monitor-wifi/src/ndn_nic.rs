@@ -36,6 +36,25 @@
 //! - **No Active CS.** Rejected on cost-model grounds in §2: it trades exact-match false positives
 //!   for prefix-match ones, and on a radio a false positive costs a wakeup, a decode and possibly an
 //!   on-air relay — not a PCIe transfer.
+//!
+//! ## ⚠ These numbers are NOT comparable to the paper's 96.30%
+//!
+//! Three reasons, any one of which is disqualifying:
+//!
+//! 1. **Different traffic.** The paper's 96.30% is over their trace. A rejection rate is mostly a
+//!    property of *how much of the traffic the receiver actually wants*, not of the filter. Our
+//!    synthetic mix has a different wanted-fraction, so the numbers cannot be laid side by side.
+//! 2. **BF-FIB only.** Their 96.30% is BF-FIB **+ BF-PIT + BF-CS** together. We implement one of the
+//!    three, because the other two answer Tier-1's question (#92). A like-for-like drop rate is not
+//!    available from this module at all.
+//! 3. **Utterly different loading.** Paper: n ≈ 10⁵ names in 16 KB. Here: E = 2..128 prefixes in
+//!    24..1536 B. Bloom-filter behaviour is a function of bits-per-key; these are different regimes.
+//!
+//! **Raw reject is also not comparable across rows of our own sweep**, which the first version of
+//! this A/B got wrong: registering more prefixes makes more of the traffic genuinely wanted, so a
+//! *perfect* filter's reject rate falls (99.2% at E=2 down to 49.6% at E=128). Reporting raw reject
+//! alone turned a moving ceiling into what looked like filter degradation. The comparable figures are
+//! **achieved fraction of that ceiling** and **FP over irrelevant frames** — both are in the output.
 
 use crate::tier0::{for_each_prefix, name_hash};
 
@@ -297,7 +316,10 @@ mod tests {
     fn ab_at_equal_receiver_state() {
         const FRAMES: u32 = 8_000;
         println!("\n#101 A/B at EQUAL receiver state (NDN-NIC table = 12 B x registered prefixes)");
-        println!("  E     state    tier0 reject/FP        ndn-nic reject/FP      tier0 work  nic work");
+        println!("  NOT comparable to the paper's 96.30% — see the module docs. Raw reject is NOT");
+        println!("  comparable ACROSS ROWS either: registering more prefixes means more traffic is");
+        println!("  genuinely wanted, so the ceiling falls. 'of max' is the filter-quality figure.");
+        println!("  E     state   wanted   max_rej   tier0 rej (of max) / FP     nic rej (of max) / FP");
         for e in [2usize, 8, 32, 128] {
             // E registered prefixes drawn from the same namespace the traffic uses.
             let reg: Vec<Vec<u8>> = (0..e)
@@ -333,11 +355,19 @@ mod tests {
                 if !na && truth { n_fn += 1 }
             }
             let irr = (FRAMES - want).max(1);
+            // **The ceiling moves with E.** Registering more prefixes makes more of the traffic
+            // genuinely wanted, so a PERFECT filter's reject rate falls. Reporting raw reject alone
+            // made a moving ceiling look like filter degradation — it is the achieved fraction of
+            // the ceiling, and the FP rate, that measure the filter.
+            let max_rej = irr as f64 * 100.0 / FRAMES as f64;
+            let t_rej = (FRAMES - t_acc) as f64 * 100.0 / FRAMES as f64;
+            let n_rej = (FRAMES - n_acc) as f64 * 100.0 / FRAMES as f64;
             println!(
-                "  {e:<4}  {state:>5} B   {:>6.2}% / {:>6.3}%      {:>6.2}% / {:>6.3}%      O(E)={e:<4}  O(depth)<=8",
-                (FRAMES - t_acc) as f64 * 100.0 / FRAMES as f64,
+                "  {e:<4}  {state:>5} B  {:>5.1}%  {max_rej:>6.2}%   {t_rej:>6.2}% ({:>5.1}%) / {:>6.3}%   {n_rej:>6.2}% ({:>5.1}%) / {:>6.3}%",
+                want as f64 * 100.0 / FRAMES as f64,
+                t_rej * 100.0 / max_rej,
                 t_fp as f64 * 100.0 / irr as f64,
-                (FRAMES - n_acc) as f64 * 100.0 / FRAMES as f64,
+                n_rej * 100.0 / max_rej,
                 n_fp as f64 * 100.0 / irr as f64,
             );
             // The invariant holds at every operating point, for both designs.
