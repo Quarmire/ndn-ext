@@ -550,6 +550,37 @@ no better, which is what isolates the cause to small-m rather than hash quality.
 > across k* did not. Live assertions in `tier0::tests::false_positive_rate_matches_measured_curve`,
 > and the k comparison in `ksweep_host_replication`.
 
+### On-air validation — #106 shadow mode, SipHash, k=4
+
+Tier-0's justification has two halves and only one is visible to a passive counter: it rejects most
+irrelevant frames, and **it never drops a wanted one**. Nothing that ACTS on the filter can measure
+the second — you cannot count what you silently discarded. Shadow mode runs the filter on every
+frame, ignores its verdict, lets everything through, and checks the verdict against ground truth
+computed by really prefix-matching the name (carried in the frame purely as an oracle).
+
+**16 500 CRC-valid frames**, LR2021 at 2477 MHz, 16 namespaces at depth 2–6, 2 registered:
+
+| | |
+|---|---|
+| reject ratio | **87.32%** (14 408 frames never parsed) |
+| **false negatives** | **0** |
+| FP over irrelevant | **0.201% ± 0.037** (29/14 437) |
+| FP over accepted | 1.39% (29/2 092 parses wasted) |
+| crc-failed, excluded before the filter | 2 |
+
+The reject ratio sits 0.18 points under the 87.5% ceiling the traffic mix sets (2 of 16 namespaces =
+12.5% genuinely wanted; observed 12.50%), and that gap **is** the false-positive leakage — the four
+numbers are mutually consistent, which is why all four are reported.
+
+FP lands slightly under the bench band (0.53–0.70% at depths 4–6, §9), as expected for a different
+name mix. The earlier FNV run measured 0.457% ± 0.145 over 2 500 frames; the two are consistent
+(≈1.7σ apart), so this is **not** evidence that SipHash filters better — only that changing the hash
+for its cryptographic property cost nothing on the FP axis, which is the claim §3.1 makes.
+
+**Report both FP denominators.** FP-over-irrelevant is the filter's true false-positive rate and the
+only figure comparable to §9; FP-over-accepted is the operational "share of parse work wasted".
+Quoting only the latter looks ~7× worse than the design and invites a chase after nothing.
+
 **The measured curve at k = 4** (this replaces the predicted table in §3.1):
 
 | name depth | bits set | false positive | zero-parse rejection |
