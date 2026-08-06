@@ -493,6 +493,17 @@ pub struct MonitorWifiFace {
     tx_addr: TxAddr,
     /// RX name-filtering capability (which frames pass before decode).
     rx_filter: RxFilter,
+    /// **Tier-1** (#92), when this node runs one: BF-FIB / BF-PIT / BF-CS consulted on the parsed
+    /// name *after* Tier-0 admits a frame. `None` on an endpoint, where Tier-0 alone is the right
+    /// trade (#101: Tier-0's FP climbs with registered-prefix count, so it suits small E and a relay
+    /// wants this instead).
+    ///
+    /// `RwLock` because the read is the per-frame fast path and the writes are comparatively rare
+    /// forwarder events (a PIT entry added, a Data cached). No `await` is held across the guard.
+    tier1: Option<Arc<std::sync::RwLock<crate::tier1::Tier1>>>,
+    /// Frames Tier-1 rejected — kept so the tier's contribution is observable rather than assumed.
+    /// A filter nobody can measure is indistinguishable from one that does nothing.
+    tier1_dropped: Arc<std::sync::atomic::AtomicU64>,
     /// For [`TxAddr::PrefixBloom`]: the per-object 12-byte filter (`addr1 ‖ addr2`) cached
     /// by LP base-sequence, so every fragment of one object carries the same filter.
     bloom_cache: Mutex<HashMap<u64, [u8; 12]>>,
@@ -537,6 +548,8 @@ impl MonitorWifiFace {
             last_rssi: AtomicI8::new(-70),
             tx_addr: TxAddr::Broadcast,
             rx_filter: RxFilter::Open,
+            tier1: None,
+            tier1_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             bloom_cache: Mutex::new(HashMap::new()),
             source: EphemeralSource::new(
                 {
@@ -685,6 +698,43 @@ impl MonitorWifiFace {
     pub fn with_rx_filter(mut self, rx: RxFilter) -> Self {
         self.rx_filter = rx;
         self
+    }
+
+    /// **Enable Tier-1** (#92) with `bits_each` bits per table, seeding BF-FIB from `prefixes`.
+    ///
+    /// Sized by the caller because the right size is a property of the node's tables, not of the
+    /// face: a relay with a large FIB and a real CS wants far more than a gateway with three
+    /// prefixes. Returns the handle so the forwarder can feed PIT/CS — see [`tier1_handle`].
+    pub fn with_tier1(
+        mut self,
+        key: &GroupKey,
+        prefixes: &[impl AsRef<[u8]>],
+        bits_each: usize,
+        k: u32,
+    ) -> Self {
+        let mut t = crate::tier1::Tier1::new(Self::bloom_key(key), bits_each, k);
+        for p in prefixes {
+            t.register_prefix(p.as_ref());
+        }
+        t.sync();
+        self.tier1 = Some(Arc::new(std::sync::RwLock::new(t)));
+        self
+    }
+
+    /// The live Tier-1 handle, for the forwarder to drive **from its real tables**.
+    ///
+    /// This is the half that makes the tier real rather than decorative: BF-PIT must be fed by the
+    /// actual PIT (`add_pit` on send, `remove_pit` on satisfy) and BF-CS by the actual CS (`cache`),
+    /// then `sync()` published. A Tier-1 whose tables drift from the forwarder's does not merely
+    /// lose efficiency — a stale BF-PIT **drops Data the node is waiting for**, which is a false
+    /// negative and the one failure mode this design must not have.
+    pub fn tier1_handle(&self) -> Option<Arc<std::sync::RwLock<crate::tier1::Tier1>>> {
+        self.tier1.clone()
+    }
+
+    /// Frames rejected by Tier-1 since start.
+    pub fn tier1_dropped(&self) -> u64 {
+        self.tier1_dropped.load(Ordering::Relaxed)
     }
 
     /// Build a [`RxFilter::Bloom`] over `prefixes` under `key`: one precomputed
@@ -916,6 +966,29 @@ impl MonitorWifiFace {
             if !self.rx_accepts(f.group, f.addr, &f.payload) {
                 continue; // a different name-group — drop before decoding
             }
+            // **Tier-1** (#92), when enabled: Tier-0 has admitted the frame on 12 bytes with no
+            // parse; this is the second gate, on the parsed name, against BF-FIB / BF-PIT / BF-CS.
+            // It catches what Tier-0 structurally cannot — notably direction (b), a prefix-seeking
+            // Interest that is an ancestor of something we cache — and it is where a node with many
+            // registered prefixes gets its selectivity back (#101).
+            //
+            // A frame with no name (a non-first fragment) is passed: reassembly needs it, and the
+            // first fragment already faced both gates. Same safe over-accept the TX path makes.
+            if let Some(t1) = self.tier1.as_ref()
+                && let Some(name) = inner_name(&f.payload)
+            {
+                let slash = ndn_name_to_slash(name);
+                let miss = match t1.read() {
+                    Ok(g) => g.lookup(&slash).is_miss(),
+                    // A poisoned lock must not silently start dropping traffic: fail open. The
+                    // filter is an optimisation; the forwarder behind it is the correctness layer.
+                    Err(_) => false,
+                };
+                if miss {
+                    self.tier1_dropped.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            }
             if let Some(rssi) = f.rssi_dbm {
                 self.last_rssi.store(rssi, Ordering::Relaxed);
             }
@@ -1061,6 +1134,68 @@ fn now_ms() -> u32 {
 
 #[cfg(test)]
 mod tests {
+
+    /// **#92 integration — Tier-1 actually gates the RX path.**
+    ///
+    /// Not "the module compiles and has unit tests": a frame whose name misses all three tables must
+    /// be dropped by the face, and the counter must say so. Without this the tier is decided and
+    /// unactuated, which is this codebase's characteristic defect.
+    #[tokio::test]
+    async fn tier1_gates_the_rx_path_and_counts_what_it_drops() {
+        let key = OPEN_GROUP_KEY;
+        let bus = LoopbackMonitorBus::new();
+        // Tier-0 open so this test isolates Tier-1: whatever is dropped, Tier-1 dropped it.
+        let rx = MonitorWifiFace::new(FaceId(1), Arc::new(bus.endpoint(1, -50)))
+            .with_tier1(&key, &["/served"], 8192, 4);
+        let tx = MonitorWifiFace::new(FaceId(2), Arc::new(bus.endpoint(2, -50)));
+
+        // A name under the registered prefix must pass; one outside must be dropped by Tier-1.
+        for (comps, expect_pass) in [
+            (vec![b"served".as_slice(), b"thing".as_slice()], true),
+            (vec![b"elsewhere".as_slice(), b"thing".as_slice()], false),
+        ] {
+            tx.send_bytes(data_pkt(&name_tlv(&comps))).await.unwrap();
+            let got = tokio::time::timeout(std::time::Duration::from_millis(150), rx.recv_bytes()).await;
+            assert_eq!(got.is_ok(), expect_pass, "Tier-1 disagreed on pass={expect_pass}");
+        }
+        assert_eq!(rx.tier1_dropped(), 1, "the drop was not counted");
+    }
+
+    /// **The failure mode that matters: a stale BF-PIT drops Data we are waiting for.**
+    ///
+    /// Tier-1's tables must be fed from the forwarder's real ones. This shows the consequence of
+    /// *not* doing that — Data for an outstanding Interest is dropped until the PIT entry is
+    /// published — so the requirement in `tier1_handle`'s doc is a demonstrated hazard, not advice.
+    #[tokio::test]
+    async fn an_unfed_bf_pit_drops_data_we_asked_for() {
+        let key = OPEN_GROUP_KEY;
+        let bus = LoopbackMonitorBus::new();
+        let rx = MonitorWifiFace::new(FaceId(1), Arc::new(bus.endpoint(1, -50)))
+            .with_tier1(&key, &["/served"], 8192, 4);
+        let tx = MonitorWifiFace::new(FaceId(2), Arc::new(bus.endpoint(2, -50)));
+        let comps: Vec<&[u8]> = vec![b"asked", b"for", b"this"];
+        let pkt = data_pkt(&name_tlv(&comps));
+
+        // PIT not yet published: Tier-1 has no reason to want it, so it drops.
+        tx.send_bytes(pkt.clone()).await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(150), rx.recv_bytes()).await.is_err(),
+            "expected the drop that an unfed BF-PIT causes"
+        );
+
+        // Feed the PIT the way a forwarder must, then the same frame passes.
+        {
+            let h = rx.tier1_handle().expect("tier1 enabled");
+            let mut g = h.write().unwrap();
+            g.add_pit(b"/asked/for/this");
+            g.sync();
+        }
+        tx.send_bytes(pkt).await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(150), rx.recv_bytes()).await.is_ok(),
+            "Data for a published PIT entry was still dropped"
+        );
+    }
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex;
