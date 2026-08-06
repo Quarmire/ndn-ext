@@ -167,6 +167,7 @@ pub mod measure;
 // replaces the name-group hash; ported from the measured firmware reference. See the module docs.
 pub mod ndn_nic;
 pub mod tier0;
+pub mod tier1;
 pub use tier0::PrefixFilter;
 
 // nl80211 Wi-Fi channel control (Linux), folded in from the former ndn-research
