@@ -165,6 +165,7 @@ pub mod measure;
 
 // #91 Tier-0: the in-frame prefix-set Bloom filter (addr1 ‖ addr2). Zero-parse name matching that
 // replaces the name-group hash; ported from the measured firmware reference. See the module docs.
+pub mod ndn_nic;
 pub mod tier0;
 pub use tier0::PrefixFilter;
 
@@ -338,6 +339,11 @@ pub enum RxFilter {
     /// [`PrefixFilter::mask_for`] of a prefix this node registered; the test is exact on the
     /// negative (definitely-not-under → drop, never parse) and over-accepts on the positive.
     Bloom(std::sync::Arc<[PrefixFilter]>),
+    /// **The NDN-NIC baseline** (#101) — receiver-side BF-FIB over registered prefixes, queried with
+    /// the *parsed* name. Present so Tier-0 can be A/B'd against the published design on identical
+    /// traffic rather than against a number quoted from the paper. **Not for production**: it needs
+    /// the parse Tier-0 exists to avoid, so selecting it forfeits the entire point.
+    NdnNic(std::sync::Arc<crate::ndn_nic::NdnNicFilter>),
 }
 
 /// Extract the NDN **Name** TLV bytes from an LP-framed wire frame's inner packet,
@@ -843,7 +849,7 @@ impl MonitorWifiFace {
 
     /// Does a captured frame pass this face's [`RxFilter`]? `addr1` is `f.group`, `addr2`
     /// is `f.addr` — together the 12 bytes the Tier-0 filter rides in. Broadcast always passes.
-    fn rx_accepts(&self, addr1: Option<[u8; 6]>, addr2: Option<[u8; 6]>) -> bool {
+    fn rx_accepts(&self, addr1: Option<[u8; 6]>, addr2: Option<[u8; 6]>, wire: &[u8]) -> bool {
         let Some(a) = addr1 else { return true };
         if a == BROADCAST {
             return true;
@@ -861,6 +867,14 @@ impl MonitorWifiFace {
                 let frame = PrefixFilter::from_wire(wire);
                 masks.iter().any(|m| frame.may_match(m))
             }
+            // The baseline's cost is visible right here: it cannot answer without `inner_name`,
+            // i.e. without decoding far enough into the frame to find the Name TLV. Tier-0's arm
+            // above never touches `wire`. A non-first fragment carries no name, so it is admitted —
+            // the same safe over-accept the TX path makes when it cannot build a filter.
+            RxFilter::NdnNic(bf) => match inner_name(wire) {
+                Some(name) => bf.may_serve(&ndn_name_to_slash(name)),
+                None => true,
+            },
         }
     }
 
@@ -898,7 +912,7 @@ impl MonitorWifiFace {
     async fn recv_inner(&self) -> Result<CapturedFrame, FaceError> {
         loop {
             let f = self.backend.recv_frame().await?;
-            if !self.rx_accepts(f.group, f.addr) {
+            if !self.rx_accepts(f.group, f.addr, &f.payload) {
                 continue; // a different name-group — drop before decoding
             }
             if let Some(rssi) = f.rssi_dbm {

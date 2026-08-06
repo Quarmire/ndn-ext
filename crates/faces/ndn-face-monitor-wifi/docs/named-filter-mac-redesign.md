@@ -382,6 +382,36 @@ the pipeline**, and it is not free: those 12 bytes are spent on every frame's ai
 receiver-side cost is **O(E)** in registered prefixes rather than O(name depth). §8.3 removes the O(E)
 limit; the airtime cost is permanent and is the honest price of zero-parse filtering.
 
+### 8.1b MEASURED (#101): Tier-0's false-positive rate scales with E, and that bounds where it belongs
+
+§8.1 said the receiver-side cost is O(E) in registered prefixes. Implementing the NDN-NIC baseline
+(`src/ndn_nic.rs`) and running both over identical traffic shows the O(E) term is worse than a *work*
+cost — **each registered mask is another independent chance to false-positive**, so the FP rate grows
+with E while NDN-NIC's shrinks as its table fills out.
+
+At **equal receiver state** (the baseline gets exactly the bytes Tier-0's masks occupy, 12 B each):
+
+| E | state | Tier-0 reject / FP | NDN-NIC reject / FP |
+|---|---|---|---|
+| 2 | 24 B | 98.59% / 0.617% | 98.97% / 0.227% |
+| 8 | 96 B | 95.15% / 1.705% | 96.65% / 0.155% |
+| 32 | 384 B | 70.03% / **19.7%** | 87.09% / 0.129% |
+| 128 | 1536 B | 31.64% / **36.2%** | 49.56% / 0.076% |
+
+Zero false negatives for both at every point.
+
+**This is a real limit on Tier-0, not a tuning issue.** A 94-bit filter tested against E masks
+saturates: past roughly 8–32 registered prefixes the reject rate collapses and the filter stops
+paying for its 12 bytes of airtime. So Tier-0 belongs where **E is small** — a consumer, a sensor, an
+endpoint with a handful of interests — which is exactly the split `RxFilter` already describes
+("a relay passes many; a consumer one"). **A relay with a large FIB wants Tier-1 (#92), not a bigger
+Tier-0.** The two tiers are not redundant and neither subsumes the other.
+
+Also worth stating because the first run of this A/B looked like a Tier-0 loss and was not a fair
+test: giving the baseline its paper default of 16 KB to hold **2** prefixes over-provisions it ~5000x
+and it scores a perfect 87.5% / 0% FP. That number means nothing. Any comparison of these two designs
+has to fix either the state budget or the prefix count, or it is measuring provisioning, not design.
+
 ### 8.2 Correction: on commodity Wi-Fi we get the CPU win but *not* the wakeup win
 
 NDN-NIC's headline is a **95.92% CPU reduction *and* a power reduction from not waking the host**. In
