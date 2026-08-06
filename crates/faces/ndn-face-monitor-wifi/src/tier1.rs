@@ -134,6 +134,25 @@ impl Table {
         self.sync_observed(|_| {});
     }
 
+    /// **Insert and publish this key's bits immediately** — O(k), no table scan.
+    ///
+    /// The batch [`sync`](Self::sync) is fine for removals but *not* for insertions, and the
+    /// difference is a correctness one. A forwarder records a PIT entry and the Data it asked for can
+    /// arrive microseconds later; if the insert is still sitting in the counting filter with the
+    /// mirror unpublished, the mirror says "not wanted" and **the reply is dropped**. That is the
+    /// false-negative the whole 0→1-before-1→0 discipline exists to prevent, reintroduced by
+    /// batching.
+    ///
+    /// Setting bits is always safe to do eagerly — it can only ever make the mirror a larger
+    /// superset of the truth. So: **insertions publish now, removals wait for the batch.** That is
+    /// the same rule as `sync`, applied per operation instead of per batch.
+    pub fn insert_published(&mut self, name: &[u8]) {
+        self.insert(name);
+        for p in self.positions(name).collect::<Vec<_>>() {
+            self.mirror[p / 8] |= 1 << (p % 8);
+        }
+    }
+
     /// The fast-path test: is `name` possibly present? Reads the mirror only.
     pub fn may_contain(&self, name: &[u8]) -> bool {
         self.positions(name).all(|p| self.mirror[p / 8] & (1 << (p % 8)) != 0)
@@ -194,13 +213,15 @@ impl Tier1 {
     }
 
     /// Register a FIB prefix. Direction (a): queried by testing the packet name's prefixes.
+    /// Published immediately, for the same reason as [`add_pit`](Self::add_pit).
     pub fn register_prefix(&mut self, prefix: &[u8]) {
-        self.fib.insert(prefix);
+        self.fib.insert_published(prefix);
     }
 
-    /// Record an outstanding Interest.
+    /// Record an outstanding Interest. **Published immediately** — see [`Table::insert_published`]:
+    /// the Data this Interest asks for may arrive before any batch sync would have run.
     pub fn add_pit(&mut self, name: &[u8]) {
-        self.pit.insert(name);
+        self.pit.insert_published(name);
     }
 
     pub fn remove_pit(&mut self, name: &[u8]) {
@@ -216,7 +237,7 @@ impl Tier1 {
             self.cs_skipped += 1;
             return;
         }
-        for_each_prefix(name, |pfx| self.cs.insert(pfx));
+        for_each_prefix(name, |pfx| self.cs.insert_published(pfx));
     }
 
     fn fib_covers(&self, name: &[u8]) -> bool {
@@ -417,6 +438,100 @@ mod tests {
         assert!(!t.lookup(b"/cached").is_miss());
     }
 
+    /// **An insert must be visible IMMEDIATELY, with no sync in between.**
+    ///
+    /// A forwarder records a PIT entry and the Data can arrive microseconds later. If insertion only
+    /// touched the counting filter, the mirror would still read "not wanted" and the reply would be
+    /// dropped — the exact false negative the ordering discipline exists to prevent, reintroduced by
+    /// batching. Note there is deliberately no `sync()` call in this test.
+    #[test]
+    fn an_insert_is_visible_without_waiting_for_a_batch_sync() {
+        let mut t = t1();
+        t.add_pit(b"/urgent/reply");
+        assert!(t.lookup(b"/urgent/reply").pit, "PIT insert not visible before sync");
+        t.cache(b"/cached/now");
+        assert!(t.lookup(b"/cached").cs, "CS insert not visible before sync");
+    }
+
+    /// **The forwarder feed, end to end: a wrapped PitStore keeps Tier-1 in step.**
+    ///
+    /// This is the join that makes #92 real. A `Tier1Feed` attached to `ObservedPit` must make a
+    /// recorded Interest visible to `lookup` with no explicit sync, and a satisfied one must stop
+    /// matching after the batch sync. Without this the two halves are each individually correct and
+    /// never actually connected — the exact shape of "decided but unactuated".
+    #[test]
+    fn a_wrapped_pit_store_drives_tier1() {
+        use ndn_fwd_core::store::{NameTableObserver, ObservedPit, PitStore};
+
+        // A minimal PitStore: enough to exercise record/satisfy/discard.
+        #[derive(Default)]
+        struct TinyPit(Vec<Vec<u8>>);
+        fn key(c: &[&[u8]]) -> Vec<u8> {
+            c.concat()
+        }
+        impl PitStore for TinyPit {
+            type Face = u8;
+            fn has_nonce(&self, _n: u32) -> bool {
+                false
+            }
+            fn record_pending(&mut self, c: &[&[u8]], _f: u8, _n: u32, _l: u32, _cm: u32) {
+                self.0.push(key(c));
+            }
+            fn satisfy(&mut self, c: &[&[u8]], mut send_to: impl FnMut(u8)) -> bool {
+                let k = key(c);
+                if let Some(i) = self.0.iter().position(|e| *e == k) {
+                    self.0.remove(i);
+                    send_to(0);
+                    return true;
+                }
+                false
+            }
+            fn discard_pending(&mut self, c: &[&[u8]]) -> bool {
+                let k = key(c);
+                match self.0.iter().position(|e| *e == k) {
+                    Some(i) => {
+                        self.0.remove(i);
+                        true
+                    }
+                    None => false,
+                }
+            }
+        }
+
+        let shared: SharedTier1 =
+            std::sync::Arc::new(std::sync::RwLock::new(Tier1::new(&KEY, BITS, K)));
+        let feed = Tier1Feed::new(shared.clone());
+        let mut pit = ObservedPit::new(TinyPit::default(), feed);
+
+        let comps: Vec<&[u8]> = vec![b"asked", b"for", b"this"];
+        assert!(!shared.read().unwrap().lookup(b"/asked/for/this").pit, "matched before recording");
+
+        // Record: must be visible IMMEDIATELY, with no sync — the Data can already be in flight.
+        pit.record_pending(&comps, 1, 42, 4000, 0);
+        assert!(
+            shared.read().unwrap().lookup(b"/asked/for/this").pit,
+            "recorded Interest not visible to Tier-1 — Data for it would be dropped"
+        );
+
+        // Satisfy, then publish: it stops matching. (Removal may lag safely; syncing is what
+        // actually reclaims the bits.)
+        assert!(pit.satisfy(&comps, |_| {}));
+        shared.write().unwrap().sync();
+        assert!(
+            !shared.read().unwrap().lookup(b"/asked/for/this").pit,
+            "satisfied Interest still matches after sync"
+        );
+
+        // A removal that removed nothing must NOT be reported — decrementing a counter for an entry
+        // that was never inserted corrupts a counting Bloom filter unrecoverably.
+        assert!(!pit.discard_pending(&comps), "second discard should find nothing");
+        assert_eq!(
+            shared.read().unwrap().pit.anomalies(),
+            0,
+            "a phantom removal reached the filter and underflowed a counter"
+        );
+    }
+
     /// Removal must actually remove — the property a plain Bloom filter cannot provide and the
     /// entire reason for the counting mirror.
     #[test]
@@ -429,5 +544,68 @@ mod tests {
         t.sync();
         assert!(!t.lookup(b"/i/want/this").pit, "satisfied PIT entry still matches");
         assert_eq!(t.pit.anomalies(), 0, "counter under/overflow during a legal cycle");
+    }
+}
+
+// ── The forwarder feed (#92) ────────────────────────────────────────────────────────────────────
+
+/// A shared, live Tier-1 the forwarder can drive.
+///
+/// [`MonitorWifiFace::tier1_handle`](crate::MonitorWifiFace::tier1_handle) hands one of these out;
+/// wrapping the forwarder's PIT and CS in `ObservedPit` / `ObservedCs` from `ndn-fwd-core` keeps the
+/// filter's tables in step with the real ones.
+pub type SharedTier1 = std::sync::Arc<std::sync::RwLock<Tier1>>;
+
+/// Feeds a [`Tier1`] from the forwarder's PIT/CS mutations.
+///
+/// Cheap to clone (it is one `Arc`), so the same feed can be attached to both stores.
+#[derive(Clone)]
+pub struct Tier1Feed {
+    tier1: SharedTier1,
+}
+
+impl Tier1Feed {
+    pub fn new(tier1: SharedTier1) -> Self {
+        Self { tier1 }
+    }
+
+    /// Join NDN name components into the `/`-separated form the filter hashes. The forwarder speaks
+    /// in component slices; Tier-0 and Tier-1 share one rendering so a prefix means the same thing
+    /// on both sides — if these two ever disagree, every match silently fails.
+    fn slash(components: &[&[u8]]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(components.iter().map(|c| c.len() + 1).sum());
+        for c in components {
+            out.push(b'/');
+            out.extend_from_slice(c);
+        }
+        if out.is_empty() {
+            out.push(b'/');
+        }
+        out
+    }
+}
+
+impl ndn_fwd_core::store::NameTableObserver for Tier1Feed {
+    fn on_pit_insert(&self, components: &[&[u8]]) {
+        // `add_pit` publishes immediately — the Data may already be in flight. A poisoned lock is
+        // ignored rather than propagated: the filter is an optimisation and the forwarder behind it
+        // is the correctness layer, so degrading to "admit everything" is the safe direction.
+        if let Ok(mut t) = self.tier1.write() {
+            t.add_pit(&Self::slash(components));
+        }
+    }
+
+    fn on_pit_remove(&self, components: &[&[u8]]) {
+        // Removal only decrements counters; the mirror bit clears on the next `sync`. Safe to lag —
+        // an over-large filter over-accepts, and over-accepting is never a lost packet.
+        if let Ok(mut t) = self.tier1.write() {
+            t.remove_pit(&Self::slash(components));
+        }
+    }
+
+    fn on_cs_admit(&self, components: &[&[u8]]) {
+        if let Ok(mut t) = self.tier1.write() {
+            t.cache(&Self::slash(components));
+        }
     }
 }
