@@ -405,6 +405,7 @@ impl EngineTask {
             tx: TxIntent::CONSERVATIVE,
             dst: BROADCAST,
             src,
+            addr3: None,
         };
         if let Err(e) = self.frame_io.inject(frame).await {
             tracing::debug!(error = %e, "NDI: inject failed");
@@ -477,6 +478,7 @@ impl EngineTask {
                 tx: TxIntent::ROBUST,
                 dst: BROADCAST,
                 src: self.nmi,
+                addr3: None,
             };
             if let Err(e) = self.frame_io.inject(frame).await {
                 tracing::debug!(error = %e, "NAN: inject failed (lossy medium)");

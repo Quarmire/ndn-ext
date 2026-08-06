@@ -150,7 +150,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut payload = Vec::with_capacity(11);
             payload.extend_from_slice(&TIME_BEACON_MAGIC);
             payload.extend_from_slice(&refr.to_le_bytes());
-            let _ = d.inject(InjectFrame { payload: payload.into(), tx: TxIntent::ROBUST, dst: BROADCAST, src }).await;
+            let _ = d.inject(InjectFrame { payload: payload.into(), tx: TxIntent::ROBUST, dst: BROADCAST, src, addr3: None }).await;
             last_beacon = Instant::now();
         }
 
@@ -169,7 +169,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             payload.push(my_role);
             payload.extend_from_slice(&sent.load(Ordering::Relaxed).to_le_bytes());
             payload.extend_from_slice(&payload_pad);
-            let _ = d.inject(InjectFrame { payload: payload.into(), tx: TxIntent::CONSERVATIVE, dst: BROADCAST, src }).await;
+            let _ = d.inject(InjectFrame { payload: payload.into(), tx: TxIntent::CONSERVATIVE, dst: BROADCAST, src, addr3: None }).await;
             sent.fetch_add(1, Ordering::Relaxed);
             if pace_us > 0 {
                 tokio::time::sleep(Duration::from_micros(pace_us)).await; // unsaturated: beacons flow

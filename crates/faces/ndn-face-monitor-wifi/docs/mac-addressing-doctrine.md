@@ -276,6 +276,31 @@ one forwarder over WiFi, SDR, and wire.
 
 ## 8. The name-hash function (decided + implemented, task #44)
 
+> **SUPERSEDED 2026-08-06 (#91d).** The `name_group_mac` / `name_group_uni` / `name_group` (split) /
+> `prefix_key` functions this section describes were **deleted** — an in-frame name *hash* cannot
+> express longest-prefix match. They are replaced by the Tier-0 **prefix-set Bloom filter** in
+> `addr1 ‖ addr2` (see `named-filter-mac-redesign.md`, and the `tier0` module). What survives from
+> below: `siphash24` — which keys the `EphemeralSource` nonce **and, since 2026-08-06, the Tier-0
+> Bloom filter** — and the `GroupKey` trust context.
+>
+> **Correction (2026-08-06):** the first Tier-0 implementation keyed the filter with **FNV-1a-64**
+> (the group key XORed into the FNV init state), for the shared-keyspace reason in #44. That silently
+> voided this section's unforgeability claim: FNV is not a PRF, its keying is invertible from
+> observed output, and an outsider could therefore recover the key and target a private group's
+> pre-parse filter — the exact attack this section was written to prevent, and the exact reason
+> FNV-1a had been replaced by SipHash-2-4 here in the first place. It was invisible because the
+> filter still *varied* with the key, so the guarding test (which checked one wrong key) still
+> passed. The filter now uses `siphash24` under the **full 16-byte** `GroupKey` (it previously
+> truncated to the low 8), the test asserts the wrong-key match rate falls to the false-positive
+> floor rather than merely being non-zero, and #44's shared-keyspace goal is *better* served: one
+> keyed-hash primitive across the nonce and the filter instead of two families.
+>
+> Filter performance is unchanged — measured FP stays in the k=4 band (0.00 / 0.39 / 0.91 / 0.78 %
+> at depths 2/4/6/8, against 0.095 / 0.24 / 0.80 / 0.94 % under FNV), because at m=94 the FP rate is
+> dominated by small-m collisions between the K positions, not by hash quality. The hardware exact-match RX filter (`set_name_group_filter`) still takes a
+> flat 6-byte address, but no longer derives it from `name_group_mac`. The rest of this section is kept
+> for historical context.
+
 The name-group hash is the *compiled form of the name* and the **same key** filters,
 forwards, caches, and suppresses — so the hash function is a shared-keyspace design,
 not a detail. Implemented in `ndn-frame-io` (`frame.rs`), replacing the previous FNV-1a.

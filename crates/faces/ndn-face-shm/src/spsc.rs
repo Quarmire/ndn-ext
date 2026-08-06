@@ -781,11 +781,15 @@ pub type ShmToken = [u8; 32];
 /// fd pressure the way opening `/dev/urandom` would.
 pub fn mint_token() -> std::io::Result<ShmToken> {
     let mut t = [0u8; 32];
-    let r = unsafe { libc::getentropy(t.as_mut_ptr() as *mut libc::c_void, t.len()) };
-    if r != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+    fill_entropy(&mut t)?;
     Ok(t)
+}
+
+/// Fill `buf` with cryptographic entropy. `getentropy` is absent from the `libc`
+/// crate's musl bindings, so read `/dev/urandom` — portable across glibc/musl/macOS.
+fn fill_entropy(buf: &mut [u8]) -> std::io::Result<()> {
+    use std::io::Read;
+    std::fs::File::open("/dev/urandom")?.read_exact(buf)
 }
 
 /// The control-socket path for a capability `token` (Option-A bootstrap): under
@@ -842,9 +846,7 @@ fn auth_mac(k: &ShmToken, tag: u8, nc: &[u8; 32], ns: &[u8; 32]) -> [u8; 32] {
 
 fn nonce() -> std::io::Result<[u8; 32]> {
     let mut n = [0u8; 32];
-    if unsafe { libc::getentropy(n.as_mut_ptr() as *mut libc::c_void, n.len()) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+    fill_entropy(&mut n)?;
     Ok(n)
 }
 

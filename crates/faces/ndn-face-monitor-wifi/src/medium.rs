@@ -494,6 +494,19 @@ pub struct RadioMediumFace {
     /// path injects at the basic legacy rate ([`TxIntent::ROBUST`]) so it reaches that
     /// neighbour — the worst-overheard-receiver rate cap. `None`/false = decided rate.
     legacy_gate: Option<Arc<AtomicBool>>,
+    /// Tier-0 name addressing (#91c): when set, outbound frames carry each object's prefix-set
+    /// filter in `addr1 ‖ addr2` (with the ephemeral nonce in `addr3`), and inbound frames are
+    /// dropped unless their filter could be under one of the registered masks. `None` ⇒ broadcast
+    /// addressing (the historical behaviour).
+    bloom: Option<BloomCfg>,
+}
+
+/// Tier-0 addressing config for the medium: the group key that keys the filter, and the receiver's
+/// precomputed registered-prefix masks.
+#[derive(Clone)]
+struct BloomCfg {
+    key: crate::GroupKey,
+    masks: Arc<[crate::PrefixFilter]>,
 }
 
 /// Predicate deciding whether an outbound wire is **FEC-eligible** — i.e. wants the
@@ -528,7 +541,21 @@ impl RadioMediumFace {
             signal_sink: None,
             fec: None,
             legacy_gate: None,
+            bloom: None,
         }
+    }
+
+    /// Enable **Tier-0 name addressing** (#91c) on this medium: outbound frames are addressed by
+    /// each object's prefix-set Bloom filter (`addr1 ‖ addr2`) under `key`, with the ephemeral
+    /// source nonce moved to `addr3`; inbound frames are dropped before the engine unless their
+    /// filter could be under one of `registered_prefixes` (given as `/`-strings). A relay passes
+    /// several prefixes (its forwarding family); a leaf, one. Broadcast frames always pass.
+    pub fn with_bloom(mut self, key: &crate::GroupKey, registered_prefixes: &[impl AsRef<[u8]>]) -> Self {
+        self.bloom = Some(BloomCfg {
+            key: *key,
+            masks: crate::bloom_masks_for(key, registered_prefixes),
+        });
+        self
     }
 
     /// Bind the shared **legacy-rate gate**: when cognition sets it true (a legacy-only-RX
@@ -648,6 +675,9 @@ struct TxBearer {
     /// (`NDN_SCHED_*`). `None` ⇒ no gating, the historical send path. Per-bearer so a hop retunes its
     /// own radio; the slot timing is identical on every bearer (one common-view clock per node).
     sched: Option<Arc<crate::FaceScheduler>>,
+    /// Tier-0 group key (#91c): when set, the frame's `addr1 ‖ addr2` carry the object's prefix-set
+    /// filter and the nonce moves to `addr3`. `None` ⇒ broadcast `addr1`, nonce in `addr2`.
+    bloom_key: Option<crate::GroupKey>,
 }
 
 impl TxBearer {
@@ -696,13 +726,28 @@ impl TxBearer {
                 }
             }
         }
-        let frame = InjectFrame {
-            payload: wire,
-            tx: intent,
-            dst: BROADCAST,
-            // Doctrine §2: the source field carries this node's ephemeral rotating nonce, not a
-            // fixed host tag — inert to real networks, no routing meaning, per-frame RSSI key.
-            src: self.source.current(super::now_ms() as u64),
+        let nonce = self.source.current(super::now_ms() as u64);
+        // Tier-0 (#91c): address by the object's prefix-set filter in addr1‖addr2, nonce → addr3.
+        // A non-first fragment (no inner name) has no filter of its own, so it falls back to
+        // broadcast — which every receiver's Bloom filter admits (safe over-accept; the object's
+        // first fragment already carried the discriminating filter).
+        let frame = match self.bloom_key.as_ref().and_then(|k| crate::bloom_wire_for_wire(k, &wire)) {
+            Some(bf) => InjectFrame {
+                payload: wire,
+                tx: intent,
+                dst: bf[..6].try_into().unwrap(), // addr1 = filter hi
+                src: bf[6..].try_into().unwrap(), // addr2 = filter lo
+                addr3: Some(nonce), // doctrine §2 per-frame RSSI key, displaced from addr2
+            },
+            None => InjectFrame {
+                payload: wire,
+                tx: intent,
+                dst: BROADCAST,
+                // Doctrine §2: the source field carries this node's ephemeral rotating nonce, not a
+                // fixed host tag — inert to real networks, no routing meaning, per-frame RSSI key.
+                src: nonce,
+                addr3: None,
+            },
         };
         self.radio.inject(frame).await
     }
@@ -760,6 +805,7 @@ impl RunningMedium {
             signal_sink,
             fec,
             legacy_gate,
+            bloom,
         } = cfg;
 
         let (tx_chan, rx_chan) = mpsc::unbounded_channel();
@@ -818,6 +864,7 @@ impl RunningMedium {
                 legacy_gate: legacy_gate.clone(),
                 source: source.clone(),
                 sched: sched.clone(),
+                bloom_key: bloom.as_ref().map(|b| b.key),
             });
 
             // One reader per radio → the RX union. A frame heard on any capability is
@@ -830,6 +877,7 @@ impl RunningMedium {
             let rx_bridge = bridge;
             let loss = fec.as_ref().map(|fc| fc.loss.clone());
             let sched_rx = sched.clone();
+            let rx_masks = bloom.as_ref().map(|b| b.masks.clone());
             tasks.push(tokio::spawn(async move {
                 let mut last_mesh_cv = 0u64; // last mesh common-view observation count ingested (#74)
                 loop {
@@ -867,6 +915,25 @@ impl RunningMedium {
                                 sched.ingest_time_ref(ref_us);
                                 continue;
                             }
+                            // Tier-0 name filter (#91c): drop frames not under any registered prefix
+                            // before they reach signals or the engine. The frame's filter is
+                            // addr1‖addr2 (f.group‖f.addr); broadcast (no group) always passes.
+                            if let Some(masks) = rx_masks.as_ref()
+                                && let (Some(g), Some(a2)) = (f.group, f.addr)
+                                && g != BROADCAST
+                            {
+                                let mut wire = [0u8; 12];
+                                wire[..6].copy_from_slice(&g);
+                                wire[6..].copy_from_slice(&a2);
+                                let frame_bf = crate::PrefixFilter::from_wire(wire);
+                                if !masks.iter().any(|m| frame_bf.may_match(m)) {
+                                    continue; // definitely not under any of our prefixes
+                                }
+                            }
+                            // The sender's ephemeral nonce is in addr3 under the Tier-0 layout, else
+                            // in addr2 (legacy). This one accessor keys per-neighbour signals and the
+                            // reassembly stream correctly for both layouts.
+                            let nonce = f.addr3.or(f.addr);
                             if (f.rssi_dbm.is_some() || f.mcs_index.is_some())
                                 && let Some(sink) = sink.as_ref()
                             {
@@ -881,13 +948,13 @@ impl RunningMedium {
                                 }
                                 sink.set_link(id, ls);
                                 // Doctrine §2: also attribute this RSSI to the *neighbour* by its
-                                // ephemeral source nonce, so the store is a per-neighbour map, not an
-                                // ambient per-face scalar. `ls` is `Copy`, so both keyings are cheap.
-                                if let Some(src) = f.addr {
+                                // ephemeral source nonce (addr3 under Tier-0, addr2 legacy), so the
+                                // store is a per-neighbour map, not an ambient per-face scalar.
+                                if let Some(src) = nonce {
                                     sink.set_source_link(src, ls);
                                 }
                             }
-                            let addr = f.addr.map(FaceAddr::Ether);
+                            let addr = nonce.map(FaceAddr::Ether);
                             match &rx_bridge {
                                 // FEC: a captured frame yields 0 (parity, incomplete),
                                 // 1 (a source), or several (parity completed a
@@ -931,11 +998,15 @@ impl RunningMedium {
                     tokio::time::interval(std::time::Duration::from_millis(TIME_BEACON_MS));
                 loop {
                     tick.tick().await;
+                    // Time beacons are broadcast control, not name-addressed: they must reach every
+                    // node regardless of its Tier-0 filter, so addr1 stays broadcast (which always
+                    // passes) and the nonce rides addr2 as in the legacy layout.
                     let frame = InjectFrame {
                         payload: sched.build_beacon(),
                         tx: TxIntent::ROBUST,
                         dst: BROADCAST,
                         src: src.current(super::now_ms() as u64),
+                        addr3: None,
                     };
                     let _ = radio.inject(frame).await; // transient errors: keep the clock alive
                 }
@@ -1170,6 +1241,78 @@ mod tests {
         RadioCapability::wifi_monitor_5ghz(vec![149])
     }
 
+    fn name_tlv(comps: &[&[u8]]) -> Vec<u8> {
+        let mut inner = Vec::new();
+        for c in comps {
+            inner.push(0x08);
+            inner.push(c.len() as u8);
+            inner.extend_from_slice(c);
+        }
+        let mut t = vec![0x07, inner.len() as u8];
+        t.extend_from_slice(&inner);
+        t
+    }
+    fn data_pkt(name: &[u8]) -> Bytes {
+        let mut d = vec![0x06, name.len() as u8];
+        d.extend_from_slice(name);
+        Bytes::from(d)
+    }
+
+    /// The multi-radio medium carries Tier-0 addressing end to end (#91c). A producer
+    /// `with_bloom` addresses each object by its name's prefix-set filter (`addr1‖addr2`) with
+    /// the ephemeral nonce in `addr3`; a relay registered on the coarse `/x` receives the whole
+    /// family, an unrelated `/w` node receives none, and — the nonce check — two objects with
+    /// *different* names arrive under the *same* neighbour address (the per-transmitter nonce
+    /// from addr3), not the name-derived filter half that sits in addr2.
+    #[tokio::test]
+    async fn medium_bloom_filters_and_keys_nonce_from_addr3() {
+        let key = crate::OPEN_GROUP_KEY;
+        let bus = LoopbackMonitorBus::new();
+        let producer = RadioMediumFace::new(
+            FaceId(1),
+            vec![RadioBearer::new(RadioId(1), Arc::new(bus.endpoint(1, -50)), cap())],
+        )
+        .with_bloom(&key, &["/x"])
+        .build();
+        let relay = RadioMediumFace::new(
+            FaceId(2),
+            vec![RadioBearer::new(RadioId(2), Arc::new(bus.endpoint(2, -50)), cap())],
+        )
+        .with_bloom(&key, &["/x"])
+        .build();
+        let other = RadioMediumFace::new(
+            FaceId(3),
+            vec![RadioBearer::new(RadioId(3), Arc::new(bus.endpoint(3, -50)), cap())],
+        )
+        .with_bloom(&key, &["/w"])
+        .build();
+
+        producer.send_bytes(data_pkt(&name_tlv(&[b"x", b"y"]))).await.unwrap();
+        producer.send_bytes(data_pkt(&name_tlv(&[b"x", b"z"]))).await.unwrap();
+
+        // The /x relay hears both names; capture their neighbour addresses (the ether bytes).
+        let mut addrs = Vec::new();
+        for _ in 0..2 {
+            let (_, a) = tokio::time::timeout(Duration::from_secs(2), relay.recv_bytes_with_addr())
+                .await
+                .expect("relay hears the /x family")
+                .unwrap();
+            let Some(ndn_transport::FaceAddr::Ether(bytes)) = a else {
+                panic!("expected an ether neighbour address, got {a:?}");
+            };
+            addrs.push(bytes);
+        }
+        assert_eq!(
+            addrs[0], addrs[1],
+            "two different-name objects from one producer share ONE neighbour address — the addr3 \
+             nonce, not the name-derived addr2 filter half"
+        );
+
+        // The /w node hears neither (Tier-0 filter drops before the engine).
+        let none = tokio::time::timeout(Duration::from_millis(200), other.recv_bytes_with_addr()).await;
+        assert!(none.is_err(), "an unrelated prefix must not pass the medium's Bloom filter");
+    }
+
     /// Two radios on two disjoint media, one medium face spanning both: a frame put
     /// on *either* medium is delivered once by the union, and a frame the face
     /// *sends* fans out onto *both* media. This is the whole "one face, N
@@ -1197,6 +1340,7 @@ mod tests {
                 tx: TxIntent::CONSERVATIVE,
                 dst: BROADCAST,
                 src: DEFAULT_SRC,
+                addr3: None,
             };
             radio.inject_at(frame, McsDescriptor::ht(0)).await.unwrap();
         };
@@ -1272,6 +1416,7 @@ mod tests {
                 tx: TxIntent::CONSERVATIVE,
                 dst: BROADCAST,
                 src: DEFAULT_SRC,
+                addr3: None,
             })
             .await
             .unwrap();

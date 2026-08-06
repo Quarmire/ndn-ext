@@ -77,7 +77,7 @@ impl<R: FrameIo + Send + Sync + 'static> GenerationSink for FrameIoSink<R> {
         for f in coded {
             let _ = self
                 .radio
-                .inject(InjectFrame { payload: f, tx: self.intent, dst: self.dst, src: self.src })
+                .inject(InjectFrame { payload: f, tx: self.intent, dst: self.dst, src: self.src, addr3: None })
                 .await;
         }
     }

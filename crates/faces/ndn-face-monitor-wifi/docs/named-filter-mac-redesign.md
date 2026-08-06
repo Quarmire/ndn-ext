@@ -111,9 +111,34 @@ the first D = 8 name components** (deeper matching is a software-tier concern an
 in 16 KB. The cap is what keeps the tail bounded; without it a deep name degrades the filter for
 everyone.
 
-Hash: **H3** as the paper recommends (cheap, parallelizable, hardware-friendly) rather than our current
-siphash24, which is heavier and serial. Keyed per group so a private group's filter is unlinkable —
-`GroupKey` already exists and carries over unchanged.
+#### Hash — DECIDED: `siphash24`, one function everywhere (amended 2026-08-06)
+
+> This paragraph originally specified **H3** ("cheap, parallelizable, hardware-friendly … rather than
+> our current siphash24, which is heavier and serial"), §6.4 closed #44 against H3, the first
+> implementation actually shipped keyed **FNV-1a-64**, and §9 measured the curve on FNV. Four
+> statements, three different hashes. **The decision is `siphash24`, in both copies of `tier0`
+> (`ndn-ext` and the LR2021 firmware), for the FIB/PIT/dedup keyspace, and for `EphemeralSource`.**
+>
+> **Why not H3.** H3 is a *universal* family — excellent false-positive bounds, genuinely cheap — but
+> it is linear over GF(2) and not a PRF. An adversary who observes filters can solve for the matrix
+> and then compute, or deliberately collide with, a private group's pre-parse filter. That is the
+> attack `mac-addressing-doctrine.md` §8 assigns the `GroupKey` to prevent, and a pre-parse filter is
+> exactly where an outsider wants a collision: it is the cheapest DoS surface we have.
+>
+> **Why "heavier and serial" was the wrong objection.** It priced the wrong operation. The receiver
+> precomputes one mask per *registered prefix* (§3.2), so the per-frame RX cost is two `u64`
+> AND-compares and **zero hashing**. Hashing happens only on TX (≤ `MAX_DEPTH` = 8 prefixes per name)
+> and once per registration. At that rate SipHash's cost is not measurable against a frame's airtime,
+> and it buys the property the design depends on.
+>
+> **Why the speed of a "better" hash buys nothing here.** §9 measured that at m=94 the false-positive
+> rate is dominated by collisions *between* the k positions, not by hash quality — swapping in two
+> independent keyed hashes moved nothing. Re-measured under SipHash the curve is unchanged
+> (0.00 / 0.39 / 0.91 / 0.78 % at depths 2/4/6/8, against FNV's 0.095 / 0.24 / 0.80 / 0.94 %). So the
+> hash choice is free on the FP axis and should be made on the security axis, which is what this does.
+>
+> Keyed per group so a private group's filter is unlinkable — `GroupKey` already exists and carries
+> over unchanged, now used in **full** (16 bytes; the FNV implementation truncated it to 8).
 
 #### 3.2 Receiver cost
 
@@ -245,6 +270,45 @@ and the `siphash24` path. `mac_addressing_doctrine.rs` needs rewriting around pr
 *Option not taken:* the 2-byte sequence-control field would give 110 bits; deferred until the FP
 measurements say we need it.
 
+> **Built 2026-08-06 (#91b), single-radio face.** `MonitorWifiFace` now carries the filter on air:
+> `TxAddr::PrefixBloom { key }` compiles each object's inner NDN name into a [`PrefixFilter`] and puts
+> its 12 wire bytes in `addr1 ‖ addr2` (all fragments of an object share it, cached by LP base
+> sequence); `RxFilter::Bloom(masks)` reconstructs the frame's filter from `addr1 ‖ addr2` (via
+> `CapturedFrame.group ‖ .addr`) and tests each registered-prefix mask — **no `InjectFrame` /
+> `build_dot11` / `parse_dot11` change was needed**, since those two fields already round-trip the 12
+> bytes. Builders: `with_bloom_producer` / `with_bloom_relay` / `with_bloom_consumer`. Proven end to
+> end over the loopback medium (`bloom_addressing_prefix_and_granularity_decoupling`): a `/x` relay
+> hears the whole family and a `/x/y/z` consumer matches at its *own* granularity — the decoupling a
+> name hash cannot do. Wire NDN names are rendered to a `/`-joined byte form (`ndn_name_to_slash`) so
+> TX and a receiver's `/`-string registration hash identical bytes.
+>
+> **Built 2026-08-06 (#91c), multi-radio path + nonce in addr3.** `InjectFrame` and `CapturedFrame`
+> gained `addr3: Option<[u8;6]>`; `build_dot11` writes `frame.addr3.unwrap_or(dst)` and `parse_dot11`
+> surfaces `body[16..22]`, so the ephemeral nonce rides `addr3` under the Tier-0 layout (`addr1‖addr2`
+> being the filter) and `None` reproduces the legacy `addr3=dst` byte-for-byte. The a81a driver's own
+> build/parse and the loopback bus thread it too. `RadioMediumFace::with_bloom(key, prefixes)` wires
+> the deployed multi-radio path: TX computes each object's filter into `addr1‖addr2` with the nonce in
+> `addr3` (a non-first fragment falls back to broadcast — a safe over-accept); the per-bearer RX reader
+> drops frames whose filter is under no registered mask *before* signals/engine, and keys the
+> per-neighbour `SignalStore` on `addr3.or(addr2)` (correct for both layouts). Test
+> `medium_bloom_filters_and_keys_nonce_from_addr3`: a `/x` relay hears the family, a `/w` node hears
+> none, and two different-name objects from one producer arrive under **one** neighbour address (the
+> addr3 nonce, not the addr2 filter half).
+>
+> **Built 2026-08-06 (#91d), name_group deleted + single-radio nonce.** `name_group`, `name_group_mac`,
+> `name_group_uni`, `prefix_key`, `tag_local`, `group_prefix_key`, `TxAddr::Group`/`SplitByName`,
+> `RxFilter::Exact`/`Prefix` and the `with_name_group*`/`with_split_producer`/`with_prefix_relay`/
+> `with_exact_consumer` builders are **gone**; `TxAddr` is `{Broadcast, PrefixBloom}` and `RxFilter` is
+> `{Open, Bloom}`. `siphash24`/`GroupKey`/`OPEN_GROUP_KEY`/`EphemeralSource` stay — `EphemeralSource`
+> uses `siphash24`, so that "retire the siphash24 path" meant the name-group path, not the primitive.
+> The one external consumer (ndn-pipes' `with_name_group`) migrated to `with_bloom_consumer`; its
+> over-air test still passes. The hardware exact-match RX filter (`set_name_group_filter`) survives as a
+> flat one-address matcher — the Tier-0 prefix-set filter is a software mask-scan, not expressible in
+> that silicon (§8.5). The single-radio `MonitorWifiFace` now carries an `EphemeralSource` and stamps a
+> distinct nonce into `addr3` on the Bloom path, closing the last #91c gap. Deleted the four
+> now-obsolete addressing tests + `tests/mac_addressing_doctrine.rs` + the `name_filter` example; the
+> Bloom round-trip tests (`bloom_addressing_*`, `medium_bloom_*`) are the contract now.
+
 ### 6.2 The MAC slot key
 `prefix_hash(name, group_depth)` with a **global** `NDN_SCHED_GROUP_DEPTH` is the same
 one-granularity-fits-all mistake as `name_group`. The slot must key on the **longest registered prefix
@@ -258,8 +322,11 @@ filter) — the redesign gives it its subject, and NDN-NIC gives it the comparis
 
 ### 6.4 The shared name-hash keyspace — task #44 is answered
 Open task #44 asks for one hash function shared across filter / FIB-prefix / PIT / generation-IDs.
-**The answer is the paper's:** one H3 family, keyed, with prefix hashes cached on name-tree nodes and
-reused by every consumer. Close #44 against this design.
+**The answer is one keyed family shared by every consumer**, with prefix hashes cached on name-tree
+nodes and reused. That was originally written as the paper's H3; it is **`siphash24`** — see the
+amended hash decision in §3.1 for why the security axis decides this and the speed axis does not.
+Sharing it is now literal rather than aspirational: `siphash24` already keys `EphemeralSource`, so the
+stack has one keyed-hash primitive rather than a second family. Close #44 against this design.
 
 ### 6.5 Relay-role population — task #45
 BF-FIB answers "do I serve this prefix?" in two word-ops, which is the input a node needs to decide
@@ -332,7 +399,7 @@ two paths separately and must not report a Wi-Fi CPU saving as if it were the pa
 |---|---|---|
 | One structure (BF + CBF mirror) for FIB, PIT and CS | **One structure per table** | FIB is near-static and small → an **immutable xor / binary-fuse / ribbon filter** (~10–25% smaller at equal FP, faster queries, rebuilt on the rare FIB change). PIT and CS churn per packet → a **cuckoo filter**, which supports deletion *natively* and thereby **deletes the entire CBF-mirror machinery**. They used one hammer because that was the 2016 toolkit. |
 | Flat BF layout | **Blocked layout** | All k probes in one cache line — the standard modern engineering win for a mutable filter. |
-| k = 2, chosen because parallel hash logic was expensive | **k ≈ 6, cheap hashing** | ARMv8 crypto extensions (the OPi's A76/A55) make AES-based keyed hashing nearly free, and double hashing (Kirsch–Mitzenmacher) derives k probes from 2 hashes. The constraint that forced k=2 no longer exists. |
+| k = 2, chosen because parallel hash logic was expensive | **k = 4 measured** (§9), from 2 hashes | Double hashing (Kirsch–Mitzenmacher) derives k probes from 2 hashes, so the constraint that forced k=2 is gone. The "cheap hashing / AES extensions" argument is **withdrawn**: per §3.1 the hash is not on the per-frame RX path at all, so its cost never bound the design and should not have driven the choice. |
 | Active CS (Transformation / Aggregation / Reversion) | **Skip; also skip learned filters** | Already rejected on cost-model grounds (§2). Learned Bloom filters are the modern temptation and are worse for us: they need a trained model and a stable key distribution, and they reintroduce false negatives unless sandwiched. The *goal* — adaptively choose which prefixes to insert — is better served by a demand-driven policy we already have the inputs for. |
 | Receiver scan proportional to table size | **Bitslice the Tier-0 scan** | Store entry masks **transposed** (one bit-plane per filter bit): one pass of ~94 AND/OR ops tests **every** entry at once — **O(m) instead of O(E)**. This is the classic packet-classification trick and it removes §3.2's scaling limit outright. |
 | Filter on a NIC (never actually built — simulated) | **eBPF/XDP is the modern kernel-adjacent location** | Did not exist for them. Relevant if we ever run a kernel-driver path; not for our userspace driver. And note their hardware was never built, which is a standing caution on their numbers. |
@@ -438,16 +505,50 @@ Measured at the depth cap, the optimum is **k = 4**:
 | 6 | 42/94 | 1.09% |
 | 8 | 53/94 | 1.50% |
 
-**Why the formula fails here.** It assumes a query's k positions are *independent*. With only 94
-bits they are not: k=6 positions collide **with each other** roughly 15% of the time, and a query
-whose 6 positions collapse to 3 distinct bits has the false-positive rate of k=3, not k=6. That
-effect is invisible to the closed form and **grows with k**, so the true optimum sits below the
-predicted one. **Small-m Bloom filters are their own regime — do not size this one from the
-asymptotic formula.** Lower k is cheaper too.
+**Why the formula looked wrong here — RETRACTED 2026-08-06.** This section argued that the closed
+form fails at m=94 because a query's k positions are not independent, so the true optimum sits
+*below* the predicted ~6, and concluded "small-m Bloom filters are their own regime — do not size
+this one from the asymptotic formula."
+
+**The sweep behind that claim was broken.** Its false-positive queries came from
+`make_name(d, 0x10000 + t)`, and that helper formats the salt as four hex digits — so `0x10000`
+truncated away and the "disjoint" queries shared their leading components with the registered name.
+Genuine ancestors were being counted as false positives, and they land differently as k varies,
+which is what produced the apparent optimum.
+
+**With the generator fixed, the picture is that there is no measurable optimum in k = 4..8.** Two
+independently written harnesses rank them differently by more than their error bars:
+
+| k | bits set | host, 200 names / 400k trials (±1σ) | device, 12 names / 20k |
+|---|---|---|---|
+| 3 | 23/94 | 1.043% ± 0.016 | 1.02% |
+| **4** | **28/94** | **0.586% ± 0.012** | 0.91% |
+| 5 | 34/94 | 0.671% ± 0.013 | 0.46% |
+| 6 | 38/94 | 0.665% ± 0.013 | 0.27% |
+| 8 | 48/94 | 0.670% ± 0.013 | 0.67% |
+
+Only **k = 3 is consistently bad**. The rest sit inside the sub-1.5% band the design needs, and which
+one "wins" tracks the *name distribution*, not k. **k = 4 stands** — it wins the one measurement with
+tight error bars, sets the fewest bits (28/94, headroom before saturation), costs the fewest hashes
+per frame, and is what the on-air shadow-mode result (#106) was measured at.
+
+**The transferable lesson is not the one this section originally drew.** It is not "measure, don't
+compute" — the computed answer was never shown to be wrong. It is that **a measurement that
+contradicts theory deserves the same scrutiny as a theory that contradicts measurement**, and that a
+single harness with ~50 events is not a result. This constant was wrong in *both* directions before
+anyone checked the generator.
 
 Ruled out first: deriving `h1`/`h2` by splitting one FNV-1a-64 output was the prime suspect for
 correlated positions (FNV's high bits are its weak half). Two **independent** keyed hashes measured
 no better, which is what isolates the cause to small-m rather than hash quality.
+
+> **Amended 2026-08-06.** This table was measured under keyed FNV-1a-64 with the broken generator
+> described above, so **both** its axes were off. Under `siphash24`, with the disjointness fixed and
+> averaged over 12 registered names, k=4 measures **0.00 / 0.53 / 0.70 / 0.56 %** at depths 2/4/6/8
+> (bits set 12/19/23/30). Still the sub-1% regime, still zero false negatives at every depth — the
+> conclusions that depended only on the *magnitude* survive; the one that depended on the *ordering
+> across k* did not. Live assertions in `tier0::tests::false_positive_rate_matches_measured_curve`,
+> and the k comparison in `ksweep_host_replication`.
 
 **The measured curve at k = 4** (this replaces the predicted table in §3.1):
 
@@ -461,7 +562,86 @@ no better, which is what isolates the cause to small-m rather than hash quality.
 **Zero false negatives at every depth**, checked on every iteration rather than sampled — the
 property the whole design rests on holds.
 
+> **Caveat discovered porting Tier 0 into ndn-ext (2026-08-06).** The depth-8 `0.94%` above is only
+> valid when the FP query namespace is disjoint from the filter's at *every* prefix depth. The
+> on-device `m7_filter_test` drew non-leaf query components from the same low range as the filter name
+> (`/0000/0001/…`) — harmless until `clamp_prefix` was added, but with clamping present a depth-8
+> query that shares the filter's first seven components truncates onto the filter's genuine depth-7
+> ancestor and *correctly* matches. Re-running the old harness now reports ~13% at depth 8 — an
+> artifact of the overlapping namespace, not a filter regression. The ported test
+> (`ndn-face-monitor-wifi/src/tier0.rs`, `make_disjoint_name`) fixes the harness and reproduces the
+> sub-1% curve. Lesson: measure FP against non-ancestors that are disjoint under clamping.
+
 The §3.1 conclusion survives with a slightly weaker constant: worst case **0.94% FP ⇒ 99.06%
 zero-parse rejection in 12 bytes**, not the 0.41% predicted. Still the right design; still far better
 than the ~2.4% that copying NDN-NIC's k=2 would have given. Validation item 1 of §7 ("the FP model on
 real names") is now **closed by measurement** — and the answer was that the model was optimistic.
+
+---
+
+## 10. Amendment — §7 validation item 4 (NAV honouring) is MEASURED, and the answer is NO. Do not announce the lease in the Duration field.
+
+*Added 2026-08-06 after measuring on hardware (o5p-1: RTL8812AU-VS `0bda:881a` injector +
+ath9k-HTC `0cf3:9271` and MT7612U `0e8d:7610` as a co-located victim IBSS pair, ch6 2437 MHz;
+`ndn-face-monitor-wifi/examples/nav_probe.rs`, the `NDN_NAVUSEHDR` gate in
+`ndn-radio-drivers/src/rtl8812au.rs::build_txdesc`). §5 proposed announcing the named airtime lease
+"for free" in the 802.11 **Duration/ID (NAV)** field on the bet that co-located commodity Wi-Fi
+honours NAV and defers to our leases. **The bet loses.** Two independent measurements:*
+
+### 10.1 Part (a) — can we even put a chosen NAV on the air? Yes, but only with a driver bit.
+
+By **default the RTL8812AU MAC recomputes and overwrites the Duration/ID field** on an
+injected monitor-mode frame — measured 60 µs on a 6 Mbps beacon and 124 µs on a QoS-data frame,
+never the `0x1234` we wrote, cross-validated by tshark's `wlan.duration` and by reading the raw MPDU
+bytes 2–3 off a **neutral** (non-Realtek) ath9k capture. The value we place in the frame is discarded.
+
+The fix is one TX-descriptor bit: **`NAVUSEHDR` (DWORD3 bit 15)** tells the MAC to transmit the
+header's Duration verbatim. With `NDN_NAVUSEHDR=1` the ath9k reads back **exactly 4660 (0x1234)** on
+every beacon and every data frame. So an arbitrary NAV *is* expressible on this hardware — it was
+never a frame-format problem, it was a driver default. (Untested on the 8822E/`a81a` path, which
+writes no NAV field and leaves HWSEQ clear; not decision-relevant — see 10.3.)
+
+### 10.2 Part (b) — do stock stations defer to it? No — not even to a canonical RTS/CTS.
+
+A saturated UDP link between two commodity stations (ath9k ↔ mt76, each in its own netns so traffic
+is forced over the air) on the injector's channel. Arms, throughput (receiver-side, 8 s each):
+
+| arm | throughput | reads as |
+|---|---|---|
+| baseline (no injection) | 11.1 Mbit/s | — |
+| **flood** — large frames, **NAV=0**, spammed | **1.49 Mbit/s** | **reception + physical CCA confirmed** |
+| RTS, NAV = 28672 µs (`NAVUSEHDR`) | 12.9 Mbit/s | **no deference** |
+| QoS-data, NAV = 28672 µs | 13.0 Mbit/s | **no deference** |
+| CTS-to-self, NAV = 28672 µs | 12.6 Mbit/s | **no deference** |
+
+The **flood arm is the instrument check** the [hardware-truth-method] demands: it collapses the same
+victims to ~13 % of baseline, proving they *hear* the injector and honour **physical** carrier sense.
+Against that positive control, the NAV arms sitting at (or fractionally above) baseline is an
+unambiguous negative — **the stations ignore the virtual carrier sense (NAV) in our injected frames**,
+including a real RTS and a real CTS-to-self, the two frames 802.11 supposedly guarantees deference to.
+
+The likely cause is NAV-attack hardening: modern commodity firmware updates its NAV only from frames
+inside a recognised exchange / its own BSS, not from arbitrary overheard frames (our frames carry a
+foreign BSSID and belong to no exchange the victim is part of). That is a *defensive* behaviour and we
+will not out-argue it from userspace.
+
+### 10.3 Consequence for the design
+
+- **§5's "zero-cost external coexistence" is retracted.** Nearby non-NDN Wi-Fi will **not** defer to a
+  lease we write into Duration/ID. The lease cannot be announced *for free* to strangers, on this
+  hardware, ever.
+- **The lease is not dead — its enforcement must be ours.** It is still `f(name, clock)`, still
+  computed identically by every NDN node, and our own receivers parse the frame regardless, so the
+  lease value can ride our **own** frame structure (payload / a reserved Tier-0 class token, §5) and be
+  enforced by our nodes' computed listen-before-talk against the Tier-0 filter — **not** delegated to
+  802.11 NAV. Self-enforced slotting is what the on-air token results already rested on; this
+  measurement just removes the tempting shortcut of borrowing commodity NAV.
+- **Which chip injects is irrelevant to this conclusion** — the failure is at the *receivers*, so
+  testing the 8822E injector would not change it.
+- **Custom-hardware note (§8.5).** This is another artifact of commodity 802.11, and a strong one:
+  when we control the PHY/MAC (the AR9271 open firmware, #109; a wake-up radio), a lease *can* be
+  enforced rather than advised, because our own MAC decides deference. The design is a faithful
+  degradation, exactly as §8.5 argued — the commodity version simply must self-enforce.
+
+Validation item 4 of §7 is **closed by measurement: NO.** The `NDN_NAVUSEHDR` gate and `nav_probe`
+example are kept as the reproduction harness.

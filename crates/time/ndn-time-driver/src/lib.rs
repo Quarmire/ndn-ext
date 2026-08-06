@@ -345,6 +345,7 @@ pub mod wifi {
                     tx: TxIntent::ROBUST,
                     dst: BROADCAST,
                     src: DEFAULT_SRC,
+                    addr3: None,
                 })
                 .await
                 .is_ok()

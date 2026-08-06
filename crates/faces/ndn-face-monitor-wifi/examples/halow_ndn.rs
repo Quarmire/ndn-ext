@@ -62,9 +62,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0);
+            // NDN_HALOW_SIZE pads each packet to N bytes so throughput can be
+            // measured, not just packet rate: this radio's cost is per frame, so
+            // bytes/frame is the number that matters.
+            let size: usize = std::env::var("NDN_HALOW_SIZE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
             let mk = |i: u32| {
                 let mut p = MARKER.to_vec();
                 p.extend_from_slice(&i.to_le_bytes());
+                if size > p.len() {
+                    p.resize(size, 0xa5);
+                }
                 InjectFrame::broadcast(Bytes::from(p), TxIntent::CONSERVATIVE)
             };
             let start = std::time::Instant::now();
@@ -94,9 +104,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 0.0
             };
+            let bps = fps * (size.max(MARKER.len() + 4) as f64) * 8.0;
             println!(
-                "injected {count} NDN-over-HaLow frames on {iface} in {:.2}s ({fps:.0} frames/s)",
-                el.as_secs_f64()
+                "injected {count} NDN-over-HaLow packets on {iface} in {:.2}s ({fps:.0} pkt/s, {:.2} Mbit/s payload)",
+                el.as_secs_f64(),
+                bps / 1e6
             );
         }
         "rx" => {

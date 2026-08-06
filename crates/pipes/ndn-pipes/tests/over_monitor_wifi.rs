@@ -16,7 +16,7 @@ use ndn_app::{Consumer, EngineBuilder, Producer};
 use ndn_coding::FecPolicy;
 use ndn_engine::EngineConfig;
 use ndn_face::local::InProcFace;
-use ndn_face_monitor_wifi::{LoopbackMonitorBus, MonitorWifiFace};
+use ndn_face_monitor_wifi::{LoopbackMonitorBus, MonitorWifiFace, OPEN_GROUP_KEY};
 use ndn_packet::Name;
 use ndn_transport::FaceId;
 
@@ -38,7 +38,10 @@ async fn run(name_group: Option<&'static str>, skip: &'static [u16]) -> (Vec<u8>
     let mk = |id: u64, fid: FaceId| {
         let f = MonitorWifiFace::new(fid, Arc::new(bus.endpoint(id, -55)));
         match name_group {
-            Some(g) => f.with_name_group(g),
+            // Tier-0 (#91): the radio registers the namespace prefix; the producer addresses each
+            // object by its name's prefix-set filter, so names under the namespace are heard and
+            // others dropped — the same coupling `with_name_group` gave, now longest-prefix.
+            Some(g) => f.with_bloom_consumer(&OPEN_GROUP_KEY, g),
             None => f,
         }
         .into_face()
