@@ -240,6 +240,20 @@ impl Tier1 {
         for_each_prefix(name, |pfx| self.cs.insert_published(pfx));
     }
 
+    /// Remove a cached name — the counterpart of [`cache`](Self::cache), for eviction.
+    ///
+    /// Must mirror `cache`'s insertion decision exactly, including the Basic CS skip: a name that was
+    /// never inserted (because a FIB prefix already covered it) must not be decremented, or the
+    /// counting filter underflows and the bit is wrong from then on. That asymmetry is easy to write
+    /// and impossible to detect at runtime, which is why the check is duplicated here rather than
+    /// assumed.
+    pub fn uncache(&mut self, name: &[u8]) {
+        if self.basic_cs && self.fib_covers(name) {
+            return;
+        }
+        for_each_prefix(name, |pfx| self.cs.remove(pfx));
+    }
+
     fn fib_covers(&self, name: &[u8]) -> bool {
         let mut hit = false;
         for_each_prefix(name, |pfx| {
@@ -532,6 +546,94 @@ mod tests {
         );
     }
 
+    /// **The production join: `ndn-store`'s real `Pit` drives Tier-1.**
+    ///
+    /// Not a stand-in `PitStore` — the actual table the forwarder uses. Covers the paths that matter:
+    /// insert must be visible with no sync, and every removal route (explicit remove, expiry) must
+    /// reach the filter. An expiry that does not is a slow leak: the mirror keeps claiming entries
+    /// that timed out and the false-positive rate climbs, with nothing ever reporting an error.
+    #[test]
+    fn the_real_pit_drives_tier1_including_expiry() {
+        use ndn_foundation_types::{Name, NameComponent};
+        use ndn_store::pit::{Pit, PitEntry, PitToken};
+
+        fn name(parts: &[&str]) -> Name {
+            let cs: Vec<NameComponent> = parts
+                .iter()
+                .map(|p| NameComponent::generic(bytes::Bytes::copy_from_slice(p.as_bytes())))
+                .collect();
+            Name::from_components(cs)
+        }
+        fn entry(n: Name, lifetime_ms: u64) -> PitEntry {
+            PitEntry::new(std::sync::Arc::new(n), 0, lifetime_ms)
+        }
+
+        let shared: SharedTier1 =
+            std::sync::Arc::new(std::sync::RwLock::new(Tier1::new(&KEY, BITS, K)));
+        let mut pit = Pit::new();
+        pit.set_observer(std::sync::Arc::new(Tier1Feed::new(shared.clone())));
+
+        // Insert: visible immediately, no sync — the Data can already be in flight.
+        pit.insert(PitToken(1), entry(name(&["a", "b"]), 60_000));
+        assert!(
+            shared.read().unwrap().lookup(b"/a/b").pit,
+            "the real Pit's insert never reached Tier-1 — its Data would be dropped"
+        );
+
+        // Explicit removal.
+        assert!(pit.remove(&PitToken(1)).is_some());
+        shared.write().unwrap().sync();
+        assert!(!shared.read().unwrap().lookup(b"/a/b").pit, "removal did not reach Tier-1");
+
+        // Expiry — the path most likely to be forgotten, because nothing calls it explicitly.
+        // 1 ms lifetime -> expires_at = 1e6 ns; drained below at 2e6 ns.
+        pit.insert(PitToken(2), entry(name(&["c", "d"]), 1));
+        assert!(shared.read().unwrap().lookup(b"/c/d").pit);
+        let drained = pit.drain_expired_entries(2_000_000);
+        assert_eq!(drained.len(), 1, "expiry did not fire");
+        shared.write().unwrap().sync();
+        assert!(
+            !shared.read().unwrap().lookup(b"/c/d").pit,
+            "an EXPIRED entry still matches — the mirror leaks entries that timed out"
+        );
+        assert_eq!(shared.read().unwrap().pit.anomalies(), 0, "counter under/overflow");
+    }
+
+    /// **CS eviction must decrement BF-CS**, or the filter claims to hold what it has thrown away.
+    ///
+    /// This is the case `ndn_fwd_core::ObservedCs` structurally cannot cover — it decorates `admit`
+    /// and never sees an eviction. `ndn-store`'s `CsObserver` does, which is why the production path
+    /// uses that seam instead.
+    #[test]
+    fn cs_eviction_decrements_the_mirror() {
+        use ndn_foundation_types::{Name, NameComponent};
+        use ndn_store::observable_cs::{CsEvent, CsObserver};
+
+        fn name(parts: &[&str]) -> std::sync::Arc<Name> {
+            let cs: Vec<NameComponent> = parts
+                .iter()
+                .map(|p| NameComponent::generic(bytes::Bytes::copy_from_slice(p.as_bytes())))
+                .collect();
+            std::sync::Arc::new(Name::from_components(cs))
+        }
+
+        let shared: SharedTier1 =
+            std::sync::Arc::new(std::sync::RwLock::new(Tier1::new(&KEY, BITS, K)));
+        let feed = Tier1Feed::new(shared.clone());
+
+        feed.on_event(CsEvent::Insert { name: name(&["x", "y", "z"]), bytes: 32 });
+        // Direction (b): a prefix-seeking Interest finds the cached descendant.
+        assert!(shared.read().unwrap().lookup(b"/x/y").cs, "cached name not visible");
+
+        feed.on_event(CsEvent::Evict { name: name(&["x", "y", "z"]) });
+        shared.write().unwrap().sync();
+        assert!(
+            !shared.read().unwrap().lookup(b"/x/y").cs,
+            "evicted Data still matches — the CS mirror only grows"
+        );
+        assert_eq!(shared.read().unwrap().cs.anomalies(), 0, "counter under/overflow on evict");
+    }
+
     /// Removal must actually remove — the property a plain Bloom filter cannot provide and the
     /// entire reason for the counting mirror.
     #[test]
@@ -582,6 +684,58 @@ impl Tier1Feed {
             out.push(b'/');
         }
         out
+    }
+}
+
+impl Tier1Feed {
+    /// Render an NDN [`Name`](ndn_foundation_types::Name) into the `/`-joined byte form the filter
+    /// hashes. Component *values* only, matching `ndn_name_to_slash` on the Tier-0 path — if the two
+    /// renderings ever diverge, every match silently fails and nothing reports an error.
+    fn slash_name(name: &ndn_foundation_types::Name) -> Vec<u8> {
+        let mut out = Vec::new();
+        for c in name.components() {
+            out.push(b'/');
+            out.extend_from_slice(&c.value);
+        }
+        if out.is_empty() {
+            out.push(b'/');
+        }
+        out
+    }
+}
+
+/// **The production PIT feed.** `ndn-store`'s `Pit` calls this on every insert and every removal
+/// path — satisfy, expire, discard, and face teardown.
+impl ndn_store::pit::PitObserver for Tier1Feed {
+    fn on_pit_insert(&self, name: &ndn_foundation_types::Name) {
+        if let Ok(mut t) = self.tier1.write() {
+            t.add_pit(&Self::slash_name(name));
+        }
+    }
+
+    fn on_pit_remove(&self, name: &ndn_foundation_types::Name) {
+        if let Ok(mut t) = self.tier1.write() {
+            t.remove_pit(&Self::slash_name(name));
+        }
+    }
+}
+
+/// **The production CS feed**, over `ndn-store`'s existing `CsObserver` seam.
+///
+/// Note this handles **eviction**, which the generic `ndn_fwd_core::ObservedCs` decorator cannot see:
+/// a Data leaving the cache must decrement BF-CS, or the filter goes on claiming to hold things it
+/// no longer has and its false-positive rate climbs without bound. The engine's own seam is richer
+/// than the one I first wrote, which is why the production path uses it.
+impl ndn_store::observable_cs::CsObserver for Tier1Feed {
+    fn on_event(&self, event: ndn_store::observable_cs::CsEvent) {
+        use ndn_store::observable_cs::CsEvent;
+        let Ok(mut t) = self.tier1.write() else { return };
+        match event {
+            CsEvent::Insert { name, .. } => t.cache(&Self::slash_name(&name)),
+            CsEvent::Evict { name } => t.uncache(&Self::slash_name(&name)),
+            // Hits and misses are lookups, not mutations — the mirror does not change.
+            CsEvent::Hit { .. } | CsEvent::Miss { .. } => {}
+        }
     }
 }
 

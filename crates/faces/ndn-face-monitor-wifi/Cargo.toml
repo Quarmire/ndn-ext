@@ -33,6 +33,8 @@ ndn-time         = { workspace = true }
 ndn-signals-core = { workspace = true }
 # #92: the NameTableObserver seam the forwarder feeds Tier-1 through.
 ndn-fwd-core     = { workspace = true }
+ndn-store        = { workspace = true }
+ndn-foundation-types = { workspace = true }
 # The four userspace USB Wi-Fi driver backends, lifted into their own crate.
 # Pulled only by the `libusb-backend` feature; re-exported from `lib.rs`.
 ndn-radio-drivers = { path = "../../../../ndn-radio-drivers", optional = true }
