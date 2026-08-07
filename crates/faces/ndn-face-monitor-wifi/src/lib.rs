@@ -230,90 +230,95 @@ impl TxBatcher {
     }
 }
 
-/// The Wi-Fi radio specifics of link FEC — the one part the bearer-agnostic
-/// [`LinkFecBridge`] delegates: inject each coded frame of a generation as its
-/// **own** MPDU (interleaved — never one generation per A-MSDU), at the MCS pinned
-/// to the frame that opened the generation.
-/// What a coded generation pins to the frame that opened it: the MCS **and** the
-/// per-Data-name destination. So a generation carrying object `/x/y` is addressed to
-/// `/x/y`'s split address — relays prefix-match it, the consumer exact-matches it —
-/// exactly as an uncoded object is (composing split addressing with the coded path).
+/// **What a coded generation pins to the frame that opened it: its whole on-air identity.**
+///
+/// One sink serves both faces (#82). Before this, each had its own: `MonitorWifiFace` pinned
+/// `(mcs, dst)` and `RadioMediumFace` used `ndn-coding`'s generic `FrameIoSink` with no pin at all,
+/// so each reconstructed the addressing its direct send path had already computed — badly, and
+/// differently. Both dropped things:
+///
+/// * **Tier-0 addressing.** Under [`TxAddr::PrefixBloom`] the object's 12-byte prefix-set filter is
+///   split across *both* address fields (addr1 = hi, addr2 = lo) and the receiver reassembles
+///   `addr1 ‖ addr2` before testing it. Pinning only `dst` left the sender's fixed source in addr2,
+///   so a receiver registered on that very prefix reconstructed half a filter and dropped the
+///   frame — a false negative, not a lost optimisation. `tier0_addressing_survives_link_fec` is
+///   the regression test; it failed with `addr2 = 02 4e 44 4e 00 01` (`DEFAULT_SRC`).
+/// * **The doctrine §2 rotating nonce.** The face pinned no `addr3` at all; the medium snapshotted
+///   one nonce for the bridge's whole lifetime. Either way the rotation that bounds linkability
+///   stopped happening the moment FEC was enabled.
+/// * **The legacy-rate gate** on the medium, which hardcoded `CONSERVATIVE` and so ignored the
+///   worst-overheard-receiver cap for coded traffic.
+///
+/// The cause was the same each time: the pin carried *less* than an [`InjectFrame`] needs, so the
+/// sink had to invent the rest. It now carries exactly what the direct path computes, and both
+/// faces build it from that same code — there is nothing left for a sink to guess.
+///
+/// The pin is per-*generation*, snapshotted from the opening frame, and that is deliberate: all
+/// k + R frames of a generation share one address, so a receiver that admits the object also admits
+/// its parity. Addressing parity independently would fail — a parity frame carries no NDN name to
+/// derive a filter from.
 #[derive(Clone, Copy)]
-struct WifiPin {
-    mcs: McsDescriptor,
-    dst: [u8; 6],
+pub(crate) struct RadioFecPin {
+    /// addr1 — the broadcast address, a split per-Data-name address, or the filter's high half.
+    pub dst: [u8; 6],
+    /// addr2 — the ephemeral source nonce, or the filter's low half under Tier-0.
+    pub src: [u8; 6],
+    /// addr3 — the doctrine §2 nonce when Tier-0 displaced it out of addr2.
+    pub addr3: Option<[u8; 6]>,
+    /// The transmit intent (so the medium's legacy-rate gate reaches coded frames too).
+    pub intent: TxIntent,
+    /// The exact rate, when the bearer takes one per frame (`MonitorWifiFace`). `None` where rate is
+    /// bearer state held in the driver (`RadioMediumFace`), which then injects at whatever is set.
+    pub mcs: Option<McsDescriptor>,
 }
 
-struct WifiFecSink {
-    backend: Arc<dyn FrameIo>,
-    /// The source (name-derived, fixed for the face); the dst is pinned per generation.
-    src: [u8; 6],
+/// The radio side of link FEC, shared by both faces: inject each coded frame of a generation as its
+/// **own** MPDU — never one generation per aggregate, where a single FCS failure would erase all of
+/// it — carrying the generation's pinned address, intent and rate.
+pub(crate) struct RadioFecSink {
+    pub radio: Arc<dyn FrameIo>,
 }
 
-impl GenerationSink for WifiFecSink {
-    type Pin = WifiPin;
+impl GenerationSink for RadioFecSink {
+    type Pin = RadioFecPin;
 
-    async fn emit(&self, coded: Vec<Bytes>, pin: &WifiPin) {
-        inject_coded(&self.backend, &coded, Some(pin.mcs), pin.dst, self.src).await;
+    async fn emit(&self, coded: Vec<Bytes>, pin: &RadioFecPin) {
+        for f in coded {
+            let frame = InjectFrame {
+                payload: f,
+                tx: pin.intent,
+                dst: pin.dst,
+                src: pin.src,
+                addr3: pin.addr3,
+            };
+            let _ = match pin.mcs {
+                Some(mcs) => self.radio.inject_at(frame, mcs).await,
+                None => self.radio.inject(frame).await,
+            };
+        }
     }
 }
 
-/// Link-layer FEC over the radio (see [`MonitorWifiFace::with_link_fec`]). The codec,
-/// generation batching, and the plan-driven redundancy actuation live in
-/// `ndn_coding`'s reusable [`LinkFecBridge`]; this face supplies only the Wi-Fi
-/// [`GenerationSink`] (MCS-pinned per-MPDU injection). The RX side feeds captured
-/// frames through the bridge's decoder, recovering up to R losses per generation
-/// without ARQ.
 struct FaceFec {
-    /// Batching + plan-R actuation over the radio; the pin is the per-generation
-    /// (MCS, split dst) — see [`WifiPin`].
-    bridge: LinkFecBridge<WifiPin>,
+    /// Batching + plan-R actuation over the radio; the pin is the generation's whole on-air
+    /// identity — see [`RadioFecPin`].
+    bridge: LinkFecBridge<RadioFecPin>,
     /// Payloads recovered/delivered by the decoder, awaiting `recv_bytes`.
     pending: std::sync::Mutex<VecDeque<(Bytes, Option<FaceAddr>)>>,
 }
 
 impl FaceFec {
-    fn spawn(
-        backend: Arc<dyn FrameIo>,
-        src: [u8; 6],
-        k: usize,
-        redundancy: u16,
-        window: Duration,
-    ) -> Self {
-        // The generation loop, the window flush, and the plan-driven R actuation
-        // are all in the bearer-agnostic bridge (task #33); this face supplies only
-        // the Wi-Fi injection (MCS + split dst pinned per generation). The dst rides
-        // in the per-frame pin so per-Data-name addressing composes with coding.
-        let bridge = LinkFecBridge::spawn(WifiFecSink { backend, src }, k, redundancy, window);
+    fn spawn(backend: Arc<dyn FrameIo>, k: usize, redundancy: u16, window: Duration) -> Self {
+        // The generation loop, the window flush, and the plan-driven R actuation are all in the
+        // bearer-agnostic bridge (task #33); the radio specifics are in the shared
+        // [`RadioFecSink`], which both faces use (#82). Everything on-air-visible rides the
+        // per-generation pin, so per-Data-name addressing and the §2 nonce compose with coding
+        // instead of being reinvented by the sink.
+        let bridge = LinkFecBridge::spawn(RadioFecSink { radio: backend }, k, redundancy, window);
         FaceFec {
             bridge,
             pending: std::sync::Mutex::new(VecDeque::new()),
         }
-    }
-}
-
-/// Inject each coded frame of a generation as its own MPDU, on the generation's MCS.
-async fn inject_coded(
-    backend: &Arc<dyn FrameIo>,
-    coded: &[Bytes],
-    mcs: Option<McsDescriptor>,
-    dst: [u8; 6],
-    src: [u8; 6],
-) {
-    let Some(mcs) = mcs else { return };
-    for f in coded {
-        let _ = backend
-            .inject_at(
-                InjectFrame {
-                    payload: f.clone(),
-                    tx: TxIntent::CONSERVATIVE,
-                    dst,
-                    src,
-                    addr3: None,
-                },
-                mcs,
-            )
-            .await;
     }
 }
 
@@ -664,12 +669,11 @@ impl MonitorWifiFace {
     /// generation; batching would bundle a whole generation into one MPDU).
     /// Both ends must enable FEC. Call before mounting (spawns the flush task).
     pub fn with_link_fec(mut self, k: usize, redundancy: u16, window: Duration) -> Self {
-        // The source is the face's fixed name-derived identity; the per-generation
-        // destination rides the pin (composes split addressing with the coded path).
-        let (_dst, src) = self.static_addr();
+        // No address is snapshotted here: the whole on-air identity (dst, src, addr3, intent) is
+        // resolved per generation from the frame that opens it and rides the pin, so coded frames
+        // are addressed exactly as uncoded ones are.
         self.fec = Some(FaceFec::spawn(
             self.backend.clone(),
-            src,
             k.max(1),
             redundancy,
             window,
@@ -680,11 +684,17 @@ impl MonitorWifiFace {
     /// Enable **link-layer A-MSDU bundling** on the send path: outbound frames
     /// are coalesced into one A-MSDU per up-to-`max_msdus` frames or `window`
     /// elapsed, whichever first — one PHY preamble for many NDN packets. Trades a
-    /// little latency for ~3–4× airtime efficiency on the broadcast medium
-    /// (`inject_amsdu`); each MSDU stays an independent NDN packet the receiver
-    /// de-aggregates, so PIT/FIB semantics are untouched. Call before mounting
-    /// (it spawns the flush task on the current runtime). A `window` of a few
-    /// milliseconds and `max_msdus` ~8–16 is a sane default.
+    /// little latency for airtime efficiency on the broadcast medium; each MSDU
+    /// stays an independent NDN packet the receiver de-aggregates, so PIT/FIB
+    /// semantics are untouched. Call before mounting (it spawns the flush task on
+    /// the current runtime). A `window` of a few milliseconds and `max_msdus`
+    /// ~8–16 is a sane default.
+    ///
+    /// The aggregation happens in the backend's
+    /// [`inject_batch_at`](ndn_radio_hal::FrameIo::inject_batch_at) override, so how much it buys is
+    /// backend-specific: AF_PACKET aggregates for real, and a backend that does not override it
+    /// falls back to individual injection with no airtime change and no error. Check the backend
+    /// before quoting a speedup — the figure that used to sit here was never measured on one.
     pub fn with_amsdu_batching(mut self, max_msdus: usize, window: Duration) -> Self {
         self.batcher = Some(TxBatcher::spawn(self.backend.clone(), max_msdus, window));
         self
@@ -1042,9 +1052,17 @@ impl Transport for MonitorWifiFace {
         // align with an object's fragments; a generation spanning objects takes the
         // opening object's address, same as it takes the opening frame's MCS.)
         if let Some(fec) = &self.fec {
-            return fec
-                .bridge
-                .send(wire, WifiPin { mcs, dst }, self.planned_redundancy());
+            return fec.bridge.send(
+                wire,
+                RadioFecPin {
+                    dst,
+                    src,
+                    addr3: self.tx_nonce(),
+                    intent: TxIntent::CONSERVATIVE,
+                    mcs: Some(mcs),
+                },
+                self.planned_redundancy(),
+            );
         }
         // The exact resolved rate travels alongside the frame (via inject_at /
         // the batcher), not on the intent — the frame's tx is a placeholder.
@@ -1592,5 +1610,66 @@ mod tests {
             0,
             "with batching on, nothing may bypass the batch seam and inject individually"
         );
+    }
+
+    /// **Tier-0 addressing must survive link-FEC.** Composing the two is offered by construction
+    /// (`with_bloom_producer` + `with_link_fec` are independent builders), so it has to work.
+    ///
+    /// Under `TxAddr::PrefixBloom` the object's 12-byte prefix-set filter is split across *both*
+    /// address fields — `resolve_addr` returns `(w[..6], w[6..])`, addr1 = filter-hi and
+    /// addr2 = filter-lo — and the receiver's `NameGate` reassembles `addr1 ‖ addr2` before testing
+    /// it. So a send path that pins only `dst` puts the face's own source in addr2, the receiver
+    /// reconstructs half a filter, and the Bloom test fails: not a lost optimisation but a **false
+    /// negative**, data dropped for a name the receiver registered.
+    ///
+    /// This asserts on the frames actually on the bus rather than on end-to-end delivery, so it
+    /// isolates the addressing from FEC decode.
+    #[tokio::test]
+    async fn tier0_addressing_survives_link_fec() {
+        use ndn_frame_io::FrameIo;
+        use ndn_transport::Transport;
+
+        const K: usize = 2;
+        let key = OPEN_GROUP_KEY;
+        let masks = crate::bloom_masks_for(&key, &[b"/x".as_slice()]);
+
+        let bus = LoopbackMonitorBus::new();
+        let sniffer = Arc::new(bus.endpoint(99, -70));
+        let producer = MonitorWifiFace::new(FaceId(1), Arc::new(bus.endpoint(1, -50)))
+            .with_bloom_producer(&key, b"/x/y")
+            .with_link_fec(K, 1, Duration::from_millis(20));
+
+        let collector = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            while let Ok(Ok(f)) =
+                tokio::time::timeout(Duration::from_millis(150), sniffer.recv_frame()).await
+            {
+                seen.push((f.group, f.addr));
+            }
+            seen
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let wire = data_pkt(&name_tlv(&[b"x", b"y"]));
+        for _ in 0..K {
+            producer.send_bytes(wire.clone()).await.unwrap();
+        }
+        let frames = collector.await.unwrap();
+
+        assert!(!frames.is_empty(), "the coded generation must reach the bus");
+        for (i, (a1, a2)) in frames.iter().enumerate() {
+            let (Some(a1), Some(a2)) = (a1, a2) else {
+                panic!("frame {i} carries no address pair");
+            };
+            let mut w = [0u8; 12];
+            w[..6].copy_from_slice(a1);
+            w[6..].copy_from_slice(a2);
+            let f = crate::PrefixFilter::from_wire(w);
+            assert!(
+                masks.iter().any(|m| f.may_match(m)),
+                "coded frame {i} must still be addressed under /x — a receiver registered on /x \
+                 reassembles addr1‖addr2 and drops it otherwise (addr1={a1:02x?} addr2={a2:02x?})"
+            );
+        }
     }
 }

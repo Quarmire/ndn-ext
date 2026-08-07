@@ -46,9 +46,8 @@ use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use async_trait::async_trait;
 use bytes::Bytes;
-use ndn_coding::link_fec_bridge::{FrameIoSink, LinkFecBridge};
+use ndn_coding::link_fec_bridge::LinkFecBridge;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio::task::JoinHandle;
 
@@ -61,29 +60,12 @@ use ndn_transport::{
 };
 
 use crate::{
-    Bandwidth, BROADCAST, CapturedFrame, DbmRange, EphemeralSource, FaceError, FaceId,
+    Bandwidth, BROADCAST, DbmRange, EphemeralSource, FaceError, FaceId,
     FrameIo, InjectFrame,
     McsDescriptor, MONITOR_MTU, OpenRadio, RadioCapability, RadioKnobs, RadioProfile, RadioTime,
     Reliability, TxIntent, WifiRadio,
     mcs_phy_rate_bps,
 };
-
-/// `Arc<dyn FrameIo>` as a concrete `FrameIo` — the link-FEC [`FrameIoSink`] takes an
-/// owned `R: FrameIo`, and a `dyn` handle needs this thin forwarder.
-struct ArcRadio(Arc<dyn FrameIo>);
-
-#[async_trait]
-impl FrameIo for ArcRadio {
-    async fn inject(&self, frame: InjectFrame) -> Result<(), FaceError> {
-        self.0.inject(frame).await
-    }
-    async fn recv_frame(&self) -> Result<CapturedFrame, FaceError> {
-        self.0.recv_frame().await
-    }
-    fn set_rate(&self, mcs: McsDescriptor) -> Result<(), FaceError> {
-        self.0.set_rate(mcs)
-    }
-}
 
 /// Measures **residual** frame loss on the delivered (post-FEC) stream via LP
 /// sequence gaps — the signal cognition drives link-FEC redundancy from (raise R
@@ -767,7 +749,7 @@ struct TxBearer {
     radio: Arc<dyn FrameIo>,
     /// `(bridge, redundancy)` when FEC is enabled: the wire is enqueued into a
     /// generation and the bridge emits `k + R` coded frames on this bearer.
-    fec: Option<(Arc<LinkFecBridge<()>>, Arc<AtomicU16>)>,
+    fec: Option<(Arc<LinkFecBridge<crate::RadioFecPin>>, Arc<AtomicU16>)>,
     /// Per-frame FEC eligibility (appropriate-traffic-only gate); `None` = all frames.
     eligible: Option<FecEligible>,
     /// Shared legacy-rate gate: when true, data injects at the basic legacy rate to reach
@@ -820,6 +802,36 @@ impl TxBearer {
         if !robust && let Some(sched) = &self.sched {
             sched.gate(&wire).await;
         }
+        // ── Address the frame FIRST, then decide how it goes out ─────────────────────────────
+        //
+        // Tier-0 (#91c): address by the object's prefix-set filter in addr1‖addr2, nonce → addr3.
+        // A non-first fragment (no inner name) has no filter of its own, so it falls back to
+        // broadcast — which every receiver's Bloom filter admits (safe over-accept; the object's
+        // first fragment already carried the discriminating filter).
+        //
+        // This block used to sit *after* the FEC branch, so a coded frame never reached it: the FEC
+        // path returned early and the sink supplied a fixed broadcast address and a nonce
+        // snapshotted once at spawn. Enabling link-FEC therefore switched Tier-0 addressing and §2
+        // nonce rotation off, silently. Computing the address before the branch is what makes the
+        // two paths incapable of disagreeing (#82).
+        let nonce = self.source.current(super::now_ms() as u64);
+        let (dst, src, addr3) = match self
+            .bloom_key
+            .as_ref()
+            .and_then(|k| crate::bloom_wire_for_wire(k, &wire))
+        {
+            // addr1 = filter hi, addr2 = filter lo, addr3 = the §2 per-frame RSSI key displaced
+            // out of addr2 by the filter.
+            Some(bf) => (
+                bf[..6].try_into().unwrap(),
+                bf[6..].try_into().unwrap(),
+                Some(nonce),
+            ),
+            // Doctrine §2: the source field carries this node's ephemeral rotating nonce, not a
+            // fixed host tag — inert to real networks, no routing meaning, per-frame RSSI key.
+            None => (BROADCAST, nonce, None),
+        };
+
         // Only route through the FEC coder when there is parity to add AND this frame
         // is FEC-eligible (appropriate-traffic-only) AND it is not a robust control frame.
         // At R=0 the generation batching would cost the tail-flush latency for no recovery;
@@ -831,32 +843,30 @@ impl TxBearer {
                 let parity = r.load(Ordering::Relaxed);
                 let eligible = self.eligible.as_ref().is_none_or(|pred| pred(&wire));
                 if parity > 0 && eligible {
-                    return bridge.send(wire, (), Some(parity));
+                    // The generation takes the opening frame's address and intent, so coded
+                    // traffic keeps both Tier-0 addressing and the legacy-rate cap. `mcs: None` —
+                    // this face holds rate as bearer state in the driver, not per frame.
+                    return bridge.send(
+                        wire,
+                        crate::RadioFecPin {
+                            dst,
+                            src,
+                            addr3,
+                            intent,
+                            mcs: None,
+                        },
+                        Some(parity),
+                    );
                 }
             }
         }
-        let nonce = self.source.current(super::now_ms() as u64);
-        // Tier-0 (#91c): address by the object's prefix-set filter in addr1‖addr2, nonce → addr3.
-        // A non-first fragment (no inner name) has no filter of its own, so it falls back to
-        // broadcast — which every receiver's Bloom filter admits (safe over-accept; the object's
-        // first fragment already carried the discriminating filter).
-        let frame = match self.bloom_key.as_ref().and_then(|k| crate::bloom_wire_for_wire(k, &wire)) {
-            Some(bf) => InjectFrame {
-                payload: wire,
-                tx: intent,
-                dst: bf[..6].try_into().unwrap(), // addr1 = filter hi
-                src: bf[6..].try_into().unwrap(), // addr2 = filter lo
-                addr3: Some(nonce), // doctrine §2 per-frame RSSI key, displaced from addr2
-            },
-            None => InjectFrame {
-                payload: wire,
-                tx: intent,
-                dst: BROADCAST,
-                // Doctrine §2: the source field carries this node's ephemeral rotating nonce, not a
-                // fixed host tag — inert to real networks, no routing meaning, per-frame RSSI key.
-                src: nonce,
-                addr3: None,
-            },
+
+        let frame = InjectFrame {
+            payload: wire,
+            tx: intent,
+            dst,
+            src,
+            addr3,
         };
         // A-MSDU bundling (#82 part 2): a non-robust data frame is coalesced instead of injected
         // one at a time. Robust control frames fall through — a report or time beacon must reach the
@@ -944,24 +954,25 @@ impl RunningMedium {
         let source = Arc::new(EphemeralSource::new(boot_seed, NONCE_ROTATION_MS));
 
         for b in bearers {
-            // One link-FEC bridge per bearer (shared TX-encode / RX-decode) when
-            // enabled: the sink injects each coded frame on this bearer, and the
-            // reader feeds captured frames through the same bridge's decoder.
-            let bridge = fec.as_ref().map(|fc| {
-                Arc::new(LinkFecBridge::spawn(
-                    FrameIoSink::new(
-                        ArcRadio(b.radio.clone()),
-                        BROADCAST,
-                        // Doctrine §2 nonce snapshot for this bridge's lifetime (the FEC sink holds a
-                        // fixed src; it re-snapshots on rebuild). The main data path rotates per-frame.
-                        source.current(super::now_ms() as u64),
-                        TxIntent::CONSERVATIVE,
-                    ),
-                    fc.k,
-                    0,
-                    fc.window,
-                ))
-            });
+            // One link-FEC bridge per bearer (shared TX-encode / RX-decode) when enabled: the sink
+            // injects each coded frame on this bearer, and the reader feeds captured frames through
+            // the same bridge's decoder.
+            //
+            // The sink is `crate::RadioFecSink`, shared with `MonitorWifiFace` (#82). It replaced
+            // `ndn-coding`'s generic `FrameIoSink`, which took a fixed broadcast dst and **one nonce
+            // snapshotted for the bridge's whole lifetime** — so turning link-FEC on turned Tier-0
+            // addressing and §2 nonce rotation off. Address, nonce and intent now ride the
+            // per-generation pin, resolved by the same code the direct send path uses.
+            let bridge = fec
+                .as_ref()
+                .map(|fc| {
+                    Arc::new(LinkFecBridge::spawn(
+                        crate::RadioFecSink { radio: b.radio.clone() },
+                        fc.k,
+                        0,
+                        fc.window,
+                    ))
+                });
             // The data-centric time-slice/FHSS scheduler (#61/#40), per bearer so a hop retunes its own
             // radio via that bearer's knobs. Constructed from `NDN_SCHED_*`; `None` ⇒ send path
             // unchanged. Shared (Arc) with this bearer's RX reader so inbound hardware stamps feed the
@@ -1708,5 +1719,77 @@ mod tests {
             Reliability::MostRobust,
             "the frame that bypassed must be the robust one"
         );
+    }
+    /// **The medium's coded frames must carry Tier-0 addressing and a fresh §2 nonce too.**
+    ///
+    /// The medium's FEC path used `ndn-coding`'s generic `FrameIoSink`, constructed with a fixed
+    /// `BROADCAST` dst and one nonce snapshotted for the bridge's whole lifetime — and the FEC
+    /// branch returned *before* the block that computes Tier-0 addressing. So enabling link-FEC
+    /// silently switched off both name addressing and nonce rotation on this face, the same defect
+    /// `MonitorWifiFace` had in its own dialect (#82).
+    ///
+    /// Both faces now share `RadioFecSink` and pin the address the direct path resolves. This
+    /// asserts the coded frames land under the registered prefix, and that addr3 carries a nonce
+    /// rather than the sink's fixed source.
+    #[tokio::test]
+    async fn medium_tier0_addressing_survives_link_fec() {
+        use crate::OPEN_GROUP_KEY;
+
+        const K: usize = 2;
+        let key = OPEN_GROUP_KEY;
+        let masks = crate::bloom_masks_for(&key, &[b"/x".as_slice()]);
+
+        let bus = LoopbackMonitorBus::new();
+        let sniffer = Arc::new(bus.endpoint(99, -70));
+        let medium = RadioMediumFace::new(
+            FaceId(5),
+            vec![RadioBearer::new(RadioId(0), Arc::new(bus.endpoint(5, -50)), cap())],
+        )
+        .with_bloom(&key, &[b"/x/y".as_slice()])
+        .with_link_fec(
+            K,
+            Duration::from_millis(20),
+            Arc::new(AtomicU16::new(1)),
+            Arc::new(LossMeter::default()),
+        )
+        .build();
+
+        let collector = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            while let Ok(Ok(f)) =
+                tokio::time::timeout(Duration::from_millis(150), sniffer.recv_frame()).await
+            {
+                seen.push((f.group, f.addr, f.addr3));
+            }
+            seen
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let wire = data_pkt(&name_tlv(&[b"x", b"y"]));
+        for _ in 0..K {
+            medium.send_bytes(wire.clone()).await.unwrap();
+        }
+        let frames = collector.await.unwrap();
+
+        assert!(!frames.is_empty(), "the coded generation must reach the bus");
+        for (i, (a1, a2, a3)) in frames.iter().enumerate() {
+            let (Some(a1), Some(a2)) = (a1, a2) else {
+                panic!("coded frame {i} carries no address pair");
+            };
+            let mut w = [0u8; 12];
+            w[..6].copy_from_slice(a1);
+            w[6..].copy_from_slice(a2);
+            assert!(
+                masks
+                    .iter()
+                    .any(|m| crate::PrefixFilter::from_wire(w).may_match(m)),
+                "coded frame {i} must stay addressed under /x (addr1={a1:02x?} addr2={a2:02x?})"
+            );
+            assert!(
+                a3.is_some(),
+                "coded frame {i} must carry the doctrine §2 nonce in addr3, displaced there by the \
+                 filter — the old sink dropped it entirely"
+            );
+        }
     }
 }
