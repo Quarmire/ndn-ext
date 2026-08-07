@@ -532,6 +532,10 @@ pub struct RadioMediumFace {
 struct BloomCfg {
     key: crate::GroupKey,
     masks: Arc<[crate::PrefixFilter]>,
+    /// **Tier-1** (#92), when this medium runs one — previously reachable only from
+    /// `MonitorWifiFace`. Part of #82: the features belong to the medium, not to whichever face
+    /// happened to grow them first.
+    tier1: Option<Arc<std::sync::RwLock<crate::tier1::Tier1>>>,
 }
 
 /// Predicate deciding whether an outbound wire is **FEC-eligible** — i.e. wants the
@@ -579,6 +583,7 @@ impl RadioMediumFace {
         self.bloom = Some(BloomCfg {
             key: *key,
             masks: crate::bloom_masks_for(key, registered_prefixes),
+            tier1: None,
         });
         self
     }
@@ -902,7 +907,12 @@ impl RunningMedium {
             let rx_bridge = bridge;
             let loss = fec.as_ref().map(|fc| fc.loss.clone());
             let sched_rx = sched.clone();
-            let rx_masks = bloom.as_ref().map(|b| b.masks.clone());
+            let rx_gate = bloom.as_ref().map(|b| {
+                std::sync::Arc::new(crate::NameGate::new(
+                    crate::RxFilter::Bloom(b.masks.clone()),
+                    b.tier1.clone(),
+                ))
+            });
             tasks.push(tokio::spawn(async move {
                 let mut last_mesh_cv = 0u64; // last mesh common-view observation count ingested (#74)
                 loop {
@@ -943,17 +953,14 @@ impl RunningMedium {
                             // Tier-0 name filter (#91c): drop frames not under any registered prefix
                             // before they reach signals or the engine. The frame's filter is
                             // addr1‖addr2 (f.group‖f.addr); broadcast (no group) always passes.
-                            if let Some(masks) = rx_masks.as_ref()
-                                && let (Some(g), Some(a2)) = (f.group, f.addr)
-                                && g != BROADCAST
+                            // #82: the SAME gate `MonitorWifiFace` uses, from the same code. This
+                            // was an open-coded Tier-0-only copy — no Tier-1, no NDN-NIC baseline, no
+                            // drop accounting — and every filtering feature added recently landed
+                            // only on the other face. Sharing it is what stops the two diverging.
+                            if let Some(gate) = rx_gate.as_ref()
+                                && !gate.admits(f.group, f.addr, &f.payload)
                             {
-                                let mut wire = [0u8; 12];
-                                wire[..6].copy_from_slice(&g);
-                                wire[6..].copy_from_slice(&a2);
-                                let frame_bf = crate::PrefixFilter::from_wire(wire);
-                                if !masks.iter().any(|m| frame_bf.may_match(m)) {
-                                    continue; // definitely not under any of our prefixes
-                                }
+                                continue;
                             }
                             // The sender's ephemeral nonce is in addr3 under the Tier-0 layout, else
                             // in addr2 (legacy). This one accessor keys per-neighbour signals and the

@@ -165,6 +165,7 @@ pub mod measure;
 
 // #91 Tier-0: the in-frame prefix-set Bloom filter (addr1 ‖ addr2). Zero-parse name matching that
 // replaces the name-group hash; ported from the measured firmware reference. See the module docs.
+pub mod name_gate;
 pub mod ndn_nic;
 pub mod tier0;
 pub mod tier1;
@@ -189,7 +190,7 @@ pub const ESPNOW_MTU: usize = ESPNOW_MAX_BODY;
 /// Coalesces queued outbound frames into **A-MSDU bursts** — the face-level
 /// realization of radio-layer bundling. [`submit`](Self::submit) is non-blocking;
 /// a background task drains up to `max_msdus` frames within a latency `window`
-/// and hands them to [`WifiRadio::inject_batch_at`] (one A-MSDU per same-dst/src/mcs
+/// and hands them to [`inject_batch_at_rate`] (one A-MSDU per same-dst/src/mcs
 /// run). Each MSDU stays an independent NDN packet (the receiver de-aggregates),
 /// so only airtime is shared — the throughput↔latency knob, not NDN-layer Interest
 /// bundling. Started by [`MonitorWifiFace::with_amsdu_batching`]. Each queued frame
@@ -199,7 +200,7 @@ struct TxBatcher {
 }
 
 impl TxBatcher {
-    fn spawn(backend: Arc<dyn WifiRadio>, max_msdus: usize, window: Duration) -> Self {
+    fn spawn(backend: Arc<dyn FrameIo>, max_msdus: usize, window: Duration) -> Self {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(InjectFrame, McsDescriptor)>();
         tokio::spawn(async move {
             while let Some(first) = rx.recv().await {
@@ -211,7 +212,7 @@ impl TxBatcher {
                         _ => break, // window elapsed, or the face was dropped
                     }
                 }
-                let _ = backend.inject_batch_at(batch).await;
+                let _ = inject_batch_at_rate(&backend, batch).await;
             }
         });
         TxBatcher { tx }
@@ -237,7 +238,7 @@ struct WifiPin {
 }
 
 struct WifiFecSink {
-    backend: Arc<dyn WifiRadio>,
+    backend: Arc<dyn FrameIo>,
     /// The source (name-derived, fixed for the face); the dst is pinned per generation.
     src: [u8; 6],
 }
@@ -266,7 +267,7 @@ struct FaceFec {
 
 impl FaceFec {
     fn spawn(
-        backend: Arc<dyn WifiRadio>,
+        backend: Arc<dyn FrameIo>,
         src: [u8; 6],
         k: usize,
         redundancy: u16,
@@ -286,7 +287,7 @@ impl FaceFec {
 
 /// Inject each coded frame of a generation as its own MPDU, on the generation's MCS.
 async fn inject_coded(
-    backend: &Arc<dyn WifiRadio>,
+    backend: &Arc<dyn FrameIo>,
     coded: &[Bytes],
     mcs: Option<McsDescriptor>,
     dst: [u8; 6],
@@ -294,18 +295,18 @@ async fn inject_coded(
 ) {
     let Some(mcs) = mcs else { return };
     for f in coded {
-        let _ = backend
-            .inject_at(
-                InjectFrame {
-                    payload: f.clone(),
-                    tx: TxIntent::CONSERVATIVE,
-                    dst,
-                    src,
-                    addr3: None,
-                },
-                mcs,
-            )
-            .await;
+        let _ = inject_at_rate(
+            &backend,
+            InjectFrame {
+                payload: f.clone(),
+                tx: TxIntent::CONSERVATIVE,
+                dst,
+                src,
+                addr3: None,
+            },
+            mcs,
+        )
+        .await;
     }
 }
 
@@ -328,24 +329,10 @@ pub enum TxAddr {
     },
 }
 
-/// **Which received frames pass the pre-decode filter** — the RX-side capability,
-/// independent of [`TxAddr`]. A promiscuous/broadcast node sets `Open`, a Tier-0 node `Bloom`.
-/// Broadcast frames always pass.
-#[derive(Clone)]
-pub enum RxFilter {
-    /// Keep every frame (promiscuous / broadcast join).
-    Open,
-    /// **Tier-0** (#91): keep any frame whose in-frame prefix-set filter (`addr1 ‖ addr2`)
-    /// could be under one of these registered-prefix masks (`may_match`). Each mask is
-    /// [`PrefixFilter::mask_for`] of a prefix this node registered; the test is exact on the
-    /// negative (definitely-not-under → drop, never parse) and over-accepts on the positive.
-    Bloom(std::sync::Arc<[PrefixFilter]>),
-    /// **The NDN-NIC baseline** (#101) — receiver-side BF-FIB over registered prefixes, queried with
-    /// the *parsed* name. Present so Tier-0 can be A/B'd against the published design on identical
-    /// traffic rather than against a number quoted from the paper. **Not for production**: it needs
-    /// the parse Tier-0 exists to avoid, so selecting it forfeits the entire point.
-    NdnNic(std::sync::Arc<crate::ndn_nic::NdnNicFilter>),
-}
+// `RxFilter` moved to `name_gate` (#82) — the gate is now one implementation shared by both
+// faces, instead of this enum being matched separately in each.
+pub use name_gate::{NameGate, RxFilter};
+
 
 /// Extract the NDN **Name** TLV bytes from an LP-framed wire frame's inner packet,
 /// for [`TxAddr::PrefixBloom`]. Returns `None` for a non-first fragment (the name is
@@ -480,9 +467,39 @@ fn named_tlv_value(parent: &[u8], want: u64) -> Option<&[u8]> {
     None
 }
 
+
+/// `set_rate` then `inject` — what [`WifiRadio::inject_at`] does, over the plain data plane.
+///
+/// #82/#83: `MonitorWifiFace` used to demand `Arc<dyn WifiRadio>` solely for this and its batch
+/// twin. `WifiRadio` adds no required methods — only these two, both *derived* from
+/// `FrameIo::set_rate` + `FrameIo::inject` — yet **only 2 of 7 backends implement it**, so the face
+/// could not accept most of the radios in the tree. Taking `FrameIo` instead costs two small
+/// helpers and makes the face work with every backend, which is also what unifies its seam with
+/// `RadioBearer`'s.
+async fn inject_at_rate(
+    io: &Arc<dyn FrameIo>,
+    frame: InjectFrame,
+    mcs: McsDescriptor,
+) -> Result<(), FaceError> {
+    io.set_rate(mcs)?;
+    io.inject(frame).await
+}
+
+/// The batch twin — one `set_rate` per frame, same as [`WifiRadio::inject_batch_at`].
+async fn inject_batch_at_rate(
+    io: &Arc<dyn FrameIo>,
+    frames: Vec<(InjectFrame, McsDescriptor)>,
+) -> Result<(), FaceError> {
+    for (f, mcs) in frames {
+        io.set_rate(mcs)?;
+        io.inject(f).await?;
+    }
+    Ok(())
+}
+
 pub struct MonitorWifiFace {
     id: FaceId,
-    backend: Arc<dyn WifiRadio>,
+    backend: Arc<dyn FrameIo>,
     mtu: usize,
     policy: McsPolicy,
     signal_sink: Option<Arc<dyn SignalStore<FaceId> + Send + Sync>>,
@@ -491,8 +508,8 @@ pub struct MonitorWifiFace {
     last_rssi: AtomicI8,
     /// TX name-addressing capability (how outgoing `addr1` is chosen).
     tx_addr: TxAddr,
-    /// RX name-filtering capability (which frames pass before decode).
-    rx_filter: RxFilter,
+    /// Name filtering (Tier-0 + optional Tier-1), shared with `RadioMediumFace` (#82).
+    gate: NameGate,
     /// **Tier-1** (#92), when this node runs one: BF-FIB / BF-PIT / BF-CS consulted on the parsed
     /// name *after* Tier-0 admits a frame. `None` on an endpoint, where Tier-0 alone is the right
     /// trade (#101: Tier-0's FP climbs with registered-prefix count, so it suits small E and a relay
@@ -538,7 +555,7 @@ pub struct MonitorWifiFace {
 impl MonitorWifiFace {
     /// New monitor-mode face over `backend`, sized for fragmented NDN traffic
     /// (`MONITOR_MTU`) and injecting at the conservative default rate.
-    pub fn new(id: FaceId, backend: Arc<dyn WifiRadio>) -> Self {
+    pub fn new(id: FaceId, backend: Arc<dyn FrameIo>) -> Self {
         Self {
             id,
             backend,
@@ -547,7 +564,7 @@ impl MonitorWifiFace {
             signal_sink: None,
             last_rssi: AtomicI8::new(-70),
             tx_addr: TxAddr::Broadcast,
-            rx_filter: RxFilter::Open,
+            gate: NameGate::open(),
             tier1: None,
             tier1_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             bloom_cache: Mutex::new(HashMap::new()),
@@ -579,7 +596,7 @@ impl MonitorWifiFace {
     /// the broadcast addressing ESP-NOW requires is the default (no name-group).
     /// Chainable with [`with_signal_sink`](Self::with_signal_sink),
     /// [`with_link_fec`](Self::with_link_fec), etc.
-    pub fn espnow(id: FaceId, backend: Arc<dyn WifiRadio>) -> Self {
+    pub fn espnow(id: FaceId, backend: Arc<dyn FrameIo>) -> Self {
         Self::new(id, backend).with_mtu(ESPNOW_MTU)
     }
 
@@ -696,7 +713,7 @@ impl MonitorWifiFace {
 
     /// Set the RX name-filtering capability directly (compose with [`with_tx_addr`]).
     pub fn with_rx_filter(mut self, rx: RxFilter) -> Self {
-        self.rx_filter = rx;
+        self.gate = NameGate::new(rx, self.gate.tier1());
         self
     }
 
@@ -717,7 +734,7 @@ impl MonitorWifiFace {
             t.register_prefix(p.as_ref());
         }
         t.sync();
-        self.tier1 = Some(Arc::new(std::sync::RwLock::new(t)));
+        self.gate = NameGate::new(self.gate.filter(), Some(Arc::new(std::sync::RwLock::new(t))));
         self
     }
 
@@ -729,12 +746,12 @@ impl MonitorWifiFace {
     /// lose efficiency — a stale BF-PIT **drops Data the node is waiting for**, which is a false
     /// negative and the one failure mode this design must not have.
     pub fn tier1_handle(&self) -> Option<Arc<std::sync::RwLock<crate::tier1::Tier1>>> {
-        self.tier1.clone()
+        self.gate.tier1()
     }
 
     /// Frames rejected by Tier-1 since start.
     pub fn tier1_dropped(&self) -> u64 {
-        self.tier1_dropped.load(Ordering::Relaxed)
+        self.gate.dropped_tier1()
     }
 
     /// Build a [`RxFilter::Bloom`] over `prefixes` under `key`: one precomputed
@@ -898,41 +915,14 @@ impl MonitorWifiFace {
         }
     }
 
-    /// Does a captured frame pass this face's [`RxFilter`]? `addr1` is `f.group`, `addr2`
-    /// is `f.addr` — together the 12 bytes the Tier-0 filter rides in. Broadcast always passes.
+    /// Does a captured frame pass this face's name filtering? Delegates to the shared
+    /// [`NameGate`] (#82) — the same decision `RadioMediumFace` makes, from the same code.
     fn rx_accepts(&self, addr1: Option<[u8; 6]>, addr2: Option<[u8; 6]>, wire: &[u8]) -> bool {
-        let Some(a) = addr1 else { return true };
-        if a == BROADCAST {
-            return true;
-        }
-        match &self.rx_filter {
-            RxFilter::Open => true,
-            RxFilter::Bloom(masks) => {
-                // Reconstruct the frame's filter from addr1 ‖ addr2 and test each registered
-                // prefix mask. `may_match(false)` is exact — that prefix is definitely not an
-                // ancestor; a true from *any* mask admits the frame to the software tier.
-                let Some(a2) = addr2 else { return true };
-                let mut wire = [0u8; 12];
-                wire[..6].copy_from_slice(&a);
-                wire[6..].copy_from_slice(&a2);
-                let frame = PrefixFilter::from_wire(wire);
-                masks.iter().any(|m| frame.may_match(m))
-            }
-            // The baseline's cost is visible right here: it cannot answer without `inner_name`,
-            // i.e. without decoding far enough into the frame to find the Name TLV. Tier-0's arm
-            // above never touches `wire`. A non-first fragment carries no name, so it is admitted —
-            // the same safe over-accept the TX path makes when it cannot build a filter.
-            RxFilter::NdnNic(bf) => match inner_name(wire) {
-                Some(name) => bf.may_serve(&ndn_name_to_slash(name)),
-                None => true,
-            },
-        }
+        self.gate.admits(addr1, addr2, wire)
     }
 
     /// The rate to inject the next frame at. A control-plane plan
     /// ([`with_planned_params`]) wins when present; otherwise the static policy.
-    ///
-    /// [`with_planned_params`]: MonitorWifiFace::with_planned_params
     fn select_mcs(&self) -> McsDescriptor {
         if let Some(cell) = &self.planned
             && let Ok(guard) = cell.read()
@@ -1075,7 +1065,7 @@ impl Transport for MonitorWifiFace {
         // by the flush task; otherwise it is injected immediately.
         match &self.batcher {
             Some(b) => b.submit(frame, mcs),
-            None => self.backend.inject_at(frame, mcs).await,
+            None => inject_at_rate(&self.backend, frame, mcs).await,
         }
     }
 
