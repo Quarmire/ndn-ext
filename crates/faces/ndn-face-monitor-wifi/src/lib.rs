@@ -190,11 +190,18 @@ pub const ESPNOW_MTU: usize = ESPNOW_MAX_BODY;
 /// Coalesces queued outbound frames into **A-MSDU bursts** — the face-level
 /// realization of radio-layer bundling. [`submit`](Self::submit) is non-blocking;
 /// a background task drains up to `max_msdus` frames within a latency `window`
-/// and hands them to [`inject_batch_at_rate`] (one A-MSDU per same-dst/src/mcs
-/// run). Each MSDU stays an independent NDN packet (the receiver de-aggregates),
+/// and hands them to [`FrameIo::inject_batch_at`](ndn_radio_hal::FrameIo::inject_batch_at), which
+/// the AF_PACKET backend overrides with real aggregation (one A-MSDU per same-RA run, greedily
+/// packed). Each MSDU stays an independent NDN packet (the receiver de-aggregates),
 /// so only airtime is shared — the throughput↔latency knob, not NDN-layer Interest
 /// bundling. Started by [`MonitorWifiFace::with_amsdu_batching`]. Each queued frame
 /// carries its resolved MCS, so the exact rate rides the batch, not the seam.
+///
+/// The aggregation is **the backend's**, and is reached only by calling `inject_batch_at` on the
+/// trait object. #82 part 1 briefly routed this through a local free function holding a copy of the
+/// trait's *default* body, which dispatches to no override and quietly turned every batch back into
+/// individual MPDUs — no error, no log, just the airtime saving gone. Part 2 restored the virtual
+/// call and moved the method onto `FrameIo` so the seam a face holds is the seam that aggregates.
 struct TxBatcher {
     tx: tokio::sync::mpsc::UnboundedSender<(InjectFrame, McsDescriptor)>,
 }
@@ -212,7 +219,7 @@ impl TxBatcher {
                         _ => break, // window elapsed, or the face was dropped
                     }
                 }
-                let _ = inject_batch_at_rate(&backend, batch).await;
+                let _ = backend.inject_batch_at(batch).await;
             }
         });
         TxBatcher { tx }
@@ -295,18 +302,18 @@ async fn inject_coded(
 ) {
     let Some(mcs) = mcs else { return };
     for f in coded {
-        let _ = inject_at_rate(
-            &backend,
-            InjectFrame {
-                payload: f.clone(),
-                tx: TxIntent::CONSERVATIVE,
-                dst,
-                src,
-                addr3: None,
-            },
-            mcs,
-        )
-        .await;
+        let _ = backend
+            .inject_at(
+                InjectFrame {
+                    payload: f.clone(),
+                    tx: TxIntent::CONSERVATIVE,
+                    dst,
+                    src,
+                    addr3: None,
+                },
+                mcs,
+            )
+            .await;
     }
 }
 
@@ -468,34 +475,23 @@ fn named_tlv_value(parent: &[u8], want: u64) -> Option<&[u8]> {
 }
 
 
-/// `set_rate` then `inject` — what [`WifiRadio::inject_at`] does, over the plain data plane.
-///
-/// #82/#83: `MonitorWifiFace` used to demand `Arc<dyn WifiRadio>` solely for this and its batch
-/// twin. `WifiRadio` adds no required methods — only these two, both *derived* from
-/// `FrameIo::set_rate` + `FrameIo::inject` — yet **only 2 of 7 backends implement it**, so the face
-/// could not accept most of the radios in the tree. Taking `FrameIo` instead costs two small
-/// helpers and makes the face work with every backend, which is also what unifies its seam with
-/// `RadioBearer`'s.
-async fn inject_at_rate(
-    io: &Arc<dyn FrameIo>,
-    frame: InjectFrame,
-    mcs: McsDescriptor,
-) -> Result<(), FaceError> {
-    io.set_rate(mcs)?;
-    io.inject(frame).await
-}
-
-/// The batch twin — one `set_rate` per frame, same as [`WifiRadio::inject_batch_at`].
-async fn inject_batch_at_rate(
-    io: &Arc<dyn FrameIo>,
-    frames: Vec<(InjectFrame, McsDescriptor)>,
-) -> Result<(), FaceError> {
-    for (f, mcs) in frames {
-        io.set_rate(mcs)?;
-        io.inject(f).await?;
-    }
-    Ok(())
-}
+// `inject_at` / `inject_batch_at` are called straight on `FrameIo` — there are no local helpers.
+//
+// #82 part 1 moved this face from `Arc<dyn WifiRadio>` to `Arc<dyn FrameIo>`. That was the right
+// change (only 2 of 7 backends implement `WifiRadio`, so the face could not accept most of the
+// radios in the tree), but the two rate-carrying methods lived on `WifiRadio`, out of reach of a
+// `dyn FrameIo`. So it grew private `inject_at_rate` / `inject_batch_at_rate` free functions that
+// reproduced the traits' *default* bodies — reasoning, wrongly, that both were purely derived from
+// `set_rate` + `inject` and therefore safe to inline.
+//
+// `inject_batch_at` is **overridden**: `AfPacketBackend` implements it as real A-MSDU aggregation
+// (one QoS-Data MPDU per RA, greedily packed — the big airtime lever at S1G). A free function
+// copying the default body cannot dispatch to an override, so the A-MSDU batcher silently went back
+// to one MPDU per frame. Nothing failed; the frames still went out; only the aggregation vanished.
+//
+// Part 2 fixes the cause instead of the call site: `inject_at` and `inject_batch_at` now live on
+// `FrameIo` (see the note on `WifiRadio` in ndn-radio-hal), so the object-safe seam a face actually
+// holds is the one carrying the overridable behaviour, and the helpers are gone.
 
 pub struct MonitorWifiFace {
     id: FaceId,
@@ -1065,7 +1061,7 @@ impl Transport for MonitorWifiFace {
         // by the flush task; otherwise it is injected immediately.
         match &self.batcher {
             Some(b) => b.submit(frame, mcs),
-            None => inject_at_rate(&self.backend, frame, mcs).await,
+            None => self.backend.inject_at(frame, mcs).await,
         }
     }
 
@@ -1528,5 +1524,73 @@ mod tests {
         // The /w consumer hears none of them (exact negative — no false accept expected here).
         let none = tokio::time::timeout(Duration::from_millis(150), other.recv_bytes_with_addr()).await;
         assert!(none.is_err(), "an unrelated prefix must not match the /x family");
+    }
+
+    /// **The A-MSDU batcher must reach the backend's `inject_batch_at` override.**
+    ///
+    /// This is the regression test for the defect #82 part 2 found: part 1 replaced
+    /// `backend.inject_batch_at(batch)` with a free function holding a copy of the trait's default
+    /// body. Every existing test still passed — the frames went out, the payloads were right, the
+    /// counts were right. The only casualty was dynamic dispatch, so `AfPacketBackend`'s real
+    /// A-MSDU aggregation stopped being called and the batcher quietly became a no-op that costs
+    /// latency.
+    ///
+    /// Nothing in the suite observed *which* method the batcher called, which is why a silent
+    /// airtime regression could ship. So this test asserts on the seam itself: a backend that
+    /// overrides `inject_batch_at` must see the batch arrive there, not as N separate `inject`s.
+    #[tokio::test]
+    async fn amsdu_batching_dispatches_to_the_backend_override() {
+        /// A backend that aggregates the way AF_PACKET does — it overrides `inject_batch_at` and
+        /// records that the override ran, plus how many frames it was handed at once.
+        struct AggregatingBackend {
+            batches: std::sync::Mutex<Vec<usize>>,
+            singles: std::sync::atomic::AtomicU64,
+        }
+
+        #[async_trait::async_trait]
+        impl FrameIo for AggregatingBackend {
+            async fn inject(&self, _frame: InjectFrame) -> Result<(), FaceError> {
+                self.singles.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            async fn inject_batch_at(
+                &self,
+                frames: Vec<(InjectFrame, McsDescriptor)>,
+            ) -> Result<(), FaceError> {
+                self.batches.lock().unwrap().push(frames.len());
+                Ok(())
+            }
+            async fn recv_frame(&self) -> Result<CapturedFrame, FaceError> {
+                std::future::pending().await
+            }
+        }
+
+        let backend = Arc::new(AggregatingBackend {
+            batches: std::sync::Mutex::new(Vec::new()),
+            singles: std::sync::atomic::AtomicU64::new(0),
+        });
+        let face = MonitorWifiFace::new(FaceId(1), backend.clone())
+            .with_amsdu_batching(8, Duration::from_millis(5));
+
+        for i in 0..4u8 {
+            face.send_bytes(Bytes::from(vec![i; 16])).await.unwrap();
+        }
+        // One flush window plus slack, so the batcher's timer fires.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let batches = backend.batches.lock().unwrap().clone();
+        let total: usize = batches.iter().sum();
+        assert!(
+            !batches.is_empty(),
+            "the batcher must call inject_batch_at — the backend's aggregation lives there; \
+             seeing zero batches is exactly the #82-part-1 regression (singles={})",
+            backend.singles.load(Ordering::Relaxed)
+        );
+        assert_eq!(total, 4, "every submitted frame must reach the override: {batches:?}");
+        assert_eq!(
+            backend.singles.load(Ordering::Relaxed),
+            0,
+            "with batching on, nothing may bypass the batch seam and inject individually"
+        );
     }
 }

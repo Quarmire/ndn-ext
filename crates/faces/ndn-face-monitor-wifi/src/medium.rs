@@ -32,9 +32,14 @@
 //!
 //! v1 scope: broadcast addressing and diversity fan-out (every allocated bearer
 //! transmits). The plan-driven *primary-vs-replica* refinement (transmit on the
-//! subset the `RadioPlan` selects, honouring per-radio channel) and the name-group
-//! / link-FEC / A-MSDU features of [`MonitorWifiFace`] are follow-ups; the
+//! subset the `RadioPlan` selects, honouring per-radio channel) remains a follow-up; the
 //! abstraction (one face, N capabilities, union RX, fan-out TX) is complete here.
+//!
+//! The feature gap versus [`MonitorWifiFace`] that this note used to describe is closed (#82):
+//! name-group addressing and link-FEC arrived earlier, the shared [`NameGate`](crate::NameGate)
+//! landed in part 1, and A-MSDU — the last genuinely one-sided feature — landed in part 2. What
+//! remains of #82 is the structural half: `MonitorWifiFace` becoming a one-bearer construction of
+//! this face rather than a parallel implementation of it.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
@@ -524,6 +529,55 @@ pub struct RadioMediumFace {
     /// dropped unless their filter could be under one of the registered masks. `None` ⇒ broadcast
     /// addressing (the historical behaviour).
     bloom: Option<BloomCfg>,
+    /// **A-MSDU bundling** (#82 part 2), when enabled: outbound data frames are coalesced and handed
+    /// to the bearer's [`FrameIo::inject_batch`], which the AF_PACKET and RTL/MT7612 backends
+    /// override with real aggregation. This was the one genuinely one-sided feature in #82 —
+    /// `MonitorWifiFace` had it and the medium did not.
+    amsdu: Option<AmsduCfg>,
+}
+
+/// A-MSDU bundling parameters for the medium: flush after `max_msdus` frames or `window`, whichever
+/// comes first.
+#[derive(Clone, Copy)]
+struct AmsduCfg {
+    max_msdus: usize,
+    window: Duration,
+}
+
+/// The medium's send-coalescer: one per bearer, submitting whole batches to that bearer's
+/// [`FrameIo::inject_batch`].
+///
+/// It carries no MCS, unlike `MonitorWifiFace`'s batcher. The medium models rate as **bearer state**
+/// (the driver holds it; the face sends [`TxIntent`]s), so there is no per-frame descriptor to
+/// attach — which is exactly why `ndn-frame-io`'s AF_PACKET backend gained an `inject_batch` that
+/// aggregates at the currently-set rate. Aggregating only through the rate-carrying spelling would
+/// have made this move silently lose A-MSDU on the S1G path.
+struct MediumBatcher {
+    tx: mpsc::UnboundedSender<InjectFrame>,
+}
+
+impl MediumBatcher {
+    fn spawn(radio: Arc<dyn FrameIo>, cfg: AmsduCfg) -> (Self, JoinHandle<()>) {
+        let (tx, mut rx) = mpsc::unbounded_channel::<InjectFrame>();
+        let handle = tokio::spawn(async move {
+            while let Some(first) = rx.recv().await {
+                let mut batch = vec![first];
+                let deadline = tokio::time::Instant::now() + cfg.window;
+                while batch.len() < cfg.max_msdus {
+                    match tokio::time::timeout_at(deadline, rx.recv()).await {
+                        Ok(Some(f)) => batch.push(f),
+                        _ => break, // window elapsed, or the face was torn down
+                    }
+                }
+                let _ = radio.inject_batch(batch).await;
+            }
+        });
+        (MediumBatcher { tx }, handle)
+    }
+
+    fn submit(&self, frame: InjectFrame) -> Result<(), FaceError> {
+        self.tx.send(frame).map_err(|_| FaceError::Closed)
+    }
 }
 
 /// Tier-0 addressing config for the medium: the group key that keys the filter, and the receiver's
@@ -571,6 +625,7 @@ impl RadioMediumFace {
             fec: None,
             legacy_gate: None,
             bloom: None,
+            amsdu: None,
         }
     }
 
@@ -632,6 +687,27 @@ impl RadioMediumFace {
         if let Some(fec) = &mut self.fec {
             fec.eligible = Some(pred);
         }
+        self
+    }
+
+    /// Enable **A-MSDU bundling** on every bearer's data path: outbound frames are coalesced into
+    /// one batch per up-to-`max_msdus` frames or `window` elapsed, whichever comes first, and handed
+    /// to that bearer's [`FrameIo::inject_batch`] — which AF_PACKET, RTL and MT7612 override with
+    /// real aggregation (one MPDU carrying many MSDUs, one PHY preamble). Each MSDU stays an
+    /// independent NDN packet the receiver de-aggregates, so PIT/FIB semantics are untouched.
+    ///
+    /// Robust control frames (reports, discovery, time beacons) **bypass** the batcher: they must
+    /// reach the worst receiver now, not wait out a flush window. So does link-FEC — a coded
+    /// generation already interleaves its own frames, and stacking the two would only add latency.
+    ///
+    /// How much this buys is the backend's business, not the face's: a driver that does not override
+    /// `inject_batch` falls back to individual injection with no airtime change, no error and no
+    /// log. Measure the backend before quoting a number.
+    pub fn with_amsdu_batching(mut self, max_msdus: usize, window: Duration) -> Self {
+        self.amsdu = Some(AmsduCfg {
+            max_msdus: max_msdus.max(1),
+            window,
+        });
         self
     }
 
@@ -708,6 +784,9 @@ struct TxBearer {
     /// Tier-0 group key (#91c): when set, the frame's `addr1 ‖ addr2` carry the object's prefix-set
     /// filter and the nonce moves to `addr3`. `None` ⇒ broadcast `addr1`, nonce in `addr2`.
     bloom_key: Option<crate::GroupKey>,
+    /// A-MSDU coalescer for this bearer's data path (#82 part 2). `None` ⇒ inject each frame
+    /// directly. Never used for robust control frames, and never combined with FEC.
+    batcher: Option<MediumBatcher>,
 }
 
 impl TxBearer {
@@ -779,6 +858,13 @@ impl TxBearer {
                 addr3: None,
             },
         };
+        // A-MSDU bundling (#82 part 2): a non-robust data frame is coalesced instead of injected
+        // one at a time. Robust control frames fall through — a report or time beacon must reach the
+        // worst receiver *now*, and holding one for a flush window would blunt exactly the
+        // worst-overheard-receiver reach the ROBUST intent exists to guarantee.
+        if !robust && let Some(bat) = &self.batcher {
+            return bat.submit(frame);
+        }
         self.radio.inject(frame).await
     }
 }
@@ -836,6 +922,7 @@ impl RunningMedium {
             fec,
             legacy_gate,
             bloom,
+            amsdu,
         } = cfg;
 
         let (tx_chan, rx_chan) = mpsc::unbounded_channel();
@@ -885,8 +972,28 @@ impl RunningMedium {
             if let Some(s) = &sched {
                 tracing::info!(target: "monitor-wifi", face = id.0, "{}", s.describe());
             }
+            // A-MSDU coalescer for this bearer (#82 part 2). Mutually exclusive with link-FEC:
+            // the FEC bridge already emits a generation's k+R frames back-to-back, and batching on
+            // top of it would only add the flush window to every generation's latency.
+            let batcher = match (&amsdu, &fec) {
+                (Some(cfg), None) => {
+                    let (bat, handle) = MediumBatcher::spawn(b.radio.clone(), *cfg);
+                    tasks.push(handle);
+                    Some(bat)
+                }
+                (Some(_), Some(_)) => {
+                    tracing::warn!(
+                        target: "monitor-wifi", face = id.0, radio = b.id.0,
+                        "A-MSDU batching ignored on this bearer: link-FEC is enabled and the two \
+                         are mutually exclusive"
+                    );
+                    None
+                }
+                _ => None,
+            };
             tx.push(TxBearer {
                 radio: b.radio.clone(),
+                batcher,
                 fec: bridge
                     .clone()
                     .zip(fec.as_ref().map(|fc| fc.redundancy.clone())),
@@ -1530,5 +1637,76 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(f.payload[0], 0x42);
+    }
+
+    /// **The medium's A-MSDU batcher must reach `FrameIo::inject_batch`, and robust frames must
+    /// bypass it.**
+    ///
+    /// A-MSDU was the one feature #82 listed that `RadioMediumFace` genuinely lacked rather than
+    /// duplicated. Moving it down is only worth anything if the batch arrives at the method the
+    /// backends override — the medium sends `TxIntent`s and holds rate as bearer state, so it can
+    /// only use the rate-free `inject_batch` spelling, and `AfPacketBackend` had to grow one.
+    ///
+    /// The bypass half matters just as much: a reception report or time beacon held for a flush
+    /// window is a report that arrives late to the receiver it exists to reach.
+    #[tokio::test]
+    async fn medium_amsdu_batches_data_and_never_delays_robust_frames() {
+        struct BatchSpy {
+            batches: std::sync::Mutex<Vec<usize>>,
+            singles: std::sync::Mutex<Vec<TxIntent>>,
+        }
+
+        #[async_trait::async_trait]
+        impl FrameIo for BatchSpy {
+            async fn inject(&self, frame: InjectFrame) -> Result<(), FaceError> {
+                self.singles.lock().unwrap().push(frame.tx);
+                Ok(())
+            }
+            async fn inject_batch(&self, frames: Vec<InjectFrame>) -> Result<(), FaceError> {
+                self.batches.lock().unwrap().push(frames.len());
+                Ok(())
+            }
+            async fn recv_frame(&self) -> Result<crate::CapturedFrame, FaceError> {
+                std::future::pending().await
+            }
+        }
+
+        let spy = Arc::new(BatchSpy {
+            batches: std::sync::Mutex::new(Vec::new()),
+            singles: std::sync::Mutex::new(Vec::new()),
+        });
+        let medium = RadioMediumFace::new(
+            FaceId(7),
+            vec![RadioBearer::new(RadioId(0), spy.clone(), cap())],
+        )
+        .with_amsdu_batching(8, Duration::from_millis(5))
+        .build();
+
+        for i in 0..4u8 {
+            medium.send_bytes(data_pkt(&name_tlv(&[b"x", &[i]]))).await.unwrap();
+        }
+        // A cooperative report — must go out immediately, not into the batch.
+        medium.send_robust(Bytes::from_static(b"report")).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let batches = spy.batches.lock().unwrap().clone();
+        let singles = spy.singles.lock().unwrap().clone();
+        assert_eq!(
+            batches.iter().sum::<usize>(),
+            4,
+            "all four data frames must arrive via inject_batch (the backends' aggregation hook), \
+             got batches={batches:?} singles={singles:?}"
+        );
+        assert_eq!(
+            singles.len(),
+            1,
+            "exactly the robust frame bypasses the batcher: {singles:?}"
+        );
+        assert_eq!(
+            singles[0].reliability,
+            Reliability::MostRobust,
+            "the frame that bypassed must be the robust one"
+        );
     }
 }
