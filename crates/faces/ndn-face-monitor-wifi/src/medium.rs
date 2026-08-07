@@ -58,7 +58,8 @@ use ndn_transport::{
 use crate::{
     Bandwidth, BROADCAST, CapturedFrame, DbmRange, EphemeralSource, FaceError, FaceId,
     FrameIo, InjectFrame,
-    McsDescriptor, MONITOR_MTU, RadioCapability, RadioKnobs, Reliability, TxIntent, WifiRadio,
+    McsDescriptor, MONITOR_MTU, OpenRadio, RadioCapability, RadioKnobs, RadioProfile, RadioTime,
+    Reliability, TxIntent, WifiRadio,
     mcs_phy_rate_bps,
 };
 
@@ -165,29 +166,53 @@ pub struct RadioBearer {
     /// state. Attach with [`with_knobs`](Self::with_knobs) so the actuator built
     /// for this bearer can drive it.
     pub knobs: Option<Arc<dyn RadioKnobs>>,
+    /// Hardware timestamping / TSF common-view for **this bearer** (#78).
+    ///
+    /// Per-bearer, not per-face, because that is the shape the MAC needs: a multi-radio node has one
+    /// clock per radio, and a slot gate that consults a face-level clock is deciding for the wrong
+    /// medium (#89). Absent until now only because [`open_named_radio`] could not return it.
+    pub time: Option<Arc<dyn RadioTime>>,
+    /// The bearer's self-description — declared capability and calibration (#78).
+    ///
+    /// `cap` above is what the *caller* asserted; this is what the *radio* says. Keeping both makes a
+    /// disagreement visible instead of letting a hand-written `RadioCapability` quietly outrank the
+    /// hardware (#98 is that failure in miniature: `agile` is asserted and never measured).
+    pub profile: Option<Arc<dyn RadioProfile>>,
 }
 
 impl RadioBearer {
     /// A bearer over **any** [`FrameIo`] radio (LoRa, BLE, …).
     pub fn new(id: RadioId, radio: Arc<dyn FrameIo>, cap: RadioCapability) -> Self {
-        Self {
-            id,
-            radio,
-            cap,
-            knobs: None,
-        }
+        Self { id, radio, cap, knobs: None, time: None, profile: None }
+    }
+
+    /// **A bearer from the standardized opener** (#78) — the capability-complete path.
+    ///
+    /// `open_named_radio` returns everything the backend implements; this carries all of it onto the
+    /// bearer in one call. Before this existed, a caller wanting knobs or timing had to bypass the
+    /// standardized opener and name a concrete backend, which is precisely the leak the opener was
+    /// created to close — it had fixed the on-air FORMAT leak and left the CAPABILITY leak open.
+    pub fn from_open(id: RadioId, r: OpenRadio, cap: RadioCapability) -> Self {
+        Self { id, radio: r.io, cap, knobs: r.knobs, time: r.time, profile: r.profile }
+    }
+
+    /// Attach this bearer's clock. See the [`time`](Self::time) field on why it is per-bearer.
+    pub fn with_time(mut self, time: Arc<dyn RadioTime>) -> Self {
+        self.time = Some(time);
+        self
+    }
+
+    /// Attach the radio's self-description.
+    pub fn with_profile(mut self, profile: Arc<dyn RadioProfile>) -> Self {
+        self.profile = Some(profile);
+        self
     }
 
     /// A **Wi-Fi** bearer — the same thing, upcasting the (now marker) [`WifiRadio`]
     /// handle to the bearer-agnostic data-plane view. Kept as a convenience for
     /// callers holding an `Arc<dyn WifiRadio>` from a driver.
     pub fn wifi(id: RadioId, radio: Arc<dyn WifiRadio>, cap: RadioCapability) -> Self {
-        Self {
-            id,
-            radio,
-            cap,
-            knobs: None,
-        }
+        Self { id, radio, cap, knobs: None, time: None, profile: None }
     }
 
     /// Attach the radio's control seam, and let it describe itself: a seam that

@@ -155,7 +155,7 @@ mod factory;
 pub use factory::RadioMediumFaceFactory;
 
 pub mod radio;
-pub use radio::{Bandwidth, DbmRange, RadioKnobs};
+pub use radio::{Bandwidth, DbmRange, OpenRadio, RadioKnobs, RadioProfile, RadioTime};
 
 // The data-centric time-slice (#61) + FHSS (#40) transmit scheduler, actuated at the TX path.
 mod sched;
