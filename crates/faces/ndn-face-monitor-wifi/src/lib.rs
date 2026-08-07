@@ -424,6 +424,156 @@ pub(crate) fn bloom_wire_for_wire(key: &GroupKey, wire: &[u8]) -> Option<[u8; 12
     Some(f.to_wire())
 }
 
+/// **How the next frame's exact rate is chosen** — shared by both faces (#82).
+///
+/// Three inputs, in priority order:
+///
+/// 1. the cognitive control plane's decided [`TxParams`], when a plan cell is bound — the ACT half
+///    of the closed loop, and the reason this is not just a constant;
+/// 2. otherwise [`McsPolicy::Adaptive`], from the most recently observed RSSI;
+/// 3. otherwise the static [`McsPolicy::Fixed`] rate.
+///
+/// This was `MonitorWifiFace`-only: `RadioMediumFace` models rate as bearer state set out-of-band,
+/// so a medium face had no way to act on a decided MCS at all. It is the last of the four features
+/// #82 found on one side only (after the name gate, link-FEC and A-MSDU), and the least visible —
+/// a plan that decides a rate nothing applies looks exactly like a plan that decided the rate you
+/// were already using.
+///
+/// Shared behind an `Arc` because the RX path writes `last_rssi` while the TX path reads it, and on
+/// the medium those are different tasks on different bearers observing one link.
+pub(crate) struct RatePolicy {
+    policy: McsPolicy,
+    /// Most-recently-observed RSSI, fed by every captured frame; the input to
+    /// [`McsPolicy::Adaptive`]. Initialised to the conservative-default RSSI.
+    last_rssi: AtomicI8,
+    /// The control plane's decided [`TxParams`], when bound. Wins over the static policy.
+    planned: Option<Arc<RwLock<Option<TxParams>>>>,
+}
+
+impl RatePolicy {
+    pub(crate) fn new(policy: McsPolicy) -> Self {
+        Self {
+            policy,
+            last_rssi: AtomicI8::new(-70),
+            planned: None,
+        }
+    }
+
+    pub(crate) fn with_planned(mut self, cell: Arc<RwLock<Option<TxParams>>>) -> Self {
+        self.planned = Some(cell);
+        self
+    }
+
+    /// Record a captured frame's RSSI — the feedback that makes `Adaptive` adaptive.
+    pub(crate) fn observe_rssi(&self, dbm: i8) {
+        self.last_rssi.store(dbm, Ordering::Relaxed);
+    }
+
+    /// The rate to inject the next frame at.
+    pub(crate) fn select(&self) -> McsDescriptor {
+        if let Some(cell) = &self.planned
+            && let Ok(guard) = cell.read()
+            && let Some(tp) = *guard
+            && let Some(index) = tp.mcs()
+        {
+            return McsDescriptor {
+                index,
+                short_gi: tp.short_gi(),
+                vht: tp.vht(),
+                nss: tp.nss().unwrap_or(1),
+                stbc: tp.stbc(),
+                ldpc: tp.ldpc(),
+            };
+        }
+        match self.policy {
+            McsPolicy::Fixed(d) => d,
+            McsPolicy::Adaptive => {
+                McsDescriptor::ht(mcs_for_rssi(self.last_rssi.load(Ordering::Relaxed)))
+            }
+        }
+    }
+
+    /// The plan's decided link-FEC redundancy, when the cell carries one.
+    pub(crate) fn planned_redundancy(&self) -> Option<u16> {
+        self.planned
+            .as_ref()?
+            .read()
+            .ok()
+            .and_then(|g| *g)
+            .and_then(|tp| tp.link_fec_redundancy)
+    }
+}
+
+/// **Tier-0 TX addressing for a whole object, fragments included** — shared by both faces (#82).
+///
+/// Only fragment 0 of an LP-fragmented object carries the Name TLV, so the object's prefix-set
+/// filter can be derived exactly once. This caches it by **LP base sequence** (`sequence -
+/// frag_index`) so fragments 1..n are addressed to the same filter as the fragment that opened the
+/// object, and a receiver registered on that prefix admits all of them.
+///
+/// `MonitorWifiFace` had this; `RadioMediumFace` did not — its `bloom_wire_for_wire` asked
+/// `inner_name` per frame, got `None` for every continuation fragment and fell back to broadcast.
+/// That loses no data (broadcast is admitted by everyone) but surrenders the filtering on all but
+/// the first frame of every fragmented object — nearly all traffic at a fragmenting MTU, and
+/// enough to have quietly invalidated #106's measured 87.32% reject had the faces been collapsed
+/// onto the uncached path. `medium_addresses_every_fragment_of_an_object_under_its_prefix` is the
+/// regression test.
+///
+/// Unlike the original, the cache is **bounded**. The face's was a `HashMap` that only ever grew:
+/// one entry per fragmented object, inserted and never removed — a slow leak on a long-running
+/// relay. Entries are dropped when the object's last fragment goes out, and a hard cap covers the
+/// case where that fragment never arrives (a torn-down peer, a reordered tail). Evicting early is
+/// safe: a miss falls back to broadcast, which over-accepts rather than dropping.
+pub(crate) struct Tier0Addresser {
+    key: GroupKey,
+    cache: Mutex<HashMap<u64, [u8; 12]>>,
+}
+
+/// Cap on in-flight fragmented objects tracked at once. Generous next to any real fragment window;
+/// it exists so a peer that vanishes mid-object cannot grow the map without bound.
+const TIER0_CACHE_CAP: usize = 4096;
+
+impl Tier0Addresser {
+    pub(crate) fn new(key: GroupKey) -> Self {
+        Self {
+            key,
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// How many in-flight objects are currently tracked — the bound this type exists to keep.
+    #[cfg(test)]
+    pub(crate) fn tracked(&self) -> usize {
+        self.cache.lock().unwrap().len()
+    }
+
+    /// The 12-byte filter (`addr1 ‖ addr2`) for this outgoing wire, or `None` to address it
+    /// broadcast — no name and no cached object, a safe over-accept.
+    pub(crate) fn wire_for(&self, wire: &[u8]) -> Option<[u8; 12]> {
+        let Some(h) = ndn_packet::lp::extract_fragment(wire) else {
+            // Unfragmented: the name is right here, nothing to remember.
+            return bloom_wire_for_wire(&self.key, wire);
+        };
+        let base = h.sequence.wrapping_sub(h.frag_index);
+        let last = h.frag_index + 1 >= h.frag_count;
+        if h.frag_index == 0 {
+            let w = bloom_wire_for_wire(&self.key, wire)?;
+            if !last {
+                let mut c = self.cache.lock().unwrap();
+                if c.len() >= TIER0_CACHE_CAP
+                    && let Some(&victim) = c.keys().next()
+                {
+                    c.remove(&victim);
+                }
+                c.insert(base, w);
+            }
+            return Some(w);
+        }
+        let mut c = self.cache.lock().unwrap();
+        if last { c.remove(&base) } else { c.get(&base).copied() }
+    }
+}
+
 /// Precompute one [`PrefixFilter::mask_for`] per registered `/`-string prefix — a receiver's
 /// [`RxFilter::Bloom`] mask set, reusable by the medium's RX reader.
 pub(crate) fn bloom_masks_for(key: &GroupKey, prefixes: &[impl AsRef<[u8]>]) -> std::sync::Arc<[PrefixFilter]> {
@@ -502,11 +652,10 @@ pub struct MonitorWifiFace {
     id: FaceId,
     backend: Arc<dyn FrameIo>,
     mtu: usize,
-    policy: McsPolicy,
+    /// How the next frame's exact rate is chosen (plan → adaptive → fixed), shared with
+    /// `RadioMediumFace` (#82). `Arc` because the RX path feeds it RSSI while TX reads it.
+    rate: Arc<RatePolicy>,
     signal_sink: Option<Arc<dyn SignalStore<FaceId> + Send + Sync>>,
-    /// Most-recently-observed RSSI, fed by every captured frame; the input to
-    /// [`McsPolicy::Adaptive`]. Initialised to the conservative-default RSSI.
-    last_rssi: AtomicI8,
     /// TX name-addressing capability (how outgoing `addr1` is chosen).
     tx_addr: TxAddr,
     /// Name filtering (Tier-0 + optional Tier-1), shared with `RadioMediumFace` (#82).
@@ -522,9 +671,10 @@ pub struct MonitorWifiFace {
     /// Frames Tier-1 rejected — kept so the tier's contribution is observable rather than assumed.
     /// A filter nobody can measure is indistinguishable from one that does nothing.
     tier1_dropped: Arc<std::sync::atomic::AtomicU64>,
-    /// For [`TxAddr::PrefixBloom`]: the per-object 12-byte filter (`addr1 ‖ addr2`) cached
-    /// by LP base-sequence, so every fragment of one object carries the same filter.
-    bloom_cache: Mutex<HashMap<u64, [u8; 12]>>,
+    /// For [`TxAddr::PrefixBloom`]: resolves each object's 12-byte filter (`addr1 ‖ addr2`),
+    /// caching by LP base sequence so every fragment of one object carries the same filter.
+    /// Shared with `RadioMediumFace` (#82) — see [`Tier0Addresser`].
+    addresser: Option<Tier0Addresser>,
     /// This face's ephemeral rotating source nonce (mac-addressing-doctrine §2). Stamped into
     /// `addr3` on the Tier-0 ([`TxAddr::PrefixBloom`]) TX path, where `addr1 ‖ addr2` is the filter
     /// and so cannot also carry the source — preserving per-transmitter RSSI keying at the receiver.
@@ -540,17 +690,6 @@ pub struct MonitorWifiFace {
     ///
     /// [`with_link_fec`]: MonitorWifiFace::with_link_fec
     fec: Option<FaceFec>,
-    /// Optional control-plane override of the per-frame [`TxParams`]
-    /// ([`with_planned_params`]). When the cognitive control plane
-    /// ([`RadioControl`]) decides a [`RadioPlan`], its actuator writes the chosen
-    /// `TxParams` into this shared cell; `select_mcs` reads it so the *decided*
-    /// rate/coding actually changes what we transmit. `None`/empty ⇒ fall back to
-    /// the static [`McsPolicy`]. This is the ACT half of the closed loop.
-    ///
-    /// [`with_planned_params`]: MonitorWifiFace::with_planned_params
-    /// [`RadioControl`]: crate::RadioControl
-    /// [`RadioPlan`]: ndn_radio_cognition::RadioPlan
-    planned: Option<Arc<RwLock<Option<TxParams>>>>,
 }
 
 impl MonitorWifiFace {
@@ -561,14 +700,13 @@ impl MonitorWifiFace {
             id,
             backend,
             mtu: MONITOR_MTU,
-            policy: McsPolicy::default(),
+            rate: Arc::new(RatePolicy::new(McsPolicy::default())),
             signal_sink: None,
-            last_rssi: AtomicI8::new(-70),
             tx_addr: TxAddr::Broadcast,
             gate: NameGate::open(),
             tier1: None,
             tier1_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            bloom_cache: Mutex::new(HashMap::new()),
+            addresser: None,
             source: EphemeralSource::new(
                 {
                     // Per-boot entropy ⊕ face id, so co-located faces get distinct nonces. The nonce
@@ -583,7 +721,6 @@ impl MonitorWifiFace {
             ),
             batcher: None,
             fec: None,
-            planned: None,
         }
     }
 
@@ -713,6 +850,12 @@ impl MonitorWifiFace {
 
     /// Set the TX name-addressing capability directly (compose with [`with_rx_filter`]).
     pub fn with_tx_addr(mut self, tx: TxAddr) -> Self {
+        // Every TxAddr change funnels through here, so this is the one place the addresser (and
+        // its fragment cache) has to be kept in step with the key.
+        self.addresser = match &tx {
+            TxAddr::PrefixBloom { key } => Some(Tier0Addresser::new(*key)),
+            _ => None,
+        };
         self.tx_addr = tx;
         self
     }
@@ -800,13 +943,13 @@ impl MonitorWifiFace {
 
     /// Inject every frame at a fixed MCS (e.g. for a known-good link or a bench).
     pub fn with_fixed_mcs(mut self, mcs: McsDescriptor) -> Self {
-        self.policy = McsPolicy::Fixed(mcs);
+        self.rate = Arc::new(RatePolicy::new(McsPolicy::Fixed(mcs)));
         self
     }
 
     /// Pick the injection MCS from observed RSSI ([`McsPolicy::Adaptive`]).
     pub fn with_adaptive_mcs(mut self) -> Self {
-        self.policy = McsPolicy::Adaptive;
+        self.rate = Arc::new(RatePolicy::new(McsPolicy::Adaptive));
         self
     }
 
@@ -831,7 +974,7 @@ impl MonitorWifiFace {
     ///
     /// [`RadioControl`]: crate::RadioControl
     pub fn with_planned_params(mut self, cell: Arc<RwLock<Option<TxParams>>>) -> Self {
-        self.planned = Some(cell);
+        self.rate = Arc::new(RatePolicy::new(self.rate.policy).with_planned(cell));
         self
     }
 
@@ -852,10 +995,7 @@ impl MonitorWifiFace {
     ///
     /// [`TxParams::link_fec_redundancy`]: ndn_radio_cognition::TxParams::link_fec_redundancy
     fn planned_redundancy(&self) -> Option<u16> {
-        self.planned
-            .as_ref()
-            .and_then(|cell| cell.read().ok().and_then(|g| *g))
-            .and_then(|tp| tp.link_fec_redundancy)
+        self.rate.planned_redundancy()
     }
 
     /// The face's fallback `(dst, src)` when no per-object filter applies (broadcast, or a
@@ -872,15 +1012,6 @@ impl MonitorWifiFace {
         &key.0
     }
 
-    /// Build the 12 wire bytes (`addr1 ‖ addr2`) of the Tier-0 filter for a wire NDN Name
-    /// TLV under `key` — every prefix of the name inserted into the 94-bit filter.
-    fn bloom_wire(key: &GroupKey, name_tlv: &[u8]) -> [u8; 12] {
-        let slash = ndn_name_to_slash(name_tlv);
-        let mut f = PrefixFilter::new();
-        f.insert_name(Self::bloom_key(key), &slash);
-        f.to_wire()
-    }
-
     /// The source nonce to stamp into `addr3`, or `None` to keep the legacy `addr3 = dst`. Only the
     /// Tier-0 ([`TxAddr::PrefixBloom`]) path needs it — there `addr2` is the filter's low half, so the
     /// per-transmitter source moves to `addr3` (doctrine §2, per-neighbour RSSI keying).
@@ -894,29 +1025,10 @@ impl MonitorWifiFace {
     /// sequence so every fragment of one object carries the same filter (only the first has the
     /// name). Non-Bloom / no-name → broadcast, a safe over-accept.
     fn resolve_addr(&self, wire: &[u8]) -> ([u8; 6], [u8; 6]) {
-        let TxAddr::PrefixBloom { key } = &self.tx_addr else {
-            return self.static_addr();
-        };
-        let split = |w: [u8; 12]| -> ([u8; 6], [u8; 6]) {
-            (w[..6].try_into().unwrap(), w[6..].try_into().unwrap())
-        };
-        if let Some(h) = ndn_packet::lp::extract_fragment(wire) {
-            let base = h.sequence.wrapping_sub(h.frag_index);
-            if h.frag_index == 0 {
-                let w = match inner_name(wire) {
-                    Some(name) => Self::bloom_wire(key, name),
-                    None => return self.static_addr(), // no name → broadcast
-                };
-                self.bloom_cache.lock().unwrap().insert(base, w);
-                return split(w);
-            }
-            if let Some(w) = self.bloom_cache.lock().unwrap().get(&base).copied() {
-                return split(w);
-            }
-            return self.static_addr(); // cache miss → broadcast (over-accept, never a FN)
-        }
-        match inner_name(wire) {
-            Some(name) => split(Self::bloom_wire(key, name)),
+        // No name, no cached object, or not on the Bloom path → broadcast: an over-accept the
+        // receiver's filter admits, never a false negative.
+        match self.addresser.as_ref().and_then(|a| a.wire_for(wire)) {
+            Some(w) => (w[..6].try_into().unwrap(), w[6..].try_into().unwrap()),
             None => self.static_addr(),
         }
     }
@@ -930,26 +1042,7 @@ impl MonitorWifiFace {
     /// The rate to inject the next frame at. A control-plane plan
     /// ([`with_planned_params`]) wins when present; otherwise the static policy.
     fn select_mcs(&self) -> McsDescriptor {
-        if let Some(cell) = &self.planned
-            && let Ok(guard) = cell.read()
-            && let Some(tp) = *guard
-            && let Some(index) = tp.mcs()
-        {
-            return McsDescriptor {
-                index,
-                short_gi: tp.short_gi(),
-                vht: tp.vht(),
-                nss: tp.nss().unwrap_or(1),
-                stbc: tp.stbc(),
-                ldpc: tp.ldpc(),
-            };
-        }
-        match self.policy {
-            McsPolicy::Fixed(d) => d,
-            McsPolicy::Adaptive => {
-                McsDescriptor::ht(mcs_for_rssi(self.last_rssi.load(Ordering::Relaxed)))
-            }
-        }
+        self.rate.select()
     }
 
     /// Receive one captured frame for this face, recording its RSSI for adaptive
@@ -986,7 +1079,7 @@ impl MonitorWifiFace {
                 }
             }
             if let Some(rssi) = f.rssi_dbm {
-                self.last_rssi.store(rssi, Ordering::Relaxed);
+                self.rate.observe_rssi(rssi);
             }
             // Publish the per-frame radio signals (RSSI + the rate the frame
             // arrived at) for this face, so measured/CCLF strategies can rank
@@ -1671,5 +1764,53 @@ mod tests {
                  reassembles addr1‖addr2 and drops it otherwise (addr1={a1:02x?} addr2={a2:02x?})"
             );
         }
+    }
+
+    /// **The Tier-0 fragment cache must not grow without bound.** The original was a `HashMap` that
+    /// only ever gained entries — one per fragmented object, never removed. A relay forwarding
+    /// fragmented objects indefinitely leaked one entry per object, quietly and forever.
+    ///
+    /// Completing an object releases its entry, and a peer that vanishes mid-object cannot push the
+    /// map past its cap. Both matter: the first is the common path, the second is the one an
+    /// adversary or a flaky link would otherwise exploit.
+    #[test]
+    fn tier0_fragment_cache_is_bounded() {
+        fn tlv(t: u8, v: &[u8]) -> Vec<u8> {
+            let mut o = vec![t, v.len() as u8];
+            o.extend_from_slice(v);
+            o
+        }
+        fn frag(seq: u64, index: u64, count: u64, payload: &[u8]) -> Vec<u8> {
+            let mut inner = Vec::new();
+            inner.extend(tlv(0x51, &seq.to_be_bytes()));
+            inner.extend(tlv(0x52, &index.to_be_bytes()));
+            inner.extend(tlv(0x53, &count.to_be_bytes()));
+            inner.extend(tlv(0x50, payload));
+            let mut out = vec![0x64, inner.len() as u8];
+            out.extend_from_slice(&inner);
+            out
+        }
+
+        let a = Tier0Addresser::new(OPEN_GROUP_KEY);
+        let named = data_pkt(&name_tlv(&[b"x", b"y"]));
+
+        // A complete 3-fragment object: tracked while in flight, released on the last fragment.
+        let opening = a.wire_for(&frag(10, 0, 3, &named));
+        assert!(opening.is_some(), "the opening fragment carries the name");
+        assert_eq!(a.tracked(), 1, "the object is tracked while its tail is outstanding");
+        assert_eq!(a.wire_for(&frag(11, 1, 3, b"mid")), opening, "mid fragment reuses the filter");
+        assert_eq!(a.wire_for(&frag(12, 2, 3, b"end")), opening, "last fragment reuses it too");
+        assert_eq!(a.tracked(), 0, "completing the object must release its entry");
+
+        // Objects whose tails never arrive: bounded by the cap, not by the peer's good behaviour.
+        for i in 0..(TIER0_CACHE_CAP + 500) {
+            let seq = 1_000_000 + (i as u64) * 10;
+            let _ = a.wire_for(&frag(seq, 0, 9, &named));
+        }
+        assert!(
+            a.tracked() <= TIER0_CACHE_CAP,
+            "abandoned objects must stay under the cap, got {}",
+            a.tracked()
+        );
     }
 }

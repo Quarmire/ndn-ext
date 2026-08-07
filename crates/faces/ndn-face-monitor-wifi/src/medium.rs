@@ -62,7 +62,8 @@ use ndn_transport::{
 use crate::{
     Bandwidth, BROADCAST, DbmRange, EphemeralSource, FaceError, FaceId,
     FrameIo, InjectFrame,
-    McsDescriptor, MONITOR_MTU, OpenRadio, RadioCapability, RadioKnobs, RadioProfile, RadioTime,
+    McsDescriptor, McsPolicy, MONITOR_MTU, OpenRadio, RadioCapability, RadioKnobs, RadioProfile,
+    RadioTime, TxParams,
     Reliability, TxIntent, WifiRadio,
     mcs_phy_rate_bps,
 };
@@ -511,6 +512,10 @@ pub struct RadioMediumFace {
     /// dropped unless their filter could be under one of the registered masks. `None` ⇒ broadcast
     /// addressing (the historical behaviour).
     bloom: Option<BloomCfg>,
+    /// **Per-frame rate selection** (#82), when enabled: the cognition-decided [`TxParams`], else an
+    /// adaptive/fixed [`McsPolicy`]. `None` ⇒ rate stays pure bearer state set out-of-band, the
+    /// historical behaviour.
+    rate: Option<Arc<crate::RatePolicy>>,
     /// **A-MSDU bundling** (#82 part 2), when enabled: outbound data frames are coalesced and handed
     /// to the bearer's [`FrameIo::inject_batch`], which the AF_PACKET and RTL/MT7612 backends
     /// override with real aggregation. This was the one genuinely one-sided feature in #82 —
@@ -608,6 +613,7 @@ impl RadioMediumFace {
             legacy_gate: None,
             bloom: None,
             amsdu: None,
+            rate: None,
         }
     }
 
@@ -669,6 +675,31 @@ impl RadioMediumFace {
         if let Some(fec) = &mut self.fec {
             fec.eligible = Some(pred);
         }
+        self
+    }
+
+    /// Choose each data frame's **exact rate** rather than leaving it as bearer state: the
+    /// cognitive control plane's decided [`TxParams`] when `planned` carries one, else `policy`
+    /// (adaptive from observed RSSI, or fixed).
+    ///
+    /// This closes #82's last one-sided feature. `MonitorWifiFace` could act on a decided MCS and
+    /// this face could not, so a `RadioPlan` mounted on a medium face decided a rate that nothing
+    /// applied — the quietest kind of gap, because a plan whose rate is never actuated looks exactly
+    /// like a plan that chose the rate you were already transmitting at.
+    ///
+    /// Robust control frames are unaffected: they keep `TxIntent::ROBUST` so the driver puts them on
+    /// the basic legacy rate every neighbour can decode. So does anything sent while the legacy gate
+    /// is up — the worst-overheard-receiver cap outranks a throughput-chosen rate by design.
+    pub fn with_rate_policy(
+        mut self,
+        policy: McsPolicy,
+        planned: Option<Arc<std::sync::RwLock<Option<TxParams>>>>,
+    ) -> Self {
+        let rp = crate::RatePolicy::new(policy);
+        self.rate = Some(Arc::new(match planned {
+            Some(cell) => rp.with_planned(cell),
+            None => rp,
+        }));
         self
     }
 
@@ -763,9 +794,13 @@ struct TxBearer {
     /// (`NDN_SCHED_*`). `None` ⇒ no gating, the historical send path. Per-bearer so a hop retunes its
     /// own radio; the slot timing is identical on every bearer (one common-view clock per node).
     sched: Option<Arc<crate::FaceScheduler>>,
-    /// Tier-0 group key (#91c): when set, the frame's `addr1 ‖ addr2` carry the object's prefix-set
-    /// filter and the nonce moves to `addr3`. `None` ⇒ broadcast `addr1`, nonce in `addr2`.
-    bloom_key: Option<crate::GroupKey>,
+    /// Tier-0 addressing (#91c): when set, the frame's `addr1 ‖ addr2` carry the object's
+    /// prefix-set filter and the nonce moves to `addr3`. `None` ⇒ broadcast `addr1`, nonce in
+    /// `addr2`. Shared (`Arc`) across this face's bearers so one object's fragments resolve to the
+    /// same filter whichever bearer each goes out on — the cache is per *object*, not per radio.
+    tier0: Option<Arc<crate::Tier0Addresser>>,
+    /// Per-frame rate selection (#82). `None` ⇒ the driver's current rate stands.
+    rate: Option<Arc<crate::RatePolicy>>,
     /// A-MSDU coalescer for this bearer's data path (#82 part 2). `None` ⇒ inject each frame
     /// directly. Never used for robust control frames, and never combined with FEC.
     batcher: Option<MediumBatcher>,
@@ -795,6 +830,10 @@ impl TxBearer {
     /// legacy rate every neighbour can decode (the worst-overheard-receiver reach).
     async fn inject_with_intent(&self, wire: Bytes, intent: TxIntent) -> Result<(), FaceError> {
         let robust = intent.reliability == Reliability::MostRobust;
+        let legacy = self
+            .legacy_gate
+            .as_ref()
+            .is_some_and(|g| g.load(Ordering::Relaxed));
         // Data-centric time-slice/FHSS gate (#61/#40): wait for this name-group's owned slot and/or
         // retune to its hop channel, from the name + the common-view clock. Robust control frames
         // (reports / discovery) bypass — they must reach the worst receiver now, not wait on a data
@@ -815,11 +854,7 @@ impl TxBearer {
         // nonce rotation off, silently. Computing the address before the branch is what makes the
         // two paths incapable of disagreeing (#82).
         let nonce = self.source.current(super::now_ms() as u64);
-        let (dst, src, addr3) = match self
-            .bloom_key
-            .as_ref()
-            .and_then(|k| crate::bloom_wire_for_wire(k, &wire))
-        {
+        let (dst, src, addr3) = match self.tier0.as_ref().and_then(|t| t.wire_for(&wire)) {
             // addr1 = filter hi, addr2 = filter lo, addr3 = the §2 per-frame RSSI key displaced
             // out of addr2 by the filter.
             Some(bf) => (
@@ -874,6 +909,16 @@ impl TxBearer {
         // worst-overheard-receiver reach the ROBUST intent exists to guarantee.
         if !robust && let Some(bat) = &self.batcher {
             return bat.submit(frame);
+        }
+        // Per-frame rate (#82), when a policy is bound. Skipped for robust frames and whenever the
+        // legacy gate is up: both mean "reach the worst receiver", which outranks any
+        // throughput-chosen rate — actuating a decided MCS there would undo the very cap that was
+        // just applied.
+        if !robust
+            && !legacy
+            && let Some(rate) = &self.rate
+        {
+            return self.radio.inject_at(frame, rate.select()).await;
         }
         self.radio.inject(frame).await
     }
@@ -933,6 +978,7 @@ impl RunningMedium {
             legacy_gate,
             bloom,
             amsdu,
+            rate,
         } = cfg;
 
         let (tx_chan, rx_chan) = mpsc::unbounded_channel();
@@ -952,6 +998,12 @@ impl RunningMedium {
             nanos ^ ((std::process::id() as u64) << 32) ^ (id.0 as u64).wrapping_mul(0x9E37_79B9)
         };
         let source = Arc::new(EphemeralSource::new(boot_seed, NONCE_ROTATION_MS));
+
+        // One Tier-0 addresser for the whole face (not per bearer): its cache is keyed by LP base
+        // sequence, i.e. by *object*, and an object's fragments may fan out across bearers.
+        let tier0 = bloom
+            .as_ref()
+            .map(|b| Arc::new(crate::Tier0Addresser::new(b.key)));
 
         for b in bearers {
             // One link-FEC bridge per bearer (shared TX-encode / RX-decode) when enabled: the sink
@@ -1012,7 +1064,8 @@ impl RunningMedium {
                 legacy_gate: legacy_gate.clone(),
                 source: source.clone(),
                 sched: sched.clone(),
-                bloom_key: bloom.as_ref().map(|b| b.key),
+                tier0: tier0.clone(),
+                rate: rate.clone(),
             });
 
             // One reader per radio → the RX union. A frame heard on any capability is
@@ -1025,6 +1078,7 @@ impl RunningMedium {
             let rx_bridge = bridge;
             let loss = fec.as_ref().map(|fc| fc.loss.clone());
             let sched_rx = sched.clone();
+            let rate_rx = rate.clone();
             let rx_gate = bloom.as_ref().map(|b| {
                 std::sync::Arc::new(crate::NameGate::new(
                     crate::RxFilter::Bloom(b.masks.clone()),
@@ -1083,6 +1137,11 @@ impl RunningMedium {
                             // The sender's ephemeral nonce is in addr3 under the Tier-0 layout, else
                             // in addr2 (legacy). This one accessor keys per-neighbour signals and the
                             // reassembly stream correctly for both layouts.
+                            // Feedback for `McsPolicy::Adaptive` (#82): the RX path is what makes
+                            // the TX path adaptive, so the policy is shared across the two.
+                            if let (Some(rate), Some(rssi)) = (rate_rx.as_ref(), f.rssi_dbm) {
+                                rate.observe_rssi(rssi);
+                            }
                             let nonce = f.addr3.or(f.addr);
                             if (f.rssi_dbm.is_some() || f.mcs_index.is_some())
                                 && let Some(sink) = sink.as_ref()
@@ -1791,5 +1850,176 @@ mod tests {
                  filter — the old sink dropped it entirely"
             );
         }
+    }
+
+    /// Build one LP fragment: `LpPacket(0x64){ Sequence(0x51), FragIndex(0x52), FragCount(0x53),
+    /// Fragment(0x50) }`. Only fragment 0 carries the Name, which is the whole point below.
+    fn lp_frag(seq: u64, index: u64, count: u64, payload: &[u8]) -> Bytes {
+        fn tlv(t: u8, v: &[u8]) -> Vec<u8> {
+            let mut o = vec![t, v.len() as u8];
+            o.extend_from_slice(v);
+            o
+        }
+        let mut inner = Vec::new();
+        inner.extend(tlv(0x51, &seq.to_be_bytes()));
+        inner.extend(tlv(0x52, &index.to_be_bytes()));
+        inner.extend(tlv(0x53, &count.to_be_bytes()));
+        inner.extend(tlv(0x50, payload));
+        let mut out = vec![0x64, inner.len() as u8];
+        out.extend_from_slice(&inner);
+        Bytes::from(out)
+    }
+
+    /// **Every fragment of one object must carry that object's Tier-0 filter, not just the first.**
+    ///
+    /// Only fragment 0 of an LP-fragmented object contains the Name TLV, so a filter derived
+    /// per-frame can only be computed once. `MonitorWifiFace` handles this with a cache keyed by LP
+    /// base sequence (`sequence - frag_index`), so fragments 1..n reuse the opening fragment's
+    /// filter. The medium's `bloom_wire_for_wire` had no cache: it called `inner_name(wire)`, got
+    /// `None` for every continuation fragment, and fell back to broadcast.
+    ///
+    /// That loses no data — broadcast is admitted by every receiver — but it silently surrenders the
+    /// filtering for all but the first frame of every fragmented object, which on a fragmenting MTU
+    /// is nearly all of the traffic. #106 measured 87.32% reject on air using the *caching* path, so
+    /// collapsing the faces onto an uncached medium would have quietly invalidated that number.
+    #[tokio::test]
+    async fn medium_addresses_every_fragment_of_an_object_under_its_prefix() {
+        use crate::OPEN_GROUP_KEY;
+
+        let key = OPEN_GROUP_KEY;
+        let masks = crate::bloom_masks_for(&key, &[b"/x".as_slice()]);
+
+        let bus = LoopbackMonitorBus::new();
+        let sniffer = Arc::new(bus.endpoint(99, -70));
+        let medium = RadioMediumFace::new(
+            FaceId(6),
+            vec![RadioBearer::new(RadioId(0), Arc::new(bus.endpoint(6, -50)), cap())],
+        )
+        .with_bloom(&key, &[b"/x/y".as_slice()])
+        .build();
+
+        let collector = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            while let Ok(Ok(f)) =
+                tokio::time::timeout(Duration::from_millis(120), sniffer.recv_frame()).await
+            {
+                seen.push((f.group, f.addr));
+            }
+            seen
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // One object /x/y split across three fragments; only fragment 0 carries the Name.
+        let named = data_pkt(&name_tlv(&[b"x", b"y"]));
+        medium.send_bytes(lp_frag(100, 0, 3, &named)).await.unwrap();
+        medium.send_bytes(lp_frag(101, 1, 3, b"tail-a")).await.unwrap();
+        medium.send_bytes(lp_frag(102, 2, 3, b"tail-b")).await.unwrap();
+
+        let frames = collector.await.unwrap();
+        assert_eq!(frames.len(), 3, "all three fragments must reach the bus");
+        for (i, (a1, a2)) in frames.iter().enumerate() {
+            let (Some(a1), Some(a2)) = (a1, a2) else {
+                panic!("fragment {i} carries no address pair");
+            };
+            let mut w = [0u8; 12];
+            w[..6].copy_from_slice(a1);
+            w[6..].copy_from_slice(a2);
+            assert!(
+                masks
+                    .iter()
+                    .any(|m| crate::PrefixFilter::from_wire(w).may_match(m)),
+                "fragment {i} must carry the object's /x filter, not fall back to broadcast \
+                 (addr1={a1:02x?} addr2={a2:02x?})"
+            );
+        }
+    }
+
+    /// **A rate the plan decides must change what the medium transmits — and must still lose to the
+    /// worst-receiver cap.**
+    ///
+    /// `MonitorWifiFace` could act on a decided MCS; this face could not, so a `RadioPlan` mounted
+    /// on a medium face chose a rate that nothing applied (#82's last one-sided feature). That gap
+    /// is invisible from the decision side, so this asserts on which call the backend received.
+    ///
+    /// The second half matters as much: when cognition raises the legacy gate because a
+    /// legacy-only-RX neighbour is present, the frame must go out at the basic legacy rate. The
+    /// medium expresses that as `TxIntent::ROBUST` on the plain `inject` path, which every driver
+    /// maps to the basic rate — *not* by picking a low MCS itself.
+    ///
+    /// Recording `set_rate` state alone was not enough to see this: the rate a driver holds is
+    /// sticky, so after one `inject_at(.., MCS7)` the spy reported MCS 7 for the *next* frame too,
+    /// even though the medium never asked for it. Asserting on the call that was made, rather than
+    /// on leftover state, is what makes the distinction visible.
+    #[tokio::test]
+    async fn medium_actuates_the_planned_rate_but_the_legacy_gate_outranks_it() {
+        #[derive(Debug, PartialEq)]
+        enum Call {
+            /// `inject_at` — an exact rate was demanded for this frame.
+            At(u8),
+            /// Plain `inject` — the rate is whatever the bearer holds; the intent carries the
+            /// robustness the driver maps to a rate.
+            Plain(Reliability),
+        }
+
+        struct RateSpy {
+            calls: std::sync::Mutex<Vec<Call>>,
+        }
+
+        #[async_trait::async_trait]
+        impl FrameIo for RateSpy {
+            async fn inject(&self, f: InjectFrame) -> Result<(), FaceError> {
+                self.calls.lock().unwrap().push(Call::Plain(f.tx.reliability));
+                Ok(())
+            }
+            async fn inject_at(
+                &self,
+                _f: InjectFrame,
+                mcs: McsDescriptor,
+            ) -> Result<(), FaceError> {
+                self.calls.lock().unwrap().push(Call::At(mcs.index));
+                Ok(())
+            }
+            async fn recv_frame(&self) -> Result<crate::CapturedFrame, FaceError> {
+                std::future::pending().await
+            }
+        }
+
+        let spy = Arc::new(RateSpy {
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        let gate = Arc::new(AtomicBool::new(false));
+        let plan = Arc::new(std::sync::RwLock::new(Some(TxParams {
+            rate: ndn_radio_cognition::RateParams::Wifi(ndn_radio_cognition::WifiRate {
+                mcs: Some(7),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })));
+
+        let medium = RadioMediumFace::new(
+            FaceId(8),
+            vec![RadioBearer::new(RadioId(0), spy.clone(), cap())],
+        )
+        .with_legacy_gate(gate.clone())
+        .with_rate_policy(McsPolicy::Fixed(McsDescriptor::CONSERVATIVE), Some(plan))
+        .build();
+
+        medium.send_bytes(Bytes::from_static(b"planned")).await.unwrap();
+        // A legacy-only-RX neighbour appears: reach beats throughput.
+        gate.store(true, Ordering::Relaxed);
+        medium.send_bytes(Bytes::from_static(b"capped")).await.unwrap();
+
+        let calls = spy.calls.lock().unwrap();
+        assert_eq!(
+            calls[0],
+            Call::At(7),
+            "the plan's decided MCS must reach the radio, not just the decision plane: {calls:?}"
+        );
+        assert_eq!(
+            calls[1],
+            Call::Plain(Reliability::MostRobust),
+            "with the legacy gate up the frame must go out MostRobust on the plain path, so the \
+             driver drops it to the basic rate — never at the planned MCS: {calls:?}"
+        );
     }
 }
