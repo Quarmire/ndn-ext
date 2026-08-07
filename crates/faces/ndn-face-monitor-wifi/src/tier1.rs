@@ -475,7 +475,7 @@ mod tests {
     /// never actually connected — the exact shape of "decided but unactuated".
     #[test]
     fn a_wrapped_pit_store_drives_tier1() {
-        use ndn_fwd_core::store::{NameTableObserver, ObservedPit, PitStore};
+        use ndn_fwd_core::store::{ObservedPit, PitStore};
 
         // A minimal PitStore: enough to exercise record/satisfy/discard.
         #[derive(Default)]

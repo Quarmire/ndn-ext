@@ -62,8 +62,8 @@ use ndn_transport::{
 use crate::{
     Bandwidth, BROADCAST, DbmRange, EphemeralSource, FaceError, FaceId,
     FrameIo, InjectFrame,
-    McsDescriptor, McsPolicy, MONITOR_MTU, OpenRadio, RadioCapability, RadioKnobs, RadioProfile,
-    RadioTime, TxParams,
+    McsDescriptor, MONITOR_MTU, OpenRadio, RadioCapability, RadioKnobs, RadioProfile,
+    RadioTime,
     Reliability, TxIntent, WifiRadio,
     mcs_phy_rate_bps,
 };
@@ -507,11 +507,18 @@ pub struct RadioMediumFace {
     /// path injects at the basic legacy rate ([`TxIntent::ROBUST`]) so it reaches that
     /// neighbour — the worst-overheard-receiver rate cap. `None`/false = decided rate.
     legacy_gate: Option<Arc<AtomicBool>>,
-    /// Tier-0 name addressing (#91c): when set, outbound frames carry each object's prefix-set
-    /// filter in `addr1 ‖ addr2` (with the ephemeral nonce in `addr3`), and inbound frames are
-    /// dropped unless their filter could be under one of the registered masks. `None` ⇒ broadcast
-    /// addressing (the historical behaviour).
-    bloom: Option<BloomCfg>,
+    /// **TX** Tier-0 addressing (#91c): when set, outbound frames carry each object's prefix-set
+    /// filter in `addr1 ‖ addr2`, with the ephemeral nonce displaced to `addr3`. `None` ⇒ broadcast
+    /// `addr1` and the nonce in `addr2`.
+    tx_bloom: Option<crate::GroupKey>,
+    /// **RX** name filtering: the shared [`NameGate`](crate::NameGate)'s two halves — the Tier-0
+    /// filter (or the NDN-NIC baseline) and an optional Tier-1.
+    ///
+    /// TX and RX are separate because they are separate capabilities: a relay filters on a family of
+    /// prefixes it forwards while addressing by whatever object it is carrying, and a passive
+    /// monitor filters without transmitting at all. `with_bloom` sets both at once for the common
+    /// case; `with_tx_bloom` / `with_rx_gate` set one.
+    rx_gate: Option<Arc<crate::NameGate>>,
     /// **Per-frame rate selection** (#82), when enabled: the cognition-decided [`TxParams`], else an
     /// adaptive/fixed [`McsPolicy`]. `None` ⇒ rate stays pure bearer state set out-of-band, the
     /// historical behaviour.
@@ -540,12 +547,12 @@ struct AmsduCfg {
 /// aggregates at the currently-set rate. Aggregating only through the rate-carrying spelling would
 /// have made this move silently lose A-MSDU on the S1G path.
 struct MediumBatcher {
-    tx: mpsc::UnboundedSender<InjectFrame>,
+    tx: mpsc::UnboundedSender<(InjectFrame, Option<McsDescriptor>)>,
 }
 
 impl MediumBatcher {
     fn spawn(radio: Arc<dyn FrameIo>, cfg: AmsduCfg) -> (Self, JoinHandle<()>) {
-        let (tx, mut rx) = mpsc::unbounded_channel::<InjectFrame>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<(InjectFrame, Option<McsDescriptor>)>();
         let handle = tokio::spawn(async move {
             while let Some(first) = rx.recv().await {
                 let mut batch = vec![first];
@@ -556,27 +563,35 @@ impl MediumBatcher {
                         _ => break, // window elapsed, or the face was torn down
                     }
                 }
-                let _ = radio.inject_batch(batch).await;
+                // Two spellings, both aggregating, chosen by whether a rate was decided per frame.
+                // Batching used to drop the rate on the floor: the coalescer sat before the rate
+                // branch, so turning on A-MSDU turned off every decided MCS. Carrying the rate
+                // through the batch is what lets the two features compose.
+                let _ = if batch.iter().any(|(_, m)| m.is_some()) {
+                    let last = batch
+                        .iter()
+                        .rev()
+                        .find_map(|(_, m)| *m)
+                        .unwrap_or(McsDescriptor::CONSERVATIVE);
+                    radio
+                        .inject_batch_at(
+                            batch
+                                .into_iter()
+                                .map(|(f, m)| (f, m.unwrap_or(last)))
+                                .collect(),
+                        )
+                        .await
+                } else {
+                    radio.inject_batch(batch.into_iter().map(|(f, _)| f).collect()).await
+                };
             }
         });
         (MediumBatcher { tx }, handle)
     }
 
-    fn submit(&self, frame: InjectFrame) -> Result<(), FaceError> {
-        self.tx.send(frame).map_err(|_| FaceError::Closed)
+    fn submit(&self, frame: InjectFrame, mcs: Option<McsDescriptor>) -> Result<(), FaceError> {
+        self.tx.send((frame, mcs)).map_err(|_| FaceError::Closed)
     }
-}
-
-/// Tier-0 addressing config for the medium: the group key that keys the filter, and the receiver's
-/// precomputed registered-prefix masks.
-#[derive(Clone)]
-struct BloomCfg {
-    key: crate::GroupKey,
-    masks: Arc<[crate::PrefixFilter]>,
-    /// **Tier-1** (#92), when this medium runs one — previously reachable only from
-    /// `MonitorWifiFace`. Part of #82: the features belong to the medium, not to whichever face
-    /// happened to grow them first.
-    tier1: Option<Arc<std::sync::RwLock<crate::tier1::Tier1>>>,
 }
 
 /// Predicate deciding whether an outbound wire is **FEC-eligible** — i.e. wants the
@@ -611,7 +626,8 @@ impl RadioMediumFace {
             signal_sink: None,
             fec: None,
             legacy_gate: None,
-            bloom: None,
+            tx_bloom: None,
+            rx_gate: None,
             amsdu: None,
             rate: None,
         }
@@ -622,12 +638,22 @@ impl RadioMediumFace {
     /// source nonce moved to `addr3`; inbound frames are dropped before the engine unless their
     /// filter could be under one of `registered_prefixes` (given as `/`-strings). A relay passes
     /// several prefixes (its forwarding family); a leaf, one. Broadcast frames always pass.
-    pub fn with_bloom(mut self, key: &crate::GroupKey, registered_prefixes: &[impl AsRef<[u8]>]) -> Self {
-        self.bloom = Some(BloomCfg {
-            key: *key,
-            masks: crate::bloom_masks_for(key, registered_prefixes),
-            tier1: None,
-        });
+    pub fn with_bloom(self, key: &crate::GroupKey, registered_prefixes: &[impl AsRef<[u8]>]) -> Self {
+        let masks = crate::bloom_masks_for(key, registered_prefixes);
+        self.with_tx_bloom(*key)
+            .with_rx_gate(Arc::new(crate::NameGate::new(crate::RxFilter::Bloom(masks), None)))
+    }
+
+    /// Address outbound frames by name (Tier-0) without changing what this face accepts.
+    pub fn with_tx_bloom(mut self, key: crate::GroupKey) -> Self {
+        self.tx_bloom = Some(key);
+        self
+    }
+
+    /// Set the inbound name gate — Tier-0 (or the #101 NDN-NIC baseline) plus an optional Tier-1 —
+    /// without changing how this face addresses what it sends.
+    pub fn with_rx_gate(mut self, gate: Arc<crate::NameGate>) -> Self {
+        self.rx_gate = Some(gate);
         self
     }
 
@@ -690,16 +716,8 @@ impl RadioMediumFace {
     /// Robust control frames are unaffected: they keep `TxIntent::ROBUST` so the driver puts them on
     /// the basic legacy rate every neighbour can decode. So does anything sent while the legacy gate
     /// is up — the worst-overheard-receiver cap outranks a throughput-chosen rate by design.
-    pub fn with_rate_policy(
-        mut self,
-        policy: McsPolicy,
-        planned: Option<Arc<std::sync::RwLock<Option<TxParams>>>>,
-    ) -> Self {
-        let rp = crate::RatePolicy::new(policy);
-        self.rate = Some(Arc::new(match planned {
-            Some(cell) => rp.with_planned(cell),
-            None => rp,
-        }));
+    pub fn with_rate_policy(mut self, rate: Arc<crate::RatePolicy>) -> Self {
+        self.rate = Some(rate);
         self
     }
 
@@ -875,7 +893,16 @@ impl TxBearer {
         // frame straight through, so mixing coded/uncoded frames is safe.
         if !robust {
             if let Some((bridge, r)) = &self.fec {
-                let parity = r.load(Ordering::Relaxed);
+                // The plan is the authority when one is bound; the shared `AtomicU16` is the
+                // channel cognition's `MediumActuator` writes when it is not. Reading only the
+                // atomic meant a `RadioPlan` could decide `link_fec_redundancy` and have nothing
+                // apply it unless a separate actuator happened to be running — the defect this
+                // crate is named for in `decided-but-unactuated`.
+                let parity = self
+                    .rate
+                    .as_ref()
+                    .and_then(|rp| rp.planned_redundancy())
+                    .unwrap_or_else(|| r.load(Ordering::Relaxed));
                 let eligible = self.eligible.as_ref().is_none_or(|pred| pred(&wire));
                 if parity > 0 && eligible {
                     // The generation takes the opening frame's address and intent, so coded
@@ -907,18 +934,18 @@ impl TxBearer {
         // one at a time. Robust control frames fall through — a report or time beacon must reach the
         // worst receiver *now*, and holding one for a flush window would blunt exactly the
         // worst-overheard-receiver reach the ROBUST intent exists to guarantee.
+        let decided = (!robust && !legacy)
+            .then(|| self.rate.as_ref().map(|r| r.select()))
+            .flatten();
         if !robust && let Some(bat) = &self.batcher {
-            return bat.submit(frame);
+            return bat.submit(frame, decided);
         }
         // Per-frame rate (#82), when a policy is bound. Skipped for robust frames and whenever the
         // legacy gate is up: both mean "reach the worst receiver", which outranks any
         // throughput-chosen rate — actuating a decided MCS there would undo the very cap that was
         // just applied.
-        if !robust
-            && !legacy
-            && let Some(rate) = &self.rate
-        {
-            return self.radio.inject_at(frame, rate.select()).await;
+        if let Some(mcs) = decided {
+            return self.radio.inject_at(frame, mcs).await;
         }
         self.radio.inject(frame).await
     }
@@ -976,7 +1003,8 @@ impl RunningMedium {
             signal_sink,
             fec,
             legacy_gate,
-            bloom,
+            tx_bloom,
+            rx_gate,
             amsdu,
             rate,
         } = cfg;
@@ -1001,9 +1029,7 @@ impl RunningMedium {
 
         // One Tier-0 addresser for the whole face (not per bearer): its cache is keyed by LP base
         // sequence, i.e. by *object*, and an object's fragments may fan out across bearers.
-        let tier0 = bloom
-            .as_ref()
-            .map(|b| Arc::new(crate::Tier0Addresser::new(b.key)));
+        let tier0 = tx_bloom.map(|k| Arc::new(crate::Tier0Addresser::new(k)));
 
         for b in bearers {
             // One link-FEC bridge per bearer (shared TX-encode / RX-decode) when enabled: the sink
@@ -1079,12 +1105,7 @@ impl RunningMedium {
             let loss = fec.as_ref().map(|fc| fc.loss.clone());
             let sched_rx = sched.clone();
             let rate_rx = rate.clone();
-            let rx_gate = bloom.as_ref().map(|b| {
-                std::sync::Arc::new(crate::NameGate::new(
-                    crate::RxFilter::Bloom(b.masks.clone()),
-                    b.tier1.clone(),
-                ))
-            });
+            let rx_gate = rx_gate.clone();
             tasks.push(tokio::spawn(async move {
                 let mut last_mesh_cv = 0u64; // last mesh common-view observation count ingested (#74)
                 loop {
@@ -1442,7 +1463,7 @@ mod power_actuation_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DEFAULT_SRC, LoopbackMonitorBus, WifiRadio};
+    use crate::{DEFAULT_SRC, LoopbackMonitorBus, McsPolicy, TxParams, WifiRadio};
     use ndn_transport::Transport;
     use std::time::Duration;
 
@@ -2001,7 +2022,10 @@ mod tests {
             vec![RadioBearer::new(RadioId(0), spy.clone(), cap())],
         )
         .with_legacy_gate(gate.clone())
-        .with_rate_policy(McsPolicy::Fixed(McsDescriptor::CONSERVATIVE), Some(plan))
+        .with_rate_policy(Arc::new(
+            crate::RatePolicy::new(McsPolicy::Fixed(McsDescriptor::CONSERVATIVE))
+                .with_planned(plan),
+        ))
         .build();
 
         medium.send_bytes(Bytes::from_static(b"planned")).await.unwrap();

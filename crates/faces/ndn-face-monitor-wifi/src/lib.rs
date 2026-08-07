@@ -86,13 +86,13 @@ use std::sync::atomic::{AtomicI8, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
-use ndn_coding::link_fec_bridge::{GenerationSink, LinkFecBridge};
+use ndn_coding::link_fec_bridge::GenerationSink;
 use ndn_radio_cognition::TxParams;
-use ndn_signals_core::{LinkSignals, SignalStore};
+use ndn_signals_core::SignalStore;
 use ndn_transport::{
     Face, FaceAddr, FaceKind, FacePersistency, LinkType, MtuError, PersistencyError, Transport,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 // The frame-I/O substrate — the `FrameIo` trait, the inject/capture frame
@@ -184,51 +184,6 @@ pub use channel_manager::ChannelManager;
 /// peer (e.g. an ESP32-C5) can parse. Built by [`MonitorWifiFace::espnow`].
 pub const ESPNOW_MTU: usize = ESPNOW_MAX_BODY;
 
-/// A connectionless 802.11 monitor-mode injection face. Build a [`Face`] with
-/// [`into_face`](Self::into_face), which pairs the `LpLinkService` so the engine
-/// fragments/reassembles NDN packets across injected frames.
-/// Coalesces queued outbound frames into **A-MSDU bursts** — the face-level
-/// realization of radio-layer bundling. [`submit`](Self::submit) is non-blocking;
-/// a background task drains up to `max_msdus` frames within a latency `window`
-/// and hands them to [`FrameIo::inject_batch_at`](ndn_radio_hal::FrameIo::inject_batch_at), which
-/// the AF_PACKET backend overrides with real aggregation (one A-MSDU per same-RA run, greedily
-/// packed). Each MSDU stays an independent NDN packet (the receiver de-aggregates),
-/// so only airtime is shared — the throughput↔latency knob, not NDN-layer Interest
-/// bundling. Started by [`MonitorWifiFace::with_amsdu_batching`]. Each queued frame
-/// carries its resolved MCS, so the exact rate rides the batch, not the seam.
-///
-/// The aggregation is **the backend's**, and is reached only by calling `inject_batch_at` on the
-/// trait object. #82 part 1 briefly routed this through a local free function holding a copy of the
-/// trait's *default* body, which dispatches to no override and quietly turned every batch back into
-/// individual MPDUs — no error, no log, just the airtime saving gone. Part 2 restored the virtual
-/// call and moved the method onto `FrameIo` so the seam a face holds is the seam that aggregates.
-struct TxBatcher {
-    tx: tokio::sync::mpsc::UnboundedSender<(InjectFrame, McsDescriptor)>,
-}
-
-impl TxBatcher {
-    fn spawn(backend: Arc<dyn FrameIo>, max_msdus: usize, window: Duration) -> Self {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(InjectFrame, McsDescriptor)>();
-        tokio::spawn(async move {
-            while let Some(first) = rx.recv().await {
-                let mut batch = vec![first];
-                let deadline = tokio::time::Instant::now() + window;
-                while batch.len() < max_msdus {
-                    match tokio::time::timeout_at(deadline, rx.recv()).await {
-                        Ok(Some(f)) => batch.push(f),
-                        _ => break, // window elapsed, or the face was dropped
-                    }
-                }
-                let _ = backend.inject_batch_at(batch).await;
-            }
-        });
-        TxBatcher { tx }
-    }
-
-    fn submit(&self, frame: InjectFrame, mcs: McsDescriptor) -> Result<(), FaceError> {
-        self.tx.send((frame, mcs)).map_err(|_| FaceError::Closed)
-    }
-}
 
 /// **What a coded generation pins to the frame that opened it: its whole on-air identity.**
 ///
@@ -299,28 +254,6 @@ impl GenerationSink for RadioFecSink {
     }
 }
 
-struct FaceFec {
-    /// Batching + plan-R actuation over the radio; the pin is the generation's whole on-air
-    /// identity — see [`RadioFecPin`].
-    bridge: LinkFecBridge<RadioFecPin>,
-    /// Payloads recovered/delivered by the decoder, awaiting `recv_bytes`.
-    pending: std::sync::Mutex<VecDeque<(Bytes, Option<FaceAddr>)>>,
-}
-
-impl FaceFec {
-    fn spawn(backend: Arc<dyn FrameIo>, k: usize, redundancy: u16, window: Duration) -> Self {
-        // The generation loop, the window flush, and the plan-driven R actuation are all in the
-        // bearer-agnostic bridge (task #33); the radio specifics are in the shared
-        // [`RadioFecSink`], which both faces use (#82). Everything on-air-visible rides the
-        // per-generation pin, so per-Data-name addressing and the §2 nonce compose with coding
-        // instead of being reinvented by the sink.
-        let bridge = LinkFecBridge::spawn(RadioFecSink { radio: backend }, k, redundancy, window);
-        FaceFec {
-            bridge,
-            pending: std::sync::Mutex::new(VecDeque::new()),
-        }
-    }
-}
 
 /// **How outgoing frames get their addr1** — a composable, configurable capability
 /// (set independently of the RX filter, the FEC bridge, the MCS policy, the trust
@@ -441,7 +374,7 @@ pub(crate) fn bloom_wire_for_wire(key: &GroupKey, wire: &[u8]) -> Option<[u8; 12
 ///
 /// Shared behind an `Arc` because the RX path writes `last_rssi` while the TX path reads it, and on
 /// the medium those are different tasks on different bearers observing one link.
-pub(crate) struct RatePolicy {
+pub struct RatePolicy {
     policy: McsPolicy,
     /// Most-recently-observed RSSI, fed by every captured frame; the input to
     /// [`McsPolicy::Adaptive`]. Initialised to the conservative-default RSSI.
@@ -451,7 +384,7 @@ pub(crate) struct RatePolicy {
 }
 
 impl RatePolicy {
-    pub(crate) fn new(policy: McsPolicy) -> Self {
+    pub fn new(policy: McsPolicy) -> Self {
         Self {
             policy,
             last_rssi: AtomicI8::new(-70),
@@ -459,18 +392,18 @@ impl RatePolicy {
         }
     }
 
-    pub(crate) fn with_planned(mut self, cell: Arc<RwLock<Option<TxParams>>>) -> Self {
+    pub fn with_planned(mut self, cell: Arc<RwLock<Option<TxParams>>>) -> Self {
         self.planned = Some(cell);
         self
     }
 
     /// Record a captured frame's RSSI — the feedback that makes `Adaptive` adaptive.
-    pub(crate) fn observe_rssi(&self, dbm: i8) {
+    pub fn observe_rssi(&self, dbm: i8) {
         self.last_rssi.store(dbm, Ordering::Relaxed);
     }
 
     /// The rate to inject the next frame at.
-    pub(crate) fn select(&self) -> McsDescriptor {
+    pub fn select(&self) -> McsDescriptor {
         if let Some(cell) = &self.planned
             && let Ok(guard) = cell.read()
             && let Some(tp) = *guard
@@ -494,7 +427,7 @@ impl RatePolicy {
     }
 
     /// The plan's decided link-FEC redundancy, when the cell carries one.
-    pub(crate) fn planned_redundancy(&self) -> Option<u16> {
+    pub fn planned_redundancy(&self) -> Option<u16> {
         self.planned
             .as_ref()?
             .read()
@@ -648,199 +581,159 @@ fn named_tlv_value(parent: &[u8], want: u64) -> Option<&[u8]> {
 // `FrameIo` (see the note on `WifiRadio` in ndn-radio-hal), so the object-safe seam a face actually
 // holds is the one carrying the overridable behaviour, and the helpers are gone.
 
+/// **A single-radio monitor-mode face — a one-bearer [`RadioMediumFace`]** (#82).
+///
+/// This is now a *builder*, not a second data plane. Every frame it sends and receives goes through
+/// the medium's `TxBearer` / reader task; nothing about addressing, filtering, coding, batching or
+/// rate lives here any more. What remains is the ergonomics that made this type worth keeping: the
+/// one-call constructors for a single radio ([`espnow`](Self::espnow), [`halow`](Self::halow),
+/// [`open_libusb`](Self::open_libusb)) and a builder chain that reads in single-radio terms.
+///
+/// #82 called for collapsing the two faces because "the right model has the fewer features", and
+/// that is what happened — but only after the features were reconciled one at a time, because each
+/// pass found the copies had diverged, not merely duplicated:
+///
+/// | feature | what the split had done |
+/// |---|---|
+/// | name gate | Tier-1 and the NDN-NIC baseline existed on one side only (part 1) |
+/// | A-MSDU | reached the backend's override from one side only; a helper silently disabled it |
+/// | link-FEC | two sinks, each pinning too little; coded frames lost Tier-0 addressing |
+/// | Tier-0 fragments | the medium had no fragment cache; the face's leaked |
+/// | rate policy | a decided MCS reached the air from one side only |
+///
+/// The collapse also fixes one thing on its own, with no code written for it: this face used to
+/// address non-Tier-0 frames `(BROADCAST, DEFAULT_SRC)` — a fixed host tag in the source field,
+/// which is exactly what `docs/mac-addressing-doctrine.md` §2 forbids. The medium has always
+/// stamped the per-boot ephemeral rotating nonce there. Routing this face through it makes the
+/// doctrine hold on both paths, which is the argument for collapsing rather than syncing: a
+/// behaviour that exists once cannot drift.
 pub struct MonitorWifiFace {
     id: FaceId,
-    backend: Arc<dyn FrameIo>,
-    mtu: usize,
-    /// How the next frame's exact rate is chosen (plan → adaptive → fixed), shared with
-    /// `RadioMediumFace` (#82). `Arc` because the RX path feeds it RSSI while TX reads it.
+    /// Mirrored so [`Transport::send_mtu`] can answer without materialising the medium.
+    mtu: std::sync::atomic::AtomicUsize,
+    /// The medium being configured. `take`n when the face is first used or mounted.
+    cfg: Mutex<Option<RadioMediumFace>>,
+    /// The running medium, materialised on first use. Built lazily so the builder chain stays a
+    /// plain `mut self -> Self` and no reader task is spawned for a face that is only configured.
+    running: tokio::sync::OnceCell<crate::medium::RunningMedium>,
+    /// The very gate the medium's reader uses — held here so `tier1_handle` / `tier1_dropped`
+    /// answer about the live filter rather than a copy of its configuration.
+    gate: Arc<NameGate>,
+    /// The very rate policy the medium's bearer uses, for `select_mcs`.
     rate: Arc<RatePolicy>,
-    signal_sink: Option<Arc<dyn SignalStore<FaceId> + Send + Sync>>,
-    /// TX name-addressing capability (how outgoing `addr1` is chosen).
-    tx_addr: TxAddr,
-    /// Name filtering (Tier-0 + optional Tier-1), shared with `RadioMediumFace` (#82).
-    gate: NameGate,
-    /// **Tier-1** (#92), when this node runs one: BF-FIB / BF-PIT / BF-CS consulted on the parsed
-    /// name *after* Tier-0 admits a frame. `None` on an endpoint, where Tier-0 alone is the right
-    /// trade (#101: Tier-0's FP climbs with registered-prefix count, so it suits small E and a relay
-    /// wants this instead).
-    ///
-    /// `RwLock` because the read is the per-frame fast path and the writes are comparatively rare
-    /// forwarder events (a PIT entry added, a Data cached). No `await` is held across the guard.
-    tier1: Option<Arc<std::sync::RwLock<crate::tier1::Tier1>>>,
-    /// Frames Tier-1 rejected — kept so the tier's contribution is observable rather than assumed.
-    /// A filter nobody can measure is indistinguishable from one that does nothing.
-    tier1_dropped: Arc<std::sync::atomic::AtomicU64>,
-    /// For [`TxAddr::PrefixBloom`]: resolves each object's 12-byte filter (`addr1 ‖ addr2`),
-    /// caching by LP base sequence so every fragment of one object carries the same filter.
-    /// Shared with `RadioMediumFace` (#82) — see [`Tier0Addresser`].
-    addresser: Option<Tier0Addresser>,
-    /// This face's ephemeral rotating source nonce (mac-addressing-doctrine §2). Stamped into
-    /// `addr3` on the Tier-0 ([`TxAddr::PrefixBloom`]) TX path, where `addr1 ‖ addr2` is the filter
-    /// and so cannot also carry the source — preserving per-transmitter RSSI keying at the receiver.
-    source: EphemeralSource,
-    /// Optional A-MSDU batcher ([`with_amsdu_batching`]). When set, `send_bytes`
-    /// enqueues outbound frames here and they are coalesced into A-MSDU bursts
-    /// instead of injected one at a time.
-    ///
-    /// [`with_amsdu_batching`]: MonitorWifiFace::with_amsdu_batching
-    batcher: Option<TxBatcher>,
-    /// Optional link-layer FEC ([`with_link_fec`]). Mutually exclusive with the
-    /// A-MSDU batcher (FEC interleaves one MPDU per frame; batching bundles).
-    ///
-    /// [`with_link_fec`]: MonitorWifiFace::with_link_fec
-    fec: Option<FaceFec>,
 }
 
 impl MonitorWifiFace {
     /// New monitor-mode face over `backend`, sized for fragmented NDN traffic
     /// (`MONITOR_MTU`) and injecting at the conservative default rate.
     pub fn new(id: FaceId, backend: Arc<dyn FrameIo>) -> Self {
-        Self {
+        Self::over(
             id,
             backend,
-            mtu: MONITOR_MTU,
-            rate: Arc::new(RatePolicy::new(McsPolicy::default())),
-            signal_sink: None,
-            tx_addr: TxAddr::Broadcast,
-            gate: NameGate::open(),
-            tier1: None,
-            tier1_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            addresser: None,
-            source: EphemeralSource::new(
-                {
-                    // Per-boot entropy ⊕ face id, so co-located faces get distinct nonces. The nonce
-                    // only appears on the Tier-0 TX path; a stronger RNG drops in unchanged.
-                    let nanos = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_nanos() as u64)
-                        .unwrap_or(0);
-                    nanos ^ (id.0 as u64).wrapping_mul(0x9E37_79B9)
-                },
-                5 * 60 * 1000,
-            ),
-            batcher: None,
-            fec: None,
+            RadioCapability::wifi_monitor_5ghz(Vec::new()),
+        )
+    }
+
+    /// New face over `backend` declaring `cap` — what the one-radio constructors use when they know
+    /// the radio's real profile (S1G channel list, dBm range) rather than a placeholder.
+    fn over(id: FaceId, backend: Arc<dyn FrameIo>, cap: RadioCapability) -> Self {
+        // A rate policy is installed from the start, unlike on a bare `RadioMediumFace`: this face's
+        // contract has always been "inject at the conservative default rate", i.e. it *names* a rate
+        // per frame rather than leaving whatever the driver holds. Handing the policy over at
+        // construction is what preserves that through the collapse — without it the medium would
+        // fall back to bearer-state rate and the face would silently stop naming one.
+        let rate = Arc::new(RatePolicy::new(McsPolicy::default()));
+        let medium = RadioMediumFace::new(id, vec![RadioBearer::new(RadioId(0), backend, cap)])
+            .with_rate_policy(rate.clone());
+        Self {
+            id,
+            mtu: std::sync::atomic::AtomicUsize::new(MONITOR_MTU),
+            cfg: Mutex::new(Some(medium)),
+            running: tokio::sync::OnceCell::new(),
+            gate: Arc::new(NameGate::open()),
+            rate,
         }
     }
 
-    /// Build an **ESP-NOW** face over `backend` — the first-class
-    /// NDN-over-ESP-NOW path. `backend` must be in [`FrameFormat::EspNow`] mode
-    /// (e.g. `AfPacketBackend::new(iface, FrameFormat::EspNow { oui: ESPNOW_OUI })`
-    /// on Linux, or use `open_libusb_espnow` on a
-    /// host without a kernel monitor driver). The face is sized to the 250-B
-    /// ESP-NOW body ([`ESPNOW_MTU`]) so the paired `LpLinkService` fragments NDN
-    /// packets into vendor-action frames a stock `esp-wifi` ESP-NOW peer hears;
-    /// the broadcast addressing ESP-NOW requires is the default (no name-group).
-    /// Chainable with [`with_signal_sink`](Self::with_signal_sink),
+    /// Reconfigure the medium under construction. Panics if the face has already been used or
+    /// mounted — a builder call after the reader task is running would silently do nothing, which is
+    /// the class of quiet no-op this whole task has been about.
+    fn map(self, f: impl FnOnce(RadioMediumFace) -> RadioMediumFace) -> Self {
+        {
+            let mut g = self.cfg.lock().unwrap();
+            let cfg = g
+                .take()
+                .expect("MonitorWifiFace builder called after the face was used or mounted");
+            *g = Some(f(cfg));
+        }
+        self
+    }
+
+    /// The running medium, built on first use.
+    async fn running(&self) -> &crate::medium::RunningMedium {
+        self.running
+            .get_or_init(|| async {
+                let cfg = self
+                    .cfg
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("MonitorWifiFace used after being mounted");
+                cfg.build()
+            })
+            .await
+    }
+
+    /// Build an **ESP-NOW** face over `backend` — the first-class NDN-over-ESP-NOW path. `backend`
+    /// must be in [`FrameFormat::EspNow`] mode (e.g.
+    /// `AfPacketBackend::new(iface, FrameFormat::EspNow { oui: ESPNOW_OUI })` on Linux, or use
+    /// `open_libusb_espnow` on a host without a kernel monitor driver). Sized to the 250-B ESP-NOW
+    /// body ([`ESPNOW_MTU`]) so the paired `LpLinkService` fragments NDN packets into vendor-action
+    /// frames a stock `esp-wifi` peer hears; the broadcast addressing ESP-NOW requires is the
+    /// default. Chainable with [`with_signal_sink`](Self::with_signal_sink),
     /// [`with_link_fec`](Self::with_link_fec), etc.
     pub fn espnow(id: FaceId, backend: Arc<dyn FrameIo>) -> Self {
         Self::new(id, backend).with_mtu(ESPNOW_MTU)
     }
 
-    /// Open a **Wi-Fi HaLow (802.11ah / S1G)** monitor face on the kernel monitor
-    /// interface `iface` — e.g. `"halow0"` (Newracom NRC7292) or `"mon0"` (Morse
-    /// Micro MM6108). Drives **both** HaLow chips uniformly; the driver-side
-    /// differences are invisible here.
+    /// Open a **Wi-Fi HaLow (802.11ah / S1G)** monitor face on the kernel monitor interface `iface`
+    /// — e.g. `"halow0"` (Newracom NRC7292) or `"mon0"` (Morse Micro MM6108). Drives **both** HaLow
+    /// chips uniformly; the driver-side differences are invisible here.
     ///
-    /// This pools the HaLow radio uniformly with the 2.4/5 GHz monitor faces:
-    /// same [`FrameIo`] data plane, same [`MonitorWifiFace`], same engine. It
-    /// sets [`FrameFormat::RawNdnS1g`], so injected frames carry the S1G radiotap
-    /// header that names *no* 11n/ac MCS — the chip's own MAC picks the sub-GHz
-    /// rate, so the same minimal radiotap suits both chips.
-    ///
-    /// Verified on-air, including cross-vendor: an NRC7292 received frames a
-    /// second NRC7292 injected, and a Morse MM6108 injected NDN-over-HaLow frames
-    /// that an NRC7292 decoded on 904.5 MHz. Each chip needs a driver patch for
-    /// monitor injection (see the minidronesys configs): NRC7292 forwards
-    /// `IEEE80211_TX_CTL_INJECTED`; the MM6108 driver routes vif-less injected
-    /// frames through its firmware monitor vif with a fixed S1G rate.
+    /// Sets [`FrameFormat::RawNdnS1g`], so injected frames carry the S1G radiotap header that names
+    /// *no* 11n/ac MCS — the chip's own MAC picks the sub-GHz rate, so the same minimal radiotap
+    /// suits both chips. Verified on-air, including cross-vendor: an NRC7292 received frames a
+    /// second NRC7292 injected, and a Morse MM6108 injected NDN-over-HaLow frames that an NRC7292
+    /// decoded on 904.5 MHz. Each chip needs a driver patch for monitor injection (see the
+    /// minidronesys configs): NRC7292 forwards `IEEE80211_TX_CTL_INJECTED`; the MM6108 driver routes
+    /// vif-less injected frames through its firmware monitor vif with a fixed S1G rate.
     ///
     /// The interface must already be in monitor mode on an S1G channel
-    /// (`iw dev <iface> set type monitor; iw dev <iface> set channel 161`; for the
-    /// MM6108 add the vif with `iw phy <phy> interface add mon0 type monitor`,
-    /// per its NixOS `services.morseMonitor`) and the process needs `CAP_NET_RAW`.
-    /// `channels` are the driver's fake channel numbers for the advertised
-    /// capability (they differ per vendor; align on real frequency for interop).
+    /// (`iw dev <iface> set type monitor; iw dev <iface> set channel 161`; for the MM6108 add the
+    /// vif with `iw phy <phy> interface add mon0 type monitor`, per its NixOS
+    /// `services.morseMonitor`) and the process needs `CAP_NET_RAW`. `channels` are the driver's
+    /// fake channel numbers for the advertised capability (they differ per vendor; align on real
+    /// frequency for interop).
     #[cfg(target_os = "linux")]
     pub fn halow(id: FaceId, iface: &str, channels: Vec<u8>) -> Result<Self, FaceError> {
-        // 0x8624 = the NDN-over-Ethernet ethertype used across the stack; both
-        // ends must agree on it (the RX parse validates the LLC/SNAP ethertype).
-        // Advertise absolute dBm power control when this interface actually has it
-        // (Morse and Newracom S1G parts both expose a dBm knob), so a control plane
-        // registering this capability decides power in link budget rather than in
-        // chip index units. Absent on a radio where nothing was found.
+        // 0x8624 = the NDN-over-Ethernet ethertype used across the stack; both ends must agree on it
+        // (the RX parse validates the LLC/SNAP ethertype). Advertise absolute dBm power control when
+        // this interface actually has it (Morse and Newracom S1G parts both expose a dBm knob), so a
+        // control plane registering this capability decides power in link budget rather than in chip
+        // index units. Absent on a radio where nothing was found.
         let mut cap = RadioCapability::wifi_halow_s1g(channels);
         if let Some(r) = crate::dbm_power::Mac80211Knobs::discover(iface).tx_power_range() {
             cap = cap.with_tx_power_dbm(r);
         }
         let backend = AfPacketBackend::new(iface, FrameFormat::RawNdnS1g { ethertype: 0x8624 })
             .map_err(FaceError::Io)?
-            .with_capability(cap);
-        Ok(Self::new(id, Arc::new(backend)))
+            .with_capability(cap.clone());
+        Ok(Self::over(id, Arc::new(backend), cap))
     }
 
-    /// Open the RTL8812EU USB dongle in 5 GHz monitor mode on `channel` and
-    /// build an **ESP-NOW** face over it — the host side of NDN-over-ESP-NOW
-    /// interop with an ESP32 on a host without a kernel monitor driver (macOS,
-    /// etc.). Sets [`FrameFormat::EspNow`] (Espressif OUI) and the 250-B
-    /// [`ESPNOW_MTU`]. For a **dual-band ESP32-C5** the dongle injects on a 5 GHz
-    /// channel (e.g. 36 or 161) and the C5 listens there in `BandMode::_5G` —
-    /// the path the 2.4 GHz-only ESP32-S3 could never close, since these wfb
-    /// dongles only inject on 5 GHz. Inject at a basic rate the peer decodes:
-    /// 6 Mbps OFDM on 5 GHz (`NDN_RADIO_TX_RATE=4`; 1 Mbps DSSS does not exist
-    /// on 5 GHz).
-    #[cfg(feature = "libusb-backend")]
-    pub fn open_libusb_espnow(id: FaceId, channel: u8) -> Result<Self, FaceError> {
-        let backend = crate::LibUsbRtl88xxBackend::open_monitor(channel)?
-            .with_format(FrameFormat::EspNow { oui: ESPNOW_OUI });
-        Ok(Self::espnow(id, Arc::new(backend)))
-    }
-
-    /// Enable **link-layer FEC**: outbound frames are grouped into generations of
-    /// up to `k` (or a `window`), sent as `k + redundancy` coded frames — each its
-    /// own MPDU (interleaved) — and the receiver recovers up to `redundancy`
-    /// losses per generation with no ARQ. The broadcast reliability lever; reuses
-    /// `ndn_coding`'s systematic codec. Mutually exclusive with A-MSDU batching
-    /// (FEC wants one MPDU per frame so a lost MPDU costs ≤ `redundancy` of a
-    /// generation; batching would bundle a whole generation into one MPDU).
-    /// Both ends must enable FEC. Call before mounting (spawns the flush task).
-    pub fn with_link_fec(mut self, k: usize, redundancy: u16, window: Duration) -> Self {
-        // No address is snapshotted here: the whole on-air identity (dst, src, addr3, intent) is
-        // resolved per generation from the frame that opens it and rides the pin, so coded frames
-        // are addressed exactly as uncoded ones are.
-        self.fec = Some(FaceFec::spawn(
-            self.backend.clone(),
-            k.max(1),
-            redundancy,
-            window,
-        ));
-        self
-    }
-
-    /// Enable **link-layer A-MSDU bundling** on the send path: outbound frames
-    /// are coalesced into one A-MSDU per up-to-`max_msdus` frames or `window`
-    /// elapsed, whichever first — one PHY preamble for many NDN packets. Trades a
-    /// little latency for airtime efficiency on the broadcast medium; each MSDU
-    /// stays an independent NDN packet the receiver de-aggregates, so PIT/FIB
-    /// semantics are untouched. Call before mounting (it spawns the flush task on
-    /// the current runtime). A `window` of a few milliseconds and `max_msdus`
-    /// ~8–16 is a sane default.
-    ///
-    /// The aggregation happens in the backend's
-    /// [`inject_batch_at`](ndn_radio_hal::FrameIo::inject_batch_at) override, so how much it buys is
-    /// backend-specific: AF_PACKET aggregates for real, and a backend that does not override it
-    /// falls back to individual injection with no airtime change and no error. Check the backend
-    /// before quoting a speedup — the figure that used to sit here was never measured on one.
-    pub fn with_amsdu_batching(mut self, max_msdus: usize, window: Duration) -> Self {
-        self.batcher = Some(TxBatcher::spawn(self.backend.clone(), max_msdus, window));
-        self
-    }
-
-    /// Open the RTL8812EU USB dongle, bring it up in 5 GHz monitor mode on
-    /// `channel` (20 MHz), and build a named-radio face over it — the one-call
-    /// path from a plugged-in dongle to a working `MonitorWifiFace` on a host
-    /// without a kernel monitor driver (macOS, etc.). Pair with
+    /// Open the RTL8812EU USB dongle, bring it up in 5 GHz monitor mode on `channel` (20 MHz), and
+    /// build a named-radio face over it — the one-call path from a plugged-in dongle to a working
+    /// face on a host without a kernel monitor driver (macOS, etc.). Pair with
     /// [`into_face`](Self::into_face) to mount it on the engine.
     #[cfg(feature = "libusb-backend")]
     pub fn open_libusb(id: FaceId, channel: u8) -> Result<Self, FaceError> {
@@ -848,29 +741,66 @@ impl MonitorWifiFace {
         Ok(Self::new(id, Arc::new(backend)))
     }
 
+    /// Open the RTL8812EU USB dongle in 5 GHz monitor mode on `channel` and build an **ESP-NOW**
+    /// face over it — the host side of NDN-over-ESP-NOW interop with an ESP32 on a host without a
+    /// kernel monitor driver (macOS, etc.). Sets [`FrameFormat::EspNow`] (Espressif OUI) and the
+    /// 250-B [`ESPNOW_MTU`]. For a **dual-band ESP32-C5** the dongle injects on a 5 GHz channel
+    /// (e.g. 36 or 161) and the C5 listens there in `BandMode::_5G` — the path the 2.4 GHz-only
+    /// ESP32-S3 could never close, since these wfb dongles only inject on 5 GHz. Inject at a basic
+    /// rate the peer decodes: 6 Mbps OFDM on 5 GHz (`NDN_RADIO_TX_RATE=4`; 1 Mbps DSSS does not
+    /// exist on 5 GHz).
+    #[cfg(feature = "libusb-backend")]
+    pub fn open_libusb_espnow(id: FaceId, channel: u8) -> Result<Self, FaceError> {
+        let backend = crate::LibUsbRtl88xxBackend::open_monitor(channel)?
+            .with_format(FrameFormat::EspNow { oui: ESPNOW_OUI });
+        Ok(Self::espnow(id, Arc::new(backend)))
+    }
+
+    /// Enable **link-layer FEC**: outbound frames are grouped into generations of up to `k` (or a
+    /// `window`), sent as `k + redundancy` coded frames — each its own MPDU (interleaved) — and the
+    /// receiver recovers up to `redundancy` losses per generation with no ARQ. The broadcast
+    /// reliability lever; reuses `ndn_coding`'s systematic codec. Mutually exclusive with A-MSDU
+    /// batching (FEC wants one MPDU per frame so a lost MPDU costs ≤ `redundancy` of a generation;
+    /// batching would bundle a whole generation into one MPDU). Both ends must enable FEC.
+    pub fn with_link_fec(self, k: usize, redundancy: u16, window: Duration) -> Self {
+        self.map(|m| {
+            m.with_link_fec(
+                k,
+                window,
+                Arc::new(std::sync::atomic::AtomicU16::new(redundancy)),
+                Arc::new(crate::medium::LossMeter::default()),
+            )
+        })
+    }
+
+    /// Enable **link-layer A-MSDU bundling** on the send path — see
+    /// [`RadioMediumFace::with_amsdu_batching`], which this now is.
+    pub fn with_amsdu_batching(self, max_msdus: usize, window: Duration) -> Self {
+        self.map(|m| m.with_amsdu_batching(max_msdus, window))
+    }
+
     /// Set the TX name-addressing capability directly (compose with [`with_rx_filter`]).
-    pub fn with_tx_addr(mut self, tx: TxAddr) -> Self {
-        // Every TxAddr change funnels through here, so this is the one place the addresser (and
-        // its fragment cache) has to be kept in step with the key.
-        self.addresser = match &tx {
-            TxAddr::PrefixBloom { key } => Some(Tier0Addresser::new(*key)),
-            _ => None,
-        };
-        self.tx_addr = tx;
-        self
+    pub fn with_tx_addr(self, tx: TxAddr) -> Self {
+        match tx {
+            TxAddr::PrefixBloom { key } => self.map(|m| m.with_tx_bloom(key)),
+            // Broadcast addressing with the doctrine §2 rotating nonce in the source field is the
+            // medium's default, so there is nothing to configure.
+            TxAddr::Broadcast => self,
+        }
     }
 
     /// Set the RX name-filtering capability directly (compose with [`with_tx_addr`]).
     pub fn with_rx_filter(mut self, rx: RxFilter) -> Self {
-        self.gate = NameGate::new(rx, self.gate.tier1());
-        self
+        self.gate = Arc::new(NameGate::new(rx, self.gate.tier1()));
+        let g = self.gate.clone();
+        self.map(|m| m.with_rx_gate(g))
     }
 
-    /// **Enable Tier-1** (#92) with `bits_each` bits per table, seeding BF-FIB from `prefixes`.
-    ///
-    /// Sized by the caller because the right size is a property of the node's tables, not of the
-    /// face: a relay with a large FIB and a real CS wants far more than a gateway with three
-    /// prefixes. Returns the handle so the forwarder can feed PIT/CS — see [`tier1_handle`].
+    /// Mount a **Tier-1** table (#92) behind the Tier-0 gate: BF-FIB / BF-PIT / BF-CS consulted on
+    /// the parsed name once Tier-0 admits a frame, registered on `prefixes` with `bits_each` bits
+    /// per table and `k` hashes. Use [`tier1_handle`](Self::tier1_handle) to drive it from the
+    /// forwarder's real PIT/CS — a Tier-1 whose tables drift from the forwarder's does not merely
+    /// lose efficiency, a stale BF-PIT drops Data the node is waiting for.
     pub fn with_tier1(
         mut self,
         key: &GroupKey,
@@ -878,46 +808,42 @@ impl MonitorWifiFace {
         bits_each: usize,
         k: u32,
     ) -> Self {
-        let mut t = crate::tier1::Tier1::new(Self::bloom_key(key), bits_each, k);
+        let mut t = crate::tier1::Tier1::new(&key.0, bits_each, k);
         for p in prefixes {
             t.register_prefix(p.as_ref());
         }
         t.sync();
-        self.gate = NameGate::new(self.gate.filter(), Some(Arc::new(std::sync::RwLock::new(t))));
-        self
+        self.gate = Arc::new(NameGate::new(
+            self.gate.filter(),
+            Some(Arc::new(std::sync::RwLock::new(t))),
+        ));
+        let g = self.gate.clone();
+        self.map(|m| m.with_rx_gate(g))
     }
 
-    /// The live Tier-1 handle, for the forwarder to drive **from its real tables**.
-    ///
-    /// This is the half that makes the tier real rather than decorative: BF-PIT must be fed by the
-    /// actual PIT (`add_pit` on send, `remove_pit` on satisfy) and BF-CS by the actual CS (`cache`),
-    /// then `sync()` published. A Tier-1 whose tables drift from the forwarder's does not merely
-    /// lose efficiency — a stale BF-PIT **drops Data the node is waiting for**, which is a false
-    /// negative and the one failure mode this design must not have.
+    /// The live Tier-1 handle, for the forwarder to drive from its real PIT/CS.
     pub fn tier1_handle(&self) -> Option<Arc<std::sync::RwLock<crate::tier1::Tier1>>> {
         self.gate.tier1()
     }
 
-    /// Frames rejected by Tier-1 since start.
+    /// Frames Tier-1 rejected — the tier's contribution, observable rather than assumed.
     pub fn tier1_dropped(&self) -> u64 {
         self.gate.dropped_tier1()
     }
 
-    /// Build a [`RxFilter::Bloom`] over `prefixes` under `key`: one precomputed
-    /// [`PrefixFilter::mask_for`] per registered prefix. A relay passes many; a consumer one.
-    fn bloom_masks(key: &GroupKey, prefixes: &[impl AsRef<[u8]>]) -> RxFilter {
-        let k = Self::bloom_key(key);
-        let masks: std::sync::Arc<[PrefixFilter]> = prefixes
-            .iter()
-            .map(|p| PrefixFilter::mask_for(k, p.as_ref()))
-            .collect();
-        RxFilter::Bloom(masks)
+    /// The rate the next frame would be injected at.
+    #[cfg(test)]
+    fn select_mcs(&self) -> McsDescriptor {
+        self.rate.select()
     }
 
-    /// **Tier-0 producer** (#91): each object is addressed by the prefix-set Bloom filter of
-    /// its inner name (`addr1 ‖ addr2`), so every receiver matches at its *own* registered
-    /// prefix. RX keeps the object's own name family (overhearing). This is the prefix-set
-    /// replacement for the retired flat/split name-group addressing.
+    /// Precompute the receiver's Tier-0 mask set for `prefixes`.
+    fn bloom_masks(key: &GroupKey, prefixes: &[impl AsRef<[u8]>]) -> RxFilter {
+        RxFilter::Bloom(crate::bloom_masks_for(key, prefixes))
+    }
+
+    /// **Tier-0 producer** (#91): address every outgoing object by its name's prefix-set filter, and
+    /// accept inbound frames whose filter could be under `routable_prefix`.
     pub fn with_bloom_producer(self, key: &GroupKey, routable_prefix: impl AsRef<[u8]>) -> Self {
         let rx = Self::bloom_masks(key, &[routable_prefix.as_ref()]);
         self.with_tx_addr(TxAddr::PrefixBloom { key: *key })
@@ -925,186 +851,63 @@ impl MonitorWifiFace {
     }
 
     /// **Tier-0 relay** (#91): RX keeps any frame whose in-frame filter could be under one of
-    /// `prefixes` — the aggregation win, now expressed as longest-prefix match rather than a
-    /// single fixed-granularity hash. TX is left as configured.
+    /// `prefixes` — the aggregation win, expressed as longest-prefix match rather than a single
+    /// fixed-granularity hash. TX is left as configured.
     pub fn with_bloom_relay(self, key: &GroupKey, prefixes: &[impl AsRef<[u8]>]) -> Self {
         let rx = Self::bloom_masks(key, prefixes);
         self.with_rx_filter(rx)
     }
 
-    /// **Tier-0 consumer** (#91): RX keeps frames under this one registered prefix. Because the
-    /// sender ships *all* name granularities, this matches whether the sender chose `/x` or
-    /// `/x/y/z` — the out-of-band granularity agreement `name_group` required is gone.
+    /// **Tier-0 consumer** (#91): accept only frames whose filter could be under `prefix`.
     pub fn with_bloom_consumer(self, key: &GroupKey, prefix: impl AsRef<[u8]>) -> Self {
         let rx = Self::bloom_masks(key, &[prefix.as_ref()]);
-        self.with_tx_addr(TxAddr::PrefixBloom { key: *key })
-            .with_rx_filter(rx)
+        self.with_rx_filter(rx)
     }
 
-    /// Inject every frame at a fixed MCS (e.g. for a known-good link or a bench).
+    /// Inject at a fixed rate.
     pub fn with_fixed_mcs(mut self, mcs: McsDescriptor) -> Self {
         self.rate = Arc::new(RatePolicy::new(McsPolicy::Fixed(mcs)));
-        self
+        let r = self.rate.clone();
+        self.map(|m| m.with_rate_policy(r))
     }
 
-    /// Pick the injection MCS from observed RSSI ([`McsPolicy::Adaptive`]).
+    /// Pick the rate from the most recently observed RSSI.
     pub fn with_adaptive_mcs(mut self) -> Self {
         self.rate = Arc::new(RatePolicy::new(McsPolicy::Adaptive));
-        self
+        let r = self.rate.clone();
+        self.map(|m| m.with_rate_policy(r))
     }
 
-    /// Override the injected-frame payload budget (custom PHY / MTU).
-    pub fn with_mtu(mut self, mtu: usize) -> Self {
-        self.mtu = mtu.max(1);
-        self
+    /// Override the injected-frame payload budget (defaults to [`MONITOR_MTU`]).
+    pub fn with_mtu(self, mtu: usize) -> Self {
+        self.mtu.store(mtu, Ordering::Relaxed);
+        self.map(|m| m.with_mtu(mtu))
     }
 
-    /// Publish per-frame RSSI into `sink` keyed by this face's id, feeding
-    /// measured strategies via [`ndn_signals_core::SignalView`].
-    pub fn with_signal_sink(mut self, sink: Arc<dyn SignalStore<FaceId> + Send + Sync>) -> Self {
-        self.signal_sink = Some(sink);
-        self
+    /// Publish each captured frame's RSSI/rate to `sink`, keyed by this face id, so the cognitive
+    /// control loop's `SignalView` sees live per-radio link quality.
+    pub fn with_signal_sink(self, sink: Arc<dyn SignalStore<FaceId> + Send + Sync>) -> Self {
+        self.map(|m| m.with_signal_sink(sink))
     }
 
-    /// Let the cognitive control plane drive the per-frame [`TxParams`] via a
-    /// shared cell. The [`RadioControl`] actuator writes the decided params here;
-    /// `select_mcs` reads them so a *decision* actually changes the transmitted
-    /// rate/coding. This is the ACT half of the sense→decide→act loop. Pass the
-    /// same `Arc` to `RadioControl::libusb_actuator` so both ends share it.
-    ///
-    /// [`RadioControl`]: crate::RadioControl
+    /// Bind the control plane's decided [`TxParams`] — the ACT half of the closed loop. `select_mcs`
+    /// reads the cell, so the decided rate/coding actually changes what we transmit.
     pub fn with_planned_params(mut self, cell: Arc<RwLock<Option<TxParams>>>) -> Self {
-        self.rate = Arc::new(RatePolicy::new(self.rate.policy).with_planned(cell));
-        self
+        self.rate = Arc::new(RatePolicy::new(McsPolicy::default()).with_planned(cell));
+        let r = self.rate.clone();
+        self.map(|m| m.with_rate_policy(r))
     }
 
-    /// Build a [`Face`] pairing this transport with the `LpLinkService`, so the
-    /// engine fragments/reassembles NDN packets across injected frames.
+    /// Build a [`Face`] pairing this face's transport with the engine's `LpLinkService`, so NDN
+    /// packets fragment/reassemble across injected frames.
     pub fn into_face(self) -> Face {
-        Face::from_transport(self)
-    }
-
-    /// Parity frames the plan wants on the next generation, if a control plane has
-    /// decided one. `None` leaves the link-FEC feature at its configured `R`.
-    ///
-    /// This is the actuator for [`TxParams::link_fec_redundancy`], which until
-    /// 2026-07-17 was decided by `RadioPolicy::fec_redundancy`, carried all the way
-    /// into this face's `planned` cell — and then read by nobody, so the redundancy
-    /// budget was fixed at `with_link_fec` construction time and no name ever moved
-    /// it (task #32). A knob reaching the face is not a knob reaching the air.
-    ///
-    /// [`TxParams::link_fec_redundancy`]: ndn_radio_cognition::TxParams::link_fec_redundancy
-    fn planned_redundancy(&self) -> Option<u16> {
-        self.rate.planned_redundancy()
-    }
-
-    /// The face's fallback `(dst, src)` when no per-object filter applies (broadcast, or a
-    /// non-first fragment on a cache miss). Broadcast passes every receiver's filter — the safe
-    /// over-accept direction; Tier 1/2 does the exact match, and a false negative is forbidden.
-    fn static_addr(&self) -> ([u8; 6], [u8; 6]) {
-        (BROADCAST, DEFAULT_SRC)
-    }
-
-    /// The 64-bit filter key derived from a [`GroupKey`] — the first 8 bytes, so the
-    /// well-known [`OPEN_GROUP_KEY`] is a public keyspace and a shared secret is private.
-    /// The Tier-0 filter key is the whole [`GroupKey`] — see [`crate::bloom_key64`].
-    fn bloom_key(key: &GroupKey) -> &[u8; 16] {
-        &key.0
-    }
-
-    /// The source nonce to stamp into `addr3`, or `None` to keep the legacy `addr3 = dst`. Only the
-    /// Tier-0 ([`TxAddr::PrefixBloom`]) path needs it — there `addr2` is the filter's low half, so the
-    /// per-transmitter source moves to `addr3` (doctrine §2, per-neighbour RSSI keying).
-    fn tx_nonce(&self) -> Option<[u8; 6]> {
-        matches!(self.tx_addr, TxAddr::PrefixBloom { .. })
-            .then(|| self.source.current(now_ms() as u64))
-    }
-
-    /// Resolve the `(dst, src)` = `addr1 ‖ addr2` for one outgoing wire frame under
-    /// [`TxAddr::PrefixBloom`]: the object's name → its prefix-set filter, cached by LP base
-    /// sequence so every fragment of one object carries the same filter (only the first has the
-    /// name). Non-Bloom / no-name → broadcast, a safe over-accept.
-    fn resolve_addr(&self, wire: &[u8]) -> ([u8; 6], [u8; 6]) {
-        // No name, no cached object, or not on the Bloom path → broadcast: an over-accept the
-        // receiver's filter admits, never a false negative.
-        match self.addresser.as_ref().and_then(|a| a.wire_for(wire)) {
-            Some(w) => (w[..6].try_into().unwrap(), w[6..].try_into().unwrap()),
-            None => self.static_addr(),
-        }
-    }
-
-    /// Does a captured frame pass this face's name filtering? Delegates to the shared
-    /// [`NameGate`] (#82) — the same decision `RadioMediumFace` makes, from the same code.
-    fn rx_accepts(&self, addr1: Option<[u8; 6]>, addr2: Option<[u8; 6]>, wire: &[u8]) -> bool {
-        self.gate.admits(addr1, addr2, wire)
-    }
-
-    /// The rate to inject the next frame at. A control-plane plan
-    /// ([`with_planned_params`]) wins when present; otherwise the static policy.
-    fn select_mcs(&self) -> McsDescriptor {
-        self.rate.select()
-    }
-
-    /// Receive one captured frame for this face, recording its RSSI for adaptive
-    /// MCS and publishing it to the signal sink. When bound to a name-group,
-    /// frames for other groups are dropped here (a name pre-filter *before* NDN
-    /// decode); our group and broadcast are kept.
-    async fn recv_inner(&self) -> Result<CapturedFrame, FaceError> {
-        loop {
-            let f = self.backend.recv_frame().await?;
-            if !self.rx_accepts(f.group, f.addr, &f.payload) {
-                continue; // a different name-group — drop before decoding
-            }
-            // **Tier-1** (#92), when enabled: Tier-0 has admitted the frame on 12 bytes with no
-            // parse; this is the second gate, on the parsed name, against BF-FIB / BF-PIT / BF-CS.
-            // It catches what Tier-0 structurally cannot — notably direction (b), a prefix-seeking
-            // Interest that is an ancestor of something we cache — and it is where a node with many
-            // registered prefixes gets its selectivity back (#101).
-            //
-            // A frame with no name (a non-first fragment) is passed: reassembly needs it, and the
-            // first fragment already faced both gates. Same safe over-accept the TX path makes.
-            if let Some(t1) = self.tier1.as_ref()
-                && let Some(name) = inner_name(&f.payload)
-            {
-                let slash = ndn_name_to_slash(name);
-                let miss = match t1.read() {
-                    Ok(g) => g.lookup(&slash).is_miss(),
-                    // A poisoned lock must not silently start dropping traffic: fail open. The
-                    // filter is an optimisation; the forwarder behind it is the correctness layer.
-                    Err(_) => false,
-                };
-                if miss {
-                    self.tier1_dropped.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-            }
-            if let Some(rssi) = f.rssi_dbm {
-                self.rate.observe_rssi(rssi);
-            }
-            // Publish the per-frame radio signals (RSSI + the rate the frame
-            // arrived at) for this face, so measured/CCLF strategies can rank
-            // this neighbour by live link quality. Publish whenever either
-            // reading is present.
-            if (f.rssi_dbm.is_some() || f.mcs_index.is_some())
-                && let Some(sink) = self.signal_sink.as_ref()
-            {
-                let mut ls = LinkSignals {
-                    rssi_dbm: f.rssi_dbm,
-                    observed_tput_bps: f.mcs_index.map(mcs_phy_rate_bps),
-                    updated_ms: now_ms(),
-                    ..LinkSignals::default()
-                };
-                // Publish the raw 802.11 MCS index as a cross-layer ext signal:
-                // the common vocab has no MCS field, and `observed_tput_bps`
-                // above is only the *derived* PHY rate. Measured/CCLF strategies
-                // and the cognitive plane read it via `ext_get("mcs")`.
-                if let Some(mcs) = f.mcs_index {
-                    ls.ext_set("mcs", mcs as f32);
-                }
-                sink.set_link(self.id, ls);
-            }
-            return Ok(f);
-        }
+        let cfg = self
+            .cfg
+            .lock()
+            .unwrap()
+            .take()
+            .expect("MonitorWifiFace mounted twice");
+        cfg.into_face()
     }
 }
 
@@ -1115,13 +918,12 @@ impl Transport for MonitorWifiFace {
 
     fn kind(&self) -> FaceKind {
         // The Wfb kind: a wire kind (LP framing on), NonLocal scope.
-        // `link_type() == AdHoc` distinguishes the connectionless injection
-        // bearer.
+        // `link_type() == AdHoc` distinguishes the connectionless injection bearer.
         FaceKind::Wfb
     }
 
     fn remote_uri(&self) -> Option<String> {
-        Some("monitor-wifi://broadcast".to_string())
+        Some("radio://broadcast".into())
     }
 
     fn link_type(&self) -> LinkType {
@@ -1129,99 +931,32 @@ impl Transport for MonitorWifiFace {
     }
 
     fn send_mtu(&self) -> Option<usize> {
-        Some(self.mtu)
+        Some(self.mtu.load(Ordering::Relaxed))
     }
 
     async fn send_bytes(&self, wire: Bytes) -> Result<(), FaceError> {
-        // The LpLinkService already framed/fragmented; each call is one frame.
-        // Address it per the TX capability (broadcast / flat group / per-Data-name
-        // split) — never a host MAC.
-        let (dst, src) = self.resolve_addr(&wire);
-        let mcs = self.select_mcs();
-        // Link-FEC: enqueue the wire frame; the flush task groups a generation,
-        // emits K+R coded frames (one MPDU each, interleaved), recovers losses. The
-        // per-object split `dst` rides in the pin, so the generation is addressed to
-        // the object that opened it — split addressing composes with coding. (K should
-        // align with an object's fragments; a generation spanning objects takes the
-        // opening object's address, same as it takes the opening frame's MCS.)
-        if let Some(fec) = &self.fec {
-            return fec.bridge.send(
-                wire,
-                RadioFecPin {
-                    dst,
-                    src,
-                    addr3: self.tx_nonce(),
-                    intent: TxIntent::CONSERVATIVE,
-                    mcs: Some(mcs),
-                },
-                self.planned_redundancy(),
-            );
-        }
-        // The exact resolved rate travels alongside the frame (via inject_at /
-        // the batcher), not on the intent — the frame's tx is a placeholder.
-        let frame = InjectFrame {
-            payload: wire,
-            tx: TxIntent::CONSERVATIVE,
-            dst,
-            src,
-            // Tier-0 (#91d): stamp the ephemeral nonce into addr3 (addr1‖addr2 is the filter). `None`
-            // off the Bloom path keeps the legacy addr3=dst.
-            addr3: self.tx_nonce(),
-        };
-        // With A-MSDU batching the frame is enqueued (non-blocking) and bundled
-        // by the flush task; otherwise it is injected immediately.
-        match &self.batcher {
-            Some(b) => b.submit(frame, mcs),
-            None => self.backend.inject_at(frame, mcs).await,
-        }
+        self.running().await.send_bytes(wire).await
     }
 
     async fn recv_bytes(&self) -> Result<Bytes, FaceError> {
-        self.recv_bytes_with_addr().await.map(|(b, _)| b)
+        self.running().await.recv_bytes().await
     }
 
     async fn recv_bytes_with_addr(&self) -> Result<(Bytes, Option<FaceAddr>), FaceError> {
-        // Link-FEC: feed each captured frame to the decoder. Source frames are
-        // delivered immediately; parity recovers missing ones. A captured frame
-        // can yield 0 (parity, not yet complete), 1, or several payloads — buffer
-        // the extras and drain them across calls. Non-FEC frames pass through.
-        if let Some(fec) = &self.fec {
-            loop {
-                if let Some(p) = fec.pending.lock().unwrap().pop_front() {
-                    return Ok(p);
-                }
-                let f = self.recv_inner().await?;
-                let addr = f.addr.map(FaceAddr::Ether);
-                // The feature delivers a plain frame as-is, a source frame immediately,
-                // and recovered sources when parity completes a generation (0, 1, or many).
-                let delivered = fec.bridge.decode(f.payload);
-                if delivered.is_empty() {
-                    continue; // parity that didn't complete a generation yet
-                }
-                let mut q = fec.pending.lock().unwrap();
-                for d in delivered {
-                    q.push_back((d, addr.clone()));
-                }
-                if let Some(p) = q.pop_front() {
-                    return Ok(p);
-                }
-            }
-        }
-        let f = self.recv_inner().await?;
-        Ok((f.payload, f.addr.map(FaceAddr::Ether)))
+        self.running().await.recv_bytes_with_addr().await
     }
 
-    /// Injected-frame budget is fixed at construction.
     fn set_send_mtu(&self, _mtu: Option<u64>) -> Result<Option<u64>, MtuError> {
-        Err(MtuError::Immutable)
+        Err(MtuError::NotSupported)
     }
 
-    /// A broadcast medium has no per-peer connection to keep alive.
     fn set_persistency(&self, _persistency: FacePersistency) -> Result<(), PersistencyError> {
-        Err(PersistencyError::Immutable)
+        Err(PersistencyError::NotSupported)
     }
 }
 
+/// Milliseconds since first call — a cheap monotonic clock for nonce rotation and signal
+/// timestamps, with no wall-clock dependency.
 fn now_ms() -> u32 {
     use std::sync::OnceLock;
     use std::time::Instant;
@@ -1231,6 +966,7 @@ fn now_ms() -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use ndn_signals_core::LinkSignals;
 
     /// **#92 integration — Tier-1 actually gates the RX path.**
     ///
