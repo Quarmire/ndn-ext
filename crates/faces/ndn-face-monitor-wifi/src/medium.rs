@@ -885,6 +885,12 @@ impl TxBearer {
             None => (BROADCAST, nonce, None),
         };
 
+        // The rate this frame should ride, if any is decided. Computed BEFORE the FEC branch so a
+        // coded generation can pin it: see the comment at the pin below.
+        let decided = (!robust && !legacy)
+            .then(|| self.rate.as_ref().map(|r| r.select()))
+            .flatten();
+
         // Only route through the FEC coder when there is parity to add AND this frame
         // is FEC-eligible (appropriate-traffic-only) AND it is not a robust control frame.
         // At R=0 the generation batching would cost the tail-flush latency for no recovery;
@@ -905,9 +911,23 @@ impl TxBearer {
                     .unwrap_or_else(|| r.load(Ordering::Relaxed));
                 let eligible = self.eligible.as_ref().is_none_or(|pred| pred(&wire));
                 if parity > 0 && eligible {
-                    // The generation takes the opening frame's address and intent, so coded
-                    // traffic keeps both Tier-0 addressing and the legacy-rate cap. `mcs: None` —
-                    // this face holds rate as bearer state in the driver, not per frame.
+                    // The generation takes the opening frame's address, intent AND rate, so coded
+                    // traffic keeps Tier-0 addressing, the legacy-rate cap, and the decided MCS.
+                    //
+                    // `mcs` was `None` here until an on-air run caught it. The reasoning was "this
+                    // face holds rate as bearer state" — true before `with_rate_policy` existed,
+                    // false after: with a policy bound and FEC on, EVERY data frame takes this
+                    // branch, so `inject_at` was never reached and no frame ever carried a decided
+                    // rate. The old `MonitorWifiFace` pinned `mcs: Some(..)` into its `WifiPin`;
+                    // unifying the sink dropped that, and the loopback test missed it because it
+                    // exercised rate and FEC separately, never together.
+                    //
+                    // MEASURED (a81a → 881a, ch149, 2684 coded frames): the receiver decoded every
+                    // `new`-arm frame at the *previous* period's MCS — the rate some other caller
+                    // had last left in the bearer — while the direct-inject control arm tracked its
+                    // plan exactly. A decided rate that reaches no frame is this codebase's
+                    // signature defect, reintroduced by a refactor and invisible to every test that
+                    // did not put both features on at once.
                     return bridge.send(
                         wire,
                         crate::RadioFecPin {
@@ -915,7 +935,7 @@ impl TxBearer {
                             src,
                             addr3,
                             intent,
-                            mcs: None,
+                            mcs: decided,
                         },
                         Some(parity),
                     );
@@ -934,9 +954,6 @@ impl TxBearer {
         // one at a time. Robust control frames fall through — a report or time beacon must reach the
         // worst receiver *now*, and holding one for a flush window would blunt exactly the
         // worst-overheard-receiver reach the ROBUST intent exists to guarantee.
-        let decided = (!robust && !legacy)
-            .then(|| self.rate.as_ref().map(|r| r.select()))
-            .flatten();
         if !robust && let Some(bat) = &self.batcher {
             return bat.submit(frame, decided);
         }
@@ -2045,5 +2062,88 @@ mod tests {
             "with the legacy gate up the frame must go out MostRobust on the plain path, so the \
              driver drops it to the basic rate — never at the planned MCS: {calls:?}"
         );
+    }
+
+    /// **A decided rate must reach FEC-CODED frames too** — the combination, not each feature alone.
+    ///
+    /// Found on air, not here. `medium_actuates_the_planned_rate_but_the_legacy_gate_outranks_it`
+    /// tests rate with FEC off; `medium_tier0_addressing_survives_link_fec` tests FEC with no rate
+    /// policy. Both passed while the intersection was broken: with a policy bound *and* FEC on,
+    /// every data frame takes the FEC branch, which pinned `mcs: None`, so `inject_at` was never
+    /// reached and coded frames rode whatever rate happened to be left in the bearer.
+    ///
+    /// The on-air A/B (a81a → 881a, ch149) showed it plainly: 2684 coded frames all decoded at the
+    /// *previous* period's MCS, while a direct-inject control arm on the same radio tracked its plan
+    /// exactly. Two features that are individually correct can still be jointly wrong, and a suite
+    /// that only tests them apart will report success.
+    #[tokio::test]
+    async fn medium_actuates_the_planned_rate_on_fec_coded_frames() {
+        struct RateSpy {
+            at: std::sync::Mutex<Vec<u8>>,
+            plain: std::sync::Mutex<usize>,
+        }
+
+        #[async_trait::async_trait]
+        impl FrameIo for RateSpy {
+            async fn inject(&self, _f: InjectFrame) -> Result<(), FaceError> {
+                *self.plain.lock().unwrap() += 1;
+                Ok(())
+            }
+            async fn inject_at(&self, _f: InjectFrame, mcs: McsDescriptor) -> Result<(), FaceError> {
+                self.at.lock().unwrap().push(mcs.index);
+                Ok(())
+            }
+            async fn recv_frame(&self) -> Result<crate::CapturedFrame, FaceError> {
+                std::future::pending().await
+            }
+        }
+
+        const K: usize = 2;
+        let spy = Arc::new(RateSpy {
+            at: std::sync::Mutex::new(Vec::new()),
+            plain: std::sync::Mutex::new(0),
+        });
+        let plan = Arc::new(std::sync::RwLock::new(Some(TxParams {
+            rate: ndn_radio_cognition::RateParams::Wifi(ndn_radio_cognition::WifiRate {
+                mcs: Some(7),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })));
+
+        let medium = RadioMediumFace::new(
+            FaceId(9),
+            vec![RadioBearer::new(RadioId(0), spy.clone(), cap())],
+        )
+        .with_rate_policy(Arc::new(
+            crate::RatePolicy::new(McsPolicy::Fixed(McsDescriptor::CONSERVATIVE))
+                .with_planned(plan),
+        ))
+        // Parity > 0, so every data frame goes through the coder.
+        .with_link_fec(
+            K,
+            Duration::from_millis(20),
+            Arc::new(AtomicU16::new(2)),
+            Arc::new(LossMeter::default()),
+        )
+        .build();
+
+        for i in 0..K as u8 {
+            medium.send_bytes(Bytes::from(vec![i; 24])).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let at = spy.at.lock().unwrap().clone();
+        let plain = *spy.plain.lock().unwrap();
+        assert!(
+            !at.is_empty(),
+            "coded frames must be injected AT the decided rate; {plain} went out on the plain \
+             path, which rides whatever rate the bearer happens to hold"
+        );
+        assert!(
+            at.iter().all(|m| *m == 7),
+            "every coded frame must carry the plan's MCS 7, got {at:?}"
+        );
+        assert_eq!(plain, 0, "no coded frame may bypass the decided rate");
     }
 }
