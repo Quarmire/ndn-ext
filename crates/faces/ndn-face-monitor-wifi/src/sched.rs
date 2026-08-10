@@ -30,7 +30,7 @@
 //! Unset ⇒ scheduler disabled ⇒ the send path is byte-for-byte unchanged.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ndn_radio_cognition::{HopSchedule, SlotSchedule, prefix_hash, wifi_airtime_us};
@@ -38,6 +38,17 @@ use ndn_radio_cognition::{HopSchedule, SlotSchedule, prefix_hash, wifi_airtime_u
 use crate::radio::{Bandwidth, RadioKnobs};
 use ndn_frame_io::LinkStamp;
 use ndn_time::{NetworkTime, RadioHwClock, RefBelief};
+
+/// What [`FaceScheduler::hold_status`] found for the slot we may be holding (#95).
+#[derive(Debug, PartialEq, Eq)]
+enum HoldStatus {
+    /// We hold this slot and there is room — keep transmitting without re-contending.
+    Continue,
+    /// We held it, and must stop: the owner spoke, or the frame no longer fits.
+    Ended,
+    /// We hold no claim on this slot.
+    None,
+}
 
 /// Which clock feeds `epoch(t)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,6 +131,17 @@ pub struct FaceScheduler {
     /// silence alone cannot tell a silent owner from a *hidden* one, and claiming a hidden owner's slot
     /// collides at its receiver — damage neither the claimant nor the owner can observe.
     heard_by_slot: Vec<AtomicU64>,
+    /// **Backlog per name-group** (#95): frames of the group owning slot *k* that we deferred since
+    /// that group last got a turn. The demand signal the CCLF election was missing — the comment on
+    /// the claim called it "the demand-adaptive form that beats fixed-TDMA" while the draw was a
+    /// function of name and time only, so a node with one trivial frame contended exactly as hard as
+    /// one with a backlog.
+    deferred_by_slot: Vec<AtomicU32>,
+    /// **The won slot we are currently holding** (#95): `(slot_start_us, deadline_us)` packed as two
+    /// cells. A claim used to buy exactly one frame — the next frame re-entered the election and paid
+    /// the jitter again, so a burst could not use the idle slot it had just won. Holding is bounded
+    /// by the slot and surrendered the moment the owner speaks.
+    hold_slot_start: AtomicU64,
     /// Claim a slot whose owner we have never heard? Default **false**: an unheard owner is exactly the
     /// hidden-terminal case, and the safe reading of silence is "I cannot tell". `NDN_SCHED_CLAIM_UNKNOWN=1`
     /// opts into the throughput-first reading (claim anything idle), which is what the code did before.
@@ -171,6 +193,8 @@ impl FaceScheduler {
             claimable,
             last_rx: AtomicU64::new(0),
             heard_by_slot: (0..slot_count).map(|_| AtomicU64::new(0)).collect(),
+            deferred_by_slot: (0..slot_count).map(|_| AtomicU32::new(0)).collect(),
+            hold_slot_start: AtomicU64::new(u64::MAX),
             claim_unknown: std::env::var("NDN_SCHED_CLAIM_UNKNOWN").is_ok(),
             rate: None,
             base: Instant::now(),
@@ -353,7 +377,79 @@ impl FaceScheduler {
         // agree without any message.
         let window = (slot_us / 2).max(1);
         let mixed = prefix_hash ^ epoch.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        (mixed ^ (mixed >> 32)) % window
+        let draw = (mixed ^ (mixed >> 32)) % window;
+
+        // **Demand shortens the wait** (#95). The election was a function of name and time only, so a
+        // node holding one trivial frame contended exactly as hard as one holding a backlog — while
+        // the code called itself "the demand-adaptive form that beats fixed-TDMA". Scaling the draw
+        // down by backlog makes that description true: the node with more deferred traffic tends to
+        // speak first and therefore wins the idle slot.
+        //
+        // Unlike the owner grant, this draw does NOT need to be agreed between nodes. It is a
+        // randomised backoff: contenders each pick a delay, the shortest transmits, the rest overhear
+        // and cancel. Nothing has to be predicted, so a purely local demand term is safe here — which
+        // is exactly why it belongs here and not in `owner_slot`.
+        //
+        // Bounded: the shift saturates at 4 (÷16) and the result keeps a floor, so a large backlog
+        // biases the election without collapsing everyone onto zero — which would replace the
+        // ordering with a collision.
+        let backlog = self.deferred_for(prefix_hash);
+        let shift = backlog.min(4);
+        (draw >> shift).max(1)
+    }
+
+    /// **The hold decision** (#95), extracted so it can be tested on its own rather than through an
+    /// async gate that reads the wall clock.
+    ///
+    /// A won slot buys the rest of that slot, not one frame — but only under the owner-return
+    /// contract: anything overheard since the slot began means the owner (or another claimant) has
+    /// spoken, and a guest yields. Without that rule, holding a claimed slot would be
+    /// indistinguishable from stealing it.
+    fn hold_status(
+        &self,
+        slot: &SlotSchedule,
+        slot_start: u64,
+        now: u64,
+        airtime: u64,
+    ) -> HoldStatus {
+        if self.hold_slot_start.load(Ordering::Relaxed) != slot_start {
+            return HoldStatus::None; // no hold on THIS slot (a stale hold never carries forward)
+        }
+        if self.last_rx.load(Ordering::Relaxed) >= slot_start {
+            return HoldStatus::Ended; // the owner spoke — yield
+        }
+        if !slot.fits_now(now, airtime) {
+            return HoldStatus::Ended; // no room left in the slot we hold
+        }
+        HoldStatus::Continue
+    }
+
+    /// Frames of `prefix_hash`'s group deferred since it last transmitted — the backlog proxy the
+    /// CCLF draw scales by. Per name-group rather than per node, so one busy group cannot lend its
+    /// urgency to an idle one.
+    fn deferred_for(&self, prefix_hash: u64) -> u32 {
+        let Some(slot) = &self.slot else { return 0 };
+        let k = slot.owner_slot(prefix_hash) as usize;
+        self.deferred_by_slot.get(k).map(|c| c.load(Ordering::Relaxed)).unwrap_or(0)
+    }
+
+    /// Record that a frame of this group had to wait — the demand signal accumulating.
+    fn note_deferred(&self, prefix_hash: u64) {
+        if let Some(slot) = &self.slot
+            && let Some(c) = self.deferred_by_slot.get(slot.owner_slot(prefix_hash) as usize)
+        {
+            // Saturating: the backlog is a bias, not a counter anyone reads for magnitude.
+            let _ = c.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_add(1)));
+        }
+    }
+
+    /// This group got its turn — the backlog is spent.
+    fn note_sent(&self, prefix_hash: u64) {
+        if let Some(slot) = &self.slot
+            && let Some(c) = self.deferred_by_slot.get(slot.owner_slot(prefix_hash) as usize)
+        {
+            c.store(0, Ordering::Relaxed);
+        }
     }
 
     // ---- Public time API: the essentials any consumer needs from the ndn-time hardware-clock plane ----
@@ -464,6 +560,7 @@ impl FaceScheduler {
                 // it never sees the loss. If it does not fit, fall through and wait for our next
                 // slot rather than transmit across the boundary.
                 if slot.fits_now(now, airtime) {
+                    self.note_sent(hash); // got our turn — backlog spent
                     return; // our owned slot, with room — a collision-free turn; transmit now.
                 }
             }
@@ -474,6 +571,27 @@ impl FaceScheduler {
             // our own turn is not imminent, and only with room left in the slot for a jittered claim.
             if self.claimable {
                 let slot_start = slot.slot_start_us(now);
+
+                // **A won slot buys more than one frame** (#95). The claim used to `return` and the
+                // next frame re-entered the election, paying the jitter again — so a burst could not
+                // use the very slot it had just won, and the airtime it fought for went unused.
+                //
+                // **The owner-return contract** is the other half, and it is why holding is safe:
+                // the hold is surrendered the instant anything is overheard in this slot. `last_rx`
+                // moved past `slot_start` ⇒ the owner (or another claimant) has spoken ⇒ we are a
+                // guest who has outstayed the invitation, and we go back to waiting for our own slot.
+                // Without that rule, holding a claimed slot would be indistinguishable from stealing
+                // it.
+                match self.hold_status(slot, slot_start, now, airtime) {
+                    HoldStatus::Continue => {
+                        self.note_sent(hash);
+                        return; // still ours, still room — continue the burst.
+                    }
+                    HoldStatus::Ended => {
+                        self.hold_slot_start.store(u64::MAX, Ordering::Relaxed);
+                    }
+                    HoldStatus::None => {}
+                }
                 let idle = self.last_rx.load(Ordering::Relaxed) < slot_start;
                 let remaining = slot.slot_remaining_us(now);
                 let jitter = self.cclf_jitter_us(hash, slot.slot_us(), slot.epoch(now));
@@ -498,11 +616,20 @@ impl FaceScheduler {
                     tokio::time::sleep(Duration::from_micros(jitter)).await;
                     let still_idle = self.last_rx.load(Ordering::Relaxed) < slot_start;
                     if still_idle {
+                        // Won it. Hold for the rest of THIS slot so a burst can use what we won,
+                        // under the owner-return contract checked at the top of the next frame.
+                        self.hold_slot_start.store(slot_start, Ordering::Relaxed);
+                        self.note_sent(hash);
                         return; // claimed the idle slot — transmit now.
                     }
                     // Overheard a claimant first → cancel and fall through to wait our owned slot.
                 }
             }
+            // Reaching here means this frame waits — which IS the demand signal (#95). A group that
+            // keeps being deferred accumulates backlog and draws a shorter CCLF jitter next time, so
+            // it wins idle slots ahead of a group with nothing queued.
+            self.note_deferred(hash);
+
             // Wait for our owned slot. If the frame would not fit in what is left of it by the time
             // we wake (we may have burned the slot's head on a lost claim), wait for the one after.
             loop {
@@ -513,6 +640,7 @@ impl FaceScheduler {
                 }
                 let t = self.now_us();
                 if slot.fits_now(t, airtime) {
+                    self.note_sent(hash); // our slot arrived — backlog spent
                     break;
                 }
                 // Past the point in this slot where the frame fits: sleep out the remainder so the
@@ -644,6 +772,8 @@ mod tests {
             claimable: false,
             last_rx: super::AtomicU64::new(0),
             heard_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
+            deferred_by_slot: (0..8).map(|_| super::AtomicU32::new(0)).collect(),
+            hold_slot_start: super::AtomicU64::new(u64::MAX),
             claim_unknown: false,
             rate: None,
             base: super::Instant::now(),
@@ -679,6 +809,8 @@ mod tests {
             claimable: true,
             last_rx: super::AtomicU64::new(0),
             heard_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
+            deferred_by_slot: (0..8).map(|_| super::AtomicU32::new(0)).collect(),
+            hold_slot_start: super::AtomicU64::new(u64::MAX),
             claim_unknown: false,
             rate: None,
             base: super::Instant::now(),
@@ -750,6 +882,8 @@ mod tests {
             claimable: false,
             last_rx: super::AtomicU64::new(0),
             heard_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
+            deferred_by_slot: (0..8).map(|_| super::AtomicU32::new(0)).collect(),
+            hold_slot_start: super::AtomicU64::new(u64::MAX),
             claim_unknown: false,
             rate: None,
             base: super::Instant::now(),
@@ -803,6 +937,8 @@ mod tests {
             claimable: true,
             last_rx: super::AtomicU64::new(0),
             heard_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
+            deferred_by_slot: (0..8).map(|_| super::AtomicU32::new(0)).collect(),
+            hold_slot_start: super::AtomicU64::new(u64::MAX),
             claim_unknown: false,
             rate: None,
             base: super::Instant::now(),
@@ -853,6 +989,143 @@ mod tests {
         assert!(
             sched.last_rx.load(super::Ordering::Relaxed) > 0,
             "busy-marking must not depend on the timing plane"
+        );
+    }
+
+
+
+    /// A claimable scheduler with an 8x3ms superframe — the shape the claim tests need.
+    fn mk_claim_sched() -> FaceScheduler {
+        FaceScheduler {
+            slot: parse_slot("8:3000"),
+            hop: None,
+            group_depth: 1,
+            clock_source: ClockSource::Wall,
+            knobs: None,
+            bw: crate::Bandwidth::default(),
+            current_ch: super::AtomicU8::new(36),
+            hw: super::Mutex::new(RadioHwClock::realtek()),
+            cv: super::Mutex::new(RadioHwClock::common_view()),
+            cv_hw: super::Mutex::new(None),
+            master: false,
+            net: super::Mutex::new(ndn_time::NetworkTime::new(u64::MAX)),
+            claimable: true,
+            last_rx: super::AtomicU64::new(0),
+            heard_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
+            deferred_by_slot: (0..8).map(|_| super::AtomicU32::new(0)).collect(),
+            hold_slot_start: super::AtomicU64::new(u64::MAX),
+            claim_unknown: false,
+            rate: None,
+            base: super::Instant::now(),
+        }
+    }
+
+    /// **The CCLF election must read demand** (#95). The claim called itself "the demand-adaptive
+    /// form that beats fixed-TDMA" while drawing purely from name and time — so a node holding one
+    /// trivial frame contended exactly as hard as one holding a backlog, and the description was
+    /// simply untrue of the code beneath it.
+    ///
+    /// Backlog now scales the draw down. Note this is safe *here* and would not be in `owner_slot`:
+    /// the CCLF draw is a randomised backoff (shortest speaks, others overhear and cancel), so
+    /// nothing needs to be predicted across nodes, whereas the owner grant must be agreed exactly.
+    #[test]
+    fn backlog_shortens_the_cclf_draw_but_keeps_an_ordering() {
+        let s = mk_claim_sched();
+        let h = prefix_hash(&[b"ndn", b"bulk"]);
+
+        let idle_draw = s.cclf_jitter_us(h, 3000, 7);
+        assert!(idle_draw >= 1, "a draw is never zero — zero is a collision, not an ordering");
+
+        // Each deferral is a frame that wanted the medium and did not get it.
+        let mut prev = idle_draw;
+        for _ in 0..4 {
+            s.note_deferred(h);
+            let d = s.cclf_jitter_us(h, 3000, 7);
+            assert!(d <= prev, "backlog must not lengthen the wait: {d} > {prev}");
+            prev = d;
+        }
+        assert!(
+            prev < idle_draw,
+            "a backlogged group must draw shorter than an idle one ({prev} vs {idle_draw})"
+        );
+        assert!(prev >= 1, "and still keep a floor, or contenders collide instead of ordering");
+
+        // Getting a turn spends the backlog — otherwise one busy burst would win forever, which is
+        // the starvation #87 just removed, reintroduced through a different door.
+        s.note_sent(h);
+        assert_eq!(
+            s.cclf_jitter_us(h, 3000, 7),
+            idle_draw,
+            "after transmitting, the group contends as an idle one again"
+        );
+
+        // Demand is per name-group, not per node: a busy group must not lend its urgency to a quiet
+        // one that happens to share the radio.
+        let other = prefix_hash(&[b"ndn", b"quiet"]);
+        let before = s.cclf_jitter_us(other, 3000, 7);
+        for _ in 0..4 {
+            s.note_deferred(h);
+        }
+        assert_eq!(
+            s.cclf_jitter_us(other, 3000, 7),
+            before,
+            "one group's backlog must not shorten another group's draw"
+        );
+    }
+
+    /// **A won slot buys more than one frame, and is surrendered when the owner speaks** (#95).
+    ///
+    /// The claim used to `return` and the next frame re-entered the election from scratch, so a burst
+    /// could not use the slot it had just won. Holding fixes that — but holding is only legitimate
+    /// under the owner-return contract: the instant anything is overheard in the slot, the hold ends.
+    /// Without that rule, holding a claimed slot is indistinguishable from stealing it.
+    ///
+    /// Asserts on `hold_status`, the function the gate actually branches on. A first draft of this
+    /// test set the atomics and then asserted on comparisons *it had written itself* — it passed
+    /// happily with the yield removed, which makes it a description, not a test.
+    #[test]
+    fn a_claim_holds_the_slot_until_the_owner_speaks() {
+        let s = mk_claim_sched();
+        let slot = s.slot.as_ref().unwrap().clone();
+        let start = 30_000u64;
+        let air = wifi_airtime_us(200, Some(7));
+
+        // No claim yet ⇒ nothing to continue.
+        assert_eq!(s.hold_status(&slot, start, start + 10, air), HoldStatus::None);
+
+        // Win the slot.
+        s.hold_slot_start.store(start, super::Ordering::Relaxed);
+        s.last_rx.store(start - 5, super::Ordering::Relaxed); // last heard BEFORE this slot began
+        assert_eq!(
+            s.hold_status(&slot, start, start + 10, air),
+            HoldStatus::Continue,
+            "held, silent, room left ⇒ the burst continues without re-contending"
+        );
+
+        // **Owner-return contract**: anything overheard inside the slot ends the hold at once.
+        s.last_rx.store(start + 100, super::Ordering::Relaxed);
+        assert_eq!(
+            s.hold_status(&slot, start, start + 150, air),
+            HoldStatus::Ended,
+            "the owner spoke ⇒ the guest yields; holding through this would be theft"
+        );
+
+        // Room runs out: the hold also ends at the slot boundary, so a held slot cannot overrun into
+        // the next owner's turn any more than an owned one can (#84).
+        s.last_rx.store(start - 5, super::Ordering::Relaxed);
+        let late = start + slot.slot_us() - 1;
+        assert_eq!(
+            s.hold_status(&slot, start, late, air),
+            HoldStatus::Ended,
+            "no room for the frame ⇒ stop, do not transmit across the boundary"
+        );
+
+        // A hold never carries into a later slot — the check is equality with THIS slot's start.
+        let next = start + slot.slot_us();
+        assert_eq!(
+            s.hold_status(&slot, next, next + 10, air),
+            HoldStatus::None,
+            "winning one slot does not grant the next"
         );
     }
 
