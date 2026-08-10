@@ -426,6 +426,25 @@ impl RatePolicy {
         }
     }
 
+    /// The plan's decided **A-MSDU target**, in MSDUs, when the cell carries one.
+    ///
+    /// `Some(0)` is meaningful and distinct from `None`: the cognition plane spelling "do not
+    /// aggregate" (a latency-sensitive class, or a medium where a long MPDU is a bad bet), versus
+    /// "no opinion — keep the face's configured cap".
+    ///
+    /// Wired late. `TxParams::amsdu_msdus` had an accessor and **zero callers** — the plane decided
+    /// an aggregation target that reached no actuator, exactly the defect this crate keeps
+    /// producing, and it survived the session that *built* the A-MSDU batcher because that batcher
+    /// took a static bound from its builder and never asked the plan.
+    pub fn planned_amsdu_msdus(&self) -> Option<u16> {
+        self.planned
+            .as_ref()?
+            .read()
+            .ok()
+            .and_then(|g| *g)
+            .and_then(|tp| tp.amsdu_msdus())
+    }
+
     /// The plan's decided link-FEC redundancy, when the cell carries one.
     pub fn planned_redundancy(&self) -> Option<u16> {
         self.planned
@@ -634,6 +653,23 @@ impl MonitorWifiFace {
         )
     }
 
+    /// **A face from the standardized opener** (#78/#83) — the capability-complete single-radio path.
+    ///
+    /// [`new`](Self::new) takes a bare `Arc<dyn FrameIo>`, which cannot be asked what it is, so it
+    /// must invent a placeholder capability and drops the radio's knobs, clock and profile on the
+    /// floor. That silently costs the scheduler its channel knob (`FaceScheduler` is built from
+    /// `bearer.knobs`) and leaves the declared capability a guess. `open_named_radio` already
+    /// returns all four handles; this carries them through.
+    ///
+    /// Capability is **discovered**, not asserted: it comes from the radio's own `RadioProfile` when
+    /// it has one, falling back to `cap` otherwise. See [`RadioBearer::effective_cap`].
+    pub fn from_open(id: FaceId, r: OpenRadio, cap: RadioCapability) -> Self {
+        let rate = Arc::new(RatePolicy::new(McsPolicy::default()));
+        let medium = RadioMediumFace::new(id, vec![RadioBearer::from_open(RadioId(0), r, cap)])
+            .with_rate_policy(rate.clone());
+        Self::wrap(id, medium, rate)
+    }
+
     /// New face over `backend` declaring `cap` — what the one-radio constructors use when they know
     /// the radio's real profile (S1G channel list, dBm range) rather than a placeholder.
     fn over(id: FaceId, backend: Arc<dyn FrameIo>, cap: RadioCapability) -> Self {
@@ -645,6 +681,11 @@ impl MonitorWifiFace {
         let rate = Arc::new(RatePolicy::new(McsPolicy::default()));
         let medium = RadioMediumFace::new(id, vec![RadioBearer::new(RadioId(0), backend, cap)])
             .with_rate_policy(rate.clone());
+        Self::wrap(id, medium, rate)
+    }
+
+    /// The common tail of every constructor: wrap a configured one-bearer medium.
+    fn wrap(id: FaceId, medium: RadioMediumFace, rate: Arc<RatePolicy>) -> Self {
         Self {
             id,
             mtu: std::sync::atomic::AtomicUsize::new(MONITOR_MTU),

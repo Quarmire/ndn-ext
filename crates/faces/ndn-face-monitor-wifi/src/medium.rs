@@ -184,6 +184,21 @@ impl RadioBearer {
         Self { id, radio: r.io, cap, knobs: r.knobs, time: r.time, profile: r.profile }
     }
 
+    /// **The capability that governs** — the radio's own when it declares one, else the caller's
+    /// assertion.
+    ///
+    /// The [`profile`](Self::profile) field's contract says keeping both "makes a disagreement
+    /// visible instead of letting a hand-written `RadioCapability` quietly outrank the hardware".
+    /// Nothing read it, so that contract was itself unactuated: every consumer saw the asserted
+    /// `cap` and the radio's self-description sat unused on the struct. The hardware wins here, and
+    /// [`RunningMedium::spawn`] logs the disagreement rather than resolving it silently.
+    pub fn effective_cap(&self) -> RadioCapability {
+        match &self.profile {
+            Some(p) => p.capability(),
+            None => self.cap.clone(),
+        }
+    }
+
     /// Attach this bearer's clock. See the [`time`](Self::time) field on why it is per-bearer.
     pub fn with_time(mut self, time: Arc<dyn RadioTime>) -> Self {
         self.time = Some(time);
@@ -551,13 +566,29 @@ struct MediumBatcher {
 }
 
 impl MediumBatcher {
-    fn spawn(radio: Arc<dyn FrameIo>, cfg: AmsduCfg) -> (Self, JoinHandle<()>) {
+    fn spawn(
+        radio: Arc<dyn FrameIo>,
+        cfg: AmsduCfg,
+        rate: Option<Arc<crate::RatePolicy>>,
+    ) -> (Self, JoinHandle<()>) {
         let (tx, mut rx) = mpsc::unbounded_channel::<(InjectFrame, Option<McsDescriptor>)>();
         let handle = tokio::spawn(async move {
             while let Some(first) = rx.recv().await {
+                // **The plan sizes the aggregate, per batch** (#83/`decided-but-unactuated`).
+                // `Some(0)` = the plane asking for no aggregation, which is not the same as `None`
+                // = no opinion; only the latter falls back to the face's configured cap. Read here
+                // rather than at spawn so a re-decided target takes effect on the next flush, the
+                // way redundancy already does.
+                // `Some(0)` never reaches here — the submit site sends those straight down the
+                // direct path, because a 1-frame `inject_batch` would still build a single-subframe
+                // A-MSDU on AF_PACKET, i.e. aggregation framing for "do not aggregate".
+                let cap = match rate.as_ref().and_then(|r| r.planned_amsdu_msdus()) {
+                    Some(n) => (n as usize).max(1),
+                    None => cfg.max_msdus,
+                };
                 let mut batch = vec![first];
                 let deadline = tokio::time::Instant::now() + cfg.window;
-                while batch.len() < cfg.max_msdus {
+                while batch.len() < cap {
                     match tokio::time::timeout_at(deadline, rx.recv()).await {
                         Ok(Some(f)) => batch.push(f),
                         _ => break, // window elapsed, or the face was torn down
@@ -759,7 +790,10 @@ impl RadioMediumFace {
     /// [`RadioControl::register_radio`](crate::RadioControl::register_radio) so the
     /// medium's decide plane knows what it is allocating across.
     pub fn capabilities(&self) -> Vec<(RadioId, RadioCapability)> {
-        self.bearers.iter().map(|b| (b.id, b.cap.clone())).collect()
+        self.bearers
+            .iter()
+            .map(|b| (b.id, b.effective_cap()))
+            .collect()
     }
 
     /// Spawn the per-radio reader tasks and return the running [`Transport`].
@@ -954,7 +988,17 @@ impl TxBearer {
         // one at a time. Robust control frames fall through — a report or time beacon must reach the
         // worst receiver *now*, and holding one for a flush window would blunt exactly the
         // worst-overheard-receiver reach the ROBUST intent exists to guarantee.
-        if !robust && let Some(bat) = &self.batcher {
+        //
+        // So does a frame the plan has asked not to aggregate (`amsdu_msdus = Some(0)`): the direct
+        // path costs it no flush window and gives it a plain MPDU rather than a one-subframe
+        // aggregate. `Some(0)` is the plane's way of saying "not this traffic" and is deliberately
+        // distinct from `None` = "no opinion, keep the configured cap".
+        let no_aggregate = self
+            .rate
+            .as_ref()
+            .and_then(|r| r.planned_amsdu_msdus())
+            .is_some_and(|n| n == 0);
+        if !robust && !no_aggregate && let Some(bat) = &self.batcher {
             return bat.submit(frame, decided);
         }
         // Per-frame rate (#82), when a policy is bound. Skipped for robust frames and whenever the
@@ -1049,6 +1093,21 @@ impl RunningMedium {
         let tier0 = tx_bloom.map(|k| Arc::new(crate::Tier0Addresser::new(k)));
 
         for b in bearers {
+            // #83: the radio's self-description outranks the caller's assertion, and a mismatch is
+            // said out loud. A capability that is asserted and never checked against the hardware is
+            // how `agile` became decorative (#98); this is the same failure caught one layer up.
+            if let Some(p) = &b.profile {
+                let declared = p.capability();
+                if declared != b.cap {
+                    tracing::warn!(
+                        target: "monitor-wifi", face = id.0, radio = b.id.0,
+                        "capability mismatch: caller asserted {:?}, radio declares {:?} — using the \
+                         radio's",
+                        b.cap, declared
+                    );
+                }
+            }
+
             // One link-FEC bridge per bearer (shared TX-encode / RX-decode) when enabled: the sink
             // injects each coded frame on this bearer, and the reader feeds captured frames through
             // the same bridge's decoder.
@@ -1083,7 +1142,8 @@ impl RunningMedium {
             // top of it would only add the flush window to every generation's latency.
             let batcher = match (&amsdu, &fec) {
                 (Some(cfg), None) => {
-                    let (bat, handle) = MediumBatcher::spawn(b.radio.clone(), *cfg);
+                    let (bat, handle) =
+                        MediumBatcher::spawn(b.radio.clone(), *cfg, rate.clone());
                     tasks.push(handle);
                     Some(bat)
                 }
@@ -2145,5 +2205,160 @@ mod tests {
             "every coded frame must carry the plan's MCS 7, got {at:?}"
         );
         assert_eq!(plain, 0, "no coded frame may bypass the decided rate");
+    }
+
+    /// **The plan must size the aggregate.** `TxParams::amsdu_msdus` had an accessor and *zero*
+    /// callers: cognition decided an A-MSDU target that reached no actuator. It survived even the
+    /// session that built this batcher, because the batcher took a static bound from its builder
+    /// and never asked the plan — the decided-but-unactuated defect, produced fresh while fixing
+    /// two other instances of it.
+    ///
+    /// Three states, all distinct and all asserted on the frames the backend actually received:
+    ///   * `None`    — no opinion: the face's configured cap stands.
+    ///   * `Some(n)` — aggregate to n.
+    ///   * `Some(0)` — do not aggregate: bypass the batcher entirely, so the frame takes the direct
+    ///                 path (no flush window, plain MPDU) rather than a one-subframe A-MSDU.
+    #[tokio::test]
+    async fn medium_sizes_the_amsdu_from_the_plan() {
+        struct Spy {
+            batches: std::sync::Mutex<Vec<usize>>,
+            singles: std::sync::Mutex<usize>,
+        }
+
+        #[async_trait::async_trait]
+        impl FrameIo for Spy {
+            async fn inject(&self, _f: InjectFrame) -> Result<(), FaceError> {
+                *self.singles.lock().unwrap() += 1;
+                Ok(())
+            }
+            async fn inject_at(&self, _f: InjectFrame, _m: McsDescriptor) -> Result<(), FaceError> {
+                *self.singles.lock().unwrap() += 1;
+                Ok(())
+            }
+            async fn inject_batch(&self, frames: Vec<InjectFrame>) -> Result<(), FaceError> {
+                self.batches.lock().unwrap().push(frames.len());
+                Ok(())
+            }
+            async fn inject_batch_at(
+                &self,
+                frames: Vec<(InjectFrame, McsDescriptor)>,
+            ) -> Result<(), FaceError> {
+                self.batches.lock().unwrap().push(frames.len());
+                Ok(())
+            }
+            async fn recv_frame(&self) -> Result<crate::CapturedFrame, FaceError> {
+                std::future::pending().await
+            }
+        }
+
+        /// Send `n` frames through a medium whose plan carries `target`, and report
+        /// `(batch sizes, direct injects)`.
+        async fn run(target: Option<u16>, n: usize) -> (Vec<usize>, usize) {
+            let spy = Arc::new(Spy {
+                batches: std::sync::Mutex::new(Vec::new()),
+                singles: std::sync::Mutex::new(0),
+            });
+            let plan = Arc::new(std::sync::RwLock::new(target.map(|t| TxParams {
+                rate: ndn_radio_cognition::RateParams::Wifi(ndn_radio_cognition::WifiRate {
+                    amsdu_msdus: Some(t),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })));
+            let medium = RadioMediumFace::new(
+                FaceId(11),
+                vec![RadioBearer::new(RadioId(0), spy.clone(), cap())],
+            )
+            .with_rate_policy(Arc::new(
+                crate::RatePolicy::new(McsPolicy::default()).with_planned(plan),
+            ))
+            // Configured cap of 8 — what `None` must fall back to.
+            .with_amsdu_batching(8, Duration::from_millis(5))
+            .build();
+
+            for i in 0..n {
+                medium.send_bytes(Bytes::from(vec![i as u8; 16])).await.unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            let b = spy.batches.lock().unwrap().clone();
+            let s = *spy.singles.lock().unwrap();
+            (b, s)
+        }
+
+        // No opinion → the configured cap of 8 governs: 8 frames land in one batch.
+        let (batches, singles) = run(None, 8).await;
+        assert_eq!(batches, vec![8], "None must keep the configured cap (singles={singles})");
+
+        // The plan asks for 2 → batches cap at 2, so 8 frames become four of them.
+        let (batches, singles) = run(Some(2), 8).await;
+        assert!(
+            !batches.is_empty() && batches.iter().all(|n| *n <= 2),
+            "the plan's target must bound every batch, got {batches:?} (singles={singles})"
+        );
+        assert_eq!(batches.iter().sum::<usize>(), 8, "and every frame still goes out");
+
+        // The plan asks for no aggregation → nothing is batched at all.
+        let (batches, singles) = run(Some(0), 4).await;
+        assert!(
+            batches.is_empty(),
+            "amsdu_msdus=0 means do not aggregate; a one-subframe A-MSDU is not that: {batches:?}"
+        );
+        assert_eq!(singles, 4, "all four take the direct path");
+    }
+
+    /// **The radio's self-description must outrank the caller's assertion.** `RadioBearer::profile`
+    /// documented exactly this — "keeping both makes a disagreement visible instead of letting a
+    /// hand-written `RadioCapability` quietly outrank the hardware" — and then nothing read the
+    /// field. #78 landed the plumbing; the contract it carried stayed unactuated, so every consumer
+    /// saw the asserted `cap` while the radio's own capability sat unused on the struct. Same shape
+    /// as `agile` (#98): a capability asserted and never checked against hardware.
+    #[test]
+    fn the_radios_own_capability_outranks_the_callers_assertion() {
+        struct Truthful(RadioCapability);
+        impl RadioProfile for Truthful {
+            fn capability(&self) -> RadioCapability {
+                self.0.clone()
+            }
+        }
+
+        struct Dummy;
+        #[async_trait::async_trait]
+        impl FrameIo for Dummy {
+            async fn inject(&self, _f: InjectFrame) -> Result<(), FaceError> {
+                Ok(())
+            }
+            async fn recv_frame(&self) -> Result<crate::CapturedFrame, FaceError> {
+                std::future::pending().await
+            }
+        }
+
+        // The caller guesses 5 GHz ch149; the radio knows it is really S1G on ch1/2.
+        let asserted = RadioCapability::wifi_monitor_5ghz(vec![149]);
+        let real = RadioCapability::wifi_halow_s1g(vec![1, 2]);
+        assert_ne!(real, asserted, "the two must actually differ or this proves nothing");
+
+        let guessed = RadioBearer::new(RadioId(0), Arc::new(Dummy), asserted.clone());
+        assert_eq!(
+            guessed.effective_cap(),
+            asserted,
+            "with no profile the caller's assertion is all there is"
+        );
+
+        let known = RadioBearer::new(RadioId(0), Arc::new(Dummy), asserted.clone())
+            .with_profile(Arc::new(Truthful(real.clone())));
+        assert_eq!(
+            known.effective_cap(),
+            real,
+            "the radio wins; believing the assertion is how a planner budgets for a band the \
+             hardware does not have"
+        );
+
+        // And the medium reports the governing one, not the asserted one.
+        let medium = RadioMediumFace::new(FaceId(12), vec![known]);
+        assert_eq!(
+            medium.capabilities(),
+            vec![(RadioId(0), real)],
+            "capabilities() is what a control plane registers — it must carry the radio's truth"
+        );
     }
 }
