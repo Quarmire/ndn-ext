@@ -376,11 +376,30 @@ impl FaceScheduler {
         };
         let now = self.now_us();
 
-        // Frequency first: sit on the name's channel for this hop epoch.
+        // Frequency first: sit on the name's channel for this hop epoch. The hop decision uses the
+        // RAW name hash — the channel must not depend on the channel.
         if let Some(hop) = &self.hop {
             let ch = hop.channel(hash, now);
             self.retune(ch).await;
         }
+
+        // **The slot assignment is keyed to the medium, not just the name** (#89).
+        //
+        // `owner_slot` is `hash % slots` with no medium term, so every radio ran the identical
+        // schedule: name N owned slot k on *every* bearer at the same instant. A second radio then
+        // bought parallel copies of one turn rather than additional turns — the per-name access
+        // latency, which is what a slot MAC costs you, did not improve at all with radio count.
+        //
+        // Folding the channel in staggers the assignment per medium: name N owns a different slot on
+        // ch36 than on ch149, so at any instant two different names are transmitting on the two
+        // channels, and each name gets one turn per superframe *per medium*. Access latency divides
+        // by the number of independent media, which is the whole reason to carry more than one radio.
+        //
+        // Keyed on the CHANNEL rather than a radio index on purpose: radios on the same channel share
+        // one medium and must agree, and two nodes' "radio 0" may sit on different channels. Every
+        // node hearing this medium computes the same key with no coordination. Two bearers genuinely
+        // on the same channel still coincide — correct, that is the diversity fan-out case.
+        let hash = hash ^ u64::from(self.current_ch.load(Ordering::Relaxed)).wrapping_mul(0x9E37_79B9);
 
         // Then time: the token grant.
         if let Some(slot) = &self.slot {

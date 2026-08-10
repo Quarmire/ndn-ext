@@ -333,4 +333,56 @@ mod tests {
         assert!(wifi_airtime_us(0, Some(7)) > 0);
     }
 
+
+    /// **A second radio must buy additional turns, not parallel copies of one turn** (#89).
+    ///
+    /// `owner_slot` is `hash % slots` with no medium term, so every bearer ran the identical
+    /// schedule: name N owned slot k on *every* radio at the same instant. The per-name access
+    /// latency — the thing a slot MAC actually costs you — did not improve with radio count at all.
+    /// The face fixes this by folding the channel into the hash before consulting the schedule; this
+    /// asserts the property that makes it worth doing.
+    #[test]
+    fn keying_the_hash_to_the_medium_staggers_the_schedule() {
+        const SLOTS: u64 = 8;
+        let s = SlotSchedule::new(3_000, SLOTS);
+        // The face's key: `hash ^ channel * K`.
+        let keyed = |h: u64, ch: u8| h ^ u64::from(ch).wrapping_mul(0x9E37_79B9);
+
+        let names: Vec<u64> = (0..64u64).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
+
+        // Same medium ⇒ identical schedule on every bearer: two radios on one channel are ONE
+        // medium and must not both think they own it independently.
+        for n in &names {
+            assert_eq!(
+                s.owner_slot(keyed(*n, 36)),
+                s.owner_slot(keyed(*n, 36)),
+                "one channel, one schedule"
+            );
+        }
+
+        // Different media ⇒ the assignment moves for most names, so at a given instant the two
+        // channels are serving different names concurrently.
+        let moved = names
+            .iter()
+            .filter(|n| s.owner_slot(keyed(**n, 36)) != s.owner_slot(keyed(**n, 149)))
+            .count();
+        assert!(
+            moved > names.len() / 2,
+            "the medium key must actually restagger; only {moved}/{} names moved slot",
+            names.len()
+        );
+
+        // And the concurrency that buys: for each slot index, the set of names owning it on ch36
+        // differs from the set owning it on ch149 — otherwise the second radio is redundant.
+        let owners = |ch: u8, k: u64| {
+            names.iter().filter(|n| s.owner_slot(keyed(**n, ch)) == k).count()
+        };
+        let differing = (0..SLOTS).filter(|k| owners(36, *k) != owners(149, *k) ||
+            names.iter().any(|n| (s.owner_slot(keyed(*n, 36)) == *k) != (s.owner_slot(keyed(*n, 149)) == *k))).count();
+        assert!(
+            differing >= SLOTS as usize - 1,
+            "nearly every slot should serve a different name set per medium, got {differing}/{SLOTS}"
+        );
+    }
+
 }
