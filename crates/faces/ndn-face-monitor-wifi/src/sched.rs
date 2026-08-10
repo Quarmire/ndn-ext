@@ -33,7 +33,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ndn_radio_cognition::{HopSchedule, SlotSchedule, prefix_hash};
+use ndn_radio_cognition::{HopSchedule, SlotSchedule, prefix_hash, wifi_airtime_us};
 
 use crate::radio::{Bandwidth, RadioKnobs};
 use ndn_frame_io::LinkStamp;
@@ -108,6 +108,11 @@ pub struct FaceScheduler {
     /// Common-view µs of the last overheard frame — the claimable decision's "is this slot idle?" input
     /// (idle ⇔ `last_rx < slot_start`). Updated by [`on_rx_stamp`](Self::on_rx_stamp). `0` = nothing yet.
     last_rx: AtomicU64,
+    /// The bearer's rate policy, so the airtime estimate behind the guard band (#84) uses the rate
+    /// we will actually transmit at. `None` ⇒ assume the conservative broadcast rate, which
+    /// over-estimates airtime — the safe direction, since a too-large estimate only defers us by a
+    /// slot while a too-small one overruns someone else's.
+    rate: Option<std::sync::Arc<crate::RatePolicy>>,
     /// Monotonic base for the hardware clock's host reference and the master's reference timeline.
     base: Instant,
 }
@@ -152,6 +157,7 @@ impl FaceScheduler {
             net: Mutex::new(NetworkTime::new(node_id)),
             claimable,
             last_rx: AtomicU64::new(0),
+            rate: None,
             base: Instant::now(),
         })
     }
@@ -274,11 +280,30 @@ impl FaceScheduler {
     /// names contending for an idle slot (named-token-scheduling.md §CCLF). The smallest-jitter claimant
     /// transmits first and the rest overhear-and-cancel. Keyed on the name so it is stable and
     /// coordinator-free; bounded to the front `frac` of the slot so a claim still fits with a guard.
-    fn cclf_jitter_us(&self, prefix_hash: u64, slot_us: u64) -> u64 {
+    /// Bind the bearer's rate policy so the guard band's airtime estimate uses the decided rate.
+    pub fn with_rate(mut self, rate: std::sync::Arc<crate::RatePolicy>) -> Self {
+        self.rate = Some(rate);
+        self
+    }
+
+    /// The HT MCS index the next frame would ride, if a rate policy is bound.
+    fn tx_mcs(&self) -> Option<u8> {
+        self.rate.as_ref().map(|r| r.select().index)
+    }
+
+    fn cclf_jitter_us(&self, prefix_hash: u64, slot_us: u64, epoch: u64) -> u64 {
         // Spread claimants over the first ~half of the slot; a 64→16-bit fold decorrelates from owner_slot.
+        //
+        // **`epoch` is mixed in so the winner rotates** (#87). Without it the jitter was a pure
+        // function of the name: the same claimant drew the same, smallest delay every idle slot and
+        // won all of them, forever — a starvation the CCLF election exists to prevent, and one that
+        // looks like a working election from the winner's side. Mixing the slot index re-randomises
+        // the draw each slot while keeping every node's view of it identical (all nodes share the
+        // common-view clock, so all compute the same epoch), which is what makes the election
+        // agree without any message.
         let window = (slot_us / 2).max(1);
-        let j = (prefix_hash ^ (prefix_hash >> 32)) % window;
-        j
+        let mixed = prefix_hash ^ epoch.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        (mixed ^ (mixed >> 32)) % window
     }
 
     // ---- Public time API: the essentials any consumer needs from the ndn-time hardware-clock plane ----
@@ -359,8 +384,19 @@ impl FaceScheduler {
 
         // Then time: the token grant.
         if let Some(slot) = &self.slot {
+            // How long this frame will hold the medium. Over-estimated on purpose — see
+            // `wifi_airtime_us`: under-estimating bleeds into the next owner's slot, over-estimating
+            // only defers us by one.
+            let airtime = wifi_airtime_us(wire.len(), self.tx_mcs());
             if slot.owns_now(hash, now) {
-                return; // our owned slot — a guaranteed, collision-free turn; transmit now.
+                // **Owning the slot is not the same as fitting in it** (#84). A frame launched near
+                // the boundary keeps radiating into the next owner's turn — the exact collision this
+                // MAC exists to prevent, and one charged to a *different* name, so the node causing
+                // it never sees the loss. If it does not fit, fall through and wait for our next
+                // slot rather than transmit across the boundary.
+                if slot.fits_now(now, airtime) {
+                    return; // our owned slot, with room — a collision-free turn; transmit now.
+                }
             }
             let owned_wait = slot.wait_us(hash, now);
             // Claimable slot (named-token-scheduling.md): if this is NOT our slot but the current slot's
@@ -371,8 +407,10 @@ impl FaceScheduler {
                 let slot_start = slot.slot_start_us(now);
                 let idle = self.last_rx.load(Ordering::Relaxed) < slot_start;
                 let remaining = slot.slot_remaining_us(now);
-                let jitter = self.cclf_jitter_us(hash, slot.slot_us());
-                if idle && owned_wait > slot.slot_us() && remaining > jitter {
+                let jitter = self.cclf_jitter_us(hash, slot.slot_us(), slot.epoch(now));
+                // Room for the jittered wait AND the frame itself — claiming a slot we cannot
+                // finish in is the same boundary overrun as the owner path, just self-inflicted.
+                if idle && owned_wait > slot.slot_us() && remaining > jitter + airtime {
                     // CCLF: wait our jitter; if the slot is STILL idle (no one claimed first), take it.
                     tokio::time::sleep(Duration::from_micros(jitter)).await;
                     let still_idle = self.last_rx.load(Ordering::Relaxed) < slot_start;
@@ -382,9 +420,21 @@ impl FaceScheduler {
                     // Overheard a claimant first → cancel and fall through to wait our owned slot.
                 }
             }
-            let wait = slot.wait_us(hash, self.now_us());
-            if wait > 0 {
-                tokio::time::sleep(Duration::from_micros(wait)).await;
+            // Wait for our owned slot. If the frame would not fit in what is left of it by the time
+            // we wake (we may have burned the slot's head on a lost claim), wait for the one after.
+            loop {
+                let t = self.now_us();
+                let wait = slot.wait_us(hash, t);
+                if wait > 0 {
+                    tokio::time::sleep(Duration::from_micros(wait)).await;
+                }
+                let t = self.now_us();
+                if slot.fits_now(t, airtime) {
+                    break;
+                }
+                // Past the point in this slot where the frame fits: sleep out the remainder so the
+                // next `wait_us` lands on the following superframe rather than spinning.
+                tokio::time::sleep(Duration::from_micros(slot.slot_remaining_us(t).max(1))).await;
             }
         }
     }
@@ -510,6 +560,7 @@ mod tests {
             net: super::Mutex::new(ndn_time::NetworkTime::new(u64::MAX)),
             claimable: false,
             last_rx: super::AtomicU64::new(0),
+            rate: None,
             base: super::Instant::now(),
         };
         let a = mk();
@@ -542,16 +593,45 @@ mod tests {
             net: super::Mutex::new(ndn_time::NetworkTime::new(u64::MAX)),
             claimable: true,
             last_rx: super::AtomicU64::new(0),
+            rate: None,
             base: super::Instant::now(),
         };
         let a = prefix_hash(&[b"ndn", b"alarm"]);
         let b = prefix_hash(&[b"ndn", b"bulk"]);
-        // Same name → same jitter (coordinator-free, stable); bounded to the front half of the slot.
-        assert_eq!(s.cclf_jitter_us(a, 3000), s.cclf_jitter_us(a, 3000));
-        assert!(s.cclf_jitter_us(a, 3000) < 1500);
-        assert!(s.cclf_jitter_us(b, 3000) < 1500);
-        // Different names generally draw different jitter → an ordering for the election.
-        assert_ne!(s.cclf_jitter_us(a, 3000), s.cclf_jitter_us(b, 3000));
+
+        // Within one slot the draw is deterministic — that is what lets every node compute the same
+        // election with no message, since all share the common-view clock and so the same epoch.
+        assert_eq!(s.cclf_jitter_us(a, 3000, 7), s.cclf_jitter_us(a, 3000, 7));
+        // Bounded to the front half of the slot, so a claim leaves room to transmit.
+        for e in 0..64 {
+            assert!(s.cclf_jitter_us(a, 3000, e) < 1500);
+            assert!(s.cclf_jitter_us(b, 3000, e) < 1500);
+        }
+        // Different names draw an ordering within a slot.
+        assert_ne!(s.cclf_jitter_us(a, 3000, 7), s.cclf_jitter_us(b, 3000, 7));
+
+        // **The winner must rotate** (#87). The jitter used to be a pure function of the name, so
+        // whichever name folded to the smallest value won *every* idle slot, forever — starvation
+        // that looks like a working election from the winner's side. Mixing the slot epoch
+        // re-randomises the draw each slot while keeping it agreed across nodes.
+        let names: Vec<u64> = (0..8)
+            .map(|i| prefix_hash(&[b"ndn", format!("n{i}").as_bytes()]))
+            .collect();
+        let mut wins = std::collections::HashMap::new();
+        for epoch in 0..2_000u64 {
+            let winner = names
+                .iter()
+                .min_by_key(|n| s.cclf_jitter_us(**n, 3000, epoch))
+                .unwrap();
+            *wins.entry(*winner).or_insert(0usize) += 1;
+        }
+        assert_eq!(wins.len(), names.len(), "every name must win some slots, got {wins:?}");
+        let most = *wins.values().max().unwrap();
+        assert!(
+            most < 2_000 / 2,
+            "no name may dominate the idle slots; the worst took {most}/2000 — with the old \
+             name-only jitter one name took all 2000"
+        );
     }
 
     #[test]
@@ -582,6 +662,7 @@ mod tests {
             net: super::Mutex::new(ndn_time::NetworkTime::new(u64::MAX)),
             claimable: false,
             last_rx: super::AtomicU64::new(0),
+            rate: None,
             base: super::Instant::now(),
         };
         let wire = sched.build_beacon();

@@ -32,6 +32,31 @@ pub struct SlotSchedule {
     slots: u64,
 }
 
+/// **On-air time for one 802.11 frame**, microseconds — payload bits at the PHY rate, plus the
+/// fixed per-frame overhead a slot must also cover.
+///
+/// Deliberately an over-estimate. It is used to decide whether a frame fits in the remaining slot
+/// (`SlotSchedule::fits_now`), and the two errors are not symmetric: under-estimating lets a frame
+/// bleed into the next owner's slot — a collision charged to someone else's name — while
+/// over-estimating only defers our own transmission by one slot. `PREAMBLE_US` covers the PHY
+/// preamble + PLCP header + SIFS-ish inter-frame slack rather than modelling each exactly; the
+/// figure is a bound, not a measurement, and is marked as such because nothing here has been checked
+/// against a spectrum capture.
+///
+/// `mcs` is the HT index; `None` assumes the conservative broadcast rate, which is the slowest thing
+/// we transmit and therefore the safe assumption when the rate is not yet resolved.
+pub fn wifi_airtime_us(bytes: usize, mcs: Option<u8>) -> u64 {
+    /// Preamble + PLCP + inter-frame slack. HT-mixed is ~36-40 µs; 60 keeps margin.
+    const PREAMBLE_US: u64 = 60;
+    let rate_bps = u64::from(ndn_radio_hal::mcs_phy_rate_bps(
+        mcs.unwrap_or(ndn_radio_hal::McsDescriptor::CONSERVATIVE.index),
+    ))
+    .max(1);
+    let bits = (bytes as u64).saturating_mul(8);
+    // Round up: a partial microsecond of airtime still occupies the medium.
+    PREAMBLE_US + bits.saturating_mul(1_000_000).div_ceil(rate_bps)
+}
+
 impl SlotSchedule {
     /// A schedule of `slots` slots, each `slot_us` microseconds wide. `slot_us` should contain one
     /// frame's on-air time plus a guard band (sized from the PHY airtime + the clock's residual
@@ -47,6 +72,21 @@ impl SlotSchedule {
     /// µs granularity: more slots fit a superframe, and the per-name access latency drops accordingly.
     pub fn from_airtime(airtime_us: u64, guard_us: u64, slots: u64) -> Self {
         Self::new(airtime_us + guard_us, slots)
+    }
+
+    /// **Does a frame of `airtime_us` still fit in the slot live at `now_us`?**
+    ///
+    /// The question the owner path never asked (#84). Owning the slot *now* is not the same as
+    /// having room to transmit in it: a frame launched near the boundary keeps radiating into the
+    /// next owner's slot, which is precisely the collision a slot MAC exists to prevent — and the
+    /// damage lands on a *different* name's turn, so the node causing it never sees the loss.
+    ///
+    /// `slot_us` is meant to be `airtime + guard` ([`from_airtime`](Self::from_airtime)), so under a
+    /// correctly-sized schedule a frame that starts at the slot boundary always fits; this guards
+    /// the case where it does not — an oversized frame, or a slot sized by hand from an env var
+    /// rather than from the airtime (#85).
+    pub fn fits_now(&self, now_us: u64, airtime_us: u64) -> bool {
+        self.slot_remaining_us(now_us) >= airtime_us
     }
 
     /// The start of the slot live at `now_us` (µs) — the slot-boundary flooring of `now`. Used to ask
@@ -243,4 +283,54 @@ mod tests {
         assert_eq!(s.channel(12345, 0), 0);
         assert_eq!(s.classes(), &[0]);
     }
+
+    /// **A frame must not be launched across a slot boundary** (#84) — the property `fits_now`
+    /// exists to enforce, stated on the numbers rather than on the call site.
+    ///
+    /// Owning the slot *now* was the whole of the old owner-path check, so a frame starting near the
+    /// boundary kept radiating into the next owner's turn. The collision then lands on a different
+    /// name's slot, which is why nothing observed it: the node causing the damage sees a clean
+    /// transmit, and the victim sees loss it cannot attribute.
+    #[test]
+    fn a_frame_only_fits_while_the_slot_has_room_for_it() {
+        // 3 ms slots, 8 of them.
+        let s = SlotSchedule::new(3_000, 8);
+        let airtime = wifi_airtime_us(1500, Some(7)); // ~245 µs at MCS7
+
+        // Start of a slot: plenty of room.
+        assert!(s.fits_now(0, airtime));
+        assert!(s.fits_now(3_000, airtime), "and at the next boundary");
+        // Comfortably inside.
+        assert!(s.fits_now(1_000, airtime));
+        // Too late in the slot: the frame would run past the boundary.
+        assert!(
+            !s.fits_now(3_000 - 10, airtime),
+            "10 µs left cannot hold a {airtime} µs frame"
+        );
+        // The exact edge: remaining == airtime still fits, one µs less does not.
+        let edge = 3_000 - airtime;
+        assert!(s.fits_now(edge, airtime), "remaining == airtime is a fit");
+        assert!(!s.fits_now(edge + 1, airtime), "one µs short is not");
+    }
+
+    /// The airtime estimate must scale the right way and stay conservative.
+    #[test]
+    fn airtime_scales_with_size_and_rate_and_errs_high() {
+        let big = wifi_airtime_us(1500, Some(7));
+        let small = wifi_airtime_us(100, Some(7));
+        assert!(big > small, "more bytes, more airtime");
+
+        let slow = wifi_airtime_us(1500, Some(0));
+        assert!(slow > big, "a slower MCS holds the medium longer");
+
+        // `None` must assume the conservative rate — the slow, safe end. Guessing fast here would
+        // under-estimate airtime, and under-estimating is the error that overruns someone else's
+        // slot; over-estimating only defers us.
+        assert_eq!(wifi_airtime_us(1500, None), wifi_airtime_us(1500, Some(1)));
+        assert!(wifi_airtime_us(1500, None) > big);
+
+        // Never zero, even for an empty frame: the preamble still occupies the medium.
+        assert!(wifi_airtime_us(0, Some(7)) > 0);
+    }
+
 }

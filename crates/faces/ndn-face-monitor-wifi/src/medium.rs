@@ -1133,6 +1133,15 @@ impl RunningMedium {
             // scheduler's disciplined clock (#41). Bandwidth defaults to 20 MHz for hops across
             // non-overlapping channels.
             let sched = crate::FaceScheduler::from_env(b.knobs.clone(), crate::Bandwidth::default())
+                .map(|s| {
+                    // Give the scheduler this bearer's rate policy so the #84 guard band sizes its
+                    // airtime estimate from the rate we will actually transmit at, not from the
+                    // conservative worst case (which would defer frames that would have fitted).
+                    match &rate {
+                        Some(r) => s.with_rate(r.clone()),
+                        None => s,
+                    }
+                })
                 .map(Arc::new);
             if let Some(s) = &sched {
                 tracing::info!(target: "monitor-wifi", face = id.0, "{}", s.describe());
