@@ -120,5 +120,18 @@ name = "recode_auth"
 harness = false
 required-features = ["f2-recode"]
 
+# recode-at-relay vs store-and-forward on the real codec. Same `recode` module as
+# the bench above, so the same gate — without this entry cargo builds the example
+# unconditionally and `cargo build --workspace --all-targets` fails on a
+# feature-gated import, which is a broken build, not a broken example.
+#
+# The other feature-gated examples in this workspace instead `#[cfg]` the whole
+# body and compile to a stub. Either works; `required-features` is right here
+# because it matches the bench beside it and keeps the example free of a
+# wrapper that exists only to satisfy the default feature set.
+[[example]]
+name = "rlnc_recode"
+required-features = ["f2-recode"]
+
 [lints]
 workspace = true

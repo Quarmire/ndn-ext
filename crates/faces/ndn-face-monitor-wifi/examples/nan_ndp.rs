@@ -18,7 +18,7 @@
 //! sudo iw dev wlu1 set type monitor && sudo ip link set wlu1 up && sudo iw dev wlu1 set channel 6
 //! sudo ./target/debug/examples/nan_ndp afpacket:wlu1 b
 //! ```
-#[cfg(feature = "libusb-backend")]
+#[cfg(all(feature = "libusb-backend", target_os = "linux"))]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::sync::Arc;
@@ -161,7 +161,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// The peer beacons once per Discovery Window (512 TU ≈ 524 ms), so ~11 frames
 /// should arrive in 6 s. Anything far below that is the link, not the stack.
-#[cfg(feature = "libusb-backend")]
+#[cfg(all(feature = "libusb-backend", target_os = "linux"))]
 async fn measure_link(
     radio: std::sync::Arc<dyn ndn_frame_io::FrameIo>,
     peer_nmi: [u8; 6],
@@ -211,7 +211,7 @@ async fn measure_link(
     Ok(())
 }
 
-#[cfg(feature = "libusb-backend")]
+#[cfg(all(feature = "libusb-backend", target_os = "linux"))]
 fn mac(m: &[u8; 6]) -> String {
     m.iter()
         .map(|b| format!("{b:02x}"))
@@ -219,7 +219,11 @@ fn mac(m: &[u8; 6]) -> String {
         .join(":")
 }
 
-#[cfg(not(feature = "libusb-backend"))]
+// The stub also covers non-Linux: this example drives `AfPacketBackend` and `ndn_nan::ndi`, both
+// `#[cfg(target_os = "linux")]`, so gating on the feature alone made
+// `cargo build --all-targets --all-features` fail to compile on macOS — a build break that only
+// appeared under a flag combination nobody routinely ran.
+#[cfg(not(all(feature = "libusb-backend", target_os = "linux")))]
 fn main() {
-    eprintln!("build with --features libusb-backend");
+    eprintln!("nan_ndp needs Linux + --features libusb-backend");
 }
