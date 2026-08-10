@@ -1203,6 +1203,12 @@ impl RunningMedium {
                             if let (Some(sched), Some(stamp)) = (sched_rx.as_ref(), f.stamp.as_ref()) {
                                 sched.on_rx_stamp(stamp);
                             }
+                            // #88: the busy mark + per-slot evidence, for EVERY captured frame. This
+                            // used to ride on the stamp branch above, so a radio whose driver reports
+                            // no TSFT never marked the medium busy at all and claimed every slot.
+                            if let Some(sched) = sched_rx.as_ref() {
+                                sched.observe_rx(&f.payload);
+                            }
                             // #74: the MESH hardware common-view — discipline the scheduler's clock to a
                             // neighbour's HW-TSF-stamped timing beacon (pair (peer_tsf, our_rxtsfl), both
                             // hardware) → self-contained sub-µs `CommonView` epoch, no AP. This is the

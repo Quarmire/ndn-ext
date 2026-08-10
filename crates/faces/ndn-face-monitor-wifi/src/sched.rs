@@ -113,6 +113,17 @@ pub struct FaceScheduler {
     /// over-estimates airtime — the safe direction, since a too-large estimate only defers us by a
     /// slot while a too-small one overruns someone else's.
     rate: Option<std::sync::Arc<crate::RatePolicy>>,
+    /// **Positive evidence that a slot's owner is in range** (#88/#94): per slot index, the
+    /// common-view µs at which we last overheard a frame whose name-group owns that slot. `0` = never.
+    ///
+    /// Bounded by the superframe length and allocation-free. This is what makes an idle slot readable:
+    /// silence alone cannot tell a silent owner from a *hidden* one, and claiming a hidden owner's slot
+    /// collides at its receiver — damage neither the claimant nor the owner can observe.
+    heard_by_slot: Vec<AtomicU64>,
+    /// Claim a slot whose owner we have never heard? Default **false**: an unheard owner is exactly the
+    /// hidden-terminal case, and the safe reading of silence is "I cannot tell". `NDN_SCHED_CLAIM_UNKNOWN=1`
+    /// opts into the throughput-first reading (claim anything idle), which is what the code did before.
+    claim_unknown: bool,
     /// Monotonic base for the hardware clock's host reference and the master's reference timeline.
     base: Instant,
 }
@@ -142,6 +153,8 @@ impl FaceScheduler {
         // the reference, always sync to a neighbour" (a pure follower); a node meant to be a candidate
         // sets its ephemeral nonce here via NDN_SCHED_NODE_ID.
         let node_id: u64 = std::env::var("NDN_SCHED_NODE_ID").ok().and_then(|s| s.parse().ok()).unwrap_or(u64::MAX);
+        // One evidence cell per slot in the superframe (1 when there is no slot schedule at all).
+        let slot_count = slot.as_ref().map(|s| s.slots() as usize).unwrap_or(1).max(1);
         Some(Self {
             slot,
             hop,
@@ -157,6 +170,8 @@ impl FaceScheduler {
             net: Mutex::new(NetworkTime::new(node_id)),
             claimable,
             last_rx: AtomicU64::new(0),
+            heard_by_slot: (0..slot_count).map(|_| AtomicU64::new(0)).collect(),
+            claim_unknown: std::env::var("NDN_SCHED_CLAIM_UNKNOWN").is_ok(),
             rate: None,
             base: Instant::now(),
         })
@@ -269,11 +284,46 @@ impl FaceScheduler {
         if let Ok(mut hw) = self.hw.lock() {
             hw.on_stamp(stamp, host_now);
         }
-        // Mark the medium busy "now" (common-view µs) for the claimable-slot idle test — overhearing a
-        // frame means the current slot's owner (or a claimer) is using it, so we must not claim it.
-        if self.claimable {
-            self.last_rx.store(self.now_us(), Ordering::Relaxed);
+    }
+
+    /// **Every captured frame**, for the claimable-slot decision (#88/#94) — the busy mark *and* the
+    /// evidence of who is in range.
+    ///
+    /// Three things were wrong with doing this in [`on_rx_stamp`](Self::on_rx_stamp):
+    ///
+    /// 1. **It only ran when the frame carried a hardware stamp.** The caller's hook is
+    ///    `if let (Some(sched), Some(stamp))`, and `stamp` is `None` on any radio whose driver does
+    ///    not report TSFT — so on those radios `last_rx` never moved, the medium looked *permanently*
+    ///    idle, and the claimable path fired on every single slot. Busy-marking must not depend on
+    ///    the timing plane; it is a data-plane fact.
+    /// 2. **It was an energy detector.** Any frame marked the medium busy, so "the owner is idle" was
+    ///    really "nobody transmitted" — which is a different statement and a weaker one.
+    /// 3. **Silence was read as permission.** Hearing nothing cannot distinguish an owner with
+    ///    nothing to send from an owner we simply cannot hear. Claiming the latter's slot collides at
+    ///    *its* receiver, and neither the claimant nor the owner can observe that.
+    ///
+    /// So this also records, per slot, when we last heard a frame whose name-group owns it. That is
+    /// positive evidence the slot's user is in range, which is what makes its silence readable.
+    pub fn observe_rx(&self, wire: &[u8]) {
+        if !self.claimable {
+            return;
         }
+        let now = self.now_us();
+        self.last_rx.store(now, Ordering::Relaxed);
+        // Key the same way TX does, so the slot indices agree (#89).
+        let Some(hash) = self.name_group_hash(wire) else { return };
+        let keyed = self.medium_keyed(hash);
+        if let Some(slot) = &self.slot {
+            let k = slot.owner_slot(keyed) as usize;
+            if let Some(cell) = self.heard_by_slot.get(k) {
+                cell.store(now, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Fold the current medium (channel) into a name hash — see the note in [`gate`](Self::gate).
+    fn medium_keyed(&self, hash: u64) -> u64 {
+        hash ^ u64::from(self.current_ch.load(Ordering::Relaxed)).wrapping_mul(0x9E37_79B9)
     }
 
     /// A deterministic within-slot CCLF jitter (µs) for this name — the demand-adaptive election among
@@ -399,7 +449,7 @@ impl FaceScheduler {
         // one medium and must agree, and two nodes' "radio 0" may sit on different channels. Every
         // node hearing this medium computes the same key with no coordination. Two bearers genuinely
         // on the same channel still coincide — correct, that is the diversity fan-out case.
-        let hash = hash ^ u64::from(self.current_ch.load(Ordering::Relaxed)).wrapping_mul(0x9E37_79B9);
+        let hash = self.medium_keyed(hash);
 
         // Then time: the token grant.
         if let Some(slot) = &self.slot {
@@ -429,7 +479,21 @@ impl FaceScheduler {
                 let jitter = self.cclf_jitter_us(hash, slot.slot_us(), slot.epoch(now));
                 // Room for the jittered wait AND the frame itself — claiming a slot we cannot
                 // finish in is the same boundary overrun as the owner path, just self-inflicted.
-                if idle && owned_wait > slot.slot_us() && remaining > jitter + airtime {
+                // **Positive evidence the slot's owner is in range** (#94). Silence is only
+                // readable as "idle" from someone we can actually hear; from a hidden owner it is
+                // indistinguishable from a busy medium, and claiming there collides at its receiver.
+                // `heard_by_slot` says when we last overheard a frame whose group owns THIS slot.
+                let k = slot.current_slot(now) as usize;
+                let last_heard = self.heard_by_slot.get(k).map(|c| c.load(Ordering::Relaxed)).unwrap_or(0);
+                // Stale after a few superframes: an owner that has gone quiet for that long is no
+                // longer evidence of anything, and we fall back to the conservative reading.
+                let evidence_window = slot.slot_us() * slot.slots() * 4;
+                let owner_known = last_heard != 0 && now.saturating_sub(last_heard) <= evidence_window;
+                if (owner_known || self.claim_unknown)
+                    && idle
+                    && owned_wait > slot.slot_us()
+                    && remaining > jitter + airtime
+                {
                     // CCLF: wait our jitter; if the slot is STILL idle (no one claimed first), take it.
                     tokio::time::sleep(Duration::from_micros(jitter)).await;
                     let still_idle = self.last_rx.load(Ordering::Relaxed) < slot_start;
@@ -579,6 +643,8 @@ mod tests {
             net: super::Mutex::new(ndn_time::NetworkTime::new(u64::MAX)),
             claimable: false,
             last_rx: super::AtomicU64::new(0),
+            heard_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
+            claim_unknown: false,
             rate: None,
             base: super::Instant::now(),
         };
@@ -612,6 +678,8 @@ mod tests {
             net: super::Mutex::new(ndn_time::NetworkTime::new(u64::MAX)),
             claimable: true,
             last_rx: super::AtomicU64::new(0),
+            heard_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
+            claim_unknown: false,
             rate: None,
             base: super::Instant::now(),
         };
@@ -681,6 +749,8 @@ mod tests {
             net: super::Mutex::new(ndn_time::NetworkTime::new(u64::MAX)),
             claimable: false,
             last_rx: super::AtomicU64::new(0),
+            heard_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
+            claim_unknown: false,
             rate: None,
             base: super::Instant::now(),
         };
@@ -704,4 +774,86 @@ mod tests {
         assert!(parse_slot("garbage").is_none());
         assert!(parse_hop(":100").is_none());
     }
+
+    /// **A slot whose owner we have never heard must not be claimed** (#88/#94).
+    ///
+    /// The claim used to turn on a bare energy detector: `last_rx < slot_start` ⇒ "idle" ⇒ take it.
+    /// That reads silence as permission, and silence has two causes — an owner with nothing to send,
+    /// and an owner we cannot hear. Claiming the second collides at *its* receiver, damage neither
+    /// the claimant nor the owner ever observes, so nothing in the system corrects it.
+    ///
+    /// `observe_rx` now records, per slot, when we last overheard a frame whose name-group owns that
+    /// slot. That is the positive evidence: silence from a station we demonstrably hear is readable;
+    /// silence from one we have never heard is not.
+    #[test]
+    fn a_slot_is_only_claimable_with_evidence_its_owner_is_in_range() {
+        let sched = FaceScheduler {
+            slot: parse_slot("8:3000"),
+            hop: None,
+            group_depth: 1,
+            clock_source: ClockSource::Wall,
+            knobs: None,
+            bw: crate::Bandwidth::default(),
+            current_ch: super::AtomicU8::new(36),
+            hw: super::Mutex::new(RadioHwClock::realtek()),
+            cv: super::Mutex::new(RadioHwClock::common_view()),
+            cv_hw: super::Mutex::new(None),
+            master: false,
+            net: super::Mutex::new(ndn_time::NetworkTime::new(u64::MAX)),
+            claimable: true,
+            last_rx: super::AtomicU64::new(0),
+            heard_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
+            claim_unknown: false,
+            rate: None,
+            base: super::Instant::now(),
+        };
+        let slot = sched.slot.as_ref().unwrap();
+
+        // A Data frame under /ndn/alarm — what a neighbour using that group would put on air.
+        let wire = {
+            let mut name = Vec::new();
+            for c in [&b"ndn"[..], &b"alarm"[..]] {
+                name.push(0x08);
+                name.push(c.len() as u8);
+                name.extend_from_slice(c);
+            }
+            let mut tlv = vec![0x07, name.len() as u8];
+            tlv.extend_from_slice(&name);
+            let mut d = vec![0x06, tlv.len() as u8];
+            d.extend_from_slice(&tlv);
+            d
+        };
+        let owned = slot.owner_slot(
+            sched.medium_keyed(sched.name_group_hash(&wire).expect("the frame carries a name")),
+        ) as usize;
+
+        // Nothing heard yet: every slot's owner is unknown — the hidden-terminal case.
+        assert!(
+            sched.heard_by_slot.iter().all(|c| c.load(super::Ordering::Relaxed) == 0),
+            "no evidence before any frame is observed"
+        );
+
+        // Overhearing that group is the evidence, and it lands on THAT group's slot only.
+        sched.observe_rx(&wire);
+        assert!(
+            sched.heard_by_slot[owned].load(super::Ordering::Relaxed) > 0,
+            "hearing /ndn/alarm must mark the slot /ndn/alarm owns"
+        );
+        let others = sched
+            .heard_by_slot
+            .iter()
+            .enumerate()
+            .filter(|(i, c)| *i != owned && c.load(super::Ordering::Relaxed) > 0)
+            .count();
+        assert_eq!(others, 0, "and must not vouch for any other slot's owner");
+
+        // It also marks the medium busy — and crucially does so with no hardware stamp involved.
+        // That path used to hang off `on_rx_stamp`, which the caller only invokes for stamped
+        // frames, so a radio reporting no TSFT marked the medium busy *never* and claimed always.
+        assert!(
+            sched.last_rx.load(super::Ordering::Relaxed) > 0,
+            "busy-marking must not depend on the timing plane"
+        );
+    }
+
 }
