@@ -143,6 +143,13 @@ pub struct FaceScheduler {
     /// Frames seen that were NOT of this domain — pure diagnostic, so an on-air run can tell "the slot
     /// was busy" from "the channel is busy", which is the distinction the old `last_rx` erased.
     ambient_rx: AtomicU64,
+    /// Times [`try_claim`](Self::try_claim) has been run, and times it won. The claim path had no
+    /// observability at all, which is why it took a two-day on-air campaign to discover that a
+    /// waiting frame was only ever *offered* one slot to contend for. `attempts ≈ wins ≈ 0` while the
+    /// gate is plainly throttling means the contention never happens; `attempts ≫ wins` means it
+    /// happens and loses.
+    claim_attempts: AtomicU64,
+    claim_wins: AtomicU64,
     /// The bearer's rate policy, so the airtime estimate behind the guard band (#84) uses the rate
     /// we will actually transmit at. `None` ⇒ assume the conservative broadcast rate, which
     /// over-estimates airtime — the safe direction, since a too-large estimate only defers us by a
@@ -217,6 +224,8 @@ impl FaceScheduler {
             claimable,
             last_domain_rx: AtomicU64::new(0),
             ambient_rx: AtomicU64::new(0),
+            claim_attempts: AtomicU64::new(0),
+            claim_wins: AtomicU64::new(0),
             heard_by_slot: (0..slot_count).map(|_| AtomicU64::new(0)).collect(),
             deferred_by_slot: (0..slot_count).map(|_| AtomicU32::new(0)).collect(),
             hold_slot_start: AtomicU64::new(u64::MAX),
@@ -479,6 +488,74 @@ impl FaceScheduler {
         HoldStatus::Continue
     }
 
+    /// **One attempt to take the slot we are currently sitting in**, `true` ⇒ transmit now.
+    ///
+    /// Extracted from [`gate`](Self::gate) so it can be run at *every* slot boundary while a frame
+    /// waits, not only at the instant the frame was offered — see the loop in `gate` for why that
+    /// distinction was worth more than the three threshold fixes put together.
+    ///
+    /// Covers both halves of #95: continuing a hold we already won, and starting a fresh CCLF
+    /// election for an idle slot whose owner we can hear.
+    async fn try_claim(&self, slot: &SlotSchedule, hash: u64, airtime: u64) -> bool {
+        if !self.claimable {
+            return false;
+        }
+        self.claim_attempts.fetch_add(1, Ordering::Relaxed);
+        let now = self.now_us();
+        let slot_start = slot.slot_start_us(now);
+
+        // **A won slot buys more than one frame** (#95). The claim used to `return` and the next
+        // frame re-entered the election, paying the jitter again — so a burst could not use the very
+        // slot it had just won, and the airtime it fought for went unused.
+        //
+        // **The owner-return contract** is the other half, and it is why holding is safe: the hold is
+        // surrendered the instant anything of this domain is overheard in this slot. The owner (or
+        // another claimant) has spoken ⇒ we are a guest who has outstayed the invitation, and we go
+        // back to waiting for our own slot. Without that rule, holding a claimed slot would be
+        // indistinguishable from stealing it.
+        match self.hold_status(slot, slot_start, now, airtime) {
+            HoldStatus::Continue => {
+                self.claim_wins.fetch_add(1, Ordering::Relaxed);
+                self.note_sent(hash);
+                return true; // still ours, still room — continue the burst.
+            }
+            HoldStatus::Ended => {
+                self.hold_slot_start.store(u64::MAX, Ordering::Relaxed);
+            }
+            HoldStatus::None => {}
+        }
+
+        let idle = self.last_domain_rx.load(Ordering::Relaxed) < slot_start;
+        let remaining = slot.slot_remaining_us(now);
+        let jitter = self.cclf_jitter_us(hash, slot.slot_us(), slot.epoch(now), airtime);
+        // **Positive evidence the slot's owner is in range** (#94). Silence is only readable as
+        // "idle" from someone we can actually hear; from a hidden owner it is indistinguishable from
+        // a busy medium, and claiming there collides at its receiver.
+        let owner_known = self.owner_in_range(slot, slot.current_slot(now) as usize, now);
+        // `owned_wait > slot_us`: not worth claiming when our own turn is next anyway — and claiming
+        // the slot adjacent to ours buys nothing but a boundary risk.
+        // `remaining > jitter + airtime`: room for the jittered wait AND the frame itself; claiming a
+        // slot we cannot finish in is the same boundary overrun as the owner path, self-inflicted.
+        if !((owner_known || self.claim_unknown)
+            && idle
+            && slot.wait_us(hash, now) > slot.slot_us()
+            && remaining > jitter + airtime)
+        {
+            return false;
+        }
+        // CCLF: wait our jitter; if the slot is STILL idle (no one claimed first), take it.
+        tokio::time::sleep(Duration::from_micros(jitter)).await;
+        if self.last_domain_rx.load(Ordering::Relaxed) >= slot_start {
+            return false; // overheard a claimant first → cancel, and wait for our owned slot.
+        }
+        // Won it. Hold for the rest of THIS slot so a burst can use what we won, under the
+        // owner-return contract checked on the next frame.
+        self.hold_slot_start.store(slot_start, Ordering::Relaxed);
+        self.claim_wins.fetch_add(1, Ordering::Relaxed);
+        self.note_sent(hash);
+        true
+    }
+
     /// How many captured frames were NOT of this scheduling domain — the channel's ambient load.
     ///
     /// Worth printing at the end of any claim experiment: it separates "our slots were busy" from
@@ -486,6 +563,14 @@ impl FaceScheduler {
     /// whole on-air campaign to rediscover.
     pub fn ambient_frames(&self) -> u64 {
         self.ambient_rx.load(Ordering::Relaxed)
+    }
+
+    /// `(claim attempts, claims won)` — the claim path's only observability, and the reading that
+    /// would have named the 2026-08-11 defect in one run instead of a campaign: a throttling gate
+    /// with `attempts == frames` means each waiting frame contended exactly once and then slept
+    /// through every slot it could have taken.
+    pub fn claim_counts(&self) -> (u64, u64) {
+        (self.claim_attempts.load(Ordering::Relaxed), self.claim_wins.load(Ordering::Relaxed))
     }
 
     /// **Do we have live evidence that slot `k`'s owner is within earshot?** (#94), extracted so the
@@ -647,84 +732,47 @@ impl FaceScheduler {
                     return; // our owned slot, with room — a collision-free turn; transmit now.
                 }
             }
-            let owned_wait = slot.wait_us(hash, now);
-            // Claimable slot (named-token-scheduling.md): if this is NOT our slot but the current slot's
-            // owner is IDLE (nothing overheard since it began), contend for it via a CCLF election rather
-            // than wasting it — the demand-adaptive form that beats fixed-TDMA. Only worth claiming when
-            // our own turn is not imminent, and only with room left in the slot for a jittered claim.
-            if self.claimable {
-                let slot_start = slot.slot_start_us(now);
-
-                // **A won slot buys more than one frame** (#95). The claim used to `return` and the
-                // next frame re-entered the election, paying the jitter again — so a burst could not
-                // use the very slot it had just won, and the airtime it fought for went unused.
-                //
-                // **The owner-return contract** is the other half, and it is why holding is safe:
-                // the hold is surrendered the instant anything is overheard in this slot. `last_rx`
-                // moved past `slot_start` ⇒ the owner (or another claimant) has spoken ⇒ we are a
-                // guest who has outstayed the invitation, and we go back to waiting for our own slot.
-                // Without that rule, holding a claimed slot would be indistinguishable from stealing
-                // it.
-                match self.hold_status(slot, slot_start, now, airtime) {
-                    HoldStatus::Continue => {
-                        self.note_sent(hash);
-                        return; // still ours, still room — continue the burst.
-                    }
-                    HoldStatus::Ended => {
-                        self.hold_slot_start.store(u64::MAX, Ordering::Relaxed);
-                    }
-                    HoldStatus::None => {}
-                }
-                let idle = self.last_domain_rx.load(Ordering::Relaxed) < slot_start;
-                let remaining = slot.slot_remaining_us(now);
-                let jitter = self.cclf_jitter_us(hash, slot.slot_us(), slot.epoch(now), airtime);
-                // Room for the jittered wait AND the frame itself — claiming a slot we cannot
-                // finish in is the same boundary overrun as the owner path, just self-inflicted.
-                // **Positive evidence the slot's owner is in range** (#94). Silence is only
-                // readable as "idle" from someone we can actually hear; from a hidden owner it is
-                // indistinguishable from a busy medium, and claiming there collides at its receiver.
-                // `heard_by_slot` says when we last overheard a frame whose group owns THIS slot.
-                let k = slot.current_slot(now) as usize;
-                let owner_known = self.owner_in_range(slot, k, now);
-                if (owner_known || self.claim_unknown)
-                    && idle
-                    && owned_wait > slot.slot_us()
-                    && remaining > jitter + airtime
-                {
-                    // CCLF: wait our jitter; if the slot is STILL idle (no one claimed first), take it.
-                    tokio::time::sleep(Duration::from_micros(jitter)).await;
-                    let still_idle = self.last_domain_rx.load(Ordering::Relaxed) < slot_start;
-                    if still_idle {
-                        // Won it. Hold for the rest of THIS slot so a burst can use what we won,
-                        // under the owner-return contract checked at the top of the next frame.
-                        self.hold_slot_start.store(slot_start, Ordering::Relaxed);
-                        self.note_sent(hash);
-                        return; // claimed the idle slot — transmit now.
-                    }
-                    // Overheard a claimant first → cancel and fall through to wait our owned slot.
-                }
+            // Claimable slot (named-token-scheduling.md): if this is NOT our slot but the current
+            // slot's owner is IDLE, contend for it via a CCLF election rather than wasting it.
+            if self.try_claim(slot, hash, airtime).await {
+                return; // claimed (or holding) this slot — transmit now.
             }
             // Reaching here means this frame waits — which IS the demand signal (#95). A group that
             // keeps being deferred accumulates backlog and draws a shorter CCLF jitter next time, so
             // it wins idle slots ahead of a group with nothing queued.
             self.note_deferred(hash);
 
-            // Wait for our owned slot. If the frame would not fit in what is left of it by the time
-            // we wake (we may have burned the slot's head on a lost claim), wait for the one after.
+            // **Wait one slot at a time, re-contending at every boundary** — not one long sleep to
+            // our own turn.
+            //
+            // This loop used to sleep `wait_us`, the whole gap to the owned slot, and that was the
+            // suppressor that dominated all three of the others (measured 2026-08-11). A frame
+            // entering the gate got exactly ONE claim evaluation, against whichever slot happened to
+            // be current at that instant; if that slot was not claimable it then slept past every
+            // idle slot between there and its own. With a serialized sender the evaluated slot was
+            // always the one right after our own — never the neighbour's, four slots away, which was
+            // the only slot we had evidence for. So the claim could not fire even though an idle,
+            // known-owner slot opened once per superframe.
+            //
+            // It also explains the otherwise-puzzling pair of measurements from 2026-08-10: with
+            // `CLAIM_UNKNOWN` the very first evaluation always succeeded (any slot is claimable), so
+            // the machinery showed 4× — while the evidence-gated claim, which needs a *particular*
+            // slot, essentially never got to look at one.
+            //
+            // A wake per slot boundary is the cost. That is ≤ `slots` wakeups per superframe per
+            // waiting frame, against a 20 ms slot — cheap next to the airtime it recovers.
             loop {
                 let t = self.now_us();
-                let wait = slot.wait_us(hash, t);
-                if wait > 0 {
-                    tokio::time::sleep(Duration::from_micros(wait)).await;
-                }
-                let t = self.now_us();
-                if slot.fits_now(t, airtime) {
+                if slot.owns_now(hash, t) && slot.fits_now(t, airtime) {
                     self.note_sent(hash); // our slot arrived — backlog spent
                     break;
                 }
-                // Past the point in this slot where the frame fits: sleep out the remainder so the
-                // next `wait_us` lands on the following superframe rather than spinning.
-                tokio::time::sleep(Duration::from_micros(slot.slot_remaining_us(t).max(1))).await;
+                if self.try_claim(slot, hash, airtime).await {
+                    return; // won an idle slot on the way to our own.
+                }
+                // To the next boundary, so every intervening slot gets exactly one evaluation.
+                let step = slot.slot_remaining_us(self.now_us()).max(1);
+                tokio::time::sleep(Duration::from_micros(step)).await;
             }
         }
     }
@@ -851,6 +899,8 @@ mod tests {
             claimable: false,
             last_domain_rx: super::AtomicU64::new(0),
             ambient_rx: super::AtomicU64::new(0),
+            claim_attempts: super::AtomicU64::new(0),
+            claim_wins: super::AtomicU64::new(0),
             heard_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
             deferred_by_slot: (0..8).map(|_| super::AtomicU32::new(0)).collect(),
             hold_slot_start: super::AtomicU64::new(u64::MAX),
@@ -889,6 +939,8 @@ mod tests {
             claimable: true,
             last_domain_rx: super::AtomicU64::new(0),
             ambient_rx: super::AtomicU64::new(0),
+            claim_attempts: super::AtomicU64::new(0),
+            claim_wins: super::AtomicU64::new(0),
             heard_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
             deferred_by_slot: (0..8).map(|_| super::AtomicU32::new(0)).collect(),
             hold_slot_start: super::AtomicU64::new(u64::MAX),
@@ -963,6 +1015,8 @@ mod tests {
             claimable: false,
             last_domain_rx: super::AtomicU64::new(0),
             ambient_rx: super::AtomicU64::new(0),
+            claim_attempts: super::AtomicU64::new(0),
+            claim_wins: super::AtomicU64::new(0),
             heard_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
             deferred_by_slot: (0..8).map(|_| super::AtomicU32::new(0)).collect(),
             hold_slot_start: super::AtomicU64::new(u64::MAX),
@@ -1019,6 +1073,8 @@ mod tests {
             claimable: true,
             last_domain_rx: super::AtomicU64::new(0),
             ambient_rx: super::AtomicU64::new(0),
+            claim_attempts: super::AtomicU64::new(0),
+            claim_wins: super::AtomicU64::new(0),
             heard_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
             deferred_by_slot: (0..8).map(|_| super::AtomicU32::new(0)).collect(),
             hold_slot_start: super::AtomicU64::new(u64::MAX),
@@ -1211,6 +1267,60 @@ mod tests {
         );
     }
 
+    /// **A waiting frame must re-contend at every slot boundary** — the fourth suppressor, and the
+    /// one that dominated the other three (measured on air 2026-08-11).
+    ///
+    /// The wait loop used to sleep `wait_us`, the entire gap to the owned slot. A frame therefore got
+    /// exactly ONE claim evaluation, against whichever slot happened to be current when it entered
+    /// the gate — and then slept past every idle slot between there and its own. With a serialized
+    /// sender the evaluated slot was always the one immediately after ours, never the neighbour's
+    /// four slots away, which was the only slot we had presence evidence for.
+    ///
+    /// That also resolves the 2026-08-10 pair of measurements: `CLAIM_UNKNOWN` made the *first*
+    /// evaluation always succeed (any slot will do), so the machinery showed 4×, while the
+    /// evidence-gated claim — needing one particular slot — never got to look at it.
+    ///
+    /// The assertion is on the seam, not on throughput: how many times the frame contended. Real
+    /// time, deliberately; the gate reads the wall clock, so a paused-clock test would spin.
+    #[tokio::test]
+    async fn a_waiting_frame_contends_for_every_slot_it_passes() {
+        let s = mk_claim_sched_slots("8:5000"); // 40 ms superframe — a few boundaries, quickly
+        let slot = *s.slot.as_ref().unwrap();
+
+        // Pick a name whose slot is FAR from the current one, so the frame really has to wait and
+        // will pass several claimable slots on the way. Chosen after reading the clock, because
+        // which slot is current is not ours to decide.
+        let target = (slot.current_slot(s.now_us()) + 4) % slot.slots();
+        let wire = (0..2000)
+            .map(|i| data_wire(&[format!("n{i}").as_bytes()]))
+            .find(|w| {
+                let h = s.medium_keyed(s.name_group_hash(w).unwrap());
+                slot.owner_slot(h) == target
+            })
+            .expect("some name in 2000 lands on the target slot");
+
+        // No evidence anywhere and claim_unknown off ⇒ every contention *loses*. That is the point:
+        // the test measures whether the frame gets to contend at all, not whether it wins, so a win
+        // cannot end the wait early and flatter the count.
+        s.gate(&wire).await;
+
+        let (attempts, wins) = s.claim_counts();
+        assert_eq!(wins, 0, "fixture check: with no presence evidence nothing may be claimed");
+        assert!(
+            attempts >= 3,
+            "a frame waiting ~4 slots must contend for each one it passes; it contended {attempts} \
+             time(s). The old single sleep to the owned slot gave exactly 1, which is why an \
+             evidence-gated claim could never reach the one slot it had evidence for."
+        );
+    }
+
+    /// A claimable scheduler on an arbitrary `slots:slot_us` spec.
+    fn mk_claim_sched_slots(spec: &str) -> FaceScheduler {
+        let mut s = mk_claim_sched();
+        s.slot = parse_slot(spec);
+        s
+    }
+
     /// A Data frame carrying `comps` as its name — what a neighbour of that group puts on air.
     fn data_wire(comps: &[&[u8]]) -> Vec<u8> {
         let mut name = Vec::new();
@@ -1244,6 +1354,8 @@ mod tests {
             claimable: true,
             last_domain_rx: super::AtomicU64::new(0),
             ambient_rx: super::AtomicU64::new(0),
+            claim_attempts: super::AtomicU64::new(0),
+            claim_wins: super::AtomicU64::new(0),
             heard_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
             deferred_by_slot: (0..8).map(|_| super::AtomicU32::new(0)).collect(),
             hold_slot_start: super::AtomicU64::new(u64::MAX),

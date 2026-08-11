@@ -192,6 +192,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the claim still shows no gain, the suppressor is somewhere else — do not re-blame ambient load.
     if let Some(s) = medium.scheduler() {
         println!("ambient frames    : {}   <-- other people's traffic; no longer vetoes a claim", s.ambient_frames());
+        // The claim path's own instrumentation. `attempts ≈ sent` with a gate that is plainly
+        // throttling means each waiting frame contended exactly once and then slept through every
+        // slot it could have taken — the 2026-08-11 defect. Many attempts, few wins means the
+        // contention is happening and losing, which is a different bug in a different place.
+        let (attempts, wins) = s.claim_counts();
+        println!("claim attempts/wins: {attempts} / {wins}");
     }
     println!(
         "\nCompare heard_peer between the OFF and ON arms at BOTH nodes. Slotting should raise it: \
