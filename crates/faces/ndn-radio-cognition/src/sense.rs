@@ -10,13 +10,13 @@ use std::collections::HashMap;
 
 use crate::report::ReceptionReport;
 
-// The capability descriptor + its axes (`Band`, `RadioKind`, `TimingModel`,
+// The capability descriptor + its axes (`Band`, `RadioKind`,
 // `RadioCapability`) moved down into the shared HAL crate (`ndn-radio-hal`) so a
 // driver depends on one contract crate. Re-exported here so every crate-internal
-// reference (`Band::`, `RadioKind::`, `TimingModel`, `RadioCapability`, used by
+// reference (`Band::`, `RadioKind::`, `RadioCapability`, used by
 // this module, `policy.rs`, and the `lib.rs` re-export) still resolves through
 // `crate::sense::…` / `crate::…` unchanged.
-pub use ndn_radio_hal::{Band, RadioCapability, RadioKind, RateCapability, TimingModel};
+pub use ndn_radio_hal::{Band, RadioCapability, RadioKind, RateCapability};
 
 /// Identifies one physical radio / face on this node. The degenerate single-radio
 /// case is just one `RadioId`.

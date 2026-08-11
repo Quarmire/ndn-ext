@@ -82,7 +82,7 @@ pub use schedule::{HopSchedule, SlotSchedule, wifi_airtime_us};
 pub use sense::{
     Band, ChannelOccupancy, DEFAULT_SATURATION_FPS, DUTY_WINDOW_MS, Demand, Ewma, LinkResidual,
     MediumState, MediumView, NeighborReport, RadioCapability, RadioId, RadioKind, RateCapability,
-    TimingModel, lora_airtime_ms,
+    lora_airtime_ms,
 };
 pub use strategy::RadioStrategy;
 
