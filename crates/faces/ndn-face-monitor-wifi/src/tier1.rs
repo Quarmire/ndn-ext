@@ -763,3 +763,68 @@ impl ndn_fwd_core::store::NameTableObserver for Tier1Feed {
         }
     }
 }
+
+/// **The three name renderings must agree, or every match silently fails** (#44).
+///
+/// Three functions independently render a name into the `/`-joined bytes the filters hash:
+///
+/// * `crate::ndn_name_to_slash` — from wire TLV, on the Tier-0 receive path
+/// * [`Tier1Feed::slash`] — from component slices, where the forwarder registers a prefix
+/// * [`Tier1Feed::slash_name`] — from a typed `Name`, where the PIT/FIB feed Tier-1
+///
+/// Both `tier1.rs` doc comments already warn that a divergence makes "every match silently fail and
+/// nothing report an error" — and nothing guarded it. This is that guard. A silent-failure hazard
+/// that is known, written down, and untested is one refactor away from being a live bug, and the
+/// symptom (a filter that rejects everything) looks exactly like a link problem.
+///
+/// This is the real content of #44. Its premise — one shared hash keyspace across filter / FIB / PIT
+/// — is wrong and the code correctly diverged from it: the wire filter needs a *keyed* PRF for
+/// doctrine §8 unforgeability (SipHash-2-4, which FNV cannot provide), the scheduler needs a cheap
+/// unkeyed hash every node computes identically, and the PIT key is process-local. Three
+/// requirements, three keyspaces. What actually has to be shared is the *normalisation* underneath
+/// them, which is what this pins.
+#[cfg(test)]
+mod keyspace_tests {
+    use super::*;
+
+    fn wire_name(comps: &[&[u8]]) -> Vec<u8> {
+        let mut name = Vec::new();
+        for c in comps {
+            name.push(0x08);
+            name.push(c.len() as u8);
+            name.extend_from_slice(c);
+        }
+        let mut out = vec![0x07, name.len() as u8];
+        out.extend_from_slice(&name);
+        out
+    }
+
+    #[test]
+    fn all_three_name_renderings_agree() {
+        let cases: Vec<Vec<&[u8]>> = vec![
+            vec![b"ndn", b"alarm"],
+            vec![b"ndn"],
+            vec![b"a", b"b", b"c", b"seg", b"0"],
+            vec![b""], // an empty component still contributes its separator
+        ];
+        for comps in &cases {
+            let from_wire = crate::ndn_name_to_slash(&wire_name(comps));
+            let from_slices = Tier1Feed::slash(comps);
+            let name = ndn_foundation_types::Name::from_components(
+                comps.iter().map(|c| ndn_foundation_types::NameComponent::generic(bytes::Bytes::from(c.to_vec()))),
+            );
+            let from_name = Tier1Feed::slash_name(&name);
+            assert_eq!(
+                from_wire, from_slices,
+                "wire vs slices disagree on {comps:?}: {from_wire:?} vs {from_slices:?} — every \
+                 Tier-0/Tier-1 match would silently fail"
+            );
+            assert_eq!(
+                from_wire, from_name,
+                "wire vs typed Name disagree on {comps:?}: {from_wire:?} vs {from_name:?}"
+            );
+        }
+        // The empty name is the edge the three implementations each special-case separately.
+        assert_eq!(Tier1Feed::slash(&[]), b"/".to_vec());
+    }
+}
