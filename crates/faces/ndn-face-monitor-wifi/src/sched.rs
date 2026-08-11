@@ -67,6 +67,20 @@ enum ClockSource {
 /// monotonic reference time in microseconds, 8 bytes little-endian.
 pub const TIME_BEACON_MAGIC: [u8; 3] = [0x7E, b'T', b'B'];
 
+/// How long a slot owner stays "known to be in range" after we last overheard it (µs).
+///
+/// This is a **presence** timeout, so it is set by how fast the neighbourhood changes — a node
+/// walking out of range, a node dying — not by how often the owner happens to transmit. Five seconds
+/// is a few seconds of pedestrian motion at 5 GHz; long enough that a once-a-second talker is
+/// continuously known, short enough that a departed neighbour stops vetoing claims within one
+/// human-noticeable beat.
+const PRESENCE_WINDOW_US: u64 = 5_000_000;
+
+/// How many frame-airtimes wide the CCLF draw is. The draw only has to order contenders far enough
+/// apart that the loser hears the winner and cancels; 8 gives a handful of separable positions
+/// without spending the slot it is competing for.
+const CCLF_SPREAD: u64 = 8;
+
 /// A snapshot of a face's common-view time state — the essentials a consumer reads from the
 /// ndn-time hardware-clock plane (see [`FaceScheduler::time_status`]).
 #[derive(Clone, Copy, Debug)]
@@ -116,9 +130,19 @@ pub struct FaceScheduler {
     /// (nothing overheard since the slot began) another name with data may CLAIM it via a CCLF election.
     /// `false` = fixed name-TDMA (owner-only). On when `NDN_SCHED_CLAIM=1`.
     claimable: bool,
-    /// Common-view µs of the last overheard frame — the claimable decision's "is this slot idle?" input
-    /// (idle ⇔ `last_rx < slot_start`). Updated by [`on_rx_stamp`](Self::on_rx_stamp). `0` = nothing yet.
-    last_rx: AtomicU64,
+    /// Common-view µs of the last overheard frame **of this scheduling domain** — the claimable
+    /// decision's "is this slot idle?" input (idle ⇔ `last_domain_rx < slot_start`). `0` = nothing yet.
+    ///
+    /// **Domain, not energy.** This used to be every captured frame, which made the gate an energy
+    /// detector on a shared channel: ch149 carries ~22 frame/s of other people's traffic, so a slot
+    /// almost never looked idle and the claim path measured as ~0 gain on air (2026-08-10). But
+    /// foreign traffic is not evidence about the *owner's* intent — it is interference, which the slot
+    /// MAC neither schedules nor can avoid. Only frames that parse as this domain's named traffic
+    /// (i.e. [`name_group_hash`](Self::name_group_hash) succeeds) mark a slot taken.
+    last_domain_rx: AtomicU64,
+    /// Frames seen that were NOT of this domain — pure diagnostic, so an on-air run can tell "the slot
+    /// was busy" from "the channel is busy", which is the distinction the old `last_rx` erased.
+    ambient_rx: AtomicU64,
     /// The bearer's rate policy, so the airtime estimate behind the guard band (#84) uses the rate
     /// we will actually transmit at. `None` ⇒ assume the conservative broadcast rate, which
     /// over-estimates airtime — the safe direction, since a too-large estimate only defers us by a
@@ -191,7 +215,8 @@ impl FaceScheduler {
             master,
             net: Mutex::new(NetworkTime::new(node_id)),
             claimable,
-            last_rx: AtomicU64::new(0),
+            last_domain_rx: AtomicU64::new(0),
+            ambient_rx: AtomicU64::new(0),
             heard_by_slot: (0..slot_count).map(|_| AtomicU64::new(0)).collect(),
             deferred_by_slot: (0..slot_count).map(|_| AtomicU32::new(0)).collect(),
             hold_slot_start: AtomicU64::new(u64::MAX),
@@ -328,14 +353,24 @@ impl FaceScheduler {
     ///
     /// So this also records, per slot, when we last heard a frame whose name-group owns it. That is
     /// positive evidence the slot's user is in range, which is what makes its silence readable.
+    ///
+    /// **A fourth thing was wrong, and only the air showed it** (2026-08-10): the busy mark fired on
+    /// *any* captured frame, including the ~22 frame/s of unrelated traffic on a shared 5 GHz channel.
+    /// A slot then essentially never read as idle, so the claim path — which measured a clean 4×
+    /// throughput gain with the evidence gate forced open — delivered ~0 with it closed. Foreign
+    /// traffic is interference, not a statement about the slot owner, so it is counted and dropped
+    /// here rather than allowed to veto a claim.
     pub fn observe_rx(&self, wire: &[u8]) {
         if !self.claimable {
             return;
         }
         let now = self.now_us();
-        self.last_rx.store(now, Ordering::Relaxed);
         // Key the same way TX does, so the slot indices agree (#89).
-        let Some(hash) = self.name_group_hash(wire) else { return };
+        let Some(hash) = self.name_group_hash(wire) else {
+            self.ambient_rx.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        self.last_domain_rx.store(now, Ordering::Relaxed);
         let keyed = self.medium_keyed(hash);
         if let Some(slot) = &self.slot {
             let k = slot.owner_slot(keyed) as usize;
@@ -365,8 +400,22 @@ impl FaceScheduler {
         self.rate.as_ref().map(|r| r.select().index)
     }
 
-    fn cclf_jitter_us(&self, prefix_hash: u64, slot_us: u64, epoch: u64) -> u64 {
-        // Spread claimants over the first ~half of the slot; a 64→16-bit fold decorrelates from owner_slot.
+    fn cclf_jitter_us(&self, prefix_hash: u64, slot_us: u64, epoch: u64, airtime_us: u64) -> u64 {
+        // **The window is sized by DETECTION time, not by the slot.**
+        //
+        // It used to be `slot_us / 2`: a claimant spent up to half the slot it was fighting for
+        // *before* transmitting, so with 8 × 20 ms slots the average claim burned 5 ms of a 20 ms
+        // prize. That is not what the draw has to buy. Its only job is to order contenders far enough
+        // apart that the loser can hear the winner and cancel — one frame's airtime plus the RX
+        // pipeline, since `still_idle` reads a *decoded* frame. So the window is a small multiple of
+        // the airtime, capped by the old half-slot bound (never worse than before) and floored so a
+        // tiny frame still leaves room to separate anyone.
+        //
+        // The cost of getting this wrong is asymmetric and that is why the multiple is 8 rather than
+        // 2: too small collides claimants (they draw the same µs and neither hears the other in
+        // time), too large only wastes airtime we were going to lose anyway.
+        let detect = airtime_us.max(1);
+        let window = (slot_us / 2).max(1).min(detect.saturating_mul(CCLF_SPREAD).max(2));
         //
         // **`epoch` is mixed in so the winner rotates** (#87). Without it the jitter was a pure
         // function of the name: the same claimant drew the same, smallest delay every idle slot and
@@ -375,7 +424,6 @@ impl FaceScheduler {
         // the draw each slot while keeping every node's view of it identical (all nodes share the
         // common-view clock, so all compute the same epoch), which is what makes the election
         // agree without any message.
-        let window = (slot_us / 2).max(1);
         let mixed = prefix_hash ^ epoch.wrapping_mul(0x9E37_79B9_7F4A_7C15);
         let draw = (mixed ^ (mixed >> 32)) % window;
 
@@ -390,11 +438,18 @@ impl FaceScheduler {
         // and cancel. Nothing has to be predicted, so a purely local demand term is safe here — which
         // is exactly why it belongs here and not in `owner_slot`.
         //
-        // Bounded: the shift saturates at 4 (÷16) and the result keeps a floor, so a large backlog
-        // biases the election without collapsing everyone onto zero — which would replace the
-        // ordering with a collision.
+        // Bounded: the shift saturates and the result keeps a floor, so a large backlog biases the
+        // election without collapsing everyone onto zero — which would replace the ordering with a
+        // collision. **The bound now follows the window** rather than being a flat 4: with the window
+        // sized in detection times (above), an unconditional ÷16 would squeeze every backlogged
+        // claimant into a sub-airtime band where none of them can hear the others in time. So halve
+        // only while the remaining band still spans at least two detection times.
+        let mut max_shift = 0u32;
+        while max_shift < 4 && (window >> (max_shift + 1)) >= detect.saturating_mul(2) {
+            max_shift += 1;
+        }
         let backlog = self.deferred_for(prefix_hash);
-        let shift = backlog.min(4);
+        let shift = backlog.min(max_shift);
         (draw >> shift).max(1)
     }
 
@@ -415,13 +470,41 @@ impl FaceScheduler {
         if self.hold_slot_start.load(Ordering::Relaxed) != slot_start {
             return HoldStatus::None; // no hold on THIS slot (a stale hold never carries forward)
         }
-        if self.last_rx.load(Ordering::Relaxed) >= slot_start {
+        if self.last_domain_rx.load(Ordering::Relaxed) >= slot_start {
             return HoldStatus::Ended; // the owner spoke — yield
         }
         if !slot.fits_now(now, airtime) {
             return HoldStatus::Ended; // no room left in the slot we hold
         }
         HoldStatus::Continue
+    }
+
+    /// How many captured frames were NOT of this scheduling domain — the channel's ambient load.
+    ///
+    /// Worth printing at the end of any claim experiment: it separates "our slots were busy" from
+    /// "the channel was busy", a distinction the old any-frame busy mark erased and which cost a
+    /// whole on-air campaign to rediscover.
+    pub fn ambient_frames(&self) -> u64 {
+        self.ambient_rx.load(Ordering::Relaxed)
+    }
+
+    /// **Do we have live evidence that slot `k`'s owner is within earshot?** (#94), extracted so the
+    /// window can be tested without driving an async gate off the wall clock.
+    ///
+    /// **Presence decays on the mobility timescale, not the traffic one.** The window used to be
+    /// `slot_us * slots * 4` — four superframes, 640 ms at 8 × 20 ms — which silently made the test
+    /// "has the owner transmitted recently" rather than "is the owner still here". A neighbour
+    /// sending once a second was therefore unknown for a third of every second, and the claim it
+    /// should have permitted was refused. Measured on air 2026-08-10: one of the three reasons the
+    /// evidence-gated claim gained ~10% where the same claim with the gate forced open gained 4×.
+    ///
+    /// So the window is a presence timeout, with the superframe only as a floor: a schedule slower
+    /// than the timeout must still let at least one silent turn pass without forgetting the owner.
+    fn owner_in_range(&self, slot: &SlotSchedule, k: usize, now: u64) -> bool {
+        let last_heard = self.heard_by_slot.get(k).map(|c| c.load(Ordering::Relaxed)).unwrap_or(0);
+        let window =
+            PRESENCE_WINDOW_US.max(slot.slot_us().saturating_mul(slot.slots()).saturating_mul(2));
+        last_heard != 0 && now.saturating_sub(last_heard) <= window
     }
 
     /// Frames of `prefix_hash`'s group deferred since it last transmitted — the backlog proxy the
@@ -592,9 +675,9 @@ impl FaceScheduler {
                     }
                     HoldStatus::None => {}
                 }
-                let idle = self.last_rx.load(Ordering::Relaxed) < slot_start;
+                let idle = self.last_domain_rx.load(Ordering::Relaxed) < slot_start;
                 let remaining = slot.slot_remaining_us(now);
-                let jitter = self.cclf_jitter_us(hash, slot.slot_us(), slot.epoch(now));
+                let jitter = self.cclf_jitter_us(hash, slot.slot_us(), slot.epoch(now), airtime);
                 // Room for the jittered wait AND the frame itself — claiming a slot we cannot
                 // finish in is the same boundary overrun as the owner path, just self-inflicted.
                 // **Positive evidence the slot's owner is in range** (#94). Silence is only
@@ -602,11 +685,7 @@ impl FaceScheduler {
                 // indistinguishable from a busy medium, and claiming there collides at its receiver.
                 // `heard_by_slot` says when we last overheard a frame whose group owns THIS slot.
                 let k = slot.current_slot(now) as usize;
-                let last_heard = self.heard_by_slot.get(k).map(|c| c.load(Ordering::Relaxed)).unwrap_or(0);
-                // Stale after a few superframes: an owner that has gone quiet for that long is no
-                // longer evidence of anything, and we fall back to the conservative reading.
-                let evidence_window = slot.slot_us() * slot.slots() * 4;
-                let owner_known = last_heard != 0 && now.saturating_sub(last_heard) <= evidence_window;
+                let owner_known = self.owner_in_range(slot, k, now);
                 if (owner_known || self.claim_unknown)
                     && idle
                     && owned_wait > slot.slot_us()
@@ -614,7 +693,7 @@ impl FaceScheduler {
                 {
                     // CCLF: wait our jitter; if the slot is STILL idle (no one claimed first), take it.
                     tokio::time::sleep(Duration::from_micros(jitter)).await;
-                    let still_idle = self.last_rx.load(Ordering::Relaxed) < slot_start;
+                    let still_idle = self.last_domain_rx.load(Ordering::Relaxed) < slot_start;
                     if still_idle {
                         // Won it. Hold for the rest of THIS slot so a burst can use what we won,
                         // under the owner-return contract checked at the top of the next frame.
@@ -770,7 +849,8 @@ mod tests {
             master: false,
             net: super::Mutex::new(ndn_time::NetworkTime::new(u64::MAX)),
             claimable: false,
-            last_rx: super::AtomicU64::new(0),
+            last_domain_rx: super::AtomicU64::new(0),
+            ambient_rx: super::AtomicU64::new(0),
             heard_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
             deferred_by_slot: (0..8).map(|_| super::AtomicU32::new(0)).collect(),
             hold_slot_start: super::AtomicU64::new(u64::MAX),
@@ -807,7 +887,8 @@ mod tests {
             master: false,
             net: super::Mutex::new(ndn_time::NetworkTime::new(u64::MAX)),
             claimable: true,
-            last_rx: super::AtomicU64::new(0),
+            last_domain_rx: super::AtomicU64::new(0),
+            ambient_rx: super::AtomicU64::new(0),
             heard_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
             deferred_by_slot: (0..8).map(|_| super::AtomicU32::new(0)).collect(),
             hold_slot_start: super::AtomicU64::new(u64::MAX),
@@ -820,14 +901,14 @@ mod tests {
 
         // Within one slot the draw is deterministic — that is what lets every node compute the same
         // election with no message, since all share the common-view clock and so the same epoch.
-        assert_eq!(s.cclf_jitter_us(a, 3000, 7), s.cclf_jitter_us(a, 3000, 7));
+        assert_eq!(s.cclf_jitter_us(a, 3000, 7, 200), s.cclf_jitter_us(a, 3000, 7, 200));
         // Bounded to the front half of the slot, so a claim leaves room to transmit.
         for e in 0..64 {
-            assert!(s.cclf_jitter_us(a, 3000, e) < 1500);
-            assert!(s.cclf_jitter_us(b, 3000, e) < 1500);
+            assert!(s.cclf_jitter_us(a, 3000, e, 200) < 1500);
+            assert!(s.cclf_jitter_us(b, 3000, e, 200) < 1500);
         }
         // Different names draw an ordering within a slot.
-        assert_ne!(s.cclf_jitter_us(a, 3000, 7), s.cclf_jitter_us(b, 3000, 7));
+        assert_ne!(s.cclf_jitter_us(a, 3000, 7, 200), s.cclf_jitter_us(b, 3000, 7, 200));
 
         // **The winner must rotate** (#87). The jitter used to be a pure function of the name, so
         // whichever name folded to the smallest value won *every* idle slot, forever — starvation
@@ -840,7 +921,7 @@ mod tests {
         for epoch in 0..2_000u64 {
             let winner = names
                 .iter()
-                .min_by_key(|n| s.cclf_jitter_us(**n, 3000, epoch))
+                .min_by_key(|n| s.cclf_jitter_us(**n, 3000, epoch, 200))
                 .unwrap();
             *wins.entry(*winner).or_insert(0usize) += 1;
         }
@@ -880,7 +961,8 @@ mod tests {
             master: true,
             net: super::Mutex::new(ndn_time::NetworkTime::new(u64::MAX)),
             claimable: false,
-            last_rx: super::AtomicU64::new(0),
+            last_domain_rx: super::AtomicU64::new(0),
+            ambient_rx: super::AtomicU64::new(0),
             heard_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
             deferred_by_slot: (0..8).map(|_| super::AtomicU32::new(0)).collect(),
             hold_slot_start: super::AtomicU64::new(u64::MAX),
@@ -935,7 +1017,8 @@ mod tests {
             master: false,
             net: super::Mutex::new(ndn_time::NetworkTime::new(u64::MAX)),
             claimable: true,
-            last_rx: super::AtomicU64::new(0),
+            last_domain_rx: super::AtomicU64::new(0),
+            ambient_rx: super::AtomicU64::new(0),
             heard_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
             deferred_by_slot: (0..8).map(|_| super::AtomicU32::new(0)).collect(),
             hold_slot_start: super::AtomicU64::new(u64::MAX),
@@ -987,12 +1070,161 @@ mod tests {
         // That path used to hang off `on_rx_stamp`, which the caller only invokes for stamped
         // frames, so a radio reporting no TSFT marked the medium busy *never* and claimed always.
         assert!(
-            sched.last_rx.load(super::Ordering::Relaxed) > 0,
+            sched.last_domain_rx.load(super::Ordering::Relaxed) > 0,
             "busy-marking must not depend on the timing plane"
         );
     }
 
+    /// **Somebody else's traffic must not veto our claim** — the first of the three suppressors the
+    /// 2026-08-10 on-air run found (`token-concept-named-radio`).
+    ///
+    /// `observe_rx` marked the medium busy on *every* captured frame. In monitor mode that is every
+    /// frame on the channel, and ch149 carried ~22 frame/s of unrelated 802.11 traffic, so a slot
+    /// essentially never satisfied `last_rx < slot_start` and the claim path never fired. The
+    /// measurement that exposed it: the same claim with the evidence gate forced open
+    /// (`NDN_SCHED_CLAIM_UNKNOWN`) delivered 4× — the machinery worked, its inputs were poisoned.
+    ///
+    /// Foreign traffic is interference. The slot MAC does not schedule it, cannot avoid it, and
+    /// learns nothing about the *owner's* intent from it — so it is counted and dropped.
+    #[test]
+    fn ambient_traffic_does_not_mark_a_slot_busy() {
+        let sched = mk_claim_sched();
 
+        // A beacon-ish frame from an unrelated network: no NDN Name, so no name-group.
+        let ambient = [0x80u8, 0x00, 0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04];
+        assert!(
+            sched.name_group_hash(&ambient).is_none(),
+            "the fixture must really be un-attributable, or this test proves nothing"
+        );
+
+        sched.observe_rx(&ambient);
+        assert_eq!(
+            sched.last_domain_rx.load(super::Ordering::Relaxed),
+            0,
+            "a frame we cannot attribute to this scheduling domain must leave every slot claimable"
+        );
+        assert_eq!(
+            sched.ambient_rx.load(super::Ordering::Relaxed),
+            1,
+            "but it must still be counted, or an on-air run cannot tell a busy slot from a busy channel"
+        );
+        assert!(
+            sched.heard_by_slot.iter().all(|c| c.load(super::Ordering::Relaxed) == 0),
+            "and it is evidence about nobody's presence"
+        );
+
+        // The contrast: a frame of ours does mark it, so this is a discrimination and not a mute.
+        sched.observe_rx(&data_wire(&[b"ndn", b"alarm"]));
+        assert!(
+            sched.last_domain_rx.load(super::Ordering::Relaxed) > 0,
+            "our own domain's traffic must still mark the slot taken"
+        );
+    }
+
+    /// **Presence evidence must outlive the gap between a slow talker's frames** — suppressor two.
+    ///
+    /// The window was four superframes: 640 ms at the 8 × 20 ms schedule used on air. The neighbour
+    /// in that run transmitted once a second, so for ~360 ms of every second its slot read as
+    /// *owner unknown* and the claim was refused — despite the node being audible, stationary, and
+    /// three feet away. The window answers "is the owner in range", which changes when a node moves,
+    /// not between two of its frames.
+    #[test]
+    fn presence_evidence_survives_a_once_a_second_neighbour() {
+        let sched = mk_claim_sched();
+        let slot = sched.slot.as_ref().unwrap();
+        let superframe = slot.slot_us() * slot.slots(); // 24 ms here, 160 ms on air
+
+        // Heard once, then silence for a full second — a 1 f/s neighbour between frames.
+        sched.heard_by_slot[3].store(1_000_000, super::Ordering::Relaxed);
+        assert!(
+            sched.owner_in_range(slot, 3, 1_000_000 + 1_000_000),
+            "a neighbour that speaks once a second is audible the whole second; the old \
+             four-superframe window ({}µs) called it unknown after {}µs",
+            superframe * 4,
+            superframe * 4
+        );
+
+        // It is still a timeout, not an amnesty: a departed neighbour must stop vouching.
+        assert!(
+            !sched.owner_in_range(slot, 3, 1_000_000 + PRESENCE_WINDOW_US + 1),
+            "evidence must expire, or a node that left keeps its slot reserved forever"
+        );
+        // And never-heard is never known — the hidden-terminal case #94 exists for.
+        assert!(!sched.owner_in_range(slot, 5, 1_000_000), "silence from an unheard owner is not evidence");
+    }
+
+    /// **The CCLF draw must not spend the slot it is competing for** — suppressor three.
+    ///
+    /// The window was `slot_us / 2`: at 20 ms slots a claimant waited an average 5 ms before
+    /// transmitting into a 20 ms prize, so a quarter of every won slot was burnt on the election.
+    /// The draw only has to separate contenders by enough that the loser hears the winner and
+    /// cancels — one frame's airtime — so it is sized in airtimes and merely *capped* by the old
+    /// half-slot bound.
+    #[test]
+    fn the_cclf_draw_is_sized_by_airtime_not_by_the_slot() {
+        let s = mk_claim_sched();
+        let h = prefix_hash(&[b"ndn", b"bulk"]);
+        let slot_us = 20_000; // the on-air schedule
+        let airtime = 250; // a small frame at the conservative broadcast rate
+
+        for e in 0..256u64 {
+            let d = s.cclf_jitter_us(h, slot_us, e, airtime);
+            assert!(
+                d <= airtime * CCLF_SPREAD,
+                "draw {d}µs exceeds the {}µs detection window; the old half-slot rule allowed \
+                 {}µs — up to half the prize",
+                airtime * CCLF_SPREAD,
+                slot_us / 2
+            );
+            assert!(d >= 1, "and is never zero — zero is a collision, not an ordering");
+        }
+
+        // The cap still binds the other way: a frame so long that 8 airtimes exceed half the slot
+        // must not draw past the half-slot bound, or the claim cannot fit in what it wins.
+        let long = 4_000;
+        for e in 0..64u64 {
+            assert!(
+                s.cclf_jitter_us(h, slot_us, e, long) <= slot_us / 2,
+                "the half-slot cap must still hold for long frames"
+            );
+        }
+
+        // Backlog may not squeeze contenders below the separation the window exists to provide —
+        // the failure the old flat ÷16 would now cause: 250µs × 8 ÷ 16 = 125µs, half an airtime,
+        // where neither claimant can hear the other before transmitting.
+        for _ in 0..8 {
+            s.note_deferred(h);
+        }
+        let band = (airtime * CCLF_SPREAD) >> 4;
+        assert!(
+            band < airtime * 2,
+            "fixture check: a flat ÷16 really would collapse this window below the detection time"
+        );
+        let mut spread = std::collections::HashSet::new();
+        for e in 0..256u64 {
+            spread.insert(s.cclf_jitter_us(h, slot_us, e, airtime) / airtime);
+        }
+        assert!(
+            spread.len() >= 2,
+            "even fully backlogged, the draws must still span more than one detection time \
+             ({spread:?}) — otherwise backlogged claimants collide instead of ordering"
+        );
+    }
+
+    /// A Data frame carrying `comps` as its name — what a neighbour of that group puts on air.
+    fn data_wire(comps: &[&[u8]]) -> Vec<u8> {
+        let mut name = Vec::new();
+        for c in comps {
+            name.push(0x08);
+            name.push(c.len() as u8);
+            name.extend_from_slice(c);
+        }
+        let mut tlv = vec![0x07, name.len() as u8];
+        tlv.extend_from_slice(&name);
+        let mut d = vec![0x06, tlv.len() as u8];
+        d.extend_from_slice(&tlv);
+        d
+    }
 
     /// A claimable scheduler with an 8x3ms superframe — the shape the claim tests need.
     fn mk_claim_sched() -> FaceScheduler {
@@ -1010,7 +1242,8 @@ mod tests {
             master: false,
             net: super::Mutex::new(ndn_time::NetworkTime::new(u64::MAX)),
             claimable: true,
-            last_rx: super::AtomicU64::new(0),
+            last_domain_rx: super::AtomicU64::new(0),
+            ambient_rx: super::AtomicU64::new(0),
             heard_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
             deferred_by_slot: (0..8).map(|_| super::AtomicU32::new(0)).collect(),
             hold_slot_start: super::AtomicU64::new(u64::MAX),
@@ -1033,14 +1266,14 @@ mod tests {
         let s = mk_claim_sched();
         let h = prefix_hash(&[b"ndn", b"bulk"]);
 
-        let idle_draw = s.cclf_jitter_us(h, 3000, 7);
+        let idle_draw = s.cclf_jitter_us(h, 3000, 7, 200);
         assert!(idle_draw >= 1, "a draw is never zero — zero is a collision, not an ordering");
 
         // Each deferral is a frame that wanted the medium and did not get it.
         let mut prev = idle_draw;
         for _ in 0..4 {
             s.note_deferred(h);
-            let d = s.cclf_jitter_us(h, 3000, 7);
+            let d = s.cclf_jitter_us(h, 3000, 7, 200);
             assert!(d <= prev, "backlog must not lengthen the wait: {d} > {prev}");
             prev = d;
         }
@@ -1054,7 +1287,7 @@ mod tests {
         // the starvation #87 just removed, reintroduced through a different door.
         s.note_sent(h);
         assert_eq!(
-            s.cclf_jitter_us(h, 3000, 7),
+            s.cclf_jitter_us(h, 3000, 7, 200),
             idle_draw,
             "after transmitting, the group contends as an idle one again"
         );
@@ -1062,12 +1295,12 @@ mod tests {
         // Demand is per name-group, not per node: a busy group must not lend its urgency to a quiet
         // one that happens to share the radio.
         let other = prefix_hash(&[b"ndn", b"quiet"]);
-        let before = s.cclf_jitter_us(other, 3000, 7);
+        let before = s.cclf_jitter_us(other, 3000, 7, 200);
         for _ in 0..4 {
             s.note_deferred(h);
         }
         assert_eq!(
-            s.cclf_jitter_us(other, 3000, 7),
+            s.cclf_jitter_us(other, 3000, 7, 200),
             before,
             "one group's backlog must not shorten another group's draw"
         );
@@ -1095,7 +1328,7 @@ mod tests {
 
         // Win the slot.
         s.hold_slot_start.store(start, super::Ordering::Relaxed);
-        s.last_rx.store(start - 5, super::Ordering::Relaxed); // last heard BEFORE this slot began
+        s.last_domain_rx.store(start - 5, super::Ordering::Relaxed); // last heard BEFORE this slot began
         assert_eq!(
             s.hold_status(&slot, start, start + 10, air),
             HoldStatus::Continue,
@@ -1103,7 +1336,7 @@ mod tests {
         );
 
         // **Owner-return contract**: anything overheard inside the slot ends the hold at once.
-        s.last_rx.store(start + 100, super::Ordering::Relaxed);
+        s.last_domain_rx.store(start + 100, super::Ordering::Relaxed);
         assert_eq!(
             s.hold_status(&slot, start, start + 150, air),
             HoldStatus::Ended,
@@ -1112,7 +1345,7 @@ mod tests {
 
         // Room runs out: the hold also ends at the slot boundary, so a held slot cannot overrun into
         // the next owner's turn any more than an owned one can (#84).
-        s.last_rx.store(start - 5, super::Ordering::Relaxed);
+        s.last_domain_rx.store(start - 5, super::Ordering::Relaxed);
         let late = start + slot.slot_us() - 1;
         assert_eq!(
             s.hold_status(&slot, start, late, air),

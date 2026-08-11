@@ -186,6 +186,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     println!("unparsed          : {unparsed}");
+    // The channel's own load, separate from ours. Until 2026-08-11 every one of these frames marked
+    // a slot busy and silently vetoed the claim, which is why an evidence-gated claim measured ~0
+    // gain while the same claim with the gate forced open measured 4×. If this number is large and
+    // the claim still shows no gain, the suppressor is somewhere else — do not re-blame ambient load.
+    if let Some(s) = medium.scheduler() {
+        println!("ambient frames    : {}   <-- other people's traffic; no longer vetoes a claim", s.ambient_frames());
+    }
     println!(
         "\nCompare heard_peer between the OFF and ON arms at BOTH nodes. Slotting should raise it: \
          the two transmitters stop overlapping. A fall, or no change, is a real result — say so."

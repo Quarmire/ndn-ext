@@ -1033,6 +1033,15 @@ impl RunningMedium {
         self.tasks.push(handle);
     }
 
+    /// This face's transmit scheduler, when `NDN_SCHED_*` configured one. Exposed so an experiment
+    /// can read what the gate saw — in particular
+    /// [`ambient_frames`](crate::FaceScheduler::ambient_frames), which distinguishes "our slots were
+    /// busy" from "the channel was busy". Every bearer shares one node clock and one slot map, so the
+    /// first bearer's scheduler is the face's.
+    pub fn scheduler(&self) -> Option<Arc<crate::FaceScheduler>> {
+        self.tx.first().and_then(|b| b.sched.clone())
+    }
+
     /// Inject a cooperative-broadcast wire (reception report / discovery / control) at
     /// `MostRobust` intent on every bearer — the basic legacy rate every neighbour can
     /// decode, FEC bypassed. Distinct from [`Transport::send_bytes`], which sends data at
