@@ -240,16 +240,16 @@ fn build_bearer(rid: RadioId, spec: &RadioSpec) -> Result<Option<RadioBearer>, F
 /// In-process bearer over a fresh loopback bus (no hardware) — the testable path and
 /// the reference for what a real backend plugs in as.
 fn build_loopback(rid: RadioId, spec: &RadioSpec) -> RadioBearer {
-    use crate::{LoopbackMonitorBus, WifiRadio};
+    use crate::{FrameIo, LoopbackMonitorBus};
     let bus = LoopbackMonitorBus::new();
-    let radio: Arc<dyn WifiRadio> = Arc::new(bus.endpoint(1, -55));
+    let radio: Arc<dyn FrameIo> = Arc::new(bus.endpoint(1, -55));
     let cap = RadioCapability::wifi_monitor_5ghz(spec.channel.into_iter().collect());
     RadioBearer::wifi(rid, radio, cap)
 }
 
 #[cfg(feature = "libusb-backend")]
 fn build_rtl8822e(rid: RadioId, spec: &RadioSpec) -> Result<Option<RadioBearer>, FaceError> {
-    use crate::{LibUsbRtl88xxBackend, WifiRadio};
+    use crate::{FrameIo, LibUsbRtl88xxBackend};
     let ch = spec.channel.ok_or_else(|| invalid("rtl8822e requires channel="))?;
     // Target `0bda:a81a` (RTL8812EU / 8822E-halmac) specifically — an 8812AU is also
     // in `RTL88XX_PIDS`, so a plain `open()` can claim the wrong Realtek device.
@@ -259,7 +259,7 @@ fn build_rtl8822e(rid: RadioId, spec: &RadioSpec) -> Result<Option<RadioBearer>,
     if let Some(p) = spec.tx_power {
         let _ = backend.set_tx_power(p as u32);
     }
-    let radio: Arc<dyn WifiRadio> = backend;
+    let radio: Arc<dyn FrameIo> = backend;
     Ok(Some(RadioBearer::wifi(
         rid,
         radio,
@@ -274,7 +274,7 @@ fn build_rtl8822e(_rid: RadioId, _spec: &RadioSpec) -> Result<Option<RadioBearer
 
 #[cfg(target_os = "linux")]
 fn build_afpacket(rid: RadioId, spec: &RadioSpec) -> Result<Option<RadioBearer>, FaceError> {
-    use crate::{AfPacketBackend, FrameFormat, WifiRadio};
+    use crate::{AfPacketBackend, FrameFormat, FrameIo};
     let iface = spec
         .iface
         .as_deref()
@@ -294,7 +294,7 @@ fn build_afpacket(rid: RadioId, spec: &RadioSpec) -> Result<Option<RadioBearer>,
     let backend = AfPacketBackend::new(iface, fmt)
         .map_err(|e| invalid(format!("{e:?}")))?
         .with_capability(cap.clone());
-    let radio: Arc<dyn WifiRadio> = Arc::new(backend);
+    let radio: Arc<dyn FrameIo> = Arc::new(backend);
 
     // Probe the interface for a control seam. This is driver-agnostic: whatever
     // absolute-dBm mechanism exists (a driver knob, else nl80211) is found by

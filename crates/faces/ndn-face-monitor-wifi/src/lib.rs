@@ -107,7 +107,7 @@ pub use ndn_frame_io::{
     BROADCAST, CapturedFrame, DEFAULT_SRC, EphemeralSource, ESPNOW_MAX_BODY, ESPNOW_OUI, FaceError, FaceId,
     FrameFormat, FrameIo, GroupKey, InjectFrame, LEGACY_ETHER_MTU, LoopbackEndpoint,
     LoopbackMonitorBus, MAX_RELIABLE_MCS, MONITOR_MTU, McsDescriptor, McsPolicy, OPEN_GROUP_KEY,
-    RadioCapability, Reach, Reliability, TxIntent, WifiRadio, frame, mcs_for_rssi, mcs_phy_rate_bps,
+    RadioCapability, Reach, Reliability, TxIntent, frame, mcs_for_rssi, mcs_phy_rate_bps,
     radiotap,
 };
 
@@ -584,7 +584,7 @@ fn named_tlv_value(parent: &[u8], want: u64) -> Option<&[u8]> {
 
 // `inject_at` / `inject_batch_at` are called straight on `FrameIo` — there are no local helpers.
 //
-// #82 part 1 moved this face from `Arc<dyn WifiRadio>` to `Arc<dyn FrameIo>`. That was the right
+// #82 part 1 moved this face from `Arc<dyn FrameIo>` to `Arc<dyn FrameIo>`. That was the right
 // change (only 2 of 7 backends implement `WifiRadio`, so the face could not accept most of the
 // radios in the tree), but the two rate-carrying methods lived on `WifiRadio`, out of reach of a
 // `dyn FrameIo`. So it grew private `inject_at_rate` / `inject_batch_at_rate` free functions that

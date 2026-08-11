@@ -25,8 +25,7 @@
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use bytes::Bytes;
     use ndn_face_monitor_wifi::{
-        AfPacketBackend, FrameFormat, FrameIo, InjectFrame, McsDescriptor, TxIntent, WifiRadio,
-    };
+        AfPacketBackend, FrameFormat, FrameIo, InjectFrame, McsDescriptor, TxIntent, };
     use std::time::Duration;
 
     let role = std::env::args().nth(1).unwrap_or_else(|| "rx".into());

@@ -228,7 +228,7 @@ mod imp {
         // userspace driver instead, so the bench can run on rigs with no kernel
         // monitor path — and on the exact radios the NAN data path was proved on,
         // which is what makes a RawNdn-vs-NDP comparison apples-to-apples.
-        let backend: Arc<dyn ndn_frame_io::WifiRadio> = if let Some(rest) =
+        let backend: Arc<dyn ndn_frame_io::FrameIo> = if let Some(rest) =
             iface.strip_prefix("8812au")
         {
             let ch: u8 = rest.strip_prefix(':').and_then(|s| s.parse().ok()).unwrap_or(6);

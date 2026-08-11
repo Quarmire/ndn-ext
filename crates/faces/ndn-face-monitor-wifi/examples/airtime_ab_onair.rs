@@ -38,8 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use ndn_face_monitor_wifi::measure::frame_airtime_us;
     use ndn_face_monitor_wifi::{
         ChannelBw, FrameIo, InjectFrame, LibUsbRtl88xxBackend, McsDescriptor, RadioControl,
-        TxIntent, WifiRadio,
-    };
+        TxIntent, };
     use ndn_radio_cognition::{
         NameContext, PolicyConfig, RadioCapability, RadioId, TxParams, WifiRate, prefix_hash,
     };

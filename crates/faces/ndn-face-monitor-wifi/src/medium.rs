@@ -64,8 +64,7 @@ use crate::{
     FrameIo, InjectFrame,
     McsDescriptor, MONITOR_MTU, OpenRadio, RadioCapability, RadioKnobs, RadioProfile,
     RadioTime,
-    Reliability, TxIntent, WifiRadio,
-    mcs_phy_rate_bps,
+    Reliability, TxIntent, mcs_phy_rate_bps,
 };
 
 /// Measures **residual** frame loss on the delivered (post-FEC) stream via LP
@@ -213,8 +212,8 @@ impl RadioBearer {
 
     /// A **Wi-Fi** bearer — the same thing, upcasting the (now marker) [`WifiRadio`]
     /// handle to the bearer-agnostic data-plane view. Kept as a convenience for
-    /// callers holding an `Arc<dyn WifiRadio>` from a driver.
-    pub fn wifi(id: RadioId, radio: Arc<dyn WifiRadio>, cap: RadioCapability) -> Self {
+    /// callers holding an `Arc<dyn FrameIo>` from a driver.
+    pub fn wifi(id: RadioId, radio: Arc<dyn FrameIo>, cap: RadioCapability) -> Self {
         Self { id, radio, cap, knobs: None, time: None, profile: None }
     }
 
@@ -1578,7 +1577,7 @@ mod power_actuation_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DEFAULT_SRC, LoopbackMonitorBus, McsPolicy, TxParams, WifiRadio};
+    use crate::{DEFAULT_SRC, LoopbackMonitorBus, McsPolicy, TxParams};
     use ndn_transport::Transport;
     use std::time::Duration;
 
@@ -1668,8 +1667,8 @@ mod tests {
         let bus_b = LoopbackMonitorBus::new();
 
         // Peers: a lone radio on each bus that we inject from / listen on.
-        let peer_a: Arc<dyn WifiRadio> = Arc::new(bus_a.endpoint(10, -50));
-        let peer_b: Arc<dyn WifiRadio> = Arc::new(bus_b.endpoint(20, -50));
+        let peer_a: Arc<dyn FrameIo> = Arc::new(bus_a.endpoint(10, -50));
+        let peer_b: Arc<dyn FrameIo> = Arc::new(bus_b.endpoint(20, -50));
 
         // The medium face: capability 1 on bus A, capability 2 on bus B.
         let bearers = vec![
@@ -1679,7 +1678,7 @@ mod tests {
         let medium = RadioMediumFace::new(FaceId(7), bearers).build();
 
         // RX union: a frame on bus A and a frame on bus B both arrive at the face.
-        let inject = |radio: Arc<dyn WifiRadio>, byte: u8| async move {
+        let inject = |radio: Arc<dyn FrameIo>, byte: u8| async move {
             let frame = InjectFrame {
                 payload: Bytes::from(vec![byte; 16]),
                 tx: TxIntent::CONSERVATIVE,
@@ -1727,7 +1726,7 @@ mod tests {
 
         let bus = LoopbackMonitorBus::new();
         let radio: Arc<dyn FrameIo> = Arc::new(bus.endpoint(1, -50));
-        let peer: Arc<dyn WifiRadio> = Arc::new(bus.endpoint(2, -50));
+        let peer: Arc<dyn FrameIo> = Arc::new(bus.endpoint(2, -50));
         let face_id = FaceId(5);
         let rid = RadioId(0);
 
@@ -1830,7 +1829,7 @@ mod tests {
     #[tokio::test]
     async fn single_bearer_is_the_degenerate_medium() {
         let bus = LoopbackMonitorBus::new();
-        let peer: Arc<dyn WifiRadio> = Arc::new(bus.endpoint(9, -50));
+        let peer: Arc<dyn FrameIo> = Arc::new(bus.endpoint(9, -50));
         let medium = RadioMediumFace::new(
             FaceId(3),
             vec![RadioBearer::new(RadioId(1), Arc::new(bus.endpoint(1, -55)), cap())],

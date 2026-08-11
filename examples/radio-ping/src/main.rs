@@ -22,7 +22,7 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use ndn_app::{EngineAppExt, EngineBuilder};
 use ndn_engine::SignalView; // read radio RSSI/rate from the engine's signal store
-use ndn_face_monitor_wifi::{FaceId, McsDescriptor, MonitorWifiFace, WifiRadio};
+use ndn_face_monitor_wifi::{FaceId, FrameIo, McsDescriptor, MonitorWifiFace};
 use ndn_packet::Name;
 use ndn_security::SecurityProfile;
 use tokio_util::sync::CancellationToken;
@@ -160,7 +160,7 @@ async fn main() -> Result<()> {
 /// Returns a [`WifiRadio`] (not a bare `FrameIo`): `MonitorWifiFace` injects at
 /// an exact resolved 802.11 rate, which rides the `WifiRadio` trait — the
 /// generic `FrameIo` seam no longer names an MCS.
-fn build_backend(args: &[String]) -> Result<Arc<dyn WifiRadio>> {
+fn build_backend(args: &[String]) -> Result<Arc<dyn FrameIo>> {
     if let Some(i) = args.iter().position(|a| a == "--libusb") {
         let _chan_idx = i + 1;
         #[cfg(feature = "libusb")]

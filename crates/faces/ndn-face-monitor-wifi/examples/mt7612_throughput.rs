@@ -7,8 +7,7 @@
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use bytes::Bytes;
     use ndn_face_monitor_wifi::{
-        FrameIo, InjectFrame, McsDescriptor, Mt7612uBackend, TxIntent, WifiRadio,
-    };
+        FrameIo, InjectFrame, McsDescriptor, Mt7612uBackend, TxIntent, };
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 

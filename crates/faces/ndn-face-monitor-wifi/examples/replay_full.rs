@@ -15,8 +15,7 @@
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use bytes::Bytes;
     use ndn_face_monitor_wifi::{
-        FrameIo, InjectFrame, LibUsbRtl88xxBackend, McsDescriptor, TxIntent, WifiRadio,
-    };
+        FrameIo, InjectFrame, LibUsbRtl88xxBackend, McsDescriptor, TxIntent, };
     use std::sync::Arc;
 
     const REGSEQ: &str = include_str!("../golden/opi-usbmon-2026-06-13/init_regseq.txt");
