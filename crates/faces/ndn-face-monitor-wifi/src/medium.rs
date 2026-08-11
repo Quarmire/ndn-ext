@@ -1160,6 +1160,14 @@ impl RunningMedium {
                 .map(Arc::new);
             if let Some(s) = &sched {
                 tracing::info!(target: "monitor-wifi", face = id.0, "{}", s.describe());
+                // **What was this run actually configured with?** (#81) 129 NDN_* variables exist
+                // and nothing recorded which were set, so a measurement could not be reproduced
+                // from its own output and a misspelled name was indistinguishable from an unset
+                // one. Printed once per scheduled face, alongside the schedule it produced.
+                let env = ndn_env::describe();
+                if !env.is_empty() {
+                    tracing::info!(target: "monitor-wifi", face = id.0, "{env}");
+                }
             }
             // A-MSDU coalescer for this bearer (#82 part 2). Mutually exclusive with link-FEC:
             // the FEC bridge already emits a generation's k+R frames back-to-back, and batching on
