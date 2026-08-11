@@ -30,6 +30,38 @@
 pub struct SlotSchedule {
     slot_us: u64,
     slots: u64,
+    /// **Reserved-lane stride** (#93): every `reserved_stride`-th slot is a reserved lane, usable
+    /// only by [`LeaseClass::Latency`] names. `0` = no reserved lanes, which is exactly the
+    /// behaviour every on-air result so far was measured under — so the lease generalises the
+    /// measured design rather than replacing it.
+    reserved_stride: u64,
+}
+
+/// **What a name's traffic needs from the medium** (#93) — the class term of a named airtime lease.
+///
+/// A lease is `(name, class, L base slots)`. Today's fixed slot is exactly `(reserved, L=1)`, which
+/// is why this generalises the measured MAC instead of superseding it.
+///
+/// **Why only two classes here.** The design called for three — latency-critical, urgent-bulk, and
+/// bulk, with urgent-bulk preempting bulk. Latency vs bulk is *derivable*: reserved lanes are a pure
+/// function of the slot index, so every node computes the same map and a bulk holder simply never
+/// takes a reserved lane — no signalling at all. Urgent-bulk vs bulk is not: both live in open
+/// slots, so a bulk holder would have to learn the class of a frame it overheard, and there is
+/// currently no channel for that. The design assumed the 802.11 Duration/NAV field would carry the
+/// lease for free; **#96 measured that stock 802.11 ignores our NAV**, which removes that channel
+/// and with it the free announcement the third class depended on.
+///
+/// The remaining candidate is Tier-0: `addr1‖addr2` already carries the name's prefix-set filter, so
+/// a reserved class prefix could be tested by any receiver at zero extra frame bits. That is the
+/// path to the third class; it is not implemented, and inventing a class that nothing can observe
+/// would be another decided-but-unactuated field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LeaseClass {
+    /// Reserved lane, `L = 1`, never preempted and never preempting. Alarms, control, time beacons —
+    /// anything whose access delay must stay bounded no matter how much bulk traffic is queued.
+    Latency,
+    /// Open slots, `L` up to the lease maximum, yields at any base-slot boundary. Bulk transfer.
+    Bulk,
 }
 
 /// **On-air time for one 802.11 frame**, microseconds — payload bits at the PHY rate, plus the
@@ -62,7 +94,104 @@ impl SlotSchedule {
     /// frame's on-air time plus a guard band (sized from the PHY airtime + the clock's residual
     /// jitter); `slots` is the superframe length (the per-name access period). Both are clamped to ≥1.
     pub fn new(slot_us: u64, slots: u64) -> Self {
-        Self { slot_us: slot_us.max(1), slots: slots.max(1) }
+        Self { slot_us: slot_us.max(1), slots: slots.max(1), reserved_stride: 0 }
+    }
+
+    /// **Reserve every `stride`-th slot as a latency lane** (#93). `0` (the default) reserves
+    /// nothing and reproduces the schedule every on-air result was measured under.
+    ///
+    /// Clamped so at least one open slot always remains: a schedule with no open slots would starve
+    /// bulk traffic completely, and a stride of 1 asks for exactly that.
+    pub fn with_reserved_stride(mut self, stride: u64) -> Self {
+        self.reserved_stride = if stride < 2 { 0 } else { stride };
+        self
+    }
+
+    /// **Is slot `k` a reserved latency lane?** A pure function of the index, so every node computes
+    /// the same map with no announcement — which is what lets a bulk holder skip reserved lanes it
+    /// was never told about. That property is the whole reason the lease needs no signalling, and it
+    /// is the same property that makes the computed token work.
+    pub fn is_reserved(&self, slot_idx: u64) -> bool {
+        self.reserved_stride >= 2 && slot_idx % self.reserved_stride == 0
+    }
+
+    /// How many slots per superframe are reserved lanes.
+    pub fn reserved_slots(&self) -> u64 {
+        if self.reserved_stride < 2 { 0 } else { self.slots.div_ceil(self.reserved_stride) }
+    }
+
+    /// How many slots per superframe are open to bulk leases.
+    pub fn open_slots(&self) -> u64 {
+        self.slots - self.reserved_slots()
+    }
+
+    /// **Which slot does this name own, in its class?** (#93)
+    ///
+    /// A `Latency` name is placed among the *reserved* lanes and a `Bulk` name among the *open*
+    /// slots, so the two classes cannot collide by construction — rather than by anyone yielding.
+    /// With no reserved lanes configured this is exactly `owner_slot`, so the generalisation is
+    /// behaviour-preserving at the default.
+    pub fn owner_slot_in(&self, prefix_hash: u64, class: LeaseClass) -> u64 {
+        if self.reserved_stride < 2 {
+            return self.owner_slot(prefix_hash);
+        }
+        match class {
+            LeaseClass::Latency => {
+                let n = self.reserved_slots().max(1);
+                (prefix_hash % n) * self.reserved_stride
+            }
+            LeaseClass::Bulk => {
+                let n = self.open_slots().max(1);
+                // Walk the open slots in order and take the nth — the reserved lanes are punched out
+                // of the index space, so a bulk name can never land on one.
+                let mut nth = prefix_hash % n;
+                for k in 0..self.slots {
+                    if !self.is_reserved(k) {
+                        if nth == 0 {
+                            return k;
+                        }
+                        nth -= 1;
+                    }
+                }
+                self.slots - 1
+            }
+        }
+    }
+
+    /// **How many consecutive base slots may this class hold?** (#93)
+    ///
+    /// `Latency` is always 1: a reserved lane exists to bound someone else's access delay, so
+    /// holding it longer would defeat the thing it is for. `Bulk` may hold `l_max`, but only across
+    /// *open* slots and only until a boundary check says otherwise — the lease is a sequence of base
+    /// slots, not one burst, and the boundary between them is where the holder is off-air and can be
+    /// preempted. Half-duplex forces that gap anyway; the lease spends it.
+    pub fn lease_slots(&self, class: LeaseClass, l_max: u64) -> u64 {
+        match class {
+            LeaseClass::Latency => 1,
+            LeaseClass::Bulk => l_max.max(1),
+        }
+    }
+
+    /// **The deadline of a lease taken at `now_us`** — the end of the last base slot it covers,
+    /// stopping early at the first reserved lane.
+    ///
+    /// Stopping at the reserved lane is the self-enforcement #96 forced on this design. The lease was
+    /// meant to be announced in the 802.11 Duration/NAV field, which stock hardware turns out to
+    /// ignore, so nothing external will hold the medium for us and nothing external will tell us to
+    /// stop. Both ends are computed instead: we take only what the shared map says is ours to take.
+    pub fn lease_deadline_us(&self, now_us: u64, class: LeaseClass, l_max: u64) -> u64 {
+        let start = self.slot_start_us(now_us);
+        let first = self.current_slot(now_us);
+        let want = self.lease_slots(class, l_max);
+        let mut held = 1;
+        while held < want {
+            let next = (first + held) % self.slots;
+            if self.is_reserved(next) {
+                break; // never squat a latency lane, even mid-lease
+            }
+            held += 1;
+        }
+        start + held * self.slot_us
     }
 
     /// Size a slot from the PHY **airtime** plus a **guard band**, over `slots` slots. The guard only
@@ -391,4 +520,89 @@ mod tests {
         );
     }
 
+}
+
+/// **The named airtime lease** (#93) — the properties the design rests on, tested rather than argued.
+#[cfg(test)]
+mod lease_tests {
+    use super::*;
+
+    /// **The property the whole primitive exists for**: a latency name's access delay is bounded by
+    /// the superframe *no matter how much bulk traffic is queued*, because a bulk lease can never
+    /// occupy a reserved lane. Not by yielding, not by preemption — by construction, since the two
+    /// classes are placed in disjoint slot sets that every node computes identically.
+    #[test]
+    fn a_bulk_lease_can_never_occupy_a_latency_lane() {
+        let s = SlotSchedule::new(1000, 8).with_reserved_stride(4); // lanes 0 and 4
+        assert_eq!(s.reserved_slots(), 2);
+        assert_eq!(s.open_slots(), 6);
+        assert!(s.is_reserved(0) && s.is_reserved(4));
+        assert!(!s.is_reserved(1) && !s.is_reserved(7));
+
+        // No bulk name, for any hash, lands on a reserved lane.
+        for h in 0..2_000u64 {
+            let slot = s.owner_slot_in(h, LeaseClass::Bulk);
+            assert!(!s.is_reserved(slot), "bulk name {h} landed on reserved lane {slot}");
+        }
+        // Every latency name lands on one.
+        for h in 0..2_000u64 {
+            let slot = s.owner_slot_in(h, LeaseClass::Latency);
+            assert!(s.is_reserved(slot), "latency name {h} landed on open slot {slot}");
+        }
+    }
+
+    /// A lease is a *sequence* of base slots and it stops at the first reserved lane — even
+    /// mid-lease. This is the self-enforcement #96 forced: stock 802.11 ignores the Duration/NAV
+    /// field, so nothing external holds the medium for us and nothing external tells us to stop.
+    /// Both ends are computed from the shared map instead.
+    #[test]
+    fn a_lease_stops_at_the_next_reserved_lane() {
+        let s = SlotSchedule::new(1000, 8).with_reserved_stride(4); // lanes 0, 4
+
+        // Starting in slot 1 with L=8 requested: slots 1,2,3 are open, 4 is reserved -> 3 slots.
+        let now = 1 * 1000 + 10; // inside slot 1
+        assert_eq!(s.current_slot(now), 1);
+        assert_eq!(s.lease_deadline_us(now, LeaseClass::Bulk, 8), 1000 + 3 * 1000);
+
+        // Starting in slot 5: 5,6,7 open, then wraps to 0 which is reserved -> 3 slots.
+        let now = 5 * 1000 + 10;
+        assert_eq!(s.lease_deadline_us(now, LeaseClass::Bulk, 8), 5000 + 3 * 1000);
+
+        // Latency is always exactly one slot: a reserved lane exists to bound someone else's delay,
+        // so holding it longer defeats the thing it is for.
+        let now = 4 * 1000 + 10;
+        assert_eq!(s.lease_deadline_us(now, LeaseClass::Latency, 8), 4000 + 1000);
+    }
+
+    /// **The generalisation must be behaviour-preserving at the default**, or every on-air number
+    /// measured so far stops applying to the shipping code. With no reserved lanes a lease of 1 is
+    /// exactly today's fixed slot, and class placement collapses to plain `owner_slot`.
+    #[test]
+    fn with_no_reserved_lanes_this_is_exactly_the_measured_schedule() {
+        let s = SlotSchedule::new(20_000, 8); // the on-air schedule, unchanged
+        assert_eq!(s.reserved_slots(), 0);
+        assert_eq!(s.open_slots(), 8);
+        for h in 0..1_000u64 {
+            assert_eq!(s.owner_slot_in(h, LeaseClass::Bulk), s.owner_slot(h));
+            assert_eq!(s.owner_slot_in(h, LeaseClass::Latency), s.owner_slot(h));
+            assert!(!s.is_reserved(s.owner_slot(h)));
+        }
+        // L=1 reproduces the single-slot hold the +119% claim result was measured with.
+        let now = 3 * 20_000 + 5;
+        assert_eq!(s.lease_deadline_us(now, LeaseClass::Bulk, 1), 3 * 20_000 + 20_000);
+    }
+
+    /// A stride of 1 would reserve every slot and starve bulk entirely; it is clamped to "none".
+    #[test]
+    fn a_degenerate_stride_cannot_starve_bulk() {
+        for stride in [0, 1] {
+            let s = SlotSchedule::new(1000, 8).with_reserved_stride(stride);
+            assert_eq!(s.reserved_slots(), 0, "stride {stride} must reserve nothing");
+            assert_eq!(s.open_slots(), 8);
+        }
+        // And the smallest real stride still leaves bulk half the medium.
+        let s = SlotSchedule::new(1000, 8).with_reserved_stride(2);
+        assert_eq!(s.reserved_slots(), 4);
+        assert_eq!(s.open_slots(), 4);
+    }
 }

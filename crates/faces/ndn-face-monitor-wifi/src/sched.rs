@@ -33,7 +33,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ndn_radio_cognition::{HopSchedule, SlotSchedule, prefix_hash, wifi_airtime_us};
+use ndn_radio_cognition::{LeaseClass, HopSchedule, SlotSchedule, prefix_hash, wifi_airtime_us};
 
 use crate::radio::{Bandwidth, RadioKnobs};
 use ndn_frame_io::LinkStamp;
@@ -201,10 +201,23 @@ pub struct FaceScheduler {
     /// the jitter again, so a burst could not use the idle slot it had just won. Holding is bounded
     /// by the slot and surrendered the moment the owner speaks.
     hold_slot_start: AtomicU64,
+    /// **The lease deadline** (#93), common-view µs: how long the current hold runs. A hold used to
+    /// be exactly one slot; a lease is `L` consecutive base slots, stopping at the first reserved
+    /// lane. `0` = no lease.
+    ///
+    /// The deadline is *computed*, not announced. The design had the lease ride the 802.11
+    /// Duration/NAV field, and #96 measured that stock 802.11 ignores it — so nothing external holds
+    /// the medium for us and nothing external tells us to stop. Both ends come from the shared map.
+    lease_until: AtomicU64,
     /// Claim a slot whose owner we have never heard? Default **false**: an unheard owner is exactly the
     /// hidden-terminal case, and the safe reading of silence is "I cannot tell". `NDN_SCHED_CLAIM_UNKNOWN=1`
     /// opts into the throughput-first reading (claim anything idle), which is what the code did before.
     claim_unknown: bool,
+    /// **Maximum base slots one lease may hold** (#93), from `NDN_SCHED_LEASE`. Default **1**, which
+    /// is exactly the single-slot hold the +119% claim result was measured with — the lease
+    /// generalises that schedule rather than replacing it, so the measurement still describes the
+    /// shipping default.
+    lease_max: u64,
     /// Monotonic base for the hardware clock's host reference and the master's reference timeline.
     base: Instant,
 }
@@ -264,7 +277,13 @@ impl FaceScheduler {
             heard_by_slot: (0..slot_count).map(|_| AtomicU64::new(0)).collect(),
             deferred_by_slot: (0..slot_count).map(|_| AtomicU32::new(0)).collect(),
             hold_slot_start: AtomicU64::new(u64::MAX),
+            lease_until: AtomicU64::new(0),
             claim_unknown: std::env::var("NDN_SCHED_CLAIM_UNKNOWN").is_ok(),
+            lease_max: std::env::var("NDN_SCHED_LEASE")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(1)
+                .max(1),
             rate: None,
             base: Instant::now(),
         })
@@ -561,14 +580,36 @@ impl FaceScheduler {
         now: u64,
         airtime: u64,
     ) -> HoldStatus {
-        if self.hold_slot_start.load(Ordering::Relaxed) != slot_start {
-            return HoldStatus::None; // no hold on THIS slot (a stale hold never carries forward)
+        let lease_until = self.lease_until.load(Ordering::Relaxed);
+        let held = self.hold_slot_start.load(Ordering::Relaxed);
+        // **A lease spans several base slots** (#93). `held` is the slot the lease STARTED in, so a
+        // hold no longer ends merely because the slot index moved on — it ends at the computed
+        // deadline. With the default `lease_max = 1` the deadline is the end of the starting slot
+        // and this is exactly the single-slot hold #95 shipped and the +119% run measured.
+        if held == u64::MAX || now >= lease_until {
+            return HoldStatus::None;
+        }
+        if slot_start > held && slot_start >= lease_until {
+            return HoldStatus::None; // the lease expired at a boundary we have already passed
         }
         if self.last_domain_rx.load(Ordering::Relaxed) >= slot_start {
-            return HoldStatus::Ended; // the owner spoke — yield
+            // The owner of the slot we are *currently* in has spoken. A guest yields — the
+            // owner-return contract, checked per base slot rather than once per lease, which is what
+            // makes a multi-slot lease safe to grant at all.
+            return HoldStatus::Ended;
+        }
+        // **Never carry a lease into a reserved lane** (#93). Checked here as well as in
+        // `lease_deadline_us` because the deadline was computed when the lease was taken and the
+        // superframe has advanced since; a lane that a lease must not occupy is the one guarantee
+        // latency traffic has, and #96 removed any possibility of being *told* to stop.
+        if slot.is_reserved(slot.current_slot(now)) {
+            return HoldStatus::Ended;
         }
         if !slot.fits_now(now, airtime) {
-            return HoldStatus::Ended; // no room left in the slot we hold
+            // No room in THIS base slot. If the lease still has slots left, the frame waits for the
+            // next boundary rather than ending the lease — the gap between base slots is exactly the
+            // off-air moment the design spends on preemption.
+            return HoldStatus::Ended;
         }
         HoldStatus::Continue
     }
@@ -606,6 +647,7 @@ impl FaceScheduler {
             }
             HoldStatus::Ended => {
                 self.hold_slot_start.store(u64::MAX, Ordering::Relaxed);
+                self.lease_until.store(0, Ordering::Relaxed);
             }
             HoldStatus::None => {}
         }
@@ -635,7 +677,12 @@ impl FaceScheduler {
         }
         // Won it. Hold for the rest of THIS slot so a burst can use what we won, under the
         // owner-return contract checked on the next frame.
+        // **Take a lease, not a slot** (#93): L base slots, stopping at the first reserved lane.
         self.hold_slot_start.store(slot_start, Ordering::Relaxed);
+        self.lease_until.store(
+            slot.lease_deadline_us(now, LeaseClass::Bulk, self.lease_max),
+            Ordering::Relaxed,
+        );
         self.claim_wins.fetch_add(1, Ordering::Relaxed);
         self.note_sent(hash);
         true
@@ -930,7 +977,13 @@ fn name_components(name_tlv: &[u8], depth: usize) -> Vec<&[u8]> {
 ///
 /// `mtu` and `clock` are the sizing inputs; see [`derive_slot_us`].
 fn parse_slot(s: &str, mtu: usize, clock: ClockSource) -> Option<SlotSchedule> {
-    match s.split_once(':') {
+    // **Reserved latency lanes** (#93), `NDN_SCHED_RESERVE=<stride>`; default 0 = none, which is the
+    // schedule every on-air result was measured under.
+    let stride: u64 = std::env::var("NDN_SCHED_RESERVE")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
+    let sched = match s.split_once(':') {
         Some((n, us)) => {
             let n: u64 = n.trim().parse().ok()?;
             let us: u64 = us.trim().parse().ok()?;
@@ -940,7 +993,8 @@ fn parse_slot(s: &str, mtu: usize, clock: ClockSource) -> Option<SlotSchedule> {
             let n: u64 = s.trim().parse().ok()?;
             Some(SlotSchedule::from_airtime(mtu_airtime_us(mtu), clock.guard_us(), n))
         }
-    }
+    };
+    sched.map(|x| x.with_reserved_stride(stride))
 }
 
 /// Airtime of a **full-MTU frame at the basic broadcast rate** — the slot's payload term.
@@ -1018,7 +1072,9 @@ mod tests {
             heard_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
             deferred_by_slot: (0..8).map(|_| super::AtomicU32::new(0)).collect(),
             hold_slot_start: super::AtomicU64::new(u64::MAX),
+            lease_until: super::AtomicU64::new(0),
             claim_unknown: false,
+            lease_max: 1,
             rate: None,
             base: super::Instant::now(),
         };
@@ -1058,7 +1114,9 @@ mod tests {
             heard_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
             deferred_by_slot: (0..8).map(|_| super::AtomicU32::new(0)).collect(),
             hold_slot_start: super::AtomicU64::new(u64::MAX),
+            lease_until: super::AtomicU64::new(0),
             claim_unknown: false,
+            lease_max: 1,
             rate: None,
             base: super::Instant::now(),
         };
@@ -1134,7 +1192,9 @@ mod tests {
             heard_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
             deferred_by_slot: (0..8).map(|_| super::AtomicU32::new(0)).collect(),
             hold_slot_start: super::AtomicU64::new(u64::MAX),
+            lease_until: super::AtomicU64::new(0),
             claim_unknown: false,
+            lease_max: 1,
             rate: None,
             base: super::Instant::now(),
         };
@@ -1287,7 +1347,9 @@ mod tests {
             heard_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
             deferred_by_slot: (0..8).map(|_| super::AtomicU32::new(0)).collect(),
             hold_slot_start: super::AtomicU64::new(u64::MAX),
+            lease_until: super::AtomicU64::new(0),
             claim_unknown: false,
+            lease_max: 1,
             rate: None,
             base: super::Instant::now(),
         };
@@ -1523,6 +1585,72 @@ mod tests {
         );
     }
 
+    /// **A multi-slot lease holds across base slots and releases at the right ones** (#93).
+    ///
+    /// The lease generalises the single-slot hold: `L` consecutive base slots for one name, with the
+    /// holder re-evaluating at every boundary. Three things end it, and all three are *computed* —
+    /// which is the redesign #96 forced. The original plan announced the lease in the 802.11
+    /// Duration/NAV field; stock 802.11 ignores it, so nothing external reserves the medium for us
+    /// and nothing external tells us to stop. Both ends come from the shared map instead.
+    #[test]
+    fn a_lease_spans_base_slots_and_yields_at_a_reserved_lane() {
+        let mut s = mk_claim_sched();
+        s.lease_max = 4;
+        // 8 x 3 ms with lanes 0 and 4 reserved for latency traffic.
+        s.slot = Some(super::SlotSchedule::new(3000, 8).with_reserved_stride(4));
+        let slot = s.slot.unwrap();
+        let air = wifi_airtime_us(200, Some(7));
+
+        // Take a lease starting in open slot 1. Slots 1,2,3 are open; slot 4 is reserved, so the
+        // lease is 3 base slots — the geometry stops it, nobody has to signal.
+        let start = slot.slot_us(); // slot 1
+        let deadline = slot.lease_deadline_us(start + 10, super::LeaseClass::Bulk, s.lease_max);
+        assert_eq!(deadline, start + 3 * slot.slot_us(), "1,2,3 open then 4 reserved");
+        s.hold_slot_start.store(start, super::Ordering::Relaxed);
+        s.lease_until.store(deadline, super::Ordering::Relaxed);
+        s.last_domain_rx.store(start - 5, super::Ordering::Relaxed);
+
+        // **It survives the base-slot boundary** — the thing a one-slot hold could not do. This is
+        // what makes a bulk transfer stop paying the CCLF election on every frame.
+        let in_slot_2 = start + slot.slot_us() + 10;
+        assert_eq!(
+            s.hold_status(&slot, slot.slot_start_us(in_slot_2), in_slot_2, air),
+            HoldStatus::Continue,
+            "a lease of 4 must carry into the next base slot; a single-slot hold stopped here"
+        );
+
+        // **The owner-return contract still applies per base slot**, not once per lease — otherwise
+        // a long lease would be exactly the theft the one-slot rule was written to prevent.
+        s.last_domain_rx.store(in_slot_2, super::Ordering::Relaxed);
+        assert_eq!(
+            s.hold_status(&slot, slot.slot_start_us(in_slot_2), in_slot_2 + 50, air),
+            HoldStatus::Ended,
+            "hearing this base slot's owner ends the lease immediately"
+        );
+
+        // **A reserved lane always wins**, even mid-lease and even in silence. This is the one
+        // guarantee latency traffic has, and with NAV unavailable it is enforced by every node
+        // computing the same map rather than by anyone being told.
+        s.last_domain_rx.store(start - 5, super::Ordering::Relaxed);
+        let in_lane_4 = 4 * slot.slot_us() + 10;
+        s.lease_until.store(in_lane_4 + slot.slot_us(), super::Ordering::Relaxed); // pretend it ran on
+        assert!(slot.is_reserved(slot.current_slot(in_lane_4)), "fixture: slot 4 is a lane");
+        assert_eq!(
+            s.hold_status(&slot, slot.slot_start_us(in_lane_4), in_lane_4, air),
+            HoldStatus::Ended,
+            "a bulk lease must never occupy a reserved lane, silent or not"
+        );
+
+        // And past the deadline there is no lease at all.
+        s.lease_until.store(deadline, super::Ordering::Relaxed);
+        let past = deadline + 10;
+        assert_eq!(
+            s.hold_status(&slot, slot.slot_start_us(past), past, air),
+            HoldStatus::None,
+            "the lease expires on its own; nothing has to revoke it"
+        );
+    }
+
     /// A claimable scheduler on an arbitrary `slots:slot_us` spec.
     fn mk_claim_sched_slots(spec: &str) -> FaceScheduler {
         let mut s = mk_claim_sched();
@@ -1568,7 +1696,9 @@ mod tests {
             heard_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
             deferred_by_slot: (0..8).map(|_| super::AtomicU32::new(0)).collect(),
             hold_slot_start: super::AtomicU64::new(u64::MAX),
+            lease_until: super::AtomicU64::new(0),
             claim_unknown: false,
+            lease_max: 1,
             rate: None,
             base: super::Instant::now(),
         }
@@ -1647,8 +1777,10 @@ mod tests {
         // No claim yet ⇒ nothing to continue.
         assert_eq!(s.hold_status(&slot, start, start + 10, air), HoldStatus::None);
 
-        // Win the slot.
+        // Win the slot. A win now takes a *lease*; with the default `lease_max = 1` that lease is
+        // exactly this one base slot, which is the behaviour #95 shipped and the +119% run measured.
         s.hold_slot_start.store(start, super::Ordering::Relaxed);
+        s.lease_until.store(start + slot.slot_us(), super::Ordering::Relaxed);
         s.last_domain_rx.store(start - 5, super::Ordering::Relaxed); // last heard BEFORE this slot began
         assert_eq!(
             s.hold_status(&slot, start, start + 10, air),
@@ -1674,7 +1806,7 @@ mod tests {
             "no room for the frame ⇒ stop, do not transmit across the boundary"
         );
 
-        // A hold never carries into a later slot — the check is equality with THIS slot's start.
+        // A one-slot lease never carries into a later slot: the deadline is this slot's end.
         let next = start + slot.slot_us();
         assert_eq!(
             s.hold_status(&slot, next, next + 10, air),
