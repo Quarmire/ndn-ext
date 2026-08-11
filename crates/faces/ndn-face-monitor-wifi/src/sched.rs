@@ -235,6 +235,49 @@ impl FaceScheduler {
         })
     }
 
+    /// **Drop a hop schedule the radio cannot actually serve** (#97/#98).
+    ///
+    /// `set_channel` on the Wi-Fi monitor parts is a ~16 ms blocking call. Against a short dwell the
+    /// radio spends most of its life retuning, and what looks like frequency diversity is thrashing:
+    /// frames miss their channel, the schedule's own epochs slip, and every measurement taken over it
+    /// is meaningless. That fact was recorded in a comment and acted on by nothing — the face hopped
+    /// regardless. Now the capability carries the measured retune cost and this refuses the
+    /// configuration, loudly, rather than producing plausible garbage.
+    ///
+    /// An *unmeasured* radio ([`RadioCapability::retune_us`] = `None`) is also refused. That is the
+    /// conservative reading and the one consistent with the rest of this layer: we do not know what
+    /// hopping costs here, so we do not silently pay it.
+    #[must_use]
+    pub fn vet_hop(mut self, cap: &ndn_radio_cognition::RadioCapability) -> Self {
+        let Some(hop) = &self.hop else { return self };
+        let dwell = hop.dwell_us();
+        match cap.can_hop(dwell) {
+            Some(true) => self,
+            Some(false) => {
+                let pct = cap.retune_overhead(dwell).unwrap_or(1.0) * 100.0;
+                tracing::warn!(
+                    target: "monitor-wifi",
+                    dwell_us = dwell,
+                    retune_us = cap.retune_us,
+                    "FHSS disabled: retuning would consume {pct:.0}% of each dwell on this radio. \
+                     Lengthen NDN_SCHED_HOP's dwell or use a radio with a measured faster retune."
+                );
+                self.hop = None;
+                self
+            }
+            None => {
+                tracing::warn!(
+                    target: "monitor-wifi",
+                    dwell_us = dwell,
+                    "FHSS disabled: this radio's retune cost has never been measured, so the hop \
+                     schedule cannot be costed. Measure it and set RadioCapability::retune_us."
+                );
+                self.hop = None;
+                self
+            }
+        }
+    }
+
     /// Whether this node is the clock master (broadcasts the time-beacon). The face spawns the beacon
     /// task iff this is true.
     pub fn is_master(&self) -> bool {
@@ -1031,6 +1074,41 @@ mod tests {
         // After ingesting a reference the common-view clock reads that timeline.
         sched.ingest_time_ref(9_000_000);
         assert!(sched.now_us() >= 9_000_000);
+    }
+
+    /// **A hop schedule the radio cannot serve must be refused, not attempted** (#97/#98).
+    ///
+    /// `set_channel` on the Wi-Fi monitor parts is ~16 ms. Hopping on a 20 ms dwell means ~80% of
+    /// every dwell is spent deaf, which is not frequency diversity — it is thrashing that yields
+    /// plausible-looking but meaningless numbers. The fact was recorded in a comment and acted on by
+    /// nothing; `RadioCapability.agile` (the field that should have carried it) was consumed by
+    /// nothing AND backwards, reading `true` for exactly these radios.
+    #[test]
+    fn a_hop_the_radio_cannot_serve_is_refused() {
+        use ndn_radio_cognition::RadioCapability;
+        let wifi = RadioCapability::wifi_monitor_5ghz(vec![36, 40, 44]);
+        assert_eq!(wifi.retune_us, Some(16_000), "the measured ~16 ms set_channel");
+
+        // A 20 ms dwell against a 16 ms retune: refused, and the hop schedule is gone.
+        let fast = FaceScheduler { hop: parse_hop("36,40,44:20000"), ..mk_claim_sched() };
+        assert!(fast.hop.is_some(), "fixture check: the schedule exists before vetting");
+        assert!(fast.vet_hop(&wifi).hop.is_none(), "a 16 ms retune cannot serve a 20 ms dwell");
+
+        // A 10 s dwell: 0.16% overhead, allowed. The point of a measured number over a boolean —
+        // the same radio is un-hoppable at 20 ms and perfectly hoppable at 10 s.
+        let slow = FaceScheduler { hop: parse_hop("36,40,44:10000000"), ..mk_claim_sched() };
+        assert!(slow.vet_hop(&wifi).hop.is_some(), "16 ms against a 10 s dwell is free");
+
+        // Never measured ⇒ refused. We do not silently pay an unknown cost.
+        let lora = RadioCapability::lora(vec![0]);
+        assert_eq!(lora.retune_us, None);
+        let unknown = FaceScheduler { hop: parse_hop("36,40,44:10000000"), ..mk_claim_sched() };
+        assert!(unknown.vet_hop(&lora).hop.is_none(), "an unmeasured retune cost is not a fast one");
+
+        assert_eq!(wifi.can_hop(20_000), Some(false));
+        assert_eq!(wifi.can_hop(10_000_000), Some(true));
+        assert_eq!(lora.can_hop(20_000), None, "unmeasured answers 'I cannot say', never a guess");
+        assert!(wifi.retune_overhead(20_000).unwrap() > 0.79, "80% of the dwell is retune");
     }
 
     #[test]

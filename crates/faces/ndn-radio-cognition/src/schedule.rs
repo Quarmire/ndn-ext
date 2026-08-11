@@ -176,6 +176,12 @@ impl HopSchedule {
         Self { classes, dwell_us: dwell_us.max(1) }
     }
 
+    /// How long this schedule sits on each channel (µs) — read by
+    /// `FaceScheduler::vet_hop` to cost the hop against the radio's measured retune time.
+    pub fn dwell_us(&self) -> u64 {
+        self.dwell_us
+    }
+
     /// The common-view hop epoch at `now_us`.
     pub fn epoch(&self, now_us: u64) -> u64 {
         now_us / self.dwell_us

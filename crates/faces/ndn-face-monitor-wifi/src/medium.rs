@@ -1151,6 +1151,12 @@ impl RunningMedium {
                         None => s,
                     }
                 })
+                // **Refuse a hop schedule this radio cannot serve** (#97/#98). `set_channel` on the
+                // Wi-Fi monitor parts is a ~16 ms blocking call; against a short dwell the radio
+                // spends most of its life retuning and the "schedule" is thrashing, not frequency
+                // diversity. That was known and written in a comment; now the capability carries the
+                // measured cost and the face acts on it instead of hopping anyway.
+                .map(|s| s.vet_hop(&b.cap))
                 .map(Arc::new);
             if let Some(s) = &sched {
                 tracing::info!(target: "monitor-wifi", face = id.0, "{}", s.describe());
