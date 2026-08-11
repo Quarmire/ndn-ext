@@ -62,6 +62,34 @@ enum ClockSource {
     CommonView,
 }
 
+impl ClockSource {
+    /// **The slot guard band this clock earns**, microseconds — how far apart two nodes' idea of a
+    /// slot boundary can drift, plus margin.
+    ///
+    /// This is the payoff #74 measured and nothing spent (#85/#86). The hardware TSF common-view
+    /// lands at ~0.4 µs against the software clock's ~55 µs — a 135× improvement that changed no
+    /// schedule anywhere, because `slot_us` was an env constant. A guard sized from the clock is
+    /// what turns that measurement into shorter slots, more slots per superframe, and proportionally
+    /// lower per-name access latency, which is the entire argument for having built the clock.
+    ///
+    /// Derived from the *configured* source, never from the instantaneous measured residual: every
+    /// node must compute the same slot map, and a runtime-varying guard would have two nodes
+    /// disagree about where slots begin. Configuration is uniform by construction; a live
+    /// measurement is not. For the same reason `CommonView` takes the conservative software figure —
+    /// a node that has not yet heard a hardware-stamped beacon is still on the software path.
+    pub fn guard_us(self) -> u64 {
+        match self {
+            // NTP-disciplined hosts on a LAN: sub-millisecond, but not by much, and it wanders.
+            ClockSource::Wall => 1_000,
+            // Software beacon: ~55 µs residual measured (#41), ×4 margin.
+            ClockSource::CommonView => 200,
+            // Hardware TSF: ~0.4 µs measured (#74). 10 µs is ~25× margin and still 2000× tighter
+            // than the wall clock — this is the number that makes µs-granular slots real.
+            ClockSource::Hardware => 10,
+        }
+    }
+}
+
 /// The 3-byte tag that marks a [`FaceScheduler`] time-beacon on the wire, chosen to not collide with
 /// an NDN packet's first byte (Interest `0x05` / Data `0x06` / LP `0x64`). Followed by the master's
 /// monotonic reference time in microseconds, 8 bytes little-endian.
@@ -184,8 +212,20 @@ pub struct FaceScheduler {
 impl FaceScheduler {
     /// Build from the `NDN_SCHED_*` environment. Returns `None` when neither slot nor hop is
     /// configured — the caller then leaves the send path untouched.
-    pub fn from_env(knobs: Option<std::sync::Arc<dyn RadioKnobs>>, bw: Bandwidth) -> Option<Self> {
-        let slot = std::env::var("NDN_SCHED_SLOT").ok().and_then(|s| parse_slot(&s));
+    pub fn from_env(
+        knobs: Option<std::sync::Arc<dyn RadioKnobs>>,
+        bw: Bandwidth,
+        mtu: usize,
+    ) -> Option<Self> {
+        // Read first: the slot width is DERIVED from the clock's guard (#85/#86), so the clock
+        // source has to be known before the schedule can be sized.
+        let clock_source = match std::env::var("NDN_SCHED_CLOCK").ok().as_deref() {
+            Some("hw") | Some("hardware") => ClockSource::Hardware,
+            Some("cv") | Some("common-view") => ClockSource::CommonView,
+            _ => ClockSource::Wall,
+        };
+        let slot =
+            std::env::var("NDN_SCHED_SLOT").ok().and_then(|s| parse_slot(&s, mtu, clock_source));
         let hop = std::env::var("NDN_SCHED_HOP").ok().and_then(|s| parse_hop(&s));
         if slot.is_none() && hop.is_none() {
             return None;
@@ -195,11 +235,6 @@ impl FaceScheduler {
             .and_then(|s| s.trim().parse::<usize>().ok())
             .unwrap_or(1)
             .max(1);
-        let clock_source = match std::env::var("NDN_SCHED_CLOCK").ok().as_deref() {
-            Some("hw") | Some("hardware") => ClockSource::Hardware,
-            Some("cv") | Some("common-view") => ClockSource::CommonView,
-            _ => ClockSource::Wall,
-        };
         let master = std::env::var("NDN_SCHED_MASTER").ok().as_deref() == Some("1");
         let claimable = std::env::var("NDN_SCHED_CLAIM").ok().as_deref() == Some("1");
         // Our node id for the network-reference election (#75): lowest id wins. Default u64::MAX = "never
@@ -368,7 +403,14 @@ impl FaceScheduler {
     pub fn describe(&self) -> String {
         let mut parts = Vec::new();
         if let Some(s) = &self.slot {
-            parts.push(format!("slot(N={}, {}µs)", s.slots(), s.slot_us()));
+            // Show the guard the clock earned alongside the slot: it is the number that says whether
+            // this schedule is paying for a wall clock (1 ms) or spending #74's hardware TSF (10 µs).
+            parts.push(format!(
+                "slot(N={}, {}µs, guard {}µs)",
+                s.slots(),
+                s.slot_us(),
+                self.clock_source.guard_us()
+            ));
         }
         if let Some(h) = &self.hop {
             parts.push(format!("hop({:?}, dwell {}µs)", h.classes(), h.dwell_remaining_us(0)));
@@ -876,11 +918,40 @@ fn name_components(name_tlv: &[u8], depth: usize) -> Vec<&[u8]> {
 }
 
 /// `NDN_SCHED_SLOT=N:slot_us`.
-fn parse_slot(s: &str) -> Option<SlotSchedule> {
-    let (n, us) = s.split_once(':')?;
-    let n: u64 = n.trim().parse().ok()?;
-    let us: u64 = us.trim().parse().ok()?;
-    Some(SlotSchedule::new(us, n))
+/// `NDN_SCHED_SLOT=<slots>` (derive the slot width) or `<slots>:<slot_us>` (state it).
+///
+/// **The derived form is the one to use** (#85/#86). A slot must hold one frame's airtime plus a
+/// guard for the clock's alignment error, and both of those are quantities the code already knows —
+/// yet `slot_us` was a hand-written env constant, and [`SlotSchedule::from_airtime`], which exists
+/// precisely to compute it, had zero callers. A hand-picked slot is either too small (frames
+/// overrun the boundary into another name's turn, the collision the MAC exists to prevent) or too
+/// large (airtime wasted on empty guard, which is what the 20 ms slots in every experiment so far
+/// were doing).
+///
+/// `mtu` and `clock` are the sizing inputs; see [`derive_slot_us`].
+fn parse_slot(s: &str, mtu: usize, clock: ClockSource) -> Option<SlotSchedule> {
+    match s.split_once(':') {
+        Some((n, us)) => {
+            let n: u64 = n.trim().parse().ok()?;
+            let us: u64 = us.trim().parse().ok()?;
+            Some(SlotSchedule::new(us, n))
+        }
+        None => {
+            let n: u64 = s.trim().parse().ok()?;
+            Some(SlotSchedule::from_airtime(mtu_airtime_us(mtu), clock.guard_us(), n))
+        }
+    }
+}
+
+/// Airtime of a **full-MTU frame at the basic broadcast rate** — the slot's payload term.
+///
+/// Deliberately not the cognition-decided rate. The slot map must come out identical at every node
+/// or the MAC does not function (measured: both nodes computing the same map is what made the gate
+/// work at all, #89), and the decided rate is per-node and per-link. MTU and the basic rate are
+/// properties of the *medium*, so every node on it derives the same number with no negotiation —
+/// the same reasoning that puts control traffic on the basic rate in #46.
+fn mtu_airtime_us(mtu: usize) -> u64 {
+    wifi_airtime_us(mtu, Some(ndn_radio_hal::McsDescriptor::CONSERVATIVE.index))
 }
 
 /// `NDN_SCHED_HOP=ch,ch,…:dwell_us`.
@@ -927,7 +998,7 @@ mod tests {
         // HW beacon it reads the peer's hardware timeline (the #74 µs path). Two nodes fed the SAME
         // peer beacon (same peer_tsf) land on the same epoch regardless of their own RX-stamp domain.
         let mk = || FaceScheduler {
-            slot: parse_slot("8:3000"),
+            slot: parse_slot("8:3000", 1500, ClockSource::Wall),
             hop: None,
             group_depth: 1,
             clock_source: ClockSource::CommonView,
@@ -967,7 +1038,7 @@ mod tests {
     #[test]
     fn cclf_jitter_is_deterministic_and_bounded() {
         let s = FaceScheduler {
-            slot: parse_slot("8:3000"),
+            slot: parse_slot("8:3000", 1500, ClockSource::Wall),
             hop: None,
             group_depth: 1,
             clock_source: ClockSource::CommonView,
@@ -1043,7 +1114,7 @@ mod tests {
     fn beacon_round_trips_and_ignores_ndn() {
         // A built beacon parses back to a plausible reference; NDN first-bytes are not beacons.
         let sched = FaceScheduler {
-            slot: parse_slot("4:3000"),
+            slot: parse_slot("4:3000", 1500, ClockSource::Wall),
             hop: None,
             group_depth: 1,
             clock_source: ClockSource::CommonView,
@@ -1074,6 +1145,66 @@ mod tests {
         // After ingesting a reference the common-view clock reads that timeline.
         sched.ingest_time_ref(9_000_000);
         assert!(sched.now_us() >= 9_000_000);
+    }
+
+    /// **The slot is sized from the airtime and the clock, not hand-written** (#85/#86).
+    ///
+    /// `SlotSchedule::from_airtime` — the function that exists to compute a slot width — had zero
+    /// callers, because `slot_us` came from `NDN_SCHED_SLOT=8:20000`. A hand-picked slot is wrong in
+    /// one of two directions: too small and frames overrun into another name's turn (the collision
+    /// the MAC exists to prevent, charged to a different name so the culprit never sees it), too
+    /// large and the surplus is dead airtime. Every on-air run so far used 20 ms slots, and this test
+    /// shows what that was actually buying.
+    ///
+    /// It also spends #74. The hardware TSF common-view measured ~0.4 µs against the software
+    /// clock's ~55 µs, a 135× improvement that changed no schedule anywhere because the slot width
+    /// was a constant. A guard sized from the clock is what converts that measurement into shorter
+    /// slots and proportionally lower per-name access latency — the whole argument for building it.
+    #[test]
+    fn the_slot_is_derived_from_airtime_and_the_clocks_guard() {
+        // A full-MTU frame at the basic broadcast rate — medium-invariant, so every node agrees.
+        let air = mtu_airtime_us(1500);
+
+        let wall = parse_slot("8", 1500, ClockSource::Wall).expect("derived");
+        let hw = parse_slot("8", 1500, ClockSource::Hardware).expect("derived");
+        assert_eq!(wall.slots(), 8);
+        assert_eq!(wall.slot_us(), air + 1_000, "wall clock pays a 1 ms guard");
+        assert_eq!(hw.slot_us(), air + 10, "the hardware TSF pays 10 µs");
+
+        // The point of #74: the same schedule on a better clock is a materially shorter slot, and
+        // per-name access latency falls with it. At full MTU the airtime term dominates, so the
+        // saving here is ~50% (994 µs vs 1984 µs) rather than the 135× the clock itself improved by
+        // — the guard was never the whole slot. The effect grows as frames get smaller: for a short
+        // Interest the airtime is tens of µs and the guard is nearly all of it.
+        assert!(
+            (hw.superframe_us() as f64) < 0.6 * wall.superframe_us() as f64,
+            "a hardware clock must materially shrink the superframe ({} vs {} µs); if it does not, \
+             the guard is not being spent and #74 bought nothing",
+            hw.superframe_us(),
+            wall.superframe_us()
+        );
+        // Small frames are where the clock really pays: guard, not airtime, is the whole slot.
+        let (small_wall, small_hw) = (
+            parse_slot("8", 64, ClockSource::Wall).unwrap().slot_us(),
+            parse_slot("8", 64, ClockSource::Hardware).unwrap().slot_us(),
+        );
+        assert!(
+            small_hw * 10 <= small_wall,
+            "on a short frame the hardware clock should shrink the slot by >=10x ({small_hw} vs \
+             {small_wall} µs) — that is #74's actual value"
+        );
+
+        // And every one of these is far tighter than the 20 ms hand-written slot used on air, which
+        // was ~10x the airtime it needed to hold.
+        assert!(
+            wall.slot_us() < 20_000 / 2,
+            "the derived slot ({}µs) should be far under the hand-written 20 000 µs",
+            wall.slot_us()
+        );
+
+        // The explicit form still works — it is the debug-bisect escape hatch, not the default.
+        let explicit = parse_slot("8:20000", 1500, ClockSource::Hardware).expect("explicit");
+        assert_eq!(explicit.slot_us(), 20_000, "an explicit width overrides the derivation");
     }
 
     /// **A hop schedule the radio cannot serve must be refused, not attempted** (#97/#98).
@@ -1113,13 +1244,13 @@ mod tests {
 
     #[test]
     fn config_parsers_round_trip() {
-        let s = parse_slot("8:3000").expect("slot");
+        let s = parse_slot("8:3000", 1500, ClockSource::Wall).expect("slot");
         assert_eq!(s.owner_slot(0), 0);
         assert_eq!(s.superframe_us(), 8 * 3000);
         let h = parse_hop("1,6,11:120000").expect("hop");
         assert_eq!(h.classes(), &[1, 6, 11]);
         assert_eq!(h.dwell_remaining_us(0), 120000);
-        assert!(parse_slot("garbage").is_none());
+        assert!(parse_slot("garbage", 1500, ClockSource::Wall).is_none());
         assert!(parse_hop(":100").is_none());
     }
 
@@ -1136,7 +1267,7 @@ mod tests {
     #[test]
     fn a_slot_is_only_claimable_with_evidence_its_owner_is_in_range() {
         let sched = FaceScheduler {
-            slot: parse_slot("8:3000"),
+            slot: parse_slot("8:3000", 1500, ClockSource::Wall),
             hop: None,
             group_depth: 1,
             clock_source: ClockSource::Wall,
@@ -1395,7 +1526,7 @@ mod tests {
     /// A claimable scheduler on an arbitrary `slots:slot_us` spec.
     fn mk_claim_sched_slots(spec: &str) -> FaceScheduler {
         let mut s = mk_claim_sched();
-        s.slot = parse_slot(spec);
+        s.slot = parse_slot(spec, 1500, ClockSource::Wall);
         s
     }
 
@@ -1417,7 +1548,7 @@ mod tests {
     /// A claimable scheduler with an 8x3ms superframe — the shape the claim tests need.
     fn mk_claim_sched() -> FaceScheduler {
         FaceScheduler {
-            slot: parse_slot("8:3000"),
+            slot: parse_slot("8:3000", 1500, ClockSource::Wall),
             hop: None,
             group_depth: 1,
             clock_source: ClockSource::Wall,

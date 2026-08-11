@@ -1141,7 +1141,7 @@ impl RunningMedium {
             // unchanged. Shared (Arc) with this bearer's RX reader so inbound hardware stamps feed the
             // scheduler's disciplined clock (#41). Bandwidth defaults to 20 MHz for hops across
             // non-overlapping channels.
-            let sched = crate::FaceScheduler::from_env(b.knobs.clone(), crate::Bandwidth::default())
+            let sched = crate::FaceScheduler::from_env(b.knobs.clone(), crate::Bandwidth::default(), mtu)
                 .map(|s| {
                     // Give the scheduler this bearer's rate policy so the #84 guard band sizes its
                     // airtime estimate from the rate we will actually transmit at, not from the

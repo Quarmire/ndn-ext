@@ -57,7 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Slave: the REAL FaceScheduler in CommonView mode. NDN_SCHED_SLOT + NDN_SCHED_CLOCK=cv must be set.
     let sched = Arc::new(
-        FaceScheduler::from_env(None, Bandwidth::default())
+        FaceScheduler::from_env(None, Bandwidth::default(), 1500)
             .ok_or("set NDN_SCHED_SLOT (+ NDN_SCHED_CLOCK=cv)")?,
     );
     println!("sched_cv_airtest SLAVE: {}", sched.describe());
