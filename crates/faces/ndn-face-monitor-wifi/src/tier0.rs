@@ -98,6 +98,31 @@ pub const K: u32 = 4;
 /// frame*, so the tail is bounded here and deeper matching is left to the software tier.
 pub const MAX_DEPTH: usize = 8;
 
+/// **Admission fill cap** — the maximum number of set bits a *received* filter may carry and still
+/// be tested against any local mask.
+///
+/// Without it, [`PrefixFilter::may_match`] is a pure AND: a frame with all 94 bits set matches every
+/// registered mask at every node, for free, computed once. That is a one-frame universal wake — and
+/// once the scheduler keys on this field it becomes worse than a wake, because the same frame
+/// matches every slot owner's mask: every slot reads busy, presence is forged for every owner
+/// including departed ones, and claims are suppressed network-wide for a full presence window per
+/// frame.
+///
+/// **Sizing.** A legitimate filter at the depth cap sets 30 bits (measured, `MAX_DEPTH` = 8,
+/// `K` = 4 — see the depth/popcount table in the tests). 48 leaves headroom for future class tokens
+/// while bounding a just-under-cap adversary to roughly `(48/94)^4` ≈ 7% per targeted prefix rather
+/// than 100%.
+///
+/// **Scope, honestly.** This removes the *amplified* attack — one frame forging presence for every
+/// group at once. It does not stop an adversary forging presence for a single group it knows the
+/// name of; that is inherent to unauthenticated MAC-level evidence and is not a property any
+/// arrangement of these 94 bits can provide.
+///
+/// Coupled to `MAX_DEPTH`, `K` and any future class tokens, so it is a **shared wire parameter**:
+/// every implementation must use the same value or they disagree about which frames are admissible.
+pub const FILL_CAP: u32 = 48;
+
+
 /// The two bits of octet 0 that must not be used by the filter (I/G and U/L).
 const RESERVED_MASK0: u8 = 0b0000_0011;
 
@@ -246,6 +271,11 @@ impl PrefixFilter {
     /// `false` is **exact** — the name is definitely not under it. `true` means *probably*, and the
     /// software tier decides.
     pub fn may_match(&self, mask: &Self) -> bool {
+        // **Fill cap first** — before any mask test, because the mask test is a pure AND and an
+        // over-full filter passes every one of them. See [`FILL_CAP`].
+        if self.popcount() > FILL_CAP {
+            return false;
+        }
         for i in 0..12 {
             let want = mask.0[i] & !if i == 0 { RESERVED_MASK0 } else { 0 };
             if self.0[i] & want != want {
@@ -564,5 +594,82 @@ mod tests {
                 bits_tot / R
             );
         }
+    }
+}
+
+/// **The admission fill cap** (F1) — the amplified-wake hole and its boundary.
+#[cfg(test)]
+mod fill_cap_tests {
+    use super::*;
+
+    /// **An over-full filter must match nothing**, and this is the whole point: `may_match` is a
+    /// pure AND, so before the cap an all-ones frame matched *every* registered mask at *every*
+    /// node. One frame, computed for free, woke the entire network — and once the scheduler keys on
+    /// this field it forges presence for every slot owner at once, suppressing all claims for a
+    /// presence window.
+    #[test]
+    fn an_all_ones_filter_matches_nothing() {
+        let key = [7u8; 16];
+        let mut mask = PrefixFilter::default();
+        mask.insert_name(&key, b"/ndn/alarm");
+        assert!(mask.popcount() > 0, "fixture: the mask has bits to match");
+
+        let mut all_ones = PrefixFilter::default();
+        for p in 0..M_BITS as u8 {
+            all_ones.set_bit(p);
+        }
+        assert!(all_ones.popcount() > FILL_CAP);
+        assert!(
+            !all_ones.may_match(&mask),
+            "a saturated filter must be inert; without the cap it matched every mask on the network"
+        );
+    }
+
+    /// A legitimate filter at the depth cap must still be admitted — the cap must not cost us the
+    /// deepest names we actually send. Measured fill at MAX_DEPTH is 30 bits against a cap of 48.
+    #[test]
+    fn a_legitimate_deep_name_is_still_admitted() {
+        let key = [3u8; 16];
+        let deep = b"/a/b/c/d/e/f/g/h".as_slice(); // MAX_DEPTH components
+        let mut f = PrefixFilter::default();
+        f.insert_name(&key, deep);
+        assert!(
+            f.popcount() <= FILL_CAP,
+            "a legitimate depth-{MAX_DEPTH} name filled {} bits, over the {FILL_CAP} cap — the cap \
+             is mis-sized and would drop real traffic",
+            f.popcount()
+        );
+        let mut mask = PrefixFilter::default();
+        mask.insert_name(&key, deep);
+        assert!(f.may_match(&mask), "and it must still match its own mask");
+    }
+
+    /// The boundary is exact and inclusive: `popcount == FILL_CAP` is admissible, `+1` is not.
+    /// Asserted directly because an off-by-one here is either a silent drop of real frames or a
+    /// silent hole, and neither shows up as anything but "the link is flaky".
+    #[test]
+    fn the_cap_boundary_is_exact() {
+        let key = [1u8; 16];
+        let mut mask = PrefixFilter::default();
+        mask.insert_name(&key, b"/x");
+
+        // Build a filter that is a superset of the mask, padded to exactly FILL_CAP bits.
+        let mut at_cap = mask;
+        let mut p = 0u8;
+        while at_cap.popcount() < FILL_CAP && (p as u32) < M_BITS {
+            at_cap.set_bit(p);
+            p += 1;
+        }
+        assert_eq!(at_cap.popcount(), FILL_CAP);
+        assert!(at_cap.may_match(&mask), "exactly at the cap is admissible");
+
+        // One more bit tips it over.
+        let mut over = at_cap;
+        while over.popcount() == FILL_CAP && (p as u32) < M_BITS {
+            over.set_bit(p);
+            p += 1;
+        }
+        assert_eq!(over.popcount(), FILL_CAP + 1);
+        assert!(!over.may_match(&mask), "one bit over the cap is rejected");
     }
 }
