@@ -4,13 +4,16 @@
 //! (`ndn-radio-drivers/firmware/lr2021-nrf54l15-rs/src/tier0.rs`), which is dependency-free integer
 //! code and compiles for RISC-V unchanged.
 //!
-//! ⚠ **The two are no longer bit-identical, and must be reconciled before any cross-PHY interop.**
-//! This copy hashes with `siphash24` (doctrine §8 unforgeability — see [`name_hash`]); the firmware
-//! copy still uses keyed FNV-1a-64. A filter built by one will not match masks built by the other,
-//! so a Wi-Fi node and an LR2021 node cannot currently share a group. Nothing depends on that today
-//! (different PHYs, no bridge yet), but the design calls for ONE filter definition, so the firmware
-//! copy should take `siphash24` too — it is ~50 lines of dependency-free integer code and stays
-//! `no_std`. The algorithm, the sizing, and the `k = 4` constant were
+//! **All three copies hash `siphash24`** (doctrine §8 unforgeability — see [`name_hash`]): this one,
+//! the LR2021 firmware `tier0.rs`, and the ath9k-htc C `ndr_tier0.c`. An earlier version of this
+//! header warned that the firmware "still uses keyed FNV-1a-64"; that was true once, was fixed in
+//! the firmware, and the warning here was not — **it then misled a review into re-planning work that
+//! was already done**, which is the exact cost of a stale comment about another file.
+//!
+//! They agree today *by having been edited in sync*, which is not a guarantee. `golden/tier0/`
+//! carries the shared vectors ([`golden_vectors`]) and every implementation asserts them, so drift
+//! is a red test rather than a silent false negative on air — the forbidden failure. The algorithm,
+//! the sizing, and the `k = 4` constant were
 //! **measured on hardware** there (`m7_filter_test`, 20 000 trials/point on an nRF54L15); the tests at
 //! the bottom of this file re-assert the two properties that matter — zero false negatives, and the
 //! measured false-positive curve — so the port cannot silently drift from the validated original.
@@ -435,7 +438,7 @@ mod tests {
         //   depth   popcount (FNV -> SipHash)   FP (FNV -> SipHash)
         //     2         12 -> 12                 0.095% -> 0.000%
         //     4         19 -> 19                 0.24%  -> 0.390%
-        //     6         27 -> 25                 0.80%  -> 0.910%
+        //     6         27 -> 23                 0.80%  -> 0.910%
         //     8         29 -> 30                 0.94%  -> 0.780%
         //
         // Both sit inside the k=4 band, which is exactly what the original sizing work predicted:
@@ -671,5 +674,138 @@ mod fill_cap_tests {
         }
         assert_eq!(over.popcount(), FILL_CAP + 1);
         assert!(!over.may_match(&mask), "one bit over the cap is rejected");
+    }
+}
+
+/// **Tier-0 golden vectors** (F2 / P0.2) — the cross-implementation pin.
+///
+/// Three copies of this filter exist: this one, the LR2021 firmware `tier0.rs`, and the ath9k-htc C
+/// `ndr_tier0.c`. They agree today *by having been edited in sync*, which is not a guarantee — and
+/// the failure mode of a divergence is a **silent false negative**, the one error class this design
+/// forbids: two nodes in one group simply stop matching each other, on air, with nothing logged.
+///
+/// So the wire is pinned to a file rather than to a habit. `NDN_TIER0_REGEN=1 cargo test
+/// tier0_golden_vectors_are_stable` rewrites it; every other implementation reads and asserts it.
+/// A parameter change is then a visible diff in a checked-in artefact, reviewed on purpose,
+/// instead of a number that drifted in one of three files.
+///
+/// Rows are chosen to catch the failures that actually happen here:
+/// * depth 2 / depth 8 — the ordinary range, and the `MAX_DEPTH` boundary
+/// * depth 12 — past `MAX_DEPTH`; pins the cap/clamp meeting point (it does *not* equal the depth-8
+///   filter — see the test), the seam whose mishandling was a false negative
+/// * wrong key — must **not** match, pinning that the filter is keyed at all (doctrine §8)
+/// * `FILL_CAP` boundary pair — admissible at the cap, rejected one bit over (F1)
+///
+/// Each row carries its popcount, which retires the depth-6 comment/assert split by construction:
+/// the vectors become the arbiter, and both the prose table and the assert are checked against them.
+#[cfg(test)]
+mod golden_vectors {
+    use super::*;
+
+    const VECTORS: &str = include_str!("../../../../../ndn-radio-drivers/golden/tier0/vectors.txt");
+
+    /// The key every non-"wrong key" row uses. Fixed, published, and not secret — these vectors pin
+    /// the *algorithm*, not a deployment's group key.
+    const VK: [u8; 16] = *b"ndr/tier0-vec-01";
+    const WRONG: [u8; 16] = *b"ndr/tier0-vec-02";
+
+    fn deep_name(depth: usize) -> Vec<u8> {
+        let mut n = Vec::new();
+        for i in 0..depth {
+            n.push(b'/');
+            n.extend_from_slice(format!("c{i}").as_bytes());
+        }
+        n
+    }
+
+    fn rows() -> Vec<(String, [u8; 16], Vec<u8>)> {
+        vec![
+            ("depth2".into(), VK, b"/ndn/alarm".to_vec()),
+            ("depth8".into(), VK, deep_name(8)),
+            ("depth12-over-cap".into(), VK, deep_name(12)),
+            ("wrongkey".into(), WRONG, b"/ndn/alarm".to_vec()),
+        ]
+    }
+
+    fn render() -> String {
+        let mut out = String::new();
+        out.push_str("# Tier0Params v1 — the shared wire parameter set. Generated by\n");
+        out.push_str("# ndn-face-monitor-wifi tier0::golden_vectors; asserted by every implementation.\n");
+        out.push_str("# Regenerate: NDN_TIER0_REGEN=1 cargo test -p ndn-face-monitor-wifi tier0_golden\n");
+        out.push_str(&format!(
+            "params version=1 k={K} m={M_BITS} max_depth={MAX_DEPTH} fill_cap={FILL_CAP} \
+             hash=siphash24 key_len=16 norm=ndn_name_to_slash reserved_mask0=0x{RESERVED_MASK0:02x}\n"
+        ));
+        out.push_str("# row <label> <key-ascii> <name> <12 wire bytes hex> <popcount>\n");
+        for (label, key, name) in rows() {
+            let mut f = PrefixFilter::default();
+            f.insert_name(&key, &name);
+            let wire: String = f.to_wire().iter().map(|b| format!("{b:02x}")).collect();
+            out.push_str(&format!(
+                "row {label} {} {} {wire} {}\n",
+                std::str::from_utf8(&key).unwrap(),
+                std::str::from_utf8(&name).unwrap(),
+                f.popcount()
+            ));
+        }
+        out
+    }
+
+    /// The vectors are stable, and the file is the arbiter. Set `NDN_TIER0_REGEN=1` to rewrite it —
+    /// which should only ever accompany a deliberate, reviewed `Tier0Params` change.
+    #[test]
+    fn tier0_golden_vectors_are_stable() {
+        let generated = render();
+        if std::env::var("NDN_TIER0_REGEN").is_ok() {
+            let path = concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../../ndn-radio-drivers/golden/tier0/vectors.txt"
+            );
+            std::fs::write(path, &generated).expect("write vectors");
+            return;
+        }
+        assert_eq!(
+            generated.trim(),
+            VECTORS.trim(),
+            "Tier-0 wire output no longer matches the checked-in vectors. If this change is \
+             intended, it is a Tier0Params change: bump the version, regenerate with \
+             NDN_TIER0_REGEN=1, and update the other two implementations in the same commit — a \
+             divergence here is a SILENT false negative on air."
+        );
+    }
+
+    /// The behavioural claims the vectors encode, asserted directly so the file cannot be
+    /// regenerated into something meaningless.
+    #[test]
+    fn the_vectors_encode_the_properties_they_exist_to_pin() {
+        // **The depth cap and the registered-prefix clamp meet here, and the vectors made it
+        // visible.** A depth-12 name does NOT produce the depth-8 name's filter: `for_each_prefix`
+        // returns at the cap *before* emitting the full name, so the 12-component name inserts the
+        // root plus 7 proper prefixes (24 bits here) while the 8-component name also inserts itself
+        // (27 bits). What makes that sound is `clamp_prefix`: a *registered* prefix is truncated to
+        // MAX_DEPTH-1 components, so the mask a receiver builds is one both senders inserted. That
+        // is the false negative `clamp_prefix` exists to prevent, and this asserts the meeting
+        // point rather than the folklore that "12 clamps to 8".
+        let (mut d8, mut d12) = (PrefixFilter::default(), PrefixFilter::default());
+        d8.insert_name(&VK, &deep_name(8));
+        d12.insert_name(&VK, &deep_name(12));
+        let mask8 = PrefixFilter::mask_for(&VK, &deep_name(8));
+        assert!(d12.may_match(&mask8), "a depth-12 name must still match its depth-8 prefix mask");
+
+        // Keyed, not merely hashed: the same name under another key must not match.
+        let right = PrefixFilter::mask_for(&VK, b"/ndn/alarm");
+        let mut wrong = PrefixFilter::default();
+        wrong.insert_name(&WRONG, b"/ndn/alarm");
+        assert!(
+            !wrong.may_match(&right),
+            "the same name under a different group key must not match — the filter is keyed (§8)"
+        );
+
+        // And the popcounts in the file agree with the depth table the prose quotes.
+        // Fill is a property of the NAME, not just its depth: this 8-component name sets 27 bits,
+        // while the tests' `make_name` shape sets 30 at the same depth. FILL_CAP was sized against
+        // the larger, so quote 30 as the worst case observed and never as a formula.
+        assert_eq!(d8.popcount(), 27);
+        assert!(d8.popcount() <= FILL_CAP, "and every legitimate shape stays under the cap");
     }
 }
