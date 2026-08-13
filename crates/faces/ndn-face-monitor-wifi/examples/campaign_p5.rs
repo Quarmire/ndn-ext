@@ -77,6 +77,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let open = ndn_radio_drivers::open_named_radio(pid, channel)?;
+    // The obs role reads raw frames for RSSI; the same Arc<dyn FrameIo> also feeds the bearer
+    // (the driver's RX pump fans in one stream — recv_frame consumers compete, which is fine for
+    // obs: its medium side only TRANSMITS /light, and a stolen frame on the TX-side reader costs
+    // nothing the meter was owed).
+    let raw_rx = if role == "obs" { Some(open.io.clone()) } else { None };
     // TX power (claim-C prereg + bench power hygiene): TXAGC index 0..63 via RadioKnobs — the
     // campaign backends do NOT read NDN_RADIO_TXPWR natively (only the 8821c does), so the tool
     // applies it explicitly and prints what it applied. Unset = the driver's calibrated default.
@@ -134,11 +139,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("gate wait µs      : max {max}  p99 {p99}  mean {mean}   <-- the access-delay metric");
         }
         _ => {
-            // /light at 1/s from the OBS node (prereg amendment 2): amendment 1 put it on `lat`,
-            // whose nonce then evidenced two slots and was DISCOUNTED by P4's relay rule — the
-            // multi-group-originator conservatism working exactly as committed. The claimable
-            // open-slot owner must be a single-group transmitter, i.e. its own node. 1 f/s is far
-            // below the 881a's brownout regime (a sustained-TX defect).
+            // OBS reads RAW frames (FrameIo::recv_frame) rather than the medium: CapturedFrame
+            // carries rssi_dbm, which the Transport surface drops — and per-group RSSI is the
+            // claim-C instrument (TXAGC verification + the capture-asymmetry diagnostic). The
+            // payload is the same NDN wire the medium parses, so the counter semantics match.
+            // Cost, stated: the obs node no longer exercises the RX gate/scheduler paths — it is a
+            // meter, and the /light sender below still runs through the full medium TX path.
             let light = {
                 let m = medium.clone();
                 tokio::spawn(async move {
@@ -152,22 +158,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     seq
                 })
             };
-            let mut heard: BTreeMap<String, u64> = BTreeMap::new();
+            let io = medium.scheduler(); // keep the medium alive for /light
+            let _ = io;
+            let raw = raw_rx.expect("obs keeps the raw io");
+            let mut heard: BTreeMap<String, (u64, i64, u64)> = BTreeMap::new(); // count, rssi sum, rssi n
             let end = Instant::now() + Duration::from_secs(secs);
             while Instant::now() < end {
-                match tokio::time::timeout(Duration::from_millis(300), medium.recv_bytes_with_addr())
-                    .await
-                {
-                    Ok(Ok((wire, _))) => {
-                        *heard.entry(first_component(&wire).unwrap_or_else(|| "?".into())).or_default() += 1;
+                match tokio::time::timeout(Duration::from_millis(300), raw.recv_frame()).await {
+                    Ok(Ok(f)) => {
+                        let g = first_component(&f.payload).unwrap_or_else(|| "?".into());
+                        let e = heard.entry(g).or_default();
+                        e.0 += 1;
+                        if let Some(r) = f.rssi_dbm {
+                            e.1 += i64::from(r);
+                            e.2 += 1;
+                        }
                     }
                     _ => continue,
                 }
             }
             println!("light sent        : {}", light.await.unwrap_or(0));
             println!("=== obs ===");
-            for (g, c) in &heard {
-                println!("heard /{g:<8}: {c}");
+            for (g, (c, rs, rn)) in &heard {
+                let rssi = if *rn > 0 { format!("{} dBm", rs / *rn as i64) } else { "-".into() };
+                println!("heard /{g:<8}: {c:<7} rssi mean {rssi}");
             }
         }
     }
