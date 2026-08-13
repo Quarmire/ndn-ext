@@ -89,3 +89,29 @@ power = idx 20 (≈ −9.6 dB vs default 63).
 
 Consequence for gate 3: 9.6 dB of authority cannot create hidden(A,C) at this geometry by power
 alone — the ANTENNA-REMOVAL fallback is now the plan of record for the topology gate.
+
+## Gate 3 — route revised 2026-08-13: software hearing matrix (antenna removal excluded by the operator)
+
+Physical constraint update: antenna removal is not an option. Combined with the measured facts —
+B receives A at ≥ −5 dBm (the RSSI meter's ceiling) against a ≈ −92 dBm legacy-6M decode floor,
+i.e. **~90 dB of link margin vs 9.6 dB of verified TXAGC authority (061274c)** — hiddenness cannot
+be created electronically or by any bench-scale physical measure short of relocation/shielding.
+
+Route of record: **`NDN_SCHED_DEAF_SRC=<hex nonce prefix>`** on the bulk node (A), making it deaf
+to C's §2 nonce at the scheduler's input — the MAC lab's hearing matrix realized on real radios.
+The MAC's information topology is exactly hidden-terminal (A cannot yield to an owner it never
+hears); the collisions at B remain PHYSICALLY real (both radios radiate; B's delivery counts
+measure genuine RF interference). The only emulated element is WHY A cannot hear C, which is
+outside the mechanism under test.
+
+Honesty clauses:
+* The var is DebugBisect-classed and appears in every run header. The prereg's "any DEBUG-class
+  var invalidates a run" rule gets exactly ONE named exception: `NDN_SCHED_DEAF_SRC` on node A
+  only, because here it IS the topology, not a confounder. Any other DEBUG var still voids.
+* The topology gate becomes: A's scheduler counters show ZERO domain attribution of C's frames
+  over a full pre-arm window (deafness verified end-to-end), while B hears both at ≥ 90%.
+* Scope limit stated: this validates the MAC's hidden-terminal behaviour, not RF capture effects
+  of true spatial hiddenness — those need the sub-GHz field fleet at real distances (plan-P4's
+  original endpoint), and results will say so.
+* TX power for the arms: pinned at the verified scale (`NDN_RADIO_TXPWR` ∈ 20..=63, 061274c's
+  clamp) — power is a controlled variable here, not the hiding mechanism.

@@ -1242,6 +1242,20 @@ impl RunningMedium {
             let rx_bridge = bridge;
             let loss = fec.as_ref().map(|fc| fc.loss.clone());
             let sched_rx = sched.clone();
+            // Claim-C topology instrument (see the RX hook below): hex byte prefix of a §2 nonce
+            // this node is artificially deaf to, e.g. NDN_SCHED_DEAF_SRC=024e444e0003.
+            let deaf_src: Option<Vec<u8>> = std::env::var("NDN_SCHED_DEAF_SRC")
+                .ok()
+                .map(|h| {
+                    (0..h.len() / 2 * 2)
+                        .step_by(2)
+                        .filter_map(|i| u8::from_str_radix(&h[i..i + 2], 16).ok())
+                        .collect()
+                })
+                .filter(|v: &Vec<u8>| !v.is_empty());
+            if let Some(d) = &deaf_src {
+                tracing::warn!(target: "monitor-wifi", "TOPOLOGY INSTRUMENT: deaf to src {:02x?}", d);
+            }
             let rate_rx = rate.clone();
             let rx_gate = rx_gate.clone();
             tasks.push(tokio::spawn(async move {
@@ -1259,10 +1273,32 @@ impl RunningMedium {
                             // used to ride on the stamp branch above, so a radio whose driver reports
                             // no TSFT never marked the medium busy at all and claimed every slot.
                             if let Some(sched) = sched_rx.as_ref() {
-                                // P1: hand the scheduler the Tier-0 bytes so attribution is a mask
-                                // AND, not a per-frame TLV parse (parse survives only for
-                                // broadcast-addressed legacy frames + first-sighting cold paths).
-                                sched.observe_rx(f.group.as_ref(), f.addr.as_ref(), f.addr3.as_ref(), &f.payload);
+                                // **NDN_SCHED_DEAF_SRC** (claim-C topology instrument, DebugBisect
+                                // class): drop frames whose §2 source nonce starts with the given
+                                // hex bytes BEFORE they reach the scheduler — a software hearing
+                                // matrix on real radios. Exists because hiddenness cannot be
+                                // created electronically at bench range (measured: ≥~90 dB link
+                                // margin vs 9.6 dB of TXAGC authority, B210 2026-08-13) and
+                                // physical options are excluded. The MAC's information topology
+                                // becomes hidden-terminal; collisions at the victim stay
+                                // physically real. Declared in the prereg; printed in the header.
+                                let deaf = deaf_src.as_deref().is_some_and(|d| {
+                                    let src = if f.group.as_ref() == Some(&ndn_radio_hal::BROADCAST)
+                                    {
+                                        f.addr.as_ref()
+                                    } else {
+                                        f.addr3.as_ref()
+                                    };
+                                    src.is_some_and(|s| s.starts_with(d))
+                                });
+                                if !deaf {
+                                    sched.observe_rx(
+                                        f.group.as_ref(),
+                                        f.addr.as_ref(),
+                                        f.addr3.as_ref(),
+                                        &f.payload,
+                                    );
+                                }
                             }
                             // #74: the MESH hardware common-view — discipline the scheduler's clock to a
                             // neighbour's HW-TSF-stamped timing beacon (pair (peer_tsf, our_rxtsfl), both
