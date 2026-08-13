@@ -56,3 +56,29 @@ half of the gate rule was void. This is the #24 drift mechanism (an ignored doct
 striking a third time. Fixes: the doc is now force-added; any future prereg commit must be
 verified with `git ls-files` before the first run — a green `git commit` is not evidence the file
 went in.
+
+## Claim B v2 — PASS (2026-08-13, post counter-split, prereg verified in-index before the runs)
+
+| arm | rep | sent | elections | elections/sent | hold continuations |
+|---|---|---|---|---|---|
+| B8 | 1r | 17,580 | 251 | 0.0143 | 9,767 |
+| B8 | 2  | 12,413 | 244 | 0.0197 | 6,742 |
+| B8 | 3* | 27,484 | 245 | 0.0089 | 15,211 |
+| B1 | 1  |  7,239 | 250 | 0.0345 | 2,812 |
+| B1 | 2  |  8,647 | 250 | 0.0289 | 3,625 |
+| B1 | 3* |  7,292 | 251 | 0.0344 | 2,949 |
+
+Threshold: elections-per-sent(B8) < 0.5 × B1 → **0.0143 < 0.0163 ✓ (ratio 0.44)**, with
+sent(B8) mean 19,159 ≥ sent(B1) mean 7,726 (**+148%**). Ranges disjoint (B8 max 0.0197 <
+B1 min 0.0289). Excluding the * pair (lat radio failed to open on o5p-2 in both rep-3 runs —
+matched across arms, so the pair is internally comparable) leaves 0.017 vs 0.0317 — still passing.
+
+The structure the split counters reveal: **elections are constant (~250 = one per superframe — one
+election per /light-slot occurrence, by design) in every arm**; the lease changes how many frames
+each win amortizes (holds ≈ 3k under LEASE=1 — even one slot amortizes a burst — vs ≈ 10k under
+LEASE=8). elections-per-sent halves because SENT rises, not because elections fall: the election
+rate is set by the schedule, and the lease multiplies what a win is worth. v1's conflated counter
+could not see any of this.
+
+Instrument note: the o5p-2 8812au failed to open in both rep-3 runs (consecutive) — watch for a
+wedge; the 881a obs also reset twice earlier. Flakiest-first is now o5p-2.
