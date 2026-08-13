@@ -84,7 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // key; /alarm is latency-class in every node's table (the shared map).
             .with_bloom_latency(
                 &OPEN_GROUP_KEY,
-                &[b"/bulk".as_slice(), b"/alarm".as_slice()],
+                &[b"/bulk".as_slice(), b"/alarm".as_slice(), b"/light".as_slice()],
                 &[b"/alarm".as_slice()],
             )
             .build(),
@@ -104,6 +104,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("sent              : {seq}");
         }
         "lat" => {
+            // /light at 1/s (prereg amendment 1): an audible, mostly-idle OPEN-slot owner, so the
+            // bulk node has something legitimately claimable — without it, claim B is unmeasurable
+            // in this topology (lanes are unclaimable by design, unowned slots evidence-refused).
+            let light = {
+                let m = medium.clone();
+                tokio::spawn(async move {
+                    let mut seq = 0u32;
+                    let end = Instant::now() + Duration::from_secs(secs);
+                    while Instant::now() < end {
+                        let _ = m.send_bytes(pkt("light", seq)).await;
+                        seq += 1;
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                    seq
+                })
+            };
             let gap = Duration::from_micros(1_000_000 / lat_per_sec.max(1));
             let end = Instant::now() + Duration::from_secs(secs);
             let (mut seq, mut waits_us) = (0u32, Vec::new());
@@ -115,6 +131,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 tokio::time::sleep(gap).await;
             }
+            let light_sent = light.await.unwrap_or(0);
+            println!("light sent        : {light_sent}");
             waits_us.sort_unstable();
             let max = waits_us.last().copied().unwrap_or(0);
             let mean = waits_us.iter().sum::<u64>() / waits_us.len().max(1) as u64;
