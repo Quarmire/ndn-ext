@@ -77,6 +77,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let open = ndn_radio_drivers::open_named_radio(pid, channel)?;
+    // TX power (claim-C prereg + bench power hygiene): TXAGC index 0..63 via RadioKnobs — the
+    // campaign backends do NOT read NDN_RADIO_TXPWR natively (only the 8821c does), so the tool
+    // applies it explicitly and prints what it applied. Unset = the driver's calibrated default.
+    let txpwr: Option<u32> = std::env::var("NDN_RADIO_TXPWR").ok().and_then(|v| v.parse().ok());
+    if let (Some(idx), Some(knobs)) = (txpwr, open.knobs.as_ref()) {
+        knobs.set_tx_power(idx)?;
+    }
     let cap = RadioCapability::wifi_monitor_5ghz(vec![channel]);
     let medium = Arc::new(
         RadioMediumFace::new(FaceId(1), vec![RadioBearer::from_open(RadioId(0), open, cap)])
@@ -89,7 +96,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .build(),
     );
-    println!("role={role} ch{channel} pid={pid:04x} {secs}s");
+    println!(
+        "role={role} ch{channel} pid={pid:04x} {secs}s txpwr={}",
+        txpwr.map(|i| i.to_string()).unwrap_or_else(|| "default".into())
+    );
 
     match role.as_str() {
         "bulk" => {
