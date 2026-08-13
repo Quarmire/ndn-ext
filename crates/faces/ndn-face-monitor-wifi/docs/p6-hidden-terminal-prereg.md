@@ -230,3 +230,26 @@ symmetric across arms: C runs undisciplined for the ~6 s before A's beacons star
 Thresholds UNCHANGED. Prediction: the v2 boundary loss collapses; flat's lease-over-alarm-slot
 collisions finally dominate; lanes/flat separation becomes visible (PASS shape) — or the next
 mask is found and named.
+
+## v3 status — 2026-08-13: HALTED by bench hardware at 1 valid replicate per arm
+
+Valid: **L1 = 284/310 = 91.6%, F1 = 260/283 = 91.9%** (nonces stable, all counters present).
+Then four consecutive runs died with the dead-observer signature (empty obs + A elections 0), and
+o5p-1's 881a is confirmed OFF THE BUS (repeated xhci resets → USB disconnect — the same terminal
+wedge o5p-2 exhibited before its replug). One additional run (F3) also had a nonce rotation.
+**Physical replug of the o5p-1 881a required; the remaining 2×2 replicates run after it.**
+
+Preliminary observations (n=1/arm — NOT conclusions, per the reporting rule):
+* **The P11-predicted boundary-loss collapse is visible**: both arms rose from v2's ~85% to ~92%
+  under the common-view clock. The skew mechanism was real and the shared clock removed it.
+* Lanes separation is still absent at n=1 — with a candidate mechanism worth pre-thinking for the
+  analysis: under SHARED time, `fits_now`'s guard creates a silence window at every slot boundary
+  on every node, and C's alarms launch exactly there — so boundary-launched latency traffic may be
+  protected by the shared boundary itself, lanes or no lanes. If v3 completes with both arms high
+  and equal, THAT is the finding: µs-shared time + guard bands protect slot-start traffic
+  intrinsically, and lanes only pay for latency traffic that is NOT boundary-aligned (mid-slot
+  urgent frames, multi-frame alarm bursts) — the next registrable question.
+
+Bench wedge ranking after today: BOTH 8812au-family dongles (881a o5p-1 now; 8812 o5p-2 earlier)
+have hit the resets→disconnect wedge within ~6 h of heavy campaign RX. The a81a has not. Pattern
+worth a bench task: the wedge follows sustained RX under the shared pump on USB2/3 xhci resets.
