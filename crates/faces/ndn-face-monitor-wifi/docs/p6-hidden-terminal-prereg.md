@@ -167,3 +167,15 @@ its 50%-on-both-groups signature and fixed (obs is now raw-only, single consumer
 two runs discarded for a stale-binary deploy (a zigbuild error count was printed and not gated on —
 process error, now the deploy gates on zero errors). RSSI asymmetry at B (bulk −8..−11, alarm
 −1..−15) recorded; capture cannot explain the result since collisions were rare.
+
+## Claim-C v2 — registered 2026-08-13, before its runs
+
+Identical to the counted v1 arms in every respect except ONE pinned addition: **bulk payload =
+1400 B** (`BULK_PAYLOAD`, printed in every run header) ⇒ ~1.9 ms per frame at the pinned 6M ⇒ a
+lease-held 20 ms slot is substantially occupied (~10 back-to-back frames), which is the airtime
+pressure v1 lacked. Alarm frames stay small (latency traffic is small by nature).
+
+Arms: C-lanes (`RESERVE=4`) vs C-flat (`RESERVE=0`), 3 replicates interleaved, deaf-A throughout,
+same roles, same instrument log rules (nonce start=end; obs raw-only; deploy gated on zero build
+errors). Thresholds UNCHANGED from v1: PASS = every lanes replicate ≥ 90% alarm delivery AND
+mean(lanes) − mean(flat) ≥ 15 pp; REFUTED < 5 pp.

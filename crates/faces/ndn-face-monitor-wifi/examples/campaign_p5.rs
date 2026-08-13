@@ -42,7 +42,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pid = u16::from_str_radix(&std::env::var("NDN_PID").unwrap_or_else(|_| "a81a".into()), 16)?;
     let lat_per_sec: u64 = std::env::var("RATE").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
 
+    /// Claim-C v2: bulk frames are MTU-SIZED so a lease-held slot is substantially OCCUPIED, not
+    /// merely owned — v1 measured ~15-B frames at ~7% duty, and a lease's collision pressure is
+    /// its airtime, not its slot count. 1400 B ≈ 1.9 ms at 6M ≈ ~10 frames fill a 20 ms slot.
+    const BULK_PAYLOAD: usize = 1400;
+
+    fn pkt_sized(group: &str, seq: u32, total: usize) -> Bytes {
+        // Data(0x06) [ Name(0x07)[c1,c2] Content(0x15) pad ] with proper TLV lengths (0xfd u16
+        // form above 252) — the tiny-frame builder's single-byte lengths cap at 255 B total.
+        fn tlv(t: u8, v: &[u8]) -> Vec<u8> {
+            let mut o = vec![t];
+            if v.len() < 253 {
+                o.push(v.len() as u8);
+            } else {
+                o.push(0xfd);
+                o.extend_from_slice(&(v.len() as u16).to_be_bytes());
+            }
+            o.extend_from_slice(v);
+            o
+        }
+        let sseq = seq.to_string();
+        let mut name_v = Vec::new();
+        name_v.extend(tlv(0x08, group.as_bytes()));
+        name_v.extend(tlv(0x08, sseq.as_bytes()));
+        let name = tlv(0x07, &name_v);
+        let mut body = name;
+        if total > 0 {
+            let overhead = body.len() + 8; // outer TLV + content header slack
+            let pad = total.saturating_sub(overhead);
+            body.extend(tlv(0x15, &vec![0xa5u8; pad]));
+        }
+        Bytes::from(tlv(0x06, &body))
+    }
+
     fn pkt(group: &str, seq: u32) -> Bytes {
+        pkt_sized(group, seq, 0)
+    }
+
+    #[allow(dead_code)]
+    fn unused(group: &str, seq: u32) -> Bytes {
         let s = seq.to_string();
         let comps: [&[u8]; 2] = [group.as_bytes(), s.as_bytes()];
         let mut name = Vec::new();
@@ -104,7 +142,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         m.source_nonce().map(|n| n.iter().map(|b| format!("{b:02x}")).collect()).unwrap_or_default()
     };
     println!(
-        "role={role} ch{channel} pid={pid:04x} {secs}s txpwr={} nonce={}",
+        "role={role} ch{channel} pid={pid:04x} {secs}s txpwr={} nonce={} bulk_payload={BULK_PAYLOAD}",
         txpwr.map(|i| i.to_string()).unwrap_or_else(|| "default".into()),
         medium.as_ref().map(|m| nonce_hex(m)).unwrap_or_else(|| "raw".into())
     );
@@ -115,7 +153,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let end = Instant::now() + Duration::from_secs(secs);
             let mut seq = 0u32;
             while Instant::now() < end {
-                if medium.send_bytes(pkt("bulk", seq)).await.is_ok() {
+                if medium.send_bytes(pkt_sized("bulk", seq, BULK_PAYLOAD)).await.is_ok() {
                     seq += 1;
                 }
             }
