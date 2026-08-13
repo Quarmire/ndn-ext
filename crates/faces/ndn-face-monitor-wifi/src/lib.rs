@@ -118,9 +118,9 @@ pub use ndn_frame_io::{
 // etc. references in `control.rs`/`lib.rs`) keep working unchanged.
 #[cfg(feature = "libusb-backend")]
 pub use ndn_radio_drivers::{
-    CHIP_ID_8822E, ChannelBw, ChipInfo, FwVersion, IqkResult, LibUsbRtl88xxBackend, MT7612U_PIDS,
-    Mt7612uBackend, REALTEK_VID, REG_SYS_CFG, RTL88XX_PIDS, RTL8733B_PIDS, RTL8812AU_PIDS,
-    RTL8821CU_PIDS, RfPath, Rtl8733buBackend, Rtl8812auBackend, Rtl8821cuBackend,
+    CHIP_ID_8822E, ChannelBw, ChipInfo, DeviceSelect, FwVersion, IqkResult, LibUsbRtl88xxBackend,
+    MT7612U_PIDS, Mt7612uBackend, REALTEK_VID, REG_SYS_CFG, RTL88XX_PIDS, RTL8733B_PIDS,
+    RTL8812AU_PIDS, RTL8821CU_PIDS, RfPath, Rtl8733buBackend, Rtl8812auBackend, Rtl8821cuBackend,
 };
 
 // The BW16 (RTL8720DN) serial-bridged backend — a dual-band 802.11 node driven
@@ -159,7 +159,7 @@ pub use radio::{Bandwidth, DbmRange, OpenRadio, RadioKnobs, RadioProfile, RadioT
 
 // The data-centric time-slice (#61) + FHSS (#40) transmit scheduler, actuated at the TX path.
 mod sched;
-pub use sched::{FaceScheduler, TIME_BEACON_MAGIC, TimeStatus};
+pub use sched::{FaceScheduler, GroupTable, TIME_BEACON_MAGIC, TimeStatus};
 
 pub mod measure;
 

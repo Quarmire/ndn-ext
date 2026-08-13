@@ -146,6 +146,19 @@ Precompute one 94-bit mask per registered prefix. A test is two `u64` AND-compar
 is 2E word-ops per frame — for the hundreds of prefixes a node actually registers, hundreds of ns. This
 is why the big tables belong in Tier 1: the mask-scan is O(E) and only stays free while E is small.
 
+#### 3.3 F1 — the all-ones frame (found and closed 2026-08-12)
+
+The admission test above was **AND-only with no fill check**: `(frame_bf & mask) == mask` is satisfied
+by a frame with all 94 bits set, for *every* registered mask, at *every* node. One forged frame was a
+universal wake — and once the scheduler keys on the field (§6.2), it becomes network-wide presence
+forgery / claim suppression, amplified from one transmitter. Closed 2026-08-12: **`FILL_CAP = 48`**
+gates inside `may_match` in all three implementations (ndn-ext, the LR2021 firmware, the ath9k C),
+boundary exact-inclusive (48 passes, 49 fails), pinned by the golden vectors in
+`ndn-radio-drivers/golden/tier0/vectors.txt`. Scope, honestly: the cap removes the *amplified* attack;
+single-group presence forgery is inherent to unauthenticated MAC-level evidence and the cap does not
+pretend otherwise. And legitimate fill is a property of the **name**, not just its depth — one depth-8
+shape measures 27 bits set, another 30. Quote **30 as worst-case-observed**, never a formula.
+
 ### Tier 1 — receiver-side BF-FIB / BF-PIT / BF-CS (NDN-NIC, near-verbatim)
 
 Direction (b) — *the packet name is a prefix of my table entry* — cannot be answered from the frame's
@@ -195,6 +208,12 @@ busy. It is an energy detector wearing a token's clothes, and we have measured w
 does to this medium (LoRa LBT at N=3: delivered 205 → 64). **Tier 0 fixes it directly: AND the frame's
 BF against the current slot owner's mask and you know, without parsing, whether that frame was the
 owner using its turn.** The filter redesign is what makes the token a *named* token. **(#88)**
+
+> **F3, recorded 2026-08-12: the zero-parse claim is NOT what shipped.** As built, `observe_rx`
+> TLV-parses every captured frame and keys slots on `prefix_hash` at `NDN_SCHED_GROUP_DEPTH` — the
+> Tier-0 bytes reach the RX gate but never the scheduler, so the "AND against the owner's mask,
+> without parsing" step above (and the §6.2 re-key) exists only on paper. This is the open P1 work —
+> the "one filter, one map" companion doc — being closed now.
 
 ---
 
@@ -322,11 +341,21 @@ filter) — the redesign gives it its subject, and NDN-NIC gives it the comparis
 
 ### 6.4 The shared name-hash keyspace — task #44 is answered
 Open task #44 asks for one hash function shared across filter / FIB-prefix / PIT / generation-IDs.
-**The answer is one keyed family shared by every consumer**, with prefix hashes cached on name-tree
-nodes and reused. That was originally written as the paper's H3; it is **`siphash24`** — see the
-amended hash decision in §3.1 for why the security axis decides this and the speed axis does not.
-Sharing it is now literal rather than aspirational: `siphash24` already keys `EphemeralSource`, so the
-stack has one keyed-hash primitive rather than a second family. Close #44 against this design.
+This section originally answered it with **one keyed family shared by every consumer** — the paper's
+H3 at first, then `siphash24` per the amended hash decision in §3.1.
+
+> **Amended 2026-08-12 — the "one keyspace" claim was wrong.** #44 was closed 2026-08-11 with the
+> opposite conclusion: **three keyspaces are correct by design**, because the three consumers need
+> different properties, not the same one. (a) The **wire filter** needs a *keyed PRF* — SipHash-2-4
+> under the `GroupKey` — for the doctrine-§8 unforgeability that §3.1 argues; that part stands. (b)
+> The **scheduler** needs a *cheap unkeyed* hash that every node computes identically with no key
+> distribution — FNV-1a `prefix_hash`. (c) The **PIT key** is process-local and never leaves the node
+> — `DefaultHasher` is fine and forcing it into a shared family buys nothing. What actually must be
+> SHARED is not the hash function: it is the **name normalization** — the `/`-joined rendering,
+> `ndn_name_to_slash`; three renderings existed and are now pinned by a test in `tier1.rs` — and the
+> **granularity source**. Collapsing them onto one hash was solving the wrong invariant. The §3.1
+> `siphash24` decision is unchanged; its scope is the wire filter and `EphemeralSource`, not "every
+> consumer".
 
 ### 6.5 Relay-role population — task #45
 BF-FIB answers "do I serve this prefix?" in two word-ops, which is the input a node needs to decide

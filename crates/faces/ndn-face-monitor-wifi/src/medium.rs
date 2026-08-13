@@ -533,6 +533,9 @@ pub struct RadioMediumFace {
     /// monitor filters without transmitting at all. `with_bloom` sets both at once for the common
     /// case; `with_tx_bloom` / `with_rx_gate` set one.
     rx_gate: Option<Arc<crate::NameGate>>,
+    /// Registered-prefix table for the scheduler (P1), built by [`with_bloom`](Self::with_bloom)
+    /// from the same key + prefixes as the RX gate.
+    group_table: Option<Arc<crate::GroupTable>>,
     /// **Per-frame rate selection** (#82), when enabled: the cognition-decided [`TxParams`], else an
     /// adaptive/fixed [`McsPolicy`]. `None` ⇒ rate stays pure bearer state set out-of-band, the
     /// historical behaviour.
@@ -658,6 +661,7 @@ impl RadioMediumFace {
             legacy_gate: None,
             tx_bloom: None,
             rx_gate: None,
+            group_table: None,
             amsdu: None,
             rate: None,
         }
@@ -668,8 +672,11 @@ impl RadioMediumFace {
     /// source nonce moved to `addr3`; inbound frames are dropped before the engine unless their
     /// filter could be under one of `registered_prefixes` (given as `/`-strings). A relay passes
     /// several prefixes (its forwarding family); a leaf, one. Broadcast frames always pass.
-    pub fn with_bloom(self, key: &crate::GroupKey, registered_prefixes: &[impl AsRef<[u8]>]) -> Self {
+    pub fn with_bloom(mut self, key: &crate::GroupKey, registered_prefixes: &[impl AsRef<[u8]>]) -> Self {
         let masks = crate::bloom_masks_for(key, registered_prefixes);
+        // P1 ("one filter, one map"): the same (key, prefixes) that gate RX also key the slot map,
+        // built HERE so the gate and the scheduler cannot disagree about what is registered.
+        self.group_table = Some(Arc::new(crate::GroupTable::new(key, registered_prefixes)));
         self.with_tx_bloom(*key)
             .with_rx_gate(Arc::new(crate::NameGate::new(crate::RxFilter::Bloom(masks), None)))
     }
@@ -1068,6 +1075,7 @@ impl RunningMedium {
         let RadioMediumFace {
             id,
             mtu,
+            group_table,
             bearers,
             signal_sink,
             fec,
@@ -1145,8 +1153,13 @@ impl RunningMedium {
                     // Give the scheduler this bearer's rate policy so the #84 guard band sizes its
                     // airtime estimate from the rate we will actually transmit at, not from the
                     // conservative worst case (which would defer frames that would have fitted).
-                    match &rate {
+                    let s = match &rate {
                         Some(r) => s.with_rate(r.clone()),
+                        None => s,
+                    };
+                    // P1: slot key = longest registered prefix; RX attribution by mask AND.
+                    match &group_table {
+                        Some(t) => s.with_groups(t.clone()),
                         None => s,
                     }
                 })
@@ -1229,7 +1242,10 @@ impl RunningMedium {
                             // used to ride on the stamp branch above, so a radio whose driver reports
                             // no TSFT never marked the medium busy at all and claimed every slot.
                             if let Some(sched) = sched_rx.as_ref() {
-                                sched.observe_rx(&f.payload);
+                                // P1: hand the scheduler the Tier-0 bytes so attribution is a mask
+                                // AND, not a per-frame TLV parse (parse survives only for
+                                // broadcast-addressed legacy frames + first-sighting cold paths).
+                                sched.observe_rx(f.group.as_ref(), f.addr.as_ref(), &f.payload);
                             }
                             // #74: the MESH hardware common-view — discipline the scheduler's clock to a
                             // neighbour's HW-TSF-stamped timing beacon (pair (peer_tsf, our_rxtsfl), both

@@ -18,8 +18,9 @@
 //! - `NDN_SCHED_SLOT=N:slot_us` — time-slice on: `N` slots of `slot_us` µs (e.g. `8:3000`).
 //! - `NDN_SCHED_HOP=ch,ch,…:dwell_us` — FHSS on: hop over these **real channel numbers**, dwelling
 //!   `dwell_us` µs each (e.g. `1,6,11:120000` for non-overlapping 2.4 GHz).
-//! - `NDN_SCHED_GROUP_DEPTH=k` — name-group granularity: hash the first `k` name components (default 1,
-//!   so all data under a top prefix shares a slot/channel — the *group*, not each object).
+//! - grouping: the registered-prefix table (P1) — slot key = longest registered prefix covering
+//!   the name, so all data under one registered prefix shares a slot/channel (depth-1
+//!   first-component fallback when no table is attached; NDN_SCHED_GROUP_DEPTH is deleted).
 //! - `NDN_SCHED_CLOCK=wall|hw|cv` — epoch source (default `wall`). `cv` = the radio-native common-view
 //!   clock disciplined to a clock-master's time-beacon (cross-node aligned with no NTP/AP).
 //! - `NDN_SCHED_MASTER=1` — this node is the clock master: it broadcasts the time-beacon that `cv`
@@ -90,6 +91,91 @@ impl ClockSource {
     }
 }
 
+/// **The registered name-groups the scheduler keys on** (P1 / redesign §6.2) — "one filter, one map".
+///
+/// Before this, the slot key was `prefix_hash` over the first `NDN_SCHED_GROUP_DEPTH` name
+/// components — a per-node env var deciding a SHARED map, the same hazard class as a hand-edited
+/// slot width: two nodes with different depths silently compute different schedules. The table
+/// replaces it: the slot key is the **longest registered prefix covering the name**, and the
+/// registration set is what nodes must share (they already must, to talk at all).
+///
+/// Each entry carries the prefix's Tier-0 mask, so an inbound frame is attributed by a mask AND
+/// against `addr1‖addr2` — no TLV parse — and the entry's hash, precomputed in the scheduler's
+/// cheap `prefix_hash` keyspace (#44: deliberately NOT the wire's keyed SipHash — the slot map must
+/// be computable by every node identically, the wire filter must be unforgeable; different
+/// requirements, different hashes, shared *normalization*).
+pub struct GroupTable {
+    /// Sorted longest-prefix-first, so the first match IS the longest match on both paths.
+    entries: Vec<GroupEntry>,
+}
+
+struct GroupEntry {
+    /// The `/`-joined prefix bytes (the shared normalization).
+    prefix: Vec<u8>,
+    /// Tier-0 mask for RX attribution without a parse.
+    mask: crate::PrefixFilter,
+    /// `prefix_hash` over the prefix's components — the slot key.
+    hash: u64,
+}
+
+impl GroupTable {
+    /// Build from the same `(key, prefixes)` the Tier-0 RX gate is built from, so the gate and the
+    /// scheduler cannot disagree about what is registered.
+    pub fn new(key: &crate::GroupKey, prefixes: &[impl AsRef<[u8]>]) -> Self {
+        let k = crate::bloom_key64(key);
+        let mut entries: Vec<GroupEntry> = prefixes
+            .iter()
+            .map(|p| {
+                let prefix = p.as_ref().to_vec();
+                let comps: Vec<&[u8]> =
+                    prefix.split(|&b| b == b'/').filter(|c| !c.is_empty()).collect();
+                GroupEntry {
+                    mask: crate::PrefixFilter::mask_for(k, &prefix),
+                    hash: prefix_hash(&comps),
+                    prefix,
+                }
+            })
+            .collect();
+        entries.sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
+        Self { entries }
+    }
+
+    /// Slot key for a name in `/`-joined form: the longest registered prefix covering it.
+    /// Component-boundary aware: `/a` covers `/a/b` and `/a`, never `/ab`.
+    fn hash_for_name(&self, slash: &[u8]) -> Option<u64> {
+        self.entries
+            .iter()
+            .find(|e| {
+                slash.starts_with(&e.prefix)
+                    && (slash.len() == e.prefix.len() || slash[e.prefix.len()] == b'/')
+            })
+            .map(|e| e.hash)
+    }
+
+    /// Slot key for a received Tier-0 filter: first (= longest) registered mask it may be under.
+    fn hash_for_filter(&self, f: &crate::PrefixFilter) -> Option<u64> {
+        self.entries.iter().find(|e| f.may_match(&e.mask)).map(|e| e.hash)
+    }
+}
+
+/// Bound on the learned-group mask cache (P1.5): filters we could not attribute to a registered
+/// prefix, parsed once and remembered so an unregistered group's slot stays claimable without a
+/// per-frame parse.
+///
+/// **A security bound, not a tuning knob**: the cache is memory an unauthenticated sender can fill
+/// — each novel filter costs one parse and one entry — so it gets the FILL_CAP treatment. Eviction
+/// is oldest-last-heard first, which is simultaneously LRU *and* the presence-pinning the design
+/// asked for: a group with live presence evidence is by definition recently heard. Under a
+/// novel-group spray the cache degrades toward known-groups-only — fewer opportunistic claims,
+/// never a collision, never a false negative — i.e. the adversary's best case is the design
+/// alternative we rejected, with `ambient`-style counters watching.
+///
+/// Deliberately NOT in `Tier0Params`/the golden vectors, despite the plan doc: it is a node-local
+/// resource bound with no wire-compat consequence — two nodes with different caps still interoperate
+/// — and pinning it cross-implementation would force the receive-only C copy to assert a parameter
+/// that is meaningless to it.
+const LEARNED_GROUP_CAP: usize = 64;
+
 /// The 3-byte tag that marks a [`FaceScheduler`] time-beacon on the wire, chosen to not collide with
 /// an NDN packet's first byte (Interest `0x05` / Data `0x06` / LP `0x64`). Followed by the master's
 /// monotonic reference time in microseconds, 8 bytes little-endian.
@@ -126,7 +212,14 @@ pub struct FaceScheduler {
     slot: Option<SlotSchedule>,
     hop: Option<HopSchedule>,
     /// Name-group depth — how many leading name components define the group the schedule keys on.
-    group_depth: usize,
+    /// Registered name-groups (P1): slot key = longest registered prefix; RX attribution by mask
+    /// AND. `None` ⇒ the depth-1 fallback below — the pre-P1 default behaviour, kept so every
+    /// measurement taken without a registration set still describes the shipping code.
+    groups: Option<std::sync::Arc<GroupTable>>,
+    /// Parse-once cache for unregistered Tier-0 groups: wire bytes → slot hash, bounded by
+    /// [`LEARNED_GROUP_CAP`] with oldest-last-heard eviction (= LRU = presence-pinning, see the
+    /// constant). Keyed on the raw 12 bytes so a hit costs a HashMap probe, not a parse.
+    learned: Mutex<std::collections::HashMap<[u8; 12], (u64, u64)>>,
     clock_source: ClockSource,
     /// Retune knob for FHSS (per-bearer; `None` ⇒ can't hop this bearer, slot-only).
     knobs: Option<std::sync::Arc<dyn RadioKnobs>>,
@@ -243,11 +336,9 @@ impl FaceScheduler {
         if slot.is_none() && hop.is_none() {
             return None;
         }
-        let group_depth = std::env::var("NDN_SCHED_GROUP_DEPTH")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .unwrap_or(1)
-            .max(1);
+        // NDN_SCHED_GROUP_DEPTH is GONE (P1): a per-node env var deciding a shared map is the same
+        // hazard as a hand-edited slot width. Grouping now comes from the registered-prefix table
+        // (`with_groups`), with a fixed depth-1 fallback that is uniform by construction.
         let master = std::env::var("NDN_SCHED_MASTER").ok().as_deref() == Some("1");
         let claimable = std::env::var("NDN_SCHED_CLAIM").ok().as_deref() == Some("1");
         // Our node id for the network-reference election (#75): lowest id wins. Default u64::MAX = "never
@@ -259,7 +350,8 @@ impl FaceScheduler {
         Some(Self {
             slot,
             hop,
-            group_depth,
+            groups: None,
+            learned: Mutex::new(std::collections::HashMap::new()),
             clock_source,
             knobs,
             bw,
@@ -435,7 +527,13 @@ impl FaceScheduler {
             parts.push(format!("hop({:?}, dwell {}µs)", h.classes(), h.dwell_remaining_us(0)));
         }
         let role = if self.master { " [clock-master]" } else { "" };
-        format!("scheduler: {} clock={:?}{} group_depth={}", parts.join(" + "), self.clock_source, role, self.group_depth)
+        format!(
+            "scheduler: {} clock={:?}{} groups={}",
+            parts.join(" + "),
+            self.clock_source,
+            role,
+            self.groups.as_ref().map(|g| g.entries.len()).unwrap_or(0)
+        )
     }
 
     /// Feed a hardware RX timestamp into the disciplined clock (called from the RX reader for every
@@ -473,13 +571,35 @@ impl FaceScheduler {
     /// throughput gain with the evidence gate forced open — delivered ~0 with it closed. Foreign
     /// traffic is interference, not a statement about the slot owner, so it is counted and dropped
     /// here rather than allowed to veto a claim.
-    pub fn observe_rx(&self, wire: &[u8]) {
+    /// `group`/`addr` are the frame's addr1/addr2 — the Tier-0 bytes when the sender addresses by
+    /// name. **P1 makes them the primary attribution path**: on a Tier-0 medium the hot path is an
+    /// origin check plus a mask AND, and the TLV parse survives only on the broadcast-addressed
+    /// legacy path (the pre-Tier-0 frame shape every pre-P1 measurement, including the +119% claim
+    /// run, was taken under) and on the first sighting of an unregistered group.
+    pub fn observe_rx(&self, group: Option<&[u8; 6]>, addr: Option<&[u8; 6]>, wire: &[u8]) {
         if !self.claimable {
             return;
         }
         let now = self.now_us();
-        // Key the same way TX does, so the slot indices agree (#89).
-        let Some(hash) = self.name_group_hash(wire) else {
+
+        // ---- Triage by frame shape, cheapest test first (P1.5) ----
+        let hash = match (group, addr) {
+            // Broadcast addr1 = the legacy NDN frame shape (no filter on the wire; the name is the
+            // only group evidence). Parse, exactly as before P1 — dropping this would regress the
+            // non-Tier-0 configuration the slot MAC was measured under.
+            (Some(g), _) if *g == ndn_radio_hal::BROADCAST => self.name_group_hash(wire),
+            // Possible Tier-0 filter: addr1‖addr2 carry the prefix set.
+            (Some(g), Some(a)) => {
+                let mut w = [0u8; 12];
+                w[..6].copy_from_slice(g);
+                w[6..].copy_from_slice(a);
+                self.attribute_filter(w, wire, now)
+            }
+            // A capture path that surfaces no addresses cannot be attributed by filter; fall back
+            // to the parse rather than silently blinding the busy mark.
+            _ => self.name_group_hash(wire),
+        };
+        let Some(hash) = hash else {
             self.ambient_rx.fetch_add(1, Ordering::Relaxed);
             return;
         };
@@ -505,6 +625,15 @@ impl FaceScheduler {
     /// Bind the bearer's rate policy so the guard band's airtime estimate uses the decided rate.
     pub fn with_rate(mut self, rate: std::sync::Arc<crate::RatePolicy>) -> Self {
         self.rate = Some(rate);
+        self
+    }
+
+    /// Attach the registered-prefix table (P1): the slot key becomes the longest registered prefix
+    /// covering a name, and RX attribution becomes a mask AND on the Tier-0 bytes instead of a
+    /// per-frame TLV parse.
+    #[must_use]
+    pub fn with_groups(mut self, groups: std::sync::Arc<GroupTable>) -> Self {
+        self.groups = Some(groups);
         self
     }
 
@@ -926,9 +1055,63 @@ impl FaceScheduler {
     /// Hash the frame's first `group_depth` name components — the shared `prefix_hash` keyspace (§44),
     /// so the schedule keys on the same name-group as demand/consistency. `None` if the wire carries no
     /// parseable Name (non-first LP fragment, control frame, parse miss).
+    /// **Attribute a Tier-0-shaped frame without parsing it** (P1.5): origin gate, then the
+    /// registered masks, then the learned cache; the TLV parse is the cold path for the first
+    /// sighting of an unregistered group only.
+    fn attribute_filter(&self, w: [u8; 12], wire: &[u8], now: u64) -> Option<u64> {
+        // Origin gate — no parse, no allocation. Our Tier-0 frames force octet 0's I/G+U/L to
+        // local-group (`to_wire`); foreign unicast has U/L=0 and fails the bit test; foreign
+        // broadcast/high-fill fails the FILL_CAP that F1 installed for exactly this dual purpose.
+        // Frames failing here are AMBIENT: they touch neither the busy mark nor presence.
+        if w[0] & 0b0000_0011 != 0b0000_0011 {
+            return None;
+        }
+        let f = crate::PrefixFilter::from_wire(w);
+        let pc = f.popcount();
+        if pc == 0 || pc > crate::tier0::FILL_CAP {
+            return None;
+        }
+        // Registered groups: longest-first mask AND — the map the slot key uses, so TX and RX land
+        // on the same slot by construction.
+        if let Some(groups) = &self.groups
+            && let Some(h) = groups.hash_for_filter(&f)
+        {
+            return Some(h);
+        }
+        // Learned cache: an unregistered group's slot stays claimable at the cost of ONE parse ever
+        // (bounded — see LEARNED_GROUP_CAP for why this is a security bound, not a tuning knob).
+        let mut learned = self.learned.lock().ok()?;
+        if let Some((h, seen)) = learned.get_mut(&w) {
+            *seen = now;
+            return Some(*h);
+        }
+        let h = self.name_group_hash(wire)?; // cold path: first sighting only
+        if learned.len() >= LEARNED_GROUP_CAP
+            && let Some(oldest) = learned.iter().min_by_key(|(_, (_, seen))| *seen).map(|(k, _)| *k)
+        {
+            // Oldest-last-heard first = LRU = presence-pinning in one rule: a presence-active
+            // group is by definition recently heard, so it is never the eviction victim.
+            learned.remove(&oldest);
+        }
+        learned.insert(w, (h, now));
+        Some(h)
+    }
+
     fn name_group_hash(&self, wire: &[u8]) -> Option<u64> {
         let name_tlv = crate::inner_name(wire)?;
-        let comps = name_components(name_tlv, self.group_depth);
+        // P1: the slot key is the longest REGISTERED prefix covering the name — the granularity the
+        // receivers actually operate at, from the shared registration set rather than a per-node
+        // env depth. The `/`-joined form is the shared normalization (#44), so this and the Tier-0
+        // masks speak about the same bytes.
+        if let Some(groups) = &self.groups {
+            let slash = crate::ndn_name_to_slash(name_tlv);
+            if let Some(h) = groups.hash_for_name(&slash) {
+                return Some(h);
+            }
+        }
+        // Fallback (no table, or an unregistered name): first component, fixed depth 1 — the
+        // pre-P1 default, uniform across nodes by construction rather than by matching env vars.
+        let comps = name_components(name_tlv, 1);
         if comps.is_empty() {
             return None;
         }
@@ -1054,7 +1237,8 @@ mod tests {
         let mk = || FaceScheduler {
             slot: parse_slot("8:3000", 1500, ClockSource::Wall),
             hop: None,
-            group_depth: 1,
+            groups: None,
+            learned: super::Mutex::new(std::collections::HashMap::new()),
             clock_source: ClockSource::CommonView,
             knobs: None,
             bw: crate::Bandwidth::default(),
@@ -1096,7 +1280,8 @@ mod tests {
         let s = FaceScheduler {
             slot: parse_slot("8:3000", 1500, ClockSource::Wall),
             hop: None,
-            group_depth: 1,
+            groups: None,
+            learned: super::Mutex::new(std::collections::HashMap::new()),
             clock_source: ClockSource::CommonView,
             knobs: None,
             bw: crate::Bandwidth::default(),
@@ -1174,7 +1359,8 @@ mod tests {
         let sched = FaceScheduler {
             slot: parse_slot("4:3000", 1500, ClockSource::Wall),
             hop: None,
-            group_depth: 1,
+            groups: None,
+            learned: super::Mutex::new(std::collections::HashMap::new()),
             clock_source: ClockSource::CommonView,
             knobs: None,
             bw: crate::Bandwidth::default(),
@@ -1329,7 +1515,8 @@ mod tests {
         let sched = FaceScheduler {
             slot: parse_slot("8:3000", 1500, ClockSource::Wall),
             hop: None,
-            group_depth: 1,
+            groups: None,
+            learned: super::Mutex::new(std::collections::HashMap::new()),
             clock_source: ClockSource::Wall,
             knobs: None,
             bw: crate::Bandwidth::default(),
@@ -1380,7 +1567,7 @@ mod tests {
         );
 
         // Overhearing that group is the evidence, and it lands on THAT group's slot only.
-        sched.observe_rx(&wire);
+        sched.observe_rx(Some(&ndn_radio_hal::BROADCAST), None, &wire);
         assert!(
             sched.heard_by_slot[owned].load(super::Ordering::Relaxed) > 0,
             "hearing /ndn/alarm must mark the slot /ndn/alarm owns"
@@ -1424,7 +1611,7 @@ mod tests {
             "the fixture must really be un-attributable, or this test proves nothing"
         );
 
-        sched.observe_rx(&ambient);
+        sched.observe_rx(Some(&ndn_radio_hal::BROADCAST), None, &ambient);
         assert_eq!(
             sched.last_domain_rx.load(super::Ordering::Relaxed),
             0,
@@ -1441,7 +1628,7 @@ mod tests {
         );
 
         // The contrast: a frame of ours does mark it, so this is a discrimination and not a mute.
-        sched.observe_rx(&data_wire(&[b"ndn", b"alarm"]));
+        sched.observe_rx(Some(&ndn_radio_hal::BROADCAST), None, &data_wire(&[b"ndn", b"alarm"]));
         assert!(
             sched.last_domain_rx.load(super::Ordering::Relaxed) > 0,
             "our own domain's traffic must still mark the slot taken"
@@ -1658,6 +1845,50 @@ mod tests {
         s
     }
 
+    /// **One filter, one map** (P1): the slot key a TX node derives from the wire name and the slot
+    /// a RX node attributes from the Tier-0 bytes must agree — with the LONGEST registered prefix
+    /// winning on both paths — and a foreign unicast frame must die at the origin gate without a
+    /// parse. This is the property the whole redesign exists for; if it fails, two nodes compute
+    /// different maps and every downstream measurement is noise.
+    #[test]
+    fn tx_keying_and_rx_attribution_land_on_the_same_slot() {
+        let key = crate::GroupKey([9u8; 16]);
+        let table = std::sync::Arc::new(super::GroupTable::new(
+            &key,
+            &[b"/ndn".as_slice(), b"/ndn/alarm".as_slice()],
+        ));
+        let mut s = mk_claim_sched();
+        s.groups = Some(table.clone());
+
+        // TX path: an /ndn/alarm/… name keys on /ndn/alarm (longest), not /ndn.
+        let wire = data_wire(&[b"ndn", b"alarm", b"7"]);
+        let tx_hash = s.name_group_hash(&wire).expect("keyed");
+        let alarm_comps: Vec<&[u8]> = vec![b"ndn", b"alarm"];
+        assert_eq!(tx_hash, prefix_hash(&alarm_comps), "longest registered prefix wins on TX");
+
+        // RX path: the same object's Tier-0 bytes attribute to the same hash via mask AND — no parse
+        // (the wire handed over is garbage on purpose: reaching the parser would panic the premise).
+        let mut f = crate::PrefixFilter::default();
+        f.insert_name(crate::bloom_key64(&key), b"/ndn/alarm/7");
+        let w = f.to_wire();
+        let rx_hash = s.attribute_filter(w, b"\xff not parseable", s.now_us()).expect("attributed");
+        assert_eq!(rx_hash, tx_hash, "RX mask attribution and TX keying disagree — two maps");
+
+        // Foreign unicast (U/L=0 first octet): ambient at the origin gate, nothing marked.
+        let mut foreign = w;
+        foreign[0] = 0x00;
+        assert_eq!(s.attribute_filter(foreign, b"", s.now_us()), None, "foreign unicast is ambient");
+
+        // Unregistered group: parse-once, then cache hits keep the slot claimable with no parse.
+        let mut other = crate::PrefixFilter::default();
+        other.insert_name(crate::bloom_key64(&key), b"/zzz/bulk");
+        let ow = other.to_wire();
+        let good_wire = data_wire(&[b"zzz", b"bulk"]);
+        let first = s.attribute_filter(ow, &good_wire, s.now_us()).expect("cold parse");
+        let second = s.attribute_filter(ow, b"unparseable", s.now_us()).expect("cache hit");
+        assert_eq!(first, second, "the learned cache must return the parsed hash");
+    }
+
     /// A Data frame carrying `comps` as its name — what a neighbour of that group puts on air.
     fn data_wire(comps: &[&[u8]]) -> Vec<u8> {
         let mut name = Vec::new();
@@ -1678,7 +1909,8 @@ mod tests {
         FaceScheduler {
             slot: parse_slot("8:3000", 1500, ClockSource::Wall),
             hop: None,
-            group_depth: 1,
+            groups: None,
+            learned: super::Mutex::new(std::collections::HashMap::new()),
             clock_source: ClockSource::Wall,
             knobs: None,
             bw: crate::Bandwidth::default(),
