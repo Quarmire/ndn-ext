@@ -132,3 +132,38 @@ delivery and A's hold_continuations-through-the-alarm-slot, per arm.
 nonce feeds A's `NDN_SCHED_DEAF_SRC`; verified live (nonce stable across a 90 s run, deafness
 applied in the RX hook before the scheduler). The BEHAVIOURAL validation coincides with the
 campaign's own C-flat arm and is not double-counted as a separate gate.
+
+## RESULTS — 2026-08-13, counted arms (3×2 interleaved, deaf-A throughout)
+
+| arm | rep | /alarm delivery (of 282) | bulk sent | A elections/holds |
+|---|---|---|---|---|
+| L (lanes) | 1r | 274 = 97.2% | 25,254 | 214 / 15,514 |
+| L | 2 | 276 = 97.9% | 27,922 | 216 / 16,782 |
+| L | 3 | 279 = 98.9% | 30,317 | 214 / 17,956 |
+| F (flat) | 1 | 267 = 94.7% | 24,392 | 219 / 15,378 |
+| F | 2 | 271 = 96.1% | 28,786 | 216 / 18,249 |
+| F | 3 | 271 = 96.1% | 24,954 | 218 / 15,994 |
+
+Means: lanes 98.0%, flat 95.6%. **Difference 2.4 pp < the 5 pp refuted bar ⇒ REFUTED as
+registered** — though note the effect is REAL: direction as predicted in all pairs and the ranges
+are disjoint (lanes min 97.2 > flat max 96.1). The mechanism exists; its magnitude at this load is
+~2 pp, not the ≥15 pp registered.
+
+**Diagnosis, quantitative.** A's frames are ~15 B ≈ 90 µs at 6M; at ~750 f/s that is **~7% airtime
+duty**. A lease grants the RIGHT to a slot, but with frames this small the right is not OCCUPATION:
+in the flat arm the lease "covers" /alarm's slot while A is on-air ~7% of it, so alarm collision
+probability ≈ duty ⇒ flat delivery ≈ 93–96% (observed 95.6%). The hidden-terminal deafness worked
+exactly as built (A never yielded — holds ran full; the ~2 pp deficit is the collisions that DID
+happen); what was missing is airtime pressure. The prereg pinned rate and slots but not PAYLOAD
+SIZE — the third campaign in a row where the unpinned variable was the story.
+
+**Claim-C v2 (to register before any re-run): identical arms with MTU-sized bulk payloads**
+(~1400 B ≈ 2 ms at 6M ⇒ a lease-held slot is ~substantially occupied), same thresholds. Predicted:
+flat collapses toward ~duty-limited delivery, lanes hold ≥90%.
+
+Instrument log: nonce-rotation self-invalidation fired once (as designed); one 881a open-failure
+re-run (signature: empty obs + A elections≈1); the raw-meter/medium-reader HALF-SPLIT was caught by
+its 50%-on-both-groups signature and fixed (obs is now raw-only, single consumer — batch discarded);
+two runs discarded for a stale-binary deploy (a zigbuild error count was printed and not gated on —
+process error, now the deploy gates on zero errors). RSSI asymmetry at B (bulk −8..−11, alarm
+−1..−15) recorded; capture cannot explain the result since collisions were rare.
