@@ -70,6 +70,9 @@ fn lab_sched(slot: SlotSchedule, groups: Option<Arc<GroupTable>>) -> FaceSchedul
         ambient_rx: AtomicU64::new(0),
         claim_attempts: AtomicU64::new(0),
         claim_wins: AtomicU64::new(0),
+        elections: AtomicU64::new(0),
+        elections_won: AtomicU64::new(0),
+        hold_continuations: AtomicU64::new(0),
         heard_by_slot: (0..slot.slots()).map(|_| AtomicU64::new(0)).collect(),
         nonce_by_slot: (0..slot.slots()).map(|_| AtomicU64::new(0)).collect(),
         deferred_by_slot: (0..slot.slots()).map(|_| AtomicU32::new(0)).collect(),
@@ -416,6 +419,74 @@ async fn prop_p6_residual_pure_silent_relay_still_collides() {
         collision_at_b,
         "residual UNEXPECTEDLY CLOSED: the pure-silent-relay claim was refused. If a report-fed          (second-hand) mechanism now closes it, flip this to assert the refusal."
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// P10 — the election/hold counter split (the P5-campaign anomaly, returned as a property).
+// ---------------------------------------------------------------------------------------------
+
+/// **A lease burst is continuations, not elections** — the distinction `claim_attempts` erased.
+/// The P5 campaign registered claim B on attempts-per-sent and found the counter dominated by
+/// per-frame hold checks (87–91% "win rates" were holds), so the metric could not see election
+/// cost at all. The split counters make the claim measurable: exactly ONE election is paid per won
+/// lease, and every subsequent frame in the burst is a continuation.
+#[tokio::test]
+async fn prop_p10_a_lease_burst_pays_one_election() {
+    let slot = SlotSchedule::new(3000, 8);
+    let mut s = lab_sched(slot, None);
+    s.lease_max = 8;
+    let s = s;
+    let h_raw = prefix_hash(&[b"mine"]);
+    let h = s.medium_keyed(h_raw);
+    let air = wifi_airtime_us(200, Some(7));
+
+    // A claimable situation: fresh singleton evidence everywhere, silence, own turn distant.
+    let own = slot.owner_slot_in(h, LeaseClass::Bulk);
+    let mut won = false;
+    for _ in 0..6 {
+        wait_for_slot(&s, |k, now| {
+            k != own && slot.wait_us_in(h, LeaseClass::Bulk, now) > slot.slot_us()
+        })
+        .await;
+        for c in s.heard_by_slot.iter() {
+            c.store(s.now_us().saturating_sub(1), Ordering::Relaxed);
+        }
+        s.last_domain_rx.store(0, Ordering::Relaxed);
+        if s.try_claim(&slot, h, LeaseClass::Bulk, air).await {
+            won = true;
+            break;
+        }
+    }
+    assert!(won, "fixture: the election must be winnable");
+    let (elections, elections_won, holds) = s.election_counts();
+    assert_eq!(elections_won, 1, "one win");
+    assert!(holds == 0, "no continuations yet — the win itself is not a continuation");
+    let elections_paid = elections; // could be >1: earlier attempts may have lost their draw
+
+    // The burst: every further frame inside the leased window must be a CONTINUATION — zero new
+    // elections. This is the fact the campaign metric was blind to.
+    let mut continued = 0;
+    while continued < 5 {
+        if s.try_claim(&slot, h, LeaseClass::Bulk, air).await {
+            continued += 1;
+        } else {
+            break; // lease boundary reached (wall clock) — however many we got, none elected
+        }
+    }
+    let (e2, w2, h2) = s.election_counts();
+    assert_eq!(
+        e2, elections_paid,
+        "a burst inside a won lease paid {} extra election(s) — the lease is not amortizing",
+        e2 - elections_paid
+    );
+    assert_eq!(h2 as usize, continued, "every burst frame is a continuation");
+    assert_eq!(w2, 1, "and none of them is a new election win");
+
+    // And the compat counter still conflates them, by documented design — the reason B needed
+    // re-registration on election_counts rather than a silent redefinition of claim_counts.
+    let (attempts, wins) = s.claim_counts();
+    assert!(attempts as usize >= 1 + continued);
+    assert_eq!(wins as usize, 1 + continued);
 }
 
 // ---------------------------------------------------------------------------------------------

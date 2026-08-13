@@ -164,7 +164,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Every role reports the scheduler's own instrumentation — the counters the prereg names.
     if let Some(s) = medium.scheduler() {
         let (attempts, wins) = s.claim_counts();
+        let (elections, ewins, holds) = s.election_counts();
         println!("claim attempts/wins: {attempts} / {wins}");
+        println!("elections paid/won : {elections} / {ewins}   hold continuations: {holds}");
         println!("ambient frames    : {}", s.ambient_frames());
     }
     Ok(())

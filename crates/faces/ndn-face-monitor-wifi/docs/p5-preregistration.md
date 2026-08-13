@@ -62,6 +62,24 @@ conservatism working as designed. Fix: `/light` moves to the `obs` node (own non
 legitimately claimable; 1 f/s is far below the 881a's sustained-TX brownout regime). Thresholds
 unchanged. The campaign proper is 3×3 interleaved runs under this tooling.
 
+## Claim B v2 — re-registered 2026-08-13, before its runs (after the counter split, lab P10)
+
+The v1 metric (`claim_attempts`-per-sent) was found conflated: attempts count per-frame HOLD
+CHECKS, so a lease's continuations swamped its elections (87–91% "win rates" were holds). The
+split counters land with lab property P10 (a won lease pays exactly one election; every burst
+frame is a continuation; verified against the conflation defect).
+
+Arms unchanged (`NDN_SCHED_RESERVE=4`, claim on): **B-8** `LEASE=8` vs **B-1** `LEASE=1`,
+3 replicates each, interleaved. Counter: `bulk`'s `elections paid` and `sent`.
+
+Pre-named threshold: **PASS** if elections-per-sent(B-8) < 0.5 × elections-per-sent(B-1), with
+sent(B-8) ≥ sent(B-1). **Refuted** if the ratio does not at least halve — meaning the burst is not
+actually riding the lease (frames arrive slower than the lease window) or wins are too rare for
+amortization to matter. Secondary report (not thresholded): hold continuations per election won.
+
+Commit verification rule (the process defect above): this amendment is verified present with
+`git ls-files` before the first B-v2 run.
+
 ## Deferred, explicitly
 
 Campaign (c) — #101's four arms swept over E, Wi-Fi and LoRa reported separately — is its own

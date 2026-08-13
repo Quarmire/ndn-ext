@@ -297,6 +297,15 @@ pub struct FaceScheduler {
     /// happens and loses.
     claim_attempts: AtomicU64,
     claim_wins: AtomicU64,
+    /// **Elections actually paid** (the P5 counter split): times the fresh CCLF path was entered —
+    /// i.e. the jitter was slept. This is the cost claim B is about; `claim_attempts` counts every
+    /// `try_claim` entry including per-frame hold checks, which the P5 campaign found dominates the
+    /// count under a lease (87–91% "win rates" were holds) and cannot see elections at all.
+    elections: AtomicU64,
+    /// Elections won (the claimant survived its jitter with the slot still silent).
+    elections_won: AtomicU64,
+    /// Hold continuations: frames that rode an already-won lease without re-contending (#95/#93).
+    hold_continuations: AtomicU64,
     /// The bearer's rate policy, so the airtime estimate behind the guard band (#84) uses the rate
     /// we will actually transmit at. `None` ⇒ assume the conservative broadcast rate, which
     /// over-estimates airtime — the safe direction, since a too-large estimate only defers us by a
@@ -400,6 +409,9 @@ impl FaceScheduler {
             ambient_rx: AtomicU64::new(0),
             claim_attempts: AtomicU64::new(0),
             claim_wins: AtomicU64::new(0),
+            elections: AtomicU64::new(0),
+            elections_won: AtomicU64::new(0),
+            hold_continuations: AtomicU64::new(0),
             heard_by_slot: (0..slot_count).map(|_| AtomicU64::new(0)).collect(),
             nonce_by_slot: (0..slot_count).map(|_| AtomicU64::new(0)).collect(),
             deferred_by_slot: (0..slot_count).map(|_| AtomicU32::new(0)).collect(),
@@ -838,6 +850,10 @@ impl FaceScheduler {
         // indistinguishable from stealing it.
         match self.hold_status(slot, slot_start, now, airtime) {
             HoldStatus::Continue => {
+                // A continuation is NOT an election: no jitter was paid, no contention happened.
+                // (claim_wins keeps counting it for compatibility with the +119% methodology's
+                // "attempts ≈ wins ⇒ throttled gate" diagnostic — documented at claim_counts.)
+                self.hold_continuations.fetch_add(1, Ordering::Relaxed);
                 self.claim_wins.fetch_add(1, Ordering::Relaxed);
                 self.note_sent(hash);
                 return true; // still ours, still room — continue the burst.
@@ -868,6 +884,7 @@ impl FaceScheduler {
             return false;
         }
         // CCLF: wait our jitter; if the slot is STILL idle (no one claimed first), take it.
+        self.elections.fetch_add(1, Ordering::Relaxed); // the jitter IS the election's cost
         tokio::time::sleep(Duration::from_micros(jitter)).await;
         if self.last_domain_rx.load(Ordering::Relaxed) >= slot_start {
             return false; // overheard a claimant first → cancel, and wait for our owned slot.
@@ -880,6 +897,7 @@ impl FaceScheduler {
             slot.lease_deadline_us(now, LeaseClass::Bulk, self.lease_max),
             Ordering::Relaxed,
         );
+        self.elections_won.fetch_add(1, Ordering::Relaxed);
         self.claim_wins.fetch_add(1, Ordering::Relaxed);
         self.note_sent(hash);
         true
@@ -898,6 +916,20 @@ impl FaceScheduler {
     /// would have named the 2026-08-11 defect in one run instead of a campaign: a throttling gate
     /// with `attempts == frames` means each waiting frame contended exactly once and then slept
     /// through every slot it could have taken.
+    /// `(elections paid, elections won, hold continuations)` — the split the P5 campaign forced:
+    /// `claim_counts` conflates per-frame hold checks with contention, so it cannot measure whether
+    /// a lease amortizes elections. An election is counted when the jitter is actually slept.
+    pub fn election_counts(&self) -> (u64, u64, u64) {
+        (
+            self.elections.load(Ordering::Relaxed),
+            self.elections_won.load(Ordering::Relaxed),
+            self.hold_continuations.load(Ordering::Relaxed),
+        )
+    }
+
+    /// NOTE: attempts here = every `try_claim` entry INCLUDING hold checks (the fourth-suppressor
+    /// diagnostic "attempts ≈ frames ⇒ throttled gate" depends on that meaning); for election cost
+    /// use [`election_counts`](Self::election_counts).
     pub fn claim_counts(&self) -> (u64, u64) {
         (self.claim_attempts.load(Ordering::Relaxed), self.claim_wins.load(Ordering::Relaxed))
     }
@@ -1366,6 +1398,9 @@ mod tests {
             ambient_rx: super::AtomicU64::new(0),
             claim_attempts: super::AtomicU64::new(0),
             claim_wins: super::AtomicU64::new(0),
+            elections: super::AtomicU64::new(0),
+            elections_won: super::AtomicU64::new(0),
+            hold_continuations: super::AtomicU64::new(0),
             heard_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
             nonce_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
             deferred_by_slot: (0..8).map(|_| super::AtomicU32::new(0)).collect(),
@@ -1410,6 +1445,9 @@ mod tests {
             ambient_rx: super::AtomicU64::new(0),
             claim_attempts: super::AtomicU64::new(0),
             claim_wins: super::AtomicU64::new(0),
+            elections: super::AtomicU64::new(0),
+            elections_won: super::AtomicU64::new(0),
+            hold_continuations: super::AtomicU64::new(0),
             heard_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
             nonce_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
             deferred_by_slot: (0..8).map(|_| super::AtomicU32::new(0)).collect(),
@@ -1490,6 +1528,9 @@ mod tests {
             ambient_rx: super::AtomicU64::new(0),
             claim_attempts: super::AtomicU64::new(0),
             claim_wins: super::AtomicU64::new(0),
+            elections: super::AtomicU64::new(0),
+            elections_won: super::AtomicU64::new(0),
+            hold_continuations: super::AtomicU64::new(0),
             heard_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
             nonce_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
             deferred_by_slot: (0..8).map(|_| super::AtomicU32::new(0)).collect(),
@@ -1647,6 +1688,9 @@ mod tests {
             ambient_rx: super::AtomicU64::new(0),
             claim_attempts: super::AtomicU64::new(0),
             claim_wins: super::AtomicU64::new(0),
+            elections: super::AtomicU64::new(0),
+            elections_won: super::AtomicU64::new(0),
+            hold_continuations: super::AtomicU64::new(0),
             heard_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
             nonce_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
             deferred_by_slot: (0..8).map(|_| super::AtomicU32::new(0)).collect(),
@@ -2043,6 +2087,9 @@ mod tests {
             ambient_rx: super::AtomicU64::new(0),
             claim_attempts: super::AtomicU64::new(0),
             claim_wins: super::AtomicU64::new(0),
+            elections: super::AtomicU64::new(0),
+            elections_won: super::AtomicU64::new(0),
+            hold_continuations: super::AtomicU64::new(0),
             heard_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
             nonce_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
             deferred_by_slot: (0..8).map(|_| super::AtomicU32::new(0)).collect(),
