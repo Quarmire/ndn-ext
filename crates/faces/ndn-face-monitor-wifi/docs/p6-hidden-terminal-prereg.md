@@ -78,3 +78,14 @@ for A-frames and C-frames (the capture-asymmetry diagnostic).
   fallback is ANTENNA REMOVAL on A and C at the next bench visit — one minute, and reversible.
 
 No counted arm has run. The campaign waits on gate 2's discriminators + gate 3's fallback.
+
+## Gate 2 — PASSED 2026-08-13 (B210, ndn-radio-drivers 061274c)
+
+The TXAGC knob is RF-verified: monotone over idx 20..=63, ~9.6 dB span (~0.22 dB/step), replicated
+±0.1–0.3 dB across three scrambled passes with a linearity-certified instrument (0.98–0.99 dB/dB).
+Found and guarded: idx < 20 UNDERFLOWS to a max-gain plateau ~11 dB ABOVE calibrated power — the
+driver now clamps to 20..=63. Campaign power settings must use the measured scale: minimum real
+power = idx 20 (≈ −9.6 dB vs default 63).
+
+Consequence for gate 3: 9.6 dB of authority cannot create hidden(A,C) at this geometry by power
+alone — the ANTENNA-REMOVAL fallback is now the plan of record for the topology gate.
