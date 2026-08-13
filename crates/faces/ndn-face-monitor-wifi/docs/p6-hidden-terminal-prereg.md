@@ -218,3 +218,15 @@ Supporting: the loss tracks per-replicate duty (worst L rep = highest duty, best
 Instrument log additions: one nonce-rotation invalidation (L2, re-run); bulk frames report as `/?`
 at the obs (the tiny-frame parser does not read 0xfd TLV lengths — counts are correct since
 nothing else 1400 B is on air; parser fix queued with the P11 work).
+
+## Claim-C v3 — registered 2026-08-13, before its runs (P11 green x3 first, per the gate rule)
+
+Identical to v2 in every respect except the clock: **`NDN_SCHED_CLOCK=cv` on A and C, with A as
+the beacon master (`NDN_SCHED_MASTER=1`)** — the #41/#74 common-view path, ~55 µs software-beacon
+residual vs the wall clock's ms-class skew, i.e. skew ≪ frame airtime, the regime P11's second arm
+demonstrates. B is a raw meter (no scheduler, no clock needed). Known contamination, accepted and
+symmetric across arms: C runs undisciplined for the ~6 s before A's beacons start.
+
+Thresholds UNCHANGED. Prediction: the v2 boundary loss collapses; flat's lease-over-alarm-slot
+collisions finally dominate; lanes/flat separation becomes visible (PASS shape) — or the next
+mask is found and named.
