@@ -104,9 +104,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("sent              : {seq}");
         }
         "lat" => {
-            // /light at 1/s (prereg amendment 1): an audible, mostly-idle OPEN-slot owner, so the
-            // bulk node has something legitimately claimable — without it, claim B is unmeasurable
-            // in this topology (lanes are unclaimable by design, unowned slots evidence-refused).
+            let gap = Duration::from_micros(1_000_000 / lat_per_sec.max(1));
+            let end = Instant::now() + Duration::from_secs(secs);
+            let (mut seq, mut waits_us) = (0u32, Vec::new());
+            while Instant::now() < end {
+                let t = Instant::now();
+                if medium.send_bytes(pkt("alarm", seq)).await.is_ok() {
+                    seq += 1;
+                    waits_us.push(t.elapsed().as_micros() as u64);
+                }
+                tokio::time::sleep(gap).await;
+            }
+            waits_us.sort_unstable();
+            let max = waits_us.last().copied().unwrap_or(0);
+            let mean = waits_us.iter().sum::<u64>() / waits_us.len().max(1) as u64;
+            let p99 = waits_us[(waits_us.len() * 99 / 100).min(waits_us.len().saturating_sub(1))];
+            println!("=== lat ===");
+            println!("sent              : {seq}");
+            println!("gate wait µs      : max {max}  p99 {p99}  mean {mean}   <-- the access-delay metric");
+        }
+        _ => {
+            // /light at 1/s from the OBS node (prereg amendment 2): amendment 1 put it on `lat`,
+            // whose nonce then evidenced two slots and was DISCOUNTED by P4's relay rule — the
+            // multi-group-originator conservatism working exactly as committed. The claimable
+            // open-slot owner must be a single-group transmitter, i.e. its own node. 1 f/s is far
+            // below the 881a's brownout regime (a sustained-TX defect).
             let light = {
                 let m = medium.clone();
                 tokio::spawn(async move {
@@ -120,28 +142,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     seq
                 })
             };
-            let gap = Duration::from_micros(1_000_000 / lat_per_sec.max(1));
-            let end = Instant::now() + Duration::from_secs(secs);
-            let (mut seq, mut waits_us) = (0u32, Vec::new());
-            while Instant::now() < end {
-                let t = Instant::now();
-                if medium.send_bytes(pkt("alarm", seq)).await.is_ok() {
-                    seq += 1;
-                    waits_us.push(t.elapsed().as_micros() as u64);
-                }
-                tokio::time::sleep(gap).await;
-            }
-            let light_sent = light.await.unwrap_or(0);
-            println!("light sent        : {light_sent}");
-            waits_us.sort_unstable();
-            let max = waits_us.last().copied().unwrap_or(0);
-            let mean = waits_us.iter().sum::<u64>() / waits_us.len().max(1) as u64;
-            let p99 = waits_us[(waits_us.len() * 99 / 100).min(waits_us.len().saturating_sub(1))];
-            println!("=== lat ===");
-            println!("sent              : {seq}");
-            println!("gate wait µs      : max {max}  p99 {p99}  mean {mean}   <-- the access-delay metric");
-        }
-        _ => {
             let mut heard: BTreeMap<String, u64> = BTreeMap::new();
             let end = Instant::now() + Duration::from_secs(secs);
             while Instant::now() < end {
@@ -154,6 +154,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     _ => continue,
                 }
             }
+            println!("light sent        : {}", light.await.unwrap_or(0));
             println!("=== obs ===");
             for (g, c) in &heard {
                 println!("heard /{g:<8}: {c}");
