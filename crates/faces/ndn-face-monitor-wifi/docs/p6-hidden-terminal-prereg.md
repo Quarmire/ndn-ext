@@ -179,3 +179,42 @@ Arms: C-lanes (`RESERVE=4`) vs C-flat (`RESERVE=0`), 3 replicates interleaved, d
 same roles, same instrument log rules (nonce start=end; obs raw-only; deploy gated on zero build
 errors). Thresholds UNCHANGED from v1: PASS = every lanes replicate ≥ 90% alarm delivery AND
 mean(lanes) − mean(flat) ≥ 15 pp; REFUTED < 5 pp.
+
+## v2 RESULTS — 2026-08-13: ANOMALY (the third branch), returned to the lab before any re-run
+
+| arm | rep | /alarm delivery | A sent (1400 B) | duty est. |
+|---|---|---|---|---|
+| L | 1 | 240/282 = 85.1% | 12,003 | ~66% |
+| L | 2r | 221/282 = 78.4% | 15,172 | ~83% |
+| L | 3 | 259/282 = 91.8% | 10,647 | ~59% |
+| F | 1 | 243/282 = 86.2% | 12,656 | ~70% |
+| F | 2 | 237/282 = 84.0% | 13,760 | ~76% |
+| F | 3 | 242/282 = 85.8% | 11,482 | ~63% |
+
+Means: lanes 85.1%, flat 85.3%. Two lanes replicates < 90% (the PASS bar) and lanes−flat ≈ 0 pp.
+This is neither PASS nor the registered refutation shape (both arms are NOT high): **anomaly**.
+
+**Diagnosis.** Alarms are lost ~15% even in the lanes arm, where A never transmits during lane
+slots *in its own clock's view* — and that qualifier is the mechanism. The campaign runs
+`clock=wall` (NTP): A's and C's slot maps are offset by the cross-node skew (order ~ms). The
+`fits_now` guard keeps a frame inside the sender's OWN slot boundary, but with skew there is no
+shared boundary: a 1.9 ms bulk frame legitimately launched near A's view of a slot end radiates
+into C's view of the lane start, and C's alarm (launched at ITS lane start, no CSMA) collides with
+it. v1's 90 µs frames made a boundary straddle nearly free; v2's 1.9 ms frames × ~66% duty ×
+per-superframe boundary exposure ≈ the observed ~15%, in BOTH arms — lanes cannot protect against
+a skewed map, because under skew the lane itself is not where the bulk node thinks it is.
+Supporting: the loss tracks per-replicate duty (worst L rep = highest duty, best = lowest).
+
+**Required before any v3 run (the gate rule):**
+1. Lab property **P11**: per-node clock offset in the lab harness + airtime-overlap bookkeeping in
+   the modeled medium; assert boundary-collision rate ∝ duty × (skew + frame_airtime)/slot and
+   that lanes do NOT protect under skew ≥ ~frame airtime. Red until the fix, then flipped.
+2. The fix the anomaly points at is already built and idle: the **hardware common-view clock**
+   (#41/#74, `NDN_SCHED_CLOCK=hw|cv`, 10 µs guard vs the wall clock's ms-class skew). v3 = the
+   same arms on the common-view clock (one node `NDN_SCHED_MASTER=1`), predicting the boundary
+   loss collapses and the lanes/flat separation FINALLY becomes visible. This is the convergence
+   the whole stack was built for: µs-class shared time is what makes long-frame slotting real.
+
+Instrument log additions: one nonce-rotation invalidation (L2, re-run); bulk frames report as `/?`
+at the obs (the tiny-frame parser does not read 0xfd TLV lengths — counts are correct since
+nothing else 1400 B is on air; parser fix queued with the P11 work).
