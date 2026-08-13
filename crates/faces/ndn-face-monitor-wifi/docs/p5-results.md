@@ -45,3 +45,14 @@ First on-air, N=3 exercise of the P1 "one filter, one map" path end-to-end: ever
 Tier-0 filter, every RX gate and every scheduler read it, /alarm rode a latency lane from a shared
 GroupTable — delivery 98–99.6% throughout, zero false-negative signature. `ambient frames` = 0 on
 every node (ch149 quiet; the counter is reported, per campaign (d)).
+
+## Process defect, on the record
+
+The pre-registration was NOT in git before the runs. `docs/.gitignore` ignores `*` (docs are
+opt-in with `-f`), so the three "prereg committed" commits (9ee57d1, amendments 1–2) silently
+carried only the `.rs` half — `git add -A` skipped the doc without a word. The file existed on
+disk, with its content and amendments, before each run (mtimes agree), but the auditable-history
+half of the gate rule was void. This is the #24 drift mechanism (an ignored doctrine file)
+striking a third time. Fixes: the doc is now force-added; any future prereg commit must be
+verified with `git ls-files` before the first run — a green `git commit` is not evidence the file
+went in.
