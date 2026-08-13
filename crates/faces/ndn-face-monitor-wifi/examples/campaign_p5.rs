@@ -77,6 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let open = ndn_radio_drivers::open_named_radio(pid, channel)?;
+    let cap = ndn_radio_cognition::RadioCapability::wifi_monitor_5ghz(vec![channel]);
     // TX power (claim-C prereg + bench power hygiene): TXAGC index via RadioKnobs — clamped to the
     // B210-verified monotone range by the driver (061274c). Unset = calibrated default.
     let txpwr: Option<u32> = std::env::var("NDN_RADIO_TXPWR").ok().and_then(|v| v.parse().ok());
