@@ -77,41 +77,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let open = ndn_radio_drivers::open_named_radio(pid, channel)?;
-    // The obs role reads raw frames for RSSI; the same Arc<dyn FrameIo> also feeds the bearer
-    // (the driver's RX pump fans in one stream — recv_frame consumers compete, which is fine for
-    // obs: its medium side only TRANSMITS /light, and a stolen frame on the TX-side reader costs
-    // nothing the meter was owed).
-    let raw_rx = if role == "obs" { Some(open.io.clone()) } else { None };
-    // TX power (claim-C prereg + bench power hygiene): TXAGC index 0..63 via RadioKnobs — the
-    // campaign backends do NOT read NDN_RADIO_TXPWR natively (only the 8821c does), so the tool
-    // applies it explicitly and prints what it applied. Unset = the driver's calibrated default.
+    // TX power (claim-C prereg + bench power hygiene): TXAGC index via RadioKnobs — clamped to the
+    // B210-verified monotone range by the driver (061274c). Unset = calibrated default.
     let txpwr: Option<u32> = std::env::var("NDN_RADIO_TXPWR").ok().and_then(|v| v.parse().ok());
     if let (Some(idx), Some(knobs)) = (txpwr, open.knobs.as_ref()) {
         knobs.set_tx_power(idx)?;
     }
-    let cap = RadioCapability::wifi_monitor_5ghz(vec![channel]);
-    let medium = Arc::new(
-        RadioMediumFace::new(FaceId(1), vec![RadioBearer::from_open(RadioId(0), open, cap)])
-            // One filter, one map, on air: every node registers the same groups under the open
-            // key; /alarm is latency-class in every node's table (the shared map).
-            .with_bloom_latency(
-                &OPEN_GROUP_KEY,
-                &[b"/bulk".as_slice(), b"/alarm".as_slice(), b"/light".as_slice()],
-                &[b"/alarm".as_slice()],
-            )
-            .build(),
-    );
+    // OBS is raw-only: no medium, no second recv_frame consumer (the batch-1 half-split lesson).
+    let raw_rx: Option<std::sync::Arc<dyn ndn_radio_hal::FrameIo>> =
+        if role == "obs" { Some(open.io.clone()) } else { None };
+    let medium = if role == "obs" {
+        None
+    } else {
+        Some(Arc::new(
+            RadioMediumFace::new(FaceId(1), vec![RadioBearer::from_open(RadioId(0), open, cap)])
+                .with_bloom_latency(
+                    &OPEN_GROUP_KEY,
+                    &[b"/bulk".as_slice(), b"/alarm".as_slice(), b"/light".as_slice()],
+                    &[b"/alarm".as_slice()],
+                )
+                .build(),
+        ))
+    };
     let nonce_hex = |m: &ndn_face_monitor_wifi::RunningMedium| -> String {
         m.source_nonce().map(|n| n.iter().map(|b| format!("{b:02x}")).collect()).unwrap_or_default()
     };
     println!(
         "role={role} ch{channel} pid={pid:04x} {secs}s txpwr={} nonce={}",
         txpwr.map(|i| i.to_string()).unwrap_or_else(|| "default".into()),
-        nonce_hex(&medium)
+        medium.as_ref().map(|m| nonce_hex(m)).unwrap_or_else(|| "raw".into())
     );
 
     match role.as_str() {
         "bulk" => {
+            let medium = medium.clone().expect("bulk uses the medium");
             let end = Instant::now() + Duration::from_secs(secs);
             let mut seq = 0u32;
             while Instant::now() < end {
@@ -123,6 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("sent              : {seq}");
         }
         "lat" => {
+            let medium = medium.clone().expect("lat uses the medium");
             let gap = Duration::from_micros(1_000_000 / lat_per_sec.max(1));
             let end = Instant::now() + Duration::from_secs(secs);
             let (mut seq, mut waits_us) = (0u32, Vec::new());
@@ -143,29 +143,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("gate wait µs      : max {max}  p99 {p99}  mean {mean}   <-- the access-delay metric");
         }
         _ => {
-            // OBS reads RAW frames (FrameIo::recv_frame) rather than the medium: CapturedFrame
-            // carries rssi_dbm, which the Transport surface drops — and per-group RSSI is the
-            // claim-C instrument (TXAGC verification + the capture-asymmetry diagnostic). The
-            // payload is the same NDN wire the medium parses, so the counter semantics match.
-            // Cost, stated: the obs node no longer exercises the RX gate/scheduler paths — it is a
-            // meter, and the /light sender below still runs through the full medium TX path.
+            // OBS is RAW-ONLY (claim-C batch-1 lesson, discarded): with both the raw RSSI meter
+            // and the medium's RX reader consuming one recv_frame stream, each saw ~HALF the
+            // frames — 150/282 alarms, 13157/26550 bulk, the 50% split signature on both groups
+            // at once. One consumer or the counts are fiction. So obs never builds the medium's
+            // RX side at all: /light is injected RAW (legacy broadcast shape — A attributes it on
+            // the parse path), and the meter is the sole recv_frame consumer.
             let light = {
-                let m = medium.clone();
+                let io = raw_rx.clone().expect("obs keeps the raw io");
                 tokio::spawn(async move {
                     let mut seq = 0u32;
                     let end = Instant::now() + Duration::from_secs(secs);
+                    // A fixed locally-administered source: /light's owner nonce. Stable across the
+                    // run so A's per-slot evidence stays a singleton (no P4 discounting).
+                    let src = [0x02u8, 0x4c, 0x49, 0x54, 0x45, 0x01]; // "LITE"-ish, U/L=local
                     while Instant::now() < end {
-                        let _ = m.send_bytes(pkt("light", seq)).await;
+                        let f = ndn_radio_hal::InjectFrame {
+                            payload: pkt("light", seq),
+                            tx: ndn_radio_hal::TxIntent::ROBUST,
+                            dst: ndn_radio_hal::BROADCAST,
+                            src,
+                            addr3: None,
+                        };
+                        let _ = io.inject(f).await;
                         seq += 1;
                         tokio::time::sleep(Duration::from_secs(1)).await;
                     }
                     seq
                 })
             };
-            let io = medium.scheduler(); // keep the medium alive for /light
-            let _ = io;
             let raw = raw_rx.expect("obs keeps the raw io");
-            let mut heard: BTreeMap<String, (u64, i64, u64)> = BTreeMap::new(); // count, rssi sum, rssi n
+            let mut heard: BTreeMap<String, (u64, i64, u64)> = BTreeMap::new();
             let end = Instant::now() + Duration::from_secs(secs);
             while Instant::now() < end {
                 match tokio::time::timeout(Duration::from_millis(300), raw.recv_frame()).await {
@@ -191,9 +199,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // Nonce at END too: if it differs from the header, a §2 rotation boundary fell inside the run
     // and any DEAF_SRC keyed on the start nonce silently broke — the run is instrument-invalid.
-    println!("nonce(end)        : {}", nonce_hex(&medium));
+    if let Some(m) = &medium {
+        println!("nonce(end)        : {}", nonce_hex(m));
+    }
     // Every role reports the scheduler's own instrumentation — the counters the prereg names.
-    if let Some(s) = medium.scheduler() {
+    if let Some(s) = medium.as_ref().and_then(|m| m.scheduler()) {
         let (attempts, wins) = s.claim_counts();
         let (elections, ewins, holds) = s.election_counts();
         println!("claim attempts/wins: {attempts} / {wins}");
