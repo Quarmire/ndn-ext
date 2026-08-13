@@ -60,3 +60,21 @@ for A-frames and C-frames (the capture-asymmetry diagnostic).
   pinned 30 dBm); Morse wlan0 (o5p-2) likewise (21 dBm; `morse_cli` not on PATH — it is the
   authoritative tool). Reducing these needs the HAL dBm path or their vendor CLIs — tracked as
   bench hygiene, not a claim-C dependency (they carry no campaign traffic).
+
+## Gate status — 2026-08-13, post-replug
+
+* **Gate 1 (o5p-2 replug): PASSED.** Moved to a USB2 port; opens and hears (~1000 frames/run) —
+  the USB2 move also sidesteps the SuperSpeed reset loop that preceded the wedge.
+* **Gate 2 (TXAGC RF-verified): NOT PASSED, evidence recorded.** Five-point sweep
+  (default/16/8/2/0) with the new RSSI meter at BOTH receivers: frames from the a81a read
+  0 dBm mean everywhere, at every index; delivery unmoved. The meter itself is not fake —
+  cross-sender rows vary (C's /light reads −9 dBm at B) — but 0 dBm is the conversion's ceiling,
+  so at ~3 ft the receivers sit at/above the meter's range and the sweep cannot yet distinguish
+  "knob dead on the a81a's legacy-rate path" from "receivers saturated". Discriminators that need
+  no RF: read back the TXAGC registers after set_tx_power (knob actuation, driver-level); check
+  `realtek_rx::rssi_dbm`'s clamp. The authoritative RF instrument remains the B210 SDR method.
+* **Gate 3 (hidden topology): UNREACHED**, and the sweep makes power-only hiddenness look
+  unlikely at this geometry (full mutual audibility with 30 dB commanded swing). The cheapest
+  fallback is ANTENNA REMOVAL on A and C at the next bench visit — one minute, and reversible.
+
+No counted arm has run. The campaign waits on gate 2's discriminators + gate 3's fallback.
