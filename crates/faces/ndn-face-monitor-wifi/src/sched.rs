@@ -354,6 +354,11 @@ pub struct FaceScheduler {
     /// generalises that schedule rather than replacing it, so the measurement still describes the
     /// shipping default.
     lease_max: u64,
+    /// **Test seam for lab property P11** (cross-node clock skew): added to the Wall clock's
+    /// reading in µs. Production constructors pin it to 0; only the MAC lab sets it, to model the
+    /// NTP offset between real nodes that the claim-C v2 anomaly measured the consequences of
+    /// (~15% boundary-collision loss at 1.9 ms frames). Consumed in [`now_us`](Self::now_us).
+    clock_skew_us: i64,
     /// Monotonic base for the hardware clock's host reference and the master's reference timeline.
     base: Instant,
 }
@@ -424,6 +429,7 @@ impl FaceScheduler {
                 .unwrap_or(1)
                 .max(1),
             rate: None,
+            clock_skew_us: 0,
             base: Instant::now(),
         })
     }
@@ -1057,7 +1063,8 @@ impl FaceScheduler {
             ClockSource::Wall => SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_micros() as u64)
-                .unwrap_or(0),
+                .unwrap_or(0)
+                .saturating_add_signed(self.clock_skew_us as i64),
             ClockSource::Hardware => {
                 let host_now = self.base.elapsed().as_micros() as u64;
                 self.hw.lock().map(|hw| hw.now(host_now)).unwrap_or(host_now)
@@ -1409,6 +1416,7 @@ mod tests {
             claim_unknown: false,
             lease_max: 1,
             rate: None,
+            clock_skew_us: 0,
             base: super::Instant::now(),
         };
         let a = mk();
@@ -1456,6 +1464,7 @@ mod tests {
             claim_unknown: false,
             lease_max: 1,
             rate: None,
+            clock_skew_us: 0,
             base: super::Instant::now(),
         };
         let a = prefix_hash(&[b"ndn", b"alarm"]);
@@ -1539,6 +1548,7 @@ mod tests {
             claim_unknown: false,
             lease_max: 1,
             rate: None,
+            clock_skew_us: 0,
             base: super::Instant::now(),
         };
         let wire = sched.build_beacon();
@@ -1699,6 +1709,7 @@ mod tests {
             claim_unknown: false,
             lease_max: 1,
             rate: None,
+            clock_skew_us: 0,
             base: super::Instant::now(),
         };
         let slot = sched.slot.as_ref().unwrap();
@@ -2098,6 +2109,7 @@ mod tests {
             claim_unknown: false,
             lease_max: 1,
             rate: None,
+            clock_skew_us: 0,
             base: super::Instant::now(),
         }
     }

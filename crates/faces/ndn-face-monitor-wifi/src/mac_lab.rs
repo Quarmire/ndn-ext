@@ -81,6 +81,7 @@ fn lab_sched(slot: SlotSchedule, groups: Option<Arc<GroupTable>>) -> FaceSchedul
         claim_unknown: false,
         lease_max: 1,
         rate: None,
+        clock_skew_us: 0,
         base: Instant::now(),
     }
 }
@@ -419,6 +420,114 @@ async fn prop_p6_residual_pure_silent_relay_still_collides() {
         collision_at_b,
         "residual UNEXPECTEDLY CLOSED: the pure-silent-relay claim was refused. If a report-fed          (second-hand) mechanism now closes it, flip this to assert the refusal."
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// P11 — clock skew × long frames: no shared boundary, lanes cannot protect (claim-C v2's anomaly,
+// returned as the property the gate rule demands before v3).
+// ---------------------------------------------------------------------------------------------
+
+/// The claim-C v2 anomaly, reproduced off-air and bounded: with `clock=wall` and ms-class
+/// cross-node skew, the two nodes' slot maps have NO SHARED BOUNDARY — `fits_now` keeps a frame
+/// inside the SENDER's view of its slot, so a long frame near A's slot-end radiates into C's view
+/// of the lane, and lanes protect nothing (measured on air: lanes 85.1% ≈ flat 85.3% at ~66%
+/// duty). With skew ≪ frame airtime (the common-view clock's regime), the overlap vanishes —
+/// which is v3's registered prediction, demonstrated here first.
+#[tokio::test]
+async fn prop_p11_skew_times_long_frames_defeats_lanes_and_cv_restores_them() {
+    // Slot 6 ms, frame ~1.9 ms (the v2 shape, time-scaled), lane stride 4.
+    let slot = SlotSchedule::new(6_000, 8).with_reserved_stride(4);
+    let air: u64 = 1_900;
+    let lane_period_ms = slot.slot_us() * 4 / 1000;
+
+    /// Drive A (bulk owner, long frames, skewed by `skew_us`) and C (alarm at each lane start,
+    /// unskewed) for `dur_ms`; return (alarms, alarms overlapped by an A-frame in flight).
+    async fn run(slot: SlotSchedule, air: u64, skew_us: i64, dur_ms: u64, lane_period_ms: u64) -> (u32, u32) {
+        let mut a = lab_sched(slot, None);
+        a.clock_skew_us = skew_us;
+        a.lease_max = 8; // the campaign shape: leases across the open slots, ~66% duty
+        let a = Arc::new(a);
+        let a_hash = prefix_hash(&[b"bulk"]);
+        // A: transmit in every owned/claimable open slot, back-to-back long frames. Record real
+        // wall intervals — the MEDIUM's time, which is what actually overlaps on air.
+        let tx_log: Arc<Mutex<Vec<(u64, u64)>>> = Arc::new(Mutex::new(Vec::new()));
+        let a_task = {
+            let (a, log) = (a.clone(), tx_log.clone());
+            let wire = data_wire(&[b"bulk", b"x"]);
+            tokio::spawn(async move {
+                let end = Instant::now() + Duration::from_millis(dur_ms);
+                while Instant::now() < end {
+                    // Fresh singleton evidence for every slot (nonce 0 = unknown, skips the relay
+                    // check): the campaign condition — A's claims+leases run over ALL open slots,
+                    // so its frames border the lanes every superframe. Without this, lab-A owns one
+                    // slot and rarely touches a lane edge (measured 3/60 vs the campaign's ~15%).
+                    let now = a.now_us();
+                    for c in a.heard_by_slot.iter() {
+                        c.store(now, Ordering::Relaxed);
+                    }
+                    a.last_domain_rx.store(0, Ordering::Relaxed);
+                    a.gate(&wire).await; // waits for A's VIEW of an allowed slot
+                    let t0 = wall_us();
+                    log.lock().unwrap().push((t0, t0 + air));
+                    tokio::time::sleep(Duration::from_micros(air)).await; // the frame is on air
+                }
+            })
+        };
+        // C: an alarm at each of ITS lane starts, deterministically (sleep-until the next
+        // wall-clock lane boundary — the real owner path fires at its lane start; polling missed
+        // instances and arbitrary-phase firing measured artifacts in both directions).
+        let mut alarms = 0u32;
+        let mut hit = 0u32;
+        let _ = lane_period_ms;
+        let end = Instant::now() + Duration::from_millis(dur_ms);
+        while Instant::now() < end {
+            let t = wall_us();
+            // Next lane start strictly after now (+200 µs so we never re-fire the current one).
+            let mut k = slot.current_slot(t) + 1;
+            let mut start = slot.slot_start_us(t) + slot.slot_us();
+            while !slot.is_reserved(k % slot.slots()) {
+                k += 1;
+                start += slot.slot_us();
+            }
+            tokio::time::sleep(Duration::from_micros(start.saturating_sub(t) + 20)).await;
+            let t = wall_us();
+            alarms += 1;
+            let log = tx_log.lock().unwrap();
+            if log.iter().rev().take(64).any(|&(s, e)| s < t + 90 && e > t) {
+                hit += 1;
+            }
+        }
+        a_task.abort();
+        let _ = a_hash;
+        (alarms, hit)
+    }
+
+    // Arm 1: 2 ms skew (NTP-class) — a substantial fraction of alarms meet an A-frame in flight,
+    // IN THE LANES SCHEDULE: the lane exists, but not where A thinks it is.
+    // A LAGGING (the sign that exposes the lane START, where the owner fires): A's pre-lane open
+    // slot ends 2 ms into the lane in wall time, plus an in-flight 1.9 ms frame's tail.
+    let (alarms, hit) = run(slot, air, -2_000, 1_500, lane_period_ms).await;
+    assert!(alarms >= 40, "fixture: enough lane occurrences ({alarms})");
+    let skewed_rate = hit as f64 / alarms as f64;
+    assert!(
+        skewed_rate > 0.10,
+        "with 2 ms skew and 1.9 ms frames, boundary overlap must be substantial — got          {hit}/{alarms}; the v2 anomaly measured ~15% on air"
+    );
+
+    // Arm 2: 0 skew (the common-view regime, residual ≪ frame airtime) — overlap collapses.
+    let (alarms2, hit2) = run(slot, air, 0, 1_500, lane_period_ms).await;
+    let cv_rate = hit2 as f64 / alarms2 as f64;
+    assert!(
+        cv_rate < skewed_rate / 3.0,
+        "with shared time the lane is where everyone thinks it is: {hit2}/{alarms2} vs skewed          {hit}/{alarms} — v3's registered prediction"
+    );
+}
+
+fn wall_us() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------------------------
