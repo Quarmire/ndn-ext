@@ -681,6 +681,23 @@ impl RadioMediumFace {
             .with_rx_gate(Arc::new(crate::NameGate::new(crate::RxFilter::Bloom(masks), None)))
     }
 
+    /// [`with_bloom`](Self::with_bloom), with some registered prefixes marked **latency-class**
+    /// (#93): those names are placed among the reserved lanes (`NDN_SCHED_RESERVE`), `L = 1`,
+    /// never contending with bulk. Class rides the registration set because it is part of the
+    /// SHARED slot map — every node must classify a prefix identically or their maps diverge.
+    pub fn with_bloom_latency(
+        mut self,
+        key: &crate::GroupKey,
+        registered_prefixes: &[impl AsRef<[u8]>],
+        latency_prefixes: &[impl AsRef<[u8]>],
+    ) -> Self {
+        self = self.with_bloom(key, registered_prefixes);
+        self.group_table = Some(Arc::new(
+            crate::GroupTable::new(key, registered_prefixes).with_latency(latency_prefixes),
+        ));
+        self
+    }
+
     /// Address outbound frames by name (Tier-0) without changing what this face accepts.
     pub fn with_tx_bloom(mut self, key: crate::GroupKey) -> Self {
         self.tx_bloom = Some(key);

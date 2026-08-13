@@ -116,6 +116,11 @@ struct GroupEntry {
     mask: crate::PrefixFilter,
     /// `prefix_hash` over the prefix's components — the slot key.
     hash: u64,
+    /// The prefix's lease class (#93): `Latency` names are placed among the reserved lanes,
+    /// `Bulk` among the open slots — disjoint by construction. Part of the SHARED map: every node
+    /// must classify a prefix identically or their slot maps diverge, which is why class rides the
+    /// registration set (already shared) and not local policy.
+    class: LeaseClass,
 }
 
 impl GroupTable {
@@ -133,6 +138,7 @@ impl GroupTable {
                     mask: crate::PrefixFilter::mask_for(k, &prefix),
                     hash: prefix_hash(&comps),
                     prefix,
+                    class: LeaseClass::Bulk,
                 }
             })
             .collect();
@@ -140,21 +146,34 @@ impl GroupTable {
         Self { entries }
     }
 
-    /// Slot key for a name in `/`-joined form: the longest registered prefix covering it.
+    /// Mark the entries matching `prefixes` as [`LeaseClass::Latency`] (#93): placed among the
+    /// reserved lanes, `L = 1`, never contending with bulk. Everything else stays `Bulk`.
+    #[must_use]
+    pub fn with_latency(mut self, prefixes: &[impl AsRef<[u8]>]) -> Self {
+        for e in &mut self.entries {
+            if prefixes.iter().any(|p| p.as_ref() == e.prefix.as_slice()) {
+                e.class = LeaseClass::Latency;
+            }
+        }
+        self
+    }
+
+    /// Slot key + class for a name in `/`-joined form: the longest registered prefix covering it.
     /// Component-boundary aware: `/a` covers `/a/b` and `/a`, never `/ab`.
-    fn hash_for_name(&self, slash: &[u8]) -> Option<u64> {
+    fn hash_for_name(&self, slash: &[u8]) -> Option<(u64, LeaseClass)> {
         self.entries
             .iter()
             .find(|e| {
                 slash.starts_with(&e.prefix)
                     && (slash.len() == e.prefix.len() || slash[e.prefix.len()] == b'/')
             })
-            .map(|e| e.hash)
+            .map(|e| (e.hash, e.class))
     }
 
-    /// Slot key for a received Tier-0 filter: first (= longest) registered mask it may be under.
-    fn hash_for_filter(&self, f: &crate::PrefixFilter) -> Option<u64> {
-        self.entries.iter().find(|e| f.may_match(&e.mask)).map(|e| e.hash)
+    /// Slot key + class for a received Tier-0 filter: first (= longest) registered mask it may be
+    /// under.
+    fn hash_for_filter(&self, f: &crate::PrefixFilter) -> Option<(u64, LeaseClass)> {
+        self.entries.iter().find(|e| f.may_match(&e.mask)).map(|e| (e.hash, e.class))
     }
 }
 
@@ -583,11 +602,11 @@ impl FaceScheduler {
         let now = self.now_us();
 
         // ---- Triage by frame shape, cheapest test first (P1.5) ----
-        let hash = match (group, addr) {
+        let group_of = match (group, addr) {
             // Broadcast addr1 = the legacy NDN frame shape (no filter on the wire; the name is the
             // only group evidence). Parse, exactly as before P1 — dropping this would regress the
             // non-Tier-0 configuration the slot MAC was measured under.
-            (Some(g), _) if *g == ndn_radio_hal::BROADCAST => self.name_group_hash(wire),
+            (Some(g), _) if *g == ndn_radio_hal::BROADCAST => self.name_group(wire),
             // Possible Tier-0 filter: addr1‖addr2 carry the prefix set.
             (Some(g), Some(a)) => {
                 let mut w = [0u8; 12];
@@ -597,16 +616,19 @@ impl FaceScheduler {
             }
             // A capture path that surfaces no addresses cannot be attributed by filter; fall back
             // to the parse rather than silently blinding the busy mark.
-            _ => self.name_group_hash(wire),
+            _ => self.name_group(wire),
         };
-        let Some(hash) = hash else {
+        let Some((hash, class)) = group_of else {
             self.ambient_rx.fetch_add(1, Ordering::Relaxed);
             return;
         };
         self.last_domain_rx.store(now, Ordering::Relaxed);
         let keyed = self.medium_keyed(hash);
         if let Some(slot) = &self.slot {
-            let k = slot.owner_slot(keyed) as usize;
+            // Class-aware placement (#93): the evidence lands on the slot this group actually owns
+            // — a latency group's lane, a bulk group's open slot — or the map and the evidence
+            // would disagree about whose silence a claimant is reading.
+            let k = slot.owner_slot_in(keyed, class) as usize;
             if let Some(cell) = self.heard_by_slot.get(k) {
                 cell.store(now, Ordering::Relaxed);
             }
@@ -751,9 +773,22 @@ impl FaceScheduler {
     ///
     /// Covers both halves of #95: continuing a hold we already won, and starting a fresh CCLF
     /// election for an idle slot whose owner we can hear.
-    async fn try_claim(&self, slot: &SlotSchedule, hash: u64, airtime: u64) -> bool {
+    async fn try_claim(&self, slot: &SlotSchedule, hash: u64, class: LeaseClass, airtime: u64) -> bool {
         if !self.claimable {
             return false;
+        }
+        // **Lanes are inviolate, and latency never contends** (#93, completing the actuation the
+        // geometry shipped without — owner placement and the claim path both ignored
+        // `is_reserved`, so a bulk claimant could take an idle latency lane and the lanes'
+        // bounded-delay guarantee was geometry with no actuator). A latency name does not claim at
+        // all: its lane comes round within one stride, which IS its latency bound; contending for
+        // open slots would spend that bound to win airtime it does not need.
+        if class == LeaseClass::Latency {
+            return false;
+        }
+        let lane_now = slot.is_reserved(slot.current_slot(self.now_us()));
+        if lane_now {
+            return false; // a bulk claim never takes a reserved lane, idle or not
         }
         self.claim_attempts.fetch_add(1, Ordering::Relaxed);
         let now = self.now_us();
@@ -794,7 +829,7 @@ impl FaceScheduler {
         // slot we cannot finish in is the same boundary overrun as the owner path, self-inflicted.
         if !((owner_known || self.claim_unknown)
             && idle
-            && slot.wait_us(hash, now) > slot.slot_us()
+            && slot.wait_us_in(hash, class, now) > slot.slot_us()
             && remaining > jitter + airtime)
         {
             return false;
@@ -946,7 +981,7 @@ impl FaceScheduler {
     /// non-NDN frame) is passed straight through. `robust` control frames should bypass entirely
     /// (the caller decides) — reports/discovery must not wait on a data slot.
     pub async fn gate(&self, wire: &[u8]) {
-        let Some(hash) = self.name_group_hash(wire) else {
+        let Some((hash, class)) = self.name_group(wire) else {
             return; // no name-group → not schedulable; transmit now
         };
         let now = self.now_us();
@@ -982,7 +1017,7 @@ impl FaceScheduler {
             // `wifi_airtime_us`: under-estimating bleeds into the next owner's slot, over-estimating
             // only defers us by one.
             let airtime = wifi_airtime_us(wire.len(), self.tx_mcs());
-            if slot.owns_now(hash, now) {
+            if slot.owns_now_in(hash, class, now) {
                 // **Owning the slot is not the same as fitting in it** (#84). A frame launched near
                 // the boundary keeps radiating into the next owner's turn — the exact collision this
                 // MAC exists to prevent, and one charged to a *different* name, so the node causing
@@ -995,7 +1030,7 @@ impl FaceScheduler {
             }
             // Claimable slot (named-token-scheduling.md): if this is NOT our slot but the current
             // slot's owner is IDLE, contend for it via a CCLF election rather than wasting it.
-            if self.try_claim(slot, hash, airtime).await {
+            if self.try_claim(slot, hash, class, airtime).await {
                 return; // claimed (or holding) this slot — transmit now.
             }
             // Reaching here means this frame waits — which IS the demand signal (#95). A group that
@@ -1024,11 +1059,11 @@ impl FaceScheduler {
             // waiting frame, against a 20 ms slot — cheap next to the airtime it recovers.
             loop {
                 let t = self.now_us();
-                if slot.owns_now(hash, t) && slot.fits_now(t, airtime) {
+                if slot.owns_now_in(hash, class, t) && slot.fits_now(t, airtime) {
                     self.note_sent(hash); // our slot arrived — backlog spent
                     break;
                 }
-                if self.try_claim(slot, hash, airtime).await {
+                if self.try_claim(slot, hash, class, airtime).await {
                     return; // won an idle slot on the way to our own.
                 }
                 // To the next boundary, so every intervening slot gets exactly one evaluation.
@@ -1058,7 +1093,7 @@ impl FaceScheduler {
     /// **Attribute a Tier-0-shaped frame without parsing it** (P1.5): origin gate, then the
     /// registered masks, then the learned cache; the TLV parse is the cold path for the first
     /// sighting of an unregistered group only.
-    fn attribute_filter(&self, w: [u8; 12], wire: &[u8], now: u64) -> Option<u64> {
+    fn attribute_filter(&self, w: [u8; 12], wire: &[u8], now: u64) -> Option<(u64, LeaseClass)> {
         // Origin gate — no parse, no allocation. Our Tier-0 frames force octet 0's I/G+U/L to
         // local-group (`to_wire`); foreign unicast has U/L=0 and fails the bit test; foreign
         // broadcast/high-fill fails the FILL_CAP that F1 installed for exactly this dual purpose.
@@ -1074,16 +1109,16 @@ impl FaceScheduler {
         // Registered groups: longest-first mask AND — the map the slot key uses, so TX and RX land
         // on the same slot by construction.
         if let Some(groups) = &self.groups
-            && let Some(h) = groups.hash_for_filter(&f)
+            && let Some(hc) = groups.hash_for_filter(&f)
         {
-            return Some(h);
+            return Some(hc);
         }
         // Learned cache: an unregistered group's slot stays claimable at the cost of ONE parse ever
         // (bounded — see LEARNED_GROUP_CAP for why this is a security bound, not a tuning knob).
         let mut learned = self.learned.lock().ok()?;
         if let Some((h, seen)) = learned.get_mut(&w) {
             *seen = now;
-            return Some(*h);
+            return Some((*h, LeaseClass::Bulk)); // unregistered ⇒ Bulk: lanes are for registered latency names
         }
         let h = self.name_group_hash(wire)?; // cold path: first sighting only
         if learned.len() >= LEARNED_GROUP_CAP
@@ -1094,29 +1129,33 @@ impl FaceScheduler {
             learned.remove(&oldest);
         }
         learned.insert(w, (h, now));
-        Some(h)
+        Some((h, LeaseClass::Bulk))
     }
 
     fn name_group_hash(&self, wire: &[u8]) -> Option<u64> {
+        self.name_group(wire).map(|(h, _)| h)
+    }
+
+    /// Slot key **and lease class** for a wire (P1 + #93). The slot key is the longest REGISTERED
+    /// prefix covering the name — the granularity the receivers actually operate at, from the
+    /// shared registration set rather than a per-node env depth; its class rides the same set, so
+    /// every node places a latency name in the same lane. The `/`-joined form is the shared
+    /// normalization (#44). Fallback (no table / unregistered name): first component, fixed
+    /// depth 1, `Bulk` — the pre-P1 default, uniform across nodes by construction.
+    fn name_group(&self, wire: &[u8]) -> Option<(u64, LeaseClass)> {
         let name_tlv = crate::inner_name(wire)?;
-        // P1: the slot key is the longest REGISTERED prefix covering the name — the granularity the
-        // receivers actually operate at, from the shared registration set rather than a per-node
-        // env depth. The `/`-joined form is the shared normalization (#44), so this and the Tier-0
-        // masks speak about the same bytes.
         if let Some(groups) = &self.groups {
             let slash = crate::ndn_name_to_slash(name_tlv);
-            if let Some(h) = groups.hash_for_name(&slash) {
-                return Some(h);
+            if let Some(hc) = groups.hash_for_name(&slash) {
+                return Some(hc);
             }
         }
-        // Fallback (no table, or an unregistered name): first component, fixed depth 1 — the
-        // pre-P1 default, uniform across nodes by construction rather than by matching env vars.
         let comps = name_components(name_tlv, 1);
         if comps.is_empty() {
             return None;
         }
         let refs: Vec<&[u8]> = comps.iter().map(|c| *c).collect();
-        Some(prefix_hash(&refs))
+        Some((prefix_hash(&refs), LeaseClass::Bulk))
     }
 }
 
@@ -1201,6 +1240,11 @@ fn parse_hop(s: &str) -> Option<HopSchedule> {
     let dwell: u64 = dwell.trim().parse().ok()?;
     Some(HopSchedule::new(classes, dwell))
 }
+
+/// P2: the MAC lab — conformance properties on a modeled medium (child module for private access).
+#[cfg(test)]
+#[path = "mac_lab.rs"]
+mod mac_lab;
 
 #[cfg(test)]
 mod tests {
@@ -1871,7 +1915,8 @@ mod tests {
         let mut f = crate::PrefixFilter::default();
         f.insert_name(crate::bloom_key64(&key), b"/ndn/alarm/7");
         let w = f.to_wire();
-        let rx_hash = s.attribute_filter(w, b"\xff not parseable", s.now_us()).expect("attributed");
+        let (rx_hash, _) =
+            s.attribute_filter(w, b"\xff not parseable", s.now_us()).expect("attributed");
         assert_eq!(rx_hash, tx_hash, "RX mask attribution and TX keying disagree — two maps");
 
         // Foreign unicast (U/L=0 first octet): ambient at the origin gate, nothing marked.
@@ -1884,8 +1929,8 @@ mod tests {
         other.insert_name(crate::bloom_key64(&key), b"/zzz/bulk");
         let ow = other.to_wire();
         let good_wire = data_wire(&[b"zzz", b"bulk"]);
-        let first = s.attribute_filter(ow, &good_wire, s.now_us()).expect("cold parse");
-        let second = s.attribute_filter(ow, b"unparseable", s.now_us()).expect("cache hit");
+        let (first, _) = s.attribute_filter(ow, &good_wire, s.now_us()).expect("cold parse");
+        let (second, _) = s.attribute_filter(ow, b"unparseable", s.now_us()).expect("cache hit");
         assert_eq!(first, second, "the learned cache must return the parsed hash");
     }
 

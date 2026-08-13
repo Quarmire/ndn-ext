@@ -158,6 +158,24 @@ impl SlotSchedule {
         }
     }
 
+    /// Class-aware [`owns_now`](Self::owns_now): does `prefix_hash`'s **class-placed** slot
+    /// contain `now_us`? Identical to `owns_now` when no lanes are reserved.
+    pub fn owns_now_in(&self, prefix_hash: u64, class: LeaseClass, now_us: u64) -> bool {
+        self.current_slot(now_us) == self.owner_slot_in(prefix_hash, class)
+    }
+
+    /// Class-aware [`wait_us`](Self::wait_us): µs until `prefix_hash`'s class-placed slot next
+    /// begins (0 if inside it now). Identical to `wait_us` when no lanes are reserved.
+    pub fn wait_us_in(&self, prefix_hash: u64, class: LeaseClass, now_us: u64) -> u64 {
+        let target = self.owner_slot_in(prefix_hash, class);
+        let cur = self.current_slot(now_us);
+        if cur == target {
+            return 0;
+        }
+        let ahead = (target + self.slots - cur) % self.slots;
+        ahead * self.slot_us - (now_us % self.slot_us)
+    }
+
     /// **How many consecutive base slots may this class hold?** (#93)
     ///
     /// `Latency` is always 1: a reserved lane exists to bound someone else's access delay, so
