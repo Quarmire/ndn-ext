@@ -253,3 +253,40 @@ Preliminary observations (n=1/arm — NOT conclusions, per the reporting rule):
 Bench wedge ranking after today: BOTH 8812au-family dongles (881a o5p-1 now; 8812 o5p-2 earlier)
 have hit the resets→disconnect wedge within ~6 h of heavy campaign RX. The a81a has not. Pattern
 worth a bench task: the wedge follows sustained RX under the shared pump on USB2/3 xhci resets.
+
+## v3 RESULTS — 2026-08-13/14, complete; replicates split by a bench-state discontinuity
+
+| epoch | arm | rep | /alarm delivery | alarm RSSI @B | bulk delivery |
+|---|---|---|---|---|---|
+| pre-halt | L | 1 | 284/310 = 91.6% | 0 dBm | 99.2% |
+| pre-halt | F | 1 | 260/283 = 91.9% | −1 dBm | 99.2% |
+| post-replug | F | 2 | 246/283 = 86.9% | −4 dBm | 99.1% |
+| post-replug | L | 2r | 216/296 = 73.0% | −11 dBm | 101%* |
+| post-replug | F | 3 | 193/286 = 67.5% | −11 dBm | 99.9% |
+| post-replug | L | 3 | 255/314 = 81.2% | −7 dBm | 97.3% |
+
+(*counting-window overlap; bulk link saturated-good throughout.)
+
+**The replicates do not pool.** Replugging the o5p-1 observer physically moved its dongle: alarm
+RSSI at B fell 4–11 dB while the A→B bulk path stayed 99%+ delivered — so post-replug alarm loss
+is dominated by the weakened C→B LINK, not by MAC collisions (bulk's 20×-airtime frames would
+suffer collisions first; they lose nothing). Post-replug delivery tracks alarm RSSI monotonically
+(−4→86.9, −7→81.2, −11→73.0/67.5), which is a link-budget curve, not an arm effect.
+
+**Evaluation:**
+* **The P11 mechanism is CONFIRMED on air**: under matched strong-link conditions, the v2
+  boundary loss (85.1/85.3%) collapsed under the common-view clock (91.6/91.9%) — the skew story
+  held end-to-end: measured on air → isolated in the lab (P11) → fixed by the clock built months
+  earlier → verified back on air.
+* **The registered claim (lanes ≥15 pp over flat) is NOT PASSED and NOT cleanly refuted**: in
+  every matched-epoch comparison the separation is ~0 (91.6 vs 91.9 pre-halt; post-replug pairs
+  inside the link-loss noise). No matched pair shows lanes earning anything.
+* **The standing hypothesis, promoted to the next registrable question**: under SHARED µs-class
+  time, `fits_now`'s guard opens a silence window at every slot boundary on every node, and
+  boundary-launched latency traffic lives in that window — protected intrinsically, lanes or no
+  lanes. Lanes should earn their cost only for latency traffic that is NOT boundary-aligned
+  (mid-slot urgent frames, alarm bursts longer than the guard). That is claim-D's shape; it needs
+  a mid-slot-launch latency role, and a stable bench epoch.
+
+Bench hygiene for the next campaign day: re-measure the C→B link (or reseat toward the pre-halt
+geometry) BEFORE registering claim D; and the 8812au-family sustained-RX wedge task stands.
