@@ -36,9 +36,13 @@ struct Medium<const N: usize> {
 
 impl<const N: usize> Medium<N> {
     fn deliver(&self, from: usize, group: Option<&[u8; 6]>, addr: Option<&[u8; 6]>, wire: &[u8]) {
+        // Each lab node's §2 nonce is derived from its index — stable per node, distinct across
+        // nodes, exactly what a real EphemeralSource provides within one rotation period.
+        let nonce = [0x02, 0x4e, 0x44, 0x4e, 0x00, from as u8 + 1];
         for (j, node) in self.nodes.iter().enumerate() {
             if j != from && self.hear[from][j] {
-                node.observe_rx(group, addr, wire);
+                // Legacy broadcast shape: the nonce rides addr2.
+                node.observe_rx(group, Some(&nonce), None, wire);
             }
         }
     }
@@ -67,6 +71,7 @@ fn lab_sched(slot: SlotSchedule, groups: Option<Arc<GroupTable>>) -> FaceSchedul
         claim_attempts: AtomicU64::new(0),
         claim_wins: AtomicU64::new(0),
         heard_by_slot: (0..slot.slots()).map(|_| AtomicU64::new(0)).collect(),
+        nonce_by_slot: (0..slot.slots()).map(|_| AtomicU64::new(0)).collect(),
         deferred_by_slot: (0..slot.slots()).map(|_| AtomicU32::new(0)).collect(),
         hold_slot_start: AtomicU64::new(u64::MAX),
         lease_until: AtomicU64::new(0),
@@ -273,7 +278,7 @@ async fn prop_p4_p5_audible_owner_and_foreign_blindness() {
     for c in s.heard_by_slot.iter() {
         c.store(s.now_us(), Ordering::Relaxed);
     }
-    s.observe_rx(Some(&ndn_radio_hal::BROADCAST), None, &owner_wire); // the owner, audibly, NOW
+    s.observe_rx(Some(&ndn_radio_hal::BROADCAST), None, None, &owner_wire); // the owner, audibly, NOW
     assert!(
         !s.try_claim(&slot, h, LeaseClass::Bulk, air).await,
         "claimed over an audible owner — theft, not opportunism"
@@ -292,9 +297,9 @@ async fn prop_p4_p5_audible_owner_and_foreign_blindness() {
     for i in 0..5_000u32 {
         let mut foreign = [0x00u8, 0x1b, 0x44, 0x11, 0x3a, 0xb7]; // real-OUI unicast, U/L=0
         foreign[5] = i as u8;
-        s2.observe_rx(Some(&foreign), Some(&[0x00, 0x1b, 0x44, 0, 0, 1]), b"");
-        s2.observe_rx(Some(&[0xffu8; 6]), Some(&[0xffu8; 6]), b""); // all-ones
-        s2.observe_rx(Some(near_cap[..6].try_into().unwrap()), Some(near_cap[6..].try_into().unwrap()), b"");
+        s2.observe_rx(Some(&foreign), Some(&[0x00, 0x1b, 0x44, 0, 0, 1]), None, b"");
+        s2.observe_rx(Some(&[0xffu8; 6]), Some(&[0xffu8; 6]), None, b""); // all-ones
+        s2.observe_rx(Some(near_cap[..6].try_into().unwrap()), Some(near_cap[6..].try_into().unwrap()), None, b"");
     }
     assert_eq!(s2.last_domain_rx.load(Ordering::Relaxed), 0, "foreign frames marked the domain busy");
     assert_eq!(
@@ -306,28 +311,25 @@ async fn prop_p4_p5_audible_owner_and_foreign_blindness() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// P6 — hidden terminal, honest: RED-BY-DESIGN. Group evidence is not transmitter audibility.
+// P6 — hidden terminal. FLIPPED for the realistic relay (P4: relay discounting via the §2 nonce);
+// red-by-design only for the narrowed residual (a pure-silent relay), which no passive local rule
+// can distinguish from the owner.
 // ---------------------------------------------------------------------------------------------
-#[tokio::test]
-async fn prop_p6_hidden_terminal_red_by_design() {
-    // Topology: A–B audible, B–C audible, A–C hidden. C's group is /c; B relays /c data, so A has
-    // heard /c frames FROM B — legitimate, fresh, per-slot presence evidence. Then C transmits in
-    // its own slot. A hears nothing (hidden), reads the slot as idle, claims it, and its frame
-    // collides with C's at B.
+
+/// Build the A–B–C chain (A–B, B–C audible; A–C hidden) and return everything the two P6 arms need.
+async fn p6_setup() -> (Medium<3>, u64, u64, u64) {
     let slot = SlotSchedule::new(3000, 8);
     let nodes: Vec<Arc<FaceScheduler>> =
         (0..3).map(|_| Arc::new(lab_sched(slot, None))).collect();
     let m = Medium::<3> {
-        nodes: nodes.clone(),
-        hear: [[false, true, false], [true, false, true], [false, true, false]], // A-B, B-C only
+        nodes,
+        hear: [[false, true, false], [true, false, true], [false, true, false]],
     };
-    let (a, _b, c) = (&m.nodes[0], &m.nodes[1], &m.nodes[2]);
-
-    // Find a group /a for A whose slot is far enough from /c's that the claim precondition
-    // (own turn not imminent) holds while sitting in /c's slot.
+    let a = &m.nodes[0];
     let c_wire = data_wire(&[b"c", b"data"]);
-    let (c_hash, _) = c.name_group(&c_wire).unwrap();
+    let (c_hash, _) = a.name_group(&c_wire).unwrap();
     let c_slot = slot.owner_slot(a.medium_keyed(c_hash));
+    // A group for A far enough from /c's slot that "own turn not imminent" holds inside it.
     let a_name = (0..500u32)
         .map(|i| format!("a{i}"))
         .find(|n| {
@@ -337,42 +339,83 @@ async fn prop_p6_hidden_terminal_red_by_design() {
         })
         .expect("a suitably distant group exists");
     let (a_hash, _) = a.name_group(&data_wire(&[a_name.as_bytes()])).unwrap();
-    // The gate medium-keys the hash before any slot logic (#89); the harness must hand try_claim
-    // the same keyed value or the own-turn-distance check runs against a different slot.
     let a_keyed = a.medium_keyed(a_hash);
-    let air = wifi_airtime_us(200, Some(7));
+    (m, a_keyed, c_slot, c_hash)
+}
 
-    // B relays a /c frame; A hears it — evidence for /c's slot, from a frame A really received.
+/// **The realistic relay — GREEN since P4.** B relays /c *and* carries its own /b traffic, as a
+/// real forwarder does. A sees nonce_B evidencing two different slots within the window, infers
+/// "relay, not owner", discounts the /c evidence, and refuses the claim — no collision at B.
+#[tokio::test]
+async fn prop_p6_hidden_terminal_refused_when_the_relay_is_recognizable() {
+    let (m, a_keyed, c_slot, c_hash) = p6_setup().await;
+    let a = &m.nodes[0];
+    let slot = a.slot.unwrap();
+    let air = wifi_airtime_us(200, Some(7));
+    let c_wire = data_wire(&[b"c", b"data"]);
+
+    // B's own traffic must land on a slot other than /c's, or the cross-slot signature is
+    // invisible; find such a group for B.
+    let b_name = (0..500u32)
+        .map(|i| format!("b{i}"))
+        .find(|n| {
+            let (h, _) = a.name_group(&data_wire(&[n.as_bytes()])).unwrap();
+            slot.owner_slot(a.medium_keyed(h)) != c_slot
+        })
+        .unwrap();
+    m.deliver(1, Some(&ndn_radio_hal::BROADCAST), None, &data_wire(&[b_name.as_bytes()]));
+    m.deliver(1, Some(&ndn_radio_hal::BROADCAST), None, &c_wire); // the relay of /c
+
+    let mut claimed = false;
+    for _ in 0..6 {
+        wait_for_slot(a, |k, _| k == c_slot).await;
+        m.deliver(2, Some(&ndn_radio_hal::BROADCAST), None, &c_wire); // hidden C transmits
+        if a.try_claim(&slot, a_keyed, LeaseClass::Bulk, air).await {
+            claimed = true;
+            break;
+        }
+        wait_for_slot(a, |k, _| k != c_slot).await;
+    }
+    assert!(
+        !claimed,
+        "A claimed a slot whose only evidence came from a recognizable relay — the P4 nonce          discounting failed and the frame collides with hidden C at B"
+    );
+    let _ = c_hash;
+}
+
+/// **The residual — RED-BY-DESIGN, narrowed.** A pure-silent relay (B never transmits its own
+/// traffic) is indistinguishable from the owner by any passive local rule: its nonce evidences
+/// exactly one slot, exactly as a real owner's would. The hidden second holder behind it stays
+/// hidden, and the claim collides at B. Closing THIS needs second-hand knowledge — the
+/// reception-report plane (B observes the collision and its reports already reach A) — not more
+/// local inference. §2 nonce rotation also reopens the recognizable-relay window until the rotated
+/// nonce is seen twice. This test PASSES by demonstrating the collision; flip it when the
+/// report-fed mechanism lands.
+#[tokio::test]
+async fn prop_p6_residual_pure_silent_relay_still_collides() {
+    let (m, a_keyed, c_slot, _) = p6_setup().await;
+    let a = &m.nodes[0];
+    let slot = a.slot.unwrap();
+    let air = wifi_airtime_us(200, Some(7));
+    let c_wire = data_wire(&[b"c", b"data"]);
+
+    // B relays /c and NOTHING else: a single-slot nonce, indistinguishable from the owner.
     m.deliver(1, Some(&ndn_radio_hal::BROADCAST), None, &c_wire);
 
-    // The CCLF draw is epoch-mixed, so one occurrence can legitimately lose to the jitter; a few
-    // superframes of C's slot separate "refused by a mechanism" from "lost this epoch's draw".
     let mut collision_at_b = false;
     for _ in 0..6 {
         wait_for_slot(a, |k, _| k == c_slot).await;
-        // C transmits in its slot — B hears it, A does not (the hidden link).
         m.deliver(2, Some(&ndn_radio_hal::BROADCAST), None, &c_wire);
-        // A, blind to C, sees fresh evidence + silence and claims C's live slot.
         if a.try_claim(&slot, a_keyed, LeaseClass::Bulk, air).await {
-            collision_at_b = true; // both frames arrive at B in the same slot
+            collision_at_b = true;
             break;
         }
-        // Next occurrence: A's view of the slot must again be pre-slot-start silence.
         wait_for_slot(a, |k, _| k != c_slot).await;
     }
-
     assert!(
         collision_at_b,
-        "P6 UNEXPECTEDLY GREEN: the hidden-terminal claim was refused. If a real mechanism now \
-         distinguishes transmitter audibility from group evidence (plan P4), FLIP this property to \
-         assert the refusal and delete this message."
+        "residual UNEXPECTEDLY CLOSED: the pure-silent-relay claim was refused. If a report-fed          (second-hand) mechanism now closes it, flip this to assert the refusal."
     );
-    // Red-by-design (plan §4, P6): per-slot evidence says "this group's frames reach me", not
-    // "I can hear the transmitter currently using this slot". B's relay legitimately creates the
-    // evidence; the hidden owner's transmission is invisible; silence reads as idle. The fix
-    // (plan-P4) needs per-transmitter audibility — e.g. the §2 nonce-keyed RSSI store — not more
-    // group evidence. Until then this test PASSES by demonstrating the collision, so the suite
-    // stays green while the limitation stays on the record.
 }
 
 // ---------------------------------------------------------------------------------------------

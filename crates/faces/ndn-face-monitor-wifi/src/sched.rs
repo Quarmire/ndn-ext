@@ -177,6 +177,13 @@ impl GroupTable {
     }
 }
 
+/// A 6-byte §2 source nonce packed LE into a u64 (`0` reserved for "unknown").
+fn nonce_u64(n: &[u8; 6]) -> u64 {
+    let mut b = [0u8; 8];
+    b[..6].copy_from_slice(n);
+    u64::from_le_bytes(b).max(1) // an all-zero on-air nonce still counts as "known"
+}
+
 /// Bound on the learned-group mask cache (P1.5): filters we could not attribute to a registered
 /// prefix, parsed once and remembered so an unregistered group's slot stays claimable without a
 /// per-frame parse.
@@ -302,6 +309,14 @@ pub struct FaceScheduler {
     /// silence alone cannot tell a silent owner from a *hidden* one, and claiming a hidden owner's slot
     /// collides at its receiver — damage neither the claimant nor the owner can observe.
     heard_by_slot: Vec<AtomicU64>,
+    /// **Who evidenced each slot** (P4/#94): the §2 ephemeral source nonce of the last frame that
+    /// marked the slot, packed LE into a u64 (`0` = unknown transmitter — e.g. lab fixtures or a
+    /// capture path without addresses; unknown skips the relay check, preserving pre-P4 behaviour).
+    ///
+    /// This is what turns group evidence into TRANSMITTER evidence: the lab's P6 showed that a
+    /// relayed frame legitimately creates fresh per-slot evidence while the slot's actual user
+    /// stays hidden. The transmitter identity is the only locally observable difference.
+    nonce_by_slot: Vec<AtomicU64>,
     /// **Backlog per name-group** (#95): frames of the group owning slot *k* that we deferred since
     /// that group last got a turn. The demand signal the CCLF election was missing — the comment on
     /// the claim called it "the demand-adaptive form that beats fixed-TDMA" while the draw was a
@@ -386,6 +401,7 @@ impl FaceScheduler {
             claim_attempts: AtomicU64::new(0),
             claim_wins: AtomicU64::new(0),
             heard_by_slot: (0..slot_count).map(|_| AtomicU64::new(0)).collect(),
+            nonce_by_slot: (0..slot_count).map(|_| AtomicU64::new(0)).collect(),
             deferred_by_slot: (0..slot_count).map(|_| AtomicU32::new(0)).collect(),
             hold_slot_start: AtomicU64::new(u64::MAX),
             lease_until: AtomicU64::new(0),
@@ -595,7 +611,13 @@ impl FaceScheduler {
     /// origin check plus a mask AND, and the TLV parse survives only on the broadcast-addressed
     /// legacy path (the pre-Tier-0 frame shape every pre-P1 measurement, including the +119% claim
     /// run, was taken under) and on the first sighting of an unregistered group.
-    pub fn observe_rx(&self, group: Option<&[u8; 6]>, addr: Option<&[u8; 6]>, wire: &[u8]) {
+    pub fn observe_rx(
+        &self,
+        group: Option<&[u8; 6]>,
+        addr: Option<&[u8; 6]>,
+        addr3: Option<&[u8; 6]>,
+        wire: &[u8],
+    ) {
         if !self.claimable {
             return;
         }
@@ -631,6 +653,17 @@ impl FaceScheduler {
             let k = slot.owner_slot_in(keyed, class) as usize;
             if let Some(cell) = self.heard_by_slot.get(k) {
                 cell.store(now, Ordering::Relaxed);
+            }
+            // The transmitter's §2 nonce: addr3 on a Tier-0-addressed frame (the filter displaced
+            // it there), addr2 on the legacy broadcast shape. Recorded per slot so the claim can
+            // tell "this group's OWNER is audible" from "somebody audibly relayed this group".
+            let nonce = match (group, addr3, addr) {
+                (Some(g), Some(a3), _) if *g != ndn_radio_hal::BROADCAST => nonce_u64(a3),
+                (_, _, Some(a2)) => nonce_u64(a2),
+                _ => 0,
+            };
+            if let Some(cell) = self.nonce_by_slot.get(k) {
+                cell.store(nonce, Ordering::Relaxed);
             }
         }
     }
@@ -885,7 +918,43 @@ impl FaceScheduler {
         let last_heard = self.heard_by_slot.get(k).map(|c| c.load(Ordering::Relaxed)).unwrap_or(0);
         let window =
             PRESENCE_WINDOW_US.max(slot.slot_us().saturating_mul(slot.slots()).saturating_mul(2));
-        last_heard != 0 && now.saturating_sub(last_heard) <= window
+        if last_heard == 0 || now.saturating_sub(last_heard) > window {
+            return false;
+        }
+        // **Relay discounting** (P4, the lab-P6 fix). A frame heard from a RELAY legitimately
+        // creates fresh evidence for this slot while the slot's actual user stays hidden — group
+        // evidence is not transmitter audibility, and claiming on it collides at the relay
+        // (demonstrated in the lab before this landed). The hidden holder is invisible to any
+        // passive local rule; what IS locally observable is the §2 nonce: a transmitter whose
+        // nonce evidences TWO OR MORE slots within the window is serving more than one group —
+        // a relay or a multi-group node — and its presence vouches only for itself, never for the
+        // group's other holders. Its evidence therefore does not license a claim.
+        //
+        // The safe direction, twice over: a genuine multi-group ORIGINATOR is indistinguishable
+        // from a relay from outside and gets the same conservative refusal (fewer claims, never a
+        // collision); and an UNKNOWN transmitter (nonce 0 — no addresses on the capture path)
+        // skips the check, preserving the measured single-owner behaviour the +119% run rides on.
+        //
+        // Residual, documented: a PURE-silent relay (never transmits its own traffic) is
+        // indistinguishable from the owner, and a hidden second holder behind it stays hidden —
+        // that case needs second-hand knowledge (the reception-report plane), not more local
+        // inference. §2 nonce ROTATION also unlinks the two sightings once the nonce turns over,
+        // reopening the window until the rotated nonce is seen twice again.
+        let nonce = self.nonce_by_slot.get(k).map(|c| c.load(Ordering::Relaxed)).unwrap_or(0);
+        if nonce == 0 {
+            return true;
+        }
+        let elsewhere = self
+            .nonce_by_slot
+            .iter()
+            .enumerate()
+            .filter(|(j, c)| *j != k && c.load(Ordering::Relaxed) == nonce)
+            .filter(|(j, _)| {
+                let t = self.heard_by_slot.get(*j).map(|c| c.load(Ordering::Relaxed)).unwrap_or(0);
+                t != 0 && now.saturating_sub(t) <= window
+            })
+            .count();
+        elsewhere == 0
     }
 
     /// Frames of `prefix_hash`'s group deferred since it last transmitted — the backlog proxy the
@@ -1298,6 +1367,7 @@ mod tests {
             claim_attempts: super::AtomicU64::new(0),
             claim_wins: super::AtomicU64::new(0),
             heard_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
+            nonce_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
             deferred_by_slot: (0..8).map(|_| super::AtomicU32::new(0)).collect(),
             hold_slot_start: super::AtomicU64::new(u64::MAX),
             lease_until: super::AtomicU64::new(0),
@@ -1341,6 +1411,7 @@ mod tests {
             claim_attempts: super::AtomicU64::new(0),
             claim_wins: super::AtomicU64::new(0),
             heard_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
+            nonce_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
             deferred_by_slot: (0..8).map(|_| super::AtomicU32::new(0)).collect(),
             hold_slot_start: super::AtomicU64::new(u64::MAX),
             lease_until: super::AtomicU64::new(0),
@@ -1420,6 +1491,7 @@ mod tests {
             claim_attempts: super::AtomicU64::new(0),
             claim_wins: super::AtomicU64::new(0),
             heard_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
+            nonce_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
             deferred_by_slot: (0..8).map(|_| super::AtomicU32::new(0)).collect(),
             hold_slot_start: super::AtomicU64::new(u64::MAX),
             lease_until: super::AtomicU64::new(0),
@@ -1576,6 +1648,7 @@ mod tests {
             claim_attempts: super::AtomicU64::new(0),
             claim_wins: super::AtomicU64::new(0),
             heard_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
+            nonce_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
             deferred_by_slot: (0..8).map(|_| super::AtomicU32::new(0)).collect(),
             hold_slot_start: super::AtomicU64::new(u64::MAX),
             lease_until: super::AtomicU64::new(0),
@@ -1611,7 +1684,7 @@ mod tests {
         );
 
         // Overhearing that group is the evidence, and it lands on THAT group's slot only.
-        sched.observe_rx(Some(&ndn_radio_hal::BROADCAST), None, &wire);
+        sched.observe_rx(Some(&ndn_radio_hal::BROADCAST), None, None, &wire);
         assert!(
             sched.heard_by_slot[owned].load(super::Ordering::Relaxed) > 0,
             "hearing /ndn/alarm must mark the slot /ndn/alarm owns"
@@ -1655,7 +1728,7 @@ mod tests {
             "the fixture must really be un-attributable, or this test proves nothing"
         );
 
-        sched.observe_rx(Some(&ndn_radio_hal::BROADCAST), None, &ambient);
+        sched.observe_rx(Some(&ndn_radio_hal::BROADCAST), None, None, &ambient);
         assert_eq!(
             sched.last_domain_rx.load(super::Ordering::Relaxed),
             0,
@@ -1672,7 +1745,7 @@ mod tests {
         );
 
         // The contrast: a frame of ours does mark it, so this is a discrimination and not a mute.
-        sched.observe_rx(Some(&ndn_radio_hal::BROADCAST), None, &data_wire(&[b"ndn", b"alarm"]));
+        sched.observe_rx(Some(&ndn_radio_hal::BROADCAST), None, None, &data_wire(&[b"ndn", b"alarm"]));
         assert!(
             sched.last_domain_rx.load(super::Ordering::Relaxed) > 0,
             "our own domain's traffic must still mark the slot taken"
@@ -1971,6 +2044,7 @@ mod tests {
             claim_attempts: super::AtomicU64::new(0),
             claim_wins: super::AtomicU64::new(0),
             heard_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
+            nonce_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
             deferred_by_slot: (0..8).map(|_| super::AtomicU32::new(0)).collect(),
             hold_slot_start: super::AtomicU64::new(u64::MAX),
             lease_until: super::AtomicU64::new(0),

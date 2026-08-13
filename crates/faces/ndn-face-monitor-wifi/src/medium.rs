@@ -1262,7 +1262,7 @@ impl RunningMedium {
                                 // P1: hand the scheduler the Tier-0 bytes so attribution is a mask
                                 // AND, not a per-frame TLV parse (parse survives only for
                                 // broadcast-addressed legacy frames + first-sighting cold paths).
-                                sched.observe_rx(f.group.as_ref(), f.addr.as_ref(), &f.payload);
+                                sched.observe_rx(f.group.as_ref(), f.addr.as_ref(), f.addr3.as_ref(), &f.payload);
                             }
                             // #74: the MESH hardware common-view — discipline the scheduler's clock to a
                             // neighbour's HW-TSF-stamped timing beacon (pair (peer_tsf, our_rxtsfl), both
