@@ -1065,6 +1065,18 @@ impl RunningMedium {
         self.tx.first().and_then(|b| b.sched.clone())
     }
 
+    /// This node's **current §2 source nonce** (rotates every `NONCE_ROTATION_MS`, fresh per
+    /// process). Exposed for the claim-C topology instrument: a run prints it at start AND end so
+    /// a rotation boundary inside the window self-invalidates, and a peer's `NDN_SCHED_DEAF_SRC`
+    /// is set from the printed value rather than guessed.
+    pub fn source_nonce(&self) -> Option<[u8; 6]> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_millis() as u64;
+        self.tx.first().map(|b| b.source.current(now_ms))
+    }
+
     /// Inject a cooperative-broadcast wire (reception report / discovery / control) at
     /// `MostRobust` intent on every bearer — the basic legacy rate every neighbour can
     /// decode, FEC bypassed. Distinct from [`Transport::send_bytes`], which sends data at

@@ -101,9 +101,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .build(),
     );
+    let nonce_hex = |m: &ndn_face_monitor_wifi::RunningMedium| -> String {
+        m.source_nonce().map(|n| n.iter().map(|b| format!("{b:02x}")).collect()).unwrap_or_default()
+    };
     println!(
-        "role={role} ch{channel} pid={pid:04x} {secs}s txpwr={}",
-        txpwr.map(|i| i.to_string()).unwrap_or_else(|| "default".into())
+        "role={role} ch{channel} pid={pid:04x} {secs}s txpwr={} nonce={}",
+        txpwr.map(|i| i.to_string()).unwrap_or_else(|| "default".into()),
+        nonce_hex(&medium)
     );
 
     match role.as_str() {
@@ -185,6 +189,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    // Nonce at END too: if it differs from the header, a §2 rotation boundary fell inside the run
+    // and any DEAF_SRC keyed on the start nonce silently broke — the run is instrument-invalid.
+    println!("nonce(end)        : {}", nonce_hex(&medium));
     // Every role reports the scheduler's own instrumentation — the counters the prereg names.
     if let Some(s) = medium.scheduler() {
         let (attempts, wins) = s.claim_counts();

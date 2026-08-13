@@ -115,3 +115,20 @@ Honesty clauses:
   original endpoint), and results will say so.
 * TX power for the arms: pinned at the verified scale (`NDN_RADIO_TXPWR` ∈ 20..=63, 061274c's
   clamp) — power is a controlled variable here, not the hiding mechanism.
+
+## Role correction + instrument status — 2026-08-13 late
+
+**Role table corrected** (found while validating the deafness instrument): C sends `/alarm` ONLY;
+B (obs) carries `/light` — as the amendment-2 tooling already does. The original text gave C both,
+which is wrong twice over: (a) A's leases need a claimable open slot from an AUDIBLE owner, and in
+this campaign that must be B, since A is deaf to C; (b) a C sending two groups would be discounted
+by P4's multi-group rule even in the hearing control. The deafness matters exactly once: A's
+owner-return yield across `/alarm`'s slot — hearing-A yields (lease Ends when C's alarm lands),
+deaf-A rolls through and collides at B. The discriminating counters are therefore B's `/alarm`
+delivery and A's hold_continuations-through-the-alarm-slot, per arm.
+
+**Instrument validated at the plumbing level**: each run prints its §2 nonce at start AND end
+(rotation = 5 min, nonce also fresh per process — a straddled run self-invalidates); C's printed
+nonce feeds A's `NDN_SCHED_DEAF_SRC`; verified live (nonce stable across a 90 s run, deafness
+applied in the RX hook before the scheduler). The BEHAVIOURAL validation coincides with the
+campaign's own C-flat arm and is not double-counted as a separate gate.
