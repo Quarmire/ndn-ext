@@ -290,3 +290,47 @@ suffer collisions first; they lose nothing). Post-replug delivery tracks alarm R
 
 Bench hygiene for the next campaign day: re-measure the C→B link (or reseat toward the pre-halt
 geometry) BEFORE registering claim D; and the 8812au-family sustained-RX wedge task stands.
+
+## v3 RE-RUN on the CLEAN harness — 2026-08-14: INCONCLUSIVE vs the 15pp bar (uncontrolled link covariate)
+
+First the retraction that matters: the "8812au sustained-RX wedge" was NOT hardware. It was three
+self-inflicted bench-state bugs (see docs/claim-c-harness.sh + commits 11bd8d8/806a6ae): a leftover
+process holding the device, `pkill -f` self-killing the harness so stale /tmp logs read as results,
+and non-root rm of root-owned logs. Fixed: Drop (clean release), `pkill -x`, `sudo rm`,
+env-before-timeout. The same 881a that "wedged" heard 2181 frames on a clean open. No dongle was
+ever damaged.
+
+Clean 3×2 (nonce start==end enforced; 2 runs invalidated by 5-min rotation and re-run):
+
+| arm | alarm delivery | alarm RSSI @B |
+|---|---|---|
+| L | 86.2% | −5 |
+| L | 88.5% | −5 |
+| L | 79.2% | −10 |
+| F | 84.8% | −6 |
+| F | 68.1% | −12 |
+| F | 66.4% | −12 |
+
+Raw means L 84.7% vs F 73.1% (+11.5pp) — but **confounded**: bulk A→B is rock-stable at −1 dBm,
+while the alarm link C→B (the 8812au on o5p-2) drifts −5..−14 dBm run-to-run and delivery tracks it
+(r strong), and the flat arm drew worse links by chance (mean −10 vs lanes −6.7 dBm). Controlling
+for RSSI: matched STRONG link (−5/−6) → lanes +2.6pp (87.4 vs 84.8, consistent with v2's ~2pp
+non-hidden effect); matched WEAK link (−10/−12) → lanes +11.9pp but only n=1-vs-2.
+
+**Verdict: INCONCLUSIVE vs the registered 15pp threshold.** The C→B alarm-link RSSI is an
+uncontrolled covariate of the same magnitude as the effect. NOT a refutation (the matched-strong
++2.6pp is real and direction-correct) and NOT a pass.
+
+## Claim-C v4 — registered 2026-08-14, before its runs
+
+Two changes, both to CONTROL THE COVARIATE the v3 re-run exposed:
+1. **Pin C's TX to a fixed level** (NDN_RADIO_TXPWR on the C/8812au node — its power knob is
+   RF-unverified, so ALSO log per-run alarm RSSI as the actual covariate and reject any run whose
+   alarm RSSI falls outside a ±2 dB band). Goal: the C→B link stops drifting between arms.
+2. **Test the mechanistic sub-hypothesis the weak-link cells hinted at**: lanes protect MORE when
+   link margin is thin (a collision on a near-floor frame is likelier to lose it). Register TWO
+   link levels — strong (RSSI ≈ −5, saturated) and marginal (RSSI ≈ −12, pinned) — 3 reps each per
+   arm. Prediction: lanes−flat ≈ 0 at strong (owner-return + margin already protect), lanes−flat
+   ≥ 10pp at marginal. Refuted if marginal shows < 5pp.
+This is the first claim in the arc whose hypothesis (margin-dependent lane value) came from the
+data, not the design — the right shape for the next registration.
