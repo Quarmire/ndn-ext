@@ -334,3 +334,24 @@ Two changes, both to CONTROL THE COVARIATE the v3 re-run exposed:
    ≥ 10pp at marginal. Refuted if marginal shows < 5pp.
 This is the first claim in the arc whose hypothesis (margin-dependent lane value) came from the
 data, not the design — the right shape for the next registration.
+
+## v4 NOT ACHIEVABLE at this bench — claim C's definitive resolution moves to the field (2026-08-14)
+
+v4 needed a pinned "marginal" C→B link (~−12 dBm). The C-power sweep shows it cannot be created:
+alarm RSSI at B stays at the meter ceiling (0 / 0 / −4 / −1 dBm) across C's entire TX-power range —
+the same ~90 dB-margin wall that made electronic hiddenness impossible at gate 3. At ~3 ft the C→B
+link is saturated regardless of C's power.
+
+★ And the sweep explains the v3 alarm-RSSI variation (−5..−14) that confounded the re-run: with C
+transmitting ALONE the link is clean at ~0 dBm, so the campaign's low/variable alarm RSSI is **A's
+bulk interference desensing B** — not C's link. The covariate (alarm SINR) and the treatment (lanes
+protecting alarms from A's frames) are the SAME mechanism; they cannot be independently pinned at
+this geometry. v4-as-registered is unrunnable here, honestly.
+
+**Claim C — final bench verdict:** the lanes effect is real, direction-correct, and SMALL (~2pp at
+matched strong link, below the 15pp bar) across every clean measurement; the hidden-terminal
+mechanism is confirmed (P4/P6 relay-discounting) and the µs-clock boundary-loss collapse is
+confirmed on air (v2 85% → v3 92%). But this bench (all nodes ~3 ft, ~90 dB margins) structurally
+cannot resolve a few-pp lane benefit or create a distance-marginal link. **Definitive resolution
+needs the sub-GHz field fleet at real ranges** — which plan-P4 always named as the true endpoint.
+Bench work on claim C is complete; the deferred campaigns (#101 E-sweep) and field validation stand.
