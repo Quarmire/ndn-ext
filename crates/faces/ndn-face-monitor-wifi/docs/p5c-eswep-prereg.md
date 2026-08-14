@@ -65,3 +65,42 @@ emission, so truth is exact). FP = admitted ∧ ¬relevant; FN = ¬admitted ∧ 
 All four arms' FP(E) with Wilson 95% CIs and N per E; the capture's frame count N and source nonce
 (start+end) are printed (the freshness/silent-zero guard — N=0 or start≠end ⇒ instrument-invalid,
 re-run). No best-of. An anomaly (FN>0, or FP off the independence curve) becomes a lab property first.
+
+## RESULTS — 2026-08-13, one capture, N = 140,331 attributable frames (56× #106)
+
+esrc a81a (nonce d61de1c5bef5) → ecap 881a, ch149, legacy 6M, clean harness. Silent-zero guard
+passed (N=140k, one fresh sender nonce). Receiver state: tier0 = 0 B; ndn-nic/tier1 = 256 B.
+
+| E  | negatives | tier0 FP (95% CI)      | ndn-nic FP | tier1 FP |
+|----|-----------|-----------------------|------------|----------|
+| 1  | 139 228   | 0.006% [0.00,0.01]    | 0.000%     | 0.000%   |
+| 2  | 138 129   | 0.811% [0.76,0.86]    | 0.000%     | 0.000%   |
+| 4  | 135 938   | 0.850% [0.80,0.90]    | 0.000%     | 0.001%   |
+| 8  | 131 541   | 0.928% [0.88,0.98]    | 0.000%     | 0.002%   |
+| 16 | 122 764   | 1.206% [1.15,1.27]    | 0.000%     | 0.002%   |
+| 32 | 105 220   | 3.044% [2.94,3.15]    | 0.000%     | 0.004%   |
+| 64 |  70 154   | 6.573% [6.39,6.76]    | 0.000%     | 0.026%   |
+
+**Safety invariant — PASS (the one that mattered).** tier0 FN = 0, tier1 FN = 0, ndn-nic FN = 0 at
+EVERY E over 140k on-air frames. The in-frame Tier-0 bits survive the air with zero false negatives
+across the whole sweep — #106's single point is now a curve. No air/reassembly defect at any E.
+
+**#101 thesis — SUPPORTED, strongly.** Tier-0 (96 in-frame bits, ZERO receiver state) saturates from
+0.006% to 6.57% FP over E=1→64; the 256 B receiver-side tables stay flat (NDN-NIC 0.000%, Tier-1
+≤0.026%) throughout. Crossover to the 5% bar: tier0 E*=64, others >64. A relay (many registered
+prefixes = large E) needs the larger Tier-1 table; an endpoint (small E) rides the free filter. This
+is a *stronger* separation than the prereg predicted.
+
+**Independence curve — anchored prediction REFUTED; the law itself CONFIRMED at scale.** The
+pre-registered check `1-(1-FP(1))^E` fails badly (predicts 0.37% at E=64 vs measured 6.57%) — but
+only because it anchored on FP(1) measured with a SINGLE prefix, /p0, which is a 16× low outlier
+(0.006% vs the population mean). Fitting the per-prefix mean from the large-E points gives a stable
+**p̄ ≈ 0.106%**, and `1-(1-p̄)^E` then matches measured essentially exactly for E≥8 (E=64: pred
+6.56% vs meas 6.57%; E=32: 3.34 vs 3.04; E=8: 0.85 vs 0.93). So the masks ARE ~independent and the
+OR-of-E-masks law holds — the small-E lumpiness (one prefix /p1 alone adds ~0.8%) is the
+per-prefix-heterogeneity / "the name distribution dominates, not k" phenomenon already documented in
+`tier0.rs`, now demonstrated on air. Lesson for the tool: never anchor a BF FP curve on one prefix.
+
+**Verdict.** #101's on-air E-sweep is COMPLETE. The design question is answered with air data: Tier-0
+is the correct free filter up to E in the low tens (FP < ~1%); beyond that a relay must carry the
+larger Tier-1 table, whose FP stays negligible. Safety (0 FN) holds unconditionally across E.
