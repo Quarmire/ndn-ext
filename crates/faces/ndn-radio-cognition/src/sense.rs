@@ -438,6 +438,13 @@ pub trait MediumView {
     fn duty_used(&self, _radio: RadioId, _now_ms: u64) -> f32 {
         0.0
     }
+    /// The worst (lowest) `max_rx_mcs` any fresh neighbour advertised in a reception report — the
+    /// rate ceiling a transmit must respect so *every* listener can decode it (the doctrine's
+    /// worst-overheard-receiver rate). `None` when no neighbour has reported. Default `None` for
+    /// views that don't track reception reports.
+    fn worst_neighbor_rx_mcs(&self, _now_ms: u64) -> Option<u8> {
+        None
+    }
 }
 
 impl MediumView for MediumState {
@@ -462,6 +469,10 @@ impl MediumView for MediumState {
             })
             .unwrap_or(0.0);
         sum / DUTY_WINDOW_MS as f32
+    }
+    fn worst_neighbor_rx_mcs(&self, now_ms: u64) -> Option<u8> {
+        // Delegate to the inherent accessor (the report-derived worst RX ceiling).
+        MediumState::worst_neighbor_rx_mcs(self, now_ms)
     }
     fn residual(&self, radio: RadioId) -> Option<LinkResidual> {
         self.residual.get(&radio).copied()

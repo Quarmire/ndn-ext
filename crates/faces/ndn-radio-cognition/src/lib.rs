@@ -75,8 +75,8 @@ pub use policy::{
     SuppressReason,
 };
 pub use report::{
-    FULL_RX_MCS, LEGACY_ONLY_RX, MAX_ENTRIES, REPORT_MAGIC, ReceptionReport, decode_report,
-    encode_report,
+    FULL_RX_MCS, LEGACY_ONLY_RX, MAX_ENTRIES, REPORT_MAGIC, ReceptionReport, SINGLE_STREAM_HT_RX_MCS,
+    decode_report, encode_report,
 };
 pub use schedule::{HopSchedule, LeaseClass, SlotSchedule, wifi_airtime_us};
 pub use sense::{

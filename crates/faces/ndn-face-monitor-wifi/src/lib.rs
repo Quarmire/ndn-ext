@@ -139,7 +139,7 @@ pub use control::LibUsbActuator;
 pub use control::RadioControl;
 pub use control::{activity_rate, spawn_occupancy_sampler};
 /// Advertised RX-capability sentinels for the worst-overheard-receiver rate cap.
-pub use ndn_radio_cognition::{FULL_RX_MCS, LEGACY_ONLY_RX};
+pub use ndn_radio_cognition::{FULL_RX_MCS, LEGACY_ONLY_RX, SINGLE_STREAM_HT_RX_MCS};
 
 // "The medium is the face": one NDN face over N radio *capabilities* (RX union +
 // TX fan-out), the data plane matching the already-medium-shaped `RadioControl`.

@@ -495,7 +495,20 @@ impl RadioPolicy {
         } else {
             base
         };
-        let mcs = self.pick_mcs(Some(eff.round().clamp(-110.0, 0.0) as i8), cap.max_mcs());
+        // Worst-overheard-receiver rate cap (doctrine §5): a listener that only brings up one RX
+        // chain (e.g. the userspace RTL8812EU, `max_rx_mcs` = 7) cannot decode a 2-stream frame at
+        // *any* index — so a neighbour advertising 1..=7 caps both the MCS ceiling and the stream
+        // count, not just the MCS. `LEGACY_ONLY_RX` (0) is out of band (the legacy-rate gate handles
+        // it); `None`/`FULL_RX_MCS` leave the radio's own ceiling. Without this, cognition happily
+        // picks a 2-stream MCS the neighbour can never decode (measured: MCS 9 → a one-way link).
+        let neighbor_rx = view.worst_neighbor_rx_mcs(now_ms);
+        let mcs_ceiling = match neighbor_rx {
+            Some(c) if c >= 1 => cap.max_mcs().min(c),
+            _ => cap.max_mcs(),
+        };
+        let neighbor_single_stream =
+            matches!(neighbor_rx, Some(c) if (1..=crate::report::SINGLE_STREAM_HT_RX_MCS).contains(&c));
+        let mcs = self.pick_mcs(Some(eff.round().clamp(-110.0, 0.0) as i8), mcs_ceiling);
 
         // Bandwidth: capability ceiling, narrowed under contention.
         let mut bw = cap.max_bw();
@@ -504,7 +517,9 @@ impl RadioPolicy {
         }
 
         let good_snr = rssi.unwrap_or(-90) >= -60;
-        let nss = if ctx.priority == Priority::Bulk && good_snr {
+        let nss = if neighbor_single_stream {
+            1 // a 1-RX-chain neighbour cannot decode a 2-stream frame at any MCS
+        } else if ctx.priority == Priority::Bulk && good_snr {
             cap.max_nss()
         } else {
             1
@@ -923,6 +938,57 @@ mod tests {
         assert!(
             broad_mcs < uni_mcs,
             "broad {broad_mcs} should be < unicast {uni_mcs}"
+        );
+    }
+
+    /// The worst-overheard-receiver cap: a neighbour that advertises a single-RX-chain capability
+    /// (`SINGLE_STREAM_HT_RX_MCS` = 7) forces the transmit down to single-stream ≤ MCS 7 even on a
+    /// strong bulk link — because a 1-chain radio cannot decode a 2-stream frame at *any* index. This
+    /// is the fix for the field-diagnosed one-way link (a peer TXing 2-stream MCS 9 the drone's
+    /// userspace RTL8812EU could never decode).
+    #[test]
+    fn single_stream_neighbor_caps_mcs_and_stream_count() {
+        use crate::report::{FULL_RX_MCS, SINGLE_STREAM_HT_RX_MCS};
+        use crate::sense::NeighborReport;
+
+        // A strong single-receiver bulk link: uncapped, cognition provisions a high, 2-stream rate.
+        let ctx = NameContext {
+            priority: Priority::Bulk,
+            ..NameContext::new(0xAA)
+        };
+        let decide_for = |max_rx: u8| {
+            let mut m = wifi_only();
+            m.observe_rx(W, 1, Some(-45), 1_000); // strong link ⇒ high uncapped MCS
+            m.observe_report(
+                1,
+                NeighborReport {
+                    heard_prefixes: vec![],
+                    quality_dbm: Some(-45),
+                    spectrum: vec![],
+                    max_rx_mcs: max_rx,
+                    ts_ms: 1_000,
+                },
+            );
+            RadioPolicy::default().decide(&ctx, &m, 1_000).allocations[0].params
+        };
+
+        let full = decide_for(FULL_RX_MCS);
+        let single = decide_for(SINGLE_STREAM_HT_RX_MCS);
+
+        assert!(
+            single.mcs().unwrap() <= 7,
+            "1-chain neighbour must cap MCS at 7, got {:?}",
+            single.mcs()
+        );
+        assert_eq!(single.nss(), Some(1), "1-chain neighbour cannot decode 2 streams");
+        // And the cap is what changed it: the full-capable neighbour is strictly more aggressive.
+        assert!(
+            full.mcs().unwrap() > single.mcs().unwrap() || full.nss() > single.nss(),
+            "full neighbour ({:?}/{:?} MCS/nss) should out-rate the capped one ({:?}/{:?})",
+            full.mcs(),
+            full.nss(),
+            single.mcs(),
+            single.nss(),
         );
     }
 

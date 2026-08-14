@@ -30,6 +30,13 @@ pub const FULL_RX_MCS: u8 = 9;
 /// 5 GHz (measured 2026-07-24). A transmitter reaching such a neighbour must use a legacy
 /// basic rate for the whole content group (the doctrine's worst-overheard-receiver rate).
 pub const LEGACY_ONLY_RX: u8 = 0;
+/// `max_rx_mcs` value for a **single-RX-chain** receiver: decodes single-stream HT (MCS 0–7) and
+/// legacy, but **no** 2-stream frame at any index. The userspace RTL8812EU (88xx backend) brings up
+/// one RX chain, so it advertises this (field-measured 2026-08-13: MCS 0–7 decode, 8–15 do not). A
+/// transmitter reaching such a neighbour caps its data rate at MCS 7 **and one spatial stream** — a
+/// 2-stream frame is undecodable by a 1-chain radio regardless of per-stream MCS. This is why
+/// [`FULL_RX_MCS`] here means "2-stream capable", and any `1..=7` means "single stream, ≤ that MCS".
+pub const SINGLE_STREAM_HT_RX_MCS: u8 = 7;
 
 /// A node's snapshot of what it observes, shared with neighbors.
 #[derive(Clone, Debug, PartialEq)]
