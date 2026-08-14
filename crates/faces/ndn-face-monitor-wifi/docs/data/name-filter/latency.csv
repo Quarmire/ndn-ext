@@ -1,0 +1,5 @@
+op,count,mean_ns,p50_ns,p99_ns
+blur_build_bloom,4000,2992,2750,6542
+blur_build_gcs,4000,2008,1958,3250
+blur_build_xor,4000,3757,3791,6000
+blur_query_fib,4000,9747,9875,12166

@@ -63,6 +63,8 @@ tokio = { workspace = true, features = ["sync", "rt", "macros", "rt-multi-thread
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ndn-packet = { workspace = true }
 ndn-tlv = { workspace = true }
+# name_filter_eval: exercise the real OTLP-in-Data span pipeline on the filter ops (#107).
+ndn-observability = { workspace = true }
 # Core FEC codec only (no `endpoint` → no engine/ndn-app pulled in): the
 # `segment_payload` / `CodedAssembler` byte-level API drives K-of-N recovery
 # over the raw Face directly. Declared by path (not inherited) so
