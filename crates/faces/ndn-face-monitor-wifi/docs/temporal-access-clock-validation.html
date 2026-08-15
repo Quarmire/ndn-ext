@@ -1,0 +1,222 @@
+<title>Closing the clock-phase gap — temporal-access validation</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root {
+    --paper:#eef2f6; --card:#ffffff; --ink:#0b1220; --muted:#5a6b7b; --line:#d7e0e8;
+    --accent:#0e9aa7; --accent-soft:#0e9aa71a; --good:#1f9d5a; --bad:#d83a3f; --warn:#b9791a;
+    --mono:ui-monospace,"SF Mono","JetBrains Mono","Cascadia Code",Menlo,monospace;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --maxw:1000px;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{ --paper:#0a1017; --card:#0f1822; --ink:#e6eef5; --muted:#8aa0b2; --line:#1d2a38;
+      --accent:#2bd4e0; --accent-soft:#2bd4e01f; --good:#35c37e; --bad:#f0575c; --warn:#e0a03a; }
+  }
+  :root[data-theme="light"]{ --paper:#eef2f6; --card:#ffffff; --ink:#0b1220; --muted:#5a6b7b; --line:#d7e0e8;
+    --accent:#0e9aa7; --accent-soft:#0e9aa71a; --good:#1f9d5a; --bad:#d83a3f; --warn:#b9791a; }
+  :root[data-theme="dark"]{ --paper:#0a1017; --card:#0f1822; --ink:#e6eef5; --muted:#8aa0b2; --line:#1d2a38;
+    --accent:#2bd4e0; --accent-soft:#2bd4e01f; --good:#35c37e; --bad:#f0575c; --warn:#e0a03a; }
+  *{ box-sizing:border-box; }
+  body{ margin:0; background:var(--paper); color:var(--ink); font-family:var(--sans); line-height:1.55; -webkit-font-smoothing:antialiased; }
+  .wrap{ max-width:var(--maxw); margin:0 auto; padding:clamp(20px,4vw,56px) clamp(16px,4vw,32px) 80px; }
+  .eyebrow{ font-family:var(--mono); font-size:12px; letter-spacing:.18em; text-transform:uppercase; color:var(--accent); margin:0 0 14px; }
+  h1{ font-size:clamp(28px,5vw,44px); line-height:1.05; letter-spacing:-.02em; margin:0 0 14px; text-wrap:balance; font-weight:760; }
+  h1 .thin{ color:var(--muted); font-weight:400; }
+  .lede{ font-size:clamp(16px,2vw,19px); color:var(--muted); max-width:66ch; margin:0; }
+  .hyp{ display:inline-flex; align-items:center; gap:8px; margin-top:18px; padding:6px 12px; border:1px solid var(--line); border-radius:999px; font-family:var(--mono); font-size:12px; color:var(--muted); }
+  .hyp .dot{ width:8px; height:8px; border-radius:50%; background:var(--warn); }
+  section{ margin-top:52px; }
+  h2{ font-size:clamp(20px,3vw,26px); letter-spacing:-.01em; margin:0 0 6px; font-weight:680; }
+  h2 .n{ font-family:var(--mono); font-size:14px; color:var(--accent); margin-right:12px; font-weight:500; }
+  .sub{ color:var(--muted); max-width:72ch; margin:0 0 20px; }
+  .readouts{ display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:14px; margin-top:32px; }
+  .stat{ background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px 18px; }
+  .stat .k{ font-family:var(--mono); font-size:11px; letter-spacing:.1em; text-transform:uppercase; color:var(--muted); }
+  .stat .v{ font-family:var(--mono); font-size:clamp(21px,3vw,27px); font-weight:600; margin-top:6px; font-variant-numeric:tabular-nums; }
+  .stat .v.good{ color:var(--good); } .stat .v.acc{ color:var(--accent); } .stat .v.bad{ color:var(--bad); }
+  .stat .note{ font-size:12.5px; color:var(--muted); margin-top:4px; }
+  .card{ background:var(--card); border:1px solid var(--line); border-radius:14px; padding:22px 22px 18px; }
+  figure{ margin:0; } figcaption{ font-size:13.5px; color:var(--muted); margin-top:12px; max-width:74ch; }
+  figcaption b{ color:var(--ink); font-weight:600; }
+  .chart{ width:100%; overflow-x:auto; } svg{ display:block; max-width:100%; height:auto; font-family:var(--mono); }
+  .legend{ display:flex; flex-wrap:wrap; gap:16px; font-family:var(--mono); font-size:12px; color:var(--muted); margin:2px 0 14px; }
+  .legend span{ display:inline-flex; align-items:center; gap:7px; } .swatch{ width:11px; height:11px; border-radius:3px; display:inline-block; }
+  table.mx{ border-collapse:collapse; font-family:var(--mono); font-size:13px; width:100%; }
+  table.mx th, table.mx td{ padding:8px 10px; text-align:center; border:1px solid var(--line); font-variant-numeric:tabular-nums; }
+  table.mx th{ color:var(--muted); font-weight:500; font-size:11.5px; }
+  table.mx td.lbl{ text-align:left; color:var(--ink); }
+  .open{ background:var(--card); border:1px solid var(--line); border-left:3px solid var(--warn); border-radius:12px; padding:18px 22px; }
+  .open ul{ margin:10px 0 0; padding-left:18px; } .open li{ margin:8px 0; color:var(--muted); max-width:74ch; } .open li b{ color:var(--ink); }
+  code{ font-family:var(--mono); font-size:.9em; background:var(--accent-soft); padding:1px 5px; border-radius:5px; }
+  footer{ margin-top:56px; padding-top:20px; border-top:1px solid var(--line); color:var(--muted); font-family:var(--mono); font-size:12px; }
+</style>
+
+<div class="wrap">
+  <p class="eyebrow">Named Data Radio · temporal access · WHEN</p>
+  <h1>Closing the clock-phase gap <span class="thin">— sub-µs cross-node time without the hardware feature</span></h1>
+  <p class="lede">A slotted MAC is only collision-free if nodes agree on where a slot begins. That
+    agreement was capped by one thing — the master's build→air transmit latency. Here is the gap, the
+    exploit that closes it with only the RX timestamps a commodity radio already gives, and what it
+    earns in delivered packets — all measured over the production time & PHY code.</p>
+  <span class="hyp"><span class="dot"></span>One facet of the MAC — validated in sim over real Timekeeper / NetworkTime / RadioBus</span>
+
+  <div class="readouts" id="readouts"></div>
+
+  <section>
+    <h2><span class="n">01</span>The gap, and the exploit that closes it</h2>
+    <p class="sub">Common-view precision is "bounded by the master's build→air TX latency." A
+      build-stamped beacon is stale by that latency at reception, biasing every offset estimate.
+      Two fixes remove it — and the winning one needs <em>no</em> TX-timestamp feature.</p>
+    <div class="card"><figure>
+      <div class="legend" id="l1"></div>
+      <div class="chart" id="c1"></div>
+      <figcaption><b>build</b> tracks the latency and breaks convergence above ~50 µs (46 ms of "sync"
+        at 1 ms latency). <b>calibrate</b> subtracts the mean, leaving jitter (helps to ~200 µs).
+        <b>shared</b> — RX-stamp a common ambient beacon so the latency <em>cancels in the receiver
+        pair</em> — holds ~6.7 µs flat at any latency, matching <b>air</b> (HW TX-stamp). The
+        femto-photography move: don't reconstruct the instrument, exploit a common event so what you
+        can't measure cancels. WiFi supplies those events free — every AP beacon.</figcaption>
+    </figure></div>
+  </section>
+
+  <section>
+    <h2><span class="n">02</span>Multi-hop — mechanism, not limit</h2>
+    <p class="sub">The first multi-hop run showed a horizon at 3 hops. It was the wrong mechanism:
+      the Timekeeper's uncertainty fusion (great for a mesh) doesn't propagate a chain. NetworkTime's
+      explicit stratum composition does — with no horizon.</p>
+    <div class="card"><figure>
+      <div class="legend" id="l2"></div>
+      <div class="chart" id="c2"></div>
+      <figcaption><b>Timekeeper</b> (uncertainty fusion): far hops never sync — a hard horizon.
+        <b>NetworkTime</b> (stratum composition): all 8 hops hold. And the exploit <em>compounds with
+        depth</em> — the systematic build gap grows k·txlat (linear), while air/shared grow only
+        √k·jitter → <b>~3 µs at 8 hops</b>. A deep mesh makes the shared-reference case stronger.</figcaption>
+    </figure></div>
+  </section>
+
+  <section>
+    <h2><span class="n">03</span>What it earns — delivery over the real PHY</h2>
+    <p class="sub">The residual must fit inside the guard band or adjacent-slot owners collide.
+      Delivery over the real <code>RadioBus</code> collision model, sweeping guard × the residual each
+      clock discipline produces:</p>
+    <div class="card">
+      <div style="overflow-x:auto"><table class="mx" id="deliv"></table></div>
+      <figcaption style="margin-top:14px">A tight clock (air/shared ~7 µs, ~3 µs at 8 hops) delivers
+        ~100% at a <b>10 µs guard</b>; a software (ms) clock needs a <b>~1000 µs guard</b> — and at a
+        tight guard delivers 20% (the #111 tax made concrete).</figcaption>
+    </div>
+  </section>
+
+  <section>
+    <h2><span class="n">04</span>The 50× payoff — the guard's price</h2>
+    <p class="sub">The guard dominates the slot (frame airtime is 9.2 µs), so it dominates goodput and
+      latency. Closing the gap lets the guard shrink from ~1000 µs to ~10 µs:</p>
+    <div class="card"><figure>
+      <div class="legend" id="l4"></div>
+      <div class="chart" id="c4"></div>
+      <figcaption>10 µs guard → <b>25 Mb/s, 144 µs p99</b>; 1000 µs guard → <b>0.5 Mb/s, 7 ms p99</b>.
+        A <b>50× goodput gain and 49× latency reduction</b> — earned by a shared reference and RX
+        stamps, with no hardware TX-timestamp feature.</figcaption>
+    </figure></div>
+  </section>
+
+  <section>
+    <h2><span class="n">05</span>What this doesn't yet settle</h2>
+    <div class="open"><ul>
+      <li><b>Adaptive engage/disengage is undesigned.</b> This proves slotting <em>can</em> be tight;
+        the controller that decides <em>when</em> to impose a schedule vs stay work-conserving (the
+        LBT/EDCCA/#111 lesson) is the next piece — capability-based, with a floor, fusing sensors.</li>
+      <li><b>The residual is modeled as a per-beacon bias driving the real estimators.</b> Faithful for
+        the residual floor; a full physical-layer beacon model (real preamble correlation, CSI) is the
+        honest next fidelity step.</li>
+      <li><b>On-air.</b> The RX-stamp floor (~0.4 µs, #74) and the shared-reference cancellation are
+        measured single-node; the cross-node closure over ambient beacons is not yet on real radios.</li>
+    </ul></div>
+  </section>
+
+  <footer id="foot"></footer>
+</div>
+
+<script>
+(function(){
+  "use strict";
+  var css = getComputedStyle(document.documentElement);
+  function tok(n){ return css.getPropertyValue(n).trim(); }
+  var C = { ink:tok('--ink'), muted:tok('--muted'), line:tok('--line'), accent:tok('--accent'), good:tok('--good'), bad:tok('--bad'), warn:tok('--warn') };
+  var SVGNS='http://www.w3.org/2000/svg';
+  function el(t,a){ var e=document.createElementNS(SVGNS,t); for(var k in a) e.setAttribute(k,a[k]); return e; }
+  function svg(w,h){ return el('svg',{viewBox:'0 0 '+w+' '+h,width:w,height:h,role:'img'}); }
+  function txt(s,x,y,o){ o=o||{}; var t=el('text',{x:x,y:y,'font-size':o.size||11,fill:o.fill||C.muted,'text-anchor':o.anchor||'start','font-weight':o.w||400}); t.textContent=s; if(o.ls)t.setAttribute('letter-spacing',o.ls); return t; }
+  function legend(id,items){ var c=document.getElementById(id); items.forEach(function(it){ var sp=document.createElement('span'); sp.innerHTML='<i class="swatch" style="background:'+it.c+'"></i>'+it.t; c.appendChild(sp); }); }
+
+  // ---- data (measured; docs/data/clock-phase/*.csv) ----
+  var tx=[10,50,200,1000,5000];
+  var s1={ build:[40.74,121.02,447.74,46433.89,232552.51], cal:[9.98,16.92,53.68,255.31,30583.17], shared:[6.66,6.66,6.66,6.66,6.66], air:[6.67,6.67,6.67,6.67,6.67] };
+  var hops=[1,2,3,4,5,6,7,8];
+  var s2={ tk:[4.6,4.8,4.8,705.4,1156.3,2084.9,3051.0,2199.6], ntAir:[0.8,1.0,1.2,1.6,1.8,1.8,1.7,2.0], ntShared:[0.7,1.2,1.3,1.9,2.2,2.3,2.6,3.1], ntCal:[4.6,8.1,7.6,11.8,15.8,19.2,15.6,15.5] };
+  var guards=[10,50,200,1000,5000];
+  var deliv=[ ['perfect',[100,100,100,100,100]], ['air/shared 8-hop',[100,100,100,100,100]], ['air/shared 1-hop',[95,100,100,100,100]], ['calibrate',[64,91,100,100,100]], ['software / ms',[20,31,67,97,100]] ];
+  var cost={ good:[25.0,8.1,2.3,0.5,0.1], lat:[143.8,423.8,1473.8,7073.8,35073.8] };
+
+  // log-scale line chart (µs residual vs latency/hops)
+  function logLines(cid, xs, series, opt){
+    opt=opt||{}; var W=920,H=opt.h||280,pad={l:56,r:20,t:16,b:38},iw=W-pad.l-pad.r,ih=H-pad.t-pad.b;
+    var s=svg(W,H);
+    var lo=Math.log10(opt.ymin||1), hi=Math.log10(opt.ymax||300000);
+    var ticks=opt.ticks||[1,10,100,1000,10000,100000];
+    ticks.forEach(function(v){ var y=pad.t+ih-(Math.log10(v)-lo)/(hi-lo)*ih;
+      s.appendChild(el('line',{x1:pad.l,y1:y,x2:W-pad.r,y2:y,stroke:C.line}));
+      s.appendChild(txt(v>=1000?(v/1000)+'ms':v+'µs',pad.l-8,y+3,{anchor:'end',size:10})); });
+    var xmin=xs[0],xmax=xs[xs.length-1];
+    function X(v){ return opt.logx ? pad.l+(Math.log10(v)-Math.log10(xmin))/(Math.log10(xmax)-Math.log10(xmin))*iw : pad.l+(v-xmin)/(xmax-xmin)*iw; }
+    function Y(v){ return pad.t+ih-(Math.log10(Math.max(v,0.5))-lo)/(hi-lo)*ih; }
+    xs.forEach(function(xv){ s.appendChild(txt(opt.xf?opt.xf(xv):xv,X(xv),pad.t+ih+20,{anchor:'middle',size:10})); });
+    series.forEach(function(ser){ var d=''; ser.y.forEach(function(yv,i){ d+=(i?'L':'M')+X(xs[i]).toFixed(1)+' '+Y(yv).toFixed(1)+' '; });
+      s.appendChild(el('path',{d:d,fill:'none',stroke:ser.c,'stroke-width':2.4,'stroke-linejoin':'round'}));
+      ser.y.forEach(function(yv,i){ s.appendChild(el('circle',{cx:X(xs[i]),cy:Y(yv),r:3,fill:ser.c})); }); });
+    document.getElementById(cid).appendChild(s);
+  }
+
+  // grouped bars: guard cost (goodput + latency), dual scaled
+  function costChart(){
+    var W=920,H=260,pad={l:52,r:52,t:18,b:40},iw=W-pad.l-pad.r,ih=H-pad.t-pad.b;
+    var s=svg(W,H), n=guards.length, bw=iw/n, gmax=26, lmax=36000;
+    [0,13,26].forEach(function(v){ var y=pad.t+ih-(v/gmax)*ih; s.appendChild(el('line',{x1:pad.l,y1:y,x2:W-pad.r,y2:y,stroke:C.line})); s.appendChild(txt(v,pad.l-8,y+3,{anchor:'end',size:10,fill:C.accent})); });
+    guards.forEach(function(g,i){ var cx=pad.l+bw*i+bw/2;
+      var gh=(cost.good[i]/gmax)*ih, gy=pad.t+ih-gh;
+      s.appendChild(el('rect',{x:cx-30,y:gy,width:26,height:gh,rx:3,fill:C.accent,opacity:.9}));
+      var lh=(Math.log10(cost.lat[i])/Math.log10(lmax))*ih, ly=pad.t+ih-lh;
+      s.appendChild(el('rect',{x:cx+4,y:ly,width:26,height:lh,rx:3,fill:C.warn,opacity:.85}));
+      s.appendChild(txt(cost.good[i].toFixed(1),cx-17,gy-6,{anchor:'middle',size:10,fill:C.ink}));
+      s.appendChild(txt((cost.lat[i]/1000).toFixed(1)+'ms',cx+17,ly-6,{anchor:'middle',size:9,fill:C.warn}));
+      s.appendChild(txt(g>=1000?(g/1000)+'ms':g+'µs',cx,pad.t+ih+22,{anchor:'middle',size:11,fill:C.ink})); });
+    document.getElementById('c4').appendChild(s);
+  }
+
+  // readouts
+  [{k:'gap closed to',v:'6.7 µs',cls:'good',note:'no TX-timestamp — shared ambient ref'},
+   {k:'vs the gap',v:'46 ms → 6.7 µs',cls:'acc',note:'build-stamp @1ms latency'},
+   {k:'8-hop residual',v:'3.1 µs',cls:'acc',note:'NetworkTime composition, no horizon'},
+   {k:'guard unlocked',v:'10 µs',cls:'acc',note:'from ~1000 µs (software)'},
+   {k:'MAC payoff',v:'50×',cls:'good',note:'goodput · 49× latency'},
+   {k:'OTLP spans',v:'25',cls:'acc',note:'via ndn-observability'}
+  ].forEach(function(r){ var d=document.createElement('div'); d.className='stat';
+    d.innerHTML='<div class="k">'+r.k+'</div><div class="v '+r.cls+'">'+r.v+'</div><div class="note">'+r.note+'</div>';
+    document.getElementById('readouts').appendChild(d); });
+
+  legend('l1',[{c:C.bad,t:'build (the gap)'},{c:C.warn,t:'calibrate mean'},{c:C.accent,t:'shared reference'},{c:C.good,t:'air (HW TX-stamp)'}]);
+  logLines('c1',tx,[{y:s1.build,c:C.bad},{y:s1.cal,c:C.warn},{y:s1.shared,c:C.accent},{y:s1.air,c:C.good}],{logx:true,ymin:3,ymax:300000,xf:function(v){return v>=1000?(v/1000)+'ms':v+'µs';}});
+  legend('l2',[{c:C.bad,t:'Timekeeper (uncertainty fusion)'},{c:C.good,t:'NetworkTime air'},{c:C.accent,t:'NetworkTime shared'},{c:C.warn,t:'NetworkTime calibrate'}]);
+  logLines('c2',hops,[{y:s2.tk,c:C.bad},{y:s2.ntAir,c:C.good},{y:s2.ntShared,c:C.accent},{y:s2.ntCal,c:C.warn}],{ymin:0.5,ymax:5000,ticks:[1,10,100,1000],xf:function(v){return 'h'+v;}});
+  legend('l4',[{c:C.accent,t:'goodput (Mb/s, left)'},{c:C.warn,t:'access p99 latency (log)'}]);
+  costChart();
+
+  // delivery matrix table
+  var t=document.getElementById('deliv'); var head='<tr><th>clock \\ guard</th>'; guards.forEach(function(g){ head+='<th>'+(g>=1000?(g/1000)+'ms':g+'µs')+'</th>'; }); head+='</tr>';
+  var body=''; deliv.forEach(function(row){ body+='<tr><td class="lbl">'+row[0]+'</td>'; row[1].forEach(function(v){
+    var col = v>=99? C.good : v>=80? C.warn : C.bad; body+='<td style="color:'+col+';font-weight:600">'+v+'%</td>'; }); body+='</tr>'; });
+  t.innerHTML=head+body;
+
+  document.getElementById('foot').textContent='Named Data Radio · temporal access · driven by real ndn-time Timekeeper + NetworkTime + ndn-sim RadioBus. 2 experiments, recorded CSV, OTLP-in-Data. A validated subsystem hypothesis.';
+})();
+</script>
