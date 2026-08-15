@@ -197,8 +197,20 @@ by *avoidance* (sense + move in frequency/time — the coband-cognition path), n
 Reservation governs the cooperative set; cooperative and foreign occupants are separated, not
 interleaved.
 
-Remaining: the reserve-vs-contend *policy* (the sensor fusion that decides when bulk escalates) and the
-coded-random-access / SIC enhancement (CRDSA, ties to RLNC #58) for the extreme-contention tail.
+**The escalation policy (validated, `reserve_policy.rs`).** Capability-graded: the **reactive floor**
+(collision-hysteresis, no sensing — every node runs it) already gets near-full burst protection (p99 6
+vs contention's 9) at **~1/5 the airtime cost of always-reserve (12% reserved vs 59%)**. Occupancy
+fusion (#30) is a *gated* add-on — it adds little in this regime, and its meta-weight (occupancy's
+measured predictiveness) correctly **discounts a misleading sensor** (no over-reservation), satisfying
+"fuse only when it helps." Default to the floor; fuse occupancy only where it is measured predictive.
+
+**The CRDSA/SIC tail (measured — and it corrected the design).** Replica diversity **without SIC does
+not raise the contention ceiling — it *hurts* at saturation** (delivery 38%→5% as replicas grow, since
+replicas add load). The CRDSA throughput gain fundamentally requires **SIC** (soft-symbol
+cancellation), which commodity 802.11 does not expose. So the base MAC does **not** rely on coded
+random access: on COTS, the answer to saturation is *reservation escalation* (above) or *load
+reduction* (rate/FEC — the link-adaptation facet). **SIC-CRDSA is a custom-silicon ceiling (#100),
+noted, not designed into the COTS MAC.**
 
 ## 10. Open cross-facet interactions
 
