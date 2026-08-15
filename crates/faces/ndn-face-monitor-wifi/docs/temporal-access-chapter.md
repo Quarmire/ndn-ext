@@ -160,16 +160,45 @@ practical ceiling, with wall as the universal floor.
 | **NAV** | ignored — self-enforce, don't delegate | #96, named-filter-mac-redesign §10 |
 | **Telemetry** | 25 OTLP-in-Data spans via ndn-observability | `traces.ndjson` (#107) |
 
-## 9. Open: the adaptive engage/disengage controller
+## 9. The reservation overlay (designed + validated)
 
-The measured negatives (LBT/EDCCA hurt when misapplied; the #111 slotting tax) say scheduling structure
-is **not free** — it trades throughput for collision-freedom and only pays under real contention. So
-the load-bearing undesigned piece is the controller that decides *when* to impose the schedule vs stay
-work-conserving. Per the design constraints: **capability-based, with a minimum floor all nodes can
-run, fusing sensors only when the fusion helps more than it costs.** Inputs: frame-free occupancy
-sensing (#30), observed delivery/collision, and traffic class (latency-critical present may force
-class protection even at low contention). This chapter gives it a clean model to build on — the
-residual→guard→delivery relationship — but the controller itself is future work.
+The negatives (LBT/EDCCA hurt when misapplied; the #111 tax) say scheduling is **not free**. The
+instinct was a binary *engage/disengage* controller — but that is the wrong structure (a mode switch
+is discontinuous and leaves coexistence undefined). The MAC literature solved this 40 years ago as a
+**reservation overlay** — [PRMA](https://www.netlab.tkk.fi/opetus/s38149/s02/reports/PRMA_jl.pdf) /
+[Reservation-ALOHA](https://en.wikipedia.org/wiki/Reservation_ALOHA), the modern
+[grant-free/grant-based](https://pmc.ncbi.nlm.nih.gov/articles/PMC6720724/) hybrid — where reservation
+and contention run **simultaneously**, and the codebase already approximates it (claimable slot +
+owner-protection + lease + class = a named PRMA/R-ALOHA).
+
+**The design is a per-name choice, not a node mode:**
+- **Latency-class content RESERVES** its owned slot (protected, PRMA-voice-like).
+- **Bulk content CONTENDS** for idle/unreserved slots via the claimable-slot/CCLF mechanism
+  (R-ALOHA data), immediate at low load — and *escalates to reserving* only when its traffic is
+  *measured* contended (fusing occupancy #30 + observed collisions). Capability-floored: a clockless
+  node can only contend + CCA.
+- **"Disengaged" is not a node** — it is unreserved airtime, accessed by contention that still defers
+  around computed reservations. Same MAC, no reservation of its own.
+
+**Validated over the real `RadioBus`** (`reservation_overlay.rs`, hidden terminals, tight 7 µs clock):
+the overlay is best-or-tied in every load cell — it holds the **latency class at 112 µs** (vs
+contention's 1377 µs tail, 12×) *and* gives **bulk 76 µs at low load** (better than TDMA's 228 µs, via
+idle-slot reuse) rising to a bounded 232 µs at saturation. It subsumes contention (which collapses
+under hidden-terminal collisions) and TDMA (which wastes idle slots). This also reconciles #111 (N=2,
+no hidden terminals): the reserve-vs-contend policy correctly *contends* there.
+
+**Coexistence — the honest limit (§10 gradient, measured worst-case).** Purely-uncooperative *foreign*
+traffic (ignores the schedule, never learns) degrades reservations toward contention — **10% foreign
+already blows the latency tail 8× (112→939 µs)**. No time-sharing MAC protects a reservation from a
+node that ignores it and cannot be heard. CCA helps for *audible* foreign; the **self-announcing
+reservation** (its periodic occupancy) lets a *cooperative-but-clockless* node learn and avoid it; but
+a genuinely foreign device does neither. So the design decision is firm: **foreign traffic is handled
+by *avoidance* (sense + move in frequency/time — the coband-cognition path), not by *time-sharing*.**
+Reservation governs the cooperative set; cooperative and foreign occupants are separated, not
+interleaved.
+
+Remaining: the reserve-vs-contend *policy* (the sensor fusion that decides when bulk escalates) and the
+coded-random-access / SIC enhancement (CRDSA, ties to RLNC #58) for the extreme-contention tail.
 
 ## 10. Open cross-facet interactions
 
