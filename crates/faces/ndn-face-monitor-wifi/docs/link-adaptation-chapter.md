@@ -165,10 +165,14 @@ capability; the sender caps to the worst audible one.
 
 ## 11. Open / decided-but-unactuated
 
-- **`fec_redundancy`'s `phy^n` is ungated** (§5) — needs an any-of/all-of semantics gate and a correlation
-  estimate. The sharpest actionable finding of the facet.
-- **The rate → lease closure is unactuated** (§4) — `SlotSchedule::from_airtime` has zero production
-  callers (#85); the slot is still an env constant. The sim shows the payoff; the wiring is pending.
+- **`fec_redundancy`'s `phy^n` — ACTUATED** (`9e56253`, 2026-08-17). The discount is now doubly gated: an
+  all-of (`Urgent`) name gets no discount, and a busy channel damps the effective receiver count toward 1.
+  Was the sharpest finding of the facet; now code.
+- **The rate → lease closure — already actuated, correction.** `from_airtime` is wired in production (#85,
+  test `the_slot_is_derived_from_airtime_and_the_clocks_guard`) and deliberately sizes the slot from the
+  **conservative shared rate**, respecting the shared-map law. `slot_closure.rs` overstated the
+  rate-derived win by sizing each slot from its *private* adapted rate — which a shared grid cannot do. The
+  production code is right; the sim's Part A headline is the thing that was wrong.
 - **The legacy-basic-rate auto-trigger is unwired** (#46/#47) — the graded single-stream cap actuates, but
   nothing flips the `legacy_gate` from a `LEGACY_ONLY_RX` advert outside tests; *data* frames don't drop to
   legacy when a legacy-only neighbour appears.

@@ -76,8 +76,10 @@ negative:
 | a81a HT MCS9 does not cleanly actuate | **on air (negative)** | **§4 run** (plan9 → decoded mcs1) |
 | Rate cliff gates delivery | **sim only** | `link_adapt.rs`; §4 saw **flat ~78% MCS0–7** at bench range (link saturated — cliff is at the margin) |
 | Slot gate improves delivery at N=2 | **on air (negative)** | #111 (actuates but costs 6–9× throughput at N=2 on a clean channel) |
-| Shared-avoid, rendezvous, multi-radio optimizer | **sim only** | `spectrum_access.rs`, `multi_radio*.rs` (FHSS never checked vs a capture) |
-| Rate→lease closure, FEC pooling gates | **sim only** | `slot_closure.rs`, `fec_pooling.rs` (the `phy^n` fix is unactuated) |
+| Cooperative occupancy map consumed for avoidance | **actuated** (`875ddfe`) | §9.5 `busy_pct` fuses neighbour spectrum; §9.2 unsensed≠clear |
+| FEC pooling discount gated (semantics + correlation) | **actuated** (`9e56253`) | `fec_redundancy` all-of/any-of + busy-correlation gates |
+| Rate→lease closure | **already actuated** (#85) | `from_airtime` IS wired; sized from the *conservative shared* rate (see §5) |
+| FHSS name→channel unified with occupancy (§9.1), slot-key channel (§9.3) | **sim / unactuated** | FHSS is retune-disabled on COTS (`vet_hop`); §9.3 is a face change |
 
 ### The §4 synthesis run (2026-08-17)
 
@@ -95,11 +97,27 @@ and honestly reports a fourth:
   was **flat across MCS0–7**, so no rate cliff is observable at bench range (the link is saturated — the
   cliff lives at the margin, exactly as `link_adapt.rs` models). Reported, not hidden.
 
-## 5. What remains
+## 5. Actuation pass (2026-08-17) — and a correction
 
-- **The three sim-only facets need air.** Shared-avoidance rendezvous, the multi-radio optimizer, and FHSS
-  have no on-air anchor; the rate→lease closure and the FEC pooling gates are measured in sim and
-  *unactuated* in code (`from_airtime` has zero callers, `phy^n` is ungated). These are the honest gaps.
+Prompted to "actuate the three sim-only facets," the honest outcome was two actuations and one
+correction:
+
+- **FEC pooling gates — actuated** (`9e56253`). `fec_redundancy` applied `phy^n` unconditionally; it is
+  now doubly gated (an all-of/`Urgent` name gets no discount; a busy channel damps the effective receiver
+  count toward 1). This was the sharpest finding and it is now code.
+- **Cooperative occupancy map — actuated** (`875ddfe`). `busy_pct` fused only the *local* map (§9.5); it
+  now fuses the neighbour spectrum reports too, which is what makes single-radio avoidance work
+  (`multi_radio.rs`). And an unsensed channel is no longer treated as clear (§9.2).
+- **Rate→lease closure — already actuated, and I was wrong to call it a gap.** `from_airtime` is wired in
+  production (#85, test `the_slot_is_derived_from_airtime_and_the_clocks_guard`) and *deliberately* sizes
+  the slot from the **conservative shared rate** — because "the slot map must come out identical at every
+  node." That is this synthesis's own shared-map law (§2.3), and `slot_closure.rs` **violated it** by
+  sizing each slot from its private adapted rate; that sim overstated the rate-derived win. The production
+  code is right; the correction is mine.
+
+Still open: FHSS name→channel unified with occupancy (§9.1) is moot on COTS (retune-disabled by
+`vet_hop`); the slot-key operating-channel fold (§9.3) is a face-layer change; and the multi-radio
+optimizer + on-air FHSS remain sim-only. These are the remaining honest gaps.
 - **The rate cliff needs a marginal link.** Bench range saturates; a real cliff measurement needs
   attenuation or distance, or the weaker MT7610U at range.
 - **The custom target (#100/#102)** is where the computed-not-announced protocol runs without the COTS tax.

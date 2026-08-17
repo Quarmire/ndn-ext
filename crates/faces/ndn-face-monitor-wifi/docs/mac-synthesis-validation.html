@@ -156,8 +156,10 @@
     ['a81a HT MCS9 does not cleanly actuate','air / negative','the 08-17 run — plan9 → decoded mcs1'],
     ['Rate cliff gates delivery','sim','link_adapt.rs; the run saw flat ~78% MCS0–7 (saturated at bench range)'],
     ['Slot gate improves delivery at N=2','air / negative','#111 — actuates but costs 6–9× throughput on a clean channel'],
-    ['Shared-avoid, rendezvous, multi-radio optimizer','sim','spectrum_access.rs, multi_radio*.rs (FHSS never checked vs a capture)'],
-    ['Rate→lease closure, FEC pooling gates','sim','slot_closure.rs, fec_pooling.rs (phy^n fix unactuated)']
+    ['Cooperative occupancy map consumed for avoidance','sim','ACTUATED in code 875ddfe + unit test — busy_pct fuses neighbour spectrum (§9.5); unsensed≠clear (§9.2)'],
+    ['FEC pooling discount gated (semantics + correlation)','sim','ACTUATED in code 9e56253 + unit test — all-of gets no discount; busy channel damps the count'],
+    ['Rate→lease closure','sim','already actuated (#85): from_airtime sized from the conservative SHARED rate; slot_closure.rs sim overstated it'],
+    ['Multi-radio optimizer, on-air FHSS','sim','multi_radio_opt.rs; §9.1 moot on COTS (retune-disabled), §9.3 a face change']
   ];
   var tb=document.querySelector('#ledger tbody');
   rows.forEach(function(r){var tr=document.createElement('tr');
