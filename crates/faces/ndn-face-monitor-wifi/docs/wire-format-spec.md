@@ -15,6 +15,14 @@ Types live in three crates: the 802.11/radiotap builders and the `EphemeralSourc
 `ndn-face-monitor-wifi/src/lib.rs:106`); the MAC logic in `ndn-radio-cognition` and
 `ndn-face-monitor-wifi`; the coding in `ndn-coding`.
 
+> **⚠ NORMATIVE vs CURRENT-CODE — the address partition is migrating (2026-08-17).** The Blurred Name
+> redesign (`name-filter-chapter.md`, commit `4706a58`) decided a new split of the 144 address bits:
+> **a 126-bit Blur filter + an 8-bit ephemeral ID + an 8-bit flags byte** (the "128 : 8" design, realized
+> byte-aligned while keeping the 2-bit local-group reservation). The 8-bit ID is viable *only* with
+> **cooperative deconfliction** (§4). The tables below are **normative** (the target contract). Where the
+> shipping code still implements the older **94-bit filter + 46-bit random nonce** it is flagged
+> `[CODE: 94:46]`; that migration is in progress (§16).
+
 ---
 
 ## 1. Design invariants that shape the wire
@@ -56,31 +64,60 @@ The **only** thing the two families share is the name *normalization*: component
 three renderings of that normalization (`ndn_name_to_slash`, `Tier1Feed::slash`, `Tier1Feed::slash_name`)
 MUST agree byte-for-byte (`tier1.rs:767`) or every match silently fails.
 
-## 3. The Blurred Name — Tier-0 prefix-set Bloom filter
+## 2a. Filter width is a cascade — address floor, body tier, receiver table
 
-Source: `ndn-face-monitor-wifi/src/tier0.rs`. Struct `PrefixFilter(pub [u8; 12])` (`:134`).
+The prefix-set filter exists at **three graduated widths**, AND-composed and each with **zero false
+negatives**; a sender picks how far up it climbs per name, a receiver applies each stage only if the one
+below passed:
+
+| stage | width | where | cost | checked when | for |
+|---|---|---|---|---|---|
+| **Address Blur** | **126 bits** | the 144 address bits (§3) | 0 body bytes | before the body is parsed (hardware-checkable) | the universal floor — every frame |
+| **Body prefix-set** | **≤ 256 bits** | a body-prefix TLV | ~32 body bytes | only if the address Blur passed | deep names / dense FIBs where 126 b saturates |
+| **NDN-NIC BF-FIB** | receiver table | receiver RAM (Tier-1) | 0 wire bytes | only if the frame is admitted | a relay whose FIB is too large for any in-frame filter |
+
+- The address Blur is the **capability floor** (free, universal, pre-parse). The 256-bit body prefix-set
+  is **capability-above-floor** — optional, signalled by `FLAG_BODY_PREFIX` in the flags byte (§5.4), and
+  applied only to frames that already passed the address gate, so it costs the rejecting majority nothing.
+- Both in-frame stages use the **same keyed-SipHash keyspace** (§2), so a receiver computes its prefix
+  masks once and applies them at both widths. Intersecting two zero-FN filters stays zero-FN; the FP rate
+  multiplies down.
+- The 32 body bytes are airtime the **sender** pays per flagged frame, so the width is a **name-driven
+  precision knob**: a shallow endpoint name rides the free floor; a deep name into a dense relay buys the
+  256-bit tier. On a bit-starved bearer (LoRa) the body filter MAY use **GCS** (~35% fewer bits, sequential
+  decode) instead of Bloom — the TLV tag selects the structure per medium.
+
+## 3. The Blurred Name — address Blur (prefix-set Bloom filter)
+
+Source: `ndn-face-monitor-wifi/src/tier0.rs`. Struct `PrefixFilter` — **normatively `[u8; 16]`** spanning
+addr1‖addr2‖addr3[0..4] (126 usable bits). `[CODE: [u8;12], addr1‖addr2, 94 usable bits]`.
 
 **Parameters (all pinned; §12):**
 
-| param | value | source |
-|---|---|---|
-| `M_BITS` (usable bits) | **94** | `tier0.rs:63` |
-| `K` (hashes/prefix) | **4** | `tier0.rs:98` |
-| `MAX_DEPTH` (deepest prefix) | **8** | `tier0.rs:102` |
-| `FILL_CAP` (admission popcount) | **48** | `tier0.rs:126` |
-| `RESERVED_MASK0` | `0b0000_0011` | `tier0.rs:130` |
-| hash | SipHash-2-4, 16-byte key | `tier0.rs:154` |
+| param | normative | `[CODE]` | source |
+|---|---|---|---|
+| `M_BITS` (usable bits) | **126** | 94 | `tier0.rs:63` |
+| `K` (hashes/prefix) | **4** | 4 | `tier0.rs:98` |
+| `MAX_DEPTH` (deepest prefix) | **8** | 8 | `tier0.rs:102` |
+| `FILL_CAP` (admission popcount) | **64** | 48 | `tier0.rs:126` |
+| `RESERVED_MASK0` | `0b0000_0011` | same | `tier0.rs:130` |
+| hash | SipHash-2-4, 16-byte key | same | `tier0.rs:154` |
 
-**Bit geometry.** The 12-byte array is 96 physical bits. Physical bits 0 and 1 (the I/G and U/L bits of
-octet 0) are **reserved** and MUST be `0b11` on the wire (locally-administered group); usable bit `p ∈
-[0,94)` maps to physical bit `p+2`: `array[(p+2)/8] |= 1 << ((p+2)%8)` (`set_bit`, `tier0.rs:237`).
+`FILL_CAP` scales with `M_BITS` (it is the ~½·m universal-wake bound); at m=126 it is **64**
+(`[CODE: 48]` at m=94).
+
+**Bit geometry.** The normative filter is a **16-byte array** = addr1‖addr2‖addr3[0..4] = 128 physical
+bits. Physical bits 0 and 1 (the I/G and U/L bits of addr1 octet 0) are **reserved** `0b11` (§1 no-ACK
+group marker), leaving **126 usable**. Usable bit `p ∈ [0,126)` maps to physical bit `p+2`:
+`array[(p+2)/8] |= 1 << ((p+2)%8)` (`set_bit`, `tier0.rs:237`). `[CODE: a 12-byte array (addr1‖addr2), 94
+usable bits — the filter does not yet extend into addr3.]`
 
 **K positions — double hashing (Kirsch–Mitzenmacher)** (`positions`, `tier0.rs:169`):
 
 ```
 h1 = siphash24(key,  prefix) as u32
 h2 = (siphash24(key2, prefix) as u32) | 1        # key2 = key XOR KEY2_DOMAIN; |1 forces an odd stride
-bit_i = (h1 + i*h2) mod 94    for i in 0..4       # four usable-bit indices
+bit_i = (h1 + i*h2) mod M_BITS   for i in 0..4    # four usable-bit indices; M_BITS=126 (CODE: 94)
 ```
 `KEY2_DOMAIN = b"ndn/tier0-h2\0\0\0\0"` (`tier0.rs:162`).
 
@@ -100,27 +137,32 @@ A receiver MUST clamp its registered prefix to `MAX_DEPTH − 1` components befo
 **Wire placement.** `to_wire()` (`tier0.rs:306`) forces `w[0] = (w[0] & !0b11) | 0b11` and yields the 12
 bytes; they map to the address fields in array order (§5.2). Golden vectors: `tier0.rs:701`.
 
-## 4. The ephemeral source nonce (§2)
+## 4. The ephemeral ID — 8 bits + cooperative deconfliction
 
-Type `[u8; 6]`. `EphemeralSource { boot_seed: u64, rotation_period_ms: u64 }`
-(`ndn-frame-io/src/frame.rs:124`). Rotation period `NONCE_ROTATION_MS = 300_000` (5 min,
-`medium.rs:1139`); `boot_seed` is per-boot random.
+**Normative: an 8-bit ephemeral ID** in `addr3[4]` (§5.3). The 46-bit random nonce is what forces the
+filter down to 94 bits; shrinking the ID to 8 bits frees 32 address bits to the filter (94 → 126). Eight
+bits is enough **only because aliases are deconflicted cooperatively** rather than made improbable by
+width — this is the load-bearing dependency, and it MUST be built before the field is narrowed (§16).
 
-**Derivation (`current(now_ms)`, `frame.rs:139`):**
-```
-epoch = now_ms / rotation_period_ms          # 0 if period == 0
-key[0..8] = boot_seed.to_le_bytes()
-h = siphash24(key, epoch.to_le_bytes())
-m[0..6] = h.to_le_bytes()[0..6]
-m[0] = (m[0] AND 0xFC) OR 0x02               # U/L = local (0x02), I/G = individual (clear 0x01)
-```
-The first octet MUST be forced local+individual so the nonce can never be mistaken for a real host MAC.
-Low 46 bits of the SipHash output form the address body.
+`[CODE: an [u8;6] SipHash-rotating nonce, EphemeralSource { boot_seed, rotation_period_ms },
+NONCE_ROTATION_MS = 300000; derivation frame.rs:139: m = siphash24(boot_seed, now_ms/period)[0..6],
+m[0] = (m[0] & 0xFC) | 0x02. Low 46 bits form the body.]`
 
-**Consumers key on the nonce, never on identity:** per-neighbour RSSI (`SignalStore`, `medium.rs:260`);
-per-source DoS token bucket `RateLimiter<[u8;6]>` (`dos.rs:104`), paired with a per-prefix
-`RateLimiter<u64>` aggregate; neighbour-density count for the FEC pooling discount. The scheduler reads it
-as an LE u64 (`nonce_u64`, `sched.rs:181`; `0` normalized to `1`) for relay-vs-owner discrimination.
+**Cooperative deconfliction (beacon-free; `id_deconflict.rs`, sim-measured 0.04% alias, 29× under the
+birthday bound):**
+- **Pick-Free-Slot (PFS)** — on boot / rotation, a node picks an 8-bit ID not seen among IDs it has
+  recently overheard. PFS alone ≈ random against *hidden* nodes (it cannot see IDs it does not hear), so
+  it is only the initial pick.
+- **Detect-And-Rotate (DAR)** — the workhorse. When a **common neighbour** overhears two senders using the
+  same ID (an alias it can attribute to distinct content/timing), it piggybacks a 1-bit *collision*
+  signal on data it already sends; a node receiving that signal for its ID rotates. No dedicated frame —
+  the signal rides existing traffic (the control-plane tenet: overhear / piggyback, never beacon).
+
+**Consumers key on the ID, never on host identity:** per-neighbour RSSI, per-source DoS token bucket, the
+neighbour-density count for the FEC pooling discount, and relay-vs-owner discrimination. All are soft
+state whose worst case under a residual alias is a merged RSSI estimate or an over-counted neighbour —
+never a delivery failure — which is why 8 bits + deconfliction is safe where a durable address would not
+be.
 
 ## 5. The injected 802.11 monitor frame
 
@@ -162,21 +204,40 @@ off 32 : payload       = LP-framed NDN packet
 The QoS-Data subtype `0x88 0x00` is used **only** for the A-MSDU aggregation path (`build_amsdu`,
 `frame.rs:237`); a conformant plain data frame MUST use `0x08 0x00`.
 
-### 5.3 The two address layouts (`medium.rs:945`)
+### 5.3 The normative address partition (18 bytes = addr1‖addr2‖addr3)
 
-An implementation with a name in hand (first fragment) MUST use the **Tier-0 layout**; a fragment with no
-name MUST fall back to the **legacy broadcast layout**:
+The 144 address bits are partitioned **filter ‖ ID ‖ flags**. An implementation with a name in hand
+(first fragment) MUST use the Tier-0 layout; a fragment with no name MUST fall back to the legacy
+broadcast layout.
 
-| field | Tier-0 layout | legacy layout |
+| bytes | field | Tier-0 layout | legacy layout |
+|---|---|---|---|
+| addr1[0..6] | Blur filter, part 1 | `filter[0..6]` (addr1[0] bits 0–1 = `0b11`) | `BROADCAST` `ff×6` |
+| addr2[0..6] | Blur filter, part 2 | `filter[6..12]` | 8-bit ID in addr2[0], rest random |
+| addr3[0..4] | Blur filter, part 3 | `filter[12..16]` | copy of addr1 |
+| addr3[4] | **ephemeral ID** | 8-bit ID (§4) | — |
+| addr3[5] | **flags** (§5.4) | flags byte | — |
+
+So the 16-byte `PrefixFilter` occupies addr1‖addr2‖addr3[0..4]; the ID and flags occupy the last two bytes
+of addr3. `BROADCAST = [0xff;6]` (`radio-hal:27`); `DEFAULT_SRC` (`radio-hal:31`) is legacy/loopback only.
+A receiver reconstructs the 16-byte filter from `addr1 ‖ addr2 ‖ addr3[0..4]`, reads the ID from
+`addr3[4]`, and the flags from `addr3[5]`.
+
+`[CODE: filter = addr1‖addr2 (12 bytes only); addr3 = the full 46-bit nonce (no ID/flags split);
+receiver reads nonce = addr3.or(addr2), filter = from_wire(addr1‖addr2) — medium.rs:945,:1378.]`
+
+### 5.4 The flags byte (`addr3[5]`)
+
+A new normative byte carrying per-frame options; `0x00` on a plain frame. Bit assignments (LSB first):
+
+| bit | name | meaning |
 |---|---|---|
-| addr1 | `filter[0..6]` | `BROADCAST` (`ff ff ff ff ff ff`) |
-| addr2 | `filter[6..12]` | ephemeral nonce |
-| addr3 | ephemeral nonce | copy of addr1 |
+| 0 | `FLAG_BODY_PREFIX` | a ≤256-bit body-prefix filter TLV follows the LP header (§2a) |
+| 1 | `FLAG_ID_COLLISION` | piggybacked Detect-And-Rotate signal: "I overheard your ID aliased" (§4) |
+| 2–7 | reserved | MUST be 0; reserved for a wire version field |
 
-`BROADCAST = [0xff; 6]` (`radio-hal:27`); `DEFAULT_SRC = [0x02,0x4e,0x44,0x4e,0x00,0x01]` (ASCII
-`\x02"NDN"\x00\x01`, `radio-hal:31`) is a legacy/loopback constant only — production MUST use the
-ephemeral nonce. The receiver extracts the nonce as `addr3.or(addr2)` (`medium.rs:1378`) and reconstructs
-the filter from `addr1 ‖ addr2` (`from_wire`, `tier0.rs:316`).
+The flags byte is what lets the 256-bit body tier and the DAR deconfliction signal ride existing frames
+without a flag-day — it is the versioning surface the frame layout otherwise lacks (§13).
 
 ## 6. Reception report
 
@@ -277,10 +338,12 @@ suppress a contradictory re-transmit. It is carried in-band with the object, not
 | EtherType (RawNdn) | `0x8624` (BE) | 802.11 | `frame.rs` |
 | `BROADCAST` | `ff ff ff ff ff ff` | addr | `radio-hal:27` |
 | `DEFAULT_SRC` | `02 4e 44 4e 00 01` | addr (legacy) | `radio-hal:31` |
-| Tier-0 `M_BITS` / `K` / `MAX_DEPTH` / `FILL_CAP` | `94 / 4 / 8 / 48` | Bloom | `tier0.rs:63,98,102,126` |
-| Tier-0 `RESERVED_MASK0` | `0x03` | Bloom byte 0 | `tier0.rs:130` |
-| `KEY2_DOMAIN` | `"ndn/tier0-h2\0\0\0\0"` | Bloom h2 | `tier0.rs:162` |
-| `NONCE_ROTATION_MS` | `300000` | nonce | `medium.rs:1139` |
+| Tier-0 `M_BITS` / `K` / `MAX_DEPTH` / `FILL_CAP` | **`126 / 4 / 8 / 64`** (`[CODE: 94/4/8/48]`) | address Blur | `tier0.rs:63,98,102,126` |
+| Tier-0 `RESERVED_MASK0` | `0x03` | Blur byte 0 | `tier0.rs:130` |
+| `KEY2_DOMAIN` | `"ndn/tier0-h2\0\0\0\0"` | Blur h2 | `tier0.rs:162` |
+| `EPHEMERAL_ID_BITS` | **`8`** (addr3[4]) (`[CODE: 46-bit nonce]`) | ID | §4 |
+| `FLAG_BODY_PREFIX` / `FLAG_ID_COLLISION` | bit 0 / bit 1 of addr3[5] | flags | §5.4 |
+| body prefix-set width | **`≤ 256` bits** (TLV; Bloom or GCS) | cascade | §2a |
 | `LINK_FEC_MAGIC` / `HDR` | `0xFC` / `6` | FEC | `link_fec.rs:54,57` |
 | `REPORT_MAGIC` / `VERSION` / `MAX_ENTRIES` | `0xCD` / `2` / `32` | report | `report.rs:21,24,26` |
 | `FULL_RX_MCS` / `SINGLE_STREAM_HT_RX_MCS` / `LEGACY_ONLY_RX` | `9 / 7 / 0` | report | `report.rs:28,39,32` |
@@ -324,7 +387,25 @@ is allocated today.
 - **NAN / BLE / embedded bearer framings** — this document covers the 802.11 monitor bearer; other
   bearers reuse the LP-NDN payload and the computed-access rules but frame differently.
 
-## 15. References
+## 15. Migration status (normative 128:8 vs code 94:46)
+
+The normative layout above is the Blurred Name redesign's decided contract; the shipping code implements
+the older split. The migration (this session's actuation) proceeds in dependency order — the ID field
+MUST NOT be narrowed before its deconfliction enabler exists:
+
+1. **Widen the address Blur** — `PrefixFilter` `[u8;12] → [u8;16]`, `M_BITS 94 → 126`, `FILL_CAP 48 → 64`,
+   the filter spanning addr1‖addr2‖addr3[0..4]; update `to_wire`/`from_wire`/`set_bit`/`positions`/
+   `mask_for`/`may_match`/popcount and the golden vectors.
+2. **Repack the frame** — filter into addr3[0..4], the ID field into addr3[4], the flags byte into
+   addr3[5]; update the TX packing (`medium.rs:945`) and RX reconstruction (`medium.rs:1378`).
+3. **Build cooperative deconfliction (PFS + DAR)** — the enabler that makes an 8-bit ID safe; only then
+   narrow `EphemeralSource` from 46 bits to 8.
+4. **Cross-implementation** — regenerate the golden vectors and propagate to the LR2021 firmware
+   (`lr2021-nrf54l15-rs/src/tier0.rs`) and the ath9k-htc C copy; a divergence is a silent on-air FN.
+5. **The 256-bit body tier** (§2a) and the `FLAG_BODY_PREFIX` path are a later addition, unblocked by the
+   flags byte but not part of the address-partition migration.
+
+## 16. References
 
 The four facet chapters (`name-filter`, `temporal-access`, `spectrum-multiradio`, `link-adaptation`),
 `mac-synthesis.md`, and the source cited inline. Task anchors: #44 (name-hash keyspace), #82/#92/#106

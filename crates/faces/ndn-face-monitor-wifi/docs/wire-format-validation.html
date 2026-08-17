@@ -64,18 +64,22 @@
       fields carry the name filter and the nonce — two layouts, chosen by whether a name is in hand.</p>
     <div class="card">
       <table id="hdrTable"></table>
-      <div class="note"><b>Tier-0 layout</b> (a name is present): the 12-byte Bloom filter fills
-        addr1‖addr2; the nonce moves to addr3. <b>Legacy layout</b> (no name — a non-first fragment):
-        addr1 = broadcast, addr2 = nonce, addr3 = copy of addr1.</div>
+      <div class="note"><b>Normative (128:8):</b> the 16-byte Blur filter fills addr1‖addr2‖addr3[0..4]
+        (126 usable bits); the 8-bit ephemeral ID and a flags byte take the last two bytes of addr3. The
+        8-bit ID is viable only via cooperative deconfliction (PFS + Detect-And-Rotate). <b>The shipping
+        code still implements 94:46</b> (94-bit filter in addr1‖addr2, a 46-bit nonce in addr3) — the
+        migration is in progress.</div>
     </div>
   </section>
 
   <section>
-    <h2><span class="n">03</span>The Blurred Name — 94 bits, 4 hashes</h2>
-    <p class="sub">A prefix-set Bloom over the 12 address bytes. Two bits are reserved (forced local +
-      group so it can never look like a host MAC); 94 bits carry the set. Every prefix of the name is
-      inserted with 4 SipHash-double-hashed bit positions. A receiver ANDs its prefix mask: a miss is
-      exact (zero false negatives), a hit costs only a parse.</p>
+    <h2><span class="n">03</span>The Blurred Name — a coarse→fine cascade</h2>
+    <p class="sub">Three graduated widths, AND-composed, all zero-false-negative: the <b>126-bit address
+      Blur</b> (free, universal, checkable before the body is parsed — the floor); an optional
+      <b>≤256-bit body prefix-set</b> TLV (~32 body bytes, flagged, for deep names / dense FIBs); and the
+      receiver-side <b>NDN-NIC BF-FIB</b> for a large relay. A sender climbs the cascade per name, trading
+      airtime for precision. Below is the address-Blur floor: two reserved bits (forced local+group so it
+      never looks like a host MAC), 126 bits of set, 4 SipHash-double-hashed positions per prefix.</p>
     <div class="card">
       <div style="font-family:var(--mono);font-size:12px;color:var(--muted);margin-bottom:8px;">byte 0, bit by bit — the two reserved bits</div>
       <div class="bits" id="byte0"></div>
@@ -138,14 +142,15 @@
     d.innerHTML='<div class="off">off '+s.off+'</div><div class="nm">'+s.nm+'</div><div class="by">'+s.by+'</div>';fs.appendChild(d);});
   fl('frameLegend',[[C.muted,'radiotap TX'],[C.accent,'802.11 MAC'],[C.warn,'LLC/SNAP'],[C.violet,'EtherType'],[C.good,'NDN payload']]);
 
-  // §2 header table
-  tbl('hdrTable',['off','field','Tier-0 layout','legacy layout'],[
+  // §2 header table — NORMATIVE 126:8 partition (code still 94:46, migrating)
+  tbl('hdrTable',['off','field','Tier-0 (normative 128:8)','legacy'],[
     ['0','Frame Control','<b>0x08 0x00</b> — Data','0x08 0x00'],
     ['2','Duration','00 00 (NAV ignored, #96)','00 00'],
-    ['4','addr1 (RA/DA)','<b>filter[0..6]</b>','broadcast ff×6'],
-    ['10','addr2 (TA/SA)','<b>filter[6..12]</b>','ephemeral nonce'],
-    ['16','addr3 (BSSID)','<b>ephemeral nonce</b>','copy of addr1'],
-    ['22','SeqCtrl','00 00','00 00']
+    ['4','addr1','<b>Blur[0..6]</b> (bits 0–1 = 0b11)','broadcast ff×6'],
+    ['10','addr2','<b>Blur[6..12]</b>','8-bit ID + random'],
+    ['16','addr3[0..4]','<b>Blur[12..16]</b>','copy of addr1'],
+    ['20','addr3[4]','<b>ephemeral ID</b> (8 b)','—'],
+    ['21','addr3[5]','<b>flags</b> (body-prefix / DAR)','—']
   ]);
 
   // §3 byte0 bits
