@@ -51,6 +51,23 @@ four are one protocol.
    decodes, the single commodity radio consuming a neighbour's shared map, the worst-receiver cap. Fast
    FHSS, wideband sensing, multi-radio diversity, and rateless coding are capabilities *above* the floor.
 
+6. **Computed ownership vs listen-resolved contention — the acceptance test for every future feature.**
+   A local, unauthenticated input may influence contention that is *settled by listening* (suppression),
+   but never *computed ownership*. Law 3 says a shared view is required somewhere; this law says **where**:
+   anything that assigns ownership needs one, anything a listener resolves does not. The worked cases:
+   - A node's backlog may shorten its **CCLF draw** — *legal*, because the draw is resolved by overhearing,
+     so nodes need not agree on each other's demand.
+   - **Demand-weighted slot ownership** would be *illegal* — it needs every node to know every node's
+     demand, a convergence protocol by the back door.
+   - Occupancy driving a node to **decline to serve a channel** is *legal* (local); occupancy **bending the
+     shared hop map** is *illegal* — unless occupancy is first published as named data and converged.
+   - It is why **urgent-bulk preemption is stuck**: preemption between two open-slot classes is an ownership
+     question, and its input — urgency — is local. It cannot be resolved by listening, so it has no legal home
+     yet.
+
+   Apply this test to any proposed knob before building it: trace its input to *local* or *shared*, and its
+   effect to *ownership* or *suppression*. Local→suppression passes; local→ownership is the trap.
+
 ## 3. What it costs on COTS — and the custom-hardware target
 
 The recurring adversary across all four facets is **commodity Wi-Fi silicon**: the 16 ms `set_channel`
@@ -129,6 +146,27 @@ sim-only. Those are the remaining honest gaps.
 - **The custom target (#100/#102)** is where the computed-not-announced protocol runs without the COTS tax.
 - **A top-level protocol spec** — wire formats, the name-hash keyspace (#44), the state machines — is the
   document that would follow this synthesis once the sim-only facets are actuated and flown.
+
+## 5a. The evidence model — trusted locally, forgeable per-group (the threat model)
+
+Stated plainly, because the boundary is otherwise only *implied* by what the fixes chose not to do. Every
+coordination signal below the forwarder — presence pings, busy-marking, owner-return, reception reports — is
+**local and unauthenticated**, so it is **forgeable by anyone who knows the name**. An adversary who knows a
+group's name can keep a departed owner's slot unclaimable (forged presence), kill any lease (a forged "owner
+speaks," which makes guests yield per the owner-return contract), or suppress claims in a chosen slot (forged
+busy). The Tier-0 fill cap removed only the *amplified* attack — one frame forging presence for **every** group
+at once; it does nothing against a targeted forgery of a **single** known name.
+
+This is the same boundary stock 802.11 lives with — a forged CTS silences a channel — and accepting it is
+defensible for an open, beacon-free broadcast MAC: **the evidence is a performance optimization over a
+correct-but-slower flood, not a security boundary.** Correctness (a wanted frame is never dropped) rests on the
+filter's over-accept-only guarantee, not on the evidence being honest; a liar costs throughput, not delivery.
+
+Where a stronger guarantee is wanted, the upgrade path is a **signed beacon** — the design's sole broadcast
+primitive, which step 1 (the schedule pin, D2) already makes carry the map-parameter digest, and which the
+enforcement hardware can verify (AR9271 open firmware, the wake-up-radio target #100/#102). It does **not**
+touch the computed-ownership core, which stays unauthenticated by construction — signing the beacon authenticates
+the *parameters of the shared computation*, never the per-group evidence, which remains a cooperative hint.
 
 ## 6. References
 
