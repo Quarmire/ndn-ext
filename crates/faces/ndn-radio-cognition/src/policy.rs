@@ -469,7 +469,7 @@ impl RadioPolicy {
                     coding_rate: Some(cr),
                     bandwidth_khz,
                 }),
-                link_fec_redundancy: self.fec_redundancy(radio, ctx, view, receivers, deficit),
+                link_fec_redundancy: self.fec_redundancy(radio, ctx, view, channel, receivers, deficit),
                 // Minimum-sufficient power (spatial reuse) off the SF operating threshold, same
                 // reciprocity as the Wi-Fi path — power is NOT a rendezvous parameter, so each end
                 // sets its own freely. Dial off the REAL measured weakest RSSI (not the proxy), so it
@@ -556,7 +556,7 @@ impl RadioPolicy {
                 ldpc,
                 amsdu_msdus,
             }),
-            link_fec_redundancy: self.fec_redundancy(radio, ctx, view, receivers, deficit),
+            link_fec_redundancy: self.fec_redundancy(radio, ctx, view, channel, receivers, deficit),
             edcca_ignore: ctx.priority == Priority::Urgent && busy >= self.cfg.busy_high,
             tx_power: self.decide_power(cap, mcs, rssi),
             tx_power_dbm: self.decide_power_dbm(cap, mcs, rssi),
@@ -671,6 +671,7 @@ impl RadioPolicy {
         radio: RadioId,
         ctx: &NameContext,
         view: &dyn MediumView,
+        channel: Option<u8>,
         receivers: usize,
         deficit: f32,
     ) -> Option<u16> {
@@ -685,11 +686,28 @@ impl RadioPolicy {
             .unwrap_or(0.0)
             .max(0.0);
 
-        // Pooling: with `n` decorrelated receivers, the chance every one misses a
-        // given frame is ~phy^n (any-of). The budget covers that residual, not the
-        // single-link PER.
-        let n = receivers.max(1) as i32;
-        let mut eff = phy.powi(n);
+        // Pooling discount — DOUBLY GATED (`fec_pooling.rs`). With `n` receivers the
+        // chance every one misses a frame is ~phy^n, so parity shrinks as `n` grows.
+        // But phy^n silently assumes two things, and applying it blindly (the old
+        // `phy.powi(receivers)`) under-provisions when either fails:
+        //   1. ANY-OF semantics — the pool wins if *any* receiver catches each frame
+        //      (cooperative relay/recode). An ALL-OF name (Urgent: every receiver must
+        //      decode — alarm/control) gets NO discount; parity is sized for the single
+        //      worst link. Ungated, the discount drops all-of delivery to ~0 at n≥2.
+        //   2. INDEPENDENT loss. A shared interferer (a busy/contended channel,
+        //      `wifi-loss-is-contention`) correlates loss across receivers, so a pool of
+        //      `n` behaves like fewer. Damp the effective count toward 1 as busy rises.
+        let all_of = matches!(ctx.priority, Priority::Urgent);
+        let n = receivers.max(1) as f64;
+        let n_eff = if all_of {
+            1.0
+        } else {
+            // rho ≈ channel occupancy: at 100% busy the losses fully correlate and the
+            // pool collapses to one effective receiver (`fec_pooling.rs` Part C).
+            let rho = f64::from(channel.and_then(|ch| view.busy_pct(radio, ch)).unwrap_or(0)) / 100.0;
+            1.0 + (n - 1.0) * (1.0 - rho.clamp(0.0, 1.0))
+        };
+        let mut eff = (f64::from(phy).powf(n_eff)) as f32;
         eff = (eff * (1.0 + reinterest)).min(0.95);
         // If diversity already drives the deficit to ~0, don't spend redundancy.
         if eff < 1e-3 || deficit < f32::EPSILON {
@@ -1015,6 +1033,53 @@ mod tests {
         assert!(
             parity_many < parity_one,
             "pooling should discount: {parity_many} < {parity_one}"
+        );
+    }
+
+    /// The pooling discount is **doubly gated** (`fec_pooling.rs`): it is legal only for
+    /// any-of names on an uncorrelated channel. Ungated `phy^n` under-provisions an all-of
+    /// (alarm) name to ~0 delivery at n≥2, and any name on a contended channel.
+    #[test]
+    fn pooling_discount_is_gated_by_semantics_and_correlation() {
+        let base = || {
+            let mut m = wifi_only();
+            for n in 0..6 {
+                m.observe_rx(W, n, Some(-80), 1_000);
+            }
+            m.observe_phy_per(W, 0.3);
+            m.observe_rank_deficit(0xAA, 1.0, 1_000);
+            m
+        };
+        let parity = |pri: Priority, m: &MediumState| {
+            RadioPolicy::default()
+                .decide(&NameContext { priority: pri, ..NameContext::new(0xAA) }, m, 1_000)
+                .allocations[0]
+                .params
+                .link_fec_redundancy
+                .unwrap_or(0)
+        };
+
+        // Baseline: a Bulk (any-of) name on a clear channel gets the full discount.
+        let bulk_clear = parity(Priority::Bulk, &base());
+
+        // SEMANTICS GATE: an Urgent (all-of — every receiver must decode) name gets NO
+        // discount, so strictly more parity than the any-of name at the same count.
+        let urgent_clear = parity(Priority::Urgent, &base());
+        assert!(
+            urgent_clear > bulk_clear,
+            "all-of must not be discounted: urgent {urgent_clear} > bulk {bulk_clear}"
+        );
+
+        // CORRELATION GATE: on a fully-busy (contended) channel the losses correlate, so
+        // the pool collapses toward one receiver → more parity even for a Bulk name.
+        let mut busy = base();
+        for ch in [149u8, 161, 165] {
+            busy.observe_occupancy(ChannelOccupancy { radio: W, channel: ch, busy_pct: 100, ts_ms: 1_000 });
+        }
+        let bulk_busy = parity(Priority::Bulk, &busy);
+        assert!(
+            bulk_busy > bulk_clear,
+            "correlated (busy) loss must undo the discount: busy {bulk_busy} > clear {bulk_clear}"
         );
     }
 
