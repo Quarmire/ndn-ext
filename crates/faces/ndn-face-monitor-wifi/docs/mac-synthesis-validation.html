@@ -159,7 +159,8 @@
     ['Cooperative occupancy map consumed for avoidance','sim','ACTUATED in code 875ddfe + unit test — busy_pct fuses neighbour spectrum (§9.5); unsensed≠clear (§9.2)'],
     ['FEC pooling discount gated (semantics + correlation)','sim','ACTUATED in code 9e56253 + unit test — all-of gets no discount; busy channel damps the count'],
     ['Rate→lease closure','sim','already actuated (#85): from_airtime sized from the conservative SHARED rate; slot_closure.rs sim overstated it'],
-    ['Multi-radio optimizer, on-air FHSS','sim','multi_radio_opt.rs; §9.1 moot on COTS (retune-disabled), §9.3 a face change']
+    ['Operating channel folds into the slot key (§9.3)','sim','ACTUATED in code 0fcf053 + unit test — static multi-radio gets distinct per-channel schedules'],
+    ['Multi-radio optimizer, on-air FHSS','sim','multi_radio_opt.rs; §9.1 moot on COTS (retune-disabled — only matters with fast-retune hardware)']
   ];
   var tb=document.querySelector('#ledger tbody');
   rows.forEach(function(r){var tr=document.createElement('tr');

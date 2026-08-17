@@ -79,7 +79,8 @@ negative:
 | Cooperative occupancy map consumed for avoidance | **actuated** (`875ddfe`) | §9.5 `busy_pct` fuses neighbour spectrum; §9.2 unsensed≠clear |
 | FEC pooling discount gated (semantics + correlation) | **actuated** (`9e56253`) | `fec_redundancy` all-of/any-of + busy-correlation gates |
 | Rate→lease closure | **already actuated** (#85) | `from_airtime` IS wired; sized from the *conservative shared* rate (see §5) |
-| FHSS name→channel unified with occupancy (§9.1), slot-key channel (§9.3) | **sim / unactuated** | FHSS is retune-disabled on COTS (`vet_hop`); §9.3 is a face change |
+| Operating channel folds into the slot key (§9.3) | **actuated** (`0fcf053`) | static multi-radio gets distinct per-channel schedules |
+| FHSS name→channel unified with occupancy (§9.1) | **moot on COTS** | FHSS is retune-disabled by `vet_hop`; unify only matters with fast-retune hardware |
 
 ### The §4 synthesis run (2026-08-17)
 
@@ -115,9 +116,14 @@ correction:
   sizing each slot from its private adapted rate; that sim overstated the rate-derived win. The production
   code is right; the correction is mine.
 
-Still open: FHSS name→channel unified with occupancy (§9.1) is moot on COTS (retune-disabled by
-`vet_hop`); the slot-key operating-channel fold (§9.3) is a face-layer change; and the multi-radio
-optimizer + on-air FHSS remain sim-only. These are the remaining honest gaps.
+- **Slot-key operating-channel fold — actuated** (`0fcf053`). The slot key's channel term was written
+  only by an FHSS retune, so two *static* radios on different channels shared one schedule (§9.3). The
+  bring-up channel now rides the bearer into the scheduler, so static multi-radio earns distinct
+  per-channel schedules — #89's per-medium concurrency, extended to the non-hopping case.
+
+Still open: FHSS name→channel unified with occupancy (§9.1) is **moot on COTS** (retune-disabled by
+`vet_hop` — it only matters with fast-retune hardware); the multi-radio optimizer + on-air FHSS remain
+sim-only. Those are the remaining honest gaps.
 - **The rate cliff needs a marginal link.** Bench range saturates; a real cliff measurement needs
   attenuation or distance, or the weaker MT7610U at range.
 - **The custom target (#100/#102)** is where the computed-not-announced protocol runs without the COTS tax.
