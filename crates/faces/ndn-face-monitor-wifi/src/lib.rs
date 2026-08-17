@@ -280,63 +280,12 @@ pub enum TxAddr {
 pub use name_gate::{NameGate, RxFilter};
 
 
-/// Extract the NDN **Name** TLV bytes from an LP-framed wire frame's inner packet,
-/// for [`TxAddr::PrefixBloom`]. Returns `None` for a non-first fragment (the name is
-/// only in fragment 0) or a parse miss. The face's one bounded NDN-structure peek —
-/// a producer compiling its own Data's name into the address, as V-MAC does.
-pub(crate) fn inner_name(wire: &[u8]) -> Option<&[u8]> {
-    // The network packet bytes: the LP `Fragment` (0x50) value. A multi-fragment
-    // frame exposes it via extract_fragment (only fragment 0 has the name); a
-    // single LP packet we scan for the 0x50 TLV; a bare packet is used as-is.
-    let pkt: &[u8] = if let Some(h) = ndn_packet::lp::extract_fragment(wire) {
-        if h.frag_index != 0 {
-            return None;
-        }
-        wire.get(h.frag_start..h.frag_end)?
-    } else if wire.first() == Some(&0x64) {
-        lp_fragment_value(wire)?
-    } else {
-        wire
-    };
-    // pkt = Interest(0x05) | Data(0x06) { Name(0x07){…}, … } — return the Name TLV.
-    named_tlv(pkt, 0x07)
-}
-
-/// Render an NDN **Name** TLV (`0x07 { 0x08 len comp … }`) to the `/`-joined byte form the
-/// Tier-0 filter iterates (`/x/y`), so a producer compiling the wire name and a receiver
-/// registering a `/`-string prefix compute [`PrefixFilter`] positions over identical bytes.
-///
-/// Component values are used verbatim. A raw `/` inside a component would create a false
-/// prefix boundary — rare for `GenericNameComponent`s, and harmless in the safe direction
-/// (an extra false positive; Tier 1/2 does the exact match). Falls back to the raw TLV bytes
-/// if it won't parse, so the filter is still deterministic rather than panicking.
-pub(crate) fn ndn_name_to_slash(name_tlv: &[u8]) -> Vec<u8> {
-    fn parse(name_tlv: &[u8]) -> Option<Vec<u8>> {
-        let (t, tn) = ndn_tlv::read_varu64(name_tlv).ok()?;
-        if t != 0x07 {
-            return None;
-        }
-        let (len, ln) = ndn_tlv::read_varu64(name_tlv.get(tn..)?).ok()?;
-        let body = name_tlv.get(tn + ln..tn + ln + len as usize)?;
-        let mut out = Vec::new();
-        let mut pos = 0;
-        while pos < body.len() {
-            let (_ct, a) = ndn_tlv::read_varu64(body.get(pos..)?).ok()?;
-            pos += a;
-            let (cl, b) = ndn_tlv::read_varu64(body.get(pos..)?).ok()?;
-            pos += b;
-            let val = body.get(pos..pos + cl as usize)?;
-            pos += cl as usize;
-            out.push(b'/');
-            out.extend_from_slice(val);
-        }
-        if out.is_empty() {
-            out.push(b'/'); // the root name
-        }
-        Some(out)
-    }
-    parse(name_tlv).unwrap_or_else(|| name_tlv.to_vec())
-}
+/// The frame → Name-TLV → `/`-joined-name derivation is a **named-data-radio primitive**, not this
+/// face's private helper: it lives in `ndn_radio_cognition::name` so every bearer (this face's
+/// address Blur, the LoRa body GCS, …) computes filter input over identical bytes (#44). Re-exported
+/// here so the many `crate::inner_name` / `crate::ndn_name_to_slash` call sites resolve unchanged,
+/// against the one shared implementation.
+pub(crate) use ndn_radio_cognition::name::{inner_name, ndn_name_to_slash};
 
 /// The 64-bit Tier-0 filter key from a [`GroupKey`] (first 8 bytes) — [`OPEN_GROUP_KEY`] a public
 /// keyspace, a shared secret a private one. Shared by the single-radio face and the multi-radio medium.
@@ -534,53 +483,6 @@ pub(crate) fn bloom_masks_for(key: &GroupKey, prefixes: &[impl AsRef<[u8]>]) -> 
     prefixes.iter().map(|p| PrefixFilter::mask_for(k, p.as_ref())).collect()
 }
 
-/// The value bytes of the LP `Fragment` (0x50) TLV inside a single LP packet (0x64).
-fn lp_fragment_value(lp: &[u8]) -> Option<&[u8]> {
-    let (_, tn) = ndn_tlv::read_varu64(lp).ok()?;
-    let (outer_len, ln) = ndn_tlv::read_varu64(lp.get(tn..)?).ok()?;
-    let body = lp.get(tn + ln..tn + ln + outer_len as usize)?;
-    named_tlv_value(body, 0x50)
-}
-
-/// Find the first sub-TLV of type `want` inside `parent`'s value and return it
-/// **including** its type+length header (the hash input for a name is the whole
-/// Name TLV). `parent` starts with an outer type+len wrapping the sub-TLVs.
-fn named_tlv(parent: &[u8], want: u64) -> Option<&[u8]> {
-    let (_, tn) = ndn_tlv::read_varu64(parent).ok()?;
-    let (len, ln) = ndn_tlv::read_varu64(parent.get(tn..)?).ok()?;
-    let body = parent.get(tn + ln..tn + ln + len as usize)?;
-    let mut pos = 0;
-    while pos < body.len() {
-        let start = pos;
-        let (t, a) = ndn_tlv::read_varu64(body.get(pos..)?).ok()?;
-        pos += a;
-        let (l, b) = ndn_tlv::read_varu64(body.get(pos..)?).ok()?;
-        pos += b + l as usize;
-        if t == want {
-            return body.get(start..pos);
-        }
-    }
-    None
-}
-
-/// Like [`named_tlv`] but returns the sub-TLV's **value** (no header).
-fn named_tlv_value(parent: &[u8], want: u64) -> Option<&[u8]> {
-    let (_, tn) = ndn_tlv::read_varu64(parent).ok()?;
-    let (len, ln) = ndn_tlv::read_varu64(parent.get(tn..)?).ok()?;
-    let body = parent.get(tn + ln..tn + ln + len as usize)?;
-    let mut pos = 0;
-    while pos < body.len() {
-        let (t, a) = ndn_tlv::read_varu64(body.get(pos..)?).ok()?;
-        pos += a;
-        let (l, b) = ndn_tlv::read_varu64(body.get(pos..)?).ok()?;
-        pos += b;
-        if t == want {
-            return body.get(pos..pos + l as usize);
-        }
-        pos += l as usize;
-    }
-    None
-}
 
 
 // `inject_at` / `inject_batch_at` are called straight on `FrameIo` — there are no local helpers.

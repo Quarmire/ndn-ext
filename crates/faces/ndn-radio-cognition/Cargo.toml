@@ -12,6 +12,9 @@ license.workspace = true
 classification = "extension"
 
 [dependencies]
+ndn-frame-io = { workspace = true }
+ndn-packet   = { workspace = true }
+ndn-tlv      = { workspace = true }
 ndn-signals-core = { workspace = true }
 # The shared radio HAL contract — home of the `RadioCapability` descriptor +
 # `Band`/`RadioKind`/`TimingModel` (re-exported through `src/sense.rs`).

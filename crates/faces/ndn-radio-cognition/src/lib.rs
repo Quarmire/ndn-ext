@@ -52,6 +52,8 @@ mod contextual;
 pub mod dos;
 mod demand;
 pub mod ephemeral_id;
+pub mod gcs;
+pub mod name;
 mod plan;
 mod policy;
 mod report;
