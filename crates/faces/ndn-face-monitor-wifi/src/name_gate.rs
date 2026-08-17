@@ -92,7 +92,13 @@ impl NameGate {
     ///
     /// Broadcast always passes: a frame with no group is addressed to everyone, and dropping it here
     /// would silently break discovery and the time beacons.
-    pub fn admits(&self, addr1: Option<[u8; 6]>, addr2: Option<[u8; 6]>, wire: &[u8]) -> bool {
+    pub fn admits(
+        &self,
+        addr1: Option<[u8; 6]>,
+        addr2: Option<[u8; 6]>,
+        addr3: Option<[u8; 6]>,
+        wire: &[u8],
+    ) -> bool {
         // **Broadcast skips TIER-0 ONLY, never Tier-1.**
         //
         // Tier-0 reads the filter out of `addr1 ‖ addr2`, so a frame with no group address carries no
@@ -107,9 +113,16 @@ impl NameGate {
             (Some(_), RxFilter::Open) => true,
             (Some(a1), RxFilter::Bloom(masks)) => {
                 let Some(a2) = addr2 else { return true };
-                let mut w = [0u8; 12];
+                // The 126-bit Blur spans addr1‖addr2‖addr3[0..4] (wire-format-spec §5.3). addr3's
+                // last two bytes are the ephemeral ID + flags, not filter — a legacy frame with no
+                // addr3 leaves those four bytes clear, which only *loosens* the match (over-accept),
+                // never a false negative.
+                let mut w = [0u8; 16];
                 w[..6].copy_from_slice(&a1);
-                w[6..].copy_from_slice(&a2);
+                w[6..12].copy_from_slice(&a2);
+                if let Some(a3) = addr3 {
+                    w[12..16].copy_from_slice(&a3[..4]);
+                }
                 let frame = PrefixFilter::from_wire(w);
                 masks.iter().any(|m| frame.may_match(m))
             }

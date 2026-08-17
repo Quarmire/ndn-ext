@@ -303,7 +303,7 @@ async fn prop_p4_p5_audible_owner_and_foreign_blindness() {
         foreign[5] = i as u8;
         s2.observe_rx(Some(&foreign), Some(&[0x00, 0x1b, 0x44, 0, 0, 1]), None, b"");
         s2.observe_rx(Some(&[0xffu8; 6]), Some(&[0xffu8; 6]), None, b""); // all-ones
-        s2.observe_rx(Some(near_cap[..6].try_into().unwrap()), Some(near_cap[6..].try_into().unwrap()), None, b"");
+        s2.observe_rx(Some(near_cap[..6].try_into().unwrap()), Some(near_cap[6..12].try_into().unwrap()), None, b"");
     }
     assert_eq!(s2.last_domain_rx.load(Ordering::Relaxed), 0, "foreign frames marked the domain busy");
     assert_eq!(

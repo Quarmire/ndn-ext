@@ -245,7 +245,7 @@ pub struct FaceScheduler {
     /// Parse-once cache for unregistered Tier-0 groups: wire bytes → slot hash, bounded by
     /// [`LEARNED_GROUP_CAP`] with oldest-last-heard eviction (= LRU = presence-pinning, see the
     /// constant). Keyed on the raw 12 bytes so a hit costs a HashMap probe, not a parse.
-    learned: Mutex<std::collections::HashMap<[u8; 12], (u64, u64)>>,
+    learned: Mutex<std::collections::HashMap<[u8; 16], (u64, u64)>>,
     clock_source: ClockSource,
     /// Retune knob for FHSS (per-bearer; `None` ⇒ can't hop this bearer, slot-only).
     knobs: Option<std::sync::Arc<dyn RadioKnobs>>,
@@ -647,11 +647,16 @@ impl FaceScheduler {
             // only group evidence). Parse, exactly as before P1 — dropping this would regress the
             // non-Tier-0 configuration the slot MAC was measured under.
             (Some(g), _) if *g == ndn_radio_hal::BROADCAST => self.name_group(wire),
-            // Possible Tier-0 filter: addr1‖addr2 carry the prefix set.
+            // Possible Tier-0 filter: addr1‖addr2‖addr3[0..4] carry the 126-bit prefix set
+            // (wire-format-spec §5.3). A legacy frame with no addr3 leaves the last four filter bytes
+            // clear, which only over-accepts, never a false negative.
             (Some(g), Some(a)) => {
-                let mut w = [0u8; 12];
+                let mut w = [0u8; 16];
                 w[..6].copy_from_slice(g);
-                w[6..].copy_from_slice(a);
+                w[6..12].copy_from_slice(a);
+                if let Some(a3) = addr3 {
+                    w[12..16].copy_from_slice(&a3[..4]);
+                }
                 self.attribute_filter(w, wire, now)
             }
             // A capture path that surfaces no addresses cannot be attributed by filter; fall back
@@ -1214,7 +1219,7 @@ impl FaceScheduler {
     /// **Attribute a Tier-0-shaped frame without parsing it** (P1.5): origin gate, then the
     /// registered masks, then the learned cache; the TLV parse is the cold path for the first
     /// sighting of an unregistered group only.
-    fn attribute_filter(&self, w: [u8; 12], wire: &[u8], now: u64) -> Option<(u64, LeaseClass)> {
+    fn attribute_filter(&self, w: [u8; 16], wire: &[u8], now: u64) -> Option<(u64, LeaseClass)> {
         // Origin gate — no parse, no allocation. Our Tier-0 frames force octet 0's I/G+U/L to
         // local-group (`to_wire`); foreign unicast has U/L=0 and fails the bit test; foreign
         // broadcast/high-fill fails the FILL_CAP that F1 installed for exactly this dual purpose.

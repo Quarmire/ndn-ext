@@ -350,7 +350,7 @@ pub(crate) fn bloom_key64(key: &GroupKey) -> &[u8; 16] {
 /// The 12 wire bytes (`addr1 ‖ addr2`) of the Tier-0 filter for the NDN name inside an LP wire frame
 /// (first fragment / bare packet). `None` when the wire carries no name (a non-first fragment) — the
 /// caller falls back to broadcast, which every receiver's filter admits (a safe over-accept).
-pub(crate) fn bloom_wire_for_wire(key: &GroupKey, wire: &[u8]) -> Option<[u8; 12]> {
+pub(crate) fn bloom_wire_for_wire(key: &GroupKey, wire: &[u8]) -> Option<[u8; 16]> {
     let name = inner_name(wire)?;
     let mut f = PrefixFilter::new();
     f.insert_name(bloom_key64(key), &ndn_name_to_slash(name));
@@ -478,7 +478,7 @@ impl RatePolicy {
 /// safe: a miss falls back to broadcast, which over-accepts rather than dropping.
 pub(crate) struct Tier0Addresser {
     key: GroupKey,
-    cache: Mutex<HashMap<u64, [u8; 12]>>,
+    cache: Mutex<HashMap<u64, [u8; 16]>>,
 }
 
 /// Cap on in-flight fragmented objects tracked at once. Generous next to any real fragment window;
@@ -501,7 +501,7 @@ impl Tier0Addresser {
 
     /// The 12-byte filter (`addr1 ‖ addr2`) for this outgoing wire, or `None` to address it
     /// broadcast — no name and no cached object, a safe over-accept.
-    pub(crate) fn wire_for(&self, wire: &[u8]) -> Option<[u8; 12]> {
+    pub(crate) fn wire_for(&self, wire: &[u8]) -> Option<[u8; 16]> {
         let Some(h) = ndn_packet::lp::extract_fragment(wire) else {
             // Unfragmented: the name is right here, nothing to remember.
             return bloom_wire_for_wire(&self.key, wire);
@@ -1531,9 +1531,9 @@ mod tests {
             let (Some(a1), Some(a2)) = (a1, a2) else {
                 panic!("frame {i} carries no address pair");
             };
-            let mut w = [0u8; 12];
+            let mut w = [0u8; 16];
             w[..6].copy_from_slice(a1);
-            w[6..].copy_from_slice(a2);
+            w[6..12].copy_from_slice(a2);
             let f = crate::PrefixFilter::from_wire(w);
             assert!(
                 masks.iter().any(|m| f.may_match(m)),

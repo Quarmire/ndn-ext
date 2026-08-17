@@ -35,12 +35,12 @@ fn main() {
         }
         s
     }
-    fn or_into(acc: &mut [u8; 12], m: &PrefixFilter) {
+    fn or_into(acc: &mut [u8; 16], m: &PrefixFilter) {
         for (a, b) in acc.iter_mut().zip(m.0.iter()) {
             *a |= *b;
         }
     }
-    fn bits(f: &[u8; 12]) -> u32 {
+    fn bits(f: &[u8; 16]) -> u32 {
         f.iter().map(|b| b.count_ones()).sum()
     }
 
@@ -49,13 +49,13 @@ fn main() {
     let measure = |d: usize, mode: &str, c: usize| -> (f64, f64, f64) {
         let (mut fp, mut bits_tot) = (0u64, 0u64);
         for t in 0..TRIALS {
-            let frame: [u8; 12] = if mode == "full" {
+            let frame: [u8; 16] = if mode == "full" {
                 let mut f = PrefixFilter::new();
                 f.insert_name(key, &full_name(d, t));
                 f.0
             } else {
                 // head=C: OR the masks for the first C prefix levels only.
-                let mut acc = [0u8; 12];
+                let mut acc = [0u8; 16];
                 for j in 1..=c.min(d) {
                     or_into(&mut acc, &PrefixFilter::mask_for(key, &prefix(d, t, j)));
                 }

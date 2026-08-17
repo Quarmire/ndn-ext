@@ -142,7 +142,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── ecap: capture, then sweep ────────────────────────────────────────────────────────────
     let raw = raw_rx.expect("ecap keeps the raw io");
     // (12-byte reassembled Tier-0 filter, i, seq) per attributable frame.
-    let mut cap_frames: Vec<([u8; 12], u32, u32)> = Vec::with_capacity(20_000);
+    let mut cap_frames: Vec<([u8; 16], u32, u32)> = Vec::with_capacity(20_000);
     let end = Instant::now() + Duration::from_secs(secs);
     while Instant::now() < end {
         match tokio::time::timeout(Duration::from_millis(300), raw.recv_frame()).await {
@@ -150,9 +150,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let Some((i, seq)) = parse_ours(&f.payload) else { continue };
                 // Reassemble addr1‖addr2 → the on-air Tier-0 filter (group=addr1 hi, addr=addr2 lo).
                 let (Some(a1), Some(a2)) = (f.group, f.addr) else { continue };
-                let mut w = [0u8; 12];
+                let mut w = [0u8; 16];
                 w[..6].copy_from_slice(&a1);
-                w[6..].copy_from_slice(&a2);
+                w[6..12].copy_from_slice(&a2);
                 cap_frames.push((w, i, seq));
             }
             _ => continue,

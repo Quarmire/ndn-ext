@@ -943,13 +943,21 @@ impl TxBearer {
         // two paths incapable of disagreeing (#82).
         let nonce = self.source.current(super::now_ms() as u64);
         let (dst, src, addr3) = match self.tier0.as_ref().and_then(|t| t.wire_for(&wire)) {
-            // addr1 = filter hi, addr2 = filter lo, addr3 = the §2 per-frame RSSI key displaced
-            // out of addr2 by the filter.
-            Some(bf) => (
-                bf[..6].try_into().unwrap(),
-                bf[6..].try_into().unwrap(),
-                Some(nonce),
-            ),
+            // The 126-bit Blur spans addr1‖addr2‖addr3[0..4] (wire-format-spec §5.3). addr3's last two
+            // bytes carry the **8-bit ephemeral ID** and the **flags byte** — the ID displaced out of
+            // addr2 by the widened filter. `nonce[1]` is a full-entropy byte of the rotating ephemeral
+            // source (nonce[0] has forced local/individual bits); flags = 0 today. NOTE: the PFS/DAR
+            // deconfliction (`ephemeral_id.rs`) is not yet fed from RX — that integration is the
+            // remaining follow-up; the wire format is complete.
+            Some(bf) => {
+                let id = nonce[1];
+                let a3 = [bf[12], bf[13], bf[14], bf[15], id, 0u8];
+                (
+                    bf[..6].try_into().unwrap(),
+                    bf[6..12].try_into().unwrap(),
+                    Some(a3),
+                )
+            }
             // Doctrine §2: the source field carries this node's ephemeral rotating nonce, not a
             // fixed host tag — inert to real networks, no routing meaning, per-frame RSSI key.
             None => (BROADCAST, nonce, None),
@@ -1363,7 +1371,7 @@ impl RunningMedium {
                             // drop accounting — and every filtering feature added recently landed
                             // only on the other face. Sharing it is what stops the two diverging.
                             if let Some(gate) = rx_gate.as_ref()
-                                && !gate.admits(f.group, f.addr, &f.payload)
+                                && !gate.admits(f.group, f.addr, f.addr3, &f.payload)
                             {
                                 continue;
                             }
@@ -1375,7 +1383,14 @@ impl RunningMedium {
                             if let (Some(rate), Some(rssi)) = (rate_rx.as_ref(), f.rssi_dbm) {
                                 rate.observe_rssi(rssi);
                             }
-                            let nonce = f.addr3.or(f.addr);
+                            // Source key = the 8-bit ephemeral ID (addr3[4] under Tier-0; the full
+                            // legacy nonce in addr2 otherwise). NOT the whole addr3 — its first four
+                            // bytes are the name-derived Blur filter, so keying on them would fabricate
+                            // a fresh neighbour per name (wire-format-spec §5.3).
+                            let nonce: Option<[u8; 6]> = match f.addr3 {
+                                Some(a3) => Some([a3[4], 0, 0, 0, 0, 0]),
+                                None => f.addr,
+                            };
                             if (f.rssi_dbm.is_some() || f.mcs_index.is_some())
                                 && let Some(sink) = sink.as_ref()
                             {
@@ -2068,9 +2083,9 @@ mod tests {
             let (Some(a1), Some(a2)) = (a1, a2) else {
                 panic!("coded frame {i} carries no address pair");
             };
-            let mut w = [0u8; 12];
+            let mut w = [0u8; 16];
             w[..6].copy_from_slice(a1);
-            w[6..].copy_from_slice(a2);
+            w[6..12].copy_from_slice(a2);
             assert!(
                 masks
                     .iter()
@@ -2154,9 +2169,9 @@ mod tests {
             let (Some(a1), Some(a2)) = (a1, a2) else {
                 panic!("fragment {i} carries no address pair");
             };
-            let mut w = [0u8; 12];
+            let mut w = [0u8; 16];
             w[..6].copy_from_slice(a1);
-            w[6..].copy_from_slice(a2);
+            w[6..12].copy_from_slice(a2);
             assert!(
                 masks
                     .iter()
