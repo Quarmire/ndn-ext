@@ -143,6 +143,68 @@ impl AliasDetector {
     }
 }
 
+/// Flags byte (`addr3[5]`, wire-format-spec §5.4), LSB first.
+pub const FLAG_BODY_PREFIX: u8 = 0b0000_0001;
+pub const FLAG_ID_COLLISION: u8 = 0b0000_0010;
+
+/// The whole cooperative-deconfliction unit the medium holds **one of** (shared, per node): the
+/// allocator, the alias detector, and the pending DAR hint. The medium calls [`tx_id`](Self::tx_id) on
+/// send and [`rx`](Self::rx) on receive — no other wiring.
+pub struct IdDeconfliction {
+    id: EphemeralId,
+    detector: AliasDetector,
+    /// A conflicted ID we detected and owe a DAR hint for, delivered on our next data frame.
+    pending_hint: Option<u8>,
+}
+
+impl IdDeconfliction {
+    pub fn new(boot_seed: u64, stale_ms: u64, window_ms: u64) -> Self {
+        Self {
+            id: EphemeralId::new(boot_seed, stale_ms),
+            detector: AliasDetector::new(window_ms),
+            pending_hint: None,
+        }
+    }
+
+    /// `(addr3[4], addr3[5])` for the next TX. A pending DAR hint rides this one frame: `addr3[4]`
+    /// carries the **conflicted** ID and `FLAG_ID_COLLISION` is set — sacrificing our own ID
+    /// attribution on this frame (soft state) to tell the aliasing senders to rotate.
+    pub fn tx_id(&mut self) -> (u8, u8) {
+        match self.pending_hint.take() {
+            Some(x) => (x, FLAG_ID_COLLISION),
+            None => (self.id.current(), 0),
+        }
+    }
+
+    /// Feed a received Tier-0 frame's ID + flags + RSSI. Runs PFS (`note_heard`), DAR-rotate (on a hint
+    /// naming our ID), and DAR-detect (an ID carrying two RSSI fingerprints in the window → queue a
+    /// hint). Returns `true` if this was a hint frame (its ID is the conflicted one, not a real
+    /// neighbour — the caller must NOT key a neighbour on it).
+    pub fn rx(&mut self, id: u8, flags: u8, rssi: Option<i8>, now_ms: u64) -> bool {
+        if flags & FLAG_ID_COLLISION != 0 {
+            if id == self.id.current() {
+                self.id.note_collision(now_ms);
+            }
+            return true;
+        }
+        self.id.note_heard(id, now_ms);
+        // Two transmitters under one ID ⇒ different RSSI within the window. A coarse ~6 dB bucket is the
+        // only sender-distinguishing signal on an identity-free radio; a single fading sender may flip a
+        // bucket and cost one spurious rotation (soft).
+        if let Some(r) = rssi {
+            let fp = (r as i64).div_euclid(6) as u64;
+            if self.detector.observe(id, fp, now_ms) {
+                self.pending_hint = Some(id);
+            }
+        }
+        false
+    }
+
+    pub fn current(&self) -> u8 {
+        self.id.current()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,6 +249,37 @@ mod tests {
                 assert_ne!(id, nodes[j].current(), "node {i} aliased node {j}");
             }
         }
+    }
+
+    #[test]
+    fn deconfliction_unit_detects_aliases_and_rotates_on_a_hint() {
+        let mut d = IdDeconfliction::new(0xABCD, 10_000, 500);
+        // Normal send: our current ID, flags clear.
+        let (id0, f0) = d.tx_id();
+        assert_eq!(f0, 0);
+
+        // Two transmitters under one ID (id 42) at very different RSSI within the window → an alias is
+        // detected and a DAR hint is queued.
+        assert!(!d.rx(42, 0, Some(-40), 1_000));
+        assert!(!d.rx(42, 0, Some(-80), 1_050));
+        // Our next TX piggybacks the hint: addr3[4] = the conflicted ID (42), flag set.
+        let (hid, hf) = d.tx_id();
+        assert_eq!(hid, 42);
+        assert_eq!(hf & FLAG_ID_COLLISION, FLAG_ID_COLLISION);
+        // The hint is one-shot — the following TX is back to our own ID.
+        let (id2, f2) = d.tx_id();
+        assert_eq!(f2, 0);
+        assert_eq!(id2, id0, "our own ID is unchanged by sending a hint about someone else");
+
+        // Receiving a hint that names OUR id rotates us; the return is `true` (a hint, not a neighbour).
+        let mine = d.current();
+        assert!(d.rx(mine, FLAG_ID_COLLISION, Some(-50), 2_000));
+        assert_ne!(d.current(), mine, "a collision hint for our ID must rotate us");
+        // A hint for someone else's ID leaves us put.
+        let now = d.current();
+        let other = now.wrapping_add(7);
+        assert!(d.rx(other, FLAG_ID_COLLISION, Some(-50), 2_100));
+        assert_eq!(d.current(), now, "a hint for another ID must not move us");
     }
 
     #[test]

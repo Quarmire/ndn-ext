@@ -53,6 +53,7 @@ use tokio::task::JoinHandle;
 
 use crate::RadioControl;
 use ndn_radio_cognition::{NameContext, RadioActuators, RadioAllocation, RadioError};
+use ndn_radio_cognition::ephemeral_id::IdDeconfliction;
 use ndn_signals_core::{LinkSignals, NodeSignals, SignalStore, SignalView};
 use ndn_transport::link_service::{LinkServiceFeature, LpLinkService};
 use ndn_transport::{
@@ -878,6 +879,8 @@ struct TxBearer {
     /// 802.11 source field of every frame, replacing the old fixed `DEFAULT_SRC` constant. Shared
     /// (one identity per node) across all bearers.
     source: Arc<EphemeralSource>,
+    /// Cooperative 8-bit ephemeral-ID deconfliction (PFS + DAR), shared per node.
+    dedup: Arc<Mutex<IdDeconfliction>>,
     /// The data-centric time-slice (#61) + FHSS (#40) transmit scheduler, when configured
     /// (`NDN_SCHED_*`). `None` ⇒ no gating, the historical send path. Per-bearer so a hop retunes its
     /// own radio; the slot timing is identical on every bearer (one common-view clock per node).
@@ -950,8 +953,11 @@ impl TxBearer {
             // deconfliction (`ephemeral_id.rs`) is not yet fed from RX — that integration is the
             // remaining follow-up; the wire format is complete.
             Some(bf) => {
-                let id = nonce[1];
-                let a3 = [bf[12], bf[13], bf[14], bf[15], id, 0u8];
+                // The 8-bit ephemeral ID (+ flags) from the PFS/DAR allocator: normally our own ID with
+                // clear flags; when a conflict hint is pending it rides this frame (conflicted ID +
+                // FLAG_ID_COLLISION) so the aliasing senders rotate (`ephemeral_id.rs`).
+                let (id, flags) = self.dedup.lock().unwrap().tx_id();
+                let a3 = [bf[12], bf[13], bf[14], bf[15], id, flags];
                 (
                     bf[..6].try_into().unwrap(),
                     bf[6..12].try_into().unwrap(),
@@ -1153,6 +1159,9 @@ impl RunningMedium {
             nanos ^ ((std::process::id() as u64) << 32) ^ (id.0 as u64).wrapping_mul(0x9E37_79B9)
         };
         let source = Arc::new(EphemeralSource::new(boot_seed, NONCE_ROTATION_MS));
+        // The 8-bit ephemeral ID + PFS/DAR deconfliction (wire-format-spec §4), shared per node like
+        // the nonce. stale = the rotation period; alias window = 2 s of soft state.
+        let dedup = Arc::new(Mutex::new(IdDeconfliction::new(boot_seed, NONCE_ROTATION_MS, 2_000)));
 
         // One Tier-0 addresser for the whole face (not per bearer): its cache is keyed by LP base
         // sequence, i.e. by *object*, and an object's fragments may fan out across bearers.
@@ -1264,6 +1273,7 @@ impl RunningMedium {
                 eligible: fec.as_ref().and_then(|fc| fc.eligible.clone()),
                 legacy_gate: legacy_gate.clone(),
                 source: source.clone(),
+                dedup: dedup.clone(),
                 sched: sched.clone(),
                 tier0: tier0.clone(),
                 rate: rate.clone(),
@@ -1295,6 +1305,7 @@ impl RunningMedium {
             }
             let rate_rx = rate.clone();
             let rx_gate = rx_gate.clone();
+            let dedup = dedup.clone();
             tasks.push(tokio::spawn(async move {
                 let mut last_mesh_cv = 0u64; // last mesh common-view observation count ingested (#74)
                 loop {
@@ -1383,13 +1394,26 @@ impl RunningMedium {
                             if let (Some(rate), Some(rssi)) = (rate_rx.as_ref(), f.rssi_dbm) {
                                 rate.observe_rssi(rssi);
                             }
+                            // Cooperative ID deconfliction (PFS/DAR): feed the received ID + flags +
+                            // RSSI. Returns true if this was a DAR *hint* frame — whose addr3[4] is the
+                            // conflicted ID, not the sender's, so it keys no neighbour.
+                            let is_hint = match f.addr3 {
+                                Some(a3) => {
+                                    dedup.lock().unwrap().rx(a3[4], a3[5], f.rssi_dbm, super::now_ms() as u64)
+                                }
+                                None => false,
+                            };
                             // Source key = the 8-bit ephemeral ID (addr3[4] under Tier-0; the full
                             // legacy nonce in addr2 otherwise). NOT the whole addr3 — its first four
                             // bytes are the name-derived Blur filter, so keying on them would fabricate
                             // a fresh neighbour per name (wire-format-spec §5.3).
-                            let nonce: Option<[u8; 6]> = match f.addr3 {
-                                Some(a3) => Some([a3[4], 0, 0, 0, 0, 0]),
-                                None => f.addr,
+                            let nonce: Option<[u8; 6]> = if is_hint {
+                                None
+                            } else {
+                                match f.addr3 {
+                                    Some(a3) => Some([a3[4], 0, 0, 0, 0, 0]),
+                                    None => f.addr,
+                                }
                             };
                             if (f.rssi_dbm.is_some() || f.mcs_index.is_some())
                                 && let Some(sink) = sink.as_ref()
