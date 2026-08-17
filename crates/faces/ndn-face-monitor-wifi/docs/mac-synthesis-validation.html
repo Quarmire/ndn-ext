@@ -1,0 +1,178 @@
+<title>The Named-Data Radio MAC — synthesis</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root{ --paper:#eef2f6;--card:#fff;--ink:#0b1220;--muted:#5a6b7b;--line:#d7e0e8;--accent:#0e9aa7;--accent-soft:#0e9aa71a;--good:#1f9d5a;--bad:#d83a3f;--warn:#b9791a;
+    --mono:ui-monospace,"SF Mono","JetBrains Mono",Menlo,monospace;--sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;--maxw:1000px; }
+  @media (prefers-color-scheme:dark){ :root{ --paper:#0a1017;--card:#0f1822;--ink:#e6eef5;--muted:#8aa0b2;--line:#1d2a38;--accent:#2bd4e0;--accent-soft:#2bd4e01f;--good:#35c37e;--bad:#f0575c;--warn:#e0a03a; } }
+  :root[data-theme="light"]{ --paper:#eef2f6;--card:#fff;--ink:#0b1220;--muted:#5a6b7b;--line:#d7e0e8;--accent:#0e9aa7;--accent-soft:#0e9aa71a;--good:#1f9d5a;--bad:#d83a3f;--warn:#b9791a; }
+  :root[data-theme="dark"]{ --paper:#0a1017;--card:#0f1822;--ink:#e6eef5;--muted:#8aa0b2;--line:#1d2a38;--accent:#2bd4e0;--accent-soft:#2bd4e01f;--good:#35c37e;--bad:#f0575c;--warn:#e0a03a; }
+  *{box-sizing:border-box;} body{margin:0;background:var(--paper);color:var(--ink);font-family:var(--sans);line-height:1.55;-webkit-font-smoothing:antialiased;}
+  .wrap{max-width:var(--maxw);margin:0 auto;padding:clamp(20px,4vw,56px) clamp(16px,4vw,32px) 80px;}
+  .eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.18em;text-transform:uppercase;color:var(--accent);margin:0 0 14px;}
+  h1{font-size:clamp(30px,5.5vw,50px);line-height:1.03;letter-spacing:-.025em;margin:0 0 16px;text-wrap:balance;font-weight:780;}
+  h1 .thin{color:var(--muted);font-weight:400;}
+  .lede{font-size:clamp(16px,2vw,19px);color:var(--muted);max-width:68ch;margin:0;}
+  .lede b{color:var(--ink);font-weight:600;}
+  .hyp{display:inline-flex;align-items:center;gap:8px;margin-top:18px;padding:6px 12px;border:1px solid var(--line);border-radius:999px;font-family:var(--mono);font-size:12px;color:var(--muted);}
+  .hyp .dot{width:8px;height:8px;border-radius:50%;background:var(--good);}
+  section{margin-top:52px;} h2{font-size:clamp(20px,3vw,26px);letter-spacing:-.01em;margin:0 0 6px;font-weight:680;}
+  h2 .n{font-family:var(--mono);font-size:14px;color:var(--accent);margin-right:12px;font-weight:500;}
+  .sub{color:var(--muted);max-width:74ch;margin:0 0 20px;}
+  .readouts{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin-top:32px;}
+  .stat{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px;}
+  .stat .k{font-family:var(--mono);font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);}
+  .stat .v{font-family:var(--mono);font-size:clamp(21px,3vw,27px);font-weight:600;margin-top:6px;font-variant-numeric:tabular-nums;}
+  .stat .v.good{color:var(--good);} .stat .v.acc{color:var(--accent);} .stat .v.warn{color:var(--warn);}
+  .stat .note{font-size:12.5px;color:var(--muted);margin-top:4px;}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:22px;}
+  .chart{width:100%;overflow-x:auto;} svg{display:block;max-width:100%;height:auto;font-family:var(--mono);}
+  figcaption{font-size:13.5px;color:var(--muted);margin-top:12px;max-width:74ch;} figcaption b{color:var(--ink);}
+  .laws{display:grid;grid-template-columns:1fr 1fr;gap:16px;} @media (max-width:720px){.laws{grid-template-columns:1fr;}}
+  .law{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px 20px;border-left:3px solid var(--accent);}
+  .law h3{margin:0 0 6px;font-size:15.5px;font-weight:660;display:flex;gap:10px;align-items:baseline;}
+  .law h3 .ln{font-family:var(--mono);font-size:12px;color:var(--accent);}
+  .law p{margin:0;color:var(--muted);font-size:13.5px;}
+  table{width:100%;border-collapse:collapse;font-size:13.5px;margin-top:6px;}
+  th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:top;}
+  th{font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);font-weight:500;}
+  td b{color:var(--ink);} .tag{font-family:var(--mono);font-size:11px;padding:2px 8px;border-radius:999px;white-space:nowrap;font-weight:600;}
+  .t-air{background:#1f9d5a22;color:var(--good);} .t-sim{background:#5a6b7b22;color:var(--muted);} .t-neg{background:#b9791a22;color:var(--warn);}
+  .run{background:var(--accent-soft);border:1px solid var(--line);border-left:3px solid var(--good);border-radius:12px;padding:18px 22px;}
+  .run ul{margin:10px 0 0;padding-left:18px;} .run li{margin:7px 0;color:var(--muted);} .run li b{color:var(--ink);}
+  code{font-family:var(--mono);font-size:.9em;background:var(--accent-soft);padding:1px 5px;border-radius:5px;}
+  footer{margin-top:56px;padding-top:20px;border-top:1px solid var(--line);color:var(--muted);font-family:var(--mono);font-size:12px;}
+</style>
+<div class="wrap">
+  <p class="eyebrow">Named Data Radio · the four facets, joined</p>
+  <h1>One protocol, four questions <span class="thin">— computed from the name, coordinated by no one</span></h1>
+  <p class="lede">Who may transmit, when, where in spectrum, and how well — a whole medium-access protocol,
+    and every answer is <b>computed from the name and a common-view clock</b>. No beacon, no coordinator;
+    capability-adaptive above a floor every node runs; and every control signal is itself named data.</p>
+  <span class="hyp"><span class="dot"></span>Four validated facets · cross-facet on-air run 2026-08-17</span>
+  <div class="readouts" id="readouts"></div>
+
+  <section>
+    <h2><span class="n">01</span>The four facets radiate from name + clock</h2>
+    <p class="sub">Each facet's decision is a hash of the name (and epoch), so a producer and a consumer
+      reach the same answer with nothing exchanged. That is what makes the whole protocol beacon-free.</p>
+    <div class="card"><figure>
+      <div class="chart" id="wheel"></div>
+      <figcaption>The filter is <code>H(prefix)</code>, the slot is <code>H(name)+epoch mod N</code>, the
+        channel is <code>H(name)%C</code>, and the lease length is the link decision itself. <b>Nothing is
+        announced.</b></figcaption>
+    </figure></div>
+  </section>
+
+  <section>
+    <h2><span class="n">02</span>Five laws the facets share</h2>
+    <p class="sub">Each appears in three or four facets independently — the evidence that these are one
+      protocol, not four mechanisms in a trench coat.</p>
+    <div class="laws" id="laws"></div>
+  </section>
+
+  <section>
+    <h2><span class="n">03</span>The honest on-air ledger</h2>
+    <p class="sub">The synthesis is only as real as its measurements. The full ledger — including the
+      sim-only and the negatives.</p>
+    <div class="card" style="overflow-x:auto;">
+      <table id="ledger"><thead><tr><th>Claim</th><th>Status</th><th>Evidence</th></tr></thead><tbody></tbody></table>
+    </div>
+  </section>
+
+  <section>
+    <h2><span class="n">04</span>The cross-facet run — 2026-08-17</h2>
+    <p class="sub">A fresh measurement over the heterogeneous bench: <b>a81a</b> (2T2R VHT) →
+      <b>8812au</b> (2T2R), 5 GHz ch149, via <code>tier0_fec_onair</code>. It validates two facets at once
+      and reports a quirk rather than hiding it.</p>
+    <div class="run"><ul>
+      <li><b>The unverified link is live and strong</b> — ~2800 frames/arm, ~78% decoded. The o5p-0↔o5p-2
+        5 GHz path is now measured, not assumed.</li>
+      <li><b>Name filter on air, under link-FEC</b> — every shipped-addressing row admitted with zero
+        rejects; every pre-fix row 100% rejected. The WHO facet, through the coding path, on real air.</li>
+      <li><b>Rate actuation on air</b> — decoded rate tracks the plan for MCS 0/2/4/7.</li>
+      <li><b>The honest quirk</b> — plan MCS9 decoded as mcs1 (the a81a HT-broken remap, caught live), and
+        decode was <b>flat across MCS0–7</b>: no rate cliff at bench range, because the link is saturated.
+        The cliff lives at the margin, exactly as the sim models. Reported, not buried.</li>
+    </ul></div>
+  </section>
+  <footer id="foot"></footer>
+</div>
+<script>
+(function(){"use strict";
+  var css=getComputedStyle(document.documentElement); function tok(n){return css.getPropertyValue(n).trim();}
+  var C={ink:tok('--ink'),muted:tok('--muted'),line:tok('--line'),accent:tok('--accent'),good:tok('--good'),bad:tok('--bad'),warn:tok('--warn'),card:tok('--card')};
+  var NS='http://www.w3.org/2000/svg';
+  function el(t,a){var e=document.createElementNS(NS,t);for(var k in a)e.setAttribute(k,a[k]);return e;}
+  function txt(s,x,y,o){o=o||{};var t=el('text',{x:x,y:y,'font-size':o.size||12,fill:o.fill||C.ink,'text-anchor':o.anchor||'middle','font-weight':o.w||400,'font-family':o.mono?'var(--mono)':'var(--sans)'});t.textContent=s;return t;}
+
+  // ---- the four-facet wheel ----
+  (function(){
+    var W=680,H=380,cx=W/2,cy=H/2,r=118;
+    var s=el('svg',{viewBox:'0 0 '+W+' '+H,width:W,height:H,role:'img'});
+    var facets=[
+      {a:-90,t:'WHO / WHAT',f:'H(prefix)',d:'name filter',c:C.accent},
+      {a:0,  t:'WHEN',      f:'H(name)+epoch',d:'temporal access',c:C.good},
+      {a:90, t:'WHERE',     f:'H(name) % C',d:'spectrum + radios',c:C.warn},
+      {a:180,t:'HOW WELL',  f:'lease = rate·gen',d:'link adaptation',c:C.bad}
+    ];
+    // spokes
+    facets.forEach(function(fc){var rad=fc.a*Math.PI/180;var x=cx+Math.cos(rad)*r,y=cy+Math.sin(rad)*r;
+      s.appendChild(el('line',{x1:cx,y1:cy,x2:x,y2:y,stroke:C.line,'stroke-width':1.5}));});
+    // center
+    s.appendChild(el('circle',{cx:cx,cy:cy,r:52,fill:C.card,stroke:C.accent,'stroke-width':2}));
+    s.appendChild(txt('name',cx,cy-6,{w:700,size:15}));
+    s.appendChild(txt('+ clock',cx,cy+13,{w:700,size:15,fill:C.muted}));
+    // facet nodes
+    facets.forEach(function(fc){var rad=fc.a*Math.PI/180;var x=cx+Math.cos(rad)*r,y=cy+Math.sin(rad)*r;
+      s.appendChild(el('circle',{cx:x,cy:y,r:8,fill:fc.c}));
+      var ox=x+Math.cos(rad)*54, oy=y+Math.sin(rad)*30;
+      var anchor=Math.abs(fc.a)===90?'middle':(fc.a===0?'start':'end');
+      if(fc.a===-90){oy=y-34;} if(fc.a===90){oy=y+44;}
+      s.appendChild(txt(fc.t,ox,oy-6,{w:700,size:13,fill:fc.c,anchor:anchor}));
+      s.appendChild(txt(fc.f,ox,oy+11,{mono:true,size:12,fill:C.ink,anchor:anchor}));
+      s.appendChild(txt(fc.d,ox,oy+27,{size:11.5,fill:C.muted,anchor:anchor}));
+    });
+    document.getElementById('wheel').appendChild(s);
+  })();
+
+  // ---- the five laws ----
+  var laws=[
+    ['01','Computed from name + clock','The filter, slot, and channel are all hashes of the name. No facet announces a schedule; both endpoints derive it. Dedicated beacons appear nowhere.'],
+    ['02','Name semantics is the master control','The class bit (alarm / bulk) sets the airtime target, the lease length, and whether the FEC pooling discount is even legal. Rate and coding are subordinate.'],
+    ['03','The shared-map law','Every facet needs a shared view or it breaks: occupancy for rendezvous (100→42%), link-state for the schedule (21→2.9), correlation for pooling. Three facets, same failure.'],
+    ['04','Feedback is named, not ACKed','No PHY ACKs on broadcast (stock 802.11 ignores even the NAV). Reception reports close the RSSI loop; re-Interest closes the rate loop; overhear senses but cannot confirm.'],
+    ['05','Capability-adaptive above a floor','Nodes differ in radio count and silicon. A floor every node runs — the legacy rate, the single radio consuming a shared map, the worst-receiver cap — makes asymmetry degrade gracefully.']
+  ];
+  var lc=document.getElementById('laws');
+  laws.forEach(function(l){var d=document.createElement('div');d.className='law';d.innerHTML='<h3><span class="ln">'+l[0]+'</span>'+l[1]+'</h3><p>'+l[2]+'</p>';lc.appendChild(d);});
+
+  // ---- the ledger ----
+  var rows=[
+    ['Name filter admits by prefix, rejects mis-addressed','air','#106 shadow (0 false neg); the 08-17 run (new/* admitted, old/* rejected)'],
+    ['Rate plan actuates on air','air','the 08-17 run — plan 0/2/4/7 → decoded mcs 0/2/4/7'],
+    ['Link-FEC delivers on real radios','air','#33/#34; the 08-17 run (filter survives the FEC path)'],
+    ['Worst-receiver cap / legacy floor','air','#46/#47/#48 (a81a HT→VHT; graded single-stream cap)'],
+    ['µs common-view + time-slice scheduler','air','#41 (0.4 µs), #73 (two OPis)'],
+    ['a81a HT MCS9 does not cleanly actuate','air / negative','the 08-17 run — plan9 → decoded mcs1'],
+    ['Rate cliff gates delivery','sim','link_adapt.rs; the run saw flat ~78% MCS0–7 (saturated at bench range)'],
+    ['Slot gate improves delivery at N=2','air / negative','#111 — actuates but costs 6–9× throughput on a clean channel'],
+    ['Shared-avoid, rendezvous, multi-radio optimizer','sim','spectrum_access.rs, multi_radio*.rs (FHSS never checked vs a capture)'],
+    ['Rate→lease closure, FEC pooling gates','sim','slot_closure.rs, fec_pooling.rs (phy^n fix unactuated)']
+  ];
+  var tb=document.querySelector('#ledger tbody');
+  rows.forEach(function(r){var tr=document.createElement('tr');
+    var tag=r[1]==='air'?'<span class="tag t-air">on air</span>':r[1]==='sim'?'<span class="tag t-sim">sim only</span>':'<span class="tag t-neg">'+(r[1].indexOf('air')>=0?'air · negative':'negative')+'</span>';
+    tr.innerHTML='<td><b>'+r[0]+'</b></td><td>'+tag+'</td><td>'+r[2]+'</td>';tb.appendChild(tr);});
+
+  // ---- readouts ----
+  var stats=[
+    {k:'facets joined',v:'4',cls:'acc',note:'who · when · where · how-well'},
+    {k:'shared spine laws',v:'5',cls:'acc',note:'each in 3–4 facets'},
+    {k:'claims measured on air',v:'6',cls:'good',note:'incl. the 08-17 cross-facet run'},
+    {k:'honest sim-only / negative',v:'4',cls:'warn',note:'FHSS, cliff, closures, slot-gate'}
+  ];
+  var ro=document.getElementById('readouts');
+  stats.forEach(function(d){var c=document.createElement('div');c.className='stat';c.innerHTML='<div class="k">'+d.k+'</div><div class="v '+d.cls+'">'+d.v+'</div><div class="note">'+d.note+'</div>';ro.appendChild(c);});
+  document.getElementById('foot').textContent='Named Data Radio · MAC synthesis · four facet chapters + the 2026-08-17 a81a→8812au on-air run · measure, don’t assert';
+})();
+</script>
