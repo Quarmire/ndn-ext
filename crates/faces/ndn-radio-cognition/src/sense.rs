@@ -481,7 +481,27 @@ impl MediumView for MediumState {
         self.e2e
     }
     fn busy_pct(&self, radio: RadioId, channel: u8) -> Option<u8> {
-        self.occupancy.get(&(radio, channel)).map(|o| o.busy_pct)
+        // Local sensed occupancy (this radio, this channel).
+        let local = self.occupancy.get(&(radio, channel)).map(|o| o.busy_pct);
+        // §9.5: fuse the SHARED cooperative map — the neighbour spectrum reports were
+        // stored (`observe_report`) but never consumed for channel selection. A single
+        // radio senses only its own channel, so without this its avoidance is blind to
+        // the rest of the band (`multi_radio.rs`: 66% → 100% once the pool fills the map).
+        // MAX across views: a channel any neighbour reports busy is busy for us too, which
+        // is also what keeps avoidance rendezvous-preserving (both endpoints fuse the same
+        // broadcast reports → the same map, `spectrum_access.rs`).
+        let cooperative = self
+            .neighbors
+            .values()
+            .filter_map(|n| n.report.as_ref())
+            .flat_map(|r| r.spectrum.iter())
+            .filter(|(ch, _)| *ch == channel)
+            .map(|(_, busy)| *busy)
+            .max();
+        match (local, cooperative) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        }
     }
     fn receiver_count(&self, now_ms: u64) -> usize {
         let reports = self
@@ -702,6 +722,34 @@ mod tests {
         );
         assert_eq!(m.neighbors_holding(0xABCD, 100), 1);
         assert_eq!(m.neighbors_holding(0x1234, 100), 0);
+    }
+
+    #[test]
+    fn cooperative_spectrum_is_fused_into_busy_pct() {
+        // §9.5: a single radio senses only its own channel; a neighbour's shared spectrum
+        // report fills in the channels it cannot see itself (the shared-occupancy map that
+        // makes single-radio avoidance work — `multi_radio.rs`).
+        let mut m = state();
+        m.observe_occupancy(ChannelOccupancy { radio: W, channel: 149, busy_pct: 90, ts_ms: 1 });
+
+        // Before cooperation: 149 sensed busy, 161 unsensed (unknown — the §9.2 case).
+        assert_eq!(m.busy_pct(W, 149), Some(90));
+        assert_eq!(m.busy_pct(W, 161), None, "unsensed locally, no report yet");
+
+        // A neighbour reports 161 busy and 165 clear — now consumed for selection.
+        m.observe_report(
+            7,
+            NeighborReport { spectrum: vec![(161, 80), (165, 5)], ts_ms: 1, ..Default::default() },
+        );
+        assert_eq!(m.busy_pct(W, 161), Some(80), "neighbour's busy view is fused in (§9.5)");
+        assert_eq!(m.busy_pct(W, 165), Some(5), "neighbour's clear view is fused in");
+
+        // Local + cooperative fuse via MAX: avoid a channel anyone reports occupied.
+        m.observe_report(
+            8,
+            NeighborReport { spectrum: vec![(149, 30)], ts_ms: 1, ..Default::default() },
+        );
+        assert_eq!(m.busy_pct(W, 149), Some(90), "MAX of local 90 and neighbour 30");
     }
 
     #[test]

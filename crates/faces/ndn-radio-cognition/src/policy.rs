@@ -410,10 +410,19 @@ impl RadioPolicy {
         view: &dyn MediumView,
     ) -> Option<u8> {
         // Cognitive channel selection inline: least-busy channel this radio offers
-        // (evidence-based when fed by an SDR PSD scan; coarse CCA otherwise).
+        // (evidence-based when fed by an SDR PSD scan or a neighbour's shared map; coarse
+        // CCA otherwise).
+        //
+        // §9.2: an UNSENSED channel — no local *and* no cooperative view (`busy_pct` now
+        // fuses both) — is UNKNOWN, not clear. Treating it as 0 busy biased selection
+        // toward channels we cannot see, and `multi_radio.rs` measured the harm: avoidance
+        // moving a name ONTO an unseen busy channel. Rank unknown between sensed-clear and
+        // sensed-busy, so we prefer known-clear and fall back to unknown only over
+        // known-busy.
+        const UNSENSED_BUSY: u8 = 50;
         cap.channels
             .iter()
-            .min_by_key(|&&ch| view.busy_pct(radio, ch).unwrap_or(0))
+            .min_by_key(|&&ch| view.busy_pct(radio, ch).unwrap_or(UNSENSED_BUSY))
             .copied()
     }
 
