@@ -167,6 +167,7 @@ pub mod measure;
 // replaces the name-group hash; ported from the measured firmware reference. See the module docs.
 pub mod name_gate;
 pub mod ndn_nic;
+pub mod gcs;
 pub mod tier0;
 pub mod tier1;
 pub use tier0::PrefixFilter;
