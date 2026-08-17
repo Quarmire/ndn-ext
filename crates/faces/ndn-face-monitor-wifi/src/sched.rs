@@ -234,12 +234,11 @@ fn slot_trunc(slash: &[u8], depth: usize) -> (Vec<u8>, u64) {
 ///
 /// `slot_depth` is the specific D3 fix: the slot key is `H(first slot_depth name components)`. It is
 /// the shared-constant successor to the deleted `NDN_SCHED_GROUP_DEPTH` — legal precisely because it
-/// is one pinned value, not a per-node choice.
-///
-/// Only `slot_depth` and `version` live here today; slot width / reserve / clock / hop fold in next
-/// (they are computed in `from_env` and still live on the schedule), at which point [`digest`] covers
-/// the full set and the time beacon can carry it for partition detection (a node hearing a foreign
-/// digest knows the medium is split — detection over agreement).
+/// is one pinned value, not a per-node choice. The rest — clock class, slot width, slot count,
+/// reserved lanes, hop dwell, and the channel set — are the schedule-map inputs that, if mismatched,
+/// silently split the map; they are captured here from `from_env` so [`digest`] covers the whole set
+/// and the time beacon can carry it for partition detection (a node hearing a foreign digest knows
+/// the medium is split — detection over agreement).
 ///
 /// [`digest`]: Self::digest
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -248,6 +247,19 @@ pub struct SchedParams {
     pub version: u16,
     /// Shared slot granularity: slot key = `H(first slot_depth name components)`. Default 1.
     pub slot_depth: u8,
+    /// Clock source discriminant (0=wall, 1=hardware, 2=common-view). Nodes on different clocks share
+    /// no epoch, so the same slot index means different wall instants — a silent split.
+    pub clock: u8,
+    /// Slot width µs (0 ⇒ no slot schedule). Different widths ⇒ disjoint maps.
+    pub slot_us: u32,
+    /// Slots per superframe (0 ⇒ none).
+    pub slots: u16,
+    /// Reserved (latency) lane count — the shared lane split.
+    pub reserved: u16,
+    /// Hop dwell µs (0 ⇒ no hop schedule).
+    pub hop_dwell_us: u32,
+    /// FNV-1a digest of the ordered channel-class set (the hop map's channels).
+    pub channels_digest: u32,
 }
 
 /// Current [`SchedParams`] wire version. Bump when the pinned set changes.
@@ -255,13 +267,47 @@ pub const SCHED_PARAMS_VERSION: u16 = 1;
 
 impl Default for SchedParams {
     fn default() -> Self {
-        Self { version: SCHED_PARAMS_VERSION, slot_depth: 1 }
+        Self {
+            version: SCHED_PARAMS_VERSION,
+            slot_depth: 1,
+            clock: 0,
+            slot_us: 0,
+            slots: 0,
+            reserved: 0,
+            hop_dwell_us: 0,
+            channels_digest: 0,
+        }
     }
 }
 
 impl SchedParams {
+    /// Capture the shared set from the parsed schedule inputs (`from_env`). `slot_depth` is threaded
+    /// separately because it is a `GroupTable`/scheduler concern, not an env-parsed one.
+    fn capture(
+        slot_depth: u8,
+        clock: ClockSource,
+        slot: Option<&SlotSchedule>,
+        hop: Option<&HopSchedule>,
+    ) -> Self {
+        let (slot_us, slots, reserved) = slot
+            .map(|s| (s.slot_us() as u32, s.slots() as u16, s.reserved_slots() as u16))
+            .unwrap_or((0, 0, 0));
+        let (hop_dwell_us, channels_digest) =
+            hop.map(|h| (h.dwell_us() as u32, fnv32(h.classes()))).unwrap_or((0, 0));
+        Self {
+            version: SCHED_PARAMS_VERSION,
+            slot_depth,
+            clock: clock as u8,
+            slot_us,
+            slots,
+            reserved,
+            hop_dwell_us,
+            channels_digest,
+        }
+    }
+
     /// A digest of the parameters that must match for the map to converge — the value the time beacon
-    /// will carry so a node hearing a foreign digest **detects** a partitioned medium (D2), with no
+    /// carries so a node hearing a foreign digest **detects** a partitioned medium (D2), with no
     /// convergence protocol. FNV-1a in the scheduler's unkeyed `prefix_hash` keyspace (#44), NOT the
     /// wire's keyed SipHash: this pins *agreement*, it does not authenticate. A signed beacon (§5a)
     /// would sign this digest; it would not replace it.
@@ -271,10 +317,28 @@ impl SchedParams {
             h ^= b as u64;
             h = h.wrapping_mul(0x0000_0100_0000_01b3);
         };
-        self.version.to_le_bytes().iter().for_each(|b| mix(*b));
+        mix((self.version & 0xff) as u8);
+        mix((self.version >> 8) as u8);
         mix(self.slot_depth);
+        mix(self.clock);
+        self.slot_us.to_le_bytes().iter().for_each(|b| mix(*b));
+        self.slots.to_le_bytes().iter().for_each(|b| mix(*b));
+        self.reserved.to_le_bytes().iter().for_each(|b| mix(*b));
+        self.hop_dwell_us.to_le_bytes().iter().for_each(|b| mix(*b));
+        self.channels_digest.to_le_bytes().iter().for_each(|b| mix(*b));
         h
     }
+}
+
+/// FNV-1a over raw bytes — the ordered channel-class digest for [`SchedParams`]. Same unkeyed
+/// keyspace as `prefix_hash` (#44); pins agreement, does not authenticate.
+fn fnv32(bytes: &[u8]) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for &b in bytes {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
 }
 
 /// A 6-byte §2 source nonce packed LE into a u64 (`0` reserved for "unknown").
@@ -500,11 +564,14 @@ impl FaceScheduler {
         let node_id: u64 = std::env::var("NDN_SCHED_NODE_ID").ok().and_then(|s| s.parse().ok()).unwrap_or(u64::MAX);
         // One evidence cell per slot in the superframe (1 when there is no slot schedule at all).
         let slot_count = slot.as_ref().map(|s| s.slots() as usize).unwrap_or(1).max(1);
+        // Capture the shared schedule pin (D2) from the parsed inputs BEFORE they move into the
+        // struct. slot_depth defaults to 1; `with_groups` syncs it up if a deeper table is attached.
+        let sched_params = SchedParams::capture(1, clock_source, slot.as_ref(), hop.as_ref());
         Some(Self {
             slot,
             hop,
             groups: None,
-            sched_params: SchedParams::default(),
+            sched_params,
             learned: Mutex::new(std::collections::HashMap::new()),
             clock_source,
             knobs,
@@ -600,14 +667,18 @@ impl FaceScheduler {
         if let Ok(mut cv) = self.cv.lock() {
             cv.on_raw(ref_us, host_now);
         }
-        let mut out = Vec::with_capacity(TIME_BEACON_MAGIC.len() + 8);
+        // `MAGIC ‖ ref_us(le64) ‖ map_digest(le64)` — the beacon now also carries the shared schedule
+        // pin (D2), so a receiver detects a partitioned medium without any convergence protocol.
+        let mut out = Vec::with_capacity(TIME_BEACON_MAGIC.len() + 16);
         out.extend_from_slice(&TIME_BEACON_MAGIC);
         out.extend_from_slice(&ref_us.to_le_bytes());
+        out.extend_from_slice(&self.sched_params.digest().to_le_bytes());
         bytes::Bytes::from(out)
     }
 
     /// If `payload` is a time-beacon, its master reference time (µs). The RX reader uses this to (a)
-    /// discipline the common-view clock and (b) suppress the frame (it is not NDN traffic).
+    /// discipline the common-view clock and (b) suppress the frame (it is not NDN traffic). Unchanged
+    /// by the added digest — an 11-byte legacy beacon and a 19-byte one both yield the reference.
     pub fn parse_beacon(payload: &[u8]) -> Option<u64> {
         if payload.len() >= TIME_BEACON_MAGIC.len() + 8 && payload[..3] == TIME_BEACON_MAGIC {
             let mut b = [0u8; 8];
@@ -616,6 +687,32 @@ impl FaceScheduler {
         } else {
             None
         }
+    }
+
+    /// The [`SchedParams`] map digest a time-beacon carries, if present. Legacy 11-byte beacons return
+    /// `None` (no signal — not a false match).
+    pub fn parse_beacon_map_digest(payload: &[u8]) -> Option<u64> {
+        if payload.len() >= TIME_BEACON_MAGIC.len() + 16 && payload[..3] == TIME_BEACON_MAGIC {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&payload[11..19]);
+            Some(u64::from_le_bytes(b))
+        } else {
+            None
+        }
+    }
+
+    /// This node's schedule-map digest (D2) — what its beacons carry and what it tests foreign beacons
+    /// against.
+    pub fn map_digest(&self) -> u64 {
+        self.sched_params.digest()
+    }
+
+    /// `true` ⇒ this beacon's carrier computes a **different** schedule map than we do: the medium is
+    /// partitioned, so its presence / busy / ownership evidence lands in different slots than ours.
+    /// Detection only — the design corrects nothing here; it is the honest signal that a deployment
+    /// mixed incompatible [`SchedParams`]. An absent digest (legacy beacon) is no signal, not a match.
+    pub fn beacon_indicates_partition(&self, payload: &[u8]) -> bool {
+        Self::parse_beacon_map_digest(payload).is_some_and(|d| d != self.map_digest())
     }
 
     /// Discipline the common-view clock to a received master reference time (called by the RX reader
@@ -830,6 +927,9 @@ impl FaceScheduler {
     /// per-frame TLV parse.
     #[must_use]
     pub fn with_groups(mut self, groups: std::sync::Arc<GroupTable>) -> Self {
+        // Keep the pin honest: the digest must reflect the slot granularity actually in force, so a
+        // deeper table raises `sched_params.slot_depth` to match (D2/D3 coupling).
+        self.sched_params.slot_depth = groups.slot_depth as u8;
         self.groups = Some(groups);
         self
     }
@@ -2264,13 +2364,49 @@ mod tests {
     }
 
     /// The pin's digest changes iff a pinned parameter changes — the property that makes it a partition
-    /// detector when the time beacon carries it (D2).
+    /// detector when the time beacon carries it (D2). Every field in the shared set must move it, or a
+    /// mismatch on that field would go undetected.
     #[test]
     fn sched_params_digest_pins_the_shared_set() {
         let base = super::SchedParams::default();
         assert_eq!(base.digest(), super::SchedParams::default().digest(), "same params, same digest");
-        let deeper = super::SchedParams { slot_depth: 2, ..base };
-        assert_ne!(base.digest(), deeper.digest(), "a different slot_depth is a different map");
+        // Each pinned field, changed alone, must change the digest.
+        for m in [
+            super::SchedParams { slot_depth: 2, ..base },
+            super::SchedParams { clock: 2, ..base },
+            super::SchedParams { slot_us: 20_000, ..base },
+            super::SchedParams { slots: 8, ..base },
+            super::SchedParams { reserved: 2, ..base },
+            super::SchedParams { hop_dwell_us: 3_000, ..base },
+            super::SchedParams { channels_digest: 0x1234_5678, ..base },
+            super::SchedParams { version: base.version + 1, ..base },
+        ] {
+            assert_ne!(base.digest(), m.digest(), "a change to {m:?} must move the digest");
+        }
+    }
+
+    /// The time beacon carries the map digest (D2): a node's own beacon round-trips it, and a beacon
+    /// carrying a foreign digest is flagged as a partition — detection, not correction. A legacy
+    /// 11-byte beacon carries none, so it is never a false partition signal.
+    #[test]
+    fn beacon_carries_map_digest_for_partition_detection() {
+        let sched = mk_claim_sched();
+        let wire = sched.build_beacon();
+        assert_eq!(
+            super::FaceScheduler::parse_beacon_map_digest(&wire),
+            Some(sched.map_digest()),
+            "own beacon round-trips our map digest"
+        );
+        assert!(!sched.beacon_indicates_partition(&wire), "our own beacon is not a partition");
+        // A beacon whose digest differs from ours ⇒ partition detected.
+        let mut foreign = wire.to_vec();
+        foreign[11..19].copy_from_slice(&(sched.map_digest() ^ 0xdead_beef).to_le_bytes());
+        assert!(sched.beacon_indicates_partition(&foreign), "a foreign map digest is a partition");
+        // A legacy beacon (ref only, no digest) is no signal — not a false positive.
+        assert!(
+            !sched.beacon_indicates_partition(&foreign[..11]),
+            "a digest-less legacy beacon must not read as a partition"
+        );
     }
 
     /// A Data frame carrying `comps` as its name — what a neighbour of that group puts on air.

@@ -1371,6 +1371,17 @@ impl RunningMedium {
                             if let Some(sched) = sched_rx.as_ref()
                                 && let Some(ref_us) = crate::FaceScheduler::parse_beacon(&f.payload)
                             {
+                                // D2: the beacon carries the sender's schedule-map digest. A mismatch
+                                // means the medium is partitioned — its slot map differs from ours, so
+                                // its evidence lands in different slots. Detected and reported, not
+                                // corrected (there is no convergence protocol, by design).
+                                if sched.beacon_indicates_partition(&f.payload) {
+                                    tracing::warn!(
+                                        ours = sched.map_digest(),
+                                        theirs = crate::FaceScheduler::parse_beacon_map_digest(&f.payload),
+                                        "schedule-map partition: a neighbour computes a different slot map (mismatched SchedParams)"
+                                    );
+                                }
                                 sched.ingest_time_ref(ref_us);
                                 continue;
                             }
