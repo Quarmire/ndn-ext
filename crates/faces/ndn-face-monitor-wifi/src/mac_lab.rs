@@ -55,6 +55,7 @@ fn lab_sched(slot: SlotSchedule, groups: Option<Arc<GroupTable>>) -> FaceSchedul
         slot: Some(slot),
         hop: None,
         groups,
+        sched_params: crate::sched::SchedParams::default(),
         learned: Mutex::new(std::collections::HashMap::new()),
         clock_source: ClockSource::Wall,
         knobs: None,

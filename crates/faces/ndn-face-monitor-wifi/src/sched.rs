@@ -107,6 +107,12 @@ impl ClockSource {
 pub struct GroupTable {
     /// Sorted longest-prefix-first, so the first match IS the longest match on both paths.
     entries: Vec<GroupEntry>,
+    /// The SHARED slot granularity the entries were truncated to (`SchedParams::slot_depth`, D3):
+    /// every entry is the first `slot_depth` components of a registered prefix, so the slot key a
+    /// name maps to is `H(first slot_depth components)` — identical at every node regardless of how
+    /// deep *this* node registered. Stored so [`with_latency`](Self::with_latency) truncates its
+    /// inputs the same way, and so the scheduler can key its no-table fallback at the same depth.
+    slot_depth: usize,
 }
 
 struct GroupEntry {
@@ -127,39 +133,62 @@ impl GroupTable {
     /// Build from the same `(key, prefixes)` the Tier-0 RX gate is built from, so the gate and the
     /// scheduler cannot disagree about what is registered.
     pub fn new(key: &crate::GroupKey, prefixes: &[impl AsRef<[u8]>]) -> Self {
+        Self::new_with_depth(key, prefixes, SchedParams::default().slot_depth as usize)
+    }
+
+    /// As [`new`](Self::new), but truncating every registered prefix to `slot_depth` components — the
+    /// **shared slot granularity** (D3). The slot key a name maps to becomes `H(first slot_depth
+    /// components)`, which every node computes identically; a node that registered `/x/y` and one that
+    /// registered `/x` now agree on the slot for a frame under `/x/y/z`, where the old
+    /// longest-registered-prefix key silently disagreed. Distinct prefixes that truncate to the same
+    /// slot group are deduplicated — they share one slot, the coarsening the shared granularity
+    /// intends. `slot_depth` MUST equal the scheduler's [`SchedParams::slot_depth`], or TX and RX key
+    /// slots at different depths; that coupling is exactly what `SchedParams` exists to pin.
+    pub fn new_with_depth(
+        key: &crate::GroupKey,
+        prefixes: &[impl AsRef<[u8]>],
+        slot_depth: usize,
+    ) -> Self {
         let k = crate::bloom_key64(key);
-        let mut entries: Vec<GroupEntry> = prefixes
-            .iter()
-            .map(|p| {
-                let prefix = p.as_ref().to_vec();
-                let comps: Vec<&[u8]> =
-                    prefix.split(|&b| b == b'/').filter(|c| !c.is_empty()).collect();
-                GroupEntry {
-                    mask: crate::PrefixFilter::mask_for(k, &prefix),
-                    hash: prefix_hash(&comps),
-                    prefix,
-                    class: LeaseClass::Bulk,
-                }
-            })
-            .collect();
+        let depth = slot_depth.max(1);
+        let mut entries: Vec<GroupEntry> = Vec::new();
+        for p in prefixes {
+            let (slash, hash) = slot_trunc(p.as_ref(), depth);
+            if slash.is_empty() || entries.iter().any(|e| e.prefix == slash) {
+                continue; // empty name, or a distinct prefix sharing this slot group — dedup
+            }
+            entries.push(GroupEntry {
+                mask: crate::PrefixFilter::mask_for(k, &slash),
+                hash,
+                prefix: slash,
+                class: LeaseClass::Bulk,
+            });
+        }
         entries.sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
-        Self { entries }
+        Self { entries, slot_depth: depth }
     }
 
     /// Mark the entries matching `prefixes` as [`LeaseClass::Latency`] (#93): placed among the
     /// reserved lanes, `L = 1`, never contending with bulk. Everything else stays `Bulk`.
     #[must_use]
     pub fn with_latency(mut self, prefixes: &[impl AsRef<[u8]>]) -> Self {
+        let depth = self.slot_depth;
         for e in &mut self.entries {
-            if prefixes.iter().any(|p| p.as_ref() == e.prefix.as_slice()) {
+            // Truncate the caller's prefixes to the shared slot depth before comparing, so a latency
+            // registration deeper than the slot granularity still marks its slot group. If two
+            // registrations under one slot group disagree, latency wins (the safer lane).
+            if prefixes.iter().any(|p| slot_trunc(p.as_ref(), depth).0 == e.prefix) {
                 e.class = LeaseClass::Latency;
             }
         }
         self
     }
 
-    /// Slot key + class for a name in `/`-joined form: the longest registered prefix covering it.
-    /// Component-boundary aware: `/a` covers `/a/b` and `/a`, never `/ab`.
+    /// Slot key + class for a name in `/`-joined form: the shared-depth slot group covering it (the
+    /// entries are truncated to `slot_depth`, so this returns `H(first slot_depth components)` — the
+    /// same value the no-table fallback computes, and the same at every node). Component-boundary
+    /// aware: `/a` covers `/a/b` and `/a`, never `/ab`. The table's role here is now only the *class*;
+    /// the *key* is shared by construction (D3).
     fn hash_for_name(&self, slash: &[u8]) -> Option<(u64, LeaseClass)> {
         self.entries
             .iter()
@@ -174,6 +203,77 @@ impl GroupTable {
     /// under.
     fn hash_for_filter(&self, f: &crate::PrefixFilter) -> Option<(u64, LeaseClass)> {
         self.entries.iter().find(|e| f.may_match(&e.mask)).map(|e| (e.hash, e.class))
+    }
+}
+
+/// Truncate a `/`-joined prefix (or name) to its first `depth` components — the shared slot
+/// granularity — and return the truncated `/`-joined bytes together with their `prefix_hash` slot
+/// key. **Every node runs this identically**, which is the whole point of D3: the slot key no longer
+/// depends on how deep a given node happened to register. Used by [`GroupTable`] construction and the
+/// scheduler's no-table fallback, so both derive the same key for the same name.
+fn slot_trunc(slash: &[u8], depth: usize) -> (Vec<u8>, u64) {
+    let comps: Vec<&[u8]> = slash.split(|&b| b == b'/').filter(|c| !c.is_empty()).collect();
+    let take = depth.max(1).min(comps.len());
+    let mut out = Vec::new();
+    for c in &comps[..take] {
+        out.push(b'/');
+        out.extend_from_slice(c);
+    }
+    let refs: Vec<&[u8]> = comps[..take].to_vec();
+    (out, prefix_hash(&refs))
+}
+
+/// **The shared schedule parameters — the pin (D2/D3).** Everything that must be identical at every
+/// node for the slot map to converge, named as one *versioned* set so a mismatch is **detectable**
+/// rather than silent. This is the schedule's [`Tier0Params`](crate::tier0): the name filter deleted
+/// the granularity agreement (every receiver matches at its own depth — its whole virtue), but the
+/// slot key quietly re-required one, and the other schedule-map inputs (slot width, reserve lanes,
+/// clock class, hop dwell) are a wire-compat surface that nothing pins. The doctrine already killed a
+/// per-node env var deciding a shared map (`NDN_SCHED_GROUP_DEPTH`); a **shared, versioned constant is
+/// a different animal**, and the schedule needs one even though the filter proudly does not.
+///
+/// `slot_depth` is the specific D3 fix: the slot key is `H(first slot_depth name components)`. It is
+/// the shared-constant successor to the deleted `NDN_SCHED_GROUP_DEPTH` — legal precisely because it
+/// is one pinned value, not a per-node choice.
+///
+/// Only `slot_depth` and `version` live here today; slot width / reserve / clock / hop fold in next
+/// (they are computed in `from_env` and still live on the schedule), at which point [`digest`] covers
+/// the full set and the time beacon can carry it for partition detection (a node hearing a foreign
+/// digest knows the medium is split — detection over agreement).
+///
+/// [`digest`]: Self::digest
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SchedParams {
+    /// Bumped on any change to the pinned set — the version a beacon digest carries.
+    pub version: u16,
+    /// Shared slot granularity: slot key = `H(first slot_depth name components)`. Default 1.
+    pub slot_depth: u8,
+}
+
+/// Current [`SchedParams`] wire version. Bump when the pinned set changes.
+pub const SCHED_PARAMS_VERSION: u16 = 1;
+
+impl Default for SchedParams {
+    fn default() -> Self {
+        Self { version: SCHED_PARAMS_VERSION, slot_depth: 1 }
+    }
+}
+
+impl SchedParams {
+    /// A digest of the parameters that must match for the map to converge — the value the time beacon
+    /// will carry so a node hearing a foreign digest **detects** a partitioned medium (D2), with no
+    /// convergence protocol. FNV-1a in the scheduler's unkeyed `prefix_hash` keyspace (#44), NOT the
+    /// wire's keyed SipHash: this pins *agreement*, it does not authenticate. A signed beacon (§5a)
+    /// would sign this digest; it would not replace it.
+    pub fn digest(&self) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut mix = |b: u8| {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        };
+        self.version.to_le_bytes().iter().for_each(|b| mix(*b));
+        mix(self.slot_depth);
+        h
     }
 }
 
@@ -242,6 +342,11 @@ pub struct FaceScheduler {
     /// AND. `None` ⇒ the depth-1 fallback below — the pre-P1 default behaviour, kept so every
     /// measurement taken without a registration set still describes the shipping code.
     groups: Option<std::sync::Arc<GroupTable>>,
+    /// The shared schedule pin (D2/D3). Its `slot_depth` sizes the no-table slot-key fallback; when a
+    /// [`GroupTable`] is attached, [`slot_depth`](Self::slot_depth) prefers the table's own depth so
+    /// the registered and fallback paths cannot disagree. `digest()` is the value the time beacon will
+    /// carry for partition detection.
+    sched_params: SchedParams,
     /// Parse-once cache for unregistered Tier-0 groups: wire bytes → slot hash, bounded by
     /// [`LEARNED_GROUP_CAP`] with oldest-last-heard eviction (= LRU = presence-pinning, see the
     /// constant). Keyed on the raw 12 bytes so a hit costs a HashMap probe, not a parse.
@@ -399,6 +504,7 @@ impl FaceScheduler {
             slot,
             hop,
             groups: None,
+            sched_params: SchedParams::default(),
             learned: Mutex::new(std::collections::HashMap::new()),
             clock_source,
             knobs,
@@ -1262,12 +1368,11 @@ impl FaceScheduler {
         self.name_group(wire).map(|(h, _)| h)
     }
 
-    /// Slot key **and lease class** for a wire (P1 + #93). The slot key is the longest REGISTERED
-    /// prefix covering the name — the granularity the receivers actually operate at, from the
-    /// shared registration set rather than a per-node env depth; its class rides the same set, so
-    /// every node places a latency name in the same lane. The `/`-joined form is the shared
-    /// normalization (#44). Fallback (no table / unregistered name): first component, fixed
-    /// depth 1, `Bulk` — the pre-P1 default, uniform across nodes by construction.
+    /// Slot key **and lease class** for a wire (P1 + #93, D3). The slot key is the **shared slot
+    /// group** — `H(first slot_depth components)` — which every node computes identically; the
+    /// registered table now supplies only the *class* (its `hash_for_name` returns the same shared key
+    /// because its entries are truncated to `slot_depth`). The `/`-joined form is the shared
+    /// normalization (#44). No-table / unregistered name: the same shared depth, `Bulk`.
     fn name_group(&self, wire: &[u8]) -> Option<(u64, LeaseClass)> {
         let name_tlv = crate::inner_name(wire)?;
         if let Some(groups) = &self.groups {
@@ -1276,12 +1381,24 @@ impl FaceScheduler {
                 return Some(hc);
             }
         }
-        let comps = name_components(name_tlv, 1);
+        // Fallback: the same shared granularity the table uses, so a registered and an unregistered
+        // name under one slot group land on the same slot. (D3: never a per-node depth.)
+        let comps = name_components(name_tlv, self.slot_depth());
         if comps.is_empty() {
             return None;
         }
         let refs: Vec<&[u8]> = comps.iter().map(|c| *c).collect();
         Some((prefix_hash(&refs), LeaseClass::Bulk))
+    }
+
+    /// The shared slot granularity in effect: the attached [`GroupTable`]'s depth if present (so the
+    /// registered and fallback paths cannot disagree), else the [`SchedParams`] default. Both are the
+    /// same pinned constant in a correct deployment — this just prefers the table as the local witness.
+    fn slot_depth(&self) -> usize {
+        self.groups
+            .as_ref()
+            .map(|g| g.slot_depth)
+            .unwrap_or(self.sched_params.slot_depth as usize)
     }
 }
 
@@ -1408,6 +1525,7 @@ mod tests {
             slot: parse_slot("8:3000", 1500, ClockSource::Wall),
             hop: None,
             groups: None,
+            sched_params: SchedParams::default(),
             learned: super::Mutex::new(std::collections::HashMap::new()),
             clock_source: ClockSource::CommonView,
             knobs: None,
@@ -1456,6 +1574,7 @@ mod tests {
             slot: parse_slot("8:3000", 1500, ClockSource::Wall),
             hop: None,
             groups: None,
+            sched_params: SchedParams::default(),
             learned: super::Mutex::new(std::collections::HashMap::new()),
             clock_source: ClockSource::CommonView,
             knobs: None,
@@ -1540,6 +1659,7 @@ mod tests {
             slot: parse_slot("4:3000", 1500, ClockSource::Wall),
             hop: None,
             groups: None,
+            sched_params: SchedParams::default(),
             learned: super::Mutex::new(std::collections::HashMap::new()),
             clock_source: ClockSource::CommonView,
             knobs: None,
@@ -1701,6 +1821,7 @@ mod tests {
             slot: parse_slot("8:3000", 1500, ClockSource::Wall),
             hop: None,
             groups: None,
+            sched_params: SchedParams::default(),
             learned: super::Mutex::new(std::collections::HashMap::new()),
             clock_source: ClockSource::Wall,
             knobs: None,
@@ -2065,11 +2186,12 @@ mod tests {
         );
     }
 
-    /// **One filter, one map** (P1): the slot key a TX node derives from the wire name and the slot
-    /// a RX node attributes from the Tier-0 bytes must agree — with the LONGEST registered prefix
-    /// winning on both paths — and a foreign unicast frame must die at the origin gate without a
-    /// parse. This is the property the whole redesign exists for; if it fails, two nodes compute
-    /// different maps and every downstream measurement is noise.
+    /// **One filter, one map** (P1, D3): the slot key a TX node derives from the wire name and the
+    /// slot a RX node attributes from the Tier-0 bytes must agree — both on the SHARED slot group
+    /// (`H(first slot_depth components)`, default depth 1), NOT on a per-node longest-registered
+    /// prefix — and a foreign unicast frame must die at the origin gate without a parse. This is the
+    /// property the whole redesign exists for; if it fails, two nodes compute different maps and every
+    /// downstream measurement is noise.
     #[test]
     fn tx_keying_and_rx_attribution_land_on_the_same_slot() {
         let key = crate::GroupKey([9u8; 16]);
@@ -2080,11 +2202,12 @@ mod tests {
         let mut s = mk_claim_sched();
         s.groups = Some(table.clone());
 
-        // TX path: an /ndn/alarm/… name keys on /ndn/alarm (longest), not /ndn.
+        // TX path: at the shared depth 1, an /ndn/alarm/… name keys on the /ndn group — the deeper
+        // /ndn/alarm registration does NOT pull the slot key deeper (D3: slot granularity is a shared
+        // constant, not the per-node longest registration; both regs truncate to /ndn and dedup).
         let wire = data_wire(&[b"ndn", b"alarm", b"7"]);
         let tx_hash = s.name_group_hash(&wire).expect("keyed");
-        let alarm_comps: Vec<&[u8]> = vec![b"ndn", b"alarm"];
-        assert_eq!(tx_hash, prefix_hash(&alarm_comps), "longest registered prefix wins on TX");
+        assert_eq!(tx_hash, prefix_hash(&[b"ndn".as_slice()]), "shared depth-1 group keys TX");
 
         // RX path: the same object's Tier-0 bytes attribute to the same hash via mask AND — no parse
         // (the wire handed over is garbage on purpose: reaching the parser would panic the premise).
@@ -2110,6 +2233,46 @@ mod tests {
         assert_eq!(first, second, "the learned cache must return the parsed hash");
     }
 
+    /// **D3 regression — the slot key is shared across heterogeneous registration tables.** The roles
+    /// thesis says two nodes legitimately register the same namespace at different depths. Before the
+    /// pin, the slot key was each node's *longest registered prefix*, so they silently keyed one name
+    /// to different slots. Now it is `H(first slot_depth components)` — a shared constant — so a
+    /// shallow-registering node and a deep-registering node agree on the slot for a covered name.
+    #[test]
+    fn slot_key_is_shared_across_heterogeneous_registrations() {
+        let key = crate::GroupKey([7u8; 16]);
+        let name = b"/ndn/x/y/z".as_slice();
+        let comps: Vec<&[u8]> =
+            name.split(|&c| c == b'/').filter(|c| !c.is_empty()).collect();
+        for depth in [1usize, 2] {
+            // Node A registered shallow, node B registered deep — different tables, same shared depth.
+            let a = super::GroupTable::new_with_depth(&key, &[b"/ndn/x".as_slice()], depth);
+            let b = super::GroupTable::new_with_depth(&key, &[b"/ndn/x/y".as_slice()], depth);
+            let ka = a.hash_for_name(name).map(|(h, _)| h);
+            let kb = b.hash_for_name(name).map(|(h, _)| h);
+            assert_eq!(ka, kb, "heterogeneous tables must key one name to one slot at depth {depth}");
+            // …and it is the NAME's shared depth-N group, independent of what was registered.
+            assert_eq!(ka, Some(prefix_hash(&comps[..depth])), "key = H(first {depth} name components)");
+        }
+        // The pre-fix behaviour would have diverged: the deep node's OWN registration hashed elsewhere.
+        let b2 = super::GroupTable::new_with_depth(&key, &[b"/ndn/x/y".as_slice()], 2);
+        assert_ne!(
+            b2.hash_for_name(name).map(|(h, _)| h),
+            Some(prefix_hash(&[&b"ndn"[..], &b"x"[..], &b"y"[..]])),
+            "the deep node no longer keys on its own longer registration (that was the D3 bug)"
+        );
+    }
+
+    /// The pin's digest changes iff a pinned parameter changes — the property that makes it a partition
+    /// detector when the time beacon carries it (D2).
+    #[test]
+    fn sched_params_digest_pins_the_shared_set() {
+        let base = super::SchedParams::default();
+        assert_eq!(base.digest(), super::SchedParams::default().digest(), "same params, same digest");
+        let deeper = super::SchedParams { slot_depth: 2, ..base };
+        assert_ne!(base.digest(), deeper.digest(), "a different slot_depth is a different map");
+    }
+
     /// A Data frame carrying `comps` as its name — what a neighbour of that group puts on air.
     fn data_wire(comps: &[&[u8]]) -> Vec<u8> {
         let mut name = Vec::new();
@@ -2131,6 +2294,7 @@ mod tests {
             slot: parse_slot("8:3000", 1500, ClockSource::Wall),
             hop: None,
             groups: None,
+            sched_params: SchedParams::default(),
             learned: super::Mutex::new(std::collections::HashMap::new()),
             clock_source: ClockSource::Wall,
             knobs: None,
