@@ -380,6 +380,11 @@ pub const TIME_BEACON_MAGIC: [u8; 3] = [0x7E, b'T', b'B'];
 /// human-noticeable beat.
 const PRESENCE_WINDOW_US: u64 = 5_000_000;
 
+/// DEBUG counters for D1 on-air diagnosis (`co_owner_debug`): calls to `co_owner_evident` and how
+/// many returned true. Module statics so they need no struct field / init-site churn.
+static CE_CALLS: AtomicU64 = AtomicU64::new(0);
+static CE_TRUE: AtomicU64 = AtomicU64::new(0);
+
 /// How many frame-airtimes wide the CCLF draw is. The draw only has to order contenders far enough
 /// apart that the loser hears the winner and cancels; 8 gives a handful of separable positions
 /// without spending the slot it is competing for.
@@ -843,7 +848,13 @@ impl FaceScheduler {
         addr3: Option<&[u8; 6]>,
         wire: &[u8],
     ) {
-        if !self.claimable {
+        // Busy-marking feeds two consumers: the claim path (heard/nonce/owner-in-range) AND the D1
+        // co-owner witness. The latter is a property of the OWNER path — an owner that never claims
+        // still must detect a co-owner of its slot — so gating all of observe on `claimable` (as it
+        // was) silently disabled D1 whenever claiming was off. Record whenever there is a slot
+        // schedule at all; with neither slots nor claiming there is nothing to mark. (Caught on air:
+        // the sub-draw never fired because the witness was never written.)
+        if !self.claimable && self.slot.is_none() {
             return;
         }
         let now = self.now_us();
@@ -1263,25 +1274,56 @@ impl FaceScheduler {
     /// while ≤ N groups are active. Evidence is the per-slot witness the RX path records: if a
     /// *different* group's hash used our slot within a presence window, its co-ownership is proven
     /// locally and the owner must sub-draw. Cheap and local — the deaf fast path pays nothing when no
-    /// co-owner exists (the common case). Keyed identically to the RX witness (`medium_keyed`), so a
-    /// static/hopping channel term never causes a false match.
-    fn co_owner_evident(&self, hash: u64, class: LeaseClass, now: u64) -> bool {
+    /// co-owner exists (the common case). Takes the **already medium-keyed** hash (as the gate passes
+    /// it to `owns_now_in`); `observe_rx` keys the witness once too, so both land on the same slot cell
+    /// — key it a second time here and the whole path silently no-ops (the on-air-caught double-key).
+    fn co_owner_evident(&self, keyed: u64, class: LeaseClass, now: u64) -> bool {
         // Debug-bisect toggle (#81 operational-vs-bisect split): `NDN_SCHED_NO_SUBDRAW=1` forces the
         // deaf fast path, so an on-air A/B can measure the sub-draw against the exact same binary
         // (`slot_ab_onair`). Read once, cached — never on the hot path per frame.
+        CE_CALLS.fetch_add(1, Ordering::Relaxed);
         static SUBDRAW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*SUBDRAW.get_or_init(|| std::env::var("NDN_SCHED_NO_SUBDRAW").as_deref() != Ok("1")) {
             return false;
         }
         let Some(slot) = &self.slot else { return false };
-        let keyed = self.medium_keyed(hash);
+        // `keyed` is ALREADY medium-keyed by the gate (like `owns_now_in`); keying it again here was a
+        // double-key that computed the wrong slot and silently disabled the whole path — caught only
+        // on air (the unit test keyed consistently *within itself* and never exercised the gate's
+        // pre-keying). `observe_rx` stores the witness at `owner_slot_in(medium_keyed(h))`, so this
+        // reads the same cell iff it keys exactly once, as the caller already did.
         let k = slot.owner_slot_in(keyed, class) as usize;
         let witness = self.co_owner_hash_by_slot.get(k).map(|c| c.load(Ordering::Relaxed)).unwrap_or(0);
         if witness == 0 || witness == keyed {
             return false; // nothing heard here, or only our own group — no co-owner
         }
         let heard = self.heard_by_slot.get(k).map(|c| c.load(Ordering::Relaxed)).unwrap_or(0);
-        now.saturating_sub(heard) < PRESENCE_WINDOW_US
+        let r = now.saturating_sub(heard) < PRESENCE_WINDOW_US;
+        if r {
+            CE_TRUE.fetch_add(1, Ordering::Relaxed);
+        }
+        r
+    }
+
+    /// DEBUG (D1 on-air diagnosis): (co_owner_evident calls, times it returned true), and the per-slot
+    /// (witness hash, last-heard µs). Lets `slot_ab_onair` show WHERE the sub-draw chain breaks.
+    pub fn co_owner_debug(&self) -> (u64, u64, Vec<(u64, u64)>) {
+        let n = self.slot.as_ref().map(|s| s.slots() as usize).unwrap_or(0);
+        let per = (0..n)
+            .map(|k| {
+                (
+                    self.co_owner_hash_by_slot.get(k).map(|c| c.load(Ordering::Relaxed)).unwrap_or(0),
+                    self.heard_by_slot.get(k).map(|c| c.load(Ordering::Relaxed)).unwrap_or(0),
+                )
+            })
+            .collect();
+        (CE_CALLS.load(Ordering::Relaxed), CE_TRUE.load(Ordering::Relaxed), per)
+    }
+
+    /// DEBUG: the medium-keyed owner slot of a name hash at the CURRENT channel — so a test can see
+    /// the RUNTIME slot map (which may differ from a printout that assumed a different channel).
+    pub fn debug_owner_slot(&self, name_hash: u64, class: LeaseClass) -> Option<u64> {
+        self.slot.as_ref().map(|s| s.owner_slot_in(self.medium_keyed(name_hash), class))
     }
 
     /// How many times the D1 co-owner sub-draw fired — the on-air signal that `hash % N` co-ownership
@@ -2504,20 +2546,23 @@ mod tests {
         let keyed = s.medium_keyed(h);
         let k = slot.owner_slot_in(keyed, LeaseClass::Bulk) as usize;
 
-        assert!(!s.co_owner_evident(h, LeaseClass::Bulk, now), "no witness ⇒ sole owner (deaf path)");
+        // co_owner_evident takes the ALREADY medium-keyed hash (as the gate passes it) — pass `keyed`,
+        // not `h`. Passing raw `h` here was the exact self-consistency that let the double-key bug
+        // slip past the unit test; the on-air run is what caught it.
+        assert!(!s.co_owner_evident(keyed, LeaseClass::Bulk, now), "no witness ⇒ sole owner (deaf path)");
 
         // Our OWN group heard in the slot is not a co-owner.
         s.co_owner_hash_by_slot[k].store(keyed, Ordering::Relaxed);
         s.heard_by_slot[k].store(now, Ordering::Relaxed);
-        assert!(!s.co_owner_evident(h, LeaseClass::Bulk, now), "our own group is not a co-owner");
+        assert!(!s.co_owner_evident(keyed, LeaseClass::Bulk, now), "our own group is not a co-owner");
 
         // A DIFFERENT group's hash in our slot ⇒ co-ownership locally evident.
         s.co_owner_hash_by_slot[k].store(keyed ^ 0xABCD, Ordering::Relaxed);
-        assert!(s.co_owner_evident(h, LeaseClass::Bulk, now), "a foreign hash in our slot is a co-owner");
+        assert!(s.co_owner_evident(keyed, LeaseClass::Bulk, now), "a foreign hash in our slot is a co-owner");
 
         // …but only while recent: after a presence window the witness is stale (the co-owner left).
         assert!(
-            !s.co_owner_evident(h, LeaseClass::Bulk, now + PRESENCE_WINDOW_US + 1),
+            !s.co_owner_evident(keyed, LeaseClass::Bulk, now + PRESENCE_WINDOW_US + 1),
             "a stale co-owner witness is not evident"
         );
     }
