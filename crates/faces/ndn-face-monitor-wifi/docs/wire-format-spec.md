@@ -279,14 +279,22 @@ Source `sched.rs`. `TIME_BEACON_MAGIC = [0x7E, 0x54, 0x42]` (`0x7E 'T' 'B'`, `:2
 collide with an NDN first byte (Interest `0x05`, Data `0x06`, LP `0x64`).
 
 ```
-off 0 : [3] MAGIC  = 7E 54 42
-off 3 : u64 ref_us  (LITTLE-endian, the master's monotonic reference time in µs)
+off 0 : [3] MAGIC       = 7E 54 42
+off 3 : u64 ref_us       (LITTLE-endian, the master's monotonic reference time in µs)
+off 11: u64 map_digest   (LITTLE-endian, SchedParams::digest() — the shared schedule pin, D2)
 ```
-Total 11 bytes (`build_beacon`, `:489`; `parse_beacon`, `:505`). The beacon is injected **raw** — it MUST
-NOT pass through the slot gate, so the clock signal never waits on a data slot — and is suppressed on RX
-as non-NDN. It carries only `ref_us`; the receiver derives the common-view offset from it plus the
-hardware RX timestamp (`ingest_common_view`, `:531`), and a network-time stratum/reference election runs
-over `RefBelief { ref_id, stratum, offset_to_ref }` (#75).
+Total 19 bytes (`build_beacon`; `parse_beacon` returns `ref_us`, `parse_beacon_map_digest` the digest).
+The beacon is injected **raw** — it MUST NOT pass through the slot gate, so the clock signal never waits
+on a data slot — and is suppressed on RX as non-NDN. The receiver derives the common-view offset from
+`ref_us` plus the hardware RX timestamp (`ingest_common_view`), and a network-time stratum/reference
+election runs over `RefBelief { ref_id, stratum, offset_to_ref }` (#75).
+
+`map_digest` is a **partition detector** (D2): a receiver compares it to its own `SchedParams::digest()`
+(`beacon_indicates_partition`); a mismatch means the sender computes a **different** slot map, so its
+presence / busy / ownership evidence lands in different slots — the medium is partitioned. Reported, not
+corrected (there is no convergence protocol, by design — detection over agreement). A legacy 11-byte
+beacon carries no digest and is never read as a false partition. `parse_beacon` is unchanged, so old and
+new beacons both yield `ref_us`.
 
 This is the **only** periodic frame in the protocol, and it exists solely because sub-µs slotting needs a
 shared clock — it is a timing reference, not a discovery beacon (there is no dedicated discovery beacon).
@@ -317,7 +325,15 @@ and only invokes recovery when a generation completes (`absorb`, `:201`).
 These are not transmitted; both endpoints compute them from the name (`prefix_hash`, §2) and the
 common-view epoch. An implementation MUST compute them identically.
 
-- **Slot owner** (`schedule.rs:256`): `owner_slot = prefix_hash % slots`. With reserved latency lanes
+- **Slot granularity is a SHARED constant** (`SchedParams::slot_depth`, D3): the slot key is
+  `prefix_hash(first slot_depth name components)`, computed identically at every node. The per-receiver
+  name filter (§3) legitimately matches at each receiver's own depth — that stays per-node, it is the
+  filter's whole virtue — but the SLOT key MUST NOT, or two nodes compute different slots for one name
+  (a silent boundary violation, invisible on cloned-config benches). The registered-prefix table drives
+  RX filter attribution and lease class; it does **not** set the slot key. `slot_depth` is the shared
+  successor to the deleted per-node `NDN_SCHED_GROUP_DEPTH`, pinned in `SchedParams` and digested onto
+  the beacon (§7).
+- **Slot owner** (`schedule.rs:256`): `owner_slot = slot_key % slots`. With reserved latency lanes
   (`owner_slot_in`, `:134`): a `Latency` name → `(prefix_hash % reserved_slots) * reserved_stride`; a
   `Bulk` name → the nth open slot skipping reserved lanes.
 - **Medium keying** (`sched.rs:690`): before the slot lookup, the operating channel is folded in —
@@ -374,10 +390,13 @@ serve as the conformance oracle; a new implementation SHOULD reproduce them befo
 
 ## 13. Versioning
 
-Only the **reception report** carries an explicit version byte (`0xCD 0x02`), with a defined v1→v2
-upgrade (the `max_rx_mcs` byte, §6). The frame layout, Bloom parameters, nonce derivation, link-FEC
-header, and time beacon are **unversioned** and are pinned by the golden vectors (§12); a change to any of
-them is a flag-day and MUST bump the golden vectors in lockstep across all implementations. A future
+Two surfaces carry an explicit version. The **reception report** has a version byte (`0xCD 0x02`), with a
+defined v1→v2 upgrade (the `max_rx_mcs` byte, §6). The **schedule pin** (`SchedParams`, §7/§9) has
+`SCHED_PARAMS_VERSION`, folded into the beacon's `map_digest`, so a version bump changes the digest and a
+node running a different version sees a partition rather than silently diverging — the pin is a *detected*
+flag-day, not a silent one. The frame layout, Bloom parameters, nonce derivation, and link-FEC header
+remain **unversioned** and are pinned by the golden vectors (§12); a change to any of them is a flag-day and
+MUST bump the golden vectors in lockstep across all implementations. A future
 in-band frame version would most naturally ride a reserved EtherType or an LP header TLV, neither of which
 is allocated today.
 
