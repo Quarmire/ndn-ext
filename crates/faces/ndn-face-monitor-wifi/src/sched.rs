@@ -1266,6 +1266,13 @@ impl FaceScheduler {
     /// co-owner exists (the common case). Keyed identically to the RX witness (`medium_keyed`), so a
     /// static/hopping channel term never causes a false match.
     fn co_owner_evident(&self, hash: u64, class: LeaseClass, now: u64) -> bool {
+        // Debug-bisect toggle (#81 operational-vs-bisect split): `NDN_SCHED_NO_SUBDRAW=1` forces the
+        // deaf fast path, so an on-air A/B can measure the sub-draw against the exact same binary
+        // (`slot_ab_onair`). Read once, cached — never on the hot path per frame.
+        static SUBDRAW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*SUBDRAW.get_or_init(|| std::env::var("NDN_SCHED_NO_SUBDRAW").as_deref() != Ok("1")) {
+            return false;
+        }
         let Some(slot) = &self.slot else { return false };
         let keyed = self.medium_keyed(hash);
         let k = slot.owner_slot_in(keyed, class) as usize;

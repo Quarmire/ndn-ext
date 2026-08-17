@@ -123,9 +123,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (ms, ps) = (s.owner_slot(keyed(&mine)), s.owner_slot(keyed(&peer)));
         println!("SCHED ON  {slots} x {slot_us}us   /{mine} owns slot {ms}   /{peer} owns slot {ps}");
         if ms == ps {
+            // For the ORIGINAL slot A/B a same-slot pair is useless (the schedule can't separate
+            // them). For the **D1 co-owner sub-draw** it is exactly the case under test:
+            // `owner_slot = hash % N` collided, both names co-own slot {ms}, and without the sub-draw
+            // both transmit deaf and collide. Set NDN_SCHED_D1=1 to read this as the intended mode.
+            let d1 = std::env::var("NDN_SCHED_D1").as_deref() == Ok("1");
             println!(
-                "!! BOTH NAMES OWN THE SAME SLOT — the scheduler cannot separate them, so this pair \
-                 of arms proves nothing. Pick different names and re-run."
+                "{} BOTH NAMES OWN SLOT {ms} (hash % {slots} collision){}",
+                if d1 { "== D1 co-ownership mode:" } else { "!!" },
+                if d1 {
+                    " — the co-owner sub-draw should let them take turns (watch co_owner_subdraws)"
+                } else {
+                    " — useless for the plain slot A/B; pick different names, or set NDN_SCHED_D1=1"
+                }
             );
         }
     } else {
@@ -198,6 +208,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // contention is happening and losing, which is a different bug in a different place.
         let (attempts, wins) = s.claim_counts();
         println!("claim attempts/wins: {attempts} / {wins}");
+        // D1: the co-owner sub-draw firing on air. > 0 means this node HEARD a different group's hash
+        // in its own slot (a real hash % N co-owner) and bought within-slot turn-taking instead of a
+        // deaf collision. 0 with NDN_SCHED_NO_SUBDRAW=1 (the baseline) or with no co-owner in range.
+        println!("co_owner_subdraws  : {}   <-- D1: turns bought on a shared slot", s.co_owner_subdraws());
     }
     println!(
         "\nCompare heard_peer between the OFF and ON arms at BOTH nodes. Slotting should raise it: \
