@@ -84,8 +84,13 @@ below passed:
   multiplies down.
 - The 32 body bytes are airtime the **sender** pays per flagged frame, so the width is a **name-driven
   precision knob**: a shallow endpoint name rides the free floor; a deep name into a dense relay buys the
-  256-bit tier. On a bit-starved bearer (LoRa) the body filter MAY use **GCS** (~35% fewer bits, sequential
-  decode) instead of Bloom — the TLV tag selects the structure per medium.
+  256-bit tier. On a bit-starved bearer (LoRa) the body filter uses **GCS** (Golomb-Coded Set) instead of
+  Bloom — the TLV tag selects the structure per medium. **The GCS codec is built** (`gcs.rs`,
+  dependency-free/no_std, same keyed-SipHash keyspace, zero-FN): a prefix-set encodes to `[n][Rice-coded
+  sorted gaps]` at `ε ≈ 2⁻⁸`, and **measured** against the fixed 16-byte address Blur for the same name it
+  is **7 B (depth 4) / 10 B (depth 6) / 12 B (depth 8)** — 25–56% smaller, i.e. direct airtime saved on a
+  LoRa frame. Membership agrees byte-for-byte with the Blur, so the structure is chosen per bearer with no
+  re-registration.
 
 ## 3. The Blurred Name — address Blur (prefix-set Bloom filter)
 
