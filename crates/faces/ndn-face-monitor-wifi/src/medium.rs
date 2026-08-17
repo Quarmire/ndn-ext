@@ -165,12 +165,18 @@ pub struct RadioBearer {
     /// disagreement visible instead of letting a hand-written `RadioCapability` quietly outrank the
     /// hardware (#98 is that failure in miniature: `agile` is asserted and never measured).
     pub profile: Option<Arc<dyn RadioProfile>>,
+    /// The channel this bearer was brought up on (its operating channel), when known. Feeds the
+    /// scheduler's medium key so two **static** radios on different channels get distinct schedules —
+    /// the #89 "one medium, one schedule" property extended to the non-hopping case (§9.3). Before
+    /// this, the slot key's channel term was written only by an FHSS retune, so a static radio always
+    /// keyed on the `u8::MAX` sentinel and two of them shared one schedule. `None` when unconfigured.
+    pub channel: Option<u8>,
 }
 
 impl RadioBearer {
     /// A bearer over **any** [`FrameIo`] radio (LoRa, BLE, …).
     pub fn new(id: RadioId, radio: Arc<dyn FrameIo>, cap: RadioCapability) -> Self {
-        Self { id, radio, cap, knobs: None, time: None, profile: None }
+        Self { id, radio, cap, knobs: None, time: None, profile: None, channel: None }
     }
 
     /// **A bearer from the standardized opener** (#78) — the capability-complete path.
@@ -180,7 +186,7 @@ impl RadioBearer {
     /// standardized opener and name a concrete backend, which is precisely the leak the opener was
     /// created to close — it had fixed the on-air FORMAT leak and left the CAPABILITY leak open.
     pub fn from_open(id: RadioId, r: OpenRadio, cap: RadioCapability) -> Self {
-        Self { id, radio: r.io, cap, knobs: r.knobs, time: r.time, profile: r.profile }
+        Self { id, radio: r.io, cap, knobs: r.knobs, time: r.time, profile: r.profile, channel: None }
     }
 
     /// **The capability that governs** — the radio's own when it declares one, else the caller's
@@ -214,7 +220,7 @@ impl RadioBearer {
     /// handle to the bearer-agnostic data-plane view. Kept as a convenience for
     /// callers holding an `Arc<dyn FrameIo>` from a driver.
     pub fn wifi(id: RadioId, radio: Arc<dyn FrameIo>, cap: RadioCapability) -> Self {
-        Self { id, radio, cap, knobs: None, time: None, profile: None }
+        Self { id, radio, cap, knobs: None, time: None, profile: None, channel: None }
     }
 
     /// Attach the radio's control seam, and let it describe itself: a seam that
@@ -222,6 +228,13 @@ impl RadioBearer {
     /// tells cognition to decide power in dB rather than chip index units.
     pub fn with_knobs(mut self, knobs: Arc<dyn RadioKnobs>) -> Self {
         self.knobs = Some(knobs);
+        self
+    }
+
+    /// Record the channel this bearer was brought up on (§9.3). The scheduler seeds its medium key
+    /// with it, so two static radios on different channels get distinct schedules.
+    pub fn with_channel(mut self, channel: Option<u8>) -> Self {
+        self.channel = channel;
         self
     }
 
@@ -1186,6 +1199,10 @@ impl RunningMedium {
                         Some(r) => s.with_rate(r.clone()),
                         None => s,
                     };
+                    // §9.3: seed the slot key with this bearer's operating channel, so a static radio
+                    // no longer keys on the FHSS sentinel and two of them on different channels get
+                    // distinct schedules.
+                    let s = s.with_operating_channel(b.channel);
                     // P1: slot key = longest registered prefix; RX attribution by mask AND.
                     match &group_table {
                         Some(t) => s.with_groups(t.clone()),

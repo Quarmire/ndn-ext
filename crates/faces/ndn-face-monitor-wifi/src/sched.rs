@@ -691,6 +691,19 @@ impl FaceScheduler {
         hash ^ u64::from(self.current_ch.load(Ordering::Relaxed)).wrapping_mul(0x9E37_79B9)
     }
 
+    /// **Seed the operating channel** (§9.3). `current_ch` was written only by an FHSS `retune`, so a
+    /// static (non-hopping) radio always keyed its slot map on the `u8::MAX` sentinel — and two static
+    /// radios on different channels computed the *same* schedule, losing the per-medium concurrency
+    /// #89 built the medium-keying for. Seeding it with the bearer's operating channel extends that
+    /// property to static multi-radio; it also spares FHSS a redundant first retune when the hop lands
+    /// on the channel we already sit on. `None` keeps the sentinel (behaviour-preserving).
+    pub fn with_operating_channel(self, channel: Option<u8>) -> Self {
+        if let Some(ch) = channel {
+            self.current_ch.store(ch, Ordering::Relaxed);
+        }
+        self
+    }
+
     /// A deterministic within-slot CCLF jitter (µs) for this name — the demand-adaptive election among
     /// names contending for an idle slot (named-token-scheduling.md §CCLF). The smallest-jitter claimant
     /// transmits first and the rest overhear-and-cancel. Keyed on the name so it is stable and
@@ -2015,6 +2028,36 @@ mod tests {
         let mut s = mk_claim_sched();
         s.slot = parse_slot(spec, 1500, ClockSource::Wall);
         s
+    }
+
+    /// **§9.3: a static radio's operating channel seeds the slot key.** Two non-hopping radios on
+    /// different channels must get distinct schedules — the #89 "different media serve different names
+    /// concurrently" property, which used to require an FHSS retune to reach the key.
+    #[test]
+    fn static_operating_channel_seeds_the_slot_key() {
+        let name = 0x9E37_79B9_7F4A_7C15u64; // any name hash; medium_keyed just folds the channel in
+
+        let a = mk_claim_sched_slots("8:3000").with_operating_channel(Some(149));
+        let b = mk_claim_sched_slots("8:3000").with_operating_channel(Some(36));
+        assert_ne!(
+            a.medium_keyed(name),
+            b.medium_keyed(name),
+            "two static radios on different channels must key the schedule differently"
+        );
+
+        // Same channel ⇒ same medium ⇒ same schedule.
+        let c = mk_claim_sched_slots("8:3000").with_operating_channel(Some(149));
+        assert_eq!(a.medium_keyed(name), c.medium_keyed(name), "one channel, one schedule");
+
+        // `None` keeps the sentinel — behaviour-preserving with the pre-fix default (a static radio
+        // that names no channel keys exactly as it did before).
+        let unseeded = mk_claim_sched_slots("8:3000");
+        let none = mk_claim_sched_slots("8:3000").with_operating_channel(None);
+        assert_eq!(
+            unseeded.medium_keyed(name),
+            none.medium_keyed(name),
+            "with_operating_channel(None) must not change the key"
+        );
     }
 
     /// **One filter, one map** (P1): the slot key a TX node derives from the wire name and the slot

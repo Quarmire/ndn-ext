@@ -244,7 +244,7 @@ fn build_loopback(rid: RadioId, spec: &RadioSpec) -> RadioBearer {
     let bus = LoopbackMonitorBus::new();
     let radio: Arc<dyn FrameIo> = Arc::new(bus.endpoint(1, -55));
     let cap = RadioCapability::wifi_monitor_5ghz(spec.channel.into_iter().collect());
-    RadioBearer::wifi(rid, radio, cap)
+    RadioBearer::wifi(rid, radio, cap).with_channel(spec.channel)
 }
 
 #[cfg(feature = "libusb-backend")]
@@ -260,11 +260,10 @@ fn build_rtl8822e(rid: RadioId, spec: &RadioSpec) -> Result<Option<RadioBearer>,
         let _ = backend.set_tx_power(p as u32);
     }
     let radio: Arc<dyn FrameIo> = backend;
-    Ok(Some(RadioBearer::wifi(
-        rid,
-        radio,
-        RadioCapability::wifi_monitor_5ghz(vec![ch]),
-    )))
+    Ok(Some(
+        RadioBearer::wifi(rid, radio, RadioCapability::wifi_monitor_5ghz(vec![ch]))
+            .with_channel(Some(ch)),
+    ))
 }
 
 #[cfg(not(feature = "libusb-backend"))]
@@ -303,7 +302,9 @@ fn build_afpacket(rid: RadioId, spec: &RadioSpec) -> Result<Option<RadioBearer>,
     // Nothing found leaves the bearer exactly as it was: rate-only.
     let knobs = crate::dbm_power::Mac80211Knobs::discover(iface);
     let range = knobs.tx_power_range();
-    let mut bearer = RadioBearer::wifi(rid, radio, cap).with_knobs(Arc::new(knobs));
+    let mut bearer = RadioBearer::wifi(rid, radio, cap)
+        .with_knobs(Arc::new(knobs))
+        .with_channel(spec.channel);
     if let Some(r) = range {
         bearer = bearer.with_tx_power_dbm(r);
     }
