@@ -212,17 +212,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // in its own slot (a real hash % N co-owner) and bought within-slot turn-taking instead of a
         // deaf collision. 0 with NDN_SCHED_NO_SUBDRAW=1 (the baseline) or with no co-owner in range.
         println!("co_owner_subdraws  : {}   <-- D1: turns bought on a shared slot", s.co_owner_subdraws());
-        // D1 diagnosis: is the owner path reaching the check, is detection firing, and what does the
-        // per-slot witness actually hold at RUNTIME (which channel-keys, unlike the header's printout)?
-        let (ce_calls, ce_true, per) = s.co_owner_debug();
-        let ms = s.debug_owner_slot(prefix_hash(&[mine.as_bytes()]), ndn_radio_cognition::LeaseClass::Bulk);
-        let ps = s.debug_owner_slot(prefix_hash(&[peer.as_bytes()]), ndn_radio_cognition::LeaseClass::Bulk);
-        println!("  DBG runtime slots: /{mine}->{ms:?}  /{peer}->{ps:?}   (co_owner_evident calls {ce_calls}, true {ce_true})");
-        for (k, (w, h)) in per.iter().enumerate() {
-            if *w != 0 || *h != 0 {
-                println!("  DBG slot {k}: witness {w:#018x}  last_heard {h}");
-            }
-        }
     }
     println!(
         "\nCompare heard_peer between the OFF and ON arms at BOTH nodes. Slotting should raise it: \

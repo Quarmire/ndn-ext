@@ -380,10 +380,6 @@ pub const TIME_BEACON_MAGIC: [u8; 3] = [0x7E, b'T', b'B'];
 /// human-noticeable beat.
 const PRESENCE_WINDOW_US: u64 = 5_000_000;
 
-/// DEBUG counters for D1 on-air diagnosis (`co_owner_debug`): calls to `co_owner_evident` and how
-/// many returned true. Module statics so they need no struct field / init-site churn.
-static CE_CALLS: AtomicU64 = AtomicU64::new(0);
-static CE_TRUE: AtomicU64 = AtomicU64::new(0);
 
 /// How many frame-airtimes wide the CCLF draw is. The draw only has to order contenders far enough
 /// apart that the loser hears the winner and cancels; 8 gives a handful of separable positions
@@ -1281,7 +1277,6 @@ impl FaceScheduler {
         // Debug-bisect toggle (#81 operational-vs-bisect split): `NDN_SCHED_NO_SUBDRAW=1` forces the
         // deaf fast path, so an on-air A/B can measure the sub-draw against the exact same binary
         // (`slot_ab_onair`). Read once, cached — never on the hot path per frame.
-        CE_CALLS.fetch_add(1, Ordering::Relaxed);
         static SUBDRAW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*SUBDRAW.get_or_init(|| std::env::var("NDN_SCHED_NO_SUBDRAW").as_deref() != Ok("1")) {
             return false;
@@ -1298,33 +1293,9 @@ impl FaceScheduler {
             return false; // nothing heard here, or only our own group — no co-owner
         }
         let heard = self.heard_by_slot.get(k).map(|c| c.load(Ordering::Relaxed)).unwrap_or(0);
-        let r = now.saturating_sub(heard) < PRESENCE_WINDOW_US;
-        if r {
-            CE_TRUE.fetch_add(1, Ordering::Relaxed);
-        }
-        r
+        now.saturating_sub(heard) < PRESENCE_WINDOW_US
     }
 
-    /// DEBUG (D1 on-air diagnosis): (co_owner_evident calls, times it returned true), and the per-slot
-    /// (witness hash, last-heard µs). Lets `slot_ab_onair` show WHERE the sub-draw chain breaks.
-    pub fn co_owner_debug(&self) -> (u64, u64, Vec<(u64, u64)>) {
-        let n = self.slot.as_ref().map(|s| s.slots() as usize).unwrap_or(0);
-        let per = (0..n)
-            .map(|k| {
-                (
-                    self.co_owner_hash_by_slot.get(k).map(|c| c.load(Ordering::Relaxed)).unwrap_or(0),
-                    self.heard_by_slot.get(k).map(|c| c.load(Ordering::Relaxed)).unwrap_or(0),
-                )
-            })
-            .collect();
-        (CE_CALLS.load(Ordering::Relaxed), CE_TRUE.load(Ordering::Relaxed), per)
-    }
-
-    /// DEBUG: the medium-keyed owner slot of a name hash at the CURRENT channel — so a test can see
-    /// the RUNTIME slot map (which may differ from a printout that assumed a different channel).
-    pub fn debug_owner_slot(&self, name_hash: u64, class: LeaseClass) -> Option<u64> {
-        self.slot.as_ref().map(|s| s.owner_slot_in(self.medium_keyed(name_hash), class))
-    }
 
     /// How many times the D1 co-owner sub-draw fired — the on-air signal that `hash % N` co-ownership
     /// was locally detected and turn-taking was bought instead of a deaf collision. `0` in the common
@@ -2566,6 +2537,34 @@ mod tests {
             "a stale co-owner witness is not evident"
         );
     }
+
+    /// **Regression (D1, caught ON AIR): the co-owner witness is recorded even when claiming is OFF.**
+    /// `observe_rx` used to early-return on `!self.claimable`, which silently disabled D1's witness in
+    /// any deployment that did not enable claiming — but an owner that never claims still must detect a
+    /// co-owner of its slot. This pins the busy-marking (and the witness) to "a slot schedule exists",
+    /// not "claimable", and would have failed before f04449d/a0a8bb4.
+    #[test]
+    fn co_owner_witness_recorded_when_claiming_is_off() {
+        use super::{LeaseClass, Ordering};
+        let mut s = mk_claim_sched_slots("2:3000");
+        s.claimable = false; // owner-only node: slots on, claiming off — the on-air D1 config
+        let wire = data_wire(&[b"c"]); // a foreign group /c, broadcast-addressed
+        let hash = s.name_group_hash(&wire).expect("the fixture must be attributable");
+        let keyed = s.medium_keyed(hash);
+        let k = s.slot.as_ref().unwrap().owner_slot_in(keyed, LeaseClass::Bulk) as usize;
+
+        s.observe_rx(Some(&ndn_radio_hal::BROADCAST), None, None, &wire);
+
+        assert_eq!(
+            s.co_owner_hash_by_slot[k].load(Ordering::Relaxed), keyed,
+            "observe must record the co-owner witness with !claimable (the gate bug the on-air run found)"
+        );
+        assert!(
+            s.heard_by_slot[k].load(Ordering::Relaxed) > 0,
+            "the witness needs a recency stamp too, or co_owner_evident cannot use it"
+        );
+    }
+
 
     /// A Data frame carrying `comps` as its name — what a neighbour of that group puts on air.
     fn data_wire(comps: &[&[u8]]) -> Vec<u8> {
