@@ -981,8 +981,8 @@ impl TxBearer {
         // for an ineligible class (real-time/best-effort) a late-recovered frame is dead
         // weight — all bypass and inject directly. The peer's decoder passes an uncoded
         // frame straight through, so mixing coded/uncoded frames is safe.
-        if !robust {
-            if let Some((bridge, r)) = &self.fec {
+        if !robust
+            && let Some((bridge, r)) = &self.fec {
                 // The plan is the authority when one is bound; the shared `AtomicU16` is the
                 // channel cognition's `MediumActuator` writes when it is not. Reading only the
                 // atomic meant a `RadioPlan` could decide `link_fec_redundancy` and have nothing
@@ -1025,7 +1025,6 @@ impl TxBearer {
                     );
                 }
             }
-        }
 
         let frame = InjectFrame {
             payload: wire,
@@ -1156,7 +1155,7 @@ impl RunningMedium {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos() as u64)
                 .unwrap_or(0);
-            nanos ^ ((std::process::id() as u64) << 32) ^ (id.0 as u64).wrapping_mul(0x9E37_79B9)
+            nanos ^ ((std::process::id() as u64) << 32) ^ id.0.wrapping_mul(0x9E37_79B9)
         };
         let source = Arc::new(EphemeralSource::new(boot_seed, NONCE_ROTATION_MS));
         // The 8-bit ephemeral ID + PFS/DAR deconfliction (wire-format-spec §4), shared per node like

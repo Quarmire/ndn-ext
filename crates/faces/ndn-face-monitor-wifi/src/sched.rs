@@ -1331,7 +1331,7 @@ impl FaceScheduler {
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_micros() as u64)
                 .unwrap_or(0)
-                .saturating_add_signed(self.clock_skew_us as i64),
+                .saturating_add_signed(self.clock_skew_us),
             ClockSource::Hardware => {
                 let host_now = self.base.elapsed().as_micros() as u64;
                 self.hw.lock().map(|hw| hw.now(host_now)).unwrap_or(host_now)
@@ -1559,7 +1559,7 @@ impl FaceScheduler {
         if comps.is_empty() {
             return None;
         }
-        let refs: Vec<&[u8]> = comps.iter().map(|c| *c).collect();
+        let refs: Vec<&[u8]> = comps.iter().copied().collect();
         Some((prefix_hash(&refs), LeaseClass::Bulk))
     }
 

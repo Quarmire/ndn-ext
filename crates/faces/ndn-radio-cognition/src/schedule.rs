@@ -112,7 +112,7 @@ impl SlotSchedule {
     /// was never told about. That property is the whole reason the lease needs no signalling, and it
     /// is the same property that makes the computed token work.
     pub fn is_reserved(&self, slot_idx: u64) -> bool {
-        self.reserved_stride >= 2 && slot_idx % self.reserved_stride == 0
+        self.reserved_stride >= 2 && slot_idx.is_multiple_of(self.reserved_stride)
     }
 
     /// How many slots per superframe are reserved lanes.
