@@ -68,17 +68,8 @@ fn lab_sched(slot: SlotSchedule, groups: Option<Arc<GroupTable>>) -> FaceSchedul
         net: Mutex::new(NetworkTime::new(u64::MAX)),
         claimable: true,
         last_domain_rx: AtomicU64::new(0),
-        ambient_rx: AtomicU64::new(0),
-        claim_attempts: AtomicU64::new(0),
-        co_owner_subdraws: AtomicU64::new(0),
-        claim_wins: AtomicU64::new(0),
-        elections: AtomicU64::new(0),
-        elections_won: AtomicU64::new(0),
-        hold_continuations: AtomicU64::new(0),
-        heard_by_slot: (0..slot.slots()).map(|_| AtomicU64::new(0)).collect(),
-        co_owner_hash_by_slot: (0..slot.slots()).map(|_| AtomicU64::new(0)).collect(),
-        nonce_by_slot: (0..slot.slots()).map(|_| AtomicU64::new(0)).collect(),
-        deferred_by_slot: (0..slot.slots()).map(|_| AtomicU32::new(0)).collect(),
+        stats: super::SchedStats::default(),
+        slots: super::SlotState::new(slot.slots() as usize),
         hold_slot_start: AtomicU64::new(u64::MAX),
         lease_until: AtomicU64::new(0),
         claim_unknown: false,
@@ -173,7 +164,7 @@ async fn prop_p2_lanes_inviolate_under_claim_pressure() {
 
     // Give the claim everything it could want: evidence for every slot, total silence.
     let now = s.now_us();
-    for c in s.heard_by_slot.iter() {
+    for c in s.slots.heard.iter() {
         c.store(now, Ordering::Relaxed);
     }
 
@@ -201,7 +192,7 @@ async fn prop_p2_lanes_inviolate_under_claim_pressure() {
             !slot.is_reserved(k) && k != own && slot.wait_us_in(h, LeaseClass::Bulk, now) > slot.slot_us()
         })
         .await;
-        for c in s.heard_by_slot.iter() {
+        for c in s.slots.heard.iter() {
             c.store(s.now_us().saturating_sub(1), Ordering::Relaxed); // fresh evidence, pre-claim
         }
         s.last_domain_rx.store(0, Ordering::Relaxed);
@@ -282,7 +273,7 @@ async fn prop_p4_p5_audible_owner_and_foreign_blindness() {
     // P4: the owner of the current slot speaks (any domain frame since slot start) — no claim.
     let own = slot.owner_slot(h);
     wait_for_slot(&s, |k, now| k != own && slot.wait_us(h, now) > slot.slot_us()).await;
-    for c in s.heard_by_slot.iter() {
+    for c in s.slots.heard.iter() {
         c.store(s.now_us(), Ordering::Relaxed);
     }
     s.observe_rx(Some(&ndn_radio_hal::BROADCAST), None, None, &owner_wire); // the owner, audibly, NOW
@@ -295,7 +286,7 @@ async fn prop_p4_p5_audible_owner_and_foreign_blindness() {
     // ambient at ANY rate: they neither mark the domain busy nor forge presence.
     let s2 = lab_sched(slot, None);
     let before_presence: Vec<u64> =
-        s2.heard_by_slot.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+        s2.slots.heard.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     let mut near_cap = [0u8; 12];
     near_cap[0] = 0b0000_0011; // passes the origin bits…
     for i in 1..8 {
@@ -310,7 +301,7 @@ async fn prop_p4_p5_audible_owner_and_foreign_blindness() {
     }
     assert_eq!(s2.last_domain_rx.load(Ordering::Relaxed), 0, "foreign frames marked the domain busy");
     assert_eq!(
-        s2.heard_by_slot.iter().map(|c| c.load(Ordering::Relaxed)).collect::<Vec<_>>(),
+        s2.slots.heard.iter().map(|c| c.load(Ordering::Relaxed)).collect::<Vec<_>>(),
         before_presence,
         "foreign frames forged presence"
     );
@@ -465,7 +456,7 @@ async fn prop_p11_skew_times_long_frames_defeats_lanes_and_cv_restores_them() {
                     // so its frames border the lanes every superframe. Without this, lab-A owns one
                     // slot and rarely touches a lane edge (measured 3/60 vs the campaign's ~15%).
                     let now = a.now_us();
-                    for c in a.heard_by_slot.iter() {
+                    for c in a.slots.heard.iter() {
                         c.store(now, Ordering::Relaxed);
                     }
                     a.last_domain_rx.store(0, Ordering::Relaxed);
@@ -560,7 +551,7 @@ async fn prop_p10_a_lease_burst_pays_one_election() {
             k != own && slot.wait_us_in(h, LeaseClass::Bulk, now) > slot.slot_us()
         })
         .await;
-        for c in s.heard_by_slot.iter() {
+        for c in s.slots.heard.iter() {
             c.store(s.now_us().saturating_sub(1), Ordering::Relaxed);
         }
         s.last_domain_rx.store(0, Ordering::Relaxed);

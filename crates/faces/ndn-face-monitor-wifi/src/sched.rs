@@ -399,6 +399,39 @@ pub struct TimeStatus {
 }
 
 /// The face's transmit scheduler: the temporal (slot) and frequency (hop) grants, actuated.
+/// Per-slot RX evidence, one cell per superframe slot — grouped so a new per-slot signal touches this
+/// one type, not every constructor (the tax that recurred while wiring D1).
+struct SlotState {
+    heard: Vec<AtomicU64>,
+    co_owner_hash: Vec<AtomicU64>,
+    nonce: Vec<AtomicU64>,
+    deferred: Vec<AtomicU32>,
+}
+
+impl SlotState {
+    fn new(count: usize) -> Self {
+        let n = count.max(1);
+        Self {
+            heard: (0..n).map(|_| AtomicU64::new(0)).collect(),
+            co_owner_hash: (0..n).map(|_| AtomicU64::new(0)).collect(),
+            nonce: (0..n).map(|_| AtomicU64::new(0)).collect(),
+            deferred: (0..n).map(|_| AtomicU32::new(0)).collect(),
+        }
+    }
+}
+
+/// Scheduler counters (observability) — all zero at construction, so `Default` gives every site one line.
+#[derive(Default)]
+struct SchedStats {
+    ambient_rx: AtomicU64,
+    claim_attempts: AtomicU64,
+    claim_wins: AtomicU64,
+    co_owner_subdraws: AtomicU64,
+    elections: AtomicU64,
+    elections_won: AtomicU64,
+    hold_continuations: AtomicU64,
+}
+
 pub struct FaceScheduler {
     slot: Option<SlotSchedule>,
     hop: Option<HopSchedule>,
@@ -457,53 +490,15 @@ pub struct FaceScheduler {
     /// MAC neither schedules nor can avoid. Only frames that parse as this domain's named traffic
     /// (i.e. [`name_group_hash`](Self::name_group_hash) succeeds) mark a slot taken.
     last_domain_rx: AtomicU64,
-    /// Frames seen that were NOT of this domain — pure diagnostic, so an on-air run can tell "the slot
-    /// was busy" from "the channel is busy", which is the distinction the old `last_rx` erased.
-    ambient_rx: AtomicU64,
-    /// Times [`try_claim`](Self::try_claim) has been run, and times it won. The claim path had no
-    /// observability at all, which is why it took a two-day on-air campaign to discover that a
-    /// waiting frame was only ever *offered* one slot to contend for. `attempts ≈ wins ≈ 0` while the
-    /// gate is plainly throttling means the contention never happens; `attempts ≫ wins` means it
-    /// happens and loses.
-    claim_attempts: AtomicU64,
-    co_owner_subdraws: AtomicU64,
-    claim_wins: AtomicU64,
-    /// **Elections actually paid** (the P5 counter split): times the fresh CCLF path was entered —
-    /// i.e. the jitter was slept. This is the cost claim B is about; `claim_attempts` counts every
-    /// `try_claim` entry including per-frame hold checks, which the P5 campaign found dominates the
-    /// count under a lease (87–91% "win rates" were holds) and cannot see elections at all.
-    elections: AtomicU64,
-    /// Elections won (the claimant survived its jitter with the slot still silent).
-    elections_won: AtomicU64,
-    /// Hold continuations: frames that rode an already-won lease without re-contending (#95/#93).
-    hold_continuations: AtomicU64,
+    /// Scheduler counters (observability), grouped into [`SchedStats`].
+    stats: SchedStats,
     /// The bearer's rate policy, so the airtime estimate behind the guard band (#84) uses the rate
     /// we will actually transmit at. `None` ⇒ assume the conservative broadcast rate, which
     /// over-estimates airtime — the safe direction, since a too-large estimate only defers us by a
     /// slot while a too-small one overruns someone else's.
     rate: Option<std::sync::Arc<crate::RatePolicy>>,
-    /// **Positive evidence that a slot's owner is in range** (#88/#94): per slot index, the
-    /// common-view µs at which we last overheard a frame whose name-group owns that slot. `0` = never.
-    ///
-    /// Bounded by the superframe length and allocation-free. This is what makes an idle slot readable:
-    /// silence alone cannot tell a silent owner from a *hidden* one, and claiming a hidden owner's slot
-    /// collides at its receiver — damage neither the claimant nor the owner can observe.
-    heard_by_slot: Vec<AtomicU64>,
-    co_owner_hash_by_slot: Vec<AtomicU64>,
-    /// **Who evidenced each slot** (P4/#94): the §2 ephemeral source nonce of the last frame that
-    /// marked the slot, packed LE into a u64 (`0` = unknown transmitter — e.g. lab fixtures or a
-    /// capture path without addresses; unknown skips the relay check, preserving pre-P4 behaviour).
-    ///
-    /// This is what turns group evidence into TRANSMITTER evidence: the lab's P6 showed that a
-    /// relayed frame legitimately creates fresh per-slot evidence while the slot's actual user
-    /// stays hidden. The transmitter identity is the only locally observable difference.
-    nonce_by_slot: Vec<AtomicU64>,
-    /// **Backlog per name-group** (#95): frames of the group owning slot *k* that we deferred since
-    /// that group last got a turn. The demand signal the CCLF election was missing — the comment on
-    /// the claim called it "the demand-adaptive form that beats fixed-TDMA" while the draw was a
-    /// function of name and time only, so a node with one trivial frame contended exactly as hard as
-    /// one with a backlog.
-    deferred_by_slot: Vec<AtomicU32>,
+    /// Per-slot RX evidence (busy time, co-owner witness, nonce, backlog), grouped into [`SlotState`].
+    slots: SlotState,
     /// **The won slot we are currently holding** (#95): `(slot_start_us, deadline_us)` packed as two
     /// cells. A claim used to buy exactly one frame — the next frame re-entered the election and paid
     /// the jitter again, so a burst could not use the idle slot it had just won. Holding is bounded
@@ -587,17 +582,8 @@ impl FaceScheduler {
             net: Mutex::new(NetworkTime::new(node_id)),
             claimable,
             last_domain_rx: AtomicU64::new(0),
-            ambient_rx: AtomicU64::new(0),
-            claim_attempts: AtomicU64::new(0),
-            co_owner_subdraws: AtomicU64::new(0),
-            claim_wins: AtomicU64::new(0),
-            elections: AtomicU64::new(0),
-            elections_won: AtomicU64::new(0),
-            hold_continuations: AtomicU64::new(0),
-            heard_by_slot: (0..slot_count).map(|_| AtomicU64::new(0)).collect(),
-            co_owner_hash_by_slot: (0..slot_count).map(|_| AtomicU64::new(0)).collect(),
-            nonce_by_slot: (0..slot_count).map(|_| AtomicU64::new(0)).collect(),
-            deferred_by_slot: (0..slot_count).map(|_| AtomicU32::new(0)).collect(),
+            stats: SchedStats::default(),
+            slots: SlotState::new((slot_count) as usize),
             hold_slot_start: AtomicU64::new(u64::MAX),
             lease_until: AtomicU64::new(0),
             claim_unknown: std::env::var("NDN_SCHED_CLAIM_UNKNOWN").is_ok(),
@@ -878,7 +864,7 @@ impl FaceScheduler {
             _ => self.name_group(wire),
         };
         let Some((hash, class)) = group_of else {
-            self.ambient_rx.fetch_add(1, Ordering::Relaxed);
+            self.stats.ambient_rx.fetch_add(1, Ordering::Relaxed);
             return;
         };
         self.last_domain_rx.store(now, Ordering::Relaxed);
@@ -888,14 +874,14 @@ impl FaceScheduler {
             // — a latency group's lane, a bulk group's open slot — or the map and the evidence
             // would disagree about whose silence a claimant is reading.
             let k = slot.owner_slot_in(keyed, class) as usize;
-            if let Some(cell) = self.heard_by_slot.get(k) {
+            if let Some(cell) = self.slots.heard.get(k) {
                 cell.store(now, Ordering::Relaxed);
             }
             // D1 co-ownership witness: which group hash just used slot k. `owner_slot = hash % N` is a
             // residue class, so a later, DIFFERENT hash owning k is a co-owner whose "collision-free
             // turn" is locally false — it must sub-draw, not transmit deaf. Recording the hash (not
             // just "busy") is what tells a co-owner apart from our own group re-heard.
-            if let Some(cell) = self.co_owner_hash_by_slot.get(k) {
+            if let Some(cell) = self.slots.co_owner_hash.get(k) {
                 cell.store(keyed, Ordering::Relaxed);
             }
             // The transmitter's §2 nonce: addr3 on a Tier-0-addressed frame (the filter displaced
@@ -906,7 +892,7 @@ impl FaceScheduler {
                 (_, _, Some(a2)) => nonce_u64(a2),
                 _ => 0,
             };
-            if let Some(cell) = self.nonce_by_slot.get(k) {
+            if let Some(cell) = self.slots.nonce.get(k) {
                 cell.store(nonce, Ordering::Relaxed);
             }
         }
@@ -1083,7 +1069,7 @@ impl FaceScheduler {
         if lane_now {
             return false; // a bulk claim never takes a reserved lane, idle or not
         }
-        self.claim_attempts.fetch_add(1, Ordering::Relaxed);
+        self.stats.claim_attempts.fetch_add(1, Ordering::Relaxed);
         let now = self.now_us();
         let slot_start = slot.slot_start_us(now);
 
@@ -1101,8 +1087,8 @@ impl FaceScheduler {
                 // A continuation is NOT an election: no jitter was paid, no contention happened.
                 // (claim_wins keeps counting it for compatibility with the +119% methodology's
                 // "attempts ≈ wins ⇒ throttled gate" diagnostic — documented at claim_counts.)
-                self.hold_continuations.fetch_add(1, Ordering::Relaxed);
-                self.claim_wins.fetch_add(1, Ordering::Relaxed);
+                self.stats.hold_continuations.fetch_add(1, Ordering::Relaxed);
+                self.stats.claim_wins.fetch_add(1, Ordering::Relaxed);
                 self.note_sent(hash);
                 return true; // still ours, still room — continue the burst.
             }
@@ -1132,7 +1118,7 @@ impl FaceScheduler {
             return false;
         }
         // CCLF: wait our jitter; if the slot is STILL idle (no one claimed first), take it.
-        self.elections.fetch_add(1, Ordering::Relaxed); // the jitter IS the election's cost
+        self.stats.elections.fetch_add(1, Ordering::Relaxed); // the jitter IS the election's cost
         tokio::time::sleep(Duration::from_micros(jitter)).await;
         if self.last_domain_rx.load(Ordering::Relaxed) >= slot_start {
             return false; // overheard a claimant first → cancel, and wait for our owned slot.
@@ -1145,8 +1131,8 @@ impl FaceScheduler {
             slot.lease_deadline_us(now, LeaseClass::Bulk, self.lease_max),
             Ordering::Relaxed,
         );
-        self.elections_won.fetch_add(1, Ordering::Relaxed);
-        self.claim_wins.fetch_add(1, Ordering::Relaxed);
+        self.stats.elections_won.fetch_add(1, Ordering::Relaxed);
+        self.stats.claim_wins.fetch_add(1, Ordering::Relaxed);
         self.note_sent(hash);
         true
     }
@@ -1157,7 +1143,7 @@ impl FaceScheduler {
     /// "the channel was busy", a distinction the old any-frame busy mark erased and which cost a
     /// whole on-air campaign to rediscover.
     pub fn ambient_frames(&self) -> u64 {
-        self.ambient_rx.load(Ordering::Relaxed)
+        self.stats.ambient_rx.load(Ordering::Relaxed)
     }
 
     /// `(claim attempts, claims won)` — the claim path's only observability, and the reading that
@@ -1169,9 +1155,9 @@ impl FaceScheduler {
     /// a lease amortizes elections. An election is counted when the jitter is actually slept.
     pub fn election_counts(&self) -> (u64, u64, u64) {
         (
-            self.elections.load(Ordering::Relaxed),
-            self.elections_won.load(Ordering::Relaxed),
-            self.hold_continuations.load(Ordering::Relaxed),
+            self.stats.elections.load(Ordering::Relaxed),
+            self.stats.elections_won.load(Ordering::Relaxed),
+            self.stats.hold_continuations.load(Ordering::Relaxed),
         )
     }
 
@@ -1179,7 +1165,7 @@ impl FaceScheduler {
     /// diagnostic "attempts ≈ frames ⇒ throttled gate" depends on that meaning); for election cost
     /// use [`election_counts`](Self::election_counts).
     pub fn claim_counts(&self) -> (u64, u64) {
-        (self.claim_attempts.load(Ordering::Relaxed), self.claim_wins.load(Ordering::Relaxed))
+        (self.stats.claim_attempts.load(Ordering::Relaxed), self.stats.claim_wins.load(Ordering::Relaxed))
     }
 
     /// **Do we have live evidence that slot `k`'s owner is within earshot?** (#94), extracted so the
@@ -1195,7 +1181,7 @@ impl FaceScheduler {
     /// So the window is a presence timeout, with the superframe only as a floor: a schedule slower
     /// than the timeout must still let at least one silent turn pass without forgetting the owner.
     fn owner_in_range(&self, slot: &SlotSchedule, k: usize, now: u64) -> bool {
-        let last_heard = self.heard_by_slot.get(k).map(|c| c.load(Ordering::Relaxed)).unwrap_or(0);
+        let last_heard = self.slots.heard.get(k).map(|c| c.load(Ordering::Relaxed)).unwrap_or(0);
         let window =
             PRESENCE_WINDOW_US.max(slot.slot_us().saturating_mul(slot.slots()).saturating_mul(2));
         if last_heard == 0 || now.saturating_sub(last_heard) > window {
@@ -1220,17 +1206,17 @@ impl FaceScheduler {
         // that case needs second-hand knowledge (the reception-report plane), not more local
         // inference. §2 nonce ROTATION also unlinks the two sightings once the nonce turns over,
         // reopening the window until the rotated nonce is seen twice again.
-        let nonce = self.nonce_by_slot.get(k).map(|c| c.load(Ordering::Relaxed)).unwrap_or(0);
+        let nonce = self.slots.nonce.get(k).map(|c| c.load(Ordering::Relaxed)).unwrap_or(0);
         if nonce == 0 {
             return true;
         }
         let elsewhere = self
-            .nonce_by_slot
+            .slots.nonce
             .iter()
             .enumerate()
             .filter(|(j, c)| *j != k && c.load(Ordering::Relaxed) == nonce)
             .filter(|(j, _)| {
-                let t = self.heard_by_slot.get(*j).map(|c| c.load(Ordering::Relaxed)).unwrap_or(0);
+                let t = self.slots.heard.get(*j).map(|c| c.load(Ordering::Relaxed)).unwrap_or(0);
                 t != 0 && now.saturating_sub(t) <= window
             })
             .count();
@@ -1243,13 +1229,13 @@ impl FaceScheduler {
     fn deferred_for(&self, prefix_hash: u64) -> u32 {
         let Some(slot) = &self.slot else { return 0 };
         let k = slot.owner_slot(prefix_hash) as usize;
-        self.deferred_by_slot.get(k).map(|c| c.load(Ordering::Relaxed)).unwrap_or(0)
+        self.slots.deferred.get(k).map(|c| c.load(Ordering::Relaxed)).unwrap_or(0)
     }
 
     /// Record that a frame of this group had to wait — the demand signal accumulating.
     fn note_deferred(&self, prefix_hash: u64) {
         if let Some(slot) = &self.slot
-            && let Some(c) = self.deferred_by_slot.get(slot.owner_slot(prefix_hash) as usize)
+            && let Some(c) = self.slots.deferred.get(slot.owner_slot(prefix_hash) as usize)
         {
             // Saturating: the backlog is a bias, not a counter anyone reads for magnitude.
             let _ = c.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_add(1)));
@@ -1259,7 +1245,7 @@ impl FaceScheduler {
     /// This group got its turn — the backlog is spent.
     fn note_sent(&self, prefix_hash: u64) {
         if let Some(slot) = &self.slot
-            && let Some(c) = self.deferred_by_slot.get(slot.owner_slot(prefix_hash) as usize)
+            && let Some(c) = self.slots.deferred.get(slot.owner_slot(prefix_hash) as usize)
         {
             c.store(0, Ordering::Relaxed);
         }
@@ -1288,11 +1274,11 @@ impl FaceScheduler {
         // pre-keying). `observe_rx` stores the witness at `owner_slot_in(medium_keyed(h))`, so this
         // reads the same cell iff it keys exactly once, as the caller already did.
         let k = slot.owner_slot_in(keyed, class) as usize;
-        let witness = self.co_owner_hash_by_slot.get(k).map(|c| c.load(Ordering::Relaxed)).unwrap_or(0);
+        let witness = self.slots.co_owner_hash.get(k).map(|c| c.load(Ordering::Relaxed)).unwrap_or(0);
         if witness == 0 || witness == keyed {
             return false; // nothing heard here, or only our own group — no co-owner
         }
-        let heard = self.heard_by_slot.get(k).map(|c| c.load(Ordering::Relaxed)).unwrap_or(0);
+        let heard = self.slots.heard.get(k).map(|c| c.load(Ordering::Relaxed)).unwrap_or(0);
         now.saturating_sub(heard) < PRESENCE_WINDOW_US
     }
 
@@ -1301,7 +1287,7 @@ impl FaceScheduler {
     /// was locally detected and turn-taking was bought instead of a deaf collision. `0` in the common
     /// (≤ N active groups) case.
     pub fn co_owner_subdraws(&self) -> u64 {
-        self.co_owner_subdraws.load(Ordering::Relaxed)
+        self.stats.co_owner_subdraws.load(Ordering::Relaxed)
     }
 
     // ---- Public time API: the essentials any consumer needs from the ndn-time hardware-clock plane ----
@@ -1429,7 +1415,7 @@ impl FaceScheduler {
                     // Only sub-draw if the jittered wait AND the frame still fit; otherwise take the
                     // turn rather than let the draw push the frame across the boundary (#84).
                     if slot.slot_remaining_us(now) > jitter + airtime {
-                        self.co_owner_subdraws.fetch_add(1, Ordering::Relaxed);
+                        self.stats.co_owner_subdraws.fetch_add(1, Ordering::Relaxed);
                         tokio::time::sleep(Duration::from_micros(jitter)).await;
                         if self.last_domain_rx.load(Ordering::Relaxed) < slot_start {
                             // Still idle after our draw — no co-owner beat us; take the turn.
@@ -1724,17 +1710,8 @@ mod tests {
             net: super::Mutex::new(ndn_time::NetworkTime::new(u64::MAX)),
             claimable: false,
             last_domain_rx: super::AtomicU64::new(0),
-            ambient_rx: super::AtomicU64::new(0),
-            claim_attempts: super::AtomicU64::new(0),
-            co_owner_subdraws: super::AtomicU64::new(0),
-            claim_wins: super::AtomicU64::new(0),
-            elections: super::AtomicU64::new(0),
-            elections_won: super::AtomicU64::new(0),
-            hold_continuations: super::AtomicU64::new(0),
-            heard_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
-            co_owner_hash_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
-            nonce_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
-            deferred_by_slot: (0..8).map(|_| super::AtomicU32::new(0)).collect(),
+            stats: SchedStats::default(),
+            slots: SlotState::new((8) as usize),
             hold_slot_start: super::AtomicU64::new(u64::MAX),
             lease_until: super::AtomicU64::new(0),
             claim_unknown: false,
@@ -1775,17 +1752,8 @@ mod tests {
             net: super::Mutex::new(ndn_time::NetworkTime::new(u64::MAX)),
             claimable: true,
             last_domain_rx: super::AtomicU64::new(0),
-            ambient_rx: super::AtomicU64::new(0),
-            claim_attempts: super::AtomicU64::new(0),
-            co_owner_subdraws: super::AtomicU64::new(0),
-            claim_wins: super::AtomicU64::new(0),
-            elections: super::AtomicU64::new(0),
-            elections_won: super::AtomicU64::new(0),
-            hold_continuations: super::AtomicU64::new(0),
-            heard_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
-            co_owner_hash_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
-            nonce_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
-            deferred_by_slot: (0..8).map(|_| super::AtomicU32::new(0)).collect(),
+            stats: SchedStats::default(),
+            slots: SlotState::new((8) as usize),
             hold_slot_start: super::AtomicU64::new(u64::MAX),
             lease_until: super::AtomicU64::new(0),
             claim_unknown: false,
@@ -1862,17 +1830,8 @@ mod tests {
             net: super::Mutex::new(ndn_time::NetworkTime::new(u64::MAX)),
             claimable: false,
             last_domain_rx: super::AtomicU64::new(0),
-            ambient_rx: super::AtomicU64::new(0),
-            claim_attempts: super::AtomicU64::new(0),
-            co_owner_subdraws: super::AtomicU64::new(0),
-            claim_wins: super::AtomicU64::new(0),
-            elections: super::AtomicU64::new(0),
-            elections_won: super::AtomicU64::new(0),
-            hold_continuations: super::AtomicU64::new(0),
-            heard_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
-            co_owner_hash_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
-            nonce_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
-            deferred_by_slot: (0..8).map(|_| super::AtomicU32::new(0)).collect(),
+            stats: SchedStats::default(),
+            slots: SlotState::new((8) as usize),
             hold_slot_start: super::AtomicU64::new(u64::MAX),
             lease_until: super::AtomicU64::new(0),
             claim_unknown: false,
@@ -2026,17 +1985,8 @@ mod tests {
             net: super::Mutex::new(ndn_time::NetworkTime::new(u64::MAX)),
             claimable: true,
             last_domain_rx: super::AtomicU64::new(0),
-            ambient_rx: super::AtomicU64::new(0),
-            claim_attempts: super::AtomicU64::new(0),
-            co_owner_subdraws: super::AtomicU64::new(0),
-            claim_wins: super::AtomicU64::new(0),
-            elections: super::AtomicU64::new(0),
-            elections_won: super::AtomicU64::new(0),
-            hold_continuations: super::AtomicU64::new(0),
-            heard_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
-            co_owner_hash_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
-            nonce_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
-            deferred_by_slot: (0..8).map(|_| super::AtomicU32::new(0)).collect(),
+            stats: SchedStats::default(),
+            slots: SlotState::new((8) as usize),
             hold_slot_start: super::AtomicU64::new(u64::MAX),
             lease_until: super::AtomicU64::new(0),
             claim_unknown: false,
@@ -2067,18 +2017,18 @@ mod tests {
 
         // Nothing heard yet: every slot's owner is unknown — the hidden-terminal case.
         assert!(
-            sched.heard_by_slot.iter().all(|c| c.load(super::Ordering::Relaxed) == 0),
+            sched.slots.heard.iter().all(|c| c.load(super::Ordering::Relaxed) == 0),
             "no evidence before any frame is observed"
         );
 
         // Overhearing that group is the evidence, and it lands on THAT group's slot only.
         sched.observe_rx(Some(&ndn_radio_hal::BROADCAST), None, None, &wire);
         assert!(
-            sched.heard_by_slot[owned].load(super::Ordering::Relaxed) > 0,
+            sched.slots.heard[owned].load(super::Ordering::Relaxed) > 0,
             "hearing /ndn/alarm must mark the slot /ndn/alarm owns"
         );
         let others = sched
-            .heard_by_slot
+            .slots.heard
             .iter()
             .enumerate()
             .filter(|(i, c)| *i != owned && c.load(super::Ordering::Relaxed) > 0)
@@ -2123,12 +2073,12 @@ mod tests {
             "a frame we cannot attribute to this scheduling domain must leave every slot claimable"
         );
         assert_eq!(
-            sched.ambient_rx.load(super::Ordering::Relaxed),
+            sched.stats.ambient_rx.load(super::Ordering::Relaxed),
             1,
             "but it must still be counted, or an on-air run cannot tell a busy slot from a busy channel"
         );
         assert!(
-            sched.heard_by_slot.iter().all(|c| c.load(super::Ordering::Relaxed) == 0),
+            sched.slots.heard.iter().all(|c| c.load(super::Ordering::Relaxed) == 0),
             "and it is evidence about nobody's presence"
         );
 
@@ -2154,7 +2104,7 @@ mod tests {
         let superframe = slot.slot_us() * slot.slots(); // 24 ms here, 160 ms on air
 
         // Heard once, then silence for a full second — a 1 f/s neighbour between frames.
-        sched.heard_by_slot[3].store(1_000_000, super::Ordering::Relaxed);
+        sched.slots.heard[3].store(1_000_000, super::Ordering::Relaxed);
         assert!(
             sched.owner_in_range(slot, 3, 1_000_000 + 1_000_000),
             "a neighbour that speaks once a second is audible the whole second; the old \
@@ -2523,12 +2473,12 @@ mod tests {
         assert!(!s.co_owner_evident(keyed, LeaseClass::Bulk, now), "no witness ⇒ sole owner (deaf path)");
 
         // Our OWN group heard in the slot is not a co-owner.
-        s.co_owner_hash_by_slot[k].store(keyed, Ordering::Relaxed);
-        s.heard_by_slot[k].store(now, Ordering::Relaxed);
+        s.slots.co_owner_hash[k].store(keyed, Ordering::Relaxed);
+        s.slots.heard[k].store(now, Ordering::Relaxed);
         assert!(!s.co_owner_evident(keyed, LeaseClass::Bulk, now), "our own group is not a co-owner");
 
         // A DIFFERENT group's hash in our slot ⇒ co-ownership locally evident.
-        s.co_owner_hash_by_slot[k].store(keyed ^ 0xABCD, Ordering::Relaxed);
+        s.slots.co_owner_hash[k].store(keyed ^ 0xABCD, Ordering::Relaxed);
         assert!(s.co_owner_evident(keyed, LeaseClass::Bulk, now), "a foreign hash in our slot is a co-owner");
 
         // …but only while recent: after a presence window the witness is stale (the co-owner left).
@@ -2556,11 +2506,11 @@ mod tests {
         s.observe_rx(Some(&ndn_radio_hal::BROADCAST), None, None, &wire);
 
         assert_eq!(
-            s.co_owner_hash_by_slot[k].load(Ordering::Relaxed), keyed,
+            s.slots.co_owner_hash[k].load(Ordering::Relaxed), keyed,
             "observe must record the co-owner witness with !claimable (the gate bug the on-air run found)"
         );
         assert!(
-            s.heard_by_slot[k].load(Ordering::Relaxed) > 0,
+            s.slots.heard[k].load(Ordering::Relaxed) > 0,
             "the witness needs a recency stamp too, or co_owner_evident cannot use it"
         );
     }
@@ -2600,17 +2550,8 @@ mod tests {
             net: super::Mutex::new(ndn_time::NetworkTime::new(u64::MAX)),
             claimable: true,
             last_domain_rx: super::AtomicU64::new(0),
-            ambient_rx: super::AtomicU64::new(0),
-            claim_attempts: super::AtomicU64::new(0),
-            co_owner_subdraws: super::AtomicU64::new(0),
-            claim_wins: super::AtomicU64::new(0),
-            elections: super::AtomicU64::new(0),
-            elections_won: super::AtomicU64::new(0),
-            hold_continuations: super::AtomicU64::new(0),
-            heard_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
-            co_owner_hash_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
-            nonce_by_slot: (0..8).map(|_| super::AtomicU64::new(0)).collect(),
-            deferred_by_slot: (0..8).map(|_| super::AtomicU32::new(0)).collect(),
+            stats: SchedStats::default(),
+            slots: SlotState::new((8) as usize),
             hold_slot_start: super::AtomicU64::new(u64::MAX),
             lease_until: super::AtomicU64::new(0),
             claim_unknown: false,
