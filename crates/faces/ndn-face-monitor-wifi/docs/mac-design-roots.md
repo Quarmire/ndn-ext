@@ -45,7 +45,7 @@ subject). D1 is therefore the gap between a stated guarantee and the mechanism's
 unaddressed contradiction. It is **distinct from the hidden terminal** (#94/p6), which is *can't-hear
 the owner*, not *two owners of one slot*.
 
-Fix (f04449d, validated on air a0a8bb4): detection-triggered co-owner sub-draw — turn-taking is bought
+Fix (f04449d, validated on air a0a8bb4): detection-triggered shared-slot backoff — turn-taking is bought
 only when a co-owner is locally evident. It does not change the `hash % N` map; it repairs the reach
 of the guarantee the map already promised.
 

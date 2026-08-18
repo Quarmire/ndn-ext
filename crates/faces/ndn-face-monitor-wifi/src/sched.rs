@@ -426,7 +426,7 @@ struct SchedStats {
     ambient_rx: AtomicU64,
     claim_attempts: AtomicU64,
     claim_wins: AtomicU64,
-    co_owner_subdraws: AtomicU64,
+    shared_slot_backoffs: AtomicU64,
     elections: AtomicU64,
     elections_won: AtomicU64,
     hold_continuations: AtomicU64,
@@ -835,7 +835,7 @@ impl FaceScheduler {
         // still must detect a co-owner of its slot — so gating all of observe on `claimable` (as it
         // was) silently disabled D1 whenever claiming was off. Record whenever there is a slot
         // schedule at all; with neither slots nor claiming there is nothing to mark. (Caught on air:
-        // the sub-draw never fired because the witness was never written.)
+        // the backoff never fired because the witness was never written.)
         if !self.claimable && self.slot.is_none() {
             return;
         }
@@ -879,7 +879,7 @@ impl FaceScheduler {
             }
             // D1 co-ownership witness: which group hash just used slot k. `owner_slot = hash % N` is a
             // residue class, so a later, DIFFERENT hash owning k is a co-owner whose "collision-free
-            // turn" is locally false — it must sub-draw, not transmit deaf. Recording the hash (not
+            // turn" is locally false — it must back off, not transmit deaf. Recording the hash (not
             // just "busy") is what tells a co-owner apart from our own group re-heard.
             if let Some(cell) = self.slots.co_owner_hash.get(k) {
                 cell.store(keyed, Ordering::Relaxed);
@@ -1255,16 +1255,16 @@ impl FaceScheduler {
     /// so distinct groups can share a slot; the owner transmits deaf, which is collision-free only
     /// while ≤ N groups are active. Evidence is the per-slot witness the RX path records: if a
     /// *different* group's hash used our slot within a presence window, its co-ownership is proven
-    /// locally and the owner must sub-draw. Cheap and local — the deaf fast path pays nothing when no
+    /// locally and the owner must back off. Cheap and local — the deaf fast path pays nothing when no
     /// co-owner exists (the common case). Takes the **already medium-keyed** hash (as the gate passes
     /// it to `owns_now_in`); `observe_rx` keys the witness once too, so both land on the same slot cell
     /// — key it a second time here and the whole path silently no-ops (the on-air-caught double-key).
     fn co_owner_evident(&self, keyed: u64, class: LeaseClass, now: u64) -> bool {
-        // Debug-bisect toggle (#81 operational-vs-bisect split): `NDN_SCHED_NO_SUBDRAW=1` forces the
-        // deaf fast path, so an on-air A/B can measure the sub-draw against the exact same binary
+        // Debug-bisect toggle (#81 operational-vs-bisect split): `NDN_SCHED_NO_BACKOFF=1` forces the
+        // deaf fast path, so an on-air A/B can measure the backoff against the exact same binary
         // (`slot_ab_onair`). Read once, cached — never on the hot path per frame.
-        static SUBDRAW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*SUBDRAW.get_or_init(|| std::env::var("NDN_SCHED_NO_SUBDRAW").as_deref() != Ok("1")) {
+        static BACKOFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*BACKOFF.get_or_init(|| std::env::var("NDN_SCHED_NO_BACKOFF").as_deref() != Ok("1")) {
             return false;
         }
         let Some(slot) = &self.slot else { return false };
@@ -1283,11 +1283,11 @@ impl FaceScheduler {
     }
 
 
-    /// How many times the D1 co-owner sub-draw fired — the on-air signal that `hash % N` co-ownership
+    /// How many times the D1 shared-slot backoff fired — the on-air signal that `hash % N` co-ownership
     /// was locally detected and turn-taking was bought instead of a deaf collision. `0` in the common
     /// (≤ N active groups) case.
-    pub fn co_owner_subdraws(&self) -> u64 {
-        self.stats.co_owner_subdraws.load(Ordering::Relaxed)
+    pub fn shared_slot_backoffs(&self) -> u64 {
+        self.stats.shared_slot_backoffs.load(Ordering::Relaxed)
     }
 
     // ---- Public time API: the essentials any consumer needs from the ndn-time hardware-clock plane ----
@@ -1403,7 +1403,7 @@ impl FaceScheduler {
                     // `owner_slot = hash % N`, two distinct groups can co-own this slot and both
                     // transmit deaf, colliding at their receivers where neither sees it. If a co-owner
                     // is *locally evident* (we recently heard a different group's hash in this slot),
-                    // buy a within-slot CCLF-lite sub-draw so the co-owners take turns; the
+                    // buy a within-slot CCLF-lite backoff so the co-owners take turns; the
                     // epoch-keyed jitter rotates who wins (#87). No co-owner evident ⇒ the deaf fast
                     // path, unchanged — listening is bought only when the collision is locally proven.
                     if !self.co_owner_evident(hash, class, now) {
@@ -1412,10 +1412,10 @@ impl FaceScheduler {
                     }
                     let slot_start = slot.slot_start_us(now);
                     let jitter = self.cclf_jitter_us(hash, slot.slot_us(), slot.epoch(now), airtime);
-                    // Only sub-draw if the jittered wait AND the frame still fit; otherwise take the
+                    // Only back off if the jittered wait AND the frame still fit; otherwise take the
                     // turn rather than let the draw push the frame across the boundary (#84).
                     if slot.slot_remaining_us(now) > jitter + airtime {
-                        self.stats.co_owner_subdraws.fetch_add(1, Ordering::Relaxed);
+                        self.stats.shared_slot_backoffs.fetch_add(1, Ordering::Relaxed);
                         tokio::time::sleep(Duration::from_micros(jitter)).await;
                         if self.last_domain_rx.load(Ordering::Relaxed) < slot_start {
                             // Still idle after our draw — no co-owner beat us; take the turn.
@@ -2455,7 +2455,7 @@ mod tests {
 
     /// **D1 detection.** A co-owner of our slot (a different group hashing to the same `hash % N`
     /// index) is evident from the per-slot witness the RX path records — but only when recent, and
-    /// never our own group. This is what gates the within-slot sub-draw: no witness ⇒ the deaf
+    /// never our own group. This is what gates the within-slot backoff: no witness ⇒ the deaf
     /// fast path; a foreign hash ⇒ buy turn-taking; a stale witness ⇒ the co-owner left, deaf again.
     #[test]
     fn co_owner_detection_is_local_recent_and_not_self() {

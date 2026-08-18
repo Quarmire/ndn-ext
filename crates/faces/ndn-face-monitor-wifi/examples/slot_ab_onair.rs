@@ -124,15 +124,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("SCHED ON  {slots} x {slot_us}us   /{mine} owns slot {ms}   /{peer} owns slot {ps}");
         if ms == ps {
             // For the ORIGINAL slot A/B a same-slot pair is useless (the schedule can't separate
-            // them). For the **D1 co-owner sub-draw** it is exactly the case under test:
-            // `owner_slot = hash % N` collided, both names co-own slot {ms}, and without the sub-draw
+            // them). For the **D1 shared-slot backoff** it is exactly the case under test:
+            // `owner_slot = hash % N` collided, both names co-own slot {ms}, and without the backoff
             // both transmit deaf and collide. Set NDN_SCHED_D1=1 to read this as the intended mode.
             let d1 = std::env::var("NDN_SCHED_D1").as_deref() == Ok("1");
             println!(
                 "{} BOTH NAMES OWN SLOT {ms} (hash % {slots} collision){}",
                 if d1 { "== D1 co-ownership mode:" } else { "!!" },
                 if d1 {
-                    " — the co-owner sub-draw should let them take turns (watch co_owner_subdraws)"
+                    " — the shared-slot backoff should let them take turns (watch shared_slot_backoffs)"
                 } else {
                     " — useless for the plain slot A/B; pick different names, or set NDN_SCHED_D1=1"
                 }
@@ -208,10 +208,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // contention is happening and losing, which is a different bug in a different place.
         let (attempts, wins) = s.claim_counts();
         println!("claim attempts/wins: {attempts} / {wins}");
-        // D1: the co-owner sub-draw firing on air. > 0 means this node HEARD a different group's hash
+        // D1: the shared-slot backoff firing on air. > 0 means this node HEARD a different group's hash
         // in its own slot (a real hash % N co-owner) and bought within-slot turn-taking instead of a
-        // deaf collision. 0 with NDN_SCHED_NO_SUBDRAW=1 (the baseline) or with no co-owner in range.
-        println!("co_owner_subdraws  : {}   <-- D1: turns bought on a shared slot", s.co_owner_subdraws());
+        // deaf collision. 0 with NDN_SCHED_NO_BACKOFF=1 (the baseline) or with no co-owner in range.
+        println!("shared_slot_backoffs  : {}   <-- D1: turns bought on a shared slot", s.shared_slot_backoffs());
     }
     println!(
         "\nCompare heard_peer between the OFF and ON arms at BOTH nodes. Slotting should raise it: \
