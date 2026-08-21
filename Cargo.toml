@@ -128,7 +128,7 @@ todo = "warn"
 unimplemented = "warn"
 
 [workspace.metadata.crane]
-name = "ndn-rs"
+name = "ndn-ext"
 
 [workspace.dependencies]
 # NDN workspace crates — grouped by subdirectory layer
@@ -143,7 +143,6 @@ ndn-signals-core = { path = "../ndn-rs/crates/core/ndn-signals-core", default-fe
 ndn-time      = { path = "../ndn-rs/crates/core/ndn-time", default-features = false }
 ndn-time-sources = { path = "crates/time/ndn-time-sources" }
 ndn-timekeeper = { path = "crates/time/ndn-timekeeper" }
-ndn-time-driver = { path = "crates/time/ndn-time-driver" }
 ndn-ble-framing = { path = "../ndn-rs/crates/core/ndn-ble-framing" }
 ndn-mgmt-wire = { path = "../ndn-rs/crates/core/ndn-mgmt-wire" }
 ndn-transport = { path = "../ndn-rs/crates/core/ndn-transport" }
@@ -174,12 +173,10 @@ ndn-discovery-core = { path = "../ndn-rs/crates/forwarding/ndn-discovery-core" }
 ndn-sync      = { path = "../ndn-rs/crates/protocols/ndn-sync" }
 ndn-cert     = { path = "../ndn-rs/crates/security/ndn-cert" }
 ndn-mgmt     = { path = "../ndn-rs/crates/forwarding/ndn-mgmt" }
-ndn-sim       = { path = "../ndn-sim/crates/ndn-sim" }
 ndn-strategy-wasm = { path = "crates/strategies/ndn-strategy-wasm" }
 ndn-compute   = { path = "crates/compute/ndn-compute" }
 ndn-service-core = { path = "crates/service/ndn-service-core" }
 ndn-service-macro = { path = "crates/service/ndn-service-macro" }
-ndn-service   = { path = "crates/service/ndn-service" }
 ndn-rpc       = { path = "crates/service/ndn-rpc" }
 ndn-nacabe    = { path = "crates/service/ndn-nacabe" }
 ndnsf-rs      = { path = "crates/service/ndnsf-rs" }
@@ -194,22 +191,12 @@ tokio-util = { version = "0.7.10", default-features = false }
 # Zero-copy byte buffers (no default features — crates opt in to bytes/std explicitly)
 bytes = { version = "1", default-features = false }
 
-# Embedded support
-heapless = "0.8"
-nb       = "1"
-
 # Concurrent data structures
 dashmap  = "6"
 smallvec = { version = "1", features = ["union"] }
-arc-swap = "1"
-
-# LRU cache
-lru = "0.12"
 
 # Structured logging
 tracing = "0.1"
-# tokio-console: runtime task inspector (opt-in; requires --cfg tokio_unstable)
-console-subscriber = "0.4"
 
 # Async combinators and stream/sink extension traits
 futures = "0.3"
@@ -229,9 +216,6 @@ libc = "0.2"
 # Serialization
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
-# Compact binary (de)serialization for the rabe ABE crypto types behind
-# `ndn-abe`'s TLV ciphertext container. Pinned to the 1.x line.
-bincode    = "1"
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 
 # Cryptography
@@ -241,25 +225,11 @@ ed25519-dalek = "2"
 # long-lived onion key across every Interest, which ring's one-shot
 # EphemeralPrivateKey can't model).
 x25519-dalek  = { version = "2", default-features = false, features = ["static_secrets"] }
-# `rayon` enables `Hasher::update_rayon` for multi-thread hashing of a
-# single large buffer. Useful only above ~128 KiB (rayon overhead beats
-# update at smaller sizes); ndn-rs uses it for bulk content publication
-# in producer apps and gates per-call on input size. Per-packet signing
-# never reaches the threshold and is unaffected.
-blake3        = { version = "1", features = ["rayon"] }
-# NDNCERT 0.3: ECDH (P-256), HKDF-SHA256, and AES-GCM-128.
-# Note: p256 and aes-gcm stay on the rustcrypto 0.10/0.13 release wave
-# until their 0.11/0.14 lines exit RC. sha2 + hkdf are on the newer wave
-# already — this works because the digest 0.11 trait family is wire-
-# compatible at runtime even when half the workspace still pulls
-# digest 0.10 transitively (the duplication is a few KB of code, not a
-# correctness issue, and p256 has no public API that touches digest).
-p256          = { version = "0.13", default-features = false, features = ["ecdh"] }
-aes-gcm       = { version = "0.10", features = ["alloc", "getrandom"] }
+# HKDF-SHA256 + SHA-2 digests (onion hop-key derivation, service seal).
 hkdf          = "0.13"
 sha2          = "0.11"
-# RNG sourcing. `getrandom` 0.2 is what `aes-gcm`, `p256`, and most
-# rustcrypto crates pull transitively; pinning the workspace version
+# RNG sourcing. `getrandom` 0.2 is what most rustcrypto crates pull
+# transitively; pinning the workspace version
 # keeps a single resolution and lets us enable the `js` feature for
 # wasm32 in one place. The `js` feature is only meaningful on
 # wasm32-unknown-unknown — on every other target it's a no-op.
@@ -279,16 +249,8 @@ tokio-tungstenite = { version = "0.26" }
 # ndnd's webtransport-go choice in fw/face/http3-listener.go.
 wtransport = { version = "0.7" }
 
-# ACME (RFC 8555) — used by ndn-acme to provision real certs for the
-# WebSocket-TLS face (issue #3) and the WebTransport listener (issue #14).
-instant-acme = { version = "0.7" }
-# DNS-01 challenge plumbing — Cloudflare HTTP API is the only impl shipped
-# in phase 2; rustls + reqwest are scoped to ndn-acme so the WT face crate
-# stays small.
+# HTTP client — WebRTC signaling-relay client (rustls, no default features)
 reqwest      = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
-# X.509 parsing — ndn-acme reads the leaf cert's notAfter to drive renewal
-# and the cert-status surface.
-x509-parser  = { version = "0.18" }
 
 # WebSocket TLS (server-side)
 tokio-rustls      = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
@@ -298,15 +260,8 @@ rustls-pemfile    = { version = "2" }
 # Logging subscriber (binaries only)
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-
-# Synchronization
-parking_lot = "0.12"
-
 # WebAssembly text format (examples)
 wat = "1"
-
-# Persistent storage
-fjall = "3"
 
 # Benchmarking
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -316,32 +271,20 @@ bluer = { version = "0.17", default-features = false, features = ["bluetoothd"] 
 
 # Bluetooth LE GATT server (macOS/iOS, CoreBluetooth via objc2)
 objc2                = { version = "0.5" }
-objc2-core-bluetooth = { version = "0.2" }
-objc2-foundation     = { version = "0.2" }
 
 # Bluetooth LE GATT *central* (macOS/Windows; CoreBluetooth / WinRT). Linux
 # central uses bluer instead. `uuid` parses the GATT profile UUID strings.
 btleplug = { version = "0.11" }
 uuid     = { version = "1" }
 
-# Raw packet capture (Windows Npcap / libpcap)
-pcap = "2"
-
-# Windows system APIs
-windows-sys = { version = "0.61", features = [
-    "Win32_Foundation",
-    "Win32_NetworkManagement_IpHelper",
-    "Win32_Networking_WinSock",
-] }
-
 # ── Build profiles ─────────────────────────────────────────────────────────────
 
-# console: build ndn-fwd with tokio-console task inspector support.
+# console: build a binary with tokio-console task inspector support.
 #
 # Note: `profile-rustflags` is not yet stable in Cargo; set the required
 # --cfg tokio_unstable via the environment instead:
 #
-#   RUSTFLAGS="--cfg tokio_unstable" cargo build -p ndn-fwd --features console --profile console
+#   RUSTFLAGS="--cfg tokio_unstable" cargo build -p <bin> --features console --profile console
 #
 # The profile inherits dev settings; add debug symbols and disable
 # inlining to keep tokio-console task names readable.
