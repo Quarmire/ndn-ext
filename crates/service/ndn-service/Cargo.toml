@@ -4,6 +4,9 @@ description = "v2 service layer: authority-as-signed-Data (dynamic, versioned po
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+# P1 compile-cost: tests/*.rs are modules of the single `suite` test binary
+# (see [[test]] below), not fifteen auto-discovered binaries to link.
+autotests = false
 
 [package.metadata.scope]
 classification = "extension"
@@ -60,6 +63,10 @@ ndn-service-macro = { workspace = true }
 ndn-transport = { workspace = true }
 # Leaf-seal ⇄ ContentKey interop witness: ScopeKey needs the `seal` feature.
 ndn-service-core = { workspace = true, features = ["seal"] }
+
+[[test]]
+name = "suite"
+path = "tests/suite.rs"
 
 [lints]
 workspace = true
