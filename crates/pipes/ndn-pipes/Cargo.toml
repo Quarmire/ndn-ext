@@ -4,6 +4,9 @@ description = "NDN-Pipes v2 — two-band (common-channel SEEK + dedicated coded 
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+# P1 compile-cost: tests/*.rs are modules of the single `suite` test binary
+# (see [[test]] below), not fourteen auto-discovered binaries to link.
+autotests = false
 
 [package.metadata.scope]
 classification = "extension"
@@ -56,6 +59,10 @@ ndn-face = { workspace = true }
 ndn-face-monitor-wifi = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 tokio-util = { workspace = true }
+
+[[test]]
+name = "suite"
+path = "tests/suite.rs"
 
 [lints]
 workspace = true
