@@ -22,13 +22,23 @@ thiserror            = { workspace = true }
 # Surface storage errors (the now-fallible ndn-storage API) rather than swallowing them.
 tracing              = { workspace = true }
 tokio                = { workspace = true, features = ["rt", "net", "time", "macros", "sync"] }
+# Only for examples/bakeoff.rs. An optional normal dep rather than a dev-dep
+# because dev-dependencies cannot be optional — without the iceoryx-bakeoff
+# feature, default builds and tests never compile iceoryx2.
+iceoryx2 = { version = "0.9.2", optional = true }
+
+[features]
+iceoryx-bakeoff = ["dep:iceoryx2"]
+
+[[example]]
+name = "bakeoff"
+required-features = ["iceoryx-bakeoff"]
 
 [dev-dependencies]
 tokio          = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync"] }
 ndn-engine     = { workspace = true }
 ndn-face-local = { workspace = true }
 ndn-security   = { workspace = true }
-iceoryx2 = "0.9.2"
 
 [lints]
 workspace = true
