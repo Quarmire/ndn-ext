@@ -45,6 +45,8 @@ serde      = { workspace = true, optional = true, features = ["derive"] }
 toml       = { version = "0.8", optional = true }
 ndn-tlv    = { workspace = true, features = ["std"] }
 bytes      = { workspace = true, features = ["std"] }
+# Compact-SELECTION token-proof hashes (upstream computeSelectionProviderTokenProofHash).
+sha2       = { workspace = true }
 rand_core  = { version = "0.6", default-features = false, features = ["getrandom"] }
 thiserror  = { workspace = true }
 # Per-phase latency tracing; spans flow into ndn-observability's OTLP-over-NDN.

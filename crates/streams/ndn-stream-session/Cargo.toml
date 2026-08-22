@@ -1,0 +1,18 @@
+[package]
+name = "ndn-stream-session"
+description = "Sans-IO stream-session state engine for NDN: seq-keyed reorder/duplicate/stale-session/gap tracking, adaptive windowed fetching, and K-of-N FEC repair groups over ndn-coding"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "extension"
+
+[dependencies]
+bytes      = { workspace = true, features = ["std"] }
+ndn-coding = { workspace = true }
+thiserror  = { workspace = true }
+tracing    = { workspace = true }
+
+[lints]
+workspace = true

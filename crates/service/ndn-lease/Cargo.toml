@@ -1,0 +1,18 @@
+[package]
+name = "ndn-lease"
+description = "Fail-closed execution leases for NDN services: provider-local prepare/commit/activate authority with boot epochs, conflict keys, and idempotency replay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "extension"
+
+[dependencies]
+ndn-packet = { workspace = true, features = ["std"] }
+rand_core  = { version = "0.6", default-features = false, features = ["getrandom"] }
+thiserror  = { workspace = true }
+tracing    = { workspace = true }
+
+[lints]
+workspace = true

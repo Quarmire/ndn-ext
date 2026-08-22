@@ -19,7 +19,10 @@ use ndn_packet::Name;
 use rand_core::{OsRng, RngCore};
 use tracing::instrument;
 
-use crate::messages::{AckMessage, RequestMessage, ResponseMessage, SelectionMessage, Strategy};
+use crate::messages::{
+    AckMessage, RequestMessage, ResponseMessage, SelectionMessage, SelectionProviderEntry,
+    Strategy, selection_token_proof_hash,
+};
 use crate::tokens::{PendingCoordination, PendingProviderTokens, ProviderToken, TokenError};
 
 /// A four-phase coordination failure on the provider side.
@@ -29,6 +32,11 @@ pub enum FlowError {
     /// or expired — no coordination occurs and no response is produced.
     #[error("selection presented an invalid provider token: {0}")]
     TokenRejected(TokenError),
+    /// A compact selection named other providers but not this one — the message
+    /// is well-formed, this provider was simply not selected. Not an attack:
+    /// the driver ignores it silently (no response, no state change).
+    #[error("compact selection carries no entry for this provider")]
+    NotForUs,
 }
 
 /// The provider-side four-phase engine: issues tokens on ACK, consumes them on
@@ -70,6 +78,7 @@ impl ProviderEngine {
         let token = self.issue_token(now_secs, requester, service, req.user_token.clone());
         AckMessage {
             status: true,
+            error_info: String::new(),
             user_token: req.user_token.clone(),
             provider_token: token.as_str().to_string(),
             payload: Bytes::new(),
@@ -118,6 +127,48 @@ impl ProviderEngine {
                 tracing::warn!(error = %e, "selection rejected — fail closed (no response)");
                 FlowError::TokenRejected(e)
             })
+    }
+
+    /// Validate and consume a **compact** (unified V2) selection for this
+    /// provider `node` serving `service`: find our [`SelectionProviderEntry`]
+    /// (else [`FlowError::NotForUs`] — we were not selected), then consume the
+    /// pending token whose [`selection_token_proof_hash`] matches the entry's
+    /// hash, for the **verified** `requester`. The plaintext token never
+    /// appears on the wire in this shape; possession is proven by the hash.
+    /// Fails closed exactly like [`consume_selection`](Self::consume_selection):
+    /// an unknown/expired/mismatched hash consumes nothing and produces no
+    /// response. Returns the coordination and the entry's assignment payload.
+    pub fn consume_selection_compact(
+        &mut self,
+        now_secs: u64,
+        sel: &SelectionMessage,
+        requester: &Name,
+        node: &Name,
+        service: &Name,
+    ) -> Result<(PendingCoordination, bytes::Bytes), FlowError> {
+        let Some(entry) = sel
+            .provider_entries
+            .iter()
+            .find(|e| e.provider_name == *node)
+        else {
+            return Err(FlowError::NotForUs);
+        };
+        // An entry without a proof hash cannot prove token possession — reject
+        // (fail closed; upstream's tokenless mode is out of scope for us).
+        if entry.provider_token_hash.is_empty() {
+            return Err(FlowError::TokenRejected(TokenError::Unknown));
+        }
+        let coord = self
+            .tokens
+            .consume_where(now_secs, requester, |token| {
+                selection_token_proof_hash(requester, node, service, token)
+                    == entry.provider_token_hash
+            })
+            .map_err(|e| {
+                tracing::warn!(error = %e, "compact selection rejected — fail closed (no response)");
+                FlowError::TokenRejected(e)
+            })?;
+        Ok((coord, entry.assignment_payload.clone()))
     }
 
     /// Pending (issued-but-unconsumed) token count.
@@ -178,12 +229,44 @@ pub fn make_request(request_id: &str, user_token: &str, payload: Bytes) -> Reque
     }
 }
 
-/// Phase 3 — build the selection for a chosen provider's `ACK`, presenting its
-/// provider token.
+/// Phase 3 (legacy per-provider shape) — build the selection for a chosen
+/// provider's `ACK`, presenting its plaintext provider token. Kept for inbound
+/// compatibility tests; the driver **emits** [`make_compact_selection`].
 pub fn make_selection(ack: &AckMessage, request_id: &str) -> SelectionMessage {
     SelectionMessage {
         provider_token: ack.provider_token.clone(),
         request_id: request_id.to_string(),
+        ..SelectionMessage::default()
+    }
+}
+
+/// Phase 3 (compact / unified V2 shape) — build **one** selection message naming
+/// every selected provider, each entry carrying the token-**proof hash** over
+/// that provider's ACKed token (never the plaintext token — upstream's
+/// post-2026-06-07 security posture). Published once under
+/// [`crate::names::compact_selection_name`].
+pub fn make_compact_selection(
+    requester: &Name,
+    service: &Name,
+    request_id: &str,
+    selected: &[(Name, AckMessage)],
+) -> SelectionMessage {
+    SelectionMessage {
+        request_id: request_id.to_string(),
+        provider_entries: selected
+            .iter()
+            .map(|(provider, ack)| SelectionProviderEntry {
+                provider_name: provider.clone(),
+                provider_token_hash: selection_token_proof_hash(
+                    requester,
+                    provider,
+                    service,
+                    &ack.provider_token,
+                ),
+                assignment_payload: bytes::Bytes::new(),
+            })
+            .collect(),
+        ..SelectionMessage::default()
     }
 }
 
@@ -265,11 +348,123 @@ mod tests {
     }
 
     #[test]
+    fn compact_selection_happy_path_and_replay() {
+        // The full compact round: two providers ACK; the user builds ONE compact
+        // selection naming only station A; A consumes by proof hash, B sees NotForUs.
+        let mut a = ProviderEngine::new(60);
+        let mut b = ProviderEngine::new(60);
+        let requester = name("/muas/alice");
+        let service = name("/svc/weather");
+        let node_a = name("/met/stationA");
+        let node_b = name("/met/stationB");
+
+        let req = make_request("r1", "utok", Bytes::from_static(b"forecast"));
+        let ack_a = a.on_request(0, requester.clone(), service.clone(), &req);
+        let _ack_b = b.on_request(0, requester.clone(), service.clone(), &req);
+
+        let sel = make_compact_selection(
+            &requester,
+            &service,
+            "r1",
+            &[(node_a.clone(), ack_a.clone())],
+        );
+        // The wire round-trip preserves the entries.
+        let sel = crate::messages::SelectionMessage::decode(sel.encode()).unwrap();
+
+        // Station B was not selected: NotForUs, token untouched.
+        assert_eq!(
+            b.consume_selection_compact(1, &sel, &requester, &node_b, &service)
+                .unwrap_err(),
+            FlowError::NotForUs
+        );
+        assert_eq!(b.pending_count(), 1);
+
+        // Station A consumes by proof hash — no plaintext token on the wire.
+        assert!(!sel.provider_entries[0].provider_token_hash.is_empty());
+        assert_ne!(
+            sel.provider_entries[0].provider_token_hash,
+            ack_a.provider_token,
+            "the compact shape must not carry the plaintext token"
+        );
+        let (coord, _assignment) = a
+            .consume_selection_compact(1, &sel, &requester, &node_a, &service)
+            .unwrap();
+        assert_eq!(coord.requester, requester);
+        assert_eq!(coord.user_token, "utok");
+        assert_eq!(a.pending_count(), 0, "consumed once (NSF-T1/S2)");
+
+        // Replay fails closed (NSF-T3).
+        assert_eq!(
+            a.consume_selection_compact(1, &sel, &requester, &node_a, &service)
+                .unwrap_err(),
+            FlowError::TokenRejected(TokenError::Unknown)
+        );
+    }
+
+    #[test]
+    fn compact_selection_wrong_requester_cannot_redeem() {
+        // SEC-03 analog for the compact shape: mallory replays alice's compact
+        // selection under her own (verified) identity — the proof hash binds the
+        // requester, so no token of mallory's matches and nothing is consumed.
+        let mut a = ProviderEngine::new(60);
+        let requester = name("/muas/alice");
+        let service = name("/svc/weather");
+        let node_a = name("/met/stationA");
+        let req = make_request("r1", "utok", Bytes::new());
+        let ack_a = a.on_request(0, requester.clone(), service.clone(), &req);
+        let sel = make_compact_selection(
+            &requester,
+            &service,
+            "r1",
+            &[(node_a.clone(), ack_a)],
+        );
+        assert_eq!(
+            a.consume_selection_compact(1, &sel, &name("/muas/mallory"), &node_a, &service)
+                .unwrap_err(),
+            FlowError::TokenRejected(TokenError::Unknown)
+        );
+        assert_eq!(a.pending_count(), 1, "alice's pending token must survive");
+    }
+
+    #[test]
+    fn compact_selection_empty_or_forged_hash_fails_closed() {
+        let mut a = ProviderEngine::new(60);
+        let requester = name("/muas/alice");
+        let service = name("/svc/weather");
+        let node_a = name("/met/stationA");
+        let req = make_request("r1", "utok", Bytes::new());
+        let _ack = a.on_request(0, requester.clone(), service.clone(), &req);
+
+        // Forged hash: well-formed entry, wrong digest.
+        let mut sel = make_compact_selection(&requester, &service, "r1", &[]);
+        sel.provider_entries.push(crate::messages::SelectionProviderEntry {
+            provider_name: node_a.clone(),
+            provider_token_hash: "00".repeat(32),
+            assignment_payload: Bytes::new(),
+        });
+        assert_eq!(
+            a.consume_selection_compact(1, &sel, &requester, &node_a, &service)
+                .unwrap_err(),
+            FlowError::TokenRejected(TokenError::Unknown)
+        );
+
+        // Empty hash: rejected, not treated as tokenless-accept.
+        sel.provider_entries[0].provider_token_hash = String::new();
+        assert_eq!(
+            a.consume_selection_compact(1, &sel, &requester, &node_a, &service)
+                .unwrap_err(),
+            FlowError::TokenRejected(TokenError::Unknown)
+        );
+        assert_eq!(a.pending_count(), 1, "nothing consumed on either rejection");
+    }
+
+    #[test]
     fn forged_token_fails_closed() {
         let mut provider = ProviderEngine::new(60);
         let sel = SelectionMessage {
             provider_token: "forged".into(),
             request_id: "r1".into(),
+            ..SelectionMessage::default()
         };
         let mut ran = false;
         let result = provider.on_selection(0, &sel, &name("/muas/alice"), |_| {

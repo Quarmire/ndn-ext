@@ -26,11 +26,98 @@ const STATUS: u64 = 152;
 const ERROR_INFO: u64 = 153;
 const REQUEST_ID: u64 = 154;
 const STRATEGY: u64 = 155;
+const PROVIDER_NAME: u64 = 158;
 const TARGET_IDENTITY: u64 = 161;
 const USER_TOKEN: u64 = 170;
 const PROVIDER_TOKEN: u64 = 171;
+const ASSIGNMENT_PAYLOAD: u64 = 184;
 const REQUEST_MODE: u64 = 189;
+const SELECTION_PROVIDER_ENTRY: u64 = 0xF503;
+const ATTEMPT: u64 = 0xF626;
 const TLV_NAME: u64 = 0x07;
+
+/// Negative-ACK reason codes (upstream spec 044 / `NegativeAckReason.hpp`). A
+/// provider that cannot serve a request answers `status=false` with one of these
+/// strings in the ACK's `error_info` field — **no new wire message** — and a user
+/// holding an explicit provider list may stop early once every known provider
+/// has negative-ACKed, instead of running out its ACK window.
+pub mod reason {
+    /// The provider's pending-request table is full.
+    pub const QUEUE_FULL: &str = "QUEUE_FULL";
+    /// The provider is busy (generic capacity).
+    pub const PROVIDER_BUSY: &str = "PROVIDER_BUSY";
+    /// The provider's accelerator is busy.
+    pub const GPU_BUSY: &str = "GPU_BUSY";
+    /// A model/artifact the request needs is not resident.
+    pub const MODEL_UNAVAILABLE: &str = "MODEL_UNAVAILABLE";
+    /// The requester is not authorized for this service.
+    pub const PERMISSION_DENIED: &str = "PERMISSION_DENIED";
+    /// The request is malformed/unsupported by this provider.
+    pub const UNSUPPORTED_REQUEST: &str = "UNSUPPORTED_REQUEST";
+    /// An internal provider error.
+    pub const INTERNAL_ERROR: &str = "INTERNAL_ERROR";
+    /// An execution lease was rejected.
+    pub const LEASE_REJECTED: &str = "LEASE_REJECTED";
+    /// An execution lease expired.
+    pub const LEASE_EXPIRED: &str = "LEASE_EXPIRED";
+    /// The operation's deadline passed before the provider could act.
+    pub const OPERATION_EXPIRED: &str = "OPERATION_EXPIRED";
+
+    /// Whether `reason` is one of the recommended (interoperable) codes. A
+    /// non-recommended string still travels — the vocabulary is advisory, not
+    /// load-bearing (faithful to upstream's `isRecommended`).
+    pub fn is_recommended(reason: &str) -> bool {
+        matches!(
+            reason,
+            QUEUE_FULL
+                | PROVIDER_BUSY
+                | GPU_BUSY
+                | MODEL_UNAVAILABLE
+                | PERMISSION_DENIED
+                | UNSUPPORTED_REQUEST
+                | INTERNAL_ERROR
+                | LEASE_REJECTED
+                | LEASE_EXPIRED
+                | OPERATION_EXPIRED
+        )
+    }
+}
+
+/// The provider-bound selection **token-proof hash** (upstream compact V2
+/// SELECTION): `SHA-256("SELECTION" ‖ requesterURI ‖ providerURI ‖ serviceURI ‖
+/// providerToken)`, uppercase hex — so the shared (group-visible) selection
+/// payload proves possession of a provider's token *to that provider only*,
+/// without ever carrying the plaintext token. An empty `provider_token` yields
+/// the empty string (faithful to upstream's guard).
+///
+/// Interop caveat: the URI inputs must render identically on both stacks. For
+/// names of unreserved characters (alphanumerics, `-._~`) ndn-rs `Name` display
+/// and ndn-cxx `Name::toUri()` agree; exotic components (other punctuation,
+/// typed components) may percent-encode differently and then the hashes differ.
+pub fn selection_token_proof_hash(
+    requester: &Name,
+    provider: &Name,
+    service: &Name,
+    provider_token: &str,
+) -> String {
+    use sha2::{Digest, Sha256};
+    if provider_token.is_empty() {
+        return String::new();
+    }
+    let mut h = Sha256::new();
+    h.update(b"SELECTION");
+    h.update(requester.to_string().as_bytes());
+    h.update(provider.to_string().as_bytes());
+    h.update(service.to_string().as_bytes());
+    h.update(provider_token.as_bytes());
+    let digest = h.finalize();
+    let mut s = String::with_capacity(64);
+    for b in digest {
+        use core::fmt::Write;
+        let _ = write!(s, "{b:02X}");
+    }
+    s
+}
 
 /// Provider-selection strategy a user requests (NDNSF `StrategyType`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -122,6 +209,28 @@ fn put_u8(w: &mut TlvWriter, typ: u64, v: u8) {
 }
 fn put_name(w: &mut TlvWriter, typ: u64, name: &Name) {
     w.write_nested(typ, |i| i.write_raw(&name.encode_to_tlv()));
+}
+/// NDN NonNegativeInteger: minimal 1/2/4/8-byte big-endian (upstream's
+/// `makeNonNegativeIntegerBlock`).
+fn put_nonneg(w: &mut TlvWriter, typ: u64, v: u64) {
+    w.write_nested(typ, |i| {
+        if v <= u64::from(u8::MAX) {
+            i.write_raw(&[v as u8]);
+        } else if v <= u64::from(u16::MAX) {
+            i.write_raw(&(v as u16).to_be_bytes());
+        } else if v <= u64::from(u32::MAX) {
+            i.write_raw(&(v as u32).to_be_bytes());
+        } else {
+            i.write_raw(&v.to_be_bytes());
+        }
+    });
+}
+fn as_nonneg(b: &Bytes) -> u64 {
+    // Tolerant: any 1..=8-byte big-endian value; longer/empty reads as 0.
+    if b.is_empty() || b.len() > 8 {
+        return 0;
+    }
+    b.iter().fold(0u64, |acc, &x| (acc << 8) | u64::from(x))
 }
 
 /// Read the inner sub-TLVs of a message envelope of type `expected`, returning
@@ -217,8 +326,12 @@ impl RequestMessage {
 /// Phase 2 — a provider's acknowledgement, carrying the one-time provider token.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AckMessage {
-    /// Whether the provider can serve the request.
+    /// Whether the provider can serve the request. `false` is a **negative ACK**
+    /// (spec 044): `error_info` then carries a [`reason`] code.
     pub status: bool,
+    /// On a negative ACK, the reason code (see [`reason`]); empty otherwise.
+    /// Upstream's `RequestAckMessage.message`, on the `ErrorInfo` TLV.
+    pub error_info: String,
     /// Echoes the request's user token.
     pub user_token: String,
     /// The single-use provider token the user must present in its SELECTION.
@@ -233,6 +346,7 @@ impl AckMessage {
         let mut w = TlvWriter::new();
         w.write_nested(ACK_MSG, |i| {
             put_bool(i, STATUS, self.status);
+            put_str(i, ERROR_INFO, &self.error_info);
             put_str(i, USER_TOKEN, &self.user_token);
             put_str(i, PROVIDER_TOKEN, &self.provider_token);
             put_bytes(i, PAYLOAD, &self.payload);
@@ -245,6 +359,7 @@ impl AckMessage {
         for (typ, val) in open_envelope(bytes, ACK_MSG)? {
             match typ {
                 STATUS => m.status = val.first().copied().unwrap_or(0) != 0,
+                ERROR_INFO => m.error_info = as_str(&val)?,
                 USER_TOKEN => m.user_token = as_str(&val)?,
                 PROVIDER_TOKEN => m.provider_token = as_str(&val)?,
                 PAYLOAD => m.payload = val,
@@ -253,15 +368,102 @@ impl AckMessage {
         }
         Ok(m)
     }
+
+    /// A negative ACK (`status=false`) with a [`reason`] code, echoing the
+    /// request's user token. Carries no provider token — nothing is pending.
+    pub fn negative(reason: &str, user_token: &str) -> Self {
+        Self {
+            status: false,
+            error_info: reason.to_string(),
+            user_token: user_token.to_string(),
+            ..Self::default()
+        }
+    }
 }
 
-/// Phase 3 — the user's selection of a provider, presenting its provider token.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// One provider's slot in a **compact** (unified V2) SELECTION: who is selected,
+/// the proof it may consume its own token, and its per-provider assignment.
+/// Faithful to upstream `SelectionProviderEntry` (TLV `0xF503`): the provider
+/// name travels as its **URI string** (not a wire-encoded Name), the proof hash
+/// rides the `ProviderToken` TLV number.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SelectionProviderEntry {
+    /// The selected provider.
+    pub provider_name: Name,
+    /// [`selection_token_proof_hash`] over this provider's token — never the
+    /// plaintext token (the security point of the compact shape).
+    pub provider_token_hash: String,
+    /// Optional per-provider assignment payload.
+    pub assignment_payload: Bytes,
+}
+
+impl SelectionProviderEntry {
+    fn encode_into(&self, w: &mut TlvWriter) {
+        w.write_nested(SELECTION_PROVIDER_ENTRY, |i| {
+            put_str(i, PROVIDER_NAME, &self.provider_name.to_string());
+            put_str(i, PROVIDER_TOKEN, &self.provider_token_hash);
+            put_bytes(i, ASSIGNMENT_PAYLOAD, &self.assignment_payload);
+        });
+    }
+    fn decode(body: Bytes) -> Result<Self, MsgError> {
+        let mut provider_name: Option<Name> = None;
+        let mut provider_token_hash = String::new();
+        let mut assignment_payload = Bytes::new();
+        let mut r = TlvReader::new(body);
+        while !r.is_empty() {
+            let (typ, val) = r.read_tlv().map_err(|_| MsgError::Malformed)?;
+            match typ {
+                PROVIDER_NAME => {
+                    provider_name =
+                        Some(as_str(&val)?.parse().map_err(|_| MsgError::Malformed)?);
+                }
+                PROVIDER_TOKEN => provider_token_hash = as_str(&val)?,
+                ASSIGNMENT_PAYLOAD => assignment_payload = val,
+                _ => {}
+            }
+        }
+        // An entry without a provider name selects nobody — malformed.
+        let provider_name = provider_name.ok_or(MsgError::Malformed)?;
+        Ok(Self {
+            provider_name,
+            provider_token_hash,
+            assignment_payload,
+        })
+    }
+}
+
+/// Phase 3 — the user's selection of provider(s).
+///
+/// Two accepted shapes, both decoded by the same tolerant loop:
+///
+/// * **Compact / unified V2** (what upstream emits today, and what our driver
+///   emits): one publication under `/<requester>/NDNSF/SELECTION/<service>/<id>`
+///   whose `provider_entries` name each **selected** provider with a token-proof
+///   hash. A provider that finds no entry for itself was not selected.
+/// * **Legacy per-provider** (pre-2026-06-07; still accepted inbound): a
+///   per-provider name carrying the plaintext `provider_token`.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SelectionMessage {
-    /// The single-use provider token from the chosen provider's ACK.
+    /// Legacy shape only: the plaintext single-use provider token. Empty in the
+    /// compact shape (the proof hash in each entry replaces it).
     pub provider_token: String,
     /// The request id this selection resolves.
     pub request_id: String,
+    /// Compact shape: one entry per **selected** provider.
+    pub provider_entries: Vec<SelectionProviderEntry>,
+    /// Selection attempt counter (upstream TLV `0xF626`; starts at 1).
+    pub attempt: u64,
+}
+
+impl Default for SelectionMessage {
+    fn default() -> Self {
+        Self {
+            provider_token: String::new(),
+            request_id: String::new(),
+            provider_entries: Vec::new(),
+            attempt: 1,
+        }
+    }
 }
 
 impl SelectionMessage {
@@ -269,8 +471,12 @@ impl SelectionMessage {
     pub fn encode(&self) -> Bytes {
         let mut w = TlvWriter::new();
         w.write_nested(SELECTION_MSG, |i| {
-            put_str(i, PROVIDER_TOKEN, &self.provider_token);
             put_str(i, REQUEST_ID, &self.request_id);
+            put_str(i, PROVIDER_TOKEN, &self.provider_token);
+            put_nonneg(i, ATTEMPT, self.attempt);
+            for entry in &self.provider_entries {
+                entry.encode_into(i);
+            }
         });
         w.finish()
     }
@@ -281,6 +487,10 @@ impl SelectionMessage {
             match typ {
                 PROVIDER_TOKEN => m.provider_token = as_str(&val)?,
                 REQUEST_ID => m.request_id = as_str(&val)?,
+                ATTEMPT => m.attempt = as_nonneg(&val),
+                SELECTION_PROVIDER_ENTRY => {
+                    m.provider_entries.push(SelectionProviderEntry::decode(val)?);
+                }
                 _ => {}
             }
         }
@@ -364,7 +574,7 @@ mod tests {
             status: true,
             user_token: "utok".into(),
             provider_token: "ptok".into(),
-            payload: Bytes::new(),
+            ..Default::default()
         };
         assert_eq!(AckMessage::decode(m.encode()).unwrap(), m);
     }
@@ -374,6 +584,7 @@ mod tests {
         let m = SelectionMessage {
             provider_token: "ptok".into(),
             request_id: "r1".into(),
+            ..Default::default()
         };
         assert_eq!(SelectionMessage::decode(m.encode()).unwrap(), m);
     }
@@ -386,6 +597,81 @@ mod tests {
             payload: Bytes::new(),
         };
         assert_eq!(ResponseMessage::decode(m.encode()).unwrap(), m);
+    }
+
+    #[test]
+    fn ack_negative_reason_round_trip() {
+        let m = AckMessage::negative(reason::QUEUE_FULL, "utok");
+        let decoded = AckMessage::decode(m.encode()).unwrap();
+        assert!(!decoded.status);
+        assert_eq!(decoded.error_info, "QUEUE_FULL");
+        assert!(decoded.provider_token.is_empty());
+        assert!(reason::is_recommended(&decoded.error_info));
+        assert!(!reason::is_recommended("MADE_UP"));
+    }
+
+    #[test]
+    fn compact_selection_round_trip() {
+        let m = SelectionMessage {
+            request_id: "r1".into(),
+            attempt: 2,
+            provider_entries: vec![
+                SelectionProviderEntry {
+                    provider_name: "/met/stationA".parse().unwrap(),
+                    provider_token_hash: "AB".repeat(32),
+                    assignment_payload: Bytes::from_static(b"role=primary;"),
+                },
+                SelectionProviderEntry {
+                    provider_name: "/met/stationB".parse().unwrap(),
+                    provider_token_hash: "CD".repeat(32),
+                    assignment_payload: Bytes::new(),
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(SelectionMessage::decode(m.encode()).unwrap(), m);
+    }
+
+    #[test]
+    fn legacy_selection_still_round_trips() {
+        // The pre-compact shape (plaintext token, no entries) must keep decoding —
+        // upstream and we both accept it inbound.
+        let m = SelectionMessage {
+            provider_token: "ptok".into(),
+            request_id: "r1".into(),
+            ..Default::default()
+        };
+        let decoded = SelectionMessage::decode(m.encode()).unwrap();
+        assert_eq!(decoded, m);
+        assert!(decoded.provider_entries.is_empty());
+        assert_eq!(decoded.attempt, 1);
+    }
+
+    #[test]
+    fn selection_token_proof_hash_matches_upstream_recipe() {
+        // Pinned vector: SHA-256("SELECTION" ‖ "/muas/alice" ‖ "/met/stationA" ‖
+        // "/svc/weather" ‖ "deadbeef"), uppercase hex — the exact byte-feed order
+        // of upstream computeSelectionProviderTokenProofHash (utils.cpp).
+        let h = selection_token_proof_hash(
+            &"/muas/alice".parse().unwrap(),
+            &"/met/stationA".parse().unwrap(),
+            &"/svc/weather".parse().unwrap(),
+            "deadbeef",
+        );
+        assert_eq!(
+            h,
+            "D806419D1323BD3D555F00E13377348D0D2AE068F278D2196C4B6BF57CAD0B06"
+        );
+        // Empty token ⇒ empty hash (faithful guard).
+        assert_eq!(
+            selection_token_proof_hash(
+                &"/a".parse().unwrap(),
+                &"/b".parse().unwrap(),
+                &"/c".parse().unwrap(),
+                ""
+            ),
+            ""
+        );
     }
 
     #[test]

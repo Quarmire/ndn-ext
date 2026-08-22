@@ -160,6 +160,42 @@ impl PendingProviderTokens {
         Ok(coord)
     }
 
+    /// Consume the **one** pending token of `requester`'s for which `matches`
+    /// holds (called for a compact SELECTION, where the message carries a
+    /// token-**proof hash** instead of the plaintext token — the provider finds
+    /// its own issued token by recomputing each candidate's hash). Same
+    /// invariants as [`consume`](Self::consume): single-use (removed on
+    /// success), TTL-checked, and requester-bound *by construction* — only
+    /// tokens issued to this verified `requester` are ever candidates, so a
+    /// proof hash lifted from another coordination can never match (fail
+    /// closed: `Unknown`).
+    pub fn consume_where<F>(
+        &mut self,
+        now_secs: u64,
+        requester: &Name,
+        matches: F,
+    ) -> Result<PendingCoordination, TokenError>
+    where
+        F: Fn(&str) -> bool,
+    {
+        let found = self
+            .entries
+            .iter()
+            .find(|(tok, (coord, _))| coord.requester == *requester && matches(tok.as_str()))
+            .map(|(tok, _)| tok.clone());
+        let Some(token) = found else {
+            return Err(TokenError::Unknown);
+        };
+        let (coord, created) = self
+            .entries
+            .remove(&token)
+            .expect("present per the find above");
+        if self.is_expired(created, now_secs) {
+            return Err(TokenError::Expired);
+        }
+        Ok(coord)
+    }
+
     /// Remove all tokens whose TTL has elapsed at `now_secs`; returns how many
     /// were reaped. Idempotent — a token already consumed or already reaped is
     /// simply absent.

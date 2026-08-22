@@ -66,6 +66,19 @@ pub fn response_name(provider: &Name, requester: &Name, service: &Name, request_
     append_name(append_name(base, service), request_id)
 }
 
+/// `/<requester>/NDNSF/SELECTION/<service...>/<request_id...>` — the **compact**
+/// (unified V2) selection name upstream emits since 2026-06-07: one publication
+/// for the whole selection, no provider in the name (the selected providers are
+/// named by the message's `SelectionProviderEntry` list). [`selection_name`]
+/// remains as the legacy per-provider shape, accepted inbound only.
+///
+/// Interop note: upstream parses the request id as the name's **final single
+/// component**, so cross-stack request ids must be one component.
+pub fn compact_selection_name(requester: &Name, service: &Name, request_id: &Name) -> Name {
+    let base = requester.clone().append(NDNSF).append(SELECTION);
+    append_name(append_name(base, service), request_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,5 +113,13 @@ mod tests {
         assert!(sel.has_prefix(&n("/muas/alice/NDNSF/SELECTION")));
         let resp = response_name(&n("/muas/bob"), &n("/muas/alice"), &n("/svc/x"), &n("/r9"));
         assert!(resp.has_prefix(&n("/muas/bob/NDNSF/RESPONSE")));
+    }
+
+    #[test]
+    fn compact_selection_name_has_no_provider_component() {
+        let sel = compact_selection_name(&n("/muas/alice"), &n("/svc/x"), &n("/r9"));
+        // The service path follows the phase marker directly — upstream's
+        // makeCompactServiceSelectionNameV2 shape.
+        assert_eq!(sel, n("/muas/alice/NDNSF/SELECTION/svc/x/r9"));
     }
 }

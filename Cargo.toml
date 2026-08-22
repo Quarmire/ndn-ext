@@ -16,6 +16,8 @@ members = [
     "crates/service/ndn-radio-node",
     "crates/service/ndn-nacabe",
     "crates/service/ndnsf-rs",
+    "crates/service/ndn-lease",
+    "crates/streams/ndn-stream-session",
     "crates/onboarding/ndn-trust-envelope",
     "crates/faces/ndn-face-serial",
     "crates/faces/ndn-face-websocket",
@@ -62,6 +64,8 @@ default-members = [
     "crates/service/ndn-radio-node",
     "crates/service/ndn-nacabe",
     "crates/service/ndnsf-rs",
+    "crates/service/ndn-lease",
+    "crates/streams/ndn-stream-session",
     "crates/faces/ndn-face-serial",
     "crates/faces/ndn-face-websocket",
     "crates/faces/ndn-face-shm",
@@ -128,6 +132,7 @@ ndn-storage   = { path = "../ndn-rs/crates/core/ndn-storage" }
 ndn-fwd-core  = { path = "../ndn-rs/crates/forwarding/ndn-fwd-core", default-features = false }
 ndn-crypto-core = { path = "../ndn-rs/crates/core/ndn-crypto-core" }
 ndn-sealed-box  = { path = "crates/compute/ndn-sealed-box" }
+ndn-coding    = { path = "crates/coding/ndn-coding" }
 ndn-signals-core = { path = "../ndn-rs/crates/core/ndn-signals-core", default-features = false }
 ndn-time      = { path = "../ndn-rs/crates/core/ndn-time", default-features = false }
 ndn-time-sources = { path = "crates/time/ndn-time-sources" }
@@ -171,6 +176,8 @@ ndn-service-macro = { path = "crates/service/ndn-service-macro" }
 ndn-rpc       = { path = "crates/service/ndn-rpc" }
 ndn-nacabe    = { path = "crates/service/ndn-nacabe" }
 ndnsf-rs      = { path = "crates/service/ndnsf-rs" }
+ndn-lease     = { path = "crates/service/ndn-lease" }
+ndn-stream-session = { path = "crates/streams/ndn-stream-session" }
 ndn-ratelimit = { path = "crates/ratelimit/ndn-ratelimit" }
 ndn-radio-cognition = { path = "crates/faces/ndn-radio-cognition" }
 ndn-nan-core  = { path = "crates/faces/ndn-nan-core", default-features = false }

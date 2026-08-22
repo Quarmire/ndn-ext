@@ -25,7 +25,7 @@ use tracing::instrument;
 
 use std::time::{Duration, Instant};
 
-use crate::flow::{ProviderEngine, make_request, make_selection, select_providers};
+use crate::flow::{ProviderEngine, make_compact_selection, make_request, select_providers};
 use crate::messages::{
     AckMessage, RequestMessage, RequestMode, ResponseMessage, SelectionMessage, Strategy,
 };
@@ -142,28 +142,49 @@ fn request_id_of(name: &Name) -> Name {
     }
 }
 
-/// The `serviceName` path embedded in a REQUEST or SELECTION name (between the
-/// phase prefix and the trailing single-component request id). `None` if the name
-/// is not a REQUEST/SELECTION or is malformed. Used to route a publication to the
-/// provider serving that service when several share one node/group.
+/// The `serviceName` path embedded in a REQUEST name (between the phase prefix
+/// and the trailing single-component request id). `None` if the name is not a
+/// REQUEST or is malformed. Used to route a publication to the provider serving
+/// that service when several share one node/group.
 fn service_of(name: &Name) -> Option<Name> {
     let comps = name.components();
     let idx = comps.iter().position(|c| *c == comp(names::NDNSF))?;
-    let phase = comps.get(idx + 1)?;
-    // REQUEST: `..NDNSF/REQUEST/<service...>/<reqid>`.
-    // SELECTION: `..NDNSF/SELECTION/<provider-uri>/<service...>/<reqid>` (skip 1).
-    let start = if *phase == comp(names::REQUEST) {
-        idx + 2
-    } else if *phase == comp(names::SELECTION) {
-        idx + 3
-    } else {
+    if comps.get(idx + 1) != Some(&comp(names::REQUEST)) {
         return None;
-    };
+    }
+    let start = idx + 2;
     let end = comps.len().checked_sub(1)?; // drop the trailing request id
     if start > end {
         return None;
     }
     Some(Name::from_components(comps[start..end].iter().cloned()))
+}
+
+/// Whether a SELECTION name addresses `service`, in **either** accepted shape:
+///
+/// * compact:  `..NDNSF/SELECTION/<service...>/<reqid>` (what we and upstream emit)
+/// * legacy:   `..NDNSF/SELECTION/<provider-uri>/<service...>/<reqid>` (inbound only)
+///
+/// A name that matches neither slice is for another service — ignore. The two
+/// shapes can't false-positive against each other for the same `service`: the
+/// slices differ in length. Routing here is only a *filter*; the message-level
+/// entry/token check is what authorizes execution.
+fn selection_matches_service(name: &Name, service: &Name) -> bool {
+    let comps = name.components();
+    let Some(idx) = comps.iter().position(|c| *c == comp(names::NDNSF)) else {
+        return false;
+    };
+    if comps.get(idx + 1) != Some(&comp(names::SELECTION)) {
+        return false;
+    }
+    let Some(end) = comps.len().checked_sub(1) else {
+        return false;
+    };
+    let slice_eq = |start: usize| {
+        start <= end
+            && Name::from_components(comps[start..end].iter().cloned()) == *service
+    };
+    slice_eq(idx + 2) || slice_eq(idx + 3)
 }
 
 /// Run the provider side: serve `service` in `group`, ACKing requests and, on a
@@ -219,8 +240,18 @@ pub async fn serve_provider<H>(
                 let reqid = request_id_of(&pubn.name);
                 match req.request_mode {
                     RequestMode::Normal => {
-                        // Shed new requests at the cap rather than grow unbounded.
+                        // At the cap: negative-ACK (spec 044, QUEUE_FULL) instead of a
+                        // silent drop, so the user can stop/fail over early. No token
+                        // is issued and nothing goes pending.
                         if pending_payloads.len() >= MAX_PENDING_PAYLOADS {
+                            let nack = AckMessage::negative(
+                                crate::messages::reason::QUEUE_FULL,
+                                &req.user_token,
+                            );
+                            let name = names::ack_name(&node, &requester, &service, &reqid);
+                            let _ = ps
+                                .publish(name.clone(), trust.seal(name, nack.encode()).as_ref())
+                                .await;
                             continue;
                         }
                         pending_payloads.insert(reqid.to_string(), (req.payload.clone(), now));
@@ -261,6 +292,7 @@ pub async fn serve_provider<H>(
                         let sel = SelectionMessage {
                             provider_token: req.provider_token.clone(),
                             request_id: reqid.to_string(),
+                            ..SelectionMessage::default()
                         };
                         if let Ok(resp) = engine.on_selection(now, &sel, &requester, |coord| {
                             handler(coord, &req.payload)
@@ -274,7 +306,7 @@ pub async fn serve_provider<H>(
                 }
             }
             Some(Phase::Selection) => {
-                if service_of(&pubn.name).as_ref() != Some(&service) {
+                if !selection_matches_service(&pubn.name, &service) {
                     continue;
                 }
                 let requester = before_ndnsf(&pubn.name);
@@ -290,10 +322,23 @@ pub async fn serve_provider<H>(
                     .get(&reqid.to_string())
                     .map(|(p, _)| p.clone())
                     .unwrap_or_default();
-                // on_selection fails closed for a token this provider did not issue.
-                if let Ok(resp) =
-                    engine.on_selection(now, &sel, &requester, |coord| handler(coord, &payload))
-                {
+                // Compact shape (entries present): consume our entry's token by
+                // proof hash; NotForUs (another provider's selection) and any
+                // token rejection alike produce no response (fail closed).
+                // Legacy shape (no entries): plaintext-token consume, as before.
+                let coord = if !sel.provider_entries.is_empty() {
+                    engine
+                        .consume_selection_compact(now, &sel, &requester, &node, &service)
+                        .map(|(coord, _assignment)| coord)
+                } else {
+                    engine.consume_selection(now, &sel, &requester)
+                };
+                if let Ok(coord) = coord {
+                    let resp = ResponseMessage {
+                        status: true,
+                        error_info: String::new(),
+                        payload: handler(&coord, &payload),
+                    };
                     pending_payloads.remove(&reqid.to_string());
                     let name = names::response_name(&node, &requester, &service, &reqid);
                     let _ = ps
@@ -362,8 +407,15 @@ pub async fn serve_provider_async(
                     continue; // this serve path drives the Normal/select flow only
                 }
                 let reqid = request_id_of(&pubn.name);
-                // Shed new requests at the cap rather than grow unbounded.
+                // At the cap: negative-ACK QUEUE_FULL (spec 044) instead of a
+                // silent drop — no token issued, nothing pending.
                 if pending_payloads.len() >= MAX_PENDING_PAYLOADS {
+                    let nack =
+                        AckMessage::negative(crate::messages::reason::QUEUE_FULL, &req.user_token);
+                    let name = names::ack_name(&node, &requester, &service, &reqid);
+                    let _ = ps
+                        .publish(name.clone(), trust.seal(name, nack.encode()).as_ref())
+                        .await;
                     continue;
                 }
                 pending_payloads.insert(reqid.to_string(), (req.payload.clone(), now));
@@ -374,7 +426,7 @@ pub async fn serve_provider_async(
                     .await;
             }
             Some(Phase::Selection) => {
-                if service_of(&pubn.name).as_ref() != Some(&service) {
+                if !selection_matches_service(&pubn.name, &service) {
                     continue;
                 }
                 let requester = before_ndnsf(&pubn.name);
@@ -389,10 +441,18 @@ pub async fn serve_provider_async(
                     .get(&reqid.to_string())
                     .map(|(p, _)| p.clone())
                     .unwrap_or_default();
-                // Consume the token (fail-closed) ON the loop, then run the handler
+                // Consume the token (fail-closed) ON the loop — compact shape by
+                // proof hash, legacy shape by plaintext — then run the handler
                 // OFF the loop with a timeout, so a slow/hung responder neither blocks
                 // other coordinations (head-of-line) nor strands the client (SEC-23).
-                if let Ok(coord) = engine.consume_selection(now, &sel, &requester) {
+                let coord = if !sel.provider_entries.is_empty() {
+                    engine
+                        .consume_selection_compact(now, &sel, &requester, &node, &service)
+                        .map(|(coord, _assignment)| coord)
+                } else {
+                    engine.consume_selection(now, &sel, &requester)
+                };
+                if let Ok(coord) = coord {
                     pending_payloads.remove(&reqid.to_string());
                     let resp_name = names::response_name(&node, &requester, &service, &reqid);
                     let responder = responder.clone();
@@ -468,10 +528,22 @@ pub async fn call(
             break AckMessage::decode(payload).ok()?;
         }
     };
+    // Negative ACK (spec 044): our single known provider declined — stop now
+    // rather than waiting out a window that can't succeed (early-stop).
+    if !ack.status {
+        tracing::warn!(reason = %ack.error_info, provider = %provider, "negative ACK — early stop");
+        return None;
+    }
 
-    // Phase 3: SELECTION, echoing the provider token (signed as the requester).
-    let sel = make_selection(&ack, &request_id.to_string());
-    let sel_name = names::selection_name(&requester, &provider, &service, &request_id);
+    // Phase 3: one compact SELECTION naming the provider, proving token
+    // possession by hash (the plaintext token stays off the wire).
+    let sel = make_compact_selection(
+        &requester,
+        &service,
+        &request_id.to_string(),
+        &[(provider.clone(), ack)],
+    );
+    let sel_name = names::compact_selection_name(&requester, &service, &request_id);
     ps.publish(
         sel_name.clone(),
         trust.seal(sel_name, sel.encode()).as_ref(),
@@ -561,6 +633,13 @@ pub async fn select_and_call(
                     && let Some(payload) = trust.unseal(pubn.payload, &provider, &pubn.name).await
                     && let Ok(ack) = AckMessage::decode(payload)
                 {
+                    // A negative ACK (spec 044) is never a selection candidate;
+                    // record its reason and keep collecting.
+                    if !ack.status {
+                        tracing::debug!(reason = %ack.error_info, provider = %provider,
+                            "negative ACK recorded");
+                        continue;
+                    }
                     acks.push((provider, ack));
                 }
             }
@@ -568,15 +647,18 @@ pub async fn select_and_call(
         }
     }
 
-    // Phase 3: SELECT the provider(s) per strategy and send each a SELECTION.
+    // Phase 3: SELECT the provider(s) per strategy and publish ONE compact
+    // SELECTION naming them all — each entry proves possession of that
+    // provider's token by hash (upstream's unified V2 shape; the plaintext
+    // tokens stay off the wire).
     let selected: Vec<(Name, AckMessage)> = select_providers(strategy, &acks)
         .into_iter()
         .cloned()
         .collect();
     let want: Vec<Name> = selected.iter().map(|(p, _)| p.clone()).collect();
-    for (provider, ack) in &selected {
-        let sel = make_selection(ack, &request_id.to_string());
-        let sel_name = names::selection_name(&requester, provider, &service, &request_id);
+    if !selected.is_empty() {
+        let sel = make_compact_selection(&requester, &service, &request_id.to_string(), &selected);
+        let sel_name = names::compact_selection_name(&requester, &service, &request_id);
         let _ = ps
             .publish(
                 sel_name.clone(),

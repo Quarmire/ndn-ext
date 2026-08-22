@@ -15,11 +15,36 @@ NDNSF node at the protocol level (the ABE *ciphertext bytes* excepted — see
 `docs/specs/service-layer.md` §7.3), and holds it to NDNSF's audited security
 properties via the O4 invariant catalogue (`docs/specs/ndnsf-invariants.md`).
 
+## Upstream baseline
+
+Tracked against upstream
+[`NDN_Service_Framework`](https://github.com/matianxing1992/NDN_Service_Framework)
+at **`5e9e7aa` (2026-08-12)** — the 2026-08 wire-refresh pass. Concretely:
+
+* **Compact (unified V2) SELECTION** — we *emit* upstream's post-2026-06-07
+  shape: one publication under
+  `/<requester>/NDNSF/SELECTION/<service…>/<requestId>` whose
+  `SelectionProviderEntry` list (TLV `0xF503`) names each **selected** provider
+  with a provider-bound **token-proof hash**
+  (`SHA-256("SELECTION" ‖ requesterURI ‖ providerURI ‖ serviceURI ‖ token)`,
+  uppercase hex) — the plaintext provider token never appears in the shared
+  payload. The legacy per-provider shape (plaintext token) is still **accepted
+  inbound**, mirroring upstream's own compatibility posture.
+* **Negative ACK** (upstream spec 044) — `status=false` + a `reason` code on the
+  ACK's `ErrorInfo` field (`QUEUE_FULL`, `PROVIDER_BUSY`, …); our provider sheds
+  with `QUEUE_FULL` at its pending cap, and `call` to a known provider stops
+  early on a negative ACK instead of running out its window.
+* **V1 protocol** — never ported; upstream deleted it (spec 086), so nothing
+  here rots.
+* **Typed ACK envelopes v2** (upstream spec 090) — not consumed here; if ACK
+  capability metadata is ever read, note upstream's mixed-reader grace ends
+  **2026-12-31** (v2-only after that).
+
 ## What's here
 
 | Module | Surface |
 |---|---|
-| `messages` | the four-phase TLV taxonomy (Request/Ack/Selection/Response, types 128–131) + `Strategy` (FirstResponding / RandomSelection / AllSelected) and `RequestMode` (Normal / Targeted / TargetedBootstrap) |
+| `messages` | the four-phase TLV taxonomy (Request/Ack/Selection/Response, types 128–131) + `Strategy` (FirstResponding / RandomSelection / AllSelected), `RequestMode` (Normal / Targeted / TargetedBootstrap), the compact-selection `SelectionProviderEntry` + `selection_token_proof_hash`, and the negative-ACK `reason` codes |
 | `tokens` | the provider-token lifecycle + pending-coordination state machine (the security/coordination guard: NSF-T/S invariants) |
 | `flow` | the sans-IO orchestration (`ProviderEngine`: `on_request` / `on_selection` / `consume_selection`) |
 | `driver` | the flow over `ndn-sync` SVS pub/sub (`serve_provider`, `call`, `select_and_call`, the targeted modes) — feature `driver` |

@@ -48,9 +48,10 @@ pub mod tokens;
 #[cfg(feature = "driver")]
 pub mod trust;
 
-pub use flow::{FlowError, ProviderEngine, make_request, make_selection};
+pub use flow::{FlowError, ProviderEngine, make_compact_selection, make_request, make_selection};
 pub use messages::{
-    AckMessage, MsgError, RequestMessage, RequestMode, ResponseMessage, SelectionMessage, Strategy,
+    AckMessage, MsgError, RequestMessage, RequestMode, ResponseMessage, SelectionMessage,
+    SelectionProviderEntry, Strategy, reason, selection_token_proof_hash,
 };
 pub use tokens::{PendingCoordination, PendingProviderTokens, ProviderToken, TokenError};
 
