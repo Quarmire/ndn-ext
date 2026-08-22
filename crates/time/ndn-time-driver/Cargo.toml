@@ -17,5 +17,12 @@ ndn-frame-io = { workspace = true, optional = true }
 # `wifi` adds a BeaconTransport over a monitor-wifi face's FrameIo — the on-air bridge.
 wifi = ["dep:ndn-frame-io"]
 
+[[example]]
+# Live on-air named-time node on a Realtek monitor-wifi radio (moved here from
+# ndn-radio-drivers in P2). Needs the wifi beacon-transport bridge.
+name = "named_time_node"
+required-features = ["wifi"]
+
 [dev-dependencies]
+ndn-radio-drivers = { path = "../../../../ndn-radio-drivers" }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }

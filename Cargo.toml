@@ -143,9 +143,11 @@ ndn-observability     = { path = "../ndn-rs/crates/platform/ndn-observability" }
 ndn-face-shm         = { path = "crates/faces/ndn-face-shm" }
 ndn-face-bluetooth   = { path = "crates/faces/ndn-face-bluetooth" }
 ndn-face-webrtc       = { path = "crates/faces/ndn-face-webrtc" }
-ndn-frame-io          = { path = "../ndn-rs/crates/core/ndn-frame-io" }
-ndn-env               = { path = "../ndn-rs/crates/core/ndn-env" }
-ndn-radio-hal         = { path = "../ndn-rs/crates/core/ndn-radio-hal" }
+# Radio foundation crates — relocated from ndn-rs crates/core to the radio
+# program's home in P2/D5 (ndn-rs <- ndn-radio-drivers <- ndn-ext is the DAG).
+ndn-frame-io          = { path = "../ndn-radio-drivers/crates/ndn-frame-io" }
+ndn-env               = { path = "../ndn-radio-drivers/crates/ndn-env" }
+ndn-radio-hal         = { path = "../ndn-radio-drivers/crates/ndn-radio-hal" }
 ndn-face-wifi-aware   = { path = "crates/faces/ndn-face-wifi-aware" }
 ndn-nan       = { path = "crates/faces/ndn-nan" }
 ndn-face-monitor-wifi = { path = "crates/faces/ndn-face-monitor-wifi" }

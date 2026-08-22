@@ -20,5 +20,14 @@ ndn-signals-core = { workspace = true }
 # `Band`/`RadioKind`/`TimingModel` (re-exported through `src/sense.rs`).
 ndn-radio-hal    = { workspace = true }
 
+[dev-dependencies]
+# Drives the live LoRa radio in examples/lora_cognition.rs (moved here from
+# ndn-radio-drivers in P2 — this direction, ext -> radio-drivers, is the DAG).
+ndn-radio-drivers = { path = "../../../../ndn-radio-drivers", features = ["lora"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+
+[[example]]
+name = "lora_cognition"
+
 [lints]
 workspace = true
