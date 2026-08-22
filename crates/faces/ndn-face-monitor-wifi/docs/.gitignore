@@ -16,6 +16,7 @@
 # cannot see is doctrine that cannot object.
 *
 !.gitignore
+!INDEX.md
 !named-radio.md
 !named-radio-vision-frontier.md
 !RADIO_SUBSYSTEM.md

@@ -5,7 +5,8 @@
 //! ([`FrameIo`] data plane / [`RadioKnobs`] control plane), how a radio is a
 //! *pool of capability* rather than an IP interface, how this binds to `ndn-rs`,
 //! the per-chip device details, and the recipe for adding a backend. (That file
-//! is a local staging note and is gitignored — it is not in a clone.)
+//! is tracked in-tree; `docs/INDEX.md` maps this directory's docs and their
+//! reading order.)
 //!
 //! **Doctrine: see `docs/named-radio.md`** (tracked), with the frontier ideas in
 //! `docs/named-radio-vision-frontier.md` and the authoritative correction in

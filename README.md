@@ -5,6 +5,8 @@ everything non-standard or optional, grouped by domain:
 
 - `crates/faces/` — non-standard faces: serial, SHM, Bluetooth, AF_XDP, QUIC,
   WebSocket, WebRTC, WebTransport, monitor-mode Wi-Fi, BLE-adv, Wi-Fi Aware, LoRa, …
+  (named-radio docs index:
+  [`ndn-face-monitor-wifi/docs/INDEX.md`](crates/faces/ndn-face-monitor-wifi/docs/INDEX.md))
 - `crates/service/` — the service/RPC stack: `#[ndn_service]` macro, carrier seam,
   Tier-0 RPC, NDNSF compat, lease/session (strategic — see workspace STATE.md)
 - `crates/streams/` — stream sessions over the service seam
