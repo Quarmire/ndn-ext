@@ -42,7 +42,7 @@ ndn-store        = { workspace = true }
 ndn-foundation-types = { workspace = true }
 # The four userspace USB Wi-Fi driver backends, lifted into their own crate.
 # Pulled only by the `libusb-backend` feature; re-exported from `lib.rs`.
-ndn-radio-drivers = { path = "../../../../ndn-radio-drivers", optional = true }
+ndn-radio-drivers = { git = "https://github.com/Quarmire/ndn-radio-drivers", tag = "v0.1.0-alpha.3", optional = true }
 # The pure cross-layer cognitive control plane this face is the actuator/seam for.
 ndn-radio-cognition = { workspace = true }
 # Link-layer FEC: the systematic K-of-N codec only (no `endpoint` → no engine).
