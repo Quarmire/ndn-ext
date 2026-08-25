@@ -22,6 +22,7 @@ bw16 = ["dep:ndn-radio-drivers", "ndn-radio-drivers/bw16"]
 dev-examples = []
 
 [dependencies]
+portable-atomic = { workspace = true }
 ndn-transport    = { workspace = true }
 ndn-frame-io     = { workspace = true }
 # LP fragment + TLV parsing: the producer's per-Data-name split addressing peeks the
@@ -79,6 +80,10 @@ ndn-coding = { path = "../../coding/ndn-coding", default-features = false, featu
 ndn-nan = { workspace = true }
 ndn-nan-core = { workspace = true }
 ndn-face-wifi-aware = { workspace = true }
+
+[[example]]
+name = "c5_slot"
+required-features = ["bw16"]
 
 [[example]]
 name = "airtime_ab_onair"
