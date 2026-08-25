@@ -128,7 +128,7 @@ pub use ndn_radio_drivers::{
 // The BW16 (RTL8720DN) serial-bridged backend — a dual-band 802.11 node driven
 // over USB-serial, usable under a MonitorWifiFace exactly like the USB backends.
 #[cfg(feature = "bw16")]
-pub use ndn_radio_drivers::Bw16SerialBackend;
+pub use ndn_radio_drivers::{Bw16SerialBackend, Esp32SerialBackend};
 
 mod control;
 
@@ -1337,7 +1337,7 @@ mod tests {
         /// records that the override ran, plus how many frames it was handed at once.
         struct AggregatingBackend {
             batches: std::sync::Mutex<Vec<usize>>,
-            singles: std::sync::atomic::AtomicU64,
+            singles: portable_atomic::AtomicU64,
         }
 
         #[async_trait::async_trait]
@@ -1360,7 +1360,7 @@ mod tests {
 
         let backend = Arc::new(AggregatingBackend {
             batches: std::sync::Mutex::new(Vec::new()),
-            singles: std::sync::atomic::AtomicU64::new(0),
+            singles: portable_atomic::AtomicU64::new(0),
         });
         let face = MonitorWifiFace::new(FaceId(1), backend.clone())
             .with_amsdu_batching(8, Duration::from_millis(5));

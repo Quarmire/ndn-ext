@@ -16,6 +16,13 @@ path = "src/main.rs"
 # Bind a real userspace USB Wi-Fi backend (RTL8822E) as the node's radio, so the
 # control plane ACTs + SENSEs on-air instead of via the no-op actuator.
 libusb-backend = ["ndn-face-monitor-wifi/libusb-backend"]
+# Bind an ESP32-C5 (serial-bridge, native USB-Serial-JTAG) as the node's radio face — see the c5_relay example.
+bw16 = ["ndn-face-monitor-wifi/bw16"]
+
+# The C5 relay example needs the serial backend (Esp32SerialBackend), so gate it on the bw16 feature.
+[[example]]
+name = "c5_relay"
+required-features = ["bw16"]
 
 [dependencies]
 ndn-engine          = { workspace = true }
