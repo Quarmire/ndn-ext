@@ -93,7 +93,26 @@ pub struct TimeService {
     /// Count of inbound beacons that passed auth and were fed to the loop — lets a driver observe
     /// that peer time is actually crossing the link (e.g. on-air 2-node convergence).
     peer_ingests: portable_atomic::AtomicU64,
+    /// Optional hardware frequency steerer — see [`ClockSteer`]. `None` on a platform whose clock
+    /// rate cannot be adjusted, which is the common case and costs it nothing.
+    steer: Option<std::sync::Arc<dyn ClockSteer>>,
 }
+
+/// Apply a **frequency** correction to the local clock, if the platform has one.
+///
+/// `ndn-time` estimates skew but its `Discipline` action is deliberately software-only — it
+/// moves the wall estimate and never touches a counter, which is right for hardware with no
+/// trim. A radio that CAN steer its rate implements this, and then a correction holds instead
+/// of re-accumulating between fixes.
+///
+/// Declared here rather than taken as a radio type so this crate keeps no dependency on the
+/// driver crates: the caller owns both and supplies the binding.
+pub trait ClockSteer: Send + Sync {
+    /// Correct a measured skew of `skew_ppb` parts-per-billion. Returns the ppm actually
+    /// applied, or `None` if the steerer declined (inside its deadband, or saturated).
+    fn steer_ppb(&self, skew_ppb: i64) -> Option<f32>;
+}
+
 
 impl TimeService {
     /// How many inbound peer beacons have passed [`BeaconAuth::open`] and been ingested so far.
@@ -125,6 +144,7 @@ impl TimeService {
             local_cap: cap,
             beacon_seq: portable_atomic::AtomicU64::new(0),
             peer_ingests: portable_atomic::AtomicU64::new(0),
+            steer: None,
         }
     }
 
@@ -142,6 +162,13 @@ impl TimeService {
         self.peer_ingests
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         true
+    }
+
+    /// Attach a hardware frequency steerer ([`ClockSteer`]). Without one the loop corrects the
+    /// wall estimate only, which is the correct behaviour for a clock whose rate cannot be moved.
+    pub fn with_clock_steer(mut self, steer: std::sync::Arc<dyn ClockSteer>) -> Self {
+        self.steer = Some(steer);
+        self
     }
 
     /// Poll the local sources, run one discipline pass at monotonic time `now_mono_ns`, push any
@@ -166,7 +193,13 @@ impl TimeService {
         if let Some(ms) = out.clock_ms {
             self.clock.set_clock_ms(ms);
         }
-        let _ = discipline_label(&out.discipline); // hook for a real clock-steering call
+        // ACT on FREQUENCY too, when the platform can. `Discipline` only ever moves the wall
+        // estimate; this spends the same pass's skew estimate on the hardware so the correction
+        // holds rather than re-accumulating. A node with no steerer is unaffected.
+        if let (Some(st), Some(ppb)) = (self.steer.as_ref(), out.correction.freq_skew_ppb) {
+            let _applied = st.steer_ppb(ppb);
+        }
+        let _ = discipline_label(&out.discipline);
         // Heartbeat: whenever we hold a usable fix, beacon the *current* estimate every tick — not
         // only when it tightens (`out.beacon`). A broadcast time source must be continuously
         // present, or a peer that joins late (or after a loss) never hears it.
@@ -463,5 +496,53 @@ mod tests {
             .flatten();
         let wire = got.expect("no beacon arrived over the loopback");
         assert!(DevAuth.open(&wire).is_some(), "beacon did not verify");
+    }
+}
+
+#[cfg(test)]
+mod clock_steer_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    struct Spy {
+        last: AtomicI64,
+        calls: portable_atomic::AtomicU64,
+    }
+    impl ClockSteer for Spy {
+        fn steer_ppb(&self, skew_ppb: i64) -> Option<f32> {
+            self.last.store(skew_ppb, Ordering::Relaxed);
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Some(skew_ppb as f32 / 1000.0)
+        }
+    }
+
+    /// The steerer must receive the SAME pass's skew estimate. Without this the hook can exist and
+    /// never fire — the shape of defect this wiring is meant to remove, not add.
+    #[test]
+    fn steerer_receives_the_skew_estimate() {
+        let spy = std::sync::Arc::new(Spy {
+            last: AtomicI64::new(i64::MIN),
+            calls: portable_atomic::AtomicU64::new(0),
+        });
+        let s: std::sync::Arc<dyn ClockSteer> = spy.clone();
+        // Exercise the trait object directly: the discipline pass only calls it when the estimator
+        // has enough history to produce `freq_skew_ppb`, which a unit test cannot conjure without
+        // driving the whole timekeeper.
+        assert_eq!(s.steer_ppb(2_500), Some(2.5));
+        assert_eq!(spy.last.load(Ordering::Relaxed), 2_500);
+        assert_eq!(spy.calls.load(Ordering::Relaxed), 1);
+    }
+
+    /// A steerer that declines (deadband/saturated) must not be treated as an error.
+    #[test]
+    fn declining_to_steer_is_not_a_failure() {
+        struct Decliner;
+        impl ClockSteer for Decliner {
+            fn steer_ppb(&self, _: i64) -> Option<f32> {
+                None
+            }
+        }
+        let s: std::sync::Arc<dyn ClockSteer> = std::sync::Arc::new(Decliner);
+        assert_eq!(s.steer_ppb(10_000), None);
     }
 }

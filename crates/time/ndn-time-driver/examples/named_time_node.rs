@@ -8,7 +8,10 @@
 //!   chip = `8733` (RTL8731BU/8733BU, the *radiating* transmitter) or `8812` (RTL8812EU/8822E).
 //!   pid_hex pins a specific 8812-class dongle when several are attached (e.g. `a81a`).
 use ndn_frame_io::{FrameFormat, FrameIo};
-use ndn_radio_drivers::{LibUsbRtl88xxBackend, PowerTracker, Rtl8733buBackend, Rtl8812auBackend};
+use ndn_radio_drivers::{
+    FreqAction, FreqDiscipline, LibUsbRtl88xxBackend, PowerTracker, Rtl8733buBackend, Rtl8812auBackend,
+};
+use ndn_time_driver::ClockSteer;
 use ndn_time::{ClockCapability, KeyId, TimePolicy};
 use ndn_time_driver::wifi::FrameIoTransport;
 use ndn_time_driver::{ClockSink, DevAuth, TimeService};
@@ -20,6 +23,26 @@ struct PrintClock(Mutex<Option<i64>>);
 impl ClockSink for PrintClock {
     fn set_clock_ms(&self, ms: i64) {
         *self.0.lock().unwrap() = Some(ms);
+    }
+}
+
+/// Binds the driver-side [`FreqDiscipline`] to the time layer's [`ClockSteer`] hook.
+///
+/// Lives here, in the binary that owns both, so neither crate has to depend on the other: the time
+/// layer computes skew and knows nothing about radios; the driver actuates and knows nothing about
+/// time discipline.
+struct RadioSteer(Mutex<FreqDiscipline>);
+
+impl ClockSteer for RadioSteer {
+    fn steer_ppb(&self, skew_ppb: i64) -> Option<f32> {
+        match self.0.lock().unwrap().update_ppb(skew_ppb) {
+            // Report only a correction that actually moved the hardware. `Held` means the residual
+            // is smaller than one trim step and is NOT correctable — reporting it as applied would
+            // tell the loop it did something it did not.
+            Ok(FreqAction::Steered { applied_ppm, .. })
+            | Ok(FreqAction::Saturated { applied_ppm, .. }) => Some(applied_ppm),
+            _ => None,
+        }
     }
 }
 
@@ -37,11 +60,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // busy channel isn't dropped between reads. The 8733b brings up a *radiating* TX with
         // thermal power-tracking (kept alive for the run); the 8812-class is RX-capable monitor.
         let mut _tracker: Option<PowerTracker> = None;
+        // Kept alongside the FrameIo handle so the frequency loop can steer the same radio's clock.
+        let mut steerer: Option<Arc<dyn ClockSteer>> = None;
         let radio: Arc<dyn FrameIo> = if chip == "8733" {
             let r = Arc::new(Rtl8733buBackend::open()?);
             _tracker = Some(r.bring_up_tx_tracked(ch)?);
             r.spawn_rx_pump(4);
-            println!("named-time node {id} up: 8733b ch{ch} (radiating TX), RX pump depth 4");
+            // FREQUENCY discipline, not just offset: this part has a crystal trim, so the loop's
+            // skew estimate can be spent on the hardware and the correction HOLDS instead of
+            // re-accumulating between fixes. `FreqDiscipline::new` returns None for a radio that
+            // cannot steer, which is how a node discovers that honestly.
+            steerer = FreqDiscipline::new(r.clone() as Arc<dyn ndn_radio_drivers::RadioTime>)
+                .map(|d| Arc::new(RadioSteer(Mutex::new(d))) as Arc<dyn ClockSteer>);
+            println!(
+                "named-time node {id} up: 8733b ch{ch} (radiating TX), RX pump depth 4, \
+                 clock steering {}",
+                if steerer.is_some() { "ENABLED" } else { "unavailable" }
+            );
             r
         } else if chip == "8812au" {
             // RTL8812AU — full-IQK great TX/RX. Route it through RawNdn framing (its default is
@@ -85,6 +120,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Arc::new(DevAuth),
             clock.clone(),
         ));
+        // Attach the hardware frequency steerer when the radio has one. Without it the loop still
+        // corrects the wall estimate — the software-only path — so a node with no trim is unchanged.
+        let svc = match steerer {
+            Some(st) => Arc::new(Arc::try_unwrap(svc).ok().expect("sole owner").with_clock_steer(st)),
+            None => svc,
+        };
         // Run the live loop (RX-ingest task + cadence tick/beacon) and report status each second:
         // clock_ms is the disciplined estimate, peer_beacons_heard counts beacons heard over the air.
         let runner = svc.clone();
