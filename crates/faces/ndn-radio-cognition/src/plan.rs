@@ -95,6 +95,13 @@ pub struct WifiRate {
     pub stbc: bool,
     pub csd: bool,
     pub ldpc: bool,
+    /// Transmit as 802.11ax (HE) — required for the two HE reach levers below. Only actuated on a radio
+    /// that advertises [`RadioCapability::he_cap`](ndn_radio_hal::RadioCapability::he_cap).
+    pub he: bool,
+    /// HE **Dual-Carrier Modulation** — a frequency-diversity reach lever (halves rate, ~few dB robustness).
+    pub dcm: bool,
+    /// HE **Extended-Range Single-User** — the strongest single-frame reach lever (~2–4 dB sensitivity).
+    pub er_su: bool,
     /// Target A-MSDU size in MSDUs (0/None = no aggregation).
     pub amsdu_msdus: Option<u16>,
 }
@@ -159,6 +166,18 @@ impl TxParams {
     /// Wi-Fi LDPC flag.
     pub fn ldpc(&self) -> bool {
         matches!(self.rate, RateParams::Wifi(w) if w.ldpc)
+    }
+    /// Wi-Fi 802.11ax (HE) flag — the gate for the DCM / ER-SU reach levers.
+    pub fn he(&self) -> bool {
+        matches!(self.rate, RateParams::Wifi(w) if w.he)
+    }
+    /// Wi-Fi HE Dual-Carrier-Modulation reach lever.
+    pub fn dcm(&self) -> bool {
+        matches!(self.rate, RateParams::Wifi(w) if w.dcm)
+    }
+    /// Wi-Fi HE Extended-Range-SU reach lever.
+    pub fn er_su(&self) -> bool {
+        matches!(self.rate, RateParams::Wifi(w) if w.er_su)
     }
     /// Wi-Fi A-MSDU size, or `None` for a non-Wi-Fi radio.
     pub fn amsdu_msdus(&self) -> Option<u16> {

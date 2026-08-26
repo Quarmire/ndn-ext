@@ -368,6 +368,9 @@ impl RatePolicy {
                 nss: tp.nss().unwrap_or(1),
                 stbc: tp.stbc(),
                 ldpc: tp.ldpc(),
+                he: tp.he(),
+                dcm: tp.dcm(),
+                er_su: tp.er_su(),
             };
         }
         match self.policy {

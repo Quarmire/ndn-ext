@@ -397,6 +397,9 @@ impl RadioActuators for MediumActuator {
                 nss: p.nss().unwrap_or(1),
                 stbc: p.stbc(),
                 ldpc: p.ldpc(),
+                he: p.he(),
+                dcm: p.dcm(),
+                er_su: p.er_su(),
             };
             self.io.set_rate(mcs).map_err(to_err)?;
         }

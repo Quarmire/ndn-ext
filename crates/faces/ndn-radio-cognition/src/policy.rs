@@ -552,6 +552,15 @@ impl RadioPolicy {
         let stbc = div && robust && nss == 1 && cap.max_nss() >= 2 && weak;
         let csd = div && nss == 1 && weak && !stbc;
 
+        // 802.11ax reach levers — the strongest single-frame reach an HE radio (e.g. the ESP32-C5) offers,
+        // above HT+STBC+LDPC. Reserved for the max-reach corner (robust send on a *weak* link) because HE
+        // ER-SU is only decodable by an HE receiver (like VHT vs 11n) and ~halves the rate: exactly the
+        // trade a struggling link wants, wrong for a healthy one. The worst-overheard-receiver legacy gate
+        // still forces legacy downstream when a legacy-only RX is advertised, so this can't strand one.
+        let he = cap.he_cap() && robust && weak;
+        let er_su = he; // extended-range single-user: the ~2–4 dB sensitivity lever
+        let dcm = he; // dual-carrier modulation: frequency-diversity robustness
+
         // A-MSDU: aggregate only for bulk on a clean link (and it interleaves with
         // FEC at MSDU granularity downstream — not mutually exclusive).
         let amsdu_msdus = if ctx.priority == Priority::Bulk && !robust {
@@ -563,13 +572,17 @@ impl RadioPolicy {
         TxParams {
             rate: RateParams::Wifi(WifiRate {
                 mcs: Some(mcs),
-                vht: cap.max_bw() >= 2,
+                // HE and VHT are alternative modes — when the HE reach corner fires, the frame is HE, not VHT.
+                vht: !he && cap.max_bw() >= 2,
                 nss: Some(nss),
                 short_gi: good_snr,
                 bw: Some(bw),
                 stbc,
                 csd,
                 ldpc,
+                he,
+                dcm,
+                er_su,
                 amsdu_msdus,
             }),
             link_fec_redundancy: self.fec_redundancy(radio, ctx, view, channel, receivers, deficit),
