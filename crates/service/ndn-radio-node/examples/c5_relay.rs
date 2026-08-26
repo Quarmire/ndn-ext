@@ -10,7 +10,7 @@
 //!
 //! ```sh
 //! C5_PORT=/dev/cu.usbmodem1101 NODE_CH=1 TICKS=40 \
-//!   cargo run --example c5_relay --features bw16 -p ndn-radio-node
+//!   cargo run --example c5_relay --features serial-radio -p ndn-radio-node
 //! ```
 use std::time::Duration;
 

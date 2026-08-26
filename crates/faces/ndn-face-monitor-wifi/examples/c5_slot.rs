@@ -10,7 +10,7 @@
 //!
 //! ```sh
 //! C5_A=/dev/cu.usbmodem1101 C5_B=/dev/cu.usbmodem4 \
-//!   cargo run --example c5_slot --features bw16 -p ndn-face-monitor-wifi
+//!   cargo run --example c5_slot --features serial-radio -p ndn-face-monitor-wifi
 //! ```
 use std::time::Duration;
 

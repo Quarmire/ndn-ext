@@ -13,9 +13,9 @@ classification = "extension"
 # without an AF_PACKET monitor interface (macOS / non-rtl8812au Linux). Pulls
 # rusb (needs libusb-1.0 at build time). Scaffold: see src/libusb_rtl88xx.rs.
 libusb-backend = ["dep:ndn-radio-drivers", "dep:rusb", "dep:libusb1-sys"]
-# The BW16 (RTL8720DN) serial-bridged backend, re-exported for use under a
-# MonitorWifiFace like any other WiFi backend.
-bw16 = ["dep:ndn-radio-drivers", "ndn-radio-drivers/bw16"]
+# The serial-bridged 802.11 backend (BW16 / ESP32-C5), re-exported for use under
+# a MonitorWifiFace like any other WiFi backend.
+serial-radio = ["dep:ndn-radio-drivers", "ndn-radio-drivers/serial-radio"]
 # No-op gate for the examples/ directory: ~79 one-off hardware bring-up /
 # campaign probe binaries. They are not part of default builds (CI's
 # `--all-targets` skips them); opt in with `--features dev-examples`.
@@ -83,7 +83,7 @@ ndn-face-wifi-aware = { workspace = true }
 
 [[example]]
 name = "c5_slot"
-required-features = ["bw16"]
+required-features = ["serial-radio"]
 
 [[example]]
 name = "airtime_ab_onair"

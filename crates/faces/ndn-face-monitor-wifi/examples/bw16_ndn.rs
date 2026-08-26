@@ -3,9 +3,9 @@
 //! second `MonitorWifiFace` (over the RTL8812EU) — two independent radio backends,
 //! the same face, a genuine NDN packet on 5 GHz.
 //!
-//!   cargo run --features bw16,libusb-backend --example bw16_ndn -- /dev/cu.usbserial-1110 149
+//!   cargo run --features serial-radio,libusb-backend --example bw16_ndn -- /dev/cu.usbserial-1110 149
 
-#[cfg(all(feature = "bw16", feature = "libusb-backend"))]
+#[cfg(all(feature = "serial-radio", feature = "libusb-backend"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -15,7 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Hand-encode a minimal NDN Data packet: Name + Content + a DigestSha256
 /// SignatureInfo/Value (dummy) — enough for `Data::decode` to round-trip.
-#[cfg(all(feature = "bw16", feature = "libusb-backend"))]
+#[cfg(all(feature = "serial-radio", feature = "libusb-backend"))]
 fn build_data(components: &[&[u8]], content: &[u8]) -> bytes::Bytes {
     let mut name = Vec::new();
     for c in components {
@@ -41,9 +41,9 @@ fn build_data(components: &[&[u8]], content: &[u8]) -> bytes::Bytes {
     bytes::Bytes::from(pkt)
 }
 
-#[cfg(all(feature = "bw16", feature = "libusb-backend"))]
+#[cfg(all(feature = "serial-radio", feature = "libusb-backend"))]
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    use ndn_face_monitor_wifi::{Bw16SerialBackend, LibUsbRtl88xxBackend, MonitorWifiFace};
+    use ndn_face_monitor_wifi::{SerialRadioBackend, LibUsbRtl88xxBackend, MonitorWifiFace};
     use ndn_packet::Data;
     use ndn_transport::{FaceId, Transport};
     use std::sync::Arc;
@@ -55,14 +55,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let rx_port = a.next(); // optional: a second BW16 serial port as the receiver
 
     // Sender: the BW16 under a MonitorWifiFace.
-    let bw = Bw16SerialBackend::open(&port)?;
+    let bw = SerialRadioBackend::open(&port)?;
     bw.set_channel(ch)?;
     let tx_face = MonitorWifiFace::new(FaceId(1), Arc::new(bw));
 
     // Receiver: a second BW16 if given, else the RTL8812EU (pumped for full-rate RX).
     let rx_face = match &rx_port {
         Some(p) => {
-            let rb = Bw16SerialBackend::open(p)?;
+            let rb = SerialRadioBackend::open(p)?;
             rb.set_channel(ch)?;
             println!("(receiver: second BW16 {p})");
             MonitorWifiFace::new(FaceId(2), Arc::new(rb))
@@ -76,7 +76,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let data = build_data(&[b"ndn", b"bw16"], b"hello-over-bw16-radio");
+    let data = build_data(&[b"ndn", b"serial-radio"], b"hello-over-bw16-radio");
     println!(
         "BW16 face → 8812EU face on ch{ch}: sending NDN Data /ndn/bw16 ({} B)…",
         data.len()
@@ -122,7 +122,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(not(all(feature = "bw16", feature = "libusb-backend")))]
+#[cfg(not(all(feature = "serial-radio", feature = "libusb-backend")))]
 fn main() {
-    eprintln!("build with --features bw16,libusb-backend");
+    eprintln!("build with --features serial-radio,libusb-backend");
 }

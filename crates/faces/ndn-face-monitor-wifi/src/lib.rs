@@ -125,10 +125,10 @@ pub use ndn_radio_drivers::{
     Rtl8812auBackend, Rtl8821cuBackend, open_ath9k, open_named_radio,
 };
 
-// The BW16 (RTL8720DN) serial-bridged backend — a dual-band 802.11 node driven
+// The serial-bridged 802.11 backend (BW16 / ESP32-C5) — a raw 802.11 node driven
 // over USB-serial, usable under a MonitorWifiFace exactly like the USB backends.
-#[cfg(feature = "bw16")]
-pub use ndn_radio_drivers::{Bw16SerialBackend, Esp32SerialBackend};
+#[cfg(feature = "serial-radio")]
+pub use ndn_radio_drivers::{SerialRadioBackend, Esp32SerialBackend};
 
 mod control;
 
