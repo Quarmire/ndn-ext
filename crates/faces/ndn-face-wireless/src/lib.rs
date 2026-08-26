@@ -106,6 +106,114 @@ impl<F: Fn(&[u8]) -> ReachClass + Send + Sync + 'static> BearerPolicy for ReachC
     }
 }
 
+/// Adapt **any** `ndn_transport::Transport` — a BLE `AdvBackend`-backed face, a Wi-Fi face, the shared mux —
+/// into a [`WirelessBearer`]. The Transport already sends/receives *whole packets with its own bearer-native
+/// framing*; this just attaches the `(kind, mtu, range_rank)` metadata the reach lever needs. Generic because
+/// `Transport` uses native `async fn` (not object-safe) — build one per concrete backend; it erases to
+/// `Arc<dyn WirelessBearer>` at the face boundary.
+pub struct TransportBearer<T: Transport + Send + Sync + 'static> {
+    inner: T,
+    kind: BearerKind,
+    mtu: usize,
+    range_rank: u8,
+}
+
+impl<T: Transport + Send + Sync + 'static> TransportBearer<T> {
+    /// Wrap `inner`; the MTU is its `send_mtu()` (or unbounded if it reports none — override with
+    /// [`with_mtu`](Self::with_mtu) to the bearer's true airtime-optimal ceiling).
+    pub fn new(inner: T, kind: BearerKind, range_rank: u8) -> Self {
+        let mtu = inner.send_mtu().unwrap_or(usize::MAX);
+        Self { inner, kind, mtu, range_rank }
+    }
+    /// Override the advertised MTU (the reach lever's throughput signal).
+    pub fn with_mtu(mut self, mtu: usize) -> Self {
+        self.mtu = mtu;
+        self
+    }
+}
+
+#[async_trait]
+impl<T: Transport + Send + Sync + 'static> WirelessBearer for TransportBearer<T> {
+    fn kind(&self) -> BearerKind {
+        self.kind
+    }
+    fn mtu(&self) -> usize {
+        self.mtu
+    }
+    fn range_rank(&self) -> u8 {
+        self.range_rank
+    }
+    async fn send(&self, wire: Bytes) -> Result<(), FaceError> {
+        self.inner.send_bytes(wire).await
+    }
+    async fn recv(&self) -> Result<Bytes, FaceError> {
+        self.inner.recv_bytes().await
+    }
+}
+
+/// A **name-computed** [`BearerPolicy`] (the HOW-WELL facet made concrete): extract the packet's NDN name and
+/// map it to a [`ReachClass`] by longest-prefix rule, then select the bearer that class wants. Unwraps an LP
+/// frame to reach the Interest/Data name; an unparseable wire falls to `default`.
+pub struct NameReachClassifier {
+    rules: Vec<(ndn_packet::Name, ReachClass)>,
+    default: ReachClass,
+}
+
+impl NameReachClassifier {
+    pub fn new(default: ReachClass) -> Self {
+        Self { rules: Vec::new(), default }
+    }
+    /// Names under `prefix` get `class` (longest matching prefix wins).
+    pub fn rule(mut self, prefix: impl Into<ndn_packet::Name>, class: ReachClass) -> Self {
+        self.rules.push((prefix.into(), class));
+        self
+    }
+    /// The reach class of a wire (best-effort name extraction).
+    pub fn classify(&self, wire: &[u8]) -> ReachClass {
+        let Some(name) = wire_name(wire) else { return self.default };
+        self.rules
+            .iter()
+            .filter(|(p, _)| name.has_prefix(p))
+            .max_by_key(|(p, _)| p.components().len())
+            .map(|(_, c)| *c)
+            .unwrap_or(self.default)
+    }
+}
+
+impl BearerPolicy for NameReachClassifier {
+    fn select(&self, wire: &[u8], bearers: &[Arc<dyn WirelessBearer>]) -> SmallVec<[usize; 2]> {
+        if bearers.is_empty() {
+            return SmallVec::new();
+        }
+        match self.classify(wire) {
+            ReachClass::Redundant => (0..bearers.len()).collect(),
+            ReachClass::Robust => {
+                SmallVec::from_slice(&[(0..bearers.len()).max_by_key(|&i| bearers[i].range_rank()).unwrap()])
+            }
+            ReachClass::Throughput => {
+                SmallVec::from_slice(&[(0..bearers.len()).max_by_key(|&i| bearers[i].mtu()).unwrap()])
+            }
+        }
+    }
+}
+
+/// Best-effort NDN name from a wire: unwrap an LP frame if present, then decode as Interest or Data.
+fn wire_name(wire: &[u8]) -> Option<ndn_packet::Name> {
+    let raw = Bytes::copy_from_slice(wire);
+    let inner = if ndn_packet::lp::is_lp_packet(wire) {
+        ndn_packet::lp::LpPacket::decode(raw).ok()?.fragment?
+    } else {
+        raw
+    };
+    if let Ok(i) = ndn_packet::Interest::decode(inner.clone()) {
+        return Some((*i.name).clone());
+    }
+    if let Ok(d) = ndn_packet::Data::decode(inner) {
+        return Some((*d.name).clone());
+    }
+    None
+}
+
 /// Bounded whole-object dedup ring — the cross-bearer RX filter. Keyed on the packet bytes (no host identity);
 /// loss of the ring only re-admits a duplicate (a performance cost, never a correctness one — §7 soft-state).
 struct Dedup {

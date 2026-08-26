@@ -213,3 +213,152 @@ async fn no_single_face_mtu_bearer_native_fragmentation() {
     let got = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv_bytes()).await.unwrap().unwrap();
     assert_eq!(got, big, "the oversize packet reassembled from bearer-native BLE fragments");
 }
+
+// --- adapter / classifier / engine-integration ---
+
+/// A whole-packet loopback **Transport** over a shared bus — to wrap in [`TransportBearer`] and to serve as the
+/// bearer under a real engine's WirelessFace.
+#[derive(Clone)]
+struct WholeBus {
+    tx: broadcast::Sender<(u64, Bytes)>,
+}
+impl WholeBus {
+    fn new() -> Arc<Self> {
+        Arc::new(Self { tx: broadcast::channel(4096).0 })
+    }
+}
+
+struct LoopbackTransport {
+    id: u64,
+    bus: Arc<WholeBus>,
+    rx: AsyncMutex<broadcast::Receiver<(u64, Bytes)>>,
+}
+impl LoopbackTransport {
+    fn new(bus: &Arc<WholeBus>) -> Self {
+        Self { id: BEARER_IDS.fetch_add(1, Ordering::Relaxed), bus: Arc::clone(bus), rx: AsyncMutex::new(bus.tx.subscribe()) }
+    }
+}
+impl Transport for LoopbackTransport {
+    fn id(&self) -> FaceId {
+        FaceId(0)
+    }
+    fn kind(&self) -> ndn_transport::FaceKind {
+        ndn_transport::FaceKind::Wfb
+    }
+    fn remote_uri(&self) -> Option<String> {
+        Some("loop://".into())
+    }
+    fn link_type(&self) -> ndn_transport::LinkType {
+        ndn_transport::LinkType::AdHoc
+    }
+    fn send_mtu(&self) -> Option<usize> {
+        Some(65535)
+    }
+    async fn send_bytes(&self, wire: Bytes) -> Result<(), FaceError> {
+        let _ = self.bus.tx.send((self.id, wire));
+        Ok(())
+    }
+    async fn recv_bytes(&self) -> Result<Bytes, FaceError> {
+        let mut rx = self.rx.lock().await;
+        loop {
+            let (src, w) = rx.recv().await.map_err(|_| FaceError::Closed)?;
+            if src != self.id {
+                return Ok(w);
+            }
+        }
+    }
+}
+
+fn wifi_bearer(bus: &Arc<WholeBus>) -> Arc<dyn WirelessBearer> {
+    Arc::new(TransportBearer::new(LoopbackTransport::new(bus), BearerKind::Wifi, 1))
+}
+
+/// `TransportBearer` turns any `Transport` into a bearer the face multiplexes.
+#[tokio::test]
+async fn transport_bearer_adapts_any_transport() {
+    let bus = WholeBus::new();
+    let a = WirelessFace::broadcast(FaceId(1), vec![wifi_bearer(&bus)]);
+    let b = WirelessFace::broadcast(FaceId(2), vec![wifi_bearer(&bus)]);
+    let obj = ndn_wire(b"/t", b"hello");
+    a.send_bytes(obj.clone()).await.unwrap();
+    let got = tokio::time::timeout(std::time::Duration::from_secs(1), b.recv_bytes()).await.unwrap().unwrap();
+    assert_eq!(got, obj);
+}
+
+/// The name-computed classifier maps real Interest names to reach classes by longest-prefix rule.
+#[tokio::test]
+async fn name_reach_classifier_maps_names_to_classes() {
+    use ndn_packet::encode::InterestBuilder;
+    use ndn_packet::Name;
+    let clf = NameReachClassifier::new(ReachClass::Redundant)
+        .rule("/emergency".parse::<Name>().unwrap(), ReachClass::Robust)
+        .rule("/video".parse::<Name>().unwrap(), ReachClass::Throughput);
+    let emerg = InterestBuilder::new("/emergency/fire/1".parse::<Name>().unwrap()).build();
+    let vid = InterestBuilder::new("/video/stream/9".parse::<Name>().unwrap()).build();
+    let other = InterestBuilder::new("/misc/x".parse::<Name>().unwrap()).build();
+    assert_eq!(clf.classify(&emerg), ReachClass::Robust, "/emergency → Robust (long reach)");
+    assert_eq!(clf.classify(&vid), ReachClass::Throughput, "/video → Throughput (high MTU)");
+    assert_eq!(clf.classify(&other), ReachClass::Redundant, "unmatched → default");
+}
+
+/// The payoff: a real `ForwarderEngine` forwards a full NDN roundtrip over ONE `WirelessFace` (the single
+/// wireless face replacing per-bearer faces). Consumer engine routes the prefix out its wireless face; the
+/// producer engine, over its own wireless face on the shared bus, serves the Data back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn engine_forwards_a_roundtrip_over_one_wireless_face() {
+    use ndn_app::{EngineAppExt, EngineBuilder};
+    use ndn_engine::builder::EngineConfig;
+    use ndn_packet::encode::DataBuilder;
+    use ndn_packet::Name;
+    use tokio_util::sync::CancellationToken;
+
+    let bus = WholeBus::new();
+    let prefix: Name = "/ndn/wl/eng".parse().unwrap();
+
+    let (engine_p, shutdown_p) = EngineBuilder::new(EngineConfig::default())
+        .face(WirelessFace::broadcast(FaceId(100), vec![wifi_bearer(&bus)]))
+        .build()
+        .await
+        .unwrap();
+    let cancel_p = CancellationToken::new();
+    let producer = engine_p.register_producer(prefix.clone(), cancel_p.child_token());
+
+    let (engine_c, shutdown_c) = EngineBuilder::new(EngineConfig::default())
+        .face(WirelessFace::broadcast(FaceId(200), vec![wifi_bearer(&bus)]))
+        .build()
+        .await
+        .unwrap();
+    engine_c.fib().add_nexthop(&prefix, FaceId(200), 0);
+    let cancel_c = CancellationToken::new();
+    let mut consumer = engine_c.app_consumer(cancel_c.child_token());
+
+    let payload = b"one wireless face, N bearers below".to_vec();
+    let want = payload.clone();
+    let producer_task = tokio::spawn(async move {
+        let _ = producer
+            .serve(move |interest, responder| {
+                let name = (*interest.name).clone();
+                let body = payload.clone();
+                async move {
+                    responder.respond_bytes(DataBuilder::new(name, &body).build()).await.ok();
+                }
+            })
+            .await;
+    });
+
+    let mut got = None;
+    for _ in 0..40u32 {
+        if let Ok(v) = consumer.fetch_unverified(prefix.clone()).await {
+            got = Some(v.trust_unchecked());
+            break;
+        }
+    }
+    cancel_p.cancel();
+    cancel_c.cancel();
+    producer_task.abort();
+
+    let data = got.expect("roundtrip did not complete over the wireless face");
+    assert_eq!(data.content().map(|c| c.to_vec()).unwrap_or_default(), want);
+    let _ = shutdown_p.shutdown().await;
+    let _ = shutdown_c.shutdown().await;
+}
