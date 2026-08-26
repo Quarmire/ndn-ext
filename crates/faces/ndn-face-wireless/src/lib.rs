@@ -22,6 +22,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -59,6 +60,12 @@ pub trait WirelessBearer: Send + Sync + 'static {
 /// one bearer". Returns indices into the face's bearer list; empty ⇒ drop; multiple ⇒ macrodiversity.
 pub trait BearerPolicy: Send + Sync + 'static {
     fn select(&self, wire: &[u8], bearers: &[Arc<dyn WirelessBearer>]) -> SmallVec<[usize; 2]>;
+
+    /// RX feedback: the face calls this when a (deduped) object arrives on `bearer` — evidence that bearer
+    /// currently reaches the name's producer/region. A learning policy reinforces a per-prefix reach prior
+    /// here (the reach prior *selecting among bearers* — the seam the forwarding-under-flux testing found is
+    /// where prior accuracy matters). Default: stateless policies ignore it.
+    fn observe_delivery(&self, _wire: &[u8], _bearer: usize) {}
 }
 
 /// Default: transmit on **all** bearers (macrodiversity — the robust default). PIT + RX-dedup absorb the copies.
@@ -214,6 +221,103 @@ fn wire_name(wire: &[u8]) -> Option<ndn_packet::Name> {
     None
 }
 
+/// A **learning** [`BearerPolicy`] — the soft-prefix-reach prior applied to *bearer selection*. It holds a
+/// decaying per-`(prefix, bearer)` reach weight, reinforced from RX ([`observe_delivery`](BearerPolicy::
+/// observe_delivery)) — "Data for this prefix came back on that bearer" — and on TX it sends the name out the
+/// **highest-reach bearer** once one is trusted, or **all** bearers while the prefix is cold (exploration).
+/// Decay lets a producer that moves to another bearer be re-discovered (the warm bearer fades → re-explore).
+/// This is the culmination: in a *single* medium the prior's accuracy was delivery-neutral (defer+cancel did
+/// the work), so its payoff is *here*, choosing among bearers — exactly what the multi-producer test predicted.
+pub struct LearnedBearerPolicy {
+    prior: Mutex<std::collections::HashMap<u64, LearnedReach>>,
+    reinforce: f64,
+    tau: Duration,
+    /// Min reach weight to *trust* a bearer (below this the prefix is "cold" ⇒ explore all bearers).
+    threshold: f64,
+    prefix_depth: usize,
+}
+
+struct LearnedReach {
+    weights: Vec<f64>,
+    last: std::time::Instant,
+}
+
+impl LearnedBearerPolicy {
+    /// Defaults: `reinforce = 1.0`, `τ = 30 s`, `threshold = 0.5`, prefix depth 1.
+    pub fn new() -> Self {
+        Self {
+            prior: Mutex::new(std::collections::HashMap::new()),
+            reinforce: 1.0,
+            tau: Duration::from_secs(30),
+            threshold: 0.5,
+            prefix_depth: 1,
+        }
+    }
+    pub fn with_params(reinforce: f64, tau: Duration, threshold: f64, prefix_depth: usize) -> Self {
+        Self { prior: Mutex::new(std::collections::HashMap::new()), reinforce, tau, threshold, prefix_depth: prefix_depth.max(1) }
+    }
+
+    fn key(&self, wire: &[u8]) -> Option<u64> {
+        let name = wire_name(wire)?;
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for comp in name.components().iter().take(self.prefix_depth) {
+            for b in comp.value.as_ref() {
+                h ^= *b as u64;
+                h = h.wrapping_mul(0x0100_0000_01b3);
+            }
+            h ^= 0x2f;
+        }
+        Some(h)
+    }
+
+    fn decay(&self, r: &mut LearnedReach) {
+        let dt = r.last.elapsed().as_secs_f64();
+        if dt > 0.0 {
+            let f = (-dt / self.tau.as_secs_f64()).exp();
+            for w in &mut r.weights {
+                *w *= f;
+            }
+            r.last = std::time::Instant::now();
+        }
+    }
+}
+
+impl Default for LearnedBearerPolicy {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BearerPolicy for LearnedBearerPolicy {
+    fn select(&self, wire: &[u8], bearers: &[Arc<dyn WirelessBearer>]) -> SmallVec<[usize; 2]> {
+        let all = || (0..bearers.len()).collect::<SmallVec<[usize; 2]>>();
+        if bearers.len() <= 1 {
+            return all();
+        }
+        let Some(key) = self.key(wire) else { return all() };
+        let mut map = self.prior.lock().unwrap();
+        let Some(r) = map.get_mut(&key) else { return all() };
+        self.decay(r);
+        let n = r.weights.len().min(bearers.len());
+        match (0..n).max_by(|&a, &b| r.weights[a].total_cmp(&r.weights[b])) {
+            Some(best) if r.weights[best] >= self.threshold => SmallVec::from_slice(&[best]),
+            _ => all(), // cold / faded ⇒ explore every bearer
+        }
+    }
+
+    fn observe_delivery(&self, wire: &[u8], bearer: usize) {
+        let Some(key) = self.key(wire) else { return };
+        let mut map = self.prior.lock().unwrap();
+        let r = map.entry(key).or_insert_with(|| LearnedReach { weights: Vec::new(), last: std::time::Instant::now() });
+        self.decay(r);
+        if r.weights.len() <= bearer {
+            r.weights.resize(bearer + 1, 0.0);
+        }
+        r.weights[bearer] += self.reinforce;
+        r.last = std::time::Instant::now();
+    }
+}
+
 /// Bounded whole-object dedup ring — the cross-bearer RX filter. Keyed on the packet bytes (no host identity);
 /// loss of the ring only re-admits a duplicate (a performance cost, never a correctness one — §7 soft-state).
 struct Dedup {
@@ -251,8 +355,8 @@ pub struct WirelessFace {
     id: FaceId,
     bearers: Vec<Arc<dyn WirelessBearer>>,
     policy: Arc<dyn BearerPolicy>,
-    /// Merged RX from every bearer's pump.
-    rx: AsyncMutex<mpsc::UnboundedReceiver<Bytes>>,
+    /// Merged RX from every bearer's pump, each object tagged with the bearer index it arrived on.
+    rx: AsyncMutex<mpsc::UnboundedReceiver<(usize, Bytes)>>,
     dedup: Mutex<Dedup>,
 }
 
@@ -261,12 +365,12 @@ impl WirelessFace {
     /// (needs a Tokio runtime — the host driving real radios has one).
     pub fn new(id: FaceId, bearers: Vec<Arc<dyn WirelessBearer>>, policy: Arc<dyn BearerPolicy>) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
-        for bearer in &bearers {
+        for (idx, bearer) in bearers.iter().enumerate() {
             let bearer = Arc::clone(bearer);
             let tx = tx.clone();
             tokio::spawn(async move {
                 while let Ok(wire) = bearer.recv().await {
-                    if tx.send(wire).is_err() {
+                    if tx.send((idx, wire)).is_err() {
                         break; // face dropped
                     }
                 }
@@ -333,9 +437,11 @@ impl Transport for WirelessFace {
         // Merge every bearer's reassembled objects; deliver each distinct object once (cross-bearer dedup).
         let mut rx = self.rx.lock().await;
         loop {
-            let wire = rx.recv().await.ok_or(FaceError::Closed)?;
+            let (bearer, wire) = rx.recv().await.ok_or(FaceError::Closed)?;
             let dup = self.dedup.lock().unwrap().is_dup(&wire);
             if !dup {
+                // Feedback to the (learning) policy: this bearer is the one that delivered the object first.
+                self.policy.observe_delivery(&wire, bearer);
                 return Ok(wire);
             }
         }

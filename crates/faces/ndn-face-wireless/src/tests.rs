@@ -362,3 +362,67 @@ async fn engine_forwards_a_roundtrip_over_one_wireless_face() {
     let _ = shutdown_p.shutdown().await;
     let _ = shutdown_c.shutdown().await;
 }
+
+fn two_bearers() -> Vec<Arc<dyn WirelessBearer>> {
+    let a = LoopbackBus::new();
+    let b = LoopbackBus::new();
+    vec![
+        LoopbackBearer::new(&a, 2000, BearerKind::Wifi, 1), // bearer 0 = Wi-Fi
+        LoopbackBearer::new(&b, 200, BearerKind::Ble, 3),   // bearer 1 = BLE
+    ]
+}
+
+/// The learning policy: cold ⇒ explore all bearers; once Data for a prefix comes back on one bearer, TX for
+/// that prefix goes out ONLY that bearer (airtime saved on the others) — the reach prior selecting a bearer.
+#[tokio::test]
+async fn learned_policy_converges_to_the_reaching_bearer() {
+    use ndn_packet::encode::{DataBuilder, InterestBuilder};
+    use ndn_packet::Name;
+
+    let policy = LearnedBearerPolicy::new();
+    let bearers = two_bearers();
+    let interest = InterestBuilder::new("/svc/data/1".parse::<Name>().unwrap()).build();
+
+    // Cold: no prior for /svc ⇒ explore every bearer.
+    assert_eq!(policy.select(&interest, &bearers).into_vec(), vec![0, 1], "cold prefix floods all bearers");
+
+    // Data for /svc arrives on bearer 1 (BLE) — the reaching bearer.
+    let data = DataBuilder::new("/svc/data/1".parse::<Name>().unwrap(), b"x").build();
+    policy.observe_delivery(&data, 1);
+
+    // Now TX for /svc goes out ONLY the learned (BLE) bearer.
+    assert_eq!(policy.select(&interest, &bearers).into_vec(), vec![1], "learned prefix → the reaching bearer only");
+
+    // A different prefix is still cold ⇒ still explores all.
+    let other = InterestBuilder::new("/misc/x".parse::<Name>().unwrap()).build();
+    assert_eq!(policy.select(&other, &bearers).into_vec(), vec![0, 1], "unrelated prefix stays exploratory");
+}
+
+/// The face feeds RX into the policy: a Data arriving on the BLE bearer teaches the shared policy, so the next
+/// TX for that prefix selects BLE — end to end through `WirelessFace`.
+#[tokio::test]
+async fn face_rx_teaches_the_learning_policy() {
+    use ndn_packet::encode::{DataBuilder, InterestBuilder};
+    use ndn_packet::Name;
+
+    let wifi = LoopbackBus::new();
+    let ble = LoopbackBus::new();
+    let policy = Arc::new(LearnedBearerPolicy::new());
+    let learner = WirelessFace::new(
+        FaceId(2),
+        vec![
+            LoopbackBearer::new(&wifi, 2000, BearerKind::Wifi, 1), // idx 0
+            LoopbackBearer::new(&ble, 200, BearerKind::Ble, 3),    // idx 1
+        ],
+        policy.clone(),
+    );
+
+    // A lone peer emits one Data for /svc on the BLE bus; the face receives it and teaches the policy.
+    let peer_ble = LoopbackBearer::new(&ble, 200, BearerKind::Ble, 3);
+    peer_ble.send(DataBuilder::new("/svc/0".parse::<Name>().unwrap(), b"x").build()).await.unwrap();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), learner.recv_bytes()).await.unwrap();
+
+    // The shared policy now steers /svc traffic to the BLE bearer (index 1).
+    let interest = InterestBuilder::new("/svc/1".parse::<Name>().unwrap()).build();
+    assert_eq!(policy.select(&interest, learner.bearers()).into_vec(), vec![1], "face RX taught the policy → BLE");
+}
