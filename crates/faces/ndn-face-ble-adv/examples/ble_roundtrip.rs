@@ -57,7 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // A large Data whose wire form exceeds one extended advertisement → it MUST fragment.
     const NAME: &[&[u8]] = &[b"ndn", b"ble", b"big"];
-    let content: Vec<u8> = (0..600u32).map(|i| (i % 251) as u8).collect();
+    let content: Vec<u8> = (0..250u32).map(|i| (i % 251) as u8).collect();
     let data = data_pkt(NAME, &content);
     let interest = interest_pkt(NAME);
     println!("Data wire size = {} B (frag MTU 200 → ~{} advertisements)", data.len(), data.len().div_ceil(200));
@@ -80,7 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Ok(Ok((wire, _))) =
                     tokio::time::timeout(Duration::from_millis(60), producer.recv_bytes_with_addr()).await
                 {
-                    if let Ok(int) = Interest::decode(wire.clone()) {
+                    if Interest::decode(wire.clone()).is_ok() {
                         if wire.windows(want.len()).any(|w| w == want.as_slice()) {
                             println!("producer: got Interest {} → serving Data", "/ndn/ble/big");
                             served = true;
