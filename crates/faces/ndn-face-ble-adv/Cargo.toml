@@ -35,6 +35,9 @@ ndn-packet = { workspace = true }
 ndn-app = { workspace = true }
 ndn-engine = { workspace = true }
 tokio-util = { workspace = true }
+# For the wireless_c5 example: the unified WirelessFace over Wi-Fi + BLE from one C5 (shared mux).
+ndn-face-wireless     = { path = "../ndn-face-wireless" }
+ndn-face-monitor-wifi = { path = "../ndn-face-monitor-wifi" }
 
 [lints]
 workspace = true
@@ -53,4 +56,8 @@ required-features = ["shared-mux"]
 
 [[example]]
 name = "ble_engine"
+required-features = ["shared-mux"]
+
+[[example]]
+name = "wireless_c5"
 required-features = ["shared-mux"]
