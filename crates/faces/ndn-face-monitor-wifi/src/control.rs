@@ -438,6 +438,15 @@ impl RadioControl {
                 // They hear us at `rssi` on this radio → measured outbound link.
                 m.observe_rx(radio, rep.node_id, Some(rssi), now_ms);
             }
+            // ...and how CLEANLY they hear us, when their radio can measure it. This is the input
+            // the worst-receiver rate cap actually wants: RSSI says our signal arrives loud at the
+            // peer, SNR says whether it arrives decodable, and a contended peer reports the first
+            // as excellent while dropping most of what we send.
+            if self.node_id != 0
+                && let Some(&(_, snr)) = rep.heard_snr.iter().find(|(n, _)| *n == self.node_id)
+            {
+                m.observe_rx_snr(radio, rep.node_id, Some(f32::from(snr)), now_ms);
+            }
         }
         true
     }

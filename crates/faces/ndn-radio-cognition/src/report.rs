@@ -59,6 +59,15 @@ pub struct ReceptionReport {
     pub heard_prefixes: Vec<u64>,
     /// The reporter's per-channel busy% view: `(channel, busy_pct)`.
     pub spectrum: Vec<(u8, u8)>,
+    /// Per-neighbour **SNR in dB** as the reporter heard them: `(neighbour_id, snr_db)`.
+    ///
+    /// The companion to [`heard_neighbors`](Self::heard_neighbors) and the reason it exists: RSSI
+    /// tells a transmitter how LOUD it arrives at a peer, SNR how CLEAN, and only the second
+    /// predicts whether a rate demodulates there. Finding our own id here is how we learn the
+    /// quality of the OUTBOUND link — the input the worst-receiver rate cap actually wants.
+    ///
+    /// Empty when the reporter's radio cannot measure SNR, which must cost it nothing.
+    pub heard_snr: Vec<(u64, i8)>,
 }
 
 impl Default for ReceptionReport {
@@ -71,6 +80,7 @@ impl Default for ReceptionReport {
             heard_neighbors: Vec::new(),
             heard_prefixes: Vec::new(),
             spectrum: Vec::new(),
+            heard_snr: Vec::new(),
         }
     }
 }
@@ -101,6 +111,20 @@ pub fn encode_report(r: &ReceptionReport) -> Vec<u8> {
     for (c, busy) in r.spectrum.iter().take(ns) {
         b.push(*c);
         b.push(*busy);
+    }
+    // --- appended section: per-neighbour SNR ---
+    //
+    // Appended rather than folded into `heard_neighbors`, and WITHOUT bumping REPORT_VERSION, on
+    // purpose. This is a broadcast protocol with no version negotiation, and the decoder rejects a
+    // version it does not know outright — so a bump is a flag day in which un-upgraded nodes
+    // discard an upgraded peer's ENTIRE report to avoid one optional field. That is a bad trade.
+    // Appending is compatible in both directions: an older decoder stops after `spectrum` and
+    // ignores these bytes, a newer one reads them when present and treats absence as "no SNR".
+    let nq = r.heard_snr.len().min(MAX_ENTRIES);
+    b.push(nq as u8);
+    for (id, snr) in r.heard_snr.iter().take(nq) {
+        b.extend_from_slice(&id.to_le_bytes());
+        b.push(*snr as u8);
     }
     b
 }
@@ -165,6 +189,22 @@ pub fn decode_report(bytes: &[u8]) -> Option<ReceptionReport> {
         let busy = r.u8()?;
         spectrum.push((c, busy));
     }
+    // Appended SNR section: absent in reports from un-upgraded peers, so a failed read is "none",
+    // never a decode failure — rejecting a whole report over an optional field is the flag day
+    // this format is shaped to avoid.
+    // ⚠ ABSENT and TRUNCATED are different things, and conflating them costs a real guarantee.
+    // No bytes at all after `spectrum` = a report from an un-upgraded peer: fine, no SNR. But once
+    // the count byte is present the entries it promises MUST all be there — a short list is
+    // malformed input, and this decoder's contract (untrusted bytes in) is to reject that. A first
+    // version of this tolerated both and silently weakened `rejects_garbage_and_truncation`.
+    let mut heard_snr = Vec::new();
+    if let Some(nq) = r.u8() {
+        for _ in 0..(nq as usize).min(MAX_ENTRIES) {
+            let id = r.u64()?;
+            let v = r.u8()?;
+            heard_snr.push((id, v as i8));
+        }
+    }
     Some(ReceptionReport {
         node_id,
         seq,
@@ -173,6 +213,7 @@ pub fn decode_report(bytes: &[u8]) -> Option<ReceptionReport> {
         heard_neighbors,
         heard_prefixes,
         spectrum,
+        heard_snr,
     })
 }
 
@@ -189,6 +230,7 @@ mod tests {
             heard_neighbors: vec![(1, -55), (2, -80)],
             heard_prefixes: vec![0x11, 0x22, 0x33],
             spectrum: vec![(149, 40), (165, 5)],
+            heard_snr: vec![(1, 21), (2, 6)],
         }
     }
 
@@ -250,5 +292,60 @@ mod tests {
         let dec = decode_report(&v1).expect("v1 decodes");
         assert_eq!(dec.max_rx_mcs, FULL_RX_MCS);
         assert_eq!(dec.node_id, r.node_id);
+    }
+}
+
+#[cfg(test)]
+mod snr_section_tests {
+    use super::*;
+
+    #[test]
+    fn snr_section_round_trips() {
+        let mut r = ReceptionReport::default();
+        r.node_id = 0xAA;
+        r.heard_neighbors = vec![(1, -50), (2, -70)];
+        r.heard_snr = vec![(1, 22), (2, 7)];
+        let d = decode_report(&encode_report(&r)).expect("decode");
+        assert_eq!(d.heard_snr, vec![(1, 22), (2, 7)]);
+        assert_eq!(d.heard_neighbors, vec![(1, -50), (2, -70)]);
+    }
+
+    /// A report from an un-upgraded peer simply stops after `spectrum`. It must decode fine with
+    /// no SNR — never be rejected, which is the flag-day failure this shape avoids.
+    #[test]
+    fn report_without_the_snr_section_still_decodes() {
+        let mut r = ReceptionReport::default();
+        r.node_id = 0xBB;
+        r.heard_neighbors = vec![(9, -60)];
+        let mut bytes = encode_report(&r);
+        bytes.pop(); // drop the appended zero-length SNR section = an older encoder's output
+        let d = decode_report(&bytes).expect("older report must still decode");
+        assert_eq!(d.node_id, 0xBB);
+        assert_eq!(d.heard_neighbors, vec![(9, -60)]);
+        assert!(d.heard_snr.is_empty());
+    }
+
+    /// A section that ANNOUNCES entries and then stops short is malformed, not old — it must be
+    /// rejected like any other truncation. Only a wholly ABSENT section means "older peer".
+    #[test]
+    fn truncated_snr_section_is_rejected() {
+        let mut r = ReceptionReport::default();
+        r.node_id = 0xCC;
+        r.heard_neighbors = vec![(3, -55)];
+        r.heard_snr = vec![(3, 18), (4, 20)];
+        let full = encode_report(&r);
+        assert_eq!(
+            decode_report(&full[..full.len() - 5]),
+            None,
+            "a short SNR list is malformed input and must not decode"
+        );
+    }
+
+    #[test]
+    fn negative_snr_survives() {
+        let mut r = ReceptionReport::default();
+        r.heard_snr = vec![(7, -5)];
+        let d = decode_report(&encode_report(&r)).unwrap();
+        assert_eq!(d.heard_snr, vec![(7, -5)]);
     }
 }

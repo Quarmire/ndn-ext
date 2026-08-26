@@ -403,6 +403,21 @@ impl MediumState {
                 heard_neighbors.push((n, r.round().clamp(-128.0, 0.0) as i8));
             }
         }
+        // Per-neighbour SNR, mirroring the RSSI loop above. Worst across our radios, not best:
+        // this is what we tell a peer about the link it must transmit into, and a rate cap must be
+        // provisioned for the poorest path, not the luckiest one.
+        let mut heard_snr = Vec::new();
+        for (&n, st) in &self.neighbors {
+            if self.fresh(st.last_seen_ms, now_ms)
+                && let Some(q) = st
+                    .snr
+                    .values()
+                    .filter_map(|e| e.get())
+                    .min_by(|a, b| a.total_cmp(b))
+            {
+                heard_snr.push((n, q.round().clamp(-128.0, 127.0) as i8));
+            }
+        }
         let heard_prefixes: Vec<u64> = self.demand.keys().copied().collect();
         let mut spec: HashMap<u8, u8> = HashMap::new();
         for ((_, ch), occ) in &self.occupancy {
@@ -417,6 +432,7 @@ impl MediumState {
             heard_neighbors,
             heard_prefixes,
             spectrum: spec.into_iter().collect(),
+            heard_snr,
         }
     }
 }
