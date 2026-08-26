@@ -359,19 +359,9 @@ impl RatePolicy {
         if let Some(cell) = &self.planned
             && let Ok(guard) = cell.read()
             && let Some(tp) = *guard
-            && let Some(index) = tp.mcs()
+            && let Some(mcs) = tp.wifi_mcs()
         {
-            return McsDescriptor {
-                index,
-                short_gi: tp.short_gi(),
-                vht: tp.vht(),
-                nss: tp.nss().unwrap_or(1),
-                stbc: tp.stbc(),
-                ldpc: tp.ldpc(),
-                he: tp.he(),
-                dcm: tp.dcm(),
-                er_su: tp.er_su(),
-            };
+            return mcs; // the write-once TxParams->McsDescriptor mapping (see TxParams::wifi_mcs)
         }
         match self.policy {
             McsPolicy::Fixed(d) => d,

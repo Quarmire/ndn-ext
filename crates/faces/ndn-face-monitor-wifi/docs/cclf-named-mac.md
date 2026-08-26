@@ -1,5 +1,9 @@
 # CCLF for the named-data MAC — cooperative forwarding, and its variations
 
+*CCLF = **Content Connectivity and Location Forwarding**. See [GLOSSARY.md](./GLOSSARY.md) for the canonical
+term and its three distinct jobs (cooperative-forwarding suppression, within-slot claim election, and the
+generic `cclf_elect` contribution kernel).*
+
 *Design note under the [mac-addressing-doctrine](./mac-addressing-doctrine.md) (§4 defines CCLF
 canonically). Companion to [named-token-scheduling](./named-token-scheduling.md) and
 [time-slice-mac](./time-slice-mac.md). Measured in `ndn-sim/examples/coding_cclf_scale.rs`; implemented

@@ -388,19 +388,9 @@ impl RadioActuators for MediumActuator {
         let to_err = |e: FaceError| RadioError(e.to_string());
         let p = &alloc.params;
 
-        // Rate as driver state — the decided MCS every subsequent `inject` transmits at.
-        if let Some(index) = p.mcs() {
-            let mcs = McsDescriptor {
-                index,
-                short_gi: p.short_gi(),
-                vht: p.vht(),
-                nss: p.nss().unwrap_or(1),
-                stbc: p.stbc(),
-                ldpc: p.ldpc(),
-                he: p.he(),
-                dcm: p.dcm(),
-                er_su: p.er_su(),
-            };
+        // Rate as driver state — the decided MCS every subsequent `inject` transmits at. The
+        // TxParams->McsDescriptor mapping is defined once (TxParams::wifi_mcs), shared with RatePolicy.
+        if let Some(mcs) = p.wifi_mcs() {
             self.io.set_rate(mcs).map_err(to_err)?;
         }
 

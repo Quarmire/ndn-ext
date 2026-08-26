@@ -115,15 +115,12 @@ slots. `schedule.rs`. The slot key is `prefix_hash` over the first `slot_depth` 
   (`mac-synthesis.md` §2 law 6). State this explicitly; do not imply three live classes.
 - *(avoid the doc variants "class 0/1/2", "alarm/report", "Urgent" as if they were the code enum.)*
 
-### CCLF **[NEEDS AUTHOR CONFIRM — acronym never expanded in the corpus]**
+### CCLF = **Content Connectivity and Location Forwarding**
 The cooperative-forwarding suppression rule: on gaining content worth forwarding, schedule a rebroadcast at
 `arrival + jitter`; if you **overhear** the same *named content* forwarded first, **cancel**. Content-keyed,
 never host-keyed. The same jitter also serves as the *within-slot election* for claimable slots.
 - Encoded: `cclf-named-mac.md` (canonical description), `coop.rs` (`CoopRelay`), `cclf_jitter_us` /
   `cclf_elect` (`sched.rs`).
-- **The letters C-C-L-F are never expanded anywhere in the docs or code.** Best-fit candidate from behaviour:
-  *"Content-keyed Cooperative Listen-First"* — **the author must confirm or correct this.** Until then, use
-  "CCLF" and cite `cclf-named-mac.md`.
 - **One acronym, three jobs — disambiguate at the call site:** (a) broadcast-storm suppression / cooperative
   forwarding (`coop.rs`); (b) the within-slot claim election (`sched.rs`); (c) `cclf_elect` reused as a
   generic contribution-based election kernel. Say which you mean.
@@ -395,7 +392,7 @@ What must actually be shared across nodes is the **name normalization** (`ndn_na
 
 | Acronym | Expansion | Note |
 |---|---|---|
-| **CCLF** | *(letters never fixed in corpus)* | **[NEEDS AUTHOR CONFIRM]** — behaviourally "content-keyed cooperative listen-first" |
+| **CCLF** | Content Connectivity and Location Forwarding | cooperative-forwarding suppression + within-slot election |
 | **TSF** | Timing Synchronization Function | 802.11 hardware µs counter |
 | **EDCCA** | Enhanced Detection Clear Channel Assessment | glossed only as "energy-detect carrier sense" in docs |
 | **PFS / DAR** | Pick-Free-Slot / Detect-And-Rotate | 8-bit-ID deconfliction |

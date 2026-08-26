@@ -15,13 +15,14 @@ Types live in three crates: the 802.11/radiotap builders and the `EphemeralSourc
 `ndn-face-monitor-wifi/src/lib.rs:106`); the MAC logic in `ndn-radio-cognition` and
 `ndn-face-monitor-wifi`; the coding in `ndn-coding`.
 
-> **⚠ NORMATIVE vs CURRENT-CODE — the address partition is migrating (2026-08-17).** The Blurred Name
-> redesign (`name-filter-chapter.md`, commit `4706a58`) decided a new split of the 144 address bits:
-> **a 126-bit Blur filter + an 8-bit ephemeral ID + an 8-bit flags byte** (the "128 : 8" design, realized
-> byte-aligned while keeping the 2-bit local-group reservation). The 8-bit ID is viable *only* with
-> **cooperative deconfliction** (§4). The tables below are **normative** (the target contract). Where the
-> shipping code still implements the older **94-bit filter + 46-bit random nonce** it is flagged
-> `[CODE: 94:46]`; that migration is in progress (§16).
+> **✅ MIGRATION COMPLETE (updated 2026-08 — see [GLOSSARY.md](./GLOSSARY.md)).** The address-partition
+> migration this section used to describe as "in progress" is **done in the wire layout**: the shipping code
+> now implements the **126-bit Blur filter + 8-bit ephemeral ID + 8-bit flags byte** (`M_BITS = 126`, `K = 4`,
+> `FILL_CAP = 64`, `PrefixFilter([u8;16])` in `tier0.rs`; `ID_BITS = 8` in `ndn-radio-cognition/ephemeral_id.rs`).
+> **The old `94-bit filter + 46-bit nonce` figures and every `[CODE: 94:46]` / `[CODE: 94]` / `(CODE: 94)`
+> annotation below are historical** — read the left-hand (normative) column, which now equals the code.
+> One integration remains open: DAR collision detection (§4) is **not yet fed from RX** (`medium.rs:~1035`),
+> so cooperative rotation is armed on the wire but not yet closed-loop. Canonical term: **Tier-0 filter**.
 
 ---
 

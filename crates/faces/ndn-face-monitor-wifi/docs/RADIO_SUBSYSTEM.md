@@ -6,6 +6,14 @@
 > the hard-won device details live so they are not re-derived. Identifiers are
 > given as `file:symbol` so they can be jumped to.
 
+> **⚠ Stale identifiers (corrected in [GLOSSARY.md](./GLOSSARY.md)).** Three things this doc still
+> describes as live were **removed** from the HAL and no longer exist: the **`WifiRadio` trait** (#83 — its
+> methods moved onto `FrameIo`, the "write-once seam"), the **`agile: bool`** capability field (#90 —
+> replaced by measured `retune_us` + `can_hop(dwell)`), and the **`TimingModel { AlwaysOn, DutyCycled }`**
+> field (#90 — zero readers, wrong for LoRa; `duty_cycle_max` carries the real airtime ceiling). Also note:
+> `link_fec_redundancy` is decided but **not yet actuated** in the send path. Treat prose about those four as
+> historical.
+
 ---
 
 ## 1. TL;DR

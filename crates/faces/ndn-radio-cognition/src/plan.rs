@@ -199,6 +199,26 @@ impl TxParams {
     pub fn wifi_mut(&mut self) -> Option<&mut WifiRate> {
         if let RateParams::Wifi(w) = &mut self.rate { Some(w) } else { None }
     }
+
+    /// The exact [`McsDescriptor`](ndn_radio_hal::McsDescriptor) this decision means, when it carries a
+    /// Wi-Fi rate with a decided MCS index. **The single construction site** both the face's `RatePolicy`
+    /// and the medium actuator use — the write-once mapping of the decided `WifiRate` onto the HAL rate
+    /// descriptor (index + short_gi/vht/nss/stbc/ldpc/he/dcm/er_su). `None` when there is no decided MCS
+    /// (leave the radio's current rate) or the bearer is not Wi-Fi.
+    pub fn wifi_mcs(&self) -> Option<ndn_radio_hal::McsDescriptor> {
+        let index = self.mcs()?;
+        Some(ndn_radio_hal::McsDescriptor {
+            index,
+            short_gi: self.short_gi(),
+            vht: self.vht(),
+            nss: self.nss().unwrap_or(1),
+            stbc: self.stbc(),
+            ldpc: self.ldpc(),
+            he: self.he(),
+            dcm: self.dcm(),
+            er_su: self.er_su(),
+        })
+    }
 }
 
 /// How a radio's transmission relates to the others in the plan.
