@@ -151,6 +151,30 @@ The base (§5) is the starting composition, not the answer. Iterate: (1) build C
 (3) swap one axis (§2 table) and re-run; (4) keep the winner, repeat. The doc's family catalog (§3) is the
 menu of axis-options to try. Rule-outs (§4) are closed unless a filter assumption changes.
 
+## 10. Measured results (ndn-sim, `ndr_mobility_sweep`, N=12, DesKernel)
+
+Built and A/B'd as registered strategies in `ndn-strategy-reach` (delivery ratio / airtime-per-satisfied-Interest):
+
+| strategy | @1 m/s | @30 m/s | verdict |
+|---|---|---|---|
+| **flood** (`broadcast`, baseline) | 0.40 / 3.09 ms | 0.31 / 3.60 ms | broadcast storm — collides *and* wastes airtime |
+| v1 probabilistic (`soft-prefix-reach`) | ~0.37 / ~1.1 ms | ~0.29 / ~1.4 ms | *along* the curve — drops delivery **and** airtime |
+| **v2 defer + overhear-cancel** (`-defer`) | **0.70 / 1.07 ms** | **0.57 / 1.35 ms** | **the Pareto win**: +75% delivery, ~2.9× less airtime/deliv vs flood |
+| v3 Thompson-bandit (`-bandit`) | 0.71 / 1.08 ms | **0.59 / 1.34 ms** | ≈ v2 with a slight high-mobility edge — exploration under uncertainty |
+| v4 counting-Bloom memory (`-bloom`) | 0.70 / 1.07 ms | 0.57 / 1.35 ms | **identical** to v2 at 1 prefix — a correct drop-in; its win is scale/gossip, not delivery |
+
+**Why v2 beats flood on *both* axes:** staggered single-winner re-broadcast avoids the broadcast-storm
+half-duplex/collision losses (Ni et al.) while the prior orders *who* wins. v1 (probabilistic drop) only slides
+along the curve; v2 (defer + cancel) *shifts* it. The **decay/timing** axis tunes it: the defer window improved
+delivery monotonically as it tightened (40→15→8 ms; 8 ms best at 0.605 @30 m/s), because less per-hop latency
+returns more Data before the topology shifts — default now 15 ms with headroom for deeper nets.
+
+**Axis verdicts:** decision = **defer+cancel** (v2) is the load-bearing win; the **bandit** is a small refinement
+(exploration helps only under high mobility); the **Bloom memory** is delivery-neutral at single-prefix scale
+(its benefit is compact gossipable memory at many prefixes — measure it in a multi-producer scenario, not here).
+The **DES-kernel radio fix** (frames delivered after *airtime + propagation*, causal on every kernel) is what
+makes flooding's storm penalty visible and the numbers reproducible.
+
 ### References (mechanism → source)
 PRoPHET (IETF draft-irtf-dtnrg-prophet-03) · Spray-and-Wait (Spyropoulos 2005) · AntHocNet/ARA (ACO) · Directed
 Diffusion/GRAB · EBR · discounted-UCB / Thompson (non-stationary bandits) · backpressure (Tassiulas-Ephremides)
