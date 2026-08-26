@@ -67,6 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let secs: u64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(22);
     let master = env("NDN_ROLE").as_deref() == Some("master");
     let slotted = env("NDN_MODE").as_deref() != Some("contention");
+    let hw_gate = env("NDN_HW_GATE").is_some();
     let slot_us: u64 = env("NDN_SLOT_US").and_then(|s| s.parse().ok()).unwrap_or(20_000);
     // Inter-frame pacing (µs). 0 = saturate. A light pace (e.g. 4000) keeps the medium unsaturated so
     // the TimeBeacon is not queue-delayed — the regime in which its common-view alignment is measured.
@@ -82,8 +83,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let host_us = move || base.elapsed().as_micros() as u64;
 
     let src = [0x02, b'M', b'D', b'R', my_role, 0x01];
-    let d = Arc::new(LibUsbRtl88xxBackend::open_monitor_pid(pid, ch)?);
-    let _pump = d.spawn_rx_pump(8);
+    // Opened by PID through the shared factory rather than pinned to one backend: this test needs
+    // to run on the RTL8733BU (the part that implements the hardware transmit gate), and the
+    // factory also hands back the `RadioKnobs` the gate arm actuates. `open_named_radio` starts the
+    // RX pump itself.
+    let opened = ndn_radio_drivers::open_named_radio(pid, ch)?;
+    let d = opened.io.clone();
+    let knobs = opened.knobs.clone();
+    if hw_gate && knobs.is_none() {
+        eprintln!("NDN_HW_GATE set but this radio exposes no RadioKnobs — the arm would be a no-op");
+    }
     println!(
         "slot_airtest: role={} mode={} ch{ch} pid={pid:04x} slot={}µs N={} secs={} frame={}B rate={}",
         if master { "master" } else { "slave" },
@@ -145,6 +154,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     while Instant::now() < deadline {
         // Master: emit the beacon on wall-schedule regardless of slot (the clock signal never waits).
+        //
+        // ⚠ MEASURED 2026-08-25 — THIS TIMESTAMP IS TAKEN AT ENQUEUE, NOT AT TRANSMIT, and under a
+        // saturated blast that is the difference between a working slot MAC and a broken one. The
+        // frame sits behind a full MAC queue (~20 KB on the 8733b) and radiates tens of ms after the
+        // instant it claims. Two f72b nodes measured alignment jitter of stddev 10 ms (slotted),
+        // 23 ms (contention) and 89 ms (slotted + hardware gate, worst because the gate holds the
+        // queue longer) — all far larger than the 20 ms slot they are meant to align, so "slotted"
+        // degenerates to random and matches contention.
+        //
+        // The fix is not a better software beacon: it is the HARDWARE common view this stack already
+        // has — per-frame RX stamps, measured this session at 0.4 us residual / 0.0034 ppm between
+        // two of these radios. Stamp at transmit, or align on the receiver's own hardware stamp.
         if master && last_beacon.elapsed().as_millis() >= BEACON_MS {
             let refr = host_us();
             cv.lock().unwrap().on_raw(refr, host_us());
@@ -162,6 +183,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cur_slot_epoch = epoch;
             let cur_slot = epoch % N_SLOTS;
             tx_this_slot = if slotted { cur_slot == my_slot } else { rng.coin() };
+            // NDN_HW_GATE=1 additionally shuts the MAC outside our slot. The software decision
+            // above stops us CALLING inject on time; it cannot stop frames already queued, which
+            // drain into the peer's turn and collide there. Measured single-node, the software
+            // decision alone confines only ~54% of traffic to its half; with the gate, 99%.
+            if hw_gate && let Some(k) = knobs.as_ref() {
+                let _ = k.set_tx_hold(!tx_this_slot);
+            }
         }
 
         if tx_this_slot {
