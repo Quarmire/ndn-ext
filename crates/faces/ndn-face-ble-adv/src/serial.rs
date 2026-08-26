@@ -29,7 +29,11 @@ const SYNC1: u8 = 0x44;
 // BLE-bearer message types in the UNIFIED C5 firmware (esp32c5-ndn serves Wi-Fi + BLE from one image, so
 // BLE needs its own types distinct from the Wi-Fi T_INJECT(0x01)/T_RX_TS(0x82)).
 const T_BLE_ADV: u8 = 0x30; // host->device: advertise this payload
+const T_COEX: u8 = 0x31; // host->device: [scan_window_le16][scan_itvl_le16] — the BLE<->Wi-Fi radio-time split
 const T_BLE_RX: u8 = 0x88; // device->host: [rssi_i8][addr6][payload] — a scanned advertisement
+
+/// BLE-scan interval base for [`Esp32BleBackend::set_ble_share`], in 0.625 ms units (256 = 160 ms).
+const COEX_ITVL: u16 = 256;
 
 /// An ESP32-C5 BLE bearer reached over its USB-serial port (see module docs).
 pub struct Esp32BleBackend {
@@ -56,6 +60,18 @@ impl Esp32BleBackend {
             tx: Arc::new(Mutex::new(port)),
             rx: AsyncMutex::new(rxch),
         })
+    }
+
+    /// Set this radio's **BLE share** of airtime — `fraction` (0.0–1.0) of the scan interval spent scanning
+    /// for BLE, the rest left to the concurrent promiscuous Wi-Fi RX (the two bearers share one radio via
+    /// coex). This is the NDR way to handle the split: **not** a firmware constant but a lever cognition
+    /// drives from measured per-bearer demand — raise it when BLE has named traffic, lower it when Wi-Fi
+    /// does. `1.0` = full BLE scan (starves Wi-Fi RX); the firmware boot fallback is ~0.12.
+    pub fn set_ble_share(&self, fraction: f32) -> Result<(), FaceError> {
+        let window = ((fraction.clamp(0.0, 1.0) * COEX_ITVL as f32) as u16).clamp(4, COEX_ITVL);
+        let mut p = window.to_le_bytes().to_vec();
+        p.extend_from_slice(&COEX_ITVL.to_le_bytes());
+        self.send_framed(T_COEX, &p)
     }
 
     fn send_framed(&self, ty: u8, payload: &[u8]) -> Result<(), FaceError> {
