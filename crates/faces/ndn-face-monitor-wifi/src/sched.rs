@@ -531,6 +531,38 @@ pub struct FaceScheduler {
     base: Instant,
 }
 
+/// Holds the MAC transmit gate closed for as long as it lives, releasing on drop.
+///
+/// The scheduler's software wait stops US from calling `inject`, but frames already sitting in the
+/// MAC queue still go out and land in whoever owns the next slot — the bleed a slot schedule exists
+/// to prevent, and charged to a name that did not cause it. Closing the hardware gate while we wait
+/// stops that at the queue.
+///
+/// **Release on Drop is the point.** A gate closed on one path and reopened on another eventually
+/// meets a path that returns early, and the failure mode is a radio that never transmits again. The
+/// guard makes every exit release, including a panic unwind.
+///
+/// Writes are issued inline rather than on a blocking pool: each costs ~126 us on the measured
+/// part, against a gate that already sleeps for milliseconds, and `Drop` cannot await.
+struct TxHoldGuard<'a>(Option<&'a std::sync::Arc<dyn RadioKnobs>>);
+
+impl<'a> TxHoldGuard<'a> {
+    fn hold(knobs: Option<&'a std::sync::Arc<dyn RadioKnobs>>) -> Self {
+        if let Some(k) = knobs {
+            let _ = k.set_tx_hold(true);
+        }
+        Self(knobs)
+    }
+}
+
+impl Drop for TxHoldGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(k) = self.0 {
+            let _ = k.set_tx_hold(false);
+        }
+    }
+}
+
 impl FaceScheduler {
     /// Build from the `NDN_SCHED_*` environment. Returns `None` when neither slot nor hop is
     /// configured — the caller then leaves the send path untouched.
@@ -1442,6 +1474,11 @@ impl FaceScheduler {
             // keeps being deferred accumulates backlog and draws a shorter CCLF jitter next time, so
             // it wins idle slots ahead of a group with nothing queued.
             self.note_deferred(hash);
+
+            // Close the hardware gate for the wait. Anything already queued would otherwise drain
+            // into another owner's slot; held, it drains at the start of OUR turn instead, which is
+            // where a burst legitimately belongs. Released automatically on every exit below.
+            let _tx_hold = TxHoldGuard::hold(self.knobs.as_ref());
 
             // **Wait one slot at a time, re-contending at every boundary** — not one long sleep to
             // our own turn.
