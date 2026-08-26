@@ -140,6 +140,12 @@ pub mod dbm_power;
 pub use control::LibUsbActuator;
 pub use control::RadioControl;
 pub use control::{activity_rate, spawn_occupancy_sampler};
+
+// The cognition telemetry as a generic mgmt introspection surface (read-only),
+// served under `/localhost/nfd/ext/list` so a dashboard observes what the control
+// plane decided (channel/rate/power/fec/objective) — see [`RadioCognitionSurface`].
+mod control_surface;
+pub use control_surface::RadioCognitionSurface;
 /// Advertised RX-capability sentinels for the worst-overheard-receiver rate cap.
 pub use ndn_radio_cognition::{FULL_RX_MCS, LEGACY_ONLY_RX, SINGLE_STREAM_HT_RX_MCS};
 

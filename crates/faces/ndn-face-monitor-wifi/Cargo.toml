@@ -46,6 +46,9 @@ ndn-foundation-types = { workspace = true }
 ndn-radio-drivers = { path = "../../../../ndn-radio-drivers", optional = true }
 # The pure cross-layer cognitive control plane this face is the actuator/seam for.
 ndn-radio-cognition = { workspace = true }
+# The generic mgmt introspection trait (`ControlSurface`) — the radio control plane
+# exposes its live cognition snapshot through it at `/localhost/nfd/ext/list`.
+ndn-mgmt-wire    = { workspace = true }
 # Link-layer FEC: the systematic K-of-N codec only (no `endpoint` → no engine).
 ndn-coding       = { path = "../../coding/ndn-coding", default-features = false, features = ["link-fec-bridge"] }
 bytes            = { workspace = true, features = ["std"] }

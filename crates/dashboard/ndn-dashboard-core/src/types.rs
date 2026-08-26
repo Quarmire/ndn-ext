@@ -1,5 +1,22 @@
 //! Typed data models and text-response parsers for the NDN management protocol.
 
+/// Seconds since the Unix epoch. `std::time` is unimplemented on
+/// `wasm32-unknown-unknown` (it panics at runtime), so the browser build reads
+/// the clock through `web-time`'s JS shim instead.
+#[cfg(not(target_arch = "wasm32"))]
+fn now_unix_s() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+#[cfg(target_arch = "wasm32")]
+fn now_unix_s() -> i64 {
+    // `js_sys` is already a core dependency under the `web` feature; use the
+    // browser clock (ms since epoch) rather than pulling in another crate.
+    (js_sys::Date::now() / 1000.0) as i64
+}
+
 /// Severity level of a captured router log line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LogLevel {
@@ -710,10 +727,7 @@ impl SecurityKeyInfo {
             && let Ok(ns) = ns_str.parse::<u64>()
         {
             let expiry_secs = (ns / 1_000_000_000) as i64;
-            let now_secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64;
+            let now_secs = now_unix_s();
             return Some((expiry_secs - now_secs) / 86400);
         }
         None

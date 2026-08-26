@@ -1531,6 +1531,34 @@ mod tests {
     }
 
     #[test]
+    fn cognition_surface_maps_telemetry_to_pairs() {
+        use crate::control_surface::RadioCognitionSurface;
+        use ndn_mgmt_wire::control_surface::ControlSurface;
+        use std::sync::Arc;
+        let (c, _m) = control_with_mock();
+        c.observe_rx(W, 99, Some(-55), 1_000);
+        c.set_active(vec![NameContext::new(0xABCD)]);
+        c.tick_now(1_000);
+        let surface = RadioCognitionSurface::new(Arc::new(c));
+        assert_eq!(surface.name(), "named-radio");
+        // Aggregate cognition keys are always present.
+        let stats = surface.stats();
+        let has = |k: &str| stats.entries.iter().any(|(kk, _)| kk == k);
+        assert!(has("strategy"), "strategy key present");
+        assert!(has("managed_objects"), "managed_objects key present");
+        assert!(has("suppressed"), "suppressed key present");
+        assert!(has("objective"), "objective key present");
+        // Read-only surface: caps advertise the subsystem, no settable options.
+        let info = surface.describe();
+        assert!(
+            info.caps
+                .iter()
+                .any(|(k, v)| k == "subsystem" && v == "named-radio-cognition")
+        );
+        assert!(info.options.is_empty(), "surface must be read-only");
+    }
+
+    #[test]
     fn probing_occasionally_samples_the_next_rate_up() {
         use ndn_radio_cognition::PolicyConfig;
         let c =
