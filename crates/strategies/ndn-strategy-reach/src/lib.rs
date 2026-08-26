@@ -46,7 +46,9 @@ register_strategy!(SOFT_PREFIX_REACH_BLOOM_REG, b"soft-prefix-reach-bloom", 1, |
     SoftPrefixReachStrategy::new(Mode::BloomDefer)
 ) as Arc<dyn ErasedStrategy>,);
 
-/// Counting-Bloom width (cells) and hash count — small; scale is a wire/memory property, not a sim metric.
+/// Counting-Bloom default width (cells) and hash count. Width is env-tunable (`NDR_BLOOM_CELLS`) so a
+/// multi-producer scenario can force saturation at a low prefix count and expose the graceful-degradation
+/// (fail-safe false-positive) behaviour that is the whole point of a *bounded* memory.
 const BLOOM_CELLS: usize = 256;
 const BLOOM_K: usize = 4;
 
@@ -66,11 +68,18 @@ struct Params {
     tau_ms: f64,
     defer_min_ms: f64,
     defer_max_ms: f64,
+    /// Name-component depth the reach prior keys on — 1 = the registered producer prefix's first component
+    /// (single-producer default); 2 for a `/p/{k}` multi-producer scenario (distinguish producers under one
+    /// routable `/p` parent + one strategy instance).
+    prefix_depth: usize,
+    /// Counting-Bloom width (cells). Low ⇒ forced saturation ⇒ visible false-positive behaviour.
+    bloom_cells: usize,
 }
 
 impl Params {
     fn from_env() -> Self {
         let env = |k: &str, d: f64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        let envu = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
         Self {
             p_floor: env("NDR_PFLOOR", 0.2),
             reinforce: env("NDR_REINFORCE", 1.0),
@@ -83,6 +92,8 @@ impl Params {
             // deeper nets (tighter separation ⇒ more near-tie collisions), so 15 ms is the default with
             // headroom; override via NDR_DEFER_MAX_MS.
             defer_max_ms: env("NDR_DEFER_MAX_MS", 15.0),
+            prefix_depth: envu("NDR_PREFIX_DEPTH", 1).max(1),
+            bloom_cells: envu("NDR_BLOOM_CELLS", BLOOM_CELLS).max(BLOOM_K),
         }
     }
 }
@@ -107,8 +118,8 @@ struct CountingBloom {
 }
 
 impl CountingBloom {
-    fn new() -> Self {
-        Self { cells: vec![0.0; BLOOM_CELLS], last_ms: 0 }
+    fn new(cells: usize) -> Self {
+        Self { cells: vec![0.0; cells], last_ms: 0 }
     }
     fn decay_to(&mut self, now_ms: u64, tau_ms: f64) {
         let dt = now_ms.saturating_sub(self.last_ms) as f64;
@@ -120,25 +131,26 @@ impl CountingBloom {
             self.last_ms = now_ms;
         }
     }
-    fn idxs(key: u64) -> [usize; BLOOM_K] {
+    fn idxs(&self, key: u64) -> [usize; BLOOM_K] {
+        let n = self.cells.len() as u64;
         let mut out = [0usize; BLOOM_K];
         let mut h = key;
         for o in &mut out {
             h ^= h >> 33;
             h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
             h ^= h >> 33;
-            *o = (h % BLOOM_CELLS as u64) as usize;
+            *o = (h % n) as usize;
         }
         out
     }
     fn insert(&mut self, key: u64, g: f64, w_max: f64) {
-        for i in Self::idxs(key) {
+        for i in self.idxs(key) {
             self.cells[i] = (self.cells[i] + g).min(w_max);
         }
     }
     /// Counting-Bloom membership strength = min over the k cells.
     fn query(&self, key: u64) -> f64 {
-        Self::idxs(key).into_iter().map(|i| self.cells[i]).fold(f64::INFINITY, f64::min)
+        self.idxs(key).into_iter().map(|i| self.cells[i]).fold(f64::INFINITY, f64::min)
     }
 }
 
@@ -161,6 +173,7 @@ impl SoftPrefixReachStrategy {
             Mode::Bandit => b"soft-prefix-reach-bandit",
             Mode::BloomDefer => b"soft-prefix-reach-bloom",
         };
+        let params = Params::from_env();
         Self {
             name: Name::from_components([
                 NameComponent::generic(bytes_static(b"localhost")),
@@ -169,22 +182,24 @@ impl SoftPrefixReachStrategy {
                 NameComponent::generic(bytes_static(leaf)),
             ]),
             mode,
-            params: Params::from_env(),
             prior: Mutex::new(HashMap::new()),
             bandit: Mutex::new(HashMap::new()),
-            bloom: Mutex::new(CountingBloom::new()),
+            bloom: Mutex::new(CountingBloom::new(params.bloom_cells)),
             rng: Mutex::new(0x2545_F491),
+            params,
         }
     }
 
-    /// FNV-1a of the name's first component — the registered-prefix granularity the reach prior keys on.
-    fn prefix_key(ctx: &StrategyContext<'_>) -> u64 {
+    /// FNV-1a of the name's first `prefix_depth` components — the registered-prefix granularity the reach
+    /// prior keys on (see `Params::prefix_depth`).
+    fn prefix_key(&self, ctx: &StrategyContext<'_>) -> u64 {
         let mut h = 0xcbf2_9ce4_8422_2325u64;
-        if let Some(first) = ctx.name.components().first() {
-            for b in first.value.as_ref() {
+        for comp in ctx.name.components().iter().take(self.params.prefix_depth) {
+            for b in comp.value.as_ref() {
                 h ^= *b as u64;
                 h = h.wrapping_mul(0x0100_0000_01b3);
             }
+            h ^= 0x2f; // component separator so /p/1 and /p1 differ
         }
         h
     }
@@ -285,7 +300,7 @@ impl Strategy for SoftPrefixReachStrategy {
             return smallvec![ForwardingAction::Forward(other)];
         }
 
-        let key = Self::prefix_key(ctx);
+        let key = self.prefix_key(ctx);
         let now = Self::now_ms(ctx);
         let reach = self.reach_norm(key, now);
         match self.mode {
@@ -306,7 +321,7 @@ impl Strategy for SoftPrefixReachStrategy {
 
     fn after_receive_data(&self, ctx: &StrategyContext<'_>) -> SmallVec<[ForwardingAction; 2]> {
         // Data came back for this prefix through this node → reinforce the reach prior (pheromone/KITE).
-        let key = Self::prefix_key(ctx);
+        let key = self.prefix_key(ctx);
         let now = Self::now_ms(ctx);
         let p = &self.params;
         match self.mode {
