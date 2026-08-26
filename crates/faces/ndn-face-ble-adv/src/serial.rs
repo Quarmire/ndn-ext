@@ -1,8 +1,10 @@
-//! Serial-bridged BLE backend — the **ESP32-C5 running `firmware/esp32c5-ble`** (NimBLE BLE 5 extended
-//! advertising + scanning), driven over its native USB-Serial-JTAG with the `[4E 44 type len payload]`
-//! "ND" wire protocol (the same one the Wi-Fi named radio uses). This is the crate's first *real*
-//! [`AdvBackend`] — named data rides in BLE extended advertisements (a manufacturer-specific AD with the
-//! `0x4E44` "ND" company magic, filtered on the device so the serial pipe is not swamped by ambient beacons).
+//! Serial-bridged BLE backend — the **ESP32-C5 running the unified `firmware/esp32c5-ndn`** (one image that
+//! serves *all* the named-radio bearers: raw 802.11 AND NimBLE BLE 5 extended advertising + scanning),
+//! driven over its native USB-Serial-JTAG with the `[4E 44 type len payload]` "ND" wire protocol. This is
+//! the crate's first *real* [`AdvBackend`] — named data rides in BLE extended advertisements (a
+//! manufacturer-specific AD with the `0x4E44` "ND" company magic, filtered on the device so the serial
+//! pipe is not swamped by ambient beacons). The Wi-Fi bearer of the same firmware is `Esp32SerialBackend`
+//! (a `FrameIo`); this is its BLE peer, using distinct `T_BLE_*` message types on the shared protocol.
 //!
 //! ```no_run
 //! # use ndn_face_ble_adv::{Esp32BleBackend, BleAdvFace};
@@ -24,8 +26,10 @@ use crate::{AdvBackend, ScannedFrame};
 
 const SYNC0: u8 = 0x4E;
 const SYNC1: u8 = 0x44;
-const T_INJECT: u8 = 0x01; // host->device: advertise this payload
-const T_RX: u8 = 0x81; // device->host: [rssi_i8][addr6][payload] — a scanned advertisement
+// BLE-bearer message types in the UNIFIED C5 firmware (esp32c5-ndn serves Wi-Fi + BLE from one image, so
+// BLE needs its own types distinct from the Wi-Fi T_INJECT(0x01)/T_RX_TS(0x82)).
+const T_BLE_ADV: u8 = 0x30; // host->device: advertise this payload
+const T_BLE_RX: u8 = 0x88; // device->host: [rssi_i8][addr6][payload] — a scanned advertisement
 
 /// An ESP32-C5 BLE bearer reached over its USB-serial port (see module docs).
 pub struct Esp32BleBackend {
@@ -70,7 +74,7 @@ impl Esp32BleBackend {
 impl AdvBackend for Esp32BleBackend {
     async fn broadcast(&self, frame: Bytes) -> Result<(), FaceError> {
         // The device wraps this in the ND manufacturer AD and burst-advertises it (fire-and-forget).
-        self.send_framed(T_INJECT, &frame)
+        self.send_framed(T_BLE_ADV, &frame)
     }
 
     async fn next_scanned(&self) -> Result<ScannedFrame, FaceError> {
@@ -99,7 +103,7 @@ fn reader_loop(mut port: Box<dyn serialport::SerialPort>, tx: mpsc::UnboundedSen
                     if acc.len() < pos + 5 + len {
                         break;
                     }
-                    if ty == T_RX && len >= 7 {
+                    if ty == T_BLE_RX && len >= 7 {
                         let p = &acc[pos + 5..pos + 5 + len];
                         let rssi = p[0] as i8;
                         let mut addr = [0u8; 6];
