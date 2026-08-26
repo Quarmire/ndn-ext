@@ -12,10 +12,14 @@ classification = "extension"
 # The ESP32-C5 serial-bridged BLE backend (firmware/esp32c5-ble): NimBLE extended advertising + scanning,
 # host-driven over USB-serial. Pulls `serialport`.
 serial = ["dep:serialport"]
+# Shared-mux BLE backend: BLE over a shared `ndn_radio_drivers::SerialRadioBackend`, so one host connection
+# carries BOTH the Wi-Fi FrameIo and the BLE bearer of the unified ESP32-C5 firmware (`SharedBleBackend`).
+shared-mux = ["dep:ndn-radio-drivers", "ndn-radio-drivers/serial-radio"]
 
 [dependencies]
 ndn-transport    = { workspace = true }
 serialport       = { version = "4", optional = true, default-features = false }
+ndn-radio-drivers = { path = "../../../../ndn-radio-drivers", optional = true }
 ndn-signals-core = { workspace = true }
 ndn-ble-framing  = { workspace = true }
 bytes            = { workspace = true, features = ["std"] }
@@ -38,3 +42,7 @@ required-features = ["serial"]
 [[example]]
 name = "ble_roundtrip"
 required-features = ["serial"]
+
+[[example]]
+name = "shared_mux"
+required-features = ["shared-mux"]

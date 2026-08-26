@@ -285,6 +285,13 @@ mod serial;
 #[cfg(feature = "serial")]
 pub use serial::Esp32BleBackend;
 
+// The shared-mux BLE backend: BLE over a *shared* SerialRadioBackend so one host connection carries both
+// the Wi-Fi FrameIo and the BLE bearer of the unified ESP32-C5 firmware (see `SharedBleBackend`).
+#[cfg(feature = "shared-mux")]
+mod shared;
+#[cfg(feature = "shared-mux")]
+pub use shared::SharedBleBackend;
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -95,7 +95,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // origin without exchanging anything. Between arrivals the phase is extrapolated on the host
     // clock, which is accurate over the few ms between frames.
     let align_cv = env("NDN_ALIGN").as_deref() == Some("cv");
-    const ANCHOR_MASK: u32 = 0xff; // anchor on every 256th common-source frame
+    // Anchor cadence must suit the SOURCE RATE, not be a fixed 256: the common-view source should
+    // be as quiet as possible (it is an unslotted transmitter and collides with everyone), so at a
+    // low rate every-256th would anchor once per ~13 s. Every 16th keeps re-anchoring sub-second
+    // even at 20 frames/s, and the host clock extrapolates the gaps at ppm-level error.
+    const ANCHOR_MASK: u32 = 0x0f;
     let cv_origin = Arc::new(Mutex::new(None::<(u64, u64)>)); // (stamp ticks, host us) at anchor
     let cv_last = Arc::new(Mutex::new(None::<(u64, u64)>)); // most recent (stamp ticks, host us)
     // One tick per slot: the common source is paced so each of its frames marks a slot boundary,
@@ -143,6 +147,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let sent = Arc::new(AtomicU64::new(0));
+    // Injects the radio REFUSED — never on air, so not part of the delivery denominator.
+    let tx_failed = Arc::new(AtomicU64::new(0));
     let recv_peer = Arc::new(AtomicU64::new(0));
     let recv_beacon = Arc::new(AtomicU64::new(0));
     // The slave's per-beacon common-view offset (ref − host), µs. Its spread = the on-air alignment
@@ -280,14 +286,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        if tx_this_slot {
+        // GUARD INTERVAL — the `fits_now` check the production FaceScheduler has (#84) and this
+        // harness lacked. A 900 B frame at legacy 6 Mbps occupies ~1.2 ms, so one launched near the
+        // end of a 20 ms slot keeps radiating into the NEXT owner's turn and collides there — a loss
+        // charged to a node that did nothing wrong. NDN_GUARD_US=0 disables it, which is the arm
+        // that measures how much of the residual loss it accounts for.
+        let guard_us: u64 = env("NDN_GUARD_US").and_then(|v| v.parse().ok()).unwrap_or(0);
+        let fits = if guard_us == 0 {
+            true
+        } else {
+            let into_slot = if align_cv || align_seq {
+                // phase within the current slot, from the same clock the epoch came from
+                match (*cv_origin.lock().unwrap(), *cv_last.lock().unwrap()) {
+                    (Some((o_tick, _)), Some((l_tick, l_host))) => {
+                        let us = l_tick.wrapping_sub(o_tick) * tick_ns / 1000
+                            + host_us().saturating_sub(l_host);
+                        us % slot_us
+                    }
+                    _ => 0,
+                }
+            } else {
+                cv.lock().unwrap().now(host_us()) % slot_us
+            };
+            slot_us.saturating_sub(into_slot) > guard_us
+        };
+
+        if tx_this_slot && fits {
             let mut payload = Vec::with_capacity(FRAME_BYTES + 10);
             payload.push(DATA_TAG);
             payload.push(my_role);
             payload.extend_from_slice(&sent.load(Ordering::Relaxed).to_le_bytes());
             payload.extend_from_slice(&payload_pad);
-            let _ = d.inject(InjectFrame { payload: payload.into(), tx: TxIntent::CONSERVATIVE, dst: BROADCAST, src, addr3: None }).await;
-            sent.fetch_add(1, Ordering::Relaxed);
+            // Count only what the radio ACCEPTED. This used to discard the result and count every
+            // attempt, so a frame that never left — queue full behind a shut gate, USB error,
+            // timeout — still inflated `sent`, and therefore deflated the delivery ratio computed
+            // against it. That biases hardest against the gated arm, which is exactly the arm whose
+            // queue is shut half the time.
+            match d.inject(InjectFrame { payload: payload.into(), tx: TxIntent::CONSERVATIVE, dst: BROADCAST, src, addr3: None }).await {
+                Ok(()) => {
+                    sent.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    tx_failed.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             if pace_us > 0 {
                 tokio::time::sleep(Duration::from_micros(pace_us)).await; // unsaturated: beacons flow
             } else {
@@ -303,11 +345,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let disciplined = cv.lock().unwrap().is_disciplined();
     println!(
         "\n=== RESULT role={} mode={} ===\n\
-         sent={}  recv_peer={}  ({:.1}/s over {:.1}s)\n\
+         sent={} tx_failed={} recv_peer={}  ({:.1}/s over {:.1}s)\n\
          recv_beacon={}  common_view={}",
         if master { "master" } else { "slave" },
         if slotted { "slotted" } else { "contention" },
         sent.load(Ordering::Relaxed),
+        tx_failed.load(Ordering::Relaxed),
         recv_peer.load(Ordering::Relaxed),
         recv_peer.load(Ordering::Relaxed) as f64 / count_secs,
         count_secs,
