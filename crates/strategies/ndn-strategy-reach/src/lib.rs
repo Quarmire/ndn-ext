@@ -1,22 +1,28 @@
-//! **Soft prefix-reach** — a mobility-first named-radio forwarding strategy, the base candidate from
-//! `ndn-ext/crates/faces/ndn-face-monitor-wifi/docs/wireless-forwarding-under-flux.md` §5. Two variants, both
-//! keyed on a decaying, **name-prefix reachability prior** (the MAC's one legal soft-state memory; §7): the
-//! prior is reinforced `+g` on Data-return (`after_receive_data`) and decays `w·e^(−Δt/τ)` on read, keyed on
-//! the name only (no host identity). What the prior *drives* is the axis being A/B'd:
+//! **Soft prefix-reach** — a mobility-first named-radio forwarding family, the base candidate from
+//! `ndn-ext/crates/faces/ndn-face-monitor-wifi/docs/wireless-forwarding-under-flux.md` §5, with each of the
+//! six design axes exposed as a swappable variant so the ndn-sim `ndr_mobility_sweep` harness can A/B one at a
+//! time (doc §7). All variants share the invariant: the prior is the MAC's one legal soft-state memory (§7) —
+//! reinforced on Data-return, decayed on read, keyed on the **name only** (no host identity) — and a cold or
+//! wrong prior only ever *widens* the flood, so it can never blackhole.
 //!
-//! - **`soft-prefix-reach`** (v1, probabilistic gate) — a relay re-broadcasts with probability
-//!   `p = floor + (1−floor)·min(w/wmax,1)`. Cheap, but it moves *along* the delivery/airtime curve: a
-//!   suppressed re-broadcast can kill a path, so airtime *and* delivery drop together.
+//! Registered strategies (env `NDR_STRATEGY`):
+//! - **`soft-prefix-reach`** — *decision* = probabilistic gate (drop below `p`); moves *along* the
+//!   delivery/airtime curve.
+//! - **`soft-prefix-reach-defer`** — *decision* = defer + overhear-cancel (LFBL/CCLF): the prior sets the
+//!   re-broadcast delay (high reach → fires first), the engine's overhear-cancel suppresses the redundant
+//!   copies. *Shifts* the curve (the Pareto win).
+//! - **`soft-prefix-reach-bandit`** — *decision* = defer, but the reach used for the delay is a **Thompson
+//!   sample** from a Beta posterior over (success, attempt) — so an *uncertain* (cold/stale, i.e. mobile)
+//!   node sometimes fires first and explores, while a *confident* node exploits. The non-stationary bandit
+//!   answering "when does the prior beat flooding" (doc §3, axis H).
+//! - **`soft-prefix-reach-bloom`** — *memory* = a counting/decaying **Bloom filter** over name-prefixes
+//!   (BFR/BLOOGO; the doctrine's prefix-set Bloom made counting) instead of a per-prefix scalar map; same
+//!   defer decision. A drop-in at small scale; its real benefit is compact, gossipable memory at many
+//!   prefixes (a wire/scale property, not a single-neighbourhood delivery win).
 //!
-//! - **`soft-prefix-reach-defer`** (v2, defer + overhear-cancel — LFBL/CCLF) — a relay does NOT drop; it
-//!   **defers** the re-broadcast by a delay the prior sets (high reach → short delay → fires first), emitting
-//!   [`ForwardingAction::ForwardAfter`]. The engine's overhear-cancel then suppresses the *redundant* copies:
-//!   when a better-positioned neighbor re-broadcasts first, the duplicate nonce sets the PIT entry's
-//!   `forward_cancelled` and the pending timer skips. So only ~one relay per hop transmits (the best), which
-//!   cuts airtime *without* dropping delivery — it *shifts* the curve. This is the intended Pareto win.
-//!
-//! Only the re-broadcast on the arrival face is gated/deferred (the floodable part); a genuine hop — a
-//! consumer's own Interest heading out, or an Interest reaching a local producer — always forwards immediately.
+//! Tunables are env-overridable for §8 sweeps: `NDR_PFLOOR`, `NDR_REINFORCE`, `NDR_WMAX`, `NDR_TAU_MS`,
+//! `NDR_DEFER_MIN_MS`, `NDR_DEFER_MAX_MS`. Only the re-broadcast on the arrival face is gated/deferred; a
+//! genuine hop (a consumer's own Interest, or an Interest reaching a local producer) always forwards.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -33,37 +39,118 @@ register_strategy!(SOFT_PREFIX_REACH_REG, b"soft-prefix-reach", 1, || Arc::new(
 register_strategy!(SOFT_PREFIX_REACH_DEFER_REG, b"soft-prefix-reach-defer", 1, || Arc::new(
     SoftPrefixReachStrategy::new(Mode::Defer)
 ) as Arc<dyn ErasedStrategy>,);
+register_strategy!(SOFT_PREFIX_REACH_BANDIT_REG, b"soft-prefix-reach-bandit", 1, || Arc::new(
+    SoftPrefixReachStrategy::new(Mode::Bandit)
+) as Arc<dyn ErasedStrategy>,);
+register_strategy!(SOFT_PREFIX_REACH_BLOOM_REG, b"soft-prefix-reach-bloom", 1, || Arc::new(
+    SoftPrefixReachStrategy::new(Mode::BloomDefer)
+) as Arc<dyn ErasedStrategy>,);
 
-// --- tunables (wireless-forwarding-under-flux.md §8; A/B these in the sim) ---
-const P_FLOOR: f64 = 0.2; // v1 exploration floor (env `NDR_PFLOOR`)
-const REINFORCE: f64 = 1.0; // weight added on each Data-return for the prefix
-const W_MAX: f64 = 4.0; // reach-weight cap (p / priority saturate here)
-const TAU_MS: f64 = 4000.0; // reach-prior decay time constant
-const DEFER_MIN_MS: f64 = 2.0; // v2 shortest defer (a fully-warm relay)
-const DEFER_MAX_MS: f64 = 40.0; // v2 longest defer (a cold relay) — keep ·hops < Interest lifetime
+/// Counting-Bloom width (cells) and hash count — small; scale is a wire/memory property, not a sim metric.
+const BLOOM_CELLS: usize = 256;
+const BLOOM_K: usize = 4;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 enum Mode {
-    /// v1: re-broadcast with probability `p(reach)`; else suppress.
-    Probabilistic,
-    /// v2: defer the re-broadcast by `delay(reach)`; the engine overhear-cancels the redundant ones.
-    Defer,
+    Probabilistic, // v1: re-broadcast with prob p(reach); else suppress.
+    Defer,         // v2: defer by delay(reach); engine overhear-cancels the redundant ones.
+    Bandit,        // v3: defer, reach = Thompson sample from a Beta posterior (explore under uncertainty).
+    BloomDefer,    // v4: defer, memory = counting/decaying Bloom over prefixes (vs the scalar map).
 }
 
+/// Env-overridable tunables (doc §8). Read once at construction.
+struct Params {
+    p_floor: f64,
+    reinforce: f64,
+    w_max: f64,
+    tau_ms: f64,
+    defer_min_ms: f64,
+    defer_max_ms: f64,
+}
+
+impl Params {
+    fn from_env() -> Self {
+        let env = |k: &str, d: f64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        Self {
+            p_floor: env("NDR_PFLOOR", 0.2),
+            reinforce: env("NDR_REINFORCE", 1.0),
+            w_max: env("NDR_WMAX", 4.0),
+            tau_ms: env("NDR_TAU_MS", 4000.0),
+            defer_min_ms: env("NDR_DEFER_MIN_MS", 2.0),
+            // Sweep (ndr_mobility_sweep, N=12, ~3-4 hops): delivery improved monotonically as the window
+            // tightened (40→15→8 ms), especially at high mobility (less per-hop latency ⇒ more Data returns
+            // before the topology shifts): 8 ms was best (0.605 vs 0.568 deliv @30 m/s) but is aggressive for
+            // deeper nets (tighter separation ⇒ more near-tie collisions), so 15 ms is the default with
+            // headroom; override via NDR_DEFER_MAX_MS.
+            defer_max_ms: env("NDR_DEFER_MAX_MS", 15.0),
+        }
+    }
+}
+
+/// Scalar EWMA reach (Probabilistic / Defer).
 struct Reach {
     weight: f64,
     last_ms: u64,
 }
 
-/// A decaying per-prefix reachability prior driving either a probabilistic gate (v1) or a prior-ordered
-/// deferred re-broadcast with overhear-cancel (v2). One instance per node (the registry factory builds a
-/// fresh one), so its `Mutex` state is that node's private soft state.
+/// Beta posterior over (success, attempt) for the Thompson-bandit decision.
+struct Beta {
+    alpha: f64, // decayed successes (Data-returns)
+    beta: f64,  // decayed attempts (re-broadcasts that didn't (yet) succeed)
+    last_ms: u64,
+}
+
+/// A counting, geometrically-decaying Bloom filter over name-prefix hashes (the reach prior's memory).
+struct CountingBloom {
+    cells: Vec<f64>,
+    last_ms: u64,
+}
+
+impl CountingBloom {
+    fn new() -> Self {
+        Self { cells: vec![0.0; BLOOM_CELLS], last_ms: 0 }
+    }
+    fn decay_to(&mut self, now_ms: u64, tau_ms: f64) {
+        let dt = now_ms.saturating_sub(self.last_ms) as f64;
+        if dt > 0.0 {
+            let f = (-dt / tau_ms).exp();
+            for c in &mut self.cells {
+                *c *= f;
+            }
+            self.last_ms = now_ms;
+        }
+    }
+    fn idxs(key: u64) -> [usize; BLOOM_K] {
+        let mut out = [0usize; BLOOM_K];
+        let mut h = key;
+        for o in &mut out {
+            h ^= h >> 33;
+            h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+            h ^= h >> 33;
+            *o = (h % BLOOM_CELLS as u64) as usize;
+        }
+        out
+    }
+    fn insert(&mut self, key: u64, g: f64, w_max: f64) {
+        for i in Self::idxs(key) {
+            self.cells[i] = (self.cells[i] + g).min(w_max);
+        }
+    }
+    /// Counting-Bloom membership strength = min over the k cells.
+    fn query(&self, key: u64) -> f64 {
+        Self::idxs(key).into_iter().map(|i| self.cells[i]).fold(f64::INFINITY, f64::min)
+    }
+}
+
+/// The strategy: a decaying name-prefix reachability prior driving one of four axis variants.
 pub struct SoftPrefixReachStrategy {
     name: Name,
     mode: Mode,
+    params: Params,
     prior: Mutex<HashMap<u64, Reach>>,
+    bandit: Mutex<HashMap<u64, Beta>>,
+    bloom: Mutex<CountingBloom>,
     rng: Mutex<u32>, // xorshift32 — deterministic per-node stream
-    p_floor: f64, // v1 exploration floor (env `NDR_PFLOOR`)
 }
 
 impl SoftPrefixReachStrategy {
@@ -71,6 +158,8 @@ impl SoftPrefixReachStrategy {
         let leaf: &'static [u8] = match mode {
             Mode::Probabilistic => b"soft-prefix-reach",
             Mode::Defer => b"soft-prefix-reach-defer",
+            Mode::Bandit => b"soft-prefix-reach-bandit",
+            Mode::BloomDefer => b"soft-prefix-reach-bloom",
         };
         Self {
             name: Name::from_components([
@@ -80,9 +169,11 @@ impl SoftPrefixReachStrategy {
                 NameComponent::generic(bytes_static(leaf)),
             ]),
             mode,
+            params: Params::from_env(),
             prior: Mutex::new(HashMap::new()),
+            bandit: Mutex::new(HashMap::new()),
+            bloom: Mutex::new(CountingBloom::new()),
             rng: Mutex::new(0x2545_F491),
-            p_floor: std::env::var("NDR_PFLOOR").ok().and_then(|v| v.parse().ok()).unwrap_or(P_FLOOR),
         }
     }
 
@@ -102,19 +193,6 @@ impl SoftPrefixReachStrategy {
         ctx.runtime.unix_nanos() / 1_000_000
     }
 
-    /// Decayed reach weight for `key` at `now_ms` (geometric decay since last reinforcement).
-    fn weight(&self, key: u64, now_ms: u64) -> f64 {
-        let map = self.prior.lock().unwrap();
-        match map.get(&key) {
-            Some(r) => {
-                let dt = now_ms.saturating_sub(r.last_ms) as f64;
-                r.weight * (-dt / TAU_MS).exp()
-            }
-            None => 0.0,
-        }
-    }
-
-    /// A deterministic pseudo-random draw in `[0, 1)` from this node's xorshift stream.
     fn draw(&self) -> f64 {
         let mut s = self.rng.lock().unwrap();
         let mut x = *s;
@@ -125,13 +203,66 @@ impl SoftPrefixReachStrategy {
         (x as f64) / (u32::MAX as f64)
     }
 
-    /// v2 defer: warm relays fire first (short delay), cold relays last; a random term spreads ties so a
+    /// A standard-normal sample (Box–Muller on the xorshift stream) for the Thompson approximation.
+    fn gauss(&self) -> f64 {
+        let u1 = self.draw().max(1e-9);
+        let u2 = self.draw();
+        (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+    }
+
+    /// The reach estimate in `[0, 1]` for this prefix, per mode (with decay applied on read).
+    fn reach_norm(&self, key: u64, now_ms: u64) -> f64 {
+        let p = &self.params;
+        match self.mode {
+            Mode::Probabilistic | Mode::Defer => {
+                let map = self.prior.lock().unwrap();
+                let w = map.get(&key).map_or(0.0, |r| {
+                    r.weight * (-(now_ms.saturating_sub(r.last_ms) as f64) / p.tau_ms).exp()
+                });
+                (w / p.w_max).clamp(0.0, 1.0)
+            }
+            Mode::BloomDefer => {
+                let mut b = self.bloom.lock().unwrap();
+                b.decay_to(now_ms, p.tau_ms);
+                (b.query(key) / p.w_max).clamp(0.0, 1.0)
+            }
+            Mode::Bandit => {
+                // Thompson: sample the reach from Beta(alpha+1, beta+1) via a Gaussian approximation
+                // (mean + z·std). An uncertain (few observations / decayed) prefix has high variance, so a
+                // mobile/cold node sometimes samples high → fires first and explores.
+                let map = self.bandit.lock().unwrap();
+                let (a, bta) = map.get(&key).map_or((0.0, 0.0), |b| {
+                    let f = (-(now_ms.saturating_sub(b.last_ms) as f64) / p.tau_ms).exp();
+                    (b.alpha * f, b.beta * f)
+                });
+                let (a1, b1) = (a + 1.0, bta + 1.0); // Laplace prior: cold ⇒ mean 0.5, high variance
+                let n = a1 + b1;
+                let mean = a1 / n;
+                let var = (a1 * b1) / (n * n * (n + 1.0));
+                (mean + self.gauss() * var.sqrt()).clamp(0.0, 1.0)
+            }
+        }
+    }
+
+    /// Defer delay: warm/high-reach → short (fires first); cold → long; a random term spreads ties so a
     /// single winner emerges per hop and the engine's overhear-cancel suppresses the rest.
     fn defer_delay(&self, reach_norm: f64) -> Duration {
-        let priority = 1.0 - reach_norm; // 0 = warm (fast), 1 = cold (slow)
-        let frac = (0.5 * priority + 0.5 * self.draw()).clamp(0.0, 1.0);
-        let ms = DEFER_MIN_MS + (DEFER_MAX_MS - DEFER_MIN_MS) * frac;
+        let p = &self.params;
+        let frac = (0.5 * (1.0 - reach_norm) + 0.5 * self.draw()).clamp(0.0, 1.0);
+        let ms = p.defer_min_ms + (p.defer_max_ms - p.defer_min_ms) * frac;
         Duration::from_micros((ms * 1000.0) as u64)
+    }
+
+    /// Count a re-broadcast attempt (bandit β) — decayed evidence the node forwarded for this prefix.
+    fn note_attempt(&self, key: u64, now_ms: u64) {
+        if self.mode == Mode::Bandit {
+            let mut map = self.bandit.lock().unwrap();
+            let b = map.entry(key).or_insert(Beta { alpha: 0.0, beta: 0.0, last_ms: now_ms });
+            let f = (-(now_ms.saturating_sub(b.last_ms) as f64) / self.params.tau_ms).exp();
+            b.beta = b.beta * f + 1.0;
+            b.alpha *= f;
+            b.last_ms = now_ms;
+        }
     }
 }
 
@@ -148,31 +279,27 @@ impl Strategy for SoftPrefixReachStrategy {
         if faces.is_empty() {
             return smallvec![ForwardingAction::Nack(NackReason::NoRoute)];
         }
-
-        // Genuine hops (a nexthop != the arrival face) always forward immediately — a consumer's own Interest
-        // heading out, or an Interest reaching a local producer. Only a pure re-broadcast on the arrival face
-        // (the flood) is gated/deferred.
+        // Genuine hops always forward immediately; only a pure re-broadcast on the arrival face is gated.
         let other: SmallVec<[FaceId; 4]> = faces.iter().copied().filter(|&f| f != ctx.in_face).collect();
         if !other.is_empty() {
             return smallvec![ForwardingAction::Forward(other)];
         }
 
-        // Pure re-broadcast on the arrival face.
         let key = Self::prefix_key(ctx);
-        let w = self.weight(key, Self::now_ms(ctx));
-        let reach_norm = (w / W_MAX).clamp(0.0, 1.0);
+        let now = Self::now_ms(ctx);
+        let reach = self.reach_norm(key, now);
         match self.mode {
             Mode::Probabilistic => {
-                let p = self.p_floor + (1.0 - self.p_floor) * reach_norm;
+                let p = self.params.p_floor + (1.0 - self.params.p_floor) * reach;
                 if self.draw() < p {
                     smallvec![ForwardingAction::Forward(faces)]
                 } else {
                     smallvec![ForwardingAction::Suppress]
                 }
             }
-            Mode::Defer => {
-                // Never drop — defer, and let the engine's overhear-cancel suppress the redundant copies.
-                smallvec![ForwardingAction::ForwardAfter { faces, delay: self.defer_delay(reach_norm) }]
+            Mode::Defer | Mode::Bandit | Mode::BloomDefer => {
+                self.note_attempt(key, now);
+                smallvec![ForwardingAction::ForwardAfter { faces, delay: self.defer_delay(reach) }]
             }
         }
     }
@@ -181,11 +308,30 @@ impl Strategy for SoftPrefixReachStrategy {
         // Data came back for this prefix through this node → reinforce the reach prior (pheromone/KITE).
         let key = Self::prefix_key(ctx);
         let now = Self::now_ms(ctx);
-        let mut map = self.prior.lock().unwrap();
-        let r = map.entry(key).or_insert(Reach { weight: 0.0, last_ms: now });
-        let dt = now.saturating_sub(r.last_ms) as f64;
-        r.weight = (r.weight * (-dt / TAU_MS).exp() + REINFORCE).min(W_MAX);
-        r.last_ms = now;
+        let p = &self.params;
+        match self.mode {
+            Mode::Probabilistic | Mode::Defer => {
+                let mut map = self.prior.lock().unwrap();
+                let r = map.entry(key).or_insert(Reach { weight: 0.0, last_ms: now });
+                r.weight = (r.weight * (-(now.saturating_sub(r.last_ms) as f64) / p.tau_ms).exp()
+                    + p.reinforce)
+                    .min(p.w_max);
+                r.last_ms = now;
+            }
+            Mode::BloomDefer => {
+                let mut b = self.bloom.lock().unwrap();
+                b.decay_to(now, p.tau_ms);
+                b.insert(key, p.reinforce, p.w_max);
+            }
+            Mode::Bandit => {
+                let mut map = self.bandit.lock().unwrap();
+                let b = map.entry(key).or_insert(Beta { alpha: 0.0, beta: 0.0, last_ms: now });
+                let f = (-(now.saturating_sub(b.last_ms) as f64) / p.tau_ms).exp();
+                b.alpha = b.alpha * f + p.reinforce; // a success
+                b.beta *= f;
+                b.last_ms = now;
+            }
+        }
         SmallVec::new()
     }
 }
