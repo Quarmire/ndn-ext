@@ -8,8 +8,14 @@ license.workspace = true
 [package.metadata.scope]
 classification = "extension"
 
+[features]
+# The ESP32-C5 serial-bridged BLE backend (firmware/esp32c5-ble): NimBLE extended advertising + scanning,
+# host-driven over USB-serial. Pulls `serialport`.
+serial = ["dep:serialport"]
+
 [dependencies]
 ndn-transport    = { workspace = true }
+serialport       = { version = "4", optional = true, default-features = false }
 ndn-signals-core = { workspace = true }
 ndn-ble-framing  = { workspace = true }
 bytes            = { workspace = true, features = ["std"] }
@@ -24,3 +30,7 @@ ndn-packet = { workspace = true }
 
 [lints]
 workspace = true
+
+[[example]]
+name = "ble_c5"
+required-features = ["serial"]

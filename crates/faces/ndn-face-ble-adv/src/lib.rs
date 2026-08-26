@@ -279,6 +279,12 @@ fn now_ms() -> u32 {
 mod loopback;
 pub use loopback::{LoopbackAdvBus, LoopbackEndpoint};
 
+// The ESP32-C5 serial-bridged BLE backend (the first real AdvBackend, over BLE 5 extended advertising).
+#[cfg(feature = "serial")]
+mod serial;
+#[cfg(feature = "serial")]
+pub use serial::Esp32BleBackend;
+
 #[cfg(test)]
 mod tests {
     use super::*;
