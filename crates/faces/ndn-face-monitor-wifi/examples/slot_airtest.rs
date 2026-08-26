@@ -146,6 +146,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         env("NDN_RADIO_TX_RATE").unwrap_or_else(|| "default".into()),
     );
 
+    // PHY PPDU counters bracketing the counting window. `err` counts PPDUs the PHY BEGAN to
+    // demodulate and failed — collisions and marginal decode — which is the only view of loss a
+    // receiver has, since a frame destroyed on air never arrives to be counted missing.
+    let phy0 = knobs.as_ref().and_then(|k| k.read_ofdm_counters().ok().flatten());
     let sent = Arc::new(AtomicU64::new(0));
     // Injects the radio REFUSED — never on air, so not part of the delivery denominator.
     let tx_failed = Arc::new(AtomicU64::new(0));
@@ -357,6 +361,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         recv_beacon.load(Ordering::Relaxed),
         disciplined,
     );
+    if let (Some((ok0, err0)), Some(k)) = (phy0, knobs.as_ref())
+        && let Ok(Some((ok1, err1))) = k.read_ofdm_counters()
+    {
+        let (d_ok, d_err) = (ok1.wrapping_sub(ok0), err1.wrapping_sub(err0));
+        let total = u32::from(d_ok) + u32::from(d_err);
+        println!(
+            "PHY ofdm_ok={d_ok} ofdm_err={d_err}  -> {:.1}% of PPDUs the PHY started FAILED to \
+             decode (collisions / marginal), across ALL transmitters on the channel",
+            if total > 0 { 100.0 * f64::from(d_err) / f64::from(total) } else { 0.0 }
+        );
+    }
     // Slave: the TimeBeacon's on-air common-view precision = the jitter of the disciplined offset.
     if !master {
         let o = offsets.lock().unwrap();
