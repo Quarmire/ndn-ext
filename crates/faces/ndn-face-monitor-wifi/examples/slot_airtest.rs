@@ -81,6 +81,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // queue delay. This is an IDEALISED alignment used to isolate the MAC question; the production
     // path still needs hardware common view (measured separately at 0.4 us residual / 0.0034 ppm).
     let align_seq = env("NDN_ALIGN").as_deref() == Some("seq");
+    // NDN_ALIGN=cv — the doctrine-correct alignment: HARDWARE RX STAMPS of a mutually-heard third
+    // node's ORDINARY traffic.
+    //
+    // Common view is an RX-only technique: both nodes stamp the SAME frame, so the transmitter's
+    // clock cancels and what remains is the offset between the two receivers (measured on these
+    // radios at 0.0034 ppm / 0.4 us residual). The sequence number here identifies WHICH frame both
+    // are looking at; it carries no timing. That is the difference from NDN_ALIGN=seq, which used
+    // the sequence itself as the clock and so needed a dedicated paced tick — the beacon-shaped
+    // crutch this design exists to avoid.
+    //
+    // Both nodes anchor on the same well-known frame (seq % ANCHOR == 0), so their epochs share an
+    // origin without exchanging anything. Between arrivals the phase is extrapolated on the host
+    // clock, which is accurate over the few ms between frames.
+    let align_cv = env("NDN_ALIGN").as_deref() == Some("cv");
+    const ANCHOR_MASK: u32 = 0xff; // anchor on every 256th common-source frame
+    let cv_origin = Arc::new(Mutex::new(None::<(u64, u64)>)); // (stamp ticks, host us) at anchor
+    let cv_last = Arc::new(Mutex::new(None::<(u64, u64)>)); // most recent (stamp ticks, host us)
     // One tick per slot: the common source is paced so each of its frames marks a slot boundary,
     // which keeps its airtime negligible. A saturating source would time the medium by destroying it.
     const FRAMES_PER_SLOT: u32 = 1;
@@ -106,6 +123,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // RX pump itself.
     let opened = ndn_radio_drivers::open_named_radio(pid, ch)?;
     let d = opened.io.clone();
+    // Real ns-per-tick of this radio's RX stamp, from its own declaration — NOT assumed 1000. The
+    // 8733b's is 4000, and assuming otherwise scales every derived duration by 4.
+    let tick_ns = opened
+        .time
+        .as_ref()
+        .and_then(|t| t.time_sources().first().map(|s| u64::from(s.tick_ns)))
+        .unwrap_or(1_000);
     let knobs = opened.knobs.clone();
     if hw_gate && knobs.is_none() {
         eprintln!("NDN_HW_GATE set but this radio exposes no RadioKnobs — the arm would be a no-op");
@@ -133,6 +157,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (d, cv, recv_peer, recv_beacon, offsets, host_us) =
             (d.clone(), cv.clone(), recv_peer.clone(), recv_beacon.clone(), offsets.clone(), host_us);
         let common_seq_rx = common_seq.clone();
+        let cv_origin_rx = cv_origin.clone();
+        let cv_last_rx = cv_last.clone();
         tokio::spawn(async move {
             while Instant::now() < deadline {
                 match tokio::time::timeout(Duration::from_millis(5), d.recv_frame()).await {
@@ -143,6 +169,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if p.len() >= 8 && p[2] == 0xC3 && p[1] == 5 {
                             let sq = u32::from_le_bytes([p[4], p[5], p[6], p[7]]);
                             common_seq_rx.store(u64::from(sq), Ordering::Relaxed);
+                            // Hardware RX stamp of this common frame — the actual time reference.
+                            if let Some(st) = f.stamp {
+                                let hn = host_us();
+                                *cv_last_rx.lock().unwrap() = Some((st.raw, hn));
+                                if sq & ANCHOR_MASK == 0 {
+                                    // RE-ANCHOR ON EVERY anchor frame, not just the first.
+                                    //
+                                    // "The first anchor frame I see" is NOT the same frame on both
+                                    // nodes — whoever starts later misses one and anchors 256 frames
+                                    // downstream, so the two phases differ by an arbitrary offset and
+                                    // the slots never line up. Re-anchoring keeps both locked to the
+                                    // MOST RECENT anchor, which is necessarily the same frame for
+                                    // both, and the phase jump is simultaneous so it costs nothing.
+                                    *cv_origin_rx.lock().unwrap() = Some((st.raw, hn));
+                                }
+                            }
                         }
                         if p.len() >= TIME_BEACON_MAGIC.len() + 8 && p[..3] == TIME_BEACON_MAGIC {
                             if !master {
@@ -189,7 +231,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // The fix is not a better software beacon: it is the HARDWARE common view this stack already
         // has — per-frame RX stamps, measured this session at 0.4 us residual / 0.0034 ppm between
         // two of these radios. Stamp at transmit, or align on the receiver's own hardware stamp.
-        if master && last_beacon.elapsed().as_millis() >= BEACON_MS {
+        // Skip the software beacon entirely under common-view alignment: it is unused there, and
+        // with the hardware gate shut outside our slot its inject BLOCKS, stalling the whole TX loop
+        // — which is why arm C's master collapsed to 764 frames sent against the slave's 4470.
+        if master && !align_cv && last_beacon.elapsed().as_millis() >= BEACON_MS {
             let refr = host_us();
             cv.lock().unwrap().on_raw(refr, host_us());
             let mut payload = Vec::with_capacity(11);
@@ -199,7 +244,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             last_beacon = Instant::now();
         }
 
-        let epoch = if align_seq {
+        let epoch = if align_cv {
+            // Phase = (stamp - anchor) in real time, extrapolated to now on the host clock.
+            match (*cv_origin.lock().unwrap(), *cv_last.lock().unwrap()) {
+                (Some((o_tick, _)), Some((l_tick, l_host))) => {
+                    let since_anchor_us = l_tick.wrapping_sub(o_tick) * tick_ns / 1000;
+                    let extrap_us = host_us().saturating_sub(l_host);
+                    (since_anchor_us + extrap_us) / slot_us
+                }
+                _ => u64::MAX, // no anchor heard yet — stay silent rather than transmit unaligned
+            }
+        } else if align_seq {
             match common_seq.load(Ordering::Relaxed) {
                 u64::MAX => u64::MAX, // no common-source frame heard yet — stay silent
                 sq => sq / u64::from(FRAMES_PER_SLOT),

@@ -34,3 +34,7 @@ workspace = true
 [[example]]
 name = "ble_c5"
 required-features = ["serial"]
+
+[[example]]
+name = "ble_roundtrip"
+required-features = ["serial"]
