@@ -31,7 +31,8 @@
 //! Unset ⇒ scheduler disabled ⇒ the send path is byte-for-byte unchanged.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use portable_atomic::AtomicU64;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ndn_radio_cognition::{LeaseClass, HopSchedule, SlotSchedule, prefix_hash, wifi_airtime_us};

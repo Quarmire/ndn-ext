@@ -3,7 +3,8 @@
 //! = 1 token, one Data packet = N bytes of token.
 
 use std::num::NonZeroU32;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
+use portable_atomic::AtomicU64;
 
 use governor::clock::DefaultClock;
 use governor::state::{InMemoryState, NotKeyed};

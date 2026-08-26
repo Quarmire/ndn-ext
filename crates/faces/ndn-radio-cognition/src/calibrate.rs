@@ -37,6 +37,47 @@ pub fn default_thresholds() -> RateThresholds {
 }
 
 /// Highest MCS ≤ `max_mcs` whose threshold is satisfied by `rssi_dbm`.
+/// **Minimum SNR (dB) each MCS structurally needs**, index 0..=9, 20 MHz, single stream.
+///
+/// This is NOT a per-chip calibration and must not be tuned like one. It is the demodulation
+/// floor implied by the modulation and coding rate themselves (BPSK 1/2 up to 64-QAM 5/6, plus
+/// 256-QAM for the VHT indices), which is a property of the standard rather than of any radio —
+/// the same reasoning as the `mode_ceiling` in the HAL's intent resolver, where a *structural*
+/// limit legitimately overrides a per-chip number. A few dB of implementation margin is included.
+///
+/// Deliberately used only as a CEILING over the RSSI-calibrated choice, never as the selector:
+/// the RSSI thresholds carry the per-chip calibration this table must not pretend to have.
+pub const MIN_SNR_DB: [f32; 10] = [5.0, 8.0, 11.0, 14.0, 18.0, 22.0, 24.0, 26.0, 29.0, 31.0];
+
+/// Highest MCS whose demodulation floor `snr_db` clears.
+pub fn snr_ceiling(snr_db: f32) -> u8 {
+    let mut best = 0u8;
+    for m in 0..MIN_SNR_DB.len() {
+        if MIN_SNR_DB[m] <= snr_db {
+            best = m as u8;
+        }
+    }
+    best
+}
+
+/// [`pick_mcs`] with an optional measured SNR applied as a physical ceiling.
+///
+/// RSSI says how LOUD a frame arrived; SNR says how CLEAN it was, and only the second predicts
+/// whether a rate demodulates. The two diverge exactly where this stack has already been bitten:
+/// a busy channel gives excellent RSSI and heavy loss (the 8812au "severe loss at 3 ft" was
+/// measured to be contention, not weak signal). An RSSI-only selector cannot see that case — it
+/// reads a strong signal and picks a high rate into a medium that will not carry it.
+///
+/// `snr_db = None` reproduces the RSSI-only behaviour exactly, so a radio that reports no SNR is
+/// unaffected.
+pub fn pick_mcs_snr(rssi_dbm: i8, snr_db: Option<f32>, max_mcs: u8, thresholds: &[f32; 10]) -> u8 {
+    let by_rssi = pick_mcs(rssi_dbm, max_mcs, thresholds);
+    match snr_db {
+        Some(s) => by_rssi.min(snr_ceiling(s)),
+        None => by_rssi,
+    }
+}
+
 pub fn pick_mcs(rssi_dbm: i8, max_mcs: u8, thresholds: &[f32; 10]) -> u8 {
     let r = rssi_dbm as f32;
     let mut best = 0u8;
@@ -358,6 +399,51 @@ mod tests {
         let t = cal.thresholds();
         for sf in 8..=12 {
             assert!(t[sf] <= t[sf - 1], "SF thresholds must be nonincreasing at {sf}: {t:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod snr_ceiling_tests {
+    use super::*;
+
+    /// No SNR reported => byte-for-byte the old behaviour. A radio that cannot measure SNR must
+    /// not be penalised for it.
+    #[test]
+    fn absent_snr_is_a_no_op() {
+        for rssi in [-30i8, -50, -70, -90] {
+            assert_eq!(
+                pick_mcs_snr(rssi, None, 9, &STATIC_REQ_RSSI),
+                pick_mcs(rssi, 9, &STATIC_REQ_RSSI)
+            );
+        }
+    }
+
+    /// The case RSSI cannot see: a LOUD but DIRTY link. Measured on this bench as contention —
+    /// excellent RSSI, heavy loss. RSSI alone picks the top rate; the SNR ceiling holds it down.
+    #[test]
+    fn loud_but_dirty_link_is_capped() {
+        let rssi_only = pick_mcs(-40, 9, &STATIC_REQ_RSSI);
+        let with_snr = pick_mcs_snr(-40, Some(9.0), 9, &STATIC_REQ_RSSI);
+        assert!(with_snr < rssi_only, "SNR ceiling did not bite: {with_snr} vs {rssi_only}");
+        assert_eq!(with_snr, 1, "9 dB SNR should allow MCS1, not {with_snr}");
+    }
+
+    /// A clean link must NOT be promoted above what RSSI calibration allows — the ceiling only
+    /// ever caps. Otherwise this table would be quietly replacing the per-chip calibration.
+    #[test]
+    fn ceiling_never_promotes() {
+        let rssi_only = pick_mcs(-80, 9, &STATIC_REQ_RSSI);
+        assert_eq!(pick_mcs_snr(-80, Some(40.0), 9, &STATIC_REQ_RSSI), rssi_only);
+    }
+
+    #[test]
+    fn snr_ceiling_is_monotonic() {
+        let mut last = 0u8;
+        for s in 0..40 {
+            let c = snr_ceiling(s as f32);
+            assert!(c >= last);
+            last = c;
         }
     }
 }

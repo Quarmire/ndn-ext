@@ -55,7 +55,8 @@ fn producer() {
     use std::io::{Read, Write};
     use std::os::unix::io::AsRawFd;
     use std::os::unix::net::UnixListener;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::Ordering;
+    use portable_atomic::AtomicU64;
     use std::time::Instant;
 
     let path = format!("/tmp/.ndn-zc-demo-{}.sock", std::process::id());
@@ -173,7 +174,8 @@ fn consumer(sock_path: &str) {
     use std::io::{Read, Write};
     use std::os::unix::io::AsRawFd;
     use std::os::unix::net::UnixStream;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::Ordering;
+    use portable_atomic::AtomicU64;
 
     let mut sock = UnixStream::connect(sock_path).unwrap();
 

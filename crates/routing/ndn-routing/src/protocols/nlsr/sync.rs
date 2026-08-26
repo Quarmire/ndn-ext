@@ -17,8 +17,9 @@
 
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::Ordering,
 };
+use portable_atomic::AtomicU64;
 
 use ndn_engine::observability::targets as t;
 use ndn_packet::Name;

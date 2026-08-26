@@ -19,6 +19,7 @@ driver = ["dep:ndn-sync", "dep:ndn-nacabe", "dep:ndn-security", "dep:ndn-foundat
 engine = ["driver", "dep:ndn-app", "dep:ndn-engine", "dep:ndn-strategy", "dep:tokio-util"]
 
 [dependencies]
+portable-atomic = { workspace = true }
 ndn-packet = { workspace = true, features = ["std"] }
 ndn-sync   = { workspace = true, optional = true }
 # KP-ABE access control for the four-phase payloads (NSF-A3): NAC-seal under

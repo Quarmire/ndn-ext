@@ -17,7 +17,8 @@
 //! NSF-A3 message trust the four-phase driver already enforces.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
+use portable_atomic::AtomicU64;
 use std::time::Duration;
 
 use async_trait::async_trait;

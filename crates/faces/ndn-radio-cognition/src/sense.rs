@@ -179,6 +179,8 @@ impl Default for Demand {
 struct NeighborState {
     /// RSSI EWMA per radio that hears this neighbor (LoRa hears far, Wi-Fi near).
     rssi: HashMap<RadioId, Ewma>,
+    /// Per-radio EWMA SNR (dB), when the backend reports it. Parallel to `rssi`.
+    snr: HashMap<RadioId, Ewma>,
     report: Option<NeighborReport>,
     last_seen_ms: u64,
 }
@@ -306,6 +308,20 @@ impl MediumState {
         }
     }
 
+    /// Fold a per-neighbour **SNR** reading (dB), from a backend that reports per-frame PHY
+    /// quality (e.g. the RTL8733BU's Jaguar-3 status block).
+    ///
+    /// Separate from [`observe_rx`](Self::observe_rx) rather than an extra parameter so existing
+    /// callers and backends that report no SNR are untouched — the absence of SNR must cost a
+    /// radio nothing.
+    pub fn observe_rx_snr(&mut self, radio: RadioId, neighbor: u64, snr_db: Option<f32>, now_ms: u64) {
+        if let Some(v) = snr_db {
+            let st = self.neighbors.entry(neighbor).or_default();
+            st.last_seen_ms = now_ms;
+            st.snr.entry(radio).or_insert_with(|| Ewma::new(0.3)).update(v);
+        }
+    }
+
     /// Fold a per-radio ambient inbound RSSI reading (no neighbour identity). Unlike
     /// [`observe_rx`] this creates no neighbour entry — it feeds only the cold-start
     /// `weakest_rssi` fallback, never `receiver_count`.
@@ -428,6 +444,19 @@ pub trait MediumView {
     /// conservative demand-set representative: provision the rate/redundancy for
     /// the worst listener, not the best. `None` when no receiver is heard.
     fn weakest_rssi(&self, radio: RadioId, now_ms: u64) -> Option<i8>;
+    /// EWMA **SNR (dB)** of the weakest fresh receiver on `radio`, if the backend reports it.
+    ///
+    /// The companion to [`weakest_rssi`](Self::weakest_rssi) and the reason it exists: RSSI says
+    /// how LOUD a frame arrived, SNR how CLEAN it was, and only the second predicts whether a rate
+    /// demodulates. The two diverge exactly where this stack has been bitten before — a busy
+    /// channel gives excellent RSSI and heavy loss (the 8812au "severe loss at 3 ft" was measured
+    /// to be contention, not weak signal), and an RSSI-only selector reads that as a strong link.
+    ///
+    /// Defaults to `None` so every existing implementation and every radio that cannot measure SNR
+    /// is unaffected; the policy only ever uses it to CAP the RSSI-chosen rate, never to raise it.
+    fn weakest_snr_db(&self, _radio: RadioId, _now_ms: u64) -> Option<f32> {
+        None
+    }
     /// Fresh neighbors reporting they already hold this prefix-hash.
     fn neighbors_holding(&self, prefix_hash: u64, now_ms: u64) -> usize;
     /// Demand for a prefix-hash, if known.
@@ -541,6 +570,16 @@ impl MediumView for MediumState {
                     .is_some_and(|r| r.heard_prefixes.contains(&prefix_hash))
             })
             .count()
+    }
+    fn weakest_snr_db(&self, radio: RadioId, now_ms: u64) -> Option<f32> {
+        // Weakest fresh receiver, same demand-set logic as `weakest_rssi`: provision for the worst
+        // listener, not the average one. No ambient fallback — an SNR with no neighbour behind it
+        // would cap the rate on nobody's behalf.
+        self.neighbors
+            .values()
+            .filter(|s| self.fresh(s.last_seen_ms, now_ms))
+            .filter_map(|s| s.snr.get(&radio).and_then(|e| e.get()))
+            .min_by(|a, b| a.total_cmp(b))
     }
     fn weakest_rssi(&self, radio: RadioId, now_ms: u64) -> Option<i8> {
         self.neighbors

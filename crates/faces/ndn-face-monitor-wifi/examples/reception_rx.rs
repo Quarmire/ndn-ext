@@ -155,7 +155,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if from == TX_SRC {
                     heard += 1;
                     last_rx_ms = now_ms();
-                    control.observe_rx(radio, tx_node, f.rssi_dbm, now_ms());
+                    let t = now_ms();
+                    control.observe_rx(radio, tx_node, f.rssi_dbm, t);
+                    // Per-frame SNR, where the backend reports it (the RTL8733BU parses it out of
+                    // the Jaguar-3 status block). RSSI says how LOUD the frame was; this says how
+                    // CLEAN — the quantity that predicts whether a rate demodulates, and the one
+                    // that separates a weak link from a contended one.
+                    control.observe_rx_snr(radio, tx_node, f.phy.and_then(|p| p.snr_db).map(f32::from), t);
                 }
             }
             Ok(Err(e)) => {

@@ -5,6 +5,7 @@ edition = "2024"
 description = "Live driver that wires the sans-IO named-time Timekeeper onto a real transport (monitor-wifi face), sources, auth, and a clock sink — the I/O layer the pure ndn-time core lacks."
 
 [dependencies]
+portable-atomic = { workspace = true }
 ndn-time = { workspace = true }
 ndn-time-sources = { workspace = true }
 ndn-timekeeper = { workspace = true }

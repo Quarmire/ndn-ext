@@ -109,7 +109,7 @@ pub struct WebBleFace {
     /// Wire framing for this peer (chosen at connect via the capability char).
     framing: BleFraming,
     /// Fragmentation sequence base, bumped once per fragmented packet.
-    frag_seq: std::sync::atomic::AtomicU64,
+    frag_seq: portable_atomic::AtomicU64,
 }
 
 /// Web Bluetooth doesn't expose the negotiated ATT MTU, so we fragment writes

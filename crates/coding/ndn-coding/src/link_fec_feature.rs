@@ -11,7 +11,8 @@
 //!
 //! Feature-gated (`link-fec-feature`) so the codec core stays dependency-free.
 
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
+use portable_atomic::AtomicU64;
 use core::time::Duration;
 use std::sync::Mutex;
 

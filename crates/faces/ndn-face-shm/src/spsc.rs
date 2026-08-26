@@ -24,7 +24,8 @@
 use std::ffi::CString;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
+use portable_atomic::AtomicU64;
 
 use bytes::Bytes;
 

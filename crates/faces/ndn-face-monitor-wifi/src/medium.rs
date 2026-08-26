@@ -42,7 +42,8 @@
 //! this face rather than a parallel implementation of it.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use portable_atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -579,6 +580,7 @@ struct AmsduCfg {
 /// have made this move silently lose A-MSDU on the S1G path.
 struct MediumBatcher {
     tx: mpsc::UnboundedSender<(InjectFrame, Option<McsDescriptor>)>,
+    submitted: Arc<AtomicU64>,
 }
 
 impl MediumBatcher {
@@ -588,6 +590,38 @@ impl MediumBatcher {
         rate: Option<Arc<crate::RatePolicy>>,
     ) -> (Self, JoinHandle<()>) {
         let (tx, mut rx) = mpsc::unbounded_channel::<(InjectFrame, Option<McsDescriptor>)>();
+        // TX-wedge diagnostics (#radio-face-wedge): count frames submitted to the
+        // batcher vs batches the batcher actually injected + their result, logged
+        // every 5s. When the relay wedges this localises it: submitted still
+        // rising but injected stalled ⇒ stuck in inject().await; both stalled ⇒
+        // nothing upstream is submitting; injected rising but Err ⇒ the backend.
+        let submitted = Arc::new(AtomicU64::new(0));
+        let injected = Arc::new(AtomicU64::new(0));
+        let inject_err = Arc::new(AtomicU64::new(0));
+        {
+            let (s, i, e) = (submitted.clone(), injected.clone(), inject_err.clone());
+            tokio::spawn(async move {
+                let mut last = (0u64, 0u64);
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    let (sn, in_, en) = (
+                        s.load(Ordering::Relaxed),
+                        i.load(Ordering::Relaxed),
+                        e.load(Ordering::Relaxed),
+                    );
+                    let stalled = sn > last.0 && in_ == last.1; // fed but not injecting
+                    tracing::info!(
+                        target: "face.radio.tx",
+                        submitted = sn, injected = in_, inject_err = en,
+                        stalled_in_inject = stalled,
+                        "radio TX batcher counters"
+                    );
+                    last = (sn, in_);
+                }
+            });
+        }
+        let inj_c = injected.clone();
+        let err_c = inject_err.clone();
         let handle = tokio::spawn(async move {
             while let Some(first) = rx.recv().await {
                 // **The plan sizes the aggregate, per batch** (#83/`decided-but-unactuated`).
@@ -614,7 +648,7 @@ impl MediumBatcher {
                 // Batching used to drop the rate on the floor: the coalescer sat before the rate
                 // branch, so turning on A-MSDU turned off every decided MCS. Carrying the rate
                 // through the batch is what lets the two features compose.
-                let _ = if batch.iter().any(|(_, m)| m.is_some()) {
+                let r = if batch.iter().any(|(_, m)| m.is_some()) {
                     let last = batch
                         .iter()
                         .rev()
@@ -631,12 +665,17 @@ impl MediumBatcher {
                 } else {
                     radio.inject_batch(batch.into_iter().map(|(f, _)| f).collect()).await
                 };
+                inj_c.fetch_add(1, Ordering::Relaxed);
+                if r.is_err() {
+                    err_c.fetch_add(1, Ordering::Relaxed);
+                }
             }
         });
-        (MediumBatcher { tx }, handle)
+        (MediumBatcher { tx, submitted }, handle)
     }
 
     fn submit(&self, frame: InjectFrame, mcs: Option<McsDescriptor>) -> Result<(), FaceError> {
+        self.submitted.fetch_add(1, Ordering::Relaxed);
         self.tx.send((frame, mcs)).map_err(|_| FaceError::Closed)
     }
 }
@@ -865,6 +904,46 @@ const TIME_BEACON_MS: u64 = 100;
 /// The send half of one bearer: the bearer-agnostic data plane and, when link-FEC is
 /// on, the generation bridge + the shared parity count. The transmit rate is bearer
 /// state (held in the driver), so this carries no rate — only the frame.
+// ── TX-wedge diagnostics (#radio-face-wedge) ────────────────────────────────
+// Process-global stage counters for the face egress path, logged every 5s. When
+// the relay wedges these localise where TX stops: `enter` still rising but
+// `gated` flat ⇒ stuck in `sched.gate().await`; `gated` rising but `done` flat
+// ⇒ stuck in the FEC bridge or `radio.inject().await`; `enter` flat while the
+// engine is forwarding ⇒ nothing upstream is calling the face. Gated behind
+// target `face.radio.tx` so it's off unless asked for.
+static TXD_ENTER: AtomicU64 = AtomicU64::new(0);
+static TXD_GATED: AtomicU64 = AtomicU64::new(0);
+static TXD_FEC: AtomicU64 = AtomicU64::new(0);
+static TXD_DONE_OK: AtomicU64 = AtomicU64::new(0);
+static TXD_DONE_ERR: AtomicU64 = AtomicU64::new(0);
+static TXD_LOGGER: std::sync::Once = std::sync::Once::new();
+fn txd_start_logger() {
+    TXD_LOGGER.call_once(|| {
+        tokio::spawn(async move {
+            let mut prev = (0u64, 0u64, 0u64);
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                let (e, g, d) = (
+                    TXD_ENTER.load(Ordering::Relaxed),
+                    TXD_GATED.load(Ordering::Relaxed),
+                    TXD_DONE_OK.load(Ordering::Relaxed) + TXD_DONE_ERR.load(Ordering::Relaxed),
+                );
+                let stuck_gate = e > prev.0 && g == prev.1;
+                let stuck_inject = g > prev.1 && d == prev.2;
+                tracing::info!(
+                    target: "face.radio.tx",
+                    enter = e, gated = g, fec = TXD_FEC.load(Ordering::Relaxed),
+                    done_ok = TXD_DONE_OK.load(Ordering::Relaxed),
+                    done_err = TXD_DONE_ERR.load(Ordering::Relaxed),
+                    stuck_in_gate = stuck_gate, stuck_in_inject = stuck_inject,
+                    "radio TX egress counters"
+                );
+                prev = (e, g, d);
+            }
+        });
+    });
+}
+
 struct TxBearer {
     radio: Arc<dyn FrameIo>,
     /// `(bridge, redundancy)` when FEC is enabled: the wire is enqueued into a
@@ -920,6 +999,8 @@ impl TxBearer {
     /// not part of a data generation — and the driver maps `MostRobust` to the basic
     /// legacy rate every neighbour can decode (the worst-overheard-receiver reach).
     async fn inject_with_intent(&self, wire: Bytes, intent: TxIntent) -> Result<(), FaceError> {
+        txd_start_logger();
+        TXD_ENTER.fetch_add(1, Ordering::Relaxed);
         let robust = intent.reliability == Reliability::MostRobust;
         let legacy = self
             .legacy_gate
@@ -932,6 +1013,7 @@ impl TxBearer {
         if !robust && let Some(sched) = &self.sched {
             sched.gate(&wire).await;
         }
+        TXD_GATED.fetch_add(1, Ordering::Relaxed);
         // ── Address the frame FIRST, then decide how it goes out ─────────────────────────────
         //
         // Tier-0 (#91c): address by the object's prefix-set filter in addr1‖addr2, nonce → addr3.
@@ -1012,7 +1094,8 @@ impl TxBearer {
                     // plan exactly. A decided rate that reaches no frame is this codebase's
                     // signature defect, reintroduced by a refactor and invisible to every test that
                     // did not put both features on at once.
-                    return bridge.send(
+                    TXD_FEC.fetch_add(1, Ordering::Relaxed);
+                    let r = bridge.send(
                         wire,
                         crate::RadioFecPin {
                             dst,
@@ -1023,6 +1106,8 @@ impl TxBearer {
                         },
                         Some(parity),
                     );
+                    if r.is_ok() { TXD_DONE_OK.fetch_add(1, Ordering::Relaxed); } else { TXD_DONE_ERR.fetch_add(1, Ordering::Relaxed); }
+                    return r;
                 }
             }
 
@@ -1054,10 +1139,13 @@ impl TxBearer {
         // legacy gate is up: both mean "reach the worst receiver", which outranks any
         // throughput-chosen rate — actuating a decided MCS there would undo the very cap that was
         // just applied.
-        if let Some(mcs) = decided {
-            return self.radio.inject_at(frame, mcs).await;
-        }
-        self.radio.inject(frame).await
+        let r = if let Some(mcs) = decided {
+            self.radio.inject_at(frame, mcs).await
+        } else {
+            self.radio.inject(frame).await
+        };
+        if r.is_ok() { TXD_DONE_OK.fetch_add(1, Ordering::Relaxed); } else { TXD_DONE_ERR.fetch_add(1, Ordering::Relaxed); }
+        r
     }
 }
 

@@ -20,6 +20,7 @@ wasm-exec = ["dep:wasmtime"]
 sealed-params = ["dep:ring", "dep:ndn-sealed-box"]
 
 [dependencies]
+portable-atomic = { workspace = true }
 ndn-packet    = { workspace = true, features = ["std"] }
 ndn-rpc       = { workspace = true }
 ndn-transport = { workspace = true }

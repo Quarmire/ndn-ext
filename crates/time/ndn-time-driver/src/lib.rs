@@ -89,10 +89,10 @@ pub struct TimeService {
     /// This node's own clock capability, stamped into every outbound heartbeat beacon.
     local_cap: ClockCapability,
     /// Monotone sequence for outbound heartbeat beacons.
-    beacon_seq: std::sync::atomic::AtomicU64,
+    beacon_seq: portable_atomic::AtomicU64,
     /// Count of inbound beacons that passed auth and were fed to the loop — lets a driver observe
     /// that peer time is actually crossing the link (e.g. on-air 2-node convergence).
-    peer_ingests: std::sync::atomic::AtomicU64,
+    peer_ingests: portable_atomic::AtomicU64,
 }
 
 impl TimeService {
@@ -123,8 +123,8 @@ impl TimeService {
             auth,
             clock,
             local_cap: cap,
-            beacon_seq: std::sync::atomic::AtomicU64::new(0),
-            peer_ingests: std::sync::atomic::AtomicU64::new(0),
+            beacon_seq: portable_atomic::AtomicU64::new(0),
+            peer_ingests: portable_atomic::AtomicU64::new(0),
         }
     }
 

@@ -22,7 +22,8 @@
 //! (computed across the two nodes' logs).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
+use portable_atomic::AtomicU64;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 

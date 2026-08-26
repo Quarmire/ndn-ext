@@ -9,6 +9,7 @@ license.workspace = true
 classification = "extension"
 
 [dependencies]
+portable-atomic = { workspace = true }
 ndn-transport = { workspace = true }
 bytes         = { workspace = true, features = ["std"] }
 thiserror     = { workspace = true }

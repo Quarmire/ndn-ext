@@ -17,6 +17,7 @@ default = []
 xdp-mirror = []
 
 [dependencies]
+portable-atomic = { workspace = true }
 ndn-foundation-types = { workspace = true }
 ndn-packet           = { workspace = true, features = ["std"] }
 ndn-transport        = { workspace = true }

@@ -228,6 +228,14 @@ mod imp {
         // userspace driver instead, so the bench can run on rigs with no kernel
         // monitor path — and on the exact radios the NAN data path was proved on,
         // which is what makes a RawNdn-vs-NDP comparison apples-to-apples.
+        #[cfg(not(feature = "libusb-backend"))]
+        let backend: Arc<dyn ndn_frame_io::FrameIo> = {
+            if iface.starts_with("8812au") {
+                return Err("the 8812au userspace driver needs --features libusb-backend".into());
+            }
+            Arc::new(AfPacketBackend::new(&iface, FrameFormat::default())?)
+        };
+        #[cfg(feature = "libusb-backend")]
         let backend: Arc<dyn ndn_frame_io::FrameIo> = if let Some(rest) =
             iface.strip_prefix("8812au")
         {

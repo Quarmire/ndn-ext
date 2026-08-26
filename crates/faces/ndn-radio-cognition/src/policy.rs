@@ -213,14 +213,17 @@ impl RadioPolicy {
         self
     }
 
-    /// Highest MCS the current thresholds allow at `rssi` (learned if present).
-    fn pick_mcs(&self, rssi: Option<i8>, max_mcs: u8) -> u8 {
+    /// Highest MCS the current thresholds allow at `rssi` (learned if present), capped by the
+    /// demodulation floor implied by `snr_db` when the radio reports one.
+    ///
+    /// `snr_db = None` reproduces the RSSI-only behaviour exactly.
+    fn pick_mcs(&self, rssi: Option<i8>, snr_db: Option<f32>, max_mcs: u8) -> u8 {
         let r = rssi.unwrap_or(-90);
         let t = match &self.learned {
             Some(cell) => *cell.read().unwrap(),
             None => STATIC_REQ_RSSI,
         };
-        crate::calibrate::pick_mcs(r, max_mcs, &t)
+        crate::calibrate::pick_mcs_snr(r, snr_db, max_mcs, &t)
     }
 
     /// Fastest LoRa spreading factor the current thresholds allow at `rssi` (learned if present).
@@ -517,7 +520,11 @@ impl RadioPolicy {
         };
         let neighbor_single_stream =
             matches!(neighbor_rx, Some(c) if (1..=crate::report::SINGLE_STREAM_HT_RX_MCS).contains(&c));
-        let mcs = self.pick_mcs(Some(eff.round().clamp(-110.0, 0.0) as i8), mcs_ceiling);
+        // SNR of the weakest fresh receiver, when the radio reports it: caps the RSSI-chosen rate
+        // at what the modulation can actually demodulate. A loud-but-dirty link (contention) reads
+        // as strong to RSSI alone, and this is the only input that sees it.
+        let snr = view.weakest_snr_db(radio, now_ms);
+        let mcs = self.pick_mcs(Some(eff.round().clamp(-110.0, 0.0) as i8), snr, mcs_ceiling);
 
         // Bandwidth: capability ceiling, narrowed under contention.
         let mut bw = cap.max_bw();
@@ -909,6 +916,34 @@ mod tests {
         let mut m = wifi_only();
         m.register_radio(L, RadioCapability::lora(vec![0]));
         m
+    }
+
+    /// End-to-end proof that the SNR ceiling reaches the PLAN, not just the selector: same strong
+    /// RSSI, once with no SNR reported and once with a poor SNR. The dirty link must plan a lower
+    /// MCS. Without this the wiring could be present and unreachable — the failure mode this whole
+    /// stack is named for.
+    #[test]
+    fn poor_snr_caps_the_planned_mcs() {
+        let mk = |snr: Option<f32>| {
+            let mut m = wifi_only();
+            m.observe_rx(W, 0x1234, Some(-40), 1_000); // loud link
+            m.observe_rx_snr(W, 0x1234, snr, 1_000);
+            RadioPolicy::default()
+                .decide(&NameContext::new(0xAA), &m, 1_000)
+                .allocations
+                .first()
+                .and_then(|a| match &a.params.rate {
+                    crate::plan::RateParams::Wifi(w) => w.mcs,
+                    _ => None,
+                })
+        };
+        let clean = mk(None);
+        let dirty = mk(Some(9.0));
+        assert!(clean.is_some(), "expected a planned MCS to compare against");
+        assert!(
+            dirty < clean,
+            "SNR ceiling never reached the plan: dirty={dirty:?} clean={clean:?}"
+        );
     }
 
     #[test]

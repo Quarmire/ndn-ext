@@ -19,7 +19,8 @@
 //! here and a trait would invite a second implementation, which is the situation being fixed.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
+use portable_atomic::AtomicU64;
 
 use crate::tier0::PrefixFilter;
 use crate::{BROADCAST, inner_name, ndn_name_to_slash};

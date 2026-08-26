@@ -79,6 +79,7 @@ f2-recode-face = [
 f2-recode-compute = ["f2-recode-face", "dep:ndn-compute"]
 
 [dependencies]
+portable-atomic = { workspace = true }
 ndn-foundation-types = { workspace = true }
 ndn-packet           = { workspace = true, features = ["std"] }
 ndn-tlv              = { workspace = true, features = ["std"] }

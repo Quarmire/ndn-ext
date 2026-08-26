@@ -165,7 +165,7 @@ impl WebBleFace {
             tx_out,
             rx_in: Mutex::new(rx_in),
             framing,
-            frag_seq: std::sync::atomic::AtomicU64::new(0),
+            frag_seq: portable_atomic::AtomicU64::new(0),
         })
     }
 }

@@ -21,6 +21,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(web_sys_unstable_apis)'] }
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+portable-atomic = { workspace = true }
 ndn-transport = { workspace = true }
 ndn-ble-framing = { workspace = true }
 ndn-runtime   = { workspace = true }

@@ -9,7 +9,8 @@
 //! for named-Data Adv / Pfx fetch+serve.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
+use portable_atomic::AtomicU64;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 

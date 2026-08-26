@@ -389,7 +389,7 @@ impl RoutingProtocol for NlsrProtocol {
 
             // 2. Originate own NameLSA so remote nodes learn our prefixes —
             // configured static prefixes plus any readvertised app prefixes.
-            let name_lsa_seq = Arc::new(std::sync::atomic::AtomicU64::new(1));
+            let name_lsa_seq = Arc::new(portable_atomic::AtomicU64::new(1));
             let refresh_ms = config.lsa_refresh_secs as u64 * 1000;
             let merged = merge_name_prefixes(&config.name_prefixes, &readvertised);
             lsdb.build_own_name_lsa(

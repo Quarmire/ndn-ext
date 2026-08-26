@@ -450,6 +450,16 @@ impl RadioControl {
             .observe_rx(radio, neighbour, rssi_dbm, now_ms);
     }
 
+    /// Fold a per-frame **SNR** (dB) for a neighbour, from a backend that reports PHY quality
+    /// (`CapturedFrame.phy`). Caps the planned MCS at what the modulation can demodulate; a radio
+    /// that reports no SNR passes `None` and is unaffected.
+    pub fn observe_rx_snr(&self, radio: RadioId, neighbour: u64, snr_db: Option<f32>, now_ms: u64) {
+        self.medium
+            .lock()
+            .unwrap()
+            .observe_rx_snr(radio, neighbour, snr_db, now_ms);
+    }
+
     /// Declare this node's own RX capability (highest HT/VHT MCS the best local radio
     /// decodes, or [`ndn_radio_cognition::report::LEGACY_ONLY_RX`]). Stamped into
     /// outgoing reception reports so peers cap the data rate they reach us at.
@@ -876,14 +886,12 @@ impl LinkServiceFeature for RadioControl {
         // prefix reachable via the medium (a PIT in-record). Feed the demand shadow so
         // the joint policy sees real fan-out + re-Interest (the ARQ/loss signal) rather
         // than the zeros it decides on today.
-        if let Some(p) = ndn_packet::lp::peek_lp_name(&frame.wire) {
-            if p.is_interest {
-                if let Some(ph) = self.demand_key(&p.components) {
+        if let Some(p) = ndn_packet::lp::peek_lp_name(&frame.wire)
+            && p.is_interest
+                && let Some(ph) = self.demand_key(&p.components) {
                     let downstream = ctx.source.unwrap_or(ctx.face_id);
                     self.on_interest(ph, downstream, self.now_ms());
                 }
-            }
-        }
     }
 
     fn on_ingress(&self, frame: &InboundLpFrame, _ctx: &IngressCtx) {
@@ -895,9 +903,9 @@ impl LinkServiceFeature for RadioControl {
             // the phy^n pooling. Reports are bounded → single-fragment, so the Content decodes
             // straight from this frame without forwarder reassembly. Handle and return.
             if !p.is_interest && is_report_name(&p.components) {
-                if let Some(ndn) = ndn_packet::lp::lp_ndn_packet_bytes(&frame.wire) {
-                    if let Ok(data) = ndn_packet::Data::decode(Bytes::copy_from_slice(ndn)) {
-                        if let Some(content) = data.content() {
+                if let Some(ndn) = ndn_packet::lp::lp_ndn_packet_bytes(&frame.wire)
+                    && let Ok(data) = ndn_packet::Data::decode(Bytes::copy_from_slice(ndn))
+                        && let Some(content) = data.content() {
                             // Attribute the report to the radio that actually received it
                             // (threaded from the medium's per-bearer reader). Falls back to
                             // radio 0 for single-bearer transports that carry no tag.
@@ -913,15 +921,12 @@ impl LinkServiceFeature for RadioControl {
                                 );
                             }
                         }
-                    }
-                }
                 return;
             }
-            if !p.is_interest {
-                if let Some(ph) = self.demand_key(&p.components) {
+            if !p.is_interest
+                && let Some(ph) = self.demand_key(&p.components) {
                     self.on_data(ph, self.now_ms());
                 }
-            }
         }
         // Liveness: note we heard a peer on this face (RSSI itself is read from the
         // signal store in `tick`). The address, when present, is the seed for
