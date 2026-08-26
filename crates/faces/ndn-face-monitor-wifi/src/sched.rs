@@ -1388,6 +1388,38 @@ impl FaceScheduler {
     /// frame's own name-group + the common-view clock. A frame with no parseable name (a control /
     /// non-NDN frame) is passed straight through. `robust` control frames should bypass entirely
     /// (the caller decides) — reports/discovery must not wait on a data slot.
+    /// The **delay** (µs from now) until `wire`'s next owned slot opens — the domain-independent form of
+    /// the gate for a radio that schedules TX in hardware ([`TxDiscipline::ScheduledAt`]). Returns `0` when
+    /// the frame owns the slot now (transmit immediately), or `None` when it is not slot-schedulable (no
+    /// name-group / no slot schedule) so the caller transmits now. A *delay* rather than an absolute instant
+    /// is what makes this reconcile-free: the device applies it against its own clock, so the offset between
+    /// the scheduler's clock and the device's TX clock (e.g. the C5's ~13 ms rx-stamp↔esp_timer lag) cancels.
+    /// Frequency/claim/CCLF are not modeled here — the hardware fast path is the owner-only lease.
+    pub fn slot_wait(&self, wire: &[u8]) -> Option<u64> {
+        let (hash, class) = self.name_group(wire)?;
+        let hash = self.medium_keyed(hash);
+        let slot = self.slot.as_ref()?;
+        Some(slot.wait_us_in(hash, class, self.now_us()))
+    }
+
+    /// The hardware-scheduled-TX decision, all in one place: `Some(delay_us)` — hand this frame to
+    /// [`FrameIo::inject_after`] instead of software-gating — only when the bearer can place TX in hardware
+    /// ([`TxDiscipline::ScheduledAt`], e.g. the ESP32-C5) AND the operator opted in with `NDN_SCHED_HW_TX=1`.
+    /// `None` ⇒ fall back to the software [`gate`](Self::gate), so every existing (BestEffort / Wall-clock)
+    /// deployment is byte-for-byte unaffected — this is a pure opt-in fast path.
+    pub fn hw_slot_wait(&self, wire: &[u8]) -> Option<u64> {
+        static HW_TX: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on = *HW_TX.get_or_init(|| std::env::var("NDN_SCHED_HW_TX").ok().as_deref() == Some("1"));
+        if !on {
+            return None;
+        }
+        let scheduled = matches!(
+            self.knobs.as_ref()?.tx_discipline(),
+            ndn_radio_hal::TxDiscipline::ScheduledAt { .. }
+        );
+        scheduled.then(|| self.slot_wait(wire)).flatten()
+    }
+
     pub async fn gate(&self, wire: &[u8]) {
         let Some((hash, class)) = self.name_group(wire) else {
             return; // no name-group → not schedulable; transmit now

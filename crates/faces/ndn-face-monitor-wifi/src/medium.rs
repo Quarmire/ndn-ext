@@ -1010,8 +1010,15 @@ impl TxBearer {
         // retune to its hop channel, from the name + the common-view clock. Robust control frames
         // (reports / discovery) bypass — they must reach the worst receiver now, not wait on a data
         // slot (they already ride the basic legacy rate). Off unless `NDN_SCHED_*` is set.
+        // A ScheduledAt bearer (the C5) with NDN_SCHED_HW_TX=1 places the frame in *hardware* at its owned
+        // slot (a delay handed to inject_after below) rather than the host sleeping in the software gate —
+        // reconcile-free (the delay is applied on the device's own clock). None ⇒ the software gate, unchanged.
+        let mut hw_delay: Option<u64> = None;
         if !robust && let Some(sched) = &self.sched {
-            sched.gate(&wire).await;
+            match sched.hw_slot_wait(&wire) {
+                Some(d) => hw_delay = Some(d),
+                None => sched.gate(&wire).await,
+            }
         }
         TXD_GATED.fetch_add(1, Ordering::Relaxed);
         // ── Address the frame FIRST, then decide how it goes out ─────────────────────────────
@@ -1132,14 +1139,22 @@ impl TxBearer {
             .as_ref()
             .and_then(|r| r.planned_amsdu_msdus())
             .is_some_and(|n| n == 0);
-        if !robust && !no_aggregate && let Some(bat) = &self.batcher {
+        // Hardware slot placement is per-frame (one MPDU at its instant), so it bypasses A-MSDU batching.
+        if !robust && !no_aggregate && hw_delay.is_none() && let Some(bat) = &self.batcher {
             return bat.submit(frame, decided);
         }
         // Per-frame rate (#82), when a policy is bound. Skipped for robust frames and whenever the
         // legacy gate is up: both mean "reach the worst receiver", which outranks any
         // throughput-chosen rate — actuating a decided MCS there would undo the very cap that was
         // just applied.
-        let r = if let Some(mcs) = decided {
+        let r = if let Some(delay) = hw_delay {
+            // Hardware-scheduled slot placement (C5 T_INJECT_AT). Set the decided rate first (inject_after
+            // carries no rate of its own), then place the frame at its owned slot on the device's clock.
+            if let Some(mcs) = decided {
+                let _ = self.radio.set_rate(mcs);
+            }
+            self.radio.inject_after(frame, delay).await
+        } else if let Some(mcs) = decided {
             self.radio.inject_at(frame, mcs).await
         } else {
             self.radio.inject(frame).await
