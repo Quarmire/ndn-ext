@@ -31,6 +31,10 @@ tokio            = { workspace = true, features = ["sync", "rt", "macros"] }
 [dev-dependencies]
 tokio = { workspace = true, features = ["sync", "rt", "macros", "rt-multi-thread", "time"] }
 ndn-packet = { workspace = true }
+# For the ble_engine example: run a real forwarding engine (PIT/FIB) over the BLE face.
+ndn-app = { workspace = true }
+ndn-engine = { workspace = true }
+tokio-util = { workspace = true }
 
 [lints]
 workspace = true
@@ -45,4 +49,8 @@ required-features = ["serial"]
 
 [[example]]
 name = "shared_mux"
+required-features = ["shared-mux"]
+
+[[example]]
+name = "ble_engine"
 required-features = ["shared-mux"]
