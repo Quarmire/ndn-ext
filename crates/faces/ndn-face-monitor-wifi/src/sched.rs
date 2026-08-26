@@ -431,6 +431,8 @@ struct SchedStats {
     elections: AtomicU64,
     elections_won: AtomicU64,
     hold_continuations: AtomicU64,
+    /// Gated-frame count — drives the sampled WHEN-facet OTLP event in `gate` (see `observability.md`).
+    gate_calls: AtomicU64,
 }
 
 pub struct FaceScheduler {
@@ -1425,6 +1427,23 @@ impl FaceScheduler {
             return; // no name-group → not schedulable; transmit now
         };
         let now = self.now_us();
+
+        // Sampled WHEN-facet telemetry (glossary: the named airtime lease) — surfaced through the OTLP-in-Data
+        // layer once per ~1024 gated frames, so slot contention is observable without a per-frame span. Zero
+        // cost without a `tracing` subscriber. See `docs/observability.md`.
+        let calls = self.stats.gate_calls.fetch_add(1, Ordering::Relaxed);
+        if calls & 0x3FF == 0 {
+            tracing::debug!(
+                target: "named_radio::when",
+                gated = calls,
+                backoffs = self.stats.shared_slot_backoffs.load(Ordering::Relaxed),
+                claim_attempts = self.stats.claim_attempts.load(Ordering::Relaxed),
+                claim_wins = self.stats.claim_wins.load(Ordering::Relaxed),
+                elections = self.stats.elections.load(Ordering::Relaxed),
+                elections_won = self.stats.elections_won.load(Ordering::Relaxed),
+                "slot lease: WHEN-facet counters"
+            );
+        }
 
         // Frequency first: sit on the name's channel for this hop epoch. The hop decision uses the
         // RAW name hash — the channel must not depend on the channel.

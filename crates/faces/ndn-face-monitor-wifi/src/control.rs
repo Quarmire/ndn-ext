@@ -815,6 +815,11 @@ impl RadioControl {
                     ldpc = a.params.ldpc(),
                     stbc = a.params.stbc(),
                     csd = a.params.csd(),
+                    // HOW-WELL reach levers (802.11ax) — decided in policy; traced here so reach escalation
+                    // is analyzable (glossary: the "reach lever"). he ⇒ frame goes out HE, not HT/VHT.
+                    he = a.params.he(),
+                    dcm = a.params.dcm(),
+                    er_su = a.params.er_su(),
                     tx_power = ?a.params.tx_power,
                     link_fec = ?a.params.link_fec_redundancy,
                     edcca_ignore = a.params.edcca_ignore,
