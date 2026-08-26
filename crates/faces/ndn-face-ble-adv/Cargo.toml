@@ -68,3 +68,7 @@ required-features = ["shared-mux"]
 [[example]]
 name = "wireless_c5_engine"
 required-features = ["shared-mux"]
+
+[[example]]
+name = "wireless_c5_relay"
+required-features = ["shared-mux"]

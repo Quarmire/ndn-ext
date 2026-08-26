@@ -358,6 +358,9 @@ pub struct WirelessFace {
     /// Merged RX from every bearer's pump, each object tagged with the bearer index it arrived on.
     rx: AsyncMutex<mpsc::UnboundedReceiver<(usize, Bytes)>>,
     dedup: Mutex<Dedup>,
+    /// Count of outbound `send_bytes` calls (each a forward/re-broadcast) — for measuring, e.g., how many
+    /// re-broadcasts a relay's strategy suppressed via defer + overhear-cancel.
+    tx_count: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl WirelessFace {
@@ -376,7 +379,20 @@ impl WirelessFace {
                 }
             });
         }
-        Self { id, bearers, policy, rx: AsyncMutex::new(rx), dedup: Mutex::new(Dedup::new(DEDUP_CAP)) }
+        Self {
+            id,
+            bearers,
+            policy,
+            rx: AsyncMutex::new(rx),
+            dedup: Mutex::new(Dedup::new(DEDUP_CAP)),
+            tx_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    /// A shared handle to the outbound-send counter — grab it before moving the face into an engine, then read
+    /// how many forwards/re-broadcasts the face actually emitted (defer + overhear-cancel suppress relay ones).
+    pub fn tx_counter(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        self.tx_count.clone()
     }
 
     /// Convenience: all-bearer macrodiversity.
@@ -418,6 +434,7 @@ impl Transport for WirelessFace {
         if sel.is_empty() {
             return Ok(()); // policy dropped it (no eligible bearer)
         }
+        self.tx_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Each selected bearer fragments `wire` to its own MTU internally (bearer-native).
         let mut last_err = None;
         for i in sel {
