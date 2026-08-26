@@ -38,6 +38,9 @@ tokio-util = { workspace = true }
 # For the wireless_c5 example: the unified WirelessFace over Wi-Fi + BLE from one C5 (shared mux).
 ndn-face-wireless     = { path = "../ndn-face-wireless" }
 ndn-face-monitor-wifi = { path = "../ndn-face-monitor-wifi" }
+# For wireless_c5_engine: the soft-prefix-reach forwarding strategy above the WirelessFace.
+ndn-strategy       = { workspace = true }
+ndn-strategy-reach = { path = "../../strategies/ndn-strategy-reach" }
 
 [lints]
 workspace = true
@@ -60,4 +63,8 @@ required-features = ["shared-mux"]
 
 [[example]]
 name = "wireless_c5"
+required-features = ["shared-mux"]
+
+[[example]]
+name = "wireless_c5_engine"
 required-features = ["shared-mux"]
