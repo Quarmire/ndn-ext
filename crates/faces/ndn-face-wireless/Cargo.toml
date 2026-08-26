@@ -23,6 +23,17 @@ tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync
 ndn-app    = { workspace = true }
 ndn-engine = { workspace = true }
 tokio-util = { workspace = true }
+# The `wireless_node` example: bring the CYD (Wi-Fi serial-radio), Heltec/S3 LoRa, BW16, and plain C5 boards
+# up to par as WirelessFace bearers. serial-radio = the 802.11 FrameIo (CYD/BW16/C5); lora = the SX12xx bearer.
+ndn-radio-drivers     = { path = "../../../../ndn-radio-drivers", features = ["serial-radio", "lora"] }
+ndn-face-monitor-wifi = { path = "../ndn-face-monitor-wifi" }
+ndn-face-lora         = { path = "../ndn-face-lora" }
+ndn-strategy          = { workspace = true }
+ndn-strategy-reach    = { path = "../../strategies/ndn-strategy-reach" }
+
+[[example]]
+name = "wireless_node"
+# Uses only dev-deps (serial-radio + lora backends), which are always built for this crate's examples.
 
 [lints]
 workspace = true
