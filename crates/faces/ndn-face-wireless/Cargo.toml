@@ -1,0 +1,23 @@
+[package]
+name = "ndn-face-wireless"
+description = "The unified WirelessFace: ONE ndn Transport over N named-radio bearers (Wi-Fi/BLE/LoRa). Bearer selection is the reach lever; fragmentation is bearer-native; RX merges + dedups across bearers. The 'one wireless face' the NDR MAC presents to the forwarder (see ndn-face-monitor-wifi/docs/bearer-face-radio-coex.md)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "extension"
+
+[dependencies]
+ndn-transport = { workspace = true }
+async-trait   = { workspace = true }
+bytes         = { workspace = true, features = ["std"] }
+smallvec      = { workspace = true }
+tokio         = { workspace = true, features = ["sync", "rt", "macros"] }
+tracing       = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
+
+[lints]
+workspace = true
