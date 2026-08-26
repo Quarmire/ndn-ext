@@ -68,6 +68,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let master = env("NDN_ROLE").as_deref() == Some("master");
     let slotted = env("NDN_MODE").as_deref() != Some("contention");
     let hw_gate = env("NDN_HW_GATE").is_some();
+    // NDN_ALIGN=seq: derive the slot phase from a COMMON SOURCE's frame sequence numbers instead of
+    // the software TimeBeacon.
+    //
+    // The beacon path stamps at enqueue, so under saturation it reports an instant tens of ms before
+    // the frame actually radiates (measured: 10-89 ms jitter against a 20 ms slot), and the slot arms
+    // degenerate to contention. That is a clock defect, not a MAC defect, and it hides the question
+    // the test exists to answer.
+    //
+    // Both nodes hear the same third radio and read the same u32 sequence out of each frame, so a
+    // phase derived from it is identical on both by construction — no clock, no propagation term, no
+    // queue delay. This is an IDEALISED alignment used to isolate the MAC question; the production
+    // path still needs hardware common view (measured separately at 0.4 us residual / 0.0034 ppm).
+    let align_seq = env("NDN_ALIGN").as_deref() == Some("seq");
+    // One tick per slot: the common source is paced so each of its frames marks a slot boundary,
+    // which keeps its airtime negligible. A saturating source would time the medium by destroying it.
+    const FRAMES_PER_SLOT: u32 = 1;
+    let common_seq = Arc::new(AtomicU64::new(u64::MAX));
     let slot_us: u64 = env("NDN_SLOT_US").and_then(|s| s.parse().ok()).unwrap_or(20_000);
     // Inter-frame pacing (µs). 0 = saturate. A light pace (e.g. 4000) keeps the medium unsaturated so
     // the TimeBeacon is not queue-delayed — the regime in which its common-view alignment is measured.
@@ -115,12 +132,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rx = {
         let (d, cv, recv_peer, recv_beacon, offsets, host_us) =
             (d.clone(), cv.clone(), recv_peer.clone(), recv_beacon.clone(), offsets.clone(), host_us);
+        let common_seq_rx = common_seq.clone();
         tokio::spawn(async move {
             while Instant::now() < deadline {
                 match tokio::time::timeout(Duration::from_millis(5), d.recv_frame()).await {
                     Ok(Ok(f)) => {
                         let p = &f.payload;
                         let counting = Instant::now() >= count_start;
+                        // Common-source frame (knob tag 5, u32 seq at p[4..8]) — the shared phase.
+                        if p.len() >= 8 && p[2] == 0xC3 && p[1] == 5 {
+                            let sq = u32::from_le_bytes([p[4], p[5], p[6], p[7]]);
+                            common_seq_rx.store(u64::from(sq), Ordering::Relaxed);
+                        }
                         if p.len() >= TIME_BEACON_MAGIC.len() + 8 && p[..3] == TIME_BEACON_MAGIC {
                             if !master {
                                 let mut b = [0u8; 8];
@@ -176,8 +199,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             last_beacon = Instant::now();
         }
 
-        let now = cv.lock().unwrap().now(host_us());
-        let epoch = now / slot_us;
+        let epoch = if align_seq {
+            match common_seq.load(Ordering::Relaxed) {
+                u64::MAX => u64::MAX, // no common-source frame heard yet — stay silent
+                sq => sq / u64::from(FRAMES_PER_SLOT),
+            }
+        } else {
+            cv.lock().unwrap().now(host_us()) / slot_us
+        };
+        if epoch == u64::MAX {
+            tokio::task::yield_now().await;
+            continue;
+        }
         if epoch != cur_slot_epoch {
             // New slot: (re)decide whether we transmit in it.
             cur_slot_epoch = epoch;
