@@ -99,9 +99,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Distinct names each round so every fetch is a fresh transaction the relay overhears.
-    const ROUNDS: u32 = 30;
+    let rounds: u32 = std::env::var("NDR_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(30);
     let mut delivered = 0u32;
-    for r in 0..ROUNDS {
+    for r in 0..rounds {
         let name: Name = format!("/ndn/wl/svc/{r}").parse().unwrap();
         if let Ok(v) = consumer.fetch_unverified(name).await {
             if v.trust_unchecked().content().map(|c| c.as_ref() == want.as_slice()).unwrap_or(false) {
@@ -113,15 +113,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let relay_rebroadcasts = relay_tx.load(Ordering::Relaxed);
     println!("\n  strategy = {}", strategy());
-    println!("  delivered {delivered}/{ROUNDS}");
+    println!("  delivered {delivered}/{rounds}");
     println!("  RELAY outbound (re-broadcasts + data-forwards) = {relay_rebroadcasts}");
     println!("  → flood re-broadcasts every overheard Interest; defer+overhear-cancel suppresses the redundant ones.");
 
     cancel_p.cancel();
     cancel_c.cancel();
     producer_task.abort();
-    let _ = shutdown_p.shutdown().await;
-    let _ = shutdown_r.shutdown().await;
-    let _ = shutdown_c.shutdown().await;
-    Ok(())
+    let _ = (shutdown_p, shutdown_r, shutdown_c);
+    // Exit immediately: the graceful engine+serial shutdown blocks on the blocking reader threads, which
+    // leaves the process wedged and the USB-JTAG port locked. process::exit reclaims everything cleanly.
+    std::process::exit(0);
 }
