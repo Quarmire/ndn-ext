@@ -31,7 +31,7 @@
 //! `docs/NAMED_RADIO_COURSE_CORRECTION.md`.
 //!
 //! This crate provides the coordination face. Like
-//! [`ndn-face-ble-adv`](https://docs.rs/ndn-face-ble-adv), it is a
+//! [`ndn-phy-ble`](https://docs.rs/ndn-phy-ble), it is a
 //! **`LinkType::AdHoc`** broadcast bearer — the engine forwards on the *name*
 //! inside each frame, broadcast/self-learning strategy does the rest. The radio
 //! lives behind the [`NanBackend`] trait, supplied by the platform. The shipped

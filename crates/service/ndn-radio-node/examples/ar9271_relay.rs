@@ -19,7 +19,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use ndn_engine::{EngineBuilder, EngineConfig};
 use ndn_face_local::InProcFace;
-use ndn_face_monitor_wifi::{FaceId, WifiPhy, open_ath9k};
+use ndn_phy_wifi::{FaceId, WifiPhy, open_ath9k};
 use ndn_packet::encode::InterestBuilder;
 use ndn_packet::{Data, Name, NameComponent};
 use ndn_transport::FaceId as TransportFaceId;

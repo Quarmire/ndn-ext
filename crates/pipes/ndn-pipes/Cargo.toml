@@ -56,7 +56,7 @@ ndn-engine      = { workspace = true }
 ndn-face = { workspace = true }
 # Hardware-integration witness: run a real pipe over the 802.11 monitor-mode
 # named-radio bearer (LoopbackMonitorBus = hardware-free shared medium).
-ndn-face-monitor-wifi = { workspace = true }
+ndn-phy-wifi = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 tokio-util = { workspace = true }
 

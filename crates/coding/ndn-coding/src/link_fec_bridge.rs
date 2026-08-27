@@ -2,7 +2,7 @@
 //! actuation over any [`FrameIo`], so a face gets plan-driven link FEC without
 //! re-hand-rolling the batching task per bearer.
 //!
-//! This is the reusable core lifted out of `ndn-face-monitor-wifi` (task #33). The
+//! This is the reusable core lifted out of `ndn-phy-wifi` (task #33). The
 //! Wi-Fi face had a working FEC task, but it was welded to that crate — LoRa, BLE,
 //! and every future bearer would have re-implemented the same generation loop to
 //! get the actuator #32 added. The loop itself is bearer-neutral; only *how a
@@ -39,7 +39,7 @@ use crate::link_fec_feature::LinkFecFeature;
 /// The bridge owns batching, redundancy actuation, and decode; the bearer owns
 /// only the on-air specifics. Implementations are cheap adapters over a radio
 /// handle — see [`FrameIoSink`] for the plain-inject default, and
-/// `ndn-face-monitor-wifi`'s MCS-pinning sink for the Wi-Fi case.
+/// `ndn-phy-wifi`'s MCS-pinning sink for the Wi-Fi case.
 pub trait GenerationSink: Send + Sync + 'static {
     /// Per-frame side channel the sender attaches — snapshotted from the frame that
     /// opens a generation and handed back with that generation's coded frames.

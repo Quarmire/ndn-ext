@@ -30,13 +30,13 @@ members = [
     "crates/faces/ndn-face-webrtc",
     "crates/faces/ndn-face-shared-worker",
     "crates/faces/ndn-face-webble",
-    "crates/faces/ndn-face-ble-adv",
-    "crates/faces/ndn-face-wireless",
-    "crates/faces/ndn-face-lora",
+    "crates/faces/ndn-phy-ble",
+    "crates/faces/ndn-radio",
+    "crates/faces/ndn-phy-lora",
     "crates/faces/ndn-face-wifi-aware",
     "crates/faces/ndn-nan-core",
     "crates/faces/ndn-nan",
-    "crates/faces/ndn-face-monitor-wifi",
+    "crates/faces/ndn-phy-wifi",
     "crates/pipes/ndn-pipes",
     "crates/faces/ndn-ipc-shm",
     "crates/discovery/ndn-discovery",
@@ -78,13 +78,13 @@ default-members = [
     "crates/faces/ndn-face-webtransport-wasm",
     "crates/faces/ndn-face-shared-worker",
     "crates/faces/ndn-face-webble",
-    "crates/faces/ndn-face-ble-adv",
-    "crates/faces/ndn-face-wireless",
-    "crates/faces/ndn-face-lora",
+    "crates/faces/ndn-phy-ble",
+    "crates/faces/ndn-radio",
+    "crates/faces/ndn-phy-lora",
     "crates/faces/ndn-face-wifi-aware",
     "crates/faces/ndn-nan-core",
     "crates/faces/ndn-nan",
-    "crates/faces/ndn-face-monitor-wifi",
+    "crates/faces/ndn-phy-wifi",
     "crates/pipes/ndn-pipes",
     "crates/faces/ndn-ipc-shm",
     "crates/discovery/ndn-discovery",
@@ -160,7 +160,7 @@ ndn-env               = { path = "../ndn-radio-drivers/crates/ndn-env" }
 ndn-radio-hal         = { path = "../ndn-radio-drivers/crates/ndn-radio-hal" }
 ndn-face-wifi-aware   = { path = "crates/faces/ndn-face-wifi-aware" }
 ndn-nan       = { path = "crates/faces/ndn-nan" }
-ndn-face-monitor-wifi = { path = "crates/faces/ndn-face-monitor-wifi" }
+ndn-phy-wifi = { path = "crates/faces/ndn-phy-wifi" }
 ndn-rtc-signaling-relay = { path = "crates/faces/ndn-rtc-signaling-relay" }
 ndn-strategy  = { path = "../ndn-rs/crates/forwarding/ndn-strategy" }
 ndn-security  = { path = "../ndn-rs/crates/security/ndn-security" }

@@ -1,5 +1,5 @@
 //! **Soft prefix-reach** — a mobility-first named-radio forwarding family, the base candidate from
-//! `ndn-ext/crates/faces/ndn-face-monitor-wifi/docs/wireless-forwarding-under-flux.md` §5, with each of the
+//! `ndn-ext/crates/faces/ndn-phy-wifi/docs/wireless-forwarding-under-flux.md` §5, with each of the
 //! six design axes exposed as a swappable variant so the ndn-sim `ndr_mobility_sweep` harness can A/B one at a
 //! time (doc §7). All variants share the invariant: the prior is the MAC's one legal soft-state memory (§7) —
 //! reinforced on Data-return, decayed on read, keyed on the **name only** (no host identity) — and a cold or

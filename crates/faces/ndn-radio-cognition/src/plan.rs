@@ -293,7 +293,7 @@ pub struct DataPlaneConfig {
     /// carrier for a name is `H(name)`-derived, so both ends compute it with no negotiation. The hop
     /// FUNCTION only — a listener still needs common-view time to know WHEN to sit on a name's channel.
     /// #41's common-view clock landed as the host-side `ndn_time::RadioHwClock`, and the *host*
-    /// monitor-wifi face now actuates FHSS from it (`ndn_face_monitor_wifi::FaceScheduler`,
+    /// monitor-wifi face now actuates FHSS from it (`ndn_phy_wifi::FaceScheduler`,
     /// `NDN_SCHED_HOP`). This firmware flag stays off until the *firmware* carries its own common-view
     /// clock (a separate port), not the host's — hence still gated here.
     pub hop: bool,

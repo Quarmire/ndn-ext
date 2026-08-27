@@ -17,7 +17,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use ndn_engine::{EngineBuilder, EngineConfig};
 use ndn_face_local::InProcFace;
-use ndn_face_monitor_wifi::{
+use ndn_phy_wifi::{
     Bandwidth, Esp32SerialBackend, FaceId, RadioKnobs, RadioProfile, WifiPhy,
 };
 use ndn_packet::encode::InterestBuilder;

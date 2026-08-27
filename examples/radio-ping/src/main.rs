@@ -22,7 +22,7 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use ndn_app::{EngineAppExt, EngineBuilder};
 use ndn_engine::SignalView; // read radio RSSI/rate from the engine's signal store
-use ndn_face_monitor_wifi::{FaceId, FrameIo, McsDescriptor, WifiPhy};
+use ndn_phy_wifi::{FaceId, FrameIo, McsDescriptor, WifiPhy};
 use ndn_packet::Name;
 use ndn_security::SecurityProfile;
 use tokio_util::sync::CancellationToken;
@@ -169,7 +169,7 @@ fn build_backend(args: &[String]) -> Result<Arc<dyn FrameIo>> {
                 .get(_chan_idx)
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(149);
-            let be = ndn_face_monitor_wifi::LibUsbRtl88xxBackend::open_monitor(chan)?;
+            let be = ndn_phy_wifi::LibUsbRtl88xxBackend::open_monitor(chan)?;
             println!("RTL8812EU (userspace/libusb) up on ch{chan}");
             return Ok(Arc::new(be));
         }
@@ -184,9 +184,9 @@ fn build_backend(args: &[String]) -> Result<Arc<dyn FrameIo>> {
                 .get(_iface_idx)
                 .cloned()
                 .unwrap_or_else(|| "wlu1u1".into());
-            let be = ndn_face_monitor_wifi::AfPacketBackend::new(
+            let be = ndn_phy_wifi::AfPacketBackend::new(
                 &iface,
-                ndn_face_monitor_wifi::FrameFormat::default(),
+                ndn_phy_wifi::FrameFormat::default(),
             )?;
             println!("RTL8812EU (kernel/af_packet) on {iface}");
             return Ok(Arc::new(be));

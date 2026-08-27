@@ -10,7 +10,7 @@
 //! (`.claude/notes/named-radio/cross-layer-cognitive-stack-2026-06-15.md`) was never
 //! in the workspace — that directory does not exist and the file is not recoverable
 //! (checked 2026-07-16). The surviving statement of the argument is
-//! `ndn-face-monitor-wifi/docs/RADIO_SUBSYSTEM.md` §2-§3, and the doctrine it
+//! `ndn-phy-wifi/docs/RADIO_SUBSYSTEM.md` §2-§3, and the doctrine it
 //! answers to is `ndn-face-wifi-aware/docs/NAMED_RADIO_COURSE_CORRECTION.md`.
 //!
 //! ## The loop

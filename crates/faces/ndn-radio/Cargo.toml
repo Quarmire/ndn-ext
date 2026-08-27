@@ -1,0 +1,39 @@
+[package]
+name = "ndn-radio"
+description = "The unified WirelessFace: ONE ndn Transport over N named-radio bearers (Wi-Fi/BLE/LoRa). Bearer selection is the reach lever; fragmentation is bearer-native; RX merges + dedups across bearers. The 'one wireless face' the NDR MAC presents to the forwarder (see ndn-phy-wifi/docs/bearer-face-radio-coex.md)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "extension"
+
+[dependencies]
+ndn-transport = { workspace = true }
+ndn-packet    = { workspace = true, features = ["std"] }
+async-trait   = { workspace = true }
+bytes         = { workspace = true, features = ["std"] }
+smallvec      = { workspace = true }
+tokio         = { workspace = true, features = ["sync", "rt", "macros"] }
+tracing       = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
+# Engine-level roundtrip test: run a real ForwarderEngine over ONE WirelessFace.
+ndn-app    = { workspace = true }
+ndn-engine = { workspace = true }
+tokio-util = { workspace = true }
+# The `wireless_node` example: bring the CYD (Wi-Fi serial-radio), Heltec/S3 LoRa, BW16, and plain C5 boards
+# up to par as WirelessFace bearers. serial-radio = the 802.11 FrameIo (CYD/BW16/C5); lora = the SX12xx bearer.
+ndn-radio-drivers     = { path = "../../../../ndn-radio-drivers", features = ["serial-radio", "lora"] }
+ndn-phy-wifi = { path = "../ndn-phy-wifi" }
+ndn-phy-lora         = { path = "../ndn-phy-lora" }
+ndn-strategy          = { workspace = true }
+ndn-strategy-reach    = { path = "../../strategies/ndn-strategy-reach" }
+
+[[example]]
+name = "wireless_node"
+# Uses only dev-deps (serial-radio + lora backends), which are always built for this crate's examples.
+
+[lints]
+workspace = true

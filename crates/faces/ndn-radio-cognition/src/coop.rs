@@ -2,7 +2,7 @@
 //! and how multi-hop Interest/Data propagate on an ad-hoc broadcast mesh with **no
 //! routing server, no association, no host identity** — the other half of the
 //! "removing MAC addresses breaks forwarding" objection (see
-//! `ndn-face-monitor-wifi/docs/mac-addressing-doctrine.md` §4).
+//! `ndn-phy-wifi/docs/mac-addressing-doctrine.md` §4).
 //!
 //! ## The FIB-formation question, and the three models
 //!

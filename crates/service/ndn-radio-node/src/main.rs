@@ -21,7 +21,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use ndn_engine::{EngineBuilder, EngineConfig};
 use ndn_face_local::InProcFace;
-use ndn_face_monitor_wifi::{FaceId, RadioControl};
+use ndn_phy_wifi::{FaceId, RadioControl};
 use ndn_observability::{
     NdnObservabilityLayer, SpanPublisher, SpanRetention, mount_observability, ratio_sampler,
 };
@@ -272,7 +272,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let signal_store: Arc<RssiStore> = Arc::new(RssiStore::default());
     #[cfg(feature = "libusb-backend")]
     let radio_backend = if role == "consumer" || role == "producer" {
-        use ndn_face_monitor_wifi::{FaceId, LibUsbRtl88xxBackend, WifiPhy};
+        use ndn_phy_wifi::{FaceId, LibUsbRtl88xxBackend, WifiPhy};
         let pid = env_u64("NODE_PID", 0xa81a) as u16;
         let backend = Arc::new(LibUsbRtl88xxBackend::open_monitor_pid(pid, ch)?);
         // NODE_TXPWR: lower the TXAGC to make the bench link marginal (induce real
@@ -614,7 +614,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(feature = "libusb-backend")]
     let backend = {
-        use ndn_face_monitor_wifi::LibUsbRtl88xxBackend;
+        use ndn_phy_wifi::LibUsbRtl88xxBackend;
         let pid = env_u64("NODE_PID", 0xa81a) as u16;
         let b = Arc::new(LibUsbRtl88xxBackend::open_monitor_pid(pid, ch)?);
         control.libusb_actuator(radio, b.clone()); // ACT: real radio applies the plan
