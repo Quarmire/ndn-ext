@@ -378,6 +378,8 @@ pub mod wifi {
                     dst: BROADCAST,
                     src: DEFAULT_SRC,
                     addr3: None,
+                    addr4: None,
+                    htc: None,
                 })
                 .await
                 .is_ok()
