@@ -12,8 +12,8 @@
 //! Feature-gated (`link-fec-feature`) so the codec core stays dependency-free.
 
 use core::sync::atomic::{AtomicBool, Ordering};
-use portable_atomic::AtomicU64;
 use core::time::Duration;
+use portable_atomic::AtomicU64;
 use std::sync::Mutex;
 
 use bytes::Bytes;
@@ -288,7 +288,10 @@ mod tests {
             coded += f.on_send(b(&format!("u{i}"))).len();
         }
         assert_eq!(coded, f.generation_size() + adopted as usize);
-        assert!(coded <= MAX_N as usize, "K + R stays within the codec bound");
+        assert!(
+            coded <= MAX_N as usize,
+            "K + R stays within the codec bound"
+        );
     }
 
     #[test]

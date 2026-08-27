@@ -314,11 +314,20 @@ impl MediumState {
     /// Separate from [`observe_rx`](Self::observe_rx) rather than an extra parameter so existing
     /// callers and backends that report no SNR are untouched — the absence of SNR must cost a
     /// radio nothing.
-    pub fn observe_rx_snr(&mut self, radio: RadioId, neighbor: u64, snr_db: Option<f32>, now_ms: u64) {
+    pub fn observe_rx_snr(
+        &mut self,
+        radio: RadioId,
+        neighbor: u64,
+        snr_db: Option<f32>,
+        now_ms: u64,
+    ) {
         if let Some(v) = snr_db {
             let st = self.neighbors.entry(neighbor).or_default();
             st.last_seen_ms = now_ms;
-            st.snr.entry(radio).or_insert_with(|| Ewma::new(0.3)).update(v);
+            st.snr
+                .entry(radio)
+                .or_insert_with(|| Ewma::new(0.3))
+                .update(v);
         }
     }
 
@@ -557,7 +566,11 @@ impl MediumView for MediumState {
         // Fold in the §2 per-frame nonce density (CCLF density term). `max`, not sum: the two sets
         // overlap (a neighbour that both reports and transmits), so max avoids double-counting while
         // still catching a silent framer the report set misses. Stale nonce density is ignored.
-        let nonce = if self.fresh(self.nonce_density.1, now_ms) { self.nonce_density.0 } else { 0 };
+        let nonce = if self.fresh(self.nonce_density.1, now_ms) {
+            self.nonce_density.0
+        } else {
+            0
+        };
         reports.max(nonce)
     }
     fn neighbor_rssi(&self, radio: RadioId, neighbor: u64) -> Option<i8> {
@@ -657,7 +670,13 @@ mod tests {
         let sdr = RadioCapability::sdr_sensor(vec![36]);
         // The rate ceiling is a bearer sum type — no privileged field.
         assert!(matches!(wifi.rate, RateCapability::Wifi { max_mcs: 9, .. }));
-        assert_eq!(lora.rate, RateCapability::Lora { min_sf: 7, max_sf: 12 });
+        assert_eq!(
+            lora.rate,
+            RateCapability::Lora {
+                min_sf: 7,
+                max_sf: 12
+            }
+        );
         assert_eq!(sdr.rate, RateCapability::None);
         // Bearer-agnostic rank: Wi-Fi ≫ LoRa > SDR-sensor, all comparable in [0,1].
         assert!(wifi.rate_rank() > lora.rate_rank());
@@ -731,11 +750,23 @@ mod tests {
         m.observe_rx(W, 1, Some(-50), 1_000); // one reporting neighbour
         assert_eq!(m.receiver_count(1_000), 1);
         m.set_nonce_density(3, 1_000); // the nonce map heard 3 distinct sources
-        assert_eq!(m.receiver_count(1_000), 3, "nonce density lifts the count past the report set");
+        assert_eq!(
+            m.receiver_count(1_000),
+            3,
+            "nonce density lifts the count past the report set"
+        );
         m.set_nonce_density(0, 1_000);
-        assert_eq!(m.receiver_count(1_000), 1, "max ⇒ reports still count when the nonce map is empty");
+        assert_eq!(
+            m.receiver_count(1_000),
+            1,
+            "max ⇒ reports still count when the nonce map is empty"
+        );
         m.set_nonce_density(5, 1_000);
-        assert_eq!(m.receiver_count(20_000), 0, "stale nonce density (and stale reports) drop out");
+        assert_eq!(
+            m.receiver_count(20_000),
+            0,
+            "stale nonce density (and stale reports) drop out"
+        );
     }
 
     #[test]
@@ -745,11 +776,23 @@ mod tests {
         // over-counts. `observe_radio_rssi` creates no neighbour entry.
         let mut m = state();
         m.observe_radio_rssi(W, Some(-58), 1_000);
-        assert_eq!(m.receiver_count(1_000), 0, "ambient RSSI is not a neighbour");
-        assert_eq!(m.weakest_rssi(W, 1_000), Some(-58), "but it feeds the rate floor");
+        assert_eq!(
+            m.receiver_count(1_000),
+            0,
+            "ambient RSSI is not a neighbour"
+        );
+        assert_eq!(
+            m.weakest_rssi(W, 1_000),
+            Some(-58),
+            "but it feeds the rate floor"
+        );
         // A real report then establishes exactly one neighbour; ambient still adds none.
         m.observe_rx(W, 42, Some(-70), 1_000);
-        assert_eq!(m.receiver_count(1_000), 1, "one real neighbour, ambient adds none");
+        assert_eq!(
+            m.receiver_count(1_000),
+            1,
+            "one real neighbour, ambient adds none"
+        );
     }
 
     #[test]
@@ -785,7 +828,12 @@ mod tests {
         // report fills in the channels it cannot see itself (the shared-occupancy map that
         // makes single-radio avoidance work — `multi_radio.rs`).
         let mut m = state();
-        m.observe_occupancy(ChannelOccupancy { radio: W, channel: 149, busy_pct: 90, ts_ms: 1 });
+        m.observe_occupancy(ChannelOccupancy {
+            radio: W,
+            channel: 149,
+            busy_pct: 90,
+            ts_ms: 1,
+        });
 
         // Before cooperation: 149 sensed busy, 161 unsensed (unknown — the §9.2 case).
         assert_eq!(m.busy_pct(W, 149), Some(90));
@@ -794,17 +842,37 @@ mod tests {
         // A neighbour reports 161 busy and 165 clear — now consumed for selection.
         m.observe_report(
             7,
-            NeighborReport { spectrum: vec![(161, 80), (165, 5)], ts_ms: 1, ..Default::default() },
+            NeighborReport {
+                spectrum: vec![(161, 80), (165, 5)],
+                ts_ms: 1,
+                ..Default::default()
+            },
         );
-        assert_eq!(m.busy_pct(W, 161), Some(80), "neighbour's busy view is fused in (§9.5)");
-        assert_eq!(m.busy_pct(W, 165), Some(5), "neighbour's clear view is fused in");
+        assert_eq!(
+            m.busy_pct(W, 161),
+            Some(80),
+            "neighbour's busy view is fused in (§9.5)"
+        );
+        assert_eq!(
+            m.busy_pct(W, 165),
+            Some(5),
+            "neighbour's clear view is fused in"
+        );
 
         // Local + cooperative fuse via MAX: avoid a channel anyone reports occupied.
         m.observe_report(
             8,
-            NeighborReport { spectrum: vec![(149, 30)], ts_ms: 1, ..Default::default() },
+            NeighborReport {
+                spectrum: vec![(149, 30)],
+                ts_ms: 1,
+                ..Default::default()
+            },
         );
-        assert_eq!(m.busy_pct(W, 149), Some(90), "MAX of local 90 and neighbour 30");
+        assert_eq!(
+            m.busy_pct(W, 149),
+            Some(90),
+            "MAX of local 90 and neighbour 30"
+        );
     }
 
     #[test]

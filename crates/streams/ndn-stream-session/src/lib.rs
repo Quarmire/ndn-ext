@@ -222,7 +222,12 @@ impl SessionConsumer {
         (fetches, events)
     }
 
-    fn absorb(&mut self, seq: u64, payload: Bytes, recovered: Vec<(u64, Bytes)>) -> Vec<StreamEvent> {
+    fn absorb(
+        &mut self,
+        seq: u64,
+        payload: Bytes,
+        recovered: Vec<(u64, Bytes)>,
+    ) -> Vec<StreamEvent> {
         let mut events = Vec::new();
         match self.reorder.insert(seq, payload) {
             InsertOutcome::Accepted => {}
@@ -444,7 +449,11 @@ mod tests {
             events.contains(&StreamEvent::Lost { seqs: vec![1] }),
             "the loss is explicit: {events:?}"
         );
-        assert_eq!(items(&events), vec![2, 3], "delivery continues past the hole");
+        assert_eq!(
+            items(&events),
+            vec![2, 3],
+            "delivery continues past the hole"
+        );
     }
 
     #[test]

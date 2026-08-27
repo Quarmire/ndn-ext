@@ -47,10 +47,10 @@
 //! face-agnostic.
 
 mod calibrate;
-pub mod coop;
 mod contextual;
-pub mod dos;
+pub mod coop;
 mod demand;
+pub mod dos;
 pub mod ephemeral_id;
 pub mod gcs;
 pub mod name;
@@ -66,7 +66,8 @@ pub use calibrate::{
     SfThresholds, default_sf_thresholds, default_thresholds, pick_sf, pick_sf_hysteretic,
 };
 pub use contextual::{
-    ARMS, Arm, ArmChoice, Context, ContextualBandit, FOOTPRINT_LAMBDA, MISS_PENALTY, apply_arm, reward,
+    ARMS, Arm, ArmChoice, Context, ContextualBandit, FOOTPRINT_LAMBDA, MISS_PENALTY, apply_arm,
+    reward,
 };
 pub use demand::DemandTracker;
 pub use plan::{
@@ -78,8 +79,8 @@ pub use policy::{
     SuppressReason,
 };
 pub use report::{
-    FULL_RX_MCS, LEGACY_ONLY_RX, MAX_ENTRIES, REPORT_MAGIC, ReceptionReport, SINGLE_STREAM_HT_RX_MCS,
-    decode_report, encode_report,
+    FULL_RX_MCS, LEGACY_ONLY_RX, MAX_ENTRIES, REPORT_MAGIC, ReceptionReport,
+    SINGLE_STREAM_HT_RX_MCS, decode_report, encode_report,
 };
 pub use schedule::{HopSchedule, LeaseClass, SlotSchedule, wifi_airtime_us};
 pub use sense::{

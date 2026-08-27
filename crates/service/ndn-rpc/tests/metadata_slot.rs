@@ -23,7 +23,10 @@ fn trace_context() -> Metadata {
         "traceparent".into(),
         Bytes::from_static(b"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
     );
-    m.insert("tracestate".into(), Bytes::from_static(b"congo=t61rcWkgMzE"));
+    m.insert(
+        "tracestate".into(),
+        Bytes::from_static(b"congo=t61rcWkgMzE"),
+    );
     m
 }
 

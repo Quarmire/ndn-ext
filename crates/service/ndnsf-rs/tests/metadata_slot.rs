@@ -11,10 +11,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use ndnsf_rs::NdnsfCarrier;
 use ndn_packet::Name;
 use ndn_service_core::{Carrier, Dispatch, Invocation, Metadata, OpId, ServiceError, ServiceId};
 use ndn_sync::{SvSyncConfig, SvsConfig, SvsPubSub};
+use ndnsf_rs::NdnsfCarrier;
 use tokio::sync::mpsc;
 
 fn name(s: &str) -> Name {
@@ -41,7 +41,13 @@ fn hub(nodes: &[&str], group: &Name) -> Vec<SvsPubSub> {
     for n in nodes {
         let (out_tx, out_rx) = mpsc::channel::<Bytes>(256);
         let (in_tx, in_rx) = mpsc::channel::<Bytes>(256);
-        pubsubs.push(SvsPubSub::join(group.clone(), name(n), out_tx, in_rx, cfg()));
+        pubsubs.push(SvsPubSub::join(
+            group.clone(),
+            name(n),
+            out_tx,
+            in_rx,
+            cfg(),
+        ));
         outs.push(out_rx);
         ins.push(in_tx);
     }
@@ -67,7 +73,10 @@ fn trace_context() -> Metadata {
         "traceparent".into(),
         Bytes::from_static(b"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
     );
-    m.insert("tracestate".into(), Bytes::from_static(b"congo=t61rcWkgMzE"));
+    m.insert(
+        "tracestate".into(),
+        Bytes::from_static(b"congo=t61rcWkgMzE"),
+    );
     m
 }
 

@@ -127,12 +127,19 @@ fn parse_spec(s: &str) -> Result<RadioSpec, FaceError> {
             .ok_or_else(|| invalid(format!("radio spec: expected key=value, got {kv:?}")))?;
         match k.trim() {
             "channel" => {
-                spec.channel = Some(v.trim().parse().map_err(|_| invalid("radio spec: bad channel"))?)
+                spec.channel = Some(
+                    v.trim()
+                        .parse()
+                        .map_err(|_| invalid("radio spec: bad channel"))?,
+                )
             }
             "iface" => spec.iface = Some(v.trim().to_string()),
             "tx-power" => {
-                spec.tx_power =
-                    Some(v.trim().parse().map_err(|_| invalid("radio spec: bad tx-power"))?)
+                spec.tx_power = Some(
+                    v.trim()
+                        .parse()
+                        .map_err(|_| invalid("radio spec: bad tx-power"))?,
+                )
             }
             other => return Err(invalid(format!("radio spec: unknown option {other:?}"))),
         }
@@ -171,7 +178,8 @@ impl FaceFactory for RadioMediumFaceFactory {
         &'a self,
         id: FaceId,
         params: &'a FaceParams,
-    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn ErasedTransport>, FaceError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn ErasedTransport>, FaceError>> + Send + 'a>>
+    {
         let context_builder = self.context_builder.clone();
         Box::pin(async move {
             let specs = parse_specs(params)?;
@@ -250,11 +258,14 @@ fn build_loopback(rid: RadioId, spec: &RadioSpec) -> RadioBearer {
 #[cfg(feature = "libusb-backend")]
 fn build_rtl8822e(rid: RadioId, spec: &RadioSpec) -> Result<Option<RadioBearer>, FaceError> {
     use crate::{FrameIo, LibUsbRtl88xxBackend};
-    let ch = spec.channel.ok_or_else(|| invalid("rtl8822e requires channel="))?;
+    let ch = spec
+        .channel
+        .ok_or_else(|| invalid("rtl8822e requires channel="))?;
     // Target `0bda:a81a` (RTL8812EU / 8822E-halmac) specifically — an 8812AU is also
     // in `RTL88XX_PIDS`, so a plain `open()` can claim the wrong Realtek device.
     let backend = Arc::new(
-        LibUsbRtl88xxBackend::open_monitor_pid(0xa81a, ch).map_err(|e| invalid(format!("{e:?}")))?,
+        LibUsbRtl88xxBackend::open_monitor_pid(0xa81a, ch)
+            .map_err(|e| invalid(format!("{e:?}")))?,
     );
     if let Some(p) = spec.tx_power {
         let _ = backend.set_tx_power(p as u32);

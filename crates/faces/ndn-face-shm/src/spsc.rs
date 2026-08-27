@@ -21,11 +21,11 @@
 //! push; consumer stores `parked` with `SeqCst` before its second ring
 //! check. The total order prevents the producer from missing a sleeping
 //! consumer.
+use portable_atomic::AtomicU64;
 use std::ffi::CString;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
-use portable_atomic::AtomicU64;
 
 use bytes::Bytes;
 

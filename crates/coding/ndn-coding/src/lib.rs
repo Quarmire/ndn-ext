@@ -88,10 +88,10 @@ pub mod endpoint;
 pub mod fec;
 pub mod field;
 pub mod link_fec;
-#[cfg(feature = "link-fec-feature")]
-pub mod link_fec_feature;
 #[cfg(feature = "link-fec-bridge")]
 pub mod link_fec_bridge;
+#[cfg(feature = "link-fec-feature")]
+pub mod link_fec_feature;
 pub mod metadata;
 #[cfg(feature = "mgmt")]
 pub mod mgmt;

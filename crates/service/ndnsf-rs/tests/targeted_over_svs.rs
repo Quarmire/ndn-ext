@@ -6,11 +6,11 @@
 use std::time::Duration;
 
 use bytes::Bytes;
+use ndn_packet::Name;
+use ndn_sync::{SvSyncConfig, SvsConfig, SvsPubSub};
 use ndnsf_rs::driver::{bootstrap_targeted, call_targeted, serve_provider};
 use ndnsf_rs::tokens::PendingCoordination;
 use ndnsf_rs::trust::TrustCtx;
-use ndn_packet::Name;
-use ndn_sync::{SvSyncConfig, SvsConfig, SvsPubSub};
 use tokio::sync::mpsc;
 
 fn n(s: &str) -> Name {

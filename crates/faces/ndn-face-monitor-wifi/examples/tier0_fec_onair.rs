@@ -77,8 +77,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .split(',')
         .filter_map(|s| s.trim().parse().ok())
         .collect();
-    let fec_k: usize = std::env::var("FEC_K").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
-    let fec_r: u16 = std::env::var("FEC_R").ok().and_then(|s| s.parse().ok()).unwrap_or(2);
+    let fec_k: usize = std::env::var("FEC_K")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4);
+    let fec_r: u16 = std::env::var("FEC_R")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
 
     // The producer publishes under /x/y; the receiver registers the coarser /x — the aggregation
     // case, and the one where a half-filter is guaranteed to miss.
@@ -113,15 +119,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // The plan cell the cognitive control plane would write; here the example drives it so the
         // rate under test is unambiguous.
         let plan = Arc::new(std::sync::RwLock::new(None::<TxParams>));
-        let rate = Arc::new(RatePolicy::new(McsPolicy::Fixed(McsDescriptor::CONSERVATIVE))
-            .with_planned(plan.clone()));
+        let rate = Arc::new(
+            RatePolicy::new(McsPolicy::Fixed(McsDescriptor::CONSERVATIVE))
+                .with_planned(plan.clone()),
+        );
         let medium = RadioMediumFace::new(
             ndn_face_monitor_wifi::FaceId(1),
             vec![RadioBearer::from_open(RadioId(0), open, cap)],
         )
         .with_bloom(&key, &[publish_prefix])
-        .with_link_fec(fec_k, Duration::from_millis(50), Arc::new(AtomicU16::new(fec_r)),
-                       Arc::new(LossMeter::default()))
+        .with_link_fec(
+            fec_k,
+            Duration::from_millis(50),
+            Arc::new(AtomicU16::new(fec_r)),
+            Arc::new(LossMeter::default()),
+        )
         .with_rate_policy(rate)
         .build();
 
@@ -138,10 +150,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let arm_new = (seq as usize / period) % 2 == 0;
             let mcs = mcs_list[(seq as usize / period / 2) % mcs_list.len()];
             *plan.write().unwrap() = Some(TxParams {
-                rate: RateParams::Wifi(WifiRate { mcs: Some(mcs), ..Default::default() }),
+                rate: RateParams::Wifi(WifiRate {
+                    mcs: Some(mcs),
+                    ..Default::default()
+                }),
                 ..Default::default()
             });
-            let marker = format!("T0AB|{}|{}|{}", if arm_new { "new" } else { "old" }, mcs, seq);
+            let marker = format!(
+                "T0AB|{}|{}|{}",
+                if arm_new { "new" } else { "old" },
+                mcs,
+                seq
+            );
             let wire = data_pkt(&[b"x", b"y", b"obj"], marker.as_bytes());
             if arm_new {
                 medium.send_bytes(wire).await?;
@@ -189,8 +209,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let deadline = Instant::now() + Duration::from_secs(secs);
     while Instant::now() < deadline {
-        let Ok(Ok(fr)) =
-            tokio::time::timeout(Duration::from_millis(500), radio.recv_frame()).await
+        let Ok(Ok(fr)) = tokio::time::timeout(Duration::from_millis(500), radio.recv_frame()).await
         else {
             continue;
         };

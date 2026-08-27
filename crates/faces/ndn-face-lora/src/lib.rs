@@ -16,7 +16,7 @@
 //! `AdHoc` broadcast bearer: the NDN *name* is the addressing, there is no
 //! association, and every LoRa receiver in range hears every frame and evaluates
 //! it against its own PIT/FIB/CS. Pair it with the engine's `LpLinkService` via
-//! [`into_face`](LoraFace::into_face) so NDN packets larger than one LoRa frame
+//! [`into_face`](LoraPhy::into_face) so NDN packets larger than one LoRa frame
 //! fragment across frames (NDNLPv2) — and, when FEC is on, ride generations.
 //!
 //! [`TxParams::link_fec_redundancy`]: ndn_radio_cognition::TxParams::link_fec_redundancy
@@ -112,7 +112,7 @@ pub struct GcsCfg {
 
 /// A connectionless LoRa broadcast face. Build a [`Face`] with
 /// [`into_face`](Self::into_face); the engine treats it as an ad-hoc bearer.
-pub struct LoraFace {
+pub struct LoraPhy {
     id: FaceId,
     radio: Arc<dyn FrameIo>,
     egress: Egress,
@@ -127,7 +127,7 @@ pub struct LoraFace {
     gcs: Option<GcsCfg>,
 }
 
-impl LoraFace {
+impl LoraPhy {
     /// A plain LoRa face over `radio` (no link FEC). Every `send_bytes` is one
     /// frame; the paired `LpLinkService` fragments larger packets.
     pub fn new(id: FaceId, radio: Arc<dyn FrameIo>) -> Self {
@@ -151,7 +151,9 @@ impl LoraFace {
     ///
     /// [`link_fec_redundancy`]: ndn_radio_cognition::TxParams::link_fec_redundancy
     pub fn with_link_fec(mut self, k: Option<usize>, window: Option<Duration>) -> Self {
-        let sink = LoraFecSink { radio: Arc::clone(&self.radio) };
+        let sink = LoraFecSink {
+            radio: Arc::clone(&self.radio),
+        };
         let bridge = LinkFecBridge::spawn(
             sink,
             k.unwrap_or(LORA_FEC_K),
@@ -202,8 +204,12 @@ impl LoraFace {
     /// untouched (a continuation fragment or nameless frame carries no filter — and must not, or a
     /// receiver would gate it against a filter it can't recompute).
     fn body_prefix_prepend(&self, wire: Bytes) -> Bytes {
-        let Some(cfg) = self.gcs.as_ref() else { return wire };
-        let Some(name_tlv) = inner_name(&wire) else { return wire };
+        let Some(cfg) = self.gcs.as_ref() else {
+            return wire;
+        };
+        let Some(name_tlv) = inner_name(&wire) else {
+            return wire;
+        };
         let name = ndn_name_to_slash(name_tlv);
         let filter = GcsFilter::from_name(&cfg.key, &name);
         let mut gcs = [0u8; GCS_MAX_BYTES + 1];
@@ -222,7 +228,9 @@ impl LoraFace {
     /// well-formed filter that provably admits none of the registered prefixes, so a parse slip can
     /// never manufacture a false negative (the forbidden failure).
     fn body_prefix_gate(&self, payload: Bytes) -> Option<Bytes> {
-        let Some(cfg) = self.gcs.as_ref() else { return Some(payload) };
+        let Some(cfg) = self.gcs.as_ref() else {
+            return Some(payload);
+        };
         if payload.first() != Some(&BODY_PREFIX_TLV) {
             return Some(payload); // no filter on this frame — keep it
         }
@@ -232,7 +240,9 @@ impl LoraFace {
             let gcs = payload.get(2..2 + len)?;
             Some((GcsFilter::from_wire(gcs), 2 + len))
         })();
-        let Some((filter, off)) = parsed else { return Some(payload) };
+        let Some((filter, off)) = parsed else {
+            return Some(payload);
+        };
         if cfg.prefixes.is_empty() || cfg.prefixes.iter().any(|p| filter.may_match(&cfg.key, p)) {
             Some(payload.slice(off..))
         } else {
@@ -241,7 +251,7 @@ impl LoraFace {
     }
 }
 
-impl Transport for LoraFace {
+impl Transport for LoraPhy {
     fn id(&self) -> FaceId {
         self.id
     }
@@ -352,10 +362,10 @@ mod tests {
             link_fec_redundancy: Some(2),
             ..Default::default()
         })));
-        let tx = LoraFace::new(FaceId(1), Arc::new(bus.endpoint(1, -60)))
+        let tx = LoraPhy::new(FaceId(1), Arc::new(bus.endpoint(1, -60)))
             .with_link_fec(Some(2), Some(Duration::from_millis(50)))
             .with_planned_params(cell);
-        let rx = LoraFace::new(FaceId(2), Arc::new(bus.endpoint(2, -60)))
+        let rx = LoraPhy::new(FaceId(2), Arc::new(bus.endpoint(2, -60)))
             .with_link_fec(Some(2), Some(Duration::from_millis(50)));
 
         let sent: Vec<Bytes> = (0..2u8).map(|i| Bytes::from(vec![i; 16])).collect();
@@ -373,7 +383,10 @@ mod tests {
         got.sort();
         let mut want = sent;
         want.sort();
-        assert_eq!(got, want, "plan-driven LoRa FEC face round-trips the generation");
+        assert_eq!(
+            got, want,
+            "plan-driven LoRa FEC face round-trips the generation"
+        );
     }
 
     /// A plain (no-FEC) face is a straight passthrough: one send, one frame, one
@@ -381,9 +394,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn plain_face_passes_frames_through() {
         let bus = LoopbackMonitorBus::new();
-        let tx = LoraFace::new(FaceId(1), Arc::new(bus.endpoint(1, -60)));
-        let rx = LoraFace::new(FaceId(2), Arc::new(bus.endpoint(2, -60)));
-        tx.send_bytes(Bytes::from_static(b"hello-lora")).await.unwrap();
+        let tx = LoraPhy::new(FaceId(1), Arc::new(bus.endpoint(1, -60)));
+        let rx = LoraPhy::new(FaceId(2), Arc::new(bus.endpoint(2, -60)));
+        tx.send_bytes(Bytes::from_static(b"hello-lora"))
+            .await
+            .unwrap();
         let (b, _) = tokio::time::timeout(Duration::from_secs(2), rx.recv_bytes_with_addr())
             .await
             .expect("plain face delivers")
@@ -418,13 +433,20 @@ mod tests {
         let radio = Arc::new(bus.endpoint(1, -60));
 
         let wire = interest(&["a", "b", "c"]); // name /a/b/c
-        let sender = LoraFace::new(FaceId(1), radio.clone()).with_gcs(key, vec![]);
+        let sender = LoraPhy::new(FaceId(1), radio.clone()).with_gcs(key, vec![]);
         let framed = sender.body_prefix_prepend(wire.clone());
-        assert_eq!(framed.first(), Some(&BODY_PREFIX_TLV), "TX prepends the body-prefix TLV");
-        assert!(framed.len() > wire.len(), "the filter adds bytes ahead of the packet");
+        assert_eq!(
+            framed.first(),
+            Some(&BODY_PREFIX_TLV),
+            "TX prepends the body-prefix TLV"
+        );
+        assert!(
+            framed.len() > wire.len(),
+            "the filter adds bytes ahead of the packet"
+        );
 
         // A receiver serving /a/b keeps it (true prefix ⇒ match) and gets the packet TLV-stripped.
-        let keep = LoraFace::new(FaceId(2), radio.clone()).with_gcs(key, vec![b"/a/b".to_vec()]);
+        let keep = LoraPhy::new(FaceId(2), radio.clone()).with_gcs(key, vec![b"/a/b".to_vec()]);
         assert_eq!(
             keep.body_prefix_gate(framed.clone()),
             Some(wire.clone()),
@@ -432,7 +454,7 @@ mod tests {
         );
 
         // A receiver serving only /z/y drops it (provably not under any registered prefix).
-        let reject = LoraFace::new(FaceId(3), radio.clone()).with_gcs(key, vec![b"/z/y".to_vec()]);
+        let reject = LoraPhy::new(FaceId(3), radio.clone()).with_gcs(key, vec![b"/z/y".to_vec()]);
         assert!(
             reject.body_prefix_gate(framed).is_none(),
             "no registered prefix can be under the carried name — the frame is dropped"

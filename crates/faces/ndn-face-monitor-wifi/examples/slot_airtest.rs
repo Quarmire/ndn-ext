@@ -21,10 +21,10 @@
 //! then re-run both with NDN_MODE=contention for the baseline. Delivery ratio = recv_peer / peer.sent
 //! (computed across the two nodes' logs).
 
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use portable_atomic::AtomicU64;
+use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use ndn_face_monitor_wifi::{LibUsbRtl88xxBackend, TIME_BEACON_MAGIC};
@@ -60,11 +60,17 @@ impl Rng {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let ch: u8 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(40);
+    let ch: u8 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40);
     let pid: u16 = env("NDN_PID")
         .and_then(|s| u16::from_str_radix(s.trim_start_matches("0x"), 16).ok())
         .unwrap_or(0x8812);
-    let secs: u64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(22);
+    let secs: u64 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(22);
     let master = env("NDN_ROLE").as_deref() == Some("master");
     let slotted = env("NDN_MODE").as_deref() != Some("contention");
     let hw_gate = env("NDN_HW_GATE").is_some();
@@ -106,7 +112,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // which keeps its airtime negligible. A saturating source would time the medium by destroying it.
     const FRAMES_PER_SLOT: u32 = 1;
     let common_seq = Arc::new(AtomicU64::new(u64::MAX));
-    let slot_us: u64 = env("NDN_SLOT_US").and_then(|s| s.parse().ok()).unwrap_or(20_000);
+    let slot_us: u64 = env("NDN_SLOT_US")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20_000);
     // Inter-frame pacing (µs). 0 = saturate. A light pace (e.g. 4000) keeps the medium unsaturated so
     // the TimeBeacon is not queue-delayed — the regime in which its common-view alignment is measured.
     let pace_us: u64 = env("NDN_PACE_US").and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -136,20 +144,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(1_000);
     let knobs = opened.knobs.clone();
     if hw_gate && knobs.is_none() {
-        eprintln!("NDN_HW_GATE set but this radio exposes no RadioKnobs — the arm would be a no-op");
+        eprintln!(
+            "NDN_HW_GATE set but this radio exposes no RadioKnobs — the arm would be a no-op"
+        );
     }
     println!(
         "slot_airtest: role={} mode={} ch{ch} pid={pid:04x} slot={}µs N={} secs={} frame={}B rate={}",
         if master { "master" } else { "slave" },
         if slotted { "slotted" } else { "contention" },
-        slot_us, N_SLOTS, secs, FRAME_BYTES,
+        slot_us,
+        N_SLOTS,
+        secs,
+        FRAME_BYTES,
         env("NDN_RADIO_TX_RATE").unwrap_or_else(|| "default".into()),
     );
 
     // PHY PPDU counters bracketing the counting window. `err` counts PPDUs the PHY BEGAN to
     // demodulate and failed — collisions and marginal decode — which is the only view of loss a
     // receiver has, since a frame destroyed on air never arrives to be counted missing.
-    let phy0 = knobs.as_ref().and_then(|k| k.read_ofdm_counters().ok().flatten());
+    let phy0 = knobs
+        .as_ref()
+        .and_then(|k| k.read_ofdm_counters().ok().flatten());
     let sent = Arc::new(AtomicU64::new(0));
     // Injects the radio REFUSED — never on air, so not part of the delivery denominator.
     let tx_failed = Arc::new(AtomicU64::new(0));
@@ -164,8 +179,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // RX task: drain continuously, classify, discipline the common-view clock on a beacon. Decoupled
     // from TX so reception reflects what the half-duplex PHY actually caught (nothing while we TX).
     let rx = {
-        let (d, cv, recv_peer, recv_beacon, offsets, host_us) =
-            (d.clone(), cv.clone(), recv_peer.clone(), recv_beacon.clone(), offsets.clone(), host_us);
+        let (d, cv, recv_peer, recv_beacon, offsets, host_us) = (
+            d.clone(),
+            cv.clone(),
+            recv_peer.clone(),
+            recv_beacon.clone(),
+            offsets.clone(),
+            host_us,
+        );
         let common_seq_rx = common_seq.clone();
         let cv_origin_rx = cv_origin.clone();
         let cv_last_rx = cv_last.clone();
@@ -250,7 +271,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut payload = Vec::with_capacity(11);
             payload.extend_from_slice(&TIME_BEACON_MAGIC);
             payload.extend_from_slice(&refr.to_le_bytes());
-            let _ = d.inject(InjectFrame { payload: payload.into(), tx: TxIntent::ROBUST, dst: BROADCAST, src, addr3: None }).await;
+            let _ = d
+                .inject(InjectFrame {
+                    payload: payload.into(),
+                    tx: TxIntent::ROBUST,
+                    dst: BROADCAST,
+                    src,
+                    addr3: None,
+                })
+                .await;
             last_beacon = Instant::now();
         }
 
@@ -280,7 +309,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // New slot: (re)decide whether we transmit in it.
             cur_slot_epoch = epoch;
             let cur_slot = epoch % N_SLOTS;
-            tx_this_slot = if slotted { cur_slot == my_slot } else { rng.coin() };
+            tx_this_slot = if slotted {
+                cur_slot == my_slot
+            } else {
+                rng.coin()
+            };
             // NDN_HW_GATE=1 additionally shuts the MAC outside our slot. The software decision
             // above stops us CALLING inject on time; it cannot stop frames already queued, which
             // drain into the peer's turn and collide there. Measured single-node, the software
@@ -295,7 +328,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // end of a 20 ms slot keeps radiating into the NEXT owner's turn and collides there — a loss
         // charged to a node that did nothing wrong. NDN_GUARD_US=0 disables it, which is the arm
         // that measures how much of the residual loss it accounts for.
-        let guard_us: u64 = env("NDN_GUARD_US").and_then(|v| v.parse().ok()).unwrap_or(0);
+        let guard_us: u64 = env("NDN_GUARD_US")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
         let fits = if guard_us == 0 {
             true
         } else {
@@ -326,7 +361,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // timeout — still inflated `sent`, and therefore deflated the delivery ratio computed
             // against it. That biases hardest against the gated arm, which is exactly the arm whose
             // queue is shut half the time.
-            match d.inject(InjectFrame { payload: payload.into(), tx: TxIntent::CONSERVATIVE, dst: BROADCAST, src, addr3: None }).await {
+            match d
+                .inject(InjectFrame {
+                    payload: payload.into(),
+                    tx: TxIntent::CONSERVATIVE,
+                    dst: BROADCAST,
+                    src,
+                    addr3: None,
+                })
+                .await
+            {
                 Ok(()) => {
                     sent.fetch_add(1, Ordering::Relaxed);
                 }
@@ -369,7 +413,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!(
             "PHY ofdm_ok={d_ok} ofdm_err={d_err}  -> {:.1}% of PPDUs the PHY started FAILED to \
              decode (collisions / marginal), across ALL transmitters on the channel",
-            if total > 0 { 100.0 * f64::from(d_err) / f64::from(total) } else { 0.0 }
+            if total > 0 {
+                100.0 * f64::from(d_err) / f64::from(total)
+            } else {
+                0.0
+            }
         );
     }
     // Slave: the TimeBeacon's on-air common-view precision = the jitter of the disciplined offset.
@@ -381,7 +429,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (min, max) = (*o.iter().min().unwrap(), *o.iter().max().unwrap());
             println!(
                 "common-view offset: n={} stddev={:.1}µs spread(max-min)={}µs  (TimeBeacon alignment jitter)",
-                o.len(), var.sqrt(), max - min,
+                o.len(),
+                var.sqrt(),
+                max - min,
             );
         }
     }

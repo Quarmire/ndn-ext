@@ -26,11 +26,11 @@
 //! - **Framing** — two choices via [`BleFraming`]. `Ndnlpv2` (default) rides
 //!   the engine's `LpLinkService`; its ~50-byte per-fragment overhead needs
 //!   *extended* advertising and interoperates with NFD/ndnd. `Ndnts`
-//!   ([`BleAdvFace::ndnts_framing`]) uses the esp8266ndn/NDNts 1-byte header so
+//!   ([`BlePhy::ndnts_framing`]) uses the esp8266ndn/NDNts 1-byte header so
 //!   it fits a *legacy* advertisement, doing fragmentation and **per-sender**
 //!   reassembly in the face itself (the 1-byte header has no sender id, so
 //!   reassembly is keyed by the scanned BD_ADDR). Use
-//!   [`BleAdvFace::into_face`] — it pairs the correct link service per framing.
+//!   [`BlePhy::into_face`] — it pairs the correct link service per framing.
 //!
 //! The radio itself is abstracted behind [`AdvBackend`]: implement it over
 //! BlueZ/`bluer` (Linux), an HCI socket, or an embedded controller. A
@@ -58,14 +58,14 @@ pub use ndn_transport::FaceError;
 /// **cannot carry LP-fragmented NDN** — a fragmenting send would have no room
 /// for payload. Legacy mode is only viable for NDN packets that fit whole in
 /// one advert (tiny names, no fragmentation). For real traffic use
-/// [`BleAdvFace::new`]'s default (extended advertising). The same limit bites
+/// [`BlePhy::new`]'s default (extended advertising). The same limit bites
 /// other tiny-frame bearers (LoRa low spreading factors).
 pub const LEGACY_ADV_MTU: usize = 26;
 
 /// Usable payload for BLE 5 **extended** advertising (up to ~255 bytes minus
 /// overhead). Offloads the bulk onto secondary channels via the AUX pointer.
 /// Above the NDNLPv2 fragmentation floor, so this is the bearer that actually
-/// carries fragmented NDN — hence the [`BleAdvFace`] default.
+/// carries fragmented NDN — hence the [`BlePhy`] default.
 pub const EXTENDED_ADV_MTU: usize = 245;
 
 /// One advertisement observed by the radio: the carried bytes plus what the
@@ -82,7 +82,7 @@ pub struct ScannedFrame {
     pub rssi_dbm: Option<i8>,
 }
 
-/// The radio behind a [`BleAdvFace`]: broadcast a frame, and yield scanned
+/// The radio behind a [`BlePhy`]: broadcast a frame, and yield scanned
 /// frames. `next_scanned` has a single consumer (the face's reader task);
 /// `broadcast` may be called concurrently and must synchronise internally.
 #[async_trait]
@@ -99,7 +99,7 @@ pub trait AdvBackend: Send + Sync + 'static {
 /// A connectionless BLE advertising face. Build a [`Face`] from it with
 /// [`into_face`](Self::into_face) (which pairs the right link service for the
 /// chosen framing); the engine treats it as an ad-hoc broadcast bearer.
-pub struct BleAdvFace {
+pub struct BlePhy {
     id: FaceId,
     backend: Arc<dyn AdvBackend>,
     mtu: usize,
@@ -116,7 +116,7 @@ pub struct BleAdvFace {
     reasm: Mutex<PerSenderReassembler<[u8; 6]>>,
 }
 
-impl BleAdvFace {
+impl BlePhy {
     /// New advertising face over `backend`, sized for BLE 5 **extended**
     /// advertising — the mode large enough for NDNLPv2 fragmentation to apply
     /// (see [`LEGACY_ADV_MTU`] for why legacy can't fragment under NDNLPv2).
@@ -194,7 +194,7 @@ impl BleAdvFace {
     }
 }
 
-impl Transport for BleAdvFace {
+impl Transport for BlePhy {
     fn id(&self) -> FaceId {
         self.id
     }
@@ -359,7 +359,7 @@ mod tests {
     async fn recv_publishes_rssi_to_sink() {
         let bus = LoopbackAdvBus::new();
         let sink = Arc::new(TestSink::default());
-        let face = BleAdvFace::new(FaceId(7), Arc::new(bus.endpoint(7, ADDR_A, -42)))
+        let face = BlePhy::new(FaceId(7), Arc::new(bus.endpoint(7, ADDR_A, -42)))
             .with_signal_sink(sink.clone());
         let peer = Arc::new(bus.endpoint(8, ADDR_B, -42));
 
@@ -385,11 +385,11 @@ mod tests {
     #[test]
     fn face_is_ad_hoc_with_small_mtu() {
         let bus = LoopbackAdvBus::new();
-        let face = BleAdvFace::new(FaceId(1), Arc::new(bus.endpoint(1, ADDR_A, -50)));
+        let face = BlePhy::new(FaceId(1), Arc::new(bus.endpoint(1, ADDR_A, -50)));
         assert_eq!(face.link_type(), LinkType::AdHoc);
         assert_eq!(face.send_mtu(), Some(EXTENDED_ADV_MTU));
         assert_eq!(face.kind(), FaceKind::Bluetooth);
-        let legacy = BleAdvFace::new(FaceId(1), Arc::new(bus.endpoint(1, ADDR_A, -50))).legacy();
+        let legacy = BlePhy::new(FaceId(1), Arc::new(bus.endpoint(1, ADDR_A, -50))).legacy();
         assert_eq!(legacy.send_mtu(), Some(LEGACY_ADV_MTU));
     }
 
@@ -399,10 +399,10 @@ mod tests {
     #[tokio::test]
     async fn ndnts_legacy_round_trip_between_faces() {
         let bus = LoopbackAdvBus::new();
-        let tx = BleAdvFace::new(FaceId(1), Arc::new(bus.endpoint(1, ADDR_A, -50)))
+        let tx = BlePhy::new(FaceId(1), Arc::new(bus.endpoint(1, ADDR_A, -50)))
             .legacy()
             .ndnts_framing();
-        let rx = BleAdvFace::new(FaceId(2), Arc::new(bus.endpoint(2, ADDR_B, -55)))
+        let rx = BlePhy::new(FaceId(2), Arc::new(bus.endpoint(2, ADDR_B, -55)))
             .legacy()
             .ndnts_framing();
 

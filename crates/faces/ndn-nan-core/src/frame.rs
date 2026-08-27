@@ -118,7 +118,9 @@ pub enum FrameType {
     Action,
     /// A NAN Action Frame (action OUI type `0x18`) — data path, ranging, or
     /// schedule. Carries the raw subtype byte; [`NafSubtype::from_byte`] names it.
-    Naf { subtype: u8 },
+    Naf {
+        subtype: u8,
+    },
     Other,
 }
 
@@ -334,7 +336,13 @@ pub struct NanActionFrame {
 
 impl NanActionFrame {
     /// A NAF to `dst` (a peer's NMI — data-path setup is unicast).
-    pub fn new(subtype: NafSubtype, dst: [u8; 6], src: [u8; 6], cluster_id: [u8; 6], seq: u16) -> Self {
+    pub fn new(
+        subtype: NafSubtype,
+        dst: [u8; 6],
+        src: [u8; 6],
+        cluster_id: [u8; 6],
+        seq: u16,
+    ) -> Self {
         Self {
             header: Dot11Header::new(FC_ACTION, dst, src, cluster_id, seq),
             subtype: subtype as u8,
@@ -398,9 +406,7 @@ pub fn classify(buf: &[u8]) -> Result<Dot11Frame<'_>, WireError> {
                 let (n, attributes) = NanActionFrame::parse(buf)?;
                 Ok(Dot11Frame {
                     header: n.header,
-                    kind: FrameType::Naf {
-                        subtype: n.subtype,
-                    },
+                    kind: FrameType::Naf { subtype: n.subtype },
                     attributes,
                 })
             }
@@ -578,7 +584,10 @@ mod tests {
         let (parsed, attrs) = NanActionFrame::parse(&wire).unwrap();
         assert_eq!(parsed.header.addr1, PEER, "data-path setup is unicast");
         assert_eq!(parsed.subtype, 5);
-        assert_eq!(NafSubtype::from_byte(parsed.subtype), Some(NafSubtype::DataPathRequest));
+        assert_eq!(
+            NafSubtype::from_byte(parsed.subtype),
+            Some(NafSubtype::DataPathRequest)
+        );
         assert_eq!(attrs, &[0xAA, 0xBB]);
     }
 
@@ -587,8 +596,8 @@ mod tests {
     /// silently lose the entire data-path channel.
     #[test]
     fn classify_separates_sdf_from_naf() {
-        let sdf = ServiceDiscoveryFrame::new(NAN_NETWORK_ID, SRC, NAN_CLUSTER_ID_BASE, 1)
-            .encode(&[]);
+        let sdf =
+            ServiceDiscoveryFrame::new(NAN_NETWORK_ID, SRC, NAN_CLUSTER_ID_BASE, 1).encode(&[]);
         assert_eq!(classify(&sdf).unwrap().kind, FrameType::Action);
 
         let naf = NanActionFrame::new(
@@ -606,6 +615,9 @@ mod tests {
     fn unknown_naf_subtype_is_none_not_an_error() {
         assert_eq!(NafSubtype::from_byte(0), None);
         assert_eq!(NafSubtype::from_byte(200), None);
-        assert_eq!(NafSubtype::from_byte(9), Some(NafSubtype::DataPathTermination));
+        assert_eq!(
+            NafSubtype::from_byte(9),
+            Some(NafSubtype::DataPathTermination)
+        );
     }
 }

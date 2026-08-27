@@ -16,8 +16,8 @@
 use bytes::Bytes;
 use ndn_coding::policy::Field;
 use ndn_coding::recode::{
-    recode_combine, row_hash, CodedMetadata, CodedPacket, CodingVector, GenerationBuffer,
-    GenerationDescriptor, RecodePolicy, SourceCommitment,
+    CodedMetadata, CodedPacket, CodingVector, GenerationBuffer, GenerationDescriptor, RecodePolicy,
+    SourceCommitment, recode_combine, row_hash,
 };
 use ndn_packet::Name;
 
@@ -70,7 +70,12 @@ fn trial(
         if (xs(&mut rng) % 1000) as f64 / 1000.0 < e {
             continue;
         }
-        let meta = CodedMetadata { generation_id: gen_id, k: K, field: Field::Gf8, vector: packet.vector.clone() };
+        let meta = CodedMetadata {
+            generation_id: gen_id,
+            k: K,
+            field: Field::Gf8,
+            vector: packet.vector.clone(),
+        };
         let _ = buf.absorb(&meta, packet.payload);
     }
     if buf.is_decodable() {
@@ -82,7 +87,9 @@ fn trial(
 }
 
 fn main() {
-    let payload: Vec<u8> = (0..K as usize * SYM).map(|i| ((i * 7 + 13) & 0xff) as u8).collect();
+    let payload: Vec<u8> = (0..K as usize * SYM)
+        .map(|i| ((i * 7 + 13) & 0xff) as u8)
+        .collect();
     let sources: Vec<Vec<u8>> = payload.chunks(SYM).map(|c| c.to_vec()).collect();
     let object: Name = "/sim/nc/clip".parse().unwrap();
     let gen_id = 1u64;
@@ -92,7 +99,9 @@ fn main() {
         symbol_size: SYM as u32,
         field: Field::Gf8,
         content_name: object.clone(),
-        source_commitment: SourceCommitment::RowHashes(sources.iter().map(|r| row_hash(r)).collect()),
+        source_commitment: SourceCommitment::RowHashes(
+            sources.iter().map(|r| row_hash(r)).collect(),
+        ),
         recode: RecodePolicy::Open,
         delegation: None,
         fingerprint: None,
@@ -101,7 +110,10 @@ fn main() {
     let held: Vec<CodedPacket> = sources
         .iter()
         .enumerate()
-        .map(|(i, r)| CodedPacket { vector: CodingVector::unit(K, i as u16), payload: Bytes::from(r.clone()) })
+        .map(|(i, r)| CodedPacket {
+            vector: CodingVector::unit(K, i as u16),
+            payload: Bytes::from(r.clone()),
+        })
         .collect();
 
     println!("recode-at-relay vs store-and-forward — K={K}, {SEEDS} seeds, verify-on-decode\n");
@@ -116,16 +128,24 @@ fn main() {
                     ok += 1;
                 }
             }
-            let mean = if ok > 0 { sum as f64 / ok as f64 } else { f64::NAN };
+            let mean = if ok > 0 {
+                sum as f64 / ok as f64
+            } else {
+                f64::NAN
+            };
             (mean, ok as f64 / SEEDS as f64)
         };
         let (ftx, fok) = stat(&Mode::Forward);
         let (rtx, rok) = stat(&Mode::Recode);
         println!(
             "  {e:.2}     {ftx:8.1}     {rtx:8.1}     {:5.2}x     {:6.0}%     {:6.0}%",
-            ftx / rtx, fok * 100.0, rok * 100.0
+            ftx / rtx,
+            fok * 100.0,
+            rok * 100.0
         );
-        if ri > 0 { json.push(','); }
+        if ri > 0 {
+            json.push(',');
+        }
         json.push_str(&format!(
             "{{\"e\":{e},\"fwd_tx\":{ftx:.1},\"rec_tx\":{rtx:.1},\"fwd_ok\":{fok:.3},\"rec_ok\":{rok:.3}}}"
         ));

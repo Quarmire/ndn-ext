@@ -25,7 +25,7 @@
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use bytes::Bytes;
-    use ndn_face_monitor_wifi::{MonitorWifiFace, Rtl8812auBackend};
+    use ndn_face_monitor_wifi::{Rtl8812auBackend, WifiPhy};
     use ndn_frame_io::{FaceId, FrameFormat};
     use ndn_radio_cognition::TxParams;
     use ndn_transport::Transport;
@@ -45,10 +45,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     const WINDOW: Duration = Duration::from_millis(500);
 
     let mode = std::env::args().nth(1).unwrap_or_else(|| "rx".into());
-    let secs: u64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(260);
+    let secs: u64 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(260);
     // FK_CH lets a liveness sweep try channels when ch6 looks jammed. Both ends
     // must agree; monitor-mode injection needs no association, so any channel works.
-    let ch: u8 = std::env::var("FK_CH").ok().and_then(|s| s.parse().ok()).unwrap_or(6);
+    let ch: u8 = std::env::var("FK_CH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(6);
 
     let b = Rtl8812auBackend::open()?.with_format(FrameFormat::default());
     b.power_on()?;
@@ -71,7 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The face is built with R=0. All parity comes from the plan cell — so a
     // non-zero count on air is proof the plan reached the air, not the constructor.
     let cell = Arc::new(RwLock::new(None::<TxParams>));
-    let face = MonitorWifiFace::new(FaceId(7), b.clone())
+    let face = WifiPhy::new(FaceId(7), b.clone())
         .with_link_fec(K, 0, WINDOW)
         .with_planned_params(cell.clone());
 
@@ -146,7 +152,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
             .count();
         // K+R frames per generation went on air (before loss).
-        println!("{:>4}  {:>10}  {:>7}/{:<4}", r, K as u16 + r, complete, PER_R);
+        println!(
+            "{:>4}  {:>10}  {:>7}/{:<4}",
+            r,
+            K as u16 + r,
+            complete,
+            PER_R
+        );
     }
     println!(
         "\n  Delivery must RISE with R. R=0 recovers a generation only if all K\n  \

@@ -68,18 +68,37 @@ fn main() {
             }
         }
         let p = fp as f64 / TRIALS as f64;
-        (bits_tot as f64 / TRIALS as f64, p * 100.0, (1.0 - (1.0 - p).powi(32)) * 100.0)
+        (
+            bits_tot as f64 / TRIALS as f64,
+            p * 100.0,
+            (1.0 - (1.0 - p).powi(32)) * 100.0,
+        )
     };
 
     println!("m=94, k=4. per-mask FIB FP over {TRIALS} disjoint depth-3 registrations.\n");
-    println!("{:<18} {:<10} {:>9} {:>13} {:>13}", "profile", "encoding", "avg bits", "per-mask FP", "union E=32");
+    println!(
+        "{:<18} {:<10} {:>9} {:>13} {:>13}",
+        "profile", "encoding", "avg bits", "per-mask FP", "union E=32"
+    );
     for (label, d) in [("shallow (ours) d=2", 2usize), ("deep (NDN) d=10", 10)] {
         let (b0, p0, u0) = measure(d, "full", 0);
-        println!("{:<18} {:<10} {:>9.1} {:>12.4}% {:>12.2}%", label, "full", b0, p0, u0);
+        println!(
+            "{:<18} {:<10} {:>9.1} {:>12.4}% {:>12.2}%",
+            label, "full", b0, p0, u0
+        );
         for c in [3usize, 4] {
             let (b, p, u) = measure(d, "head", c);
-            println!("{:<18} {:<10} {:>9.1} {:>12.4}% {:>12.2}%", "", format!("head={c}"), b, p, u);
+            println!(
+                "{:<18} {:<10} {:>9.1} {:>12.4}% {:>12.2}%",
+                "",
+                format!("head={c}"),
+                b,
+                p,
+                u
+            );
         }
     }
-    println!("\nexact-match fingerprint (PIT-exact + CS): FP = 2^-w  →  16b: 0.0015%   24b: 6e-6%   32b: 2.3e-8%");
+    println!(
+        "\nexact-match fingerprint (PIT-exact + CS): FP = 2^-w  →  16b: 0.0015%   24b: 6e-6%   32b: 2.3e-8%"
+    );
 }

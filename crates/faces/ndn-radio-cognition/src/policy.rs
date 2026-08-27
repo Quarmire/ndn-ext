@@ -23,7 +23,8 @@
 
 use crate::calibrate::{RateThresholds, STATIC_REQ_RSSI, STATIC_REQ_RSSI_SF, SfThresholds};
 use crate::plan::{
-    AllocRole, DataPlaneConfig, LoraRate, RadioAllocation, RadioPlan, RateParams, TxParams, WifiRate,
+    AllocRole, DataPlaneConfig, LoraRate, RadioAllocation, RadioPlan, RateParams, TxParams,
+    WifiRate,
 };
 use crate::sense::{MediumView, RadioCapability, RadioId, RadioKind};
 use crate::strategy::RadioStrategy;
@@ -481,7 +482,8 @@ impl RadioPolicy {
                     coding_rate: Some(cr),
                     bandwidth_khz,
                 }),
-                link_fec_redundancy: self.fec_redundancy(radio, ctx, view, channel, receivers, deficit),
+                link_fec_redundancy: self
+                    .fec_redundancy(radio, ctx, view, channel, receivers, deficit),
                 // Minimum-sufficient power (spatial reuse) off the SF operating threshold, same
                 // reciprocity as the Wi-Fi path — power is NOT a rendezvous parameter, so each end
                 // sets its own freely. Dial off the REAL measured weakest RSSI (not the proxy), so it
@@ -518,8 +520,7 @@ impl RadioPolicy {
             Some(c) if c >= 1 => cap.max_mcs().min(c),
             _ => cap.max_mcs(),
         };
-        let neighbor_single_stream =
-            matches!(neighbor_rx, Some(c) if (1..=crate::report::SINGLE_STREAM_HT_RX_MCS).contains(&c));
+        let neighbor_single_stream = matches!(neighbor_rx, Some(c) if (1..=crate::report::SINGLE_STREAM_HT_RX_MCS).contains(&c));
         // SNR of the weakest fresh receiver, when the radio reports it: caps the RSSI-chosen rate
         // at what the modulation can actually demodulate. A loud-but-dirty link (contention) reads
         // as strong to RSSI alone, and this is the only input that sees it.
@@ -733,7 +734,8 @@ impl RadioPolicy {
         } else {
             // rho ≈ channel occupancy: at 100% busy the losses fully correlate and the
             // pool collapses to one effective receiver (`fec_pooling.rs` Part C).
-            let rho = f64::from(channel.and_then(|ch| view.busy_pct(radio, ch)).unwrap_or(0)) / 100.0;
+            let rho =
+                f64::from(channel.and_then(|ch| view.busy_pct(radio, ch)).unwrap_or(0)) / 100.0;
             1.0 + (n - 1.0) * (1.0 - rho.clamp(0.0, 1.0))
         };
         let mut eff = (f64::from(phy).powf(n_eff)) as f32;
@@ -854,7 +856,9 @@ mod power_dbm_tests {
         let p = RadioPolicy::default();
         let cap = RadioCapability::wifi_halow_s1g(vec![36]).with_tx_power_dbm(DbmRange::new(1, 27));
         // A very strong peer: lots of surplus margin to give back.
-        let dbm = p.decide_power_dbm(&cap, 0, Some(-30)).expect("surplus margin");
+        let dbm = p
+            .decide_power_dbm(&cap, 0, Some(-30))
+            .expect("surplus margin");
         assert!(dbm < 27, "must back off below the ceiling, got {dbm}");
         assert!(dbm >= 1, "must stay inside the advertised range, got {dbm}");
     }
@@ -1055,7 +1059,11 @@ mod tests {
             "1-chain neighbour must cap MCS at 7, got {:?}",
             single.mcs()
         );
-        assert_eq!(single.nss(), Some(1), "1-chain neighbour cannot decode 2 streams");
+        assert_eq!(
+            single.nss(),
+            Some(1),
+            "1-chain neighbour cannot decode 2 streams"
+        );
         // And the cap is what changed it: the full-capable neighbour is strictly more aggressive.
         assert!(
             full.mcs().unwrap() > single.mcs().unwrap() || full.nss() > single.nss(),
@@ -1109,7 +1117,14 @@ mod tests {
         };
         let parity = |pri: Priority, m: &MediumState| {
             RadioPolicy::default()
-                .decide(&NameContext { priority: pri, ..NameContext::new(0xAA) }, m, 1_000)
+                .decide(
+                    &NameContext {
+                        priority: pri,
+                        ..NameContext::new(0xAA)
+                    },
+                    m,
+                    1_000,
+                )
                 .allocations[0]
                 .params
                 .link_fec_redundancy
@@ -1131,7 +1146,12 @@ mod tests {
         // the pool collapses toward one receiver → more parity even for a Bulk name.
         let mut busy = base();
         for ch in [149u8, 161, 165] {
-            busy.observe_occupancy(ChannelOccupancy { radio: W, channel: ch, busy_pct: 100, ts_ms: 1_000 });
+            busy.observe_occupancy(ChannelOccupancy {
+                radio: W,
+                channel: ch,
+                busy_pct: 100,
+                ts_ms: 1_000,
+            });
         }
         let bulk_busy = parity(Priority::Bulk, &busy);
         assert!(
@@ -1203,24 +1223,50 @@ mod tests {
     #[test]
     fn rationale_captures_the_why_of_a_decision() {
         let mut m = wifi_only();
-        m.observe_occupancy(ChannelOccupancy { radio: W, channel: 149, busy_pct: 80, ts_ms: 1 });
-        m.observe_occupancy(ChannelOccupancy { radio: W, channel: 161, busy_pct: 10, ts_ms: 1 });
-        m.observe_occupancy(ChannelOccupancy { radio: W, channel: 165, busy_pct: 50, ts_ms: 1 });
+        m.observe_occupancy(ChannelOccupancy {
+            radio: W,
+            channel: 149,
+            busy_pct: 80,
+            ts_ms: 1,
+        });
+        m.observe_occupancy(ChannelOccupancy {
+            radio: W,
+            channel: 161,
+            busy_pct: 10,
+            ts_ms: 1,
+        });
+        m.observe_occupancy(ChannelOccupancy {
+            radio: W,
+            channel: 165,
+            busy_pct: 50,
+            ts_ms: 1,
+        });
 
         // Origin transmits: the rationale explains the plan — the picked channel and
         // the occupancy that picked it are both in the "why".
         let (plan, why) = RadioPolicy::default().decide_traced(&NameContext::new(0xAA), &m, 1_000);
         assert_eq!(why.suppress, None);
-        assert!(why.is_origin, "origin transmits regardless of receiver count");
+        assert!(
+            why.is_origin,
+            "origin transmits regardless of receiver count"
+        );
         assert!(!why.radios.is_empty());
         assert_eq!(why.radios.len(), plan.allocations.len());
         let r0 = why.radios[0];
         assert_eq!(r0.channel, Some(161), "chose least-busy");
-        assert_eq!(r0.channel_busy_pct, Some(10), "and the trace records why (10% busy)");
-        assert_eq!(r0.channel, plan.allocations[0].channel, "input matches the output");
+        assert_eq!(
+            r0.channel_busy_pct,
+            Some(10),
+            "and the trace records why (10% busy)"
+        );
+        assert_eq!(
+            r0.channel, plan.allocations[0].channel,
+            "input matches the output"
+        );
 
         // A relay with nothing to add is suppressed — and the trace says *why*.
-        let (plan, why) = RadioPolicy::default().decide_traced(&NameContext::relayed(0xBB), &m, 1_000);
+        let (plan, why) =
+            RadioPolicy::default().decide_traced(&NameContext::relayed(0xBB), &m, 1_000);
         assert!(plan.suppress);
         assert_eq!(why.suppress, Some(SuppressReason::RelayAddsNoRank));
     }

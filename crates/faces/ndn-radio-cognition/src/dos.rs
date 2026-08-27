@@ -33,7 +33,11 @@ pub type PerSourceRateLimiter = RateLimiter<[u8; 6]>;
 
 impl<K: Hash + Eq + Copy> RateLimiter<K> {
     pub fn new(capacity: f64, refill_per_ms: f64) -> Self {
-        Self { capacity: capacity.max(0.0), refill_per_ms: refill_per_ms.max(0.0), buckets: HashMap::new() }
+        Self {
+            capacity: capacity.max(0.0),
+            refill_per_ms: refill_per_ms.max(0.0),
+            buckets: HashMap::new(),
+        }
     }
 
     /// Refill by elapsed time and report whether a token is available — WITHOUT consuming it. Pair
@@ -109,7 +113,11 @@ impl DosGate {
     /// `groups` = the name-groups this node filters for (consumer subs ∪ produced ∪ routed prefixes).
     /// The per-source burst is small (one neighbour's fair share); the per-prefix aggregate is larger
     /// (it fronts for many legitimate sources) but still bounds a distributed flood.
-    pub fn new(groups: impl IntoIterator<Item = u64>, source_capacity: f64, source_refill_per_ms: f64) -> Self {
+    pub fn new(
+        groups: impl IntoIterator<Item = u64>,
+        source_capacity: f64,
+        source_refill_per_ms: f64,
+    ) -> Self {
         // Default per-prefix aggregate: 128× the per-source burst (many legit neighbours), same refill.
         let prefix_cap = (source_capacity * 128.0).max(source_capacity);
         Self {
@@ -133,7 +141,14 @@ impl DosGate {
     }
 
     /// Run a frame through the cascade.
-    pub fn admit(&mut self, kind: FrameKind, group: u64, name_hash: u64, src: [u8; 6], now_ms: u64) -> Verdict {
+    pub fn admit(
+        &mut self,
+        kind: FrameKind,
+        group: u64,
+        name_hash: u64,
+        src: [u8; 6],
+        now_ms: u64,
+    ) -> Verdict {
         // Stage 1 — the name-group filter (drops out-of-group floods before anything expensive).
         if !self.groups.contains(&group) {
             return Verdict::DroppedAtFilter;
@@ -153,7 +168,9 @@ impl DosGate {
             FrameKind::Interest => {
                 // Peek BOTH before consuming: a frame that fails one limit must not spend the other's
                 // token (else a nonce-rotating flood drains the per-prefix budget with rejected frames).
-                if self.per_source.has_token(src, now_ms) && self.per_prefix.has_token(group, now_ms) {
+                if self.per_source.has_token(src, now_ms)
+                    && self.per_prefix.has_token(group, now_ms)
+                {
                     self.per_source.consume(src);
                     self.per_prefix.consume(group);
                     Verdict::ReachesVerify
@@ -186,7 +203,10 @@ mod tests {
         let reached = (0..1000)
             .filter(|i| gate.admit(FrameKind::Data, OTHER, *i, SRC_A, 0) == Verdict::ReachesVerify)
             .count();
-        assert_eq!(reached, 0, "the name-group filter drops every out-of-group frame");
+        assert_eq!(
+            reached, 0,
+            "the name-group filter drops every out-of-group frame"
+        );
     }
 
     /// Stage 2: fake Data for names I never requested is dropped BEFORE verify (the key claim).
@@ -195,12 +215,18 @@ mod tests {
         let mut gate = DosGate::new([WANTED], 8.0, 0.0);
         // In-group but unsolicited: no PIT breadcrumb for any of these names.
         let verify = (0..1000)
-            .filter(|i| gate.admit(FrameKind::Data, WANTED, 0xdead_0000 + i, SRC_A, 0) == Verdict::ReachesVerify)
+            .filter(|i| {
+                gate.admit(FrameKind::Data, WANTED, 0xdead_0000 + i, SRC_A, 0)
+                    == Verdict::ReachesVerify
+            })
             .count();
         assert_eq!(verify, 0, "no outstanding Interest ⇒ no verify forced");
         // A solicited Data (I expressed the Interest) does pass.
         gate.expect(42);
-        assert_eq!(gate.admit(FrameKind::Data, WANTED, 42, SRC_A, 0), Verdict::ReachesVerify);
+        assert_eq!(
+            gate.admit(FrameKind::Data, WANTED, 42, SRC_A, 0),
+            Verdict::ReachesVerify
+        );
     }
 
     /// Stage 3: an Interest flood from ONE source is throttled to its bucket; the rest are dropped.
@@ -208,7 +234,9 @@ mod tests {
     fn interest_flood_rate_limited_per_source() {
         let mut gate = DosGate::new([WANTED], 8.0, 0.0); // burst 8, no refill (all at t=0)
         let admitted = (0..1000)
-            .filter(|i| gate.admit(FrameKind::Interest, WANTED, *i, SRC_A, 0) == Verdict::ReachesVerify)
+            .filter(|i| {
+                gate.admit(FrameKind::Interest, WANTED, *i, SRC_A, 0) == Verdict::ReachesVerify
+            })
             .count();
         assert_eq!(admitted, 8, "one source is bounded to its burst capacity");
     }
@@ -222,10 +250,15 @@ mod tests {
         for s in 0u8..10 {
             let src = [0x02, s, s, s, s, s];
             admitted += (0..100)
-                .filter(|i| gate.admit(FrameKind::Interest, WANTED, *i, src, 0) == Verdict::ReachesVerify)
+                .filter(|i| {
+                    gate.admit(FrameKind::Interest, WANTED, *i, src, 0) == Verdict::ReachesVerify
+                })
                 .count();
         }
-        assert_eq!(admitted, 40, "10 nonces × burst 4 = 40 — linear in the attacker's nonce count");
+        assert_eq!(
+            admitted, 40,
+            "10 nonces × burst 4 = 40 — linear in the attacker's nonce count"
+        );
         assert_eq!(gate.distinct_sources(), 10);
     }
 

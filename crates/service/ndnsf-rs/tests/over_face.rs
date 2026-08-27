@@ -13,10 +13,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use ndn_app::EngineBuilder;
 use ndn_engine::EngineConfig;
-use ndnsf_rs::{NdnsfCarrier, over_face};
 use ndn_packet::Name;
 use ndn_service_core::{Carrier, Dispatch, Invocation, OpId, ServiceError, ServiceId};
 use ndn_sync::{SvSyncConfig, SvsConfig};
+use ndnsf_rs::{NdnsfCarrier, over_face};
 use tokio_util::sync::CancellationToken;
 
 fn name(s: &str) -> Name {

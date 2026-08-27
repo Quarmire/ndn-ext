@@ -53,7 +53,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let role = args.get(1).cloned().unwrap_or_else(|| "ecap".into());
     let channel: u8 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(149);
     let secs: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(60);
-    let pid = u16::from_str_radix(&std::env::var("NDN_PID").unwrap_or_else(|_| "a81a".into()), 16)?;
+    let pid = u16::from_str_radix(
+        &std::env::var("NDN_PID").unwrap_or_else(|_| "a81a".into()),
+        16,
+    )?;
 
     /// Data(0x06)[ Name(0x07)[ comp(0x08)"p{i}", comp(0x08)"{seq}" ] ] — the exact shape `inner_name`
     /// + `ndn_name_to_slash` turn into `/p{i}/{seq}`, and small so the frame rate stays high.
@@ -101,25 +104,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let open = ndn_radio_drivers::open_named_radio(pid, channel)?;
     let cap = ndn_radio_cognition::RadioCapability::wifi_monitor_5ghz(vec![channel]);
-    let raw_rx: Option<Arc<dyn ndn_radio_hal::FrameIo>> =
-        if role == "ecap" { Some(open.io.clone()) } else { None };
+    let raw_rx: Option<Arc<dyn ndn_radio_hal::FrameIo>> = if role == "ecap" {
+        Some(open.io.clone())
+    } else {
+        None
+    };
     let medium = if role == "ecap" {
         None
     } else {
         Some(Arc::new(
             // TX-only bloom: each object's own prefix-set filter is packed per-frame. No RX gate,
             // no slot map (this is a filter experiment; the scheduler is deliberately out of frame).
-            RadioMediumFace::new(FaceId(1), vec![RadioBearer::from_open(RadioId(0), open, cap)])
-                .with_tx_bloom(OPEN_GROUP_KEY)
-                .build(),
+            RadioMediumFace::new(
+                FaceId(1),
+                vec![RadioBearer::from_open(RadioId(0), open, cap)],
+            )
+            .with_tx_bloom(OPEN_GROUP_KEY)
+            .build(),
         ))
     };
     let nonce_hex = |m: &ndn_face_monitor_wifi::RunningMedium| -> String {
-        m.source_nonce().map(|n| n.iter().map(|b| format!("{b:02x}")).collect()).unwrap_or_default()
+        m.source_nonce()
+            .map(|n| n.iter().map(|b| format!("{b:02x}")).collect())
+            .unwrap_or_default()
     };
     println!(
         "role={role} ch{channel} pid={pid:04x} {secs}s UNIV={UNIV} nonce={}",
-        medium.as_ref().map(|m| nonce_hex(m)).unwrap_or_else(|| "raw".into())
+        medium
+            .as_ref()
+            .map(|m| nonce_hex(m))
+            .unwrap_or_else(|| "raw".into())
     );
 
     if role == "esrc" {
@@ -147,9 +161,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     while Instant::now() < end {
         match tokio::time::timeout(Duration::from_millis(300), raw.recv_frame()).await {
             Ok(Ok(f)) => {
-                let Some((i, seq)) = parse_ours(&f.payload) else { continue };
+                let Some((i, seq)) = parse_ours(&f.payload) else {
+                    continue;
+                };
                 // Reassemble addr1‖addr2 → the on-air Tier-0 filter (group=addr1 hi, addr=addr2 lo).
-                let (Some(a1), Some(a2)) = (f.group, f.addr) else { continue };
+                let (Some(a1), Some(a2)) = (f.group, f.addr) else {
+                    continue;
+                };
                 let mut w = [0u8; 16];
                 w[..6].copy_from_slice(&a1);
                 w[6..12].copy_from_slice(&a2);
@@ -194,8 +212,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for &e in &E_VALUES {
         // Registered prefixes /p0 … /p{e-1} and the derived filters.
         let regs: Vec<String> = (0..e).map(|i| format!("/p{i}")).collect();
-        let masks: Vec<PrefixFilter> =
-            regs.iter().map(|p| PrefixFilter::mask_for(key, p.as_bytes())).collect();
+        let masks: Vec<PrefixFilter> = regs
+            .iter()
+            .map(|p| PrefixFilter::mask_for(key, p.as_bytes()))
+            .collect();
         let nic = NdnNicFilter::paper_default(key, &regs);
         let mut t1 = Tier1::new(key, TIER1_BITS, 4);
         for p in &regs {
@@ -213,10 +233,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let full = format!("/p{i}/{seq}");
             let frame = PrefixFilter::from_wire(*w);
             let admits = [
-                true,                                          // none
-                masks.iter().any(|m| frame.may_match(m)),      // tier0 (on-air bits)
-                nic.may_serve(full.as_bytes()),                // ndn-nic (receiver-side)
-                t1.lookup(full.as_bytes()).fib,                // tier1 (receiver-side)
+                true,                                     // none
+                masks.iter().any(|m| frame.may_match(m)), // tier0 (on-air bits)
+                nic.may_serve(full.as_bytes()),           // ndn-nic (receiver-side)
+                t1.lookup(full.as_bytes()).fib,           // tier1 (receiver-side)
             ];
             for (arm, &adm) in [&mut none, &mut tier0, &mut nic_c, &mut tier1_c]
                 .into_iter()
@@ -230,7 +250,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        rows.push(Row { e, none, tier0, nic: nic_c, tier1: tier1_c });
+        rows.push(Row {
+            e,
+            none,
+            tier0,
+            nic: nic_c,
+            tier1: tier1_c,
+        });
     }
 
     // ── Report ───────────────────────────────────────────────────────────────────────────────
@@ -255,7 +281,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         println!(
             "{:>4} {:>8} {:>22} {:>22} {:>22}",
-            r.e, neg, f(&r.tier0), f(&r.nic), f(&r.tier1)
+            r.e,
+            neg,
+            f(&r.tier0),
+            f(&r.nic),
+            f(&r.tier1)
         );
     }
 

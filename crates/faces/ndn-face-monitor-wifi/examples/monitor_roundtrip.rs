@@ -1,5 +1,5 @@
 //! Phase-1 witness: a real NDN Interest/Data round-trip over raw 802.11
-//! monitor-mode injection, through `MonitorWifiFace` + the engine's
+//! monitor-mode injection, through `WifiPhy` + the engine's
 //! `LpLinkService` (so NDNLPv2 fragmentation/reassembly runs over the air).
 //!
 //! One binary, three modes:
@@ -35,7 +35,7 @@ mod imp {
 
     use bytes::Bytes;
     use ndn_coding::{FecPolicy, segment_payload};
-    use ndn_face_monitor_wifi::{AfPacketBackend, FrameFormat, McsDescriptor, MonitorWifiFace};
+    use ndn_face_monitor_wifi::{AfPacketBackend, FrameFormat, McsDescriptor, WifiPhy};
     use ndn_packet::encode::{DataBuilder, encode_interest, ensure_nonce};
     use ndn_packet::fragment::ReassemblyBuffer;
     use ndn_packet::lp::extract_fragment;
@@ -236,40 +236,42 @@ mod imp {
             Arc::new(AfPacketBackend::new(&iface, FrameFormat::default())?)
         };
         #[cfg(feature = "libusb-backend")]
-        let backend: Arc<dyn ndn_frame_io::FrameIo> = if let Some(rest) =
-            iface.strip_prefix("8812au")
-        {
-            let ch: u8 = rest.strip_prefix(':').and_then(|s| s.parse().ok()).unwrap_or(6);
-            let b = ndn_face_monitor_wifi::Rtl8812auBackend::open()?
-                .with_format(FrameFormat::default());
-            eprintln!("bringing up RTL8812AU pid={:#06x} on ch{ch} …", b.pid());
-            b.power_on()?;
-            b.mac_enable_dma()?;
-            b.init_llt()?;
-            b.download_firmware()?;
-            b.mac_config()?;
-            b.mac_init_queues()?;
-            b.bb_config()?;
-            b.rf_config()?;
-            b.set_channel(ch)?;
-            b.iq_calibrate()?;
-            b.lc_calibrate()?;
-            b.set_tx_power(0x3f)?;
-            b.start_rx_dma()?; // last: calibration re-pauses RX DMA
-            let b = Arc::new(b);
-            // Keep a bulk-IN read ALWAYS in flight. Without this the 8812AU reads
-            // once per `recv_frame` call, so between calls — while the face parses,
-            // reassembles, and the app works — nothing is draining the dongle's RX
-            // FIFO and a back-to-back burst is simply lost. That hurts exactly in
-            // proportion to fragments per object, which is what the MTU sweep
-            // showed. Depth 1: one continuous reader, so no gap and no reordering
-            // (several threads on one endpoint would race and interleave).
-            b.spawn_rx_pump(1);
-            eprintln!("✓ 8812AU up on ch{ch}, RX pump running");
-            b
-        } else {
-            Arc::new(AfPacketBackend::new(&iface, FrameFormat::default())?)
-        };
+        let backend: Arc<dyn ndn_frame_io::FrameIo> =
+            if let Some(rest) = iface.strip_prefix("8812au") {
+                let ch: u8 = rest
+                    .strip_prefix(':')
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(6);
+                let b = ndn_face_monitor_wifi::Rtl8812auBackend::open()?
+                    .with_format(FrameFormat::default());
+                eprintln!("bringing up RTL8812AU pid={:#06x} on ch{ch} …", b.pid());
+                b.power_on()?;
+                b.mac_enable_dma()?;
+                b.init_llt()?;
+                b.download_firmware()?;
+                b.mac_config()?;
+                b.mac_init_queues()?;
+                b.bb_config()?;
+                b.rf_config()?;
+                b.set_channel(ch)?;
+                b.iq_calibrate()?;
+                b.lc_calibrate()?;
+                b.set_tx_power(0x3f)?;
+                b.start_rx_dma()?; // last: calibration re-pauses RX DMA
+                let b = Arc::new(b);
+                // Keep a bulk-IN read ALWAYS in flight. Without this the 8812AU reads
+                // once per `recv_frame` call, so between calls — while the face parses,
+                // reassembles, and the app works — nothing is draining the dongle's RX
+                // FIFO and a back-to-back burst is simply lost. That hurts exactly in
+                // proportion to fragments per object, which is what the MTU sweep
+                // showed. Depth 1: one continuous reader, so no gap and no reordering
+                // (several threads on one endpoint would race and interleave).
+                b.spawn_rx_pump(1);
+                eprintln!("✓ 8812AU up on ch{ch}, RX pump running");
+                b
+            } else {
+                Arc::new(AfPacketBackend::new(&iface, FrameFormat::default())?)
+            };
         let prefix_name = Name::from_str(&prefix)?;
 
         match mode.as_str() {
@@ -284,7 +286,7 @@ mod imp {
                 // sweeping that alone moves nothing and yields a flat curve that
                 // reads like "rate doesn't matter".
                 let mcs: Option<u8> = args.get(4).and_then(|s| s.parse().ok());
-                let mut f = MonitorWifiFace::new(FaceId(1), backend).with_mtu(mtu);
+                let mut f = WifiPhy::new(FaceId(1), backend).with_mtu(mtu);
                 if let Some(index) = mcs {
                     f = f.with_fixed_mcs(McsDescriptor {
                         index,
@@ -300,7 +302,8 @@ mod imp {
                 let prefix_len = prefix_name.components().len();
                 println!(
                     "responding under {prefix}/<size>/<seq> at MTU {mtu}, MCS {} on {iface} …",
-                    mcs.map(|m| m.to_string()).unwrap_or_else(|| "default".into())
+                    mcs.map(|m| m.to_string())
+                        .unwrap_or_else(|| "default".into())
                 );
                 loop {
                     let frame = face.link_service.recv(face.transport.as_ref()).await?;
@@ -338,9 +341,7 @@ mod imp {
                     .get(3)
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(ndn_face_monitor_wifi::MONITOR_MTU);
-                let face = MonitorWifiFace::new(FaceId(1), backend)
-                    .with_mtu(mtu)
-                    .into_face();
+                let face = WifiPhy::new(FaceId(1), backend).with_mtu(mtu).into_face();
                 let mut reasm = ReassemblyBuffer::new(Duration::from_secs(2));
                 let p = prefix_name.components().len();
                 println!("responding CODED under {prefix}/<size>/<gen>/<idx> on {iface} …");
@@ -394,7 +395,7 @@ mod imp {
                 let size: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(4000);
                 let count: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(20);
                 let mcs: u8 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(1);
-                let face = MonitorWifiFace::new(FaceId(2), backend)
+                let face = WifiPhy::new(FaceId(2), backend)
                     .with_fixed_mcs(McsDescriptor {
                         index: mcs,
                         short_gi: false,
@@ -429,7 +430,7 @@ mod imp {
                     .get(5)
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(ndn_face_monitor_wifi::MONITOR_MTU);
-                let face = MonitorWifiFace::new(FaceId(2), backend)
+                let face = WifiPhy::new(FaceId(2), backend)
                     .with_fixed_mcs(McsDescriptor {
                         index: mcs,
                         short_gi: false,
@@ -480,7 +481,7 @@ mod imp {
             "bench-coded" => {
                 let count: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(40);
                 let mcs: u8 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(1);
-                let face = MonitorWifiFace::new(FaceId(2), backend)
+                let face = WifiPhy::new(FaceId(2), backend)
                     .with_fixed_mcs(McsDescriptor {
                         index: mcs,
                         short_gi: false,

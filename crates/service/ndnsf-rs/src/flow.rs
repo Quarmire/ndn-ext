@@ -382,8 +382,7 @@ mod tests {
         // Station A consumes by proof hash — no plaintext token on the wire.
         assert!(!sel.provider_entries[0].provider_token_hash.is_empty());
         assert_ne!(
-            sel.provider_entries[0].provider_token_hash,
-            ack_a.provider_token,
+            sel.provider_entries[0].provider_token_hash, ack_a.provider_token,
             "the compact shape must not carry the plaintext token"
         );
         let (coord, _assignment) = a
@@ -412,12 +411,7 @@ mod tests {
         let node_a = name("/met/stationA");
         let req = make_request("r1", "utok", Bytes::new());
         let ack_a = a.on_request(0, requester.clone(), service.clone(), &req);
-        let sel = make_compact_selection(
-            &requester,
-            &service,
-            "r1",
-            &[(node_a.clone(), ack_a)],
-        );
+        let sel = make_compact_selection(&requester, &service, "r1", &[(node_a.clone(), ack_a)]);
         assert_eq!(
             a.consume_selection_compact(1, &sel, &name("/muas/mallory"), &node_a, &service)
                 .unwrap_err(),
@@ -437,11 +431,12 @@ mod tests {
 
         // Forged hash: well-formed entry, wrong digest.
         let mut sel = make_compact_selection(&requester, &service, "r1", &[]);
-        sel.provider_entries.push(crate::messages::SelectionProviderEntry {
-            provider_name: node_a.clone(),
-            provider_token_hash: "00".repeat(32),
-            assignment_payload: Bytes::new(),
-        });
+        sel.provider_entries
+            .push(crate::messages::SelectionProviderEntry {
+                provider_name: node_a.clone(),
+                provider_token_hash: "00".repeat(32),
+                assignment_payload: Bytes::new(),
+            });
         assert_eq!(
             a.consume_selection_compact(1, &sel, &requester, &node_a, &service)
                 .unwrap_err(),

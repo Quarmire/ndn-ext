@@ -269,10 +269,16 @@ mod tests {
     #[test]
     fn max_rx_mcs_round_trips() {
         let dec = decode_report(&encode_report(&sample())).unwrap();
-        assert_eq!(dec.max_rx_mcs, LEGACY_ONLY_RX, "legacy-only advert survives");
+        assert_eq!(
+            dec.max_rx_mcs, LEGACY_ONLY_RX,
+            "legacy-only advert survives"
+        );
         let mut hi = sample();
         hi.max_rx_mcs = FULL_RX_MCS;
-        assert_eq!(decode_report(&encode_report(&hi)).unwrap().max_rx_mcs, FULL_RX_MCS);
+        assert_eq!(
+            decode_report(&encode_report(&hi)).unwrap().max_rx_mcs,
+            FULL_RX_MCS
+        );
     }
 
     #[test]

@@ -110,7 +110,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let parsed = mode == "rxparsed";
     println!(
         "rx: counting distinct frames per (size, gap) for {secs}s via {} …",
-        if parsed { "poll_frame (PARSED)" } else { "rx_raw (RAW)" }
+        if parsed {
+            "poll_frame (PARSED)"
+        } else {
+            "rx_raw (RAW)"
+        }
     );
     let mut seen: BTreeMap<(usize, u64), std::collections::HashSet<u32>> = BTreeMap::new();
     let mut buf = vec![0u8; 16384];

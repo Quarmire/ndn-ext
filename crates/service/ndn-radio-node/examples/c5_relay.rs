@@ -2,8 +2,8 @@
 //!
 //! The step 2–5 work proved the C5 as a `FrameIo`/`RadioKnobs`/`RadioProfile`; this proves it as a
 //! *forwarder face*, exactly as `ar9271_relay` does for the AR9271. Its `OpenRadio` (io + knobs + time
-//! + dual-band profile) is wrapped in a [`MonitorWifiFace`] via `from_open` — so the discovered
-//! capability is the real dual-band one, not the placeholder `MonitorWifiFace::new` invents — composed
+//! + dual-band profile) is wrapped in a [`WifiPhy`] via `from_open` — so the discovered
+//! capability is the real dual-band one, not the placeholder `WifiPhy::new` invents — composed
 //! into an `EngineBuilder`, and a demo prefix routed out it. Interests expressed on the app face are
 //! FORWARDED BY THE ENGINE out the C5 and hit the air as real LP-framed NDN (ethertype 0x8624); the
 //! mt76 witness counts them, and the face's RX pump delivers received NDN back into the engine.
@@ -17,7 +17,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use ndn_engine::{EngineBuilder, EngineConfig};
 use ndn_face_local::InProcFace;
-use ndn_face_monitor_wifi::{Bandwidth, Esp32SerialBackend, FaceId, MonitorWifiFace, RadioKnobs, RadioProfile};
+use ndn_face_monitor_wifi::{
+    Bandwidth, Esp32SerialBackend, FaceId, RadioKnobs, RadioProfile, WifiPhy,
+};
 use ndn_packet::encode::InterestBuilder;
 use ndn_packet::{Data, Name, NameComponent};
 use ndn_transport::FaceId as TransportFaceId;
@@ -26,7 +28,10 @@ const APP_FACE_ID: TransportFaceId = TransportFaceId(10_000);
 const RADIO_FACE_ID: TransportFaceId = TransportFaceId(1);
 
 fn env_u64(k: &str, d: u64) -> u64 {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(d)
 }
 
 fn demo_prefix() -> Name {
@@ -47,13 +52,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let cap = radio.profile.as_ref().expect("C5 profile").capability();
     println!(
-        "C5 open on {port} ch{ch} — bands {:?}, channels {:?}; wrapping its FrameIo in a MonitorWifiFace (engine face {})",
+        "C5 open on {port} ch{ch} — bands {:?}, channels {:?}; wrapping its FrameIo in a WifiPhy (engine face {})",
         cap.bands, cap.channels, RADIO_FACE_ID.0
     );
 
     // Compose the engine: an in-proc app face + the C5 radio face (capability discovered from the profile).
     let (app_face, app_handle) = InProcFace::new(APP_FACE_ID, 64);
-    let radio_face = MonitorWifiFace::from_open(FaceId(RADIO_FACE_ID.0), radio, cap).into_face();
+    let radio_face = WifiPhy::from_open(FaceId(RADIO_FACE_ID.0), radio, cap).into_face();
     let builder = EngineBuilder::new(EngineConfig::default())
         .face(app_face)
         .face_composed(radio_face);
@@ -73,10 +78,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         app_handle
             .send(InterestBuilder::new(name).must_be_fresh().build())
             .await?;
-        if let Ok(Some(wire)) = tokio::time::timeout(Duration::from_millis(tick_ms), app_handle.recv()).await {
+        if let Ok(Some(wire)) =
+            tokio::time::timeout(Duration::from_millis(tick_ms), app_handle.recv()).await
+        {
             if let Ok(d) = Data::decode(wire) {
                 got += 1;
-                println!("  seq {seq}: Data over the C5 ({} B) ✓", d.content().map(|c| c.len()).unwrap_or(0));
+                println!(
+                    "  seq {seq}: Data over the C5 ({} B) ✓",
+                    d.content().map(|c| c.len()).unwrap_or(0)
+                );
             }
         }
     }

@@ -159,7 +159,12 @@ fn parse_wire(wire: &str) -> Option<ParsedWire<'_>> {
     if src.is_empty() || !(7..=12).contains(&sf) || parse_name(name).is_none() {
         return None;
     }
-    Some(ParsedWire { kind, src, sf, name })
+    Some(ParsedWire {
+        kind,
+        src,
+        sf,
+        name,
+    })
 }
 
 /// Opaque sense-bus key for a neighbor, derived from who actually transmitted.
@@ -284,7 +289,10 @@ impl Node {
         // SF/BW fixed so the only variables are contention + LBT (the RSSI-driven SF rendezvous can
         // otherwise diverge the two ends into mutual deafness, which is a separate rate-adaptation
         // concern, not what the LBT experiment is testing).
-        let sf = if let Some(psf) = std::env::var("NDN_LORA_SF").ok().and_then(|s| s.parse::<u8>().ok()) {
+        let sf = if let Some(psf) = std::env::var("NDN_LORA_SF")
+            .ok()
+            .and_then(|s| s.parse::<u8>().ok())
+        {
             Some(psf)
         } else {
             alloc.and_then(|a| a.params.spreading_factor()).map(|_| {
@@ -310,7 +318,11 @@ impl Node {
         let fec = std::env::var("NDN_LORA_FEC")
             .ok()
             .and_then(|s| s.parse::<u16>().ok())
-            .unwrap_or_else(|| alloc.and_then(|a| a.params.link_fec_redundancy).unwrap_or(0));
+            .unwrap_or_else(|| {
+                alloc
+                    .and_then(|a| a.params.link_fec_redundancy)
+                    .unwrap_or(0)
+            });
         // Power is set freely per-node (not a rendezvous parameter); bandwidth IS a rendezvous
         // parameter but the policy dials it only from shared inputs, so both peers reach the same one.
         let power = alloc.and_then(|a| a.params.tx_power_dbm);
@@ -412,14 +424,7 @@ impl Node {
         self.print_row(ctx, sf, cr, fec, &act);
     }
 
-    fn print_row(
-        &self,
-        ctx: &NameContext,
-        sf: Option<u8>,
-        cr: Option<u8>,
-        fec: u16,
-        act: &str,
-    ) {
+    fn print_row(&self, ctx: &NameContext, sf: Option<u8>, cr: Option<u8>, fec: u16, act: &str) {
         let now = self.now();
         let secs = now / 1000;
         let d = self.medium.demand(ctx.prefix_hash);
@@ -444,8 +449,16 @@ impl Node {
             .unwrap_or_else(|| "---".into());
         let duty = self.medium.duty_used(self.radio, now) * 100.0;
         // BW and TX power are cognition-driven too now — show the live actuated values.
-        let bw_s = if self.last_bw_khz > 0 { format!("BW{}", self.last_bw_khz) } else { "BW---".into() };
-        let pwr_s = if self.last_power_dbm > 0 { format!("{}dBm", self.last_power_dbm) } else { "--dBm".into() };
+        let bw_s = if self.last_bw_khz > 0 {
+            format!("BW{}", self.last_bw_khz)
+        } else {
+            "BW---".into()
+        };
+        let pwr_s = if self.last_power_dbm > 0 {
+            format!("{}dBm", self.last_power_dbm)
+        } else {
+            "--dBm".into()
+        };
         println!(
             "[{}] {secs:>3}s| {:<7?}| {rssi:>7} | fan={fanout} reI={reint:.2} PER={per:.2} | {sf_s} {cr_s} {bw_s} {pwr_s} FEC{fec} duty={duty:.2}% | {act}",
             self.name, ctx.priority,
@@ -517,7 +530,10 @@ impl Node {
                 let before = self.pending_replies.len();
                 self.pending_replies.retain(|r| r.name != name);
                 if self.pending_replies.len() < before {
-                    println!("[{}] ~~ suppressed reply {name} (overheard Data)", self.name);
+                    println!(
+                        "[{}] ~~ suppressed reply {name} (overheard Data)",
+                        self.name
+                    );
                 }
                 // Data we asked for came back: satisfy the in-record and score the round trip.
                 if node == self.peer {
@@ -550,7 +566,10 @@ impl Node {
         // #52: show the firmware's carrier-sense counters — cad_busy climbing with deferred near zero
         // means LBT is finding the channel and winning the backoff, not starving.
         if let Ok((cad_busy, deferred)) = self.dev.csma_counters() {
-            println!("[{}] csma: cad_busy={cad_busy} deferred={deferred}", self.name);
+            println!(
+                "[{}] csma: cad_busy={cad_busy} deferred={deferred}",
+                self.name
+            );
         }
 
         // Age out any class whose Interest has gone unanswered too long. Pure bookkeeping — no frame
@@ -577,12 +596,12 @@ impl Node {
         // wasting the slot on a class whose Interest is still fresh.
         let start = (self.tick_seq % CLASSES.len() as u64) as usize;
         self.tick_seq += 1;
-        let chosen = (0..CLASSES.len()).map(|i| CLASSES[(start + i) % CLASSES.len()]).find(
-            |(class, _)| match self.pending.get(class) {
+        let chosen = (0..CLASSES.len())
+            .map(|i| CLASSES[(start + i) % CLASSES.len()])
+            .find(|(class, _)| match self.pending.get(class) {
                 Some(p) => now.saturating_sub(p.expressed_ms) >= RETX_MS,
                 None => true,
-            },
-        );
+            });
 
         if let Some((class, priority)) = chosen {
             let ph = class_prefix(&self.peer, class);
@@ -668,10 +687,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // LBT is OFF for N=2 (measured counterproductive on a clean channel) and ON for the N≥3 contended
     // case — set NDN_LBT=1 to enable it (the #54 measurement: does carrier-sense help once a third node
     // makes the channel collision-limited?).
-    let lbt_on = std::env::var("NDN_LBT").map(|v| v == "1" || v == "true").unwrap_or(false);
+    let lbt_on = std::env::var("NDN_LBT")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
     dev.set_lbt(lbt_on);
-    println!("[{name}] open OK — cognition plane driving {path} (LBT {}), consuming from {peer}",
-        if lbt_on { "ON" } else { "off" });
+    println!(
+        "[{name}] open OK — cognition plane driving {path} (LBT {}), consuming from {peer}",
+        if lbt_on { "ON" } else { "off" }
+    );
 
     // Frequency is a rendezvous parameter (both ends must sit on the same carrier). Derive the link's
     // channel from the *pair identity* — name-keyed, task #40 in miniature — so both nodes compute the
@@ -679,11 +702,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // the cognition-chosen frequency; per-name/per-time FHSS (tasks #40/#41) is the scalable version.
     // NDN_LORA_CHANNEL pins every node to one carrier (the #54 N=3 measurement needs A, B and the
     // contender C on the SAME channel; the name-keyed default would scatter a 3rd node elsewhere).
-    let (lo, hi) = if name <= peer { (&name, &peer) } else { (&peer, &name) };
+    let (lo, hi) = if name <= peer {
+        (&name, &peer)
+    } else {
+        (&peer, &name)
+    };
     let link_ch = std::env::var("NDN_LORA_CHANNEL")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| 64 + (prefix_hash(&[b"lorach", lo.as_bytes(), hi.as_bytes()]) % 3) as u8);
+        .unwrap_or_else(|| {
+            64 + (prefix_hash(&[b"lorach", lo.as_bytes(), hi.as_bytes()]) % 3) as u8
+        });
     if let Err(e) = dev.set_channel(link_ch, Bandwidth::from_code(0)) {
         eprintln!("[{name}] set channel {link_ch} failed: {e}");
     }
@@ -835,17 +864,32 @@ mod tests {
     #[test]
     fn only_attributable_frames_are_accepted() {
         let w = parse_wire("I|B|9|ndn/lora-cog/A/alarm/7").expect("well-formed Interest");
-        assert_eq!((w.kind, w.src, w.sf, w.name), ("I", "B", 9, "ndn/lora-cog/A/alarm/7"));
+        assert_eq!(
+            (w.kind, w.src, w.sf, w.name),
+            ("I", "B", 9, "ndn/lora-cog/A/alarm/7")
+        );
         let d = parse_wire("D|A|12|ndn/lora-cog/A/bulk/2|payload-xxx").expect("well-formed Data");
         assert_eq!((d.kind, d.src, d.sf), ("D", "A", 12));
 
         // The frames that were silently polluting the peer's RSSI before.
-        assert!(parse_wire("LORA-BEACON seq=3").is_none(), "a beacon is not ours");
-        assert!(parse_wire("I|B|9|ndn/other-app/A/alarm/7").is_none(), "foreign name");
+        assert!(
+            parse_wire("LORA-BEACON seq=3").is_none(),
+            "a beacon is not ours"
+        );
+        assert!(
+            parse_wire("I|B|9|ndn/other-app/A/alarm/7").is_none(),
+            "foreign name"
+        );
         assert!(parse_wire("I|B").is_none(), "truncated");
         assert!(parse_wire("I|B|9").is_none(), "no name");
-        assert!(parse_wire("I|B|99|ndn/lora-cog/A/alarm/7").is_none(), "SF out of range");
-        assert!(parse_wire("I||9|ndn/lora-cog/A/alarm/7").is_none(), "no sender");
+        assert!(
+            parse_wire("I|B|99|ndn/lora-cog/A/alarm/7").is_none(),
+            "SF out of range"
+        );
+        assert!(
+            parse_wire("I||9|ndn/lora-cog/A/alarm/7").is_none(),
+            "no sender"
+        );
         // Distinct senders key distinct neighbors — the whole point of carrying `src`.
         assert_ne!(neighbor_key("A"), neighbor_key("B"));
     }
@@ -879,7 +923,11 @@ mod tests {
         for (p, d) in t.snapshot(0) {
             m.observe_demand(p, d);
         }
-        assert_eq!(m.demand(ph).map(|d| d.fanout), Some(1), "peer Interest = 1 in-record");
+        assert_eq!(
+            m.demand(ph).map(|d| d.fanout),
+            Some(1),
+            "peer Interest = 1 in-record"
+        );
 
         let policy = RadioPolicy::default();
         let mut urgent = NameContext::new(ph);
@@ -921,7 +969,10 @@ mod tests {
             .expect("lossy link buys some parity");
 
         // The peer re-asks before we satisfied it — a real delivery miss.
-        assert!(t.on_interest(ph, PEER_FACE, 1_000), "re-expression is detected");
+        assert!(
+            t.on_interest(ph, PEER_FACE, 1_000),
+            "re-expression is detected"
+        );
         t.on_interest(ph, PEER_FACE, 2_000);
         for (p, d) in t.snapshot(2_000) {
             m.observe_demand(p, d);
@@ -931,7 +982,10 @@ mod tests {
             .allocation_for(R)
             .and_then(|a| a.params.link_fec_redundancy)
             .expect("still lossy");
-        assert!(fec1 > fec0, "re-Interest must raise redundancy: {fec1} > {fec0}");
+        assert!(
+            fec1 > fec0,
+            "re-Interest must raise redundancy: {fec1} > {fec0}"
+        );
     }
 
     /// Satisfying the demand retires it: with no in-record left, a relay has no rank to add.
@@ -946,7 +1000,10 @@ mod tests {
         }
         let policy = RadioPolicy::default();
         let ctx = NameContext::relayed(ph);
-        assert!(!policy.decide(&ctx, &m, 0).suppress, "live demand → transmit");
+        assert!(
+            !policy.decide(&ctx, &m, 0).suppress,
+            "live demand → transmit"
+        );
 
         t.on_data(ph, 1_000); // Data came back; the in-records clear
         for (p, d) in t.snapshot(1_000) {

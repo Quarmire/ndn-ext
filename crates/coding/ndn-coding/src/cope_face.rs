@@ -15,10 +15,10 @@
 //! [`report`](CopeBroadcastLink::report) / passive overhearing on receive; a
 //! real deployment broadcasts periodic reports — also a seam.
 
+use portable_atomic::AtomicU64;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use portable_atomic::AtomicU64;
 
 use bytes::Bytes;
 use tokio::sync::Mutex;

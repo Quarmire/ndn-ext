@@ -9,10 +9,11 @@
 //!   pid_hex pins a specific 8812-class dongle when several are attached (e.g. `a81a`).
 use ndn_frame_io::{FrameFormat, FrameIo};
 use ndn_radio_drivers::{
-    FreqAction, FreqDiscipline, LibUsbRtl88xxBackend, PowerTracker, Rtl8733buBackend, Rtl8812auBackend,
+    FreqAction, FreqDiscipline, LibUsbRtl88xxBackend, PowerTracker, Rtl8733buBackend,
+    Rtl8812auBackend,
 };
-use ndn_time_driver::ClockSteer;
 use ndn_time::{ClockCapability, KeyId, TimePolicy};
+use ndn_time_driver::ClockSteer;
 use ndn_time_driver::wifi::FrameIoTransport;
 use ndn_time_driver::{ClockSink, DevAuth, TimeService};
 use ndn_time_sources::OsClock;
@@ -47,14 +48,25 @@ impl ClockSteer for RadioSteer {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let id: u64 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let id: u64 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     let chip: String = std::env::args().nth(2).unwrap_or_else(|| "8812".into());
-    let ch: u8 = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(36);
-    let secs: u64 = std::env::args().nth(4).and_then(|s| s.parse().ok()).unwrap_or(20);
+    let ch: u8 = std::env::args()
+        .nth(3)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(36);
+    let secs: u64 = std::env::args()
+        .nth(4)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
     let pid: Option<u16> = std::env::args()
         .nth(5)
         .and_then(|s| u16::from_str_radix(&s, 16).ok());
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
     rt.block_on(async move {
         // Open + bring up the radio, then pipeline RX with the shared async-URB pump (depth 4) so a
         // busy channel isn't dropped between reads. The 8733b brings up a *radiating* TX with
@@ -75,15 +87,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!(
                 "named-time node {id} up: 8733b ch{ch} (radiating TX), RX pump depth 4, \
                  clock steering {}",
-                if steerer.is_some() { "ENABLED" } else { "unavailable" }
+                if steerer.is_some() {
+                    "ENABLED"
+                } else {
+                    "unavailable"
+                }
             );
             r
         } else if chip == "8812au" {
             // RTL8812AU — full-IQK great TX/RX. Route it through RawNdn framing (its default is
             // NAN/Raw80211) + legacy 6M inject, so it interops with the 8733b/8812EU beacons.
             let r = Arc::new(
-                Rtl8812auBackend::open()?
-                    .with_format(FrameFormat::RawNdn { ethertype: 0x8624 }),
+                Rtl8812auBackend::open()?.with_format(FrameFormat::RawNdn { ethertype: 0x8624 }),
             );
             r.bring_up_monitor(ch)?;
             r.spawn_rx_pump(4);
@@ -98,7 +113,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // receiver (the 8733b, no HT/VHT demod) can decode us. Default HT/VHT would be deaf to it.
             r.set_fixed_desc_rate(Some(0x04));
             r.spawn_rx_pump(4);
-            println!("named-time node {id} up: 8812-class ch{ch} (legacy 6M beacons), RX pump depth 4");
+            println!(
+                "named-time node {id} up: 8812-class ch{ch} (legacy 6M beacons), RX pump depth 4"
+            );
             r
         };
 
@@ -123,7 +140,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Attach the hardware frequency steerer when the radio has one. Without it the loop still
         // corrects the wall estimate — the software-only path — so a node with no trim is unchanged.
         let svc = match steerer {
-            Some(st) => Arc::new(Arc::try_unwrap(svc).ok().expect("sole owner").with_clock_steer(st)),
+            Some(st) => Arc::new(
+                Arc::try_unwrap(svc)
+                    .ok()
+                    .expect("sole owner")
+                    .with_clock_steer(st),
+            ),
             None => svc,
         };
         // Run the live loop (RX-ingest task + cadence tick/beacon) and report status each second:

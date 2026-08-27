@@ -5,9 +5,9 @@
 //! phys, and the reach policy chooses which phy(s) carry each packet.
 //!
 //! ```text
-//!   WL_WIFI  ─→ SerialRadioBackend ─→ MonitorWifiFace ─┐
+//!   WL_WIFI  ─→ SerialRadioBackend ─→ WifiPhy ─┐
 //!                                                       ├─→ Radio ─→ ForwarderEngine (+ strategy)
-//!   WL_LORA  ─→ LoraSerialBackend  ─→ LoraFace ────────┘
+//!   WL_LORA  ─→ LoraSerialBackend  ─→ LoraPhy ────────┘
 //! ```
 //!
 //! Every board here speaks the same host contract as the C5 (the `[4E 44 …]` ND wire protocol for Wi-Fi,
@@ -33,8 +33,8 @@ use std::time::Duration;
 
 use ndn_app::{EngineAppExt, EngineBuilder};
 use ndn_engine::builder::EngineConfig;
-use ndn_face_lora::LoraFace;
-use ndn_face_monitor_wifi::MonitorWifiFace;
+use ndn_face_lora::LoraPhy;
+use ndn_face_monitor_wifi::WifiPhy;
 use ndn_face_wireless::{
     BroadcastAllPhys, NameReachClassifier, PhyKind, Radio, ReachClass, TransportPhy, WirelessPhy,
 };
@@ -65,7 +65,7 @@ fn build_wireless(prefix: &Name) -> Result<Radio, Box<dyn std::error::Error>> {
             eprintln!("  ! WL_WIFI set_channel({ch}) failed: {e} (continuing on firmware default)");
         }
         let io: Arc<dyn FrameIo> = be;
-        let face = MonitorWifiFace::new(FaceId(1), io);
+        let face = WifiPhy::new(FaceId(1), io);
         // 802.11 airtime-optimal ceiling ~2272 B; range_rank 1 (shortest of the three phys).
         phys.push(Arc::new(
             TransportPhy::new(face, PhyKind::Wifi, 1).with_mtu(2272),
@@ -82,7 +82,7 @@ fn build_wireless(prefix: &Name) -> Result<Radio, Box<dyn std::error::Error>> {
         let ch: u8 = env_or("WL_CHANNEL", "6").parse().unwrap_or(6);
         let radio = ndn_radio_drivers::open_named_radio(pid, ch)?;
         let io = radio.io();
-        let face = MonitorWifiFace::new(FaceId(3), io);
+        let face = WifiPhy::new(FaceId(3), io);
         phys.push(Arc::new(
             TransportPhy::new(face, PhyKind::Wifi, 1).with_mtu(2272),
         ));
@@ -93,7 +93,7 @@ fn build_wireless(prefix: &Name) -> Result<Radio, Box<dyn std::error::Error>> {
     if let Ok(port) = env::var("WL_LORA") {
         let be = Arc::new(LoraSerialBackend::open(&port)?);
         let io: Arc<dyn FrameIo> = be;
-        let face = LoraFace::new(FaceId(2), io);
+        let face = LoraPhy::new(FaceId(2), io);
         // One LoRa frame is the MTU (LpLinkService fragments above this); range_rank 5 = longest reach.
         phys.push(Arc::new(
             TransportPhy::new(face, PhyKind::LoRa, 5).with_mtu(MAX_LORA_PAYLOAD),

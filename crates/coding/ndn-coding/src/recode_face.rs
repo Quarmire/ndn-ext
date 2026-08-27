@@ -15,10 +15,10 @@
 //! ([`verify_delegated_recoder`], doctrine §3b) — full cert-chain validation
 //! to the trust anchor remains the engine validator's job.
 
+use portable_atomic::AtomicU64;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use portable_atomic::AtomicU64;
 
 use bytes::Bytes;
 use tokio::sync::{Mutex, mpsc};

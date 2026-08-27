@@ -43,9 +43,10 @@ pub async fn over_face(
 ) -> SvsPubSub {
     // SVS is a broadcast protocol: every member must see each Sync Interest, so the
     // group prefix forwards on all nexthops but the incoming one (multicast).
-    engine
-        .strategy_table()
-        .insert(&group, Arc::new(MulticastStrategy::new()) as Arc<dyn ErasedStrategy>);
+    engine.strategy_table().insert(
+        &group,
+        Arc::new(MulticastStrategy::new()) as Arc<dyn ErasedStrategy>,
+    );
 
     let (net_out_tx, mut net_out_rx) = mpsc::channel::<Bytes>(BIND_BUFFER);
     let (net_in_tx, net_in_rx) = mpsc::channel::<Bytes>(BIND_BUFFER);

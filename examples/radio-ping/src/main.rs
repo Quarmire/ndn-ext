@@ -22,7 +22,7 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use ndn_app::{EngineAppExt, EngineBuilder};
 use ndn_engine::SignalView; // read radio RSSI/rate from the engine's signal store
-use ndn_face_monitor_wifi::{FaceId, FrameIo, McsDescriptor, MonitorWifiFace};
+use ndn_face_monitor_wifi::{FaceId, FrameIo, McsDescriptor, WifiPhy};
 use ndn_packet::Name;
 use ndn_security::SecurityProfile;
 use tokio_util::sync::CancellationToken;
@@ -46,7 +46,7 @@ async fn main() -> Result<()> {
     // — adaptive climbing OFF MCS1 would break the link until TX power is raised
     // (per-device EFUSE power-by-rate). RADIO_PING_ADAPTIVE=1 forces the
     // RSSI-driven picker; RADIO_PING_MCS=<n> pins a fixed MCS.
-    let face = MonitorWifiFace::new(RADIO_FACE, backend);
+    let face = WifiPhy::new(RADIO_FACE, backend);
     let face = if std::env::var("RADIO_PING_ADAPTIVE").is_ok() {
         println!("rate: ADAPTIVE (RSSI-driven MCS)");
         face.with_adaptive_mcs()
@@ -157,7 +157,7 @@ async fn main() -> Result<()> {
 /// Build the radio backend from `--libusb <chan>` (userspace driver, needs the
 /// `libusb` feature) or `--afpacket <iface>` (Linux kernel monitor driver).
 ///
-/// Returns a [`WifiRadio`] (not a bare `FrameIo`): `MonitorWifiFace` injects at
+/// Returns a [`WifiRadio`] (not a bare `FrameIo`): `WifiPhy` injects at
 /// an exact resolved 802.11 rate, which rides the `WifiRadio` trait — the
 /// generic `FrameIo` seam no longer names an MCS.
 fn build_backend(args: &[String]) -> Result<Arc<dyn FrameIo>> {

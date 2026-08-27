@@ -2,12 +2,12 @@
 //! named-radio bearer** instead of an in-process link. Two engines sit on a
 //! shared `LoopbackMonitorBus` (the hardware-free stand-in for the air; the real
 //! deployment swaps in `AfPacketBackend` over a monitor-mode interface), each
-//! with a `MonitorWifiFace`. The SEEK→JOIN→CHECK handshake and the
+//! with a `WifiPhy`. The SEEK→JOIN→CHECK handshake and the
 //! encrypt-then-code bulk cross the air — fragmented by `LpLinkService` and
 //! reassembled — proving the protocol works on the actual radio face.
 //!
 //! ```text
-//!  consumer-app─[engine A]─[MonitorWifiFace]∿∿ air ∿∿[MonitorWifiFace]─[engine B]─producer-app
+//!  consumer-app─[engine A]─[WifiPhy]∿∿ air ∿∿[WifiPhy]─[engine B]─producer-app
 //! ```
 
 use std::sync::Arc;
@@ -16,7 +16,7 @@ use ndn_app::{Consumer, EngineBuilder, Producer};
 use ndn_coding::FecPolicy;
 use ndn_engine::EngineConfig;
 use ndn_face::local::InProcFace;
-use ndn_face_monitor_wifi::{LoopbackMonitorBus, MonitorWifiFace, OPEN_GROUP_KEY};
+use ndn_face_monitor_wifi::{LoopbackMonitorBus, OPEN_GROUP_KEY, WifiPhy};
 use ndn_packet::Name;
 use ndn_transport::FaceId;
 
@@ -36,7 +36,7 @@ async fn run(name_group: Option<&'static str>, skip: &'static [u16]) -> (Vec<u8>
     // The shared medium and two radios on it (strong RSSI = high MCS).
     let bus = LoopbackMonitorBus::new();
     let mk = |id: u64, fid: FaceId| {
-        let f = MonitorWifiFace::new(fid, Arc::new(bus.endpoint(id, -55)));
+        let f = WifiPhy::new(fid, Arc::new(bus.endpoint(id, -55)));
         match name_group {
             // Tier-0 (#91): the radio registers the namespace prefix; the producer addresses each
             // object by its name's prefix-set filter, so names under the namespace are heard and

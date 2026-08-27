@@ -55,7 +55,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         use ndn_face_monitor_wifi::Rtl8812auBackend;
         let b = Rtl8812auBackend::open()?;
-        println!("[{node}] radio: RTL8812AU pid={:#06x} — bringing up", b.pid());
+        println!(
+            "[{node}] radio: RTL8812AU pid={:#06x} — bringing up",
+            b.pid()
+        );
         b.power_on()?;
         b.mac_enable_dma()?;
         b.init_llt()?;
@@ -140,7 +143,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let msg = format!("hello-from-{node}-{i}");
         let _ = link.socket.send_to(msg.as_bytes(), link.peer_addr).await;
         let mut buf = [0u8; 256];
-        match tokio::time::timeout(Duration::from_millis(700), link.socket.recv_from(&mut buf)).await
+        match tokio::time::timeout(Duration::from_millis(700), link.socket.recv_from(&mut buf))
+            .await
         {
             Ok(Ok((n, from))) => {
                 got += 1;
@@ -172,13 +176,18 @@ async fn measure_link(
 
     println!("[{node}] measuring {} for 30s …", mac(&peer_nmi));
     let start = Instant::now();
-    let (mut heard, mut rssi_sum, mut rssi_n, mut worst, mut best) = (0u32, 0i32, 0u32, 0i8, -128i8);
+    let (mut heard, mut rssi_sum, mut rssi_n, mut worst, mut best) =
+        (0u32, 0i32, 0u32, 0i8, -128i8);
     let mut window = Instant::now();
     let mut in_window = 0u32;
 
     while start.elapsed() < Duration::from_secs(30) {
-        let Ok(cf) = radio.recv_frame().await else { break };
-        let Ok(f) = classify(&cf.payload) else { continue };
+        let Ok(cf) = radio.recv_frame().await else {
+            break;
+        };
+        let Ok(f) = classify(&cf.payload) else {
+            continue;
+        };
         if f.header.addr2 != peer_nmi {
             continue;
         }
@@ -195,7 +204,11 @@ async fn measure_link(
             }
         }
         if window.elapsed() >= Duration::from_secs(6) {
-            let avg = if rssi_n > 0 { rssi_sum / rssi_n as i32 } else { 0 };
+            let avg = if rssi_n > 0 {
+                rssi_sum / rssi_n as i32
+            } else {
+                0
+            };
             println!(
                 "[{node}] 6s window: {in_window} frames from peer (expect ~11 beacons) | \
                  rssi avg {avg} best {best} worst {worst} dBm"
@@ -204,7 +217,11 @@ async fn measure_link(
             in_window = 0;
         }
     }
-    let avg = if rssi_n > 0 { rssi_sum / rssi_n as i32 } else { 0 };
+    let avg = if rssi_n > 0 {
+        rssi_sum / rssi_n as i32
+    } else {
+        0
+    };
     println!(
         "[{node}] TOTAL: {heard} frames from the peer in 30s (expect ~57) | rssi avg {avg} dBm"
     );

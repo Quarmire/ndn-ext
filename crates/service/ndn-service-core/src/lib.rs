@@ -417,8 +417,8 @@ pub mod framing {
         for _ in 0..count {
             let key = read_field(bytes, &mut pos)?;
             let value = read_field(bytes, &mut pos)?;
-            let key = String::from_utf8(key.to_vec())
-                .map_err(|e| ServiceError::Decode(e.to_string()))?;
+            let key =
+                String::from_utf8(key.to_vec()).map_err(|e| ServiceError::Decode(e.to_string()))?;
             metadata.insert(key, Bytes::copy_from_slice(value));
         }
         Ok((metadata, Bytes::copy_from_slice(&bytes[pos..])))

@@ -37,7 +37,9 @@ fn report(name: &str, verifies: u64, victim_cost: u64) {
 
 fn main() {
     println!("DoS validation — {FRAMES} attacker frames through the §3.2 cascade\n");
-    println!("  attack                              verifies   victim cost   no-defense   reduction");
+    println!(
+        "  attack                              verifies   victim cost   no-defense   reduction"
+    );
 
     // 1. Out-of-group flood: frames for a group the victim never registered.
     {
@@ -58,7 +60,13 @@ fn main() {
         let mut gate = DosGate::new([WANTED], 8.0, 0.0);
         let (mut verifies, mut c) = (0u64, 0u64);
         for i in 0..FRAMES {
-            let v = gate.admit(FrameKind::Data, WANTED, 0xdead_0000 + i, [0x02, 1, 1, 1, 1, 1], 0);
+            let v = gate.admit(
+                FrameKind::Data,
+                WANTED,
+                0xdead_0000 + i,
+                [0x02, 1, 1, 1, 1, 1],
+                0,
+            );
             c += cost(v);
             if v == Verdict::ReachesVerify {
                 verifies += 1;
@@ -101,10 +109,20 @@ fn main() {
         );
     }
 
-    println!("\nTakeaway: the two floods that try to force verify (out-of-group, fake-Data) reach it ZERO");
-    println!("times — dropped at the filter / PIT gate before the expensive op. Interest flooding is the");
-    println!("residual, and the PAIRED limits hold it: per-source (nonce) stops one flooder, per-prefix");
-    println!("(aggregate) stops a distributed one that rotates nonces — so even 12.5k nonces are bounded");
-    println!("to the prefix budget, not 100k verifies. Keeping MACs would not help — MAC filters are");
+    println!(
+        "\nTakeaway: the two floods that try to force verify (out-of-group, fake-Data) reach it ZERO"
+    );
+    println!(
+        "times — dropped at the filter / PIT gate before the expensive op. Interest flooding is the"
+    );
+    println!(
+        "residual, and the PAIRED limits hold it: per-source (nonce) stops one flooder, per-prefix"
+    );
+    println!(
+        "(aggregate) stops a distributed one that rotates nonces — so even 12.5k nonces are bounded"
+    );
+    println!(
+        "to the prefix budget, not 100k verifies. Keeping MACs would not help — MAC filters are"
+    );
     println!("spoofable and broadcast bypasses them (doctrine §3.2).");
 }

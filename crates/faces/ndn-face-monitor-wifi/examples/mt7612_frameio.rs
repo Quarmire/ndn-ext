@@ -15,8 +15,8 @@
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use bytes::Bytes;
     use ndn_face_monitor_wifi::{
-        FaceId, FrameIo, InjectFrame, McsDescriptor, MonitorWifiFace, Mt7612uBackend, TxIntent,
-        };
+        FaceId, FrameIo, InjectFrame, McsDescriptor, Mt7612uBackend, TxIntent, WifiPhy,
+    };
     use std::sync::Arc;
     use std::time::Instant;
 
@@ -33,7 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The actual NDN face: wrap the backend, set the verified large MTU so the
     // LpLinkService fragments NDN packets into ~5650 B frames (not 2296 B). This
     // `Face` plugs into a forwarder; here we just build it to show the wiring.
-    let _face = MonitorWifiFace::new(FaceId(1), dev.clone())
+    let _face = WifiPhy::new(FaceId(1), dev.clone())
         .with_mtu(Mt7612uBackend::MAX_MPDU_PAYLOAD)
         .into_face();
 

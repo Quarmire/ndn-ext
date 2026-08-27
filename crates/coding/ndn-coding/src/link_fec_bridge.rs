@@ -66,7 +66,12 @@ pub struct FrameIoSink<R: FrameIo> {
 
 impl<R: FrameIo> FrameIoSink<R> {
     pub fn new(radio: R, dst: [u8; 6], src: [u8; 6], intent: TxIntent) -> Self {
-        Self { radio, dst, src, intent }
+        Self {
+            radio,
+            dst,
+            src,
+            intent,
+        }
     }
 }
 
@@ -77,7 +82,13 @@ impl<R: FrameIo + Send + Sync + 'static> GenerationSink for FrameIoSink<R> {
         for f in coded {
             let _ = self
                 .radio
-                .inject(InjectFrame { payload: f, tx: self.intent, dst: self.dst, src: self.src, addr3: None })
+                .inject(InjectFrame {
+                    payload: f,
+                    tx: self.intent,
+                    dst: self.dst,
+                    src: self.src,
+                    addr3: None,
+                })
                 .await;
         }
     }
@@ -151,7 +162,9 @@ impl<P: Send + 'static> LinkFecBridge<P> {
     /// parity `redundancy` (`None` leaves R unchanged). The batching task groups it
     /// into a generation and emits K+R coded frames via the sink.
     pub fn send(&self, frame: Bytes, pin: P, redundancy: Option<u16>) -> Result<(), FaceError> {
-        self.tx.send((frame, pin, redundancy)).map_err(|_| FaceError::Closed)
+        self.tx
+            .send((frame, pin, redundancy))
+            .map_err(|_| FaceError::Closed)
     }
 
     /// Feed one captured frame to the decoder; returns recovered source frames (0
@@ -202,7 +215,11 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
         let gens = rec.0.lock().unwrap().clone();
         assert_eq!(frame_total(&gens), 7, "K=3 + plan R=4 = 7 frames on air");
-        assert_eq!(bridge.redundancy(), 4, "R was actuated, not left at the constructed 0");
+        assert_eq!(
+            bridge.redundancy(),
+            4,
+            "R was actuated, not left at the constructed 0"
+        );
     }
 
     #[tokio::test]

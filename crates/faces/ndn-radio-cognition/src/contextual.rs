@@ -189,7 +189,12 @@ impl ContextualBandit {
         let arms = match self.stats.get(&ctx.key()) {
             Some(a) => a,
             None => {
-                return ArmChoice { arm: 0, scores: [f32::INFINITY; ARMS.len()], cold_start: true, pulls: 0 };
+                return ArmChoice {
+                    arm: 0,
+                    scores: [f32::INFINITY; ARMS.len()],
+                    cold_start: true,
+                    pulls: 0,
+                };
             }
         };
         let total: u32 = arms.iter().map(|a| a.n).sum();
@@ -214,7 +219,12 @@ impl ContextualBandit {
                 arm = i;
             }
         }
-        ArmChoice { arm, scores, cold_start: cold, pulls: total }
+        ArmChoice {
+            arm,
+            scores,
+            cold_start: cold,
+            pulls: total,
+        }
     }
 
     /// Record a reward for `(ctx, arm)` (incremental mean).

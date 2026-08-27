@@ -116,7 +116,8 @@ impl NdnNicFilter {
     }
 
     fn contains(&self, prefix: &[u8]) -> bool {
-        self.positions(prefix).all(|pos| self.bits[pos / 8] & (1 << (pos % 8)) != 0)
+        self.positions(prefix)
+            .all(|pos| self.bits[pos / 8] & (1 << (pos % 8)) != 0)
     }
 
     /// **The query — requires the name, i.e. requires a parse.**
@@ -230,7 +231,11 @@ mod tests {
         let mut out = Vec::new();
         for c in 0..depth {
             out.push(b'/');
-            let v = if c == 0 { ns } else { seq.wrapping_add(c as u32 * 7) };
+            let v = if c == 0 {
+                ns
+            } else {
+                seq.wrapping_add(c as u32 * 7)
+            };
             for shift in [12, 8, 4, 0] {
                 let d = ((v >> shift) & 0xf) as u8;
                 out.push(if d < 10 { b'0' + d } else { b'a' + d - 10 });
@@ -252,23 +257,39 @@ mod tests {
     fn ab_tier0_versus_ndn_nic_baseline() {
         const FRAMES: u32 = 20_000;
         let reg = registered();
-        let masks: Vec<PrefixFilter> =
-            reg.iter().map(|p| PrefixFilter::mask_for(&KEY, p)).collect();
+        let masks: Vec<PrefixFilter> = reg
+            .iter()
+            .map(|p| PrefixFilter::mask_for(&KEY, p))
+            .collect();
         let bf = NdnNicFilter::paper_default(&KEY, &reg);
 
         let mut t0 = Score {
-            seen: 0, accepted: 0, wanted: 0, false_pos: 0, false_neg: 0,
-            wire_bytes_per_frame: 12, table_bytes: masks.len() * 12, needs_parse: false,
+            seen: 0,
+            accepted: 0,
+            wanted: 0,
+            false_pos: 0,
+            false_neg: 0,
+            wire_bytes_per_frame: 12,
+            table_bytes: masks.len() * 12,
+            needs_parse: false,
         };
         let mut nn = Score {
-            seen: 0, accepted: 0, wanted: 0, false_pos: 0, false_neg: 0,
-            wire_bytes_per_frame: 0, table_bytes: bf.table_bytes(), needs_parse: true,
+            seen: 0,
+            accepted: 0,
+            wanted: 0,
+            false_pos: 0,
+            false_neg: 0,
+            wire_bytes_per_frame: 0,
+            table_bytes: bf.table_bytes(),
+            needs_parse: true,
         };
 
         for seq in 0..FRAMES {
             let name = make_name(seq % NS, seq);
             // Ground truth: a real prefix match on the name.
-            let truth = reg.iter().any(|p| name.len() >= p.len() && &name[..p.len()] == &p[..]);
+            let truth = reg
+                .iter()
+                .any(|p| name.len() >= p.len() && &name[..p.len()] == &p[..]);
 
             // Tier-0: the frame carries the filter; the receiver never sees the name.
             let mut frame_bf = PrefixFilter::new();
@@ -290,7 +311,10 @@ mod tests {
             }
         }
 
-        let cmp = Comparison { tier0: t0, ndn_nic: nn };
+        let cmp = Comparison {
+            tier0: t0,
+            ndn_nic: nn,
+        };
         println!("\n#101 A/B — Tier-0 vs NDN-NIC BF-FIB\n{}", cmp.report());
 
         // The one hard invariant both designs must hold.
@@ -317,9 +341,15 @@ mod tests {
         const FRAMES: u32 = 8_000;
         println!("\n#101 A/B at EQUAL receiver state (NDN-NIC table = 12 B x registered prefixes)");
         println!("  NOT comparable to the paper's 96.30% — see the module docs. Raw reject is NOT");
-        println!("  comparable ACROSS ROWS either: registering more prefixes means more traffic is");
-        println!("  genuinely wanted, so the ceiling falls. 'of max' is the filter-quality figure.");
-        println!("  E     state   wanted   max_rej   tier0 rej (of max) / FP     nic rej (of max) / FP");
+        println!(
+            "  comparable ACROSS ROWS either: registering more prefixes means more traffic is"
+        );
+        println!(
+            "  genuinely wanted, so the ceiling falls. 'of max' is the filter-quality figure."
+        );
+        println!(
+            "  E     state   wanted   max_rej   tier0 rej (of max) / FP     nic rej (of max) / FP"
+        );
         for e in [2usize, 8, 32, 128] {
             // E registered prefixes drawn from the same namespace the traffic uses.
             let reg: Vec<Vec<u8>> = (0..e)
@@ -333,15 +363,19 @@ mod tests {
                 })
                 .collect();
             let state = reg.len() * 12;
-            let masks: Vec<PrefixFilter> =
-                reg.iter().map(|p| PrefixFilter::mask_for(&KEY, p)).collect();
+            let masks: Vec<PrefixFilter> = reg
+                .iter()
+                .map(|p| PrefixFilter::mask_for(&KEY, p))
+                .collect();
             let bf = NdnNicFilter::new(&KEY, &reg, state, PAPER_K);
 
             let (mut t_acc, mut n_acc, mut want, mut t_fp, mut n_fp, mut t_fn, mut n_fn) =
                 (0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32);
             for seq in 0..FRAMES {
                 let name = make_name(seq % 256, seq);
-                let truth = reg.iter().any(|p| name.len() >= p.len() && &name[..p.len()] == &p[..]);
+                let truth = reg
+                    .iter()
+                    .any(|p| name.len() >= p.len() && &name[..p.len()] == &p[..]);
                 let mut fbf = PrefixFilter::new();
                 fbf.insert_name(&KEY, &name);
                 let ta = masks.iter().any(|m| fbf.may_match(m));
@@ -349,10 +383,18 @@ mod tests {
                 want += truth as u32;
                 t_acc += ta as u32;
                 n_acc += na as u32;
-                if ta && !truth { t_fp += 1 }
-                if na && !truth { n_fp += 1 }
-                if !ta && truth { t_fn += 1 }
-                if !na && truth { n_fn += 1 }
+                if ta && !truth {
+                    t_fp += 1
+                }
+                if na && !truth {
+                    n_fp += 1
+                }
+                if !ta && truth {
+                    t_fn += 1
+                }
+                if !na && truth {
+                    n_fn += 1
+                }
             }
             let irr = (FRAMES - want).max(1);
             // **The ceiling moves with E.** Registering more prefixes makes more of the traffic
@@ -394,8 +436,14 @@ mod tests {
                 }
             }
             let ppm = (fp as u64) * 1_000_000 / T as u64;
-            println!("  table {bytes:>6} B: popcount {:>6}  FP {ppm} ppm", bf.popcount());
-            assert!(ppm <= prev, "FP rose from {prev} to {ppm} ppm as the table grew");
+            println!(
+                "  table {bytes:>6} B: popcount {:>6}  FP {ppm} ppm",
+                bf.popcount()
+            );
+            assert!(
+                ppm <= prev,
+                "FP rose from {prev} to {ppm} ppm as the table grew"
+            );
             prev = ppm;
         }
     }

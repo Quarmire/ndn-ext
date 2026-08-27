@@ -30,7 +30,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or(d)
     };
 
-    let ch: u8 = std::env::var("NDN_CH").ok().and_then(|s| s.trim().parse().ok()).unwrap_or(6);
+    let ch: u8 = std::env::var("NDN_CH")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(6);
     let b = Rtl8812auBackend::open()?;
     println!("opened RTL8812AU pid={:#06x} role={mode}", b.pid());
     b.power_on()?;

@@ -9,12 +9,12 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use ndnsf_rs::NdnsfCarrier;
 use ndn_packet::Name;
 use ndn_rpc::RpcCarrier;
 use ndn_service_core::{Carrier, ServiceId, Strategy};
 use ndn_service_macro::{Frame, ndn_service};
 use ndn_sync::{SvSyncConfig, SvsConfig, SvsPubSub};
+use ndnsf_rs::NdnsfCarrier;
 use tokio::sync::mpsc;
 
 // --- The service definition: a parameterized request, a structured response. ---

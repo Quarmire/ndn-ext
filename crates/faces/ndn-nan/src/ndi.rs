@@ -357,8 +357,7 @@ mod linux {
 
         fn sysctl(&self, knob: &str, value: &str) -> Result<(), FaceError> {
             let path = format!("/proc/sys/net/ipv6/conf/{}/{knob}", self.name);
-            std::fs::write(&path, value)
-                .map_err(|e| err(format!("write {path} = {value}: {e}")))
+            std::fs::write(&path, value).map_err(|e| err(format!("write {path} = {value}: {e}")))
         }
 
         fn set_up(&self) -> Result<(), FaceError> {
@@ -407,7 +406,8 @@ mod linux {
 
         /// Read one Ethernet frame from the interface (blocking).
         pub fn read_frame(&self, buf: &mut [u8]) -> std::io::Result<usize> {
-            let n = unsafe { libc::read(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            let n =
+                unsafe { libc::read(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
             if n < 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -566,7 +566,10 @@ mod tests {
 
         // Same sequence, but NOT flagged as a retry: a distinct frame.
         let b = eth_to_dot11(&eth(OUR_NDI, PEER_NDI, b"two"), CLUSTER, 5).unwrap();
-        assert!(!f.is_duplicate(&b), "same seq without the retry bit is not a dup");
+        assert!(
+            !f.is_duplicate(&b),
+            "same seq without the retry bit is not a dup"
+        );
 
         // A new sequence is obviously fresh.
         let c = eth_to_dot11(&eth(OUR_NDI, PEER_NDI, b"three"), CLUSTER, 6).unwrap();
@@ -597,7 +600,9 @@ mod tests {
         let iid = ndn_nan_core::eui64_iid(OUR_NDI);
         assert_eq!(
             link_local_addr(iid),
-            "fe80::aa:aaff:fe00:1".parse::<std::net::Ipv6Addr>().unwrap()
+            "fe80::aa:aaff:fe00:1"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
         );
     }
 }

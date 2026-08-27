@@ -10,10 +10,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use ndnsf_rs::roles::{ServiceProvider, ServiceUser};
 use ndn_packet::Name;
 use ndn_security::KeyChain;
 use ndn_sync::{SvSyncConfig, SvsConfig, SvsPubSub};
+use ndnsf_rs::roles::{ServiceProvider, ServiceUser};
 use tokio::sync::mpsc;
 
 fn n(s: &str) -> Name {

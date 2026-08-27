@@ -548,12 +548,8 @@ impl EngineTask {
                 format!("bind {local} on the NDI: {e}"),
             ))
         })?;
-        let peer_addr = std::net::SocketAddrV6::new(
-            ndi::link_local_addr(peer_iid),
-            NDP_PORT,
-            0,
-            scope,
-        );
+        let peer_addr =
+            std::net::SocketAddrV6::new(ndi::link_local_addr(peer_iid), NDP_PORT, 0, scope);
         Ok(NdpLink {
             socket,
             peer_addr: peer_addr.into(),
@@ -882,11 +878,7 @@ mod tests {
             Config::new(NMI_A, 6, 200),
             None,
         );
-        let err = a
-            .request_ndp(NMI_B)
-            .await
-            .err()
-            .expect("no NDI → no link");
+        let err = a.request_ndp(NMI_B).await.err().expect("no NDI → no link");
         assert!(
             format!("{err}").contains("Data Interface"),
             "the error should say what is missing, got: {err}"

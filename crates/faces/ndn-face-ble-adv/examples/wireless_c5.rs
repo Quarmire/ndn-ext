@@ -1,6 +1,6 @@
 //! **The unified `Radio` on REAL hardware.** ONE ESP32-C5 exposes BOTH phys through the shared mux —
-//! raw 802.11 (Wi-Fi, a `MonitorWifiFace` over the `Esp32SerialBackend` `FrameIo`) and BLE 5 extended
-//! advertising (a `BleAdvFace` over the mux's `SharedBleBackend`) — and a `Radio` multiplexes them into
+//! raw 802.11 (Wi-Fi, a `WifiPhy` over the `Esp32SerialBackend` `FrameIo`) and BLE 5 extended
+//! advertising (a `BlePhy` over the mux's `SharedBleBackend`) — and a `Radio` multiplexes them into
 //! ONE face. Two C5s exchange a packet that goes out over **both radios at once** and is received + **deduped
 //! to one** by the peer: the one-wireless-face doctrine, on air, over two different PHYs from a single chip.
 //!
@@ -13,8 +13,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use ndn_face_ble_adv::{BleAdvFace, SharedBleBackend};
-use ndn_face_monitor_wifi::MonitorWifiFace;
+use ndn_face_ble_adv::{BlePhy, SharedBleBackend};
+use ndn_face_monitor_wifi::WifiPhy;
 use ndn_face_wireless::{PhyKind, Radio, TransportPhy, WirelessPhy};
 use ndn_radio_drivers::{Esp32SerialBackend, FrameIo};
 use ndn_transport::{FaceId, Transport};
@@ -25,8 +25,8 @@ fn build_wireless(port: &str) -> Result<Radio, Box<dyn std::error::Error>> {
     let ble_backend = Arc::new(SharedBleBackend::new(wifi.shared_mux()));
 
     let io: Arc<dyn FrameIo> = wifi.clone();
-    let wifi_face = MonitorWifiFace::new(FaceId(1), io); // Wi-Fi phy (802.11 injection/capture)
-    let ble_face = BleAdvFace::new(FaceId(2), ble_backend)
+    let wifi_face = WifiPhy::new(FaceId(1), io); // Wi-Fi phy (802.11 injection/capture)
+    let ble_face = BlePhy::new(FaceId(2), ble_backend)
         .ndnts_framing()
         .with_mtu(200); // BLE phy
 

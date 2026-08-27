@@ -1,4 +1,4 @@
-//! Wire the RTL8812EU userspace driver into a named-radio [`MonitorWifiFace`]
+//! Wire the RTL8812EU userspace driver into a named-radio [`WifiPhy`]
 //! and transmit NDN frames on 5 GHz monitor mode — no kernel driver.
 //!
 //! ```text
@@ -14,8 +14,8 @@
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use bytes::Bytes;
     use ndn_face_monitor_wifi::{
-        FaceId, FrameIo, InjectFrame, LibUsbRtl88xxBackend, McsDescriptor, MonitorWifiFace,
-        TxIntent, };
+        FaceId, FrameIo, InjectFrame, LibUsbRtl88xxBackend, McsDescriptor, TxIntent, WifiPhy,
+    };
     use std::sync::Arc;
 
     let channel: u8 = std::env::args()
@@ -123,10 +123,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build the named-radio face. Mount it on a ForwarderEngine with
     // `face.into_face()`; the LpLinkService then fragments/reassembles NDN
-    // packets across injected frames. `MonitorWifiFace::open_libusb(id, channel)`
+    // packets across injected frames. `WifiPhy::open_libusb(id, channel)`
     // collapses the two steps above into one when you don't need the backend
     // handle.
-    let _face = MonitorWifiFace::new(FaceId(1), backend.clone());
+    let _face = WifiPhy::new(FaceId(1), backend.clone());
 
     // Flood `count` frames of `psize` pattern bytes at fixed MCS `mcs_idx`.
     //   RADIO_VHT=1  inject 802.11ac (VHT) instead of 802.11n (HT)

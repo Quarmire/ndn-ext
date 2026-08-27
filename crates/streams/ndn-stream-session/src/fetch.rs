@@ -304,10 +304,17 @@ mod tests {
         assert_eq!(f.srtt_ms(), 175);
         // Time out seq 1 (rto = 175*4 = 700), then answer the retry — no sample.
         let acts = f.actions(701);
-        assert!(acts.contains(&FetchAction::Fetch { seq: 1, retry: true }));
+        assert!(acts.contains(&FetchAction::Fetch {
+            seq: 1,
+            retry: true
+        }));
         let before = f.srtt_ms();
         f.on_data(5000, 1);
-        assert_eq!(f.srtt_ms(), before, "Karn's rule: retried seq takes no sample");
+        assert_eq!(
+            f.srtt_ms(),
+            before,
+            "Karn's rule: retried seq takes no sample"
+        );
     }
 
     #[test]

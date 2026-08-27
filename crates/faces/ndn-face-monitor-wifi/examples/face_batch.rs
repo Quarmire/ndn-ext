@@ -1,4 +1,4 @@
-//! Face-level A-MSDU batching demo: drive `MonitorWifiFace::send_bytes` rapidly
+//! Face-level A-MSDU batching demo: drive `WifiPhy::send_bytes` rapidly
 //! with batching on, and the outbound frames coalesce into A-MSDU bursts (far
 //! fewer, larger on-air MPDUs). With batching off, each send is one MPDU.
 //!
@@ -7,7 +7,7 @@
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use bytes::Bytes;
-    use ndn_face_monitor_wifi::{LibUsbRtl88xxBackend, McsDescriptor, MonitorWifiFace};
+    use ndn_face_monitor_wifi::{LibUsbRtl88xxBackend, McsDescriptor, WifiPhy};
     use ndn_transport::{FaceId, Transport};
     use std::sync::Arc;
     use std::time::Duration;
@@ -21,7 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let backend = Arc::new(LibUsbRtl88xxBackend::open_monitor(ch)?);
     let off = std::env::var("BATCH_OFF").is_ok();
-    let mut face = MonitorWifiFace::new(FaceId(1), backend).with_fixed_mcs(McsDescriptor::ht(mcs));
+    let mut face = WifiPhy::new(FaceId(1), backend).with_fixed_mcs(McsDescriptor::ht(mcs));
     if !off {
         face = face.with_amsdu_batching(max_msdus, Duration::from_millis(5));
     }

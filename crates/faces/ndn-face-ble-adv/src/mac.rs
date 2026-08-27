@@ -4,7 +4,7 @@
 //! ESP32's controller, this drives the Mac's built-in Bluetooth as an [`AdvBackend`]. It **scans** for
 //! our connectionless named adverts — the manufacturer-specific AD with company id `0x4E44` ("ND") that
 //! every ND BLE firmware emits — and surfaces each as a [`ScannedFrame`], so a
-//! [`BleAdvFace`](crate::BleAdvFace) over it receives named data straight off Apple's BLE stack. The same
+//! [`BlePhy`](crate::BlePhy) over it receives named data straight off Apple's BLE stack. The same
 //! backend works on Windows (WinRT) and Linux (BlueZ) since `btleplug` is cross-platform; it is named
 //! `MacBleBackend` because the one-way limitation below is a macOS/CoreBluetooth property.
 //!
@@ -61,8 +61,13 @@ impl MacBleBackend {
     /// several radios); `None` picks the first. Starts a passive scan and spawns the reader task that
     /// turns company-`0x4E44` manufacturer-data adverts into [`ScannedFrame`]s.
     pub async fn open_adapter(select: Option<&str>) -> Result<Self, FaceError> {
-        let manager = Manager::new().await.map_err(|e| io_err(format!("ble manager: {e}")))?;
-        let adapters = manager.adapters().await.map_err(|e| io_err(format!("ble adapters: {e}")))?;
+        let manager = Manager::new()
+            .await
+            .map_err(|e| io_err(format!("ble manager: {e}")))?;
+        let adapters = manager
+            .adapters()
+            .await
+            .map_err(|e| io_err(format!("ble adapters: {e}")))?;
         let adapter = match select {
             Some(want) => {
                 let mut chosen = None;
@@ -74,7 +79,10 @@ impl MacBleBackend {
                 }
                 chosen.ok_or_else(|| io_err(format!("no BLE adapter matching {want:?}")))?
             }
-            None => adapters.into_iter().next().ok_or_else(|| io_err("no BLE adapter found".into()))?,
+            None => adapters
+                .into_iter()
+                .next()
+                .ok_or_else(|| io_err("no BLE adapter found".into()))?,
         };
 
         // Empty filter: our firmware advertises manufacturer data with no service UUID, so a service
@@ -83,20 +91,33 @@ impl MacBleBackend {
             .start_scan(ScanFilter::default())
             .await
             .map_err(|e| io_err(format!("ble start_scan: {e}")))?;
-        let mut events = adapter.events().await.map_err(|e| io_err(format!("ble events: {e}")))?;
+        let mut events = adapter
+            .events()
+            .await
+            .map_err(|e| io_err(format!("ble events: {e}")))?;
 
         let (tx, rxch) = mpsc::unbounded_channel();
         tokio::spawn(async move {
             while let Some(ev) = events.next().await {
-                if let CentralEvent::ManufacturerDataAdvertisement { id, manufacturer_data } = ev {
-                    let Some(payload) = manufacturer_data.get(&COMPANY_ID_ND) else { continue };
+                if let CentralEvent::ManufacturerDataAdvertisement {
+                    id,
+                    manufacturer_data,
+                } = ev
+                {
+                    let Some(payload) = manufacturer_data.get(&COMPANY_ID_ND) else {
+                        continue;
+                    };
                     if payload.is_empty() {
                         continue;
                     }
                     let frame = Bytes::copy_from_slice(payload);
                     debug!(bytes = frame.len(), "mac-ble: ND advert");
                     if tx
-                        .send(ScannedFrame { frame, addr: Some(synth_addr(&id)), rssi_dbm: None })
+                        .send(ScannedFrame {
+                            frame,
+                            addr: Some(synth_addr(&id)),
+                            rssi_dbm: None,
+                        })
                         .is_err()
                     {
                         break; // face dropped
@@ -106,7 +127,10 @@ impl MacBleBackend {
             warn!("mac-ble: scan event stream ended");
         });
 
-        Ok(Self { rx: AsyncMutex::new(rxch), _adapter: adapter })
+        Ok(Self {
+            rx: AsyncMutex::new(rxch),
+            _adapter: adapter,
+        })
     }
 }
 

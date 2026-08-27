@@ -39,8 +39,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let role = args.get(1).cloned().unwrap_or_else(|| "obs".into());
     let channel: u8 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(149);
     let secs: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(40);
-    let pid = u16::from_str_radix(&std::env::var("NDN_PID").unwrap_or_else(|_| "a81a".into()), 16)?;
-    let lat_per_sec: u64 = std::env::var("RATE").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
+    let pid = u16::from_str_radix(
+        &std::env::var("NDN_PID").unwrap_or_else(|_| "a81a".into()),
+        16,
+    )?;
+    let lat_per_sec: u64 = std::env::var("RATE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
 
     /// Claim-C v2: bulk frames are MTU-SIZED so a lease-held slot is substantially OCCUPIED, not
     /// merely owned — v1 measured ~15-B frames at ~7% duty, and a lease's collision pressure is
@@ -118,33 +124,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cap = ndn_radio_cognition::RadioCapability::wifi_monitor_5ghz(vec![channel]);
     // TX power (claim-C prereg + bench power hygiene): TXAGC index via RadioKnobs — clamped to the
     // B210-verified monotone range by the driver (061274c). Unset = calibrated default.
-    let txpwr: Option<u32> = std::env::var("NDN_RADIO_TXPWR").ok().and_then(|v| v.parse().ok());
+    let txpwr: Option<u32> = std::env::var("NDN_RADIO_TXPWR")
+        .ok()
+        .and_then(|v| v.parse().ok());
     if let (Some(idx), Some(knobs)) = (txpwr, open.knobs.as_ref()) {
         knobs.set_tx_power(idx)?;
     }
     // OBS is raw-only: no medium, no second recv_frame consumer (the batch-1 half-split lesson).
-    let raw_rx: Option<std::sync::Arc<dyn ndn_radio_hal::FrameIo>> =
-        if role == "obs" { Some(open.io.clone()) } else { None };
+    let raw_rx: Option<std::sync::Arc<dyn ndn_radio_hal::FrameIo>> = if role == "obs" {
+        Some(open.io.clone())
+    } else {
+        None
+    };
     let medium = if role == "obs" {
         None
     } else {
         Some(Arc::new(
-            RadioMediumFace::new(FaceId(1), vec![RadioBearer::from_open(RadioId(0), open, cap)])
-                .with_bloom_latency(
-                    &OPEN_GROUP_KEY,
-                    &[b"/bulk".as_slice(), b"/alarm".as_slice(), b"/light".as_slice()],
-                    &[b"/alarm".as_slice()],
-                )
-                .build(),
+            RadioMediumFace::new(
+                FaceId(1),
+                vec![RadioBearer::from_open(RadioId(0), open, cap)],
+            )
+            .with_bloom_latency(
+                &OPEN_GROUP_KEY,
+                &[
+                    b"/bulk".as_slice(),
+                    b"/alarm".as_slice(),
+                    b"/light".as_slice(),
+                ],
+                &[b"/alarm".as_slice()],
+            )
+            .build(),
         ))
     };
     let nonce_hex = |m: &ndn_face_monitor_wifi::RunningMedium| -> String {
-        m.source_nonce().map(|n| n.iter().map(|b| format!("{b:02x}")).collect()).unwrap_or_default()
+        m.source_nonce()
+            .map(|n| n.iter().map(|b| format!("{b:02x}")).collect())
+            .unwrap_or_default()
     };
     println!(
         "role={role} ch{channel} pid={pid:04x} {secs}s txpwr={} nonce={} bulk_payload={BULK_PAYLOAD}",
-        txpwr.map(|i| i.to_string()).unwrap_or_else(|| "default".into()),
-        medium.as_ref().map(|m| nonce_hex(m)).unwrap_or_else(|| "raw".into())
+        txpwr
+            .map(|i| i.to_string())
+            .unwrap_or_else(|| "default".into()),
+        medium
+            .as_ref()
+            .map(|m| nonce_hex(m))
+            .unwrap_or_else(|| "raw".into())
     );
 
     match role.as_str() {
@@ -153,7 +178,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let end = Instant::now() + Duration::from_secs(secs);
             let mut seq = 0u32;
             while Instant::now() < end {
-                if medium.send_bytes(pkt_sized("bulk", seq, BULK_PAYLOAD)).await.is_ok() {
+                if medium
+                    .send_bytes(pkt_sized("bulk", seq, BULK_PAYLOAD))
+                    .await
+                    .is_ok()
+                {
                     seq += 1;
                 }
             }
@@ -179,7 +208,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let p99 = waits_us[(waits_us.len() * 99 / 100).min(waits_us.len().saturating_sub(1))];
             println!("=== lat ===");
             println!("sent              : {seq}");
-            println!("gate wait µs      : max {max}  p99 {p99}  mean {mean}   <-- the access-delay metric");
+            println!(
+                "gate wait µs      : max {max}  p99 {p99}  mean {mean}   <-- the access-delay metric"
+            );
         }
         _ => {
             // OBS is RAW-ONLY (claim-C batch-1 lesson, discarded): with both the raw RSSI meter
@@ -231,7 +262,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("light sent        : {}", light.await.unwrap_or(0));
             println!("=== obs ===");
             for (g, (c, rs, rn)) in &heard {
-                let rssi = if *rn > 0 { format!("{} dBm", rs / *rn as i64) } else { "-".into() };
+                let rssi = if *rn > 0 {
+                    format!("{} dBm", rs / *rn as i64)
+                } else {
+                    "-".into()
+                };
                 println!("heard /{g:<8}: {c:<7} rssi mean {rssi}");
             }
         }

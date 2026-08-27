@@ -16,9 +16,9 @@
 //! Trust: built unsigned by default; `.signed(signer, validator)` enables the
 //! NSF-A3 message trust the four-phase driver already enforces.
 
+use portable_atomic::AtomicU64;
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
-use portable_atomic::AtomicU64;
 use std::time::Duration;
 
 use async_trait::async_trait;

@@ -137,15 +137,27 @@ impl TxParams {
 
     /// Wi-Fi MCS, or `None` for a non-Wi-Fi radio.
     pub fn mcs(&self) -> Option<u8> {
-        if let RateParams::Wifi(w) = &self.rate { w.mcs } else { None }
+        if let RateParams::Wifi(w) = &self.rate {
+            w.mcs
+        } else {
+            None
+        }
     }
     /// Wi-Fi spatial streams, or `None` for a non-Wi-Fi radio.
     pub fn nss(&self) -> Option<u8> {
-        if let RateParams::Wifi(w) = &self.rate { w.nss } else { None }
+        if let RateParams::Wifi(w) = &self.rate {
+            w.nss
+        } else {
+            None
+        }
     }
     /// Wi-Fi channel-bandwidth code, or `None` for a non-Wi-Fi radio.
     pub fn bw(&self) -> Option<u8> {
-        if let RateParams::Wifi(w) = &self.rate { w.bw } else { None }
+        if let RateParams::Wifi(w) = &self.rate {
+            w.bw
+        } else {
+            None
+        }
     }
     /// Wi-Fi VHT flag (false unless a Wi-Fi rate sets it).
     pub fn vht(&self) -> bool {
@@ -181,23 +193,43 @@ impl TxParams {
     }
     /// Wi-Fi A-MSDU size, or `None` for a non-Wi-Fi radio.
     pub fn amsdu_msdus(&self) -> Option<u16> {
-        if let RateParams::Wifi(w) = &self.rate { w.amsdu_msdus } else { None }
+        if let RateParams::Wifi(w) = &self.rate {
+            w.amsdu_msdus
+        } else {
+            None
+        }
     }
     /// LoRa spreading factor, or `None` for a non-LoRa radio.
     pub fn spreading_factor(&self) -> Option<u8> {
-        if let RateParams::Lora(l) = &self.rate { l.spreading_factor } else { None }
+        if let RateParams::Lora(l) = &self.rate {
+            l.spreading_factor
+        } else {
+            None
+        }
     }
     /// LoRa coding rate, or `None` for a non-LoRa radio.
     pub fn coding_rate(&self) -> Option<u8> {
-        if let RateParams::Lora(l) = &self.rate { l.coding_rate } else { None }
+        if let RateParams::Lora(l) = &self.rate {
+            l.coding_rate
+        } else {
+            None
+        }
     }
     /// LoRa bandwidth in kHz, or `None` for a non-LoRa radio.
     pub fn bandwidth_khz(&self) -> Option<u32> {
-        if let RateParams::Lora(l) = &self.rate { l.bandwidth_khz } else { None }
+        if let RateParams::Lora(l) = &self.rate {
+            l.bandwidth_khz
+        } else {
+            None
+        }
     }
     /// Mutable access to the Wi-Fi rate (e.g. for the Minstrel-style probe bump), if this is Wi-Fi.
     pub fn wifi_mut(&mut self) -> Option<&mut WifiRate> {
-        if let RateParams::Wifi(w) = &mut self.rate { Some(w) } else { None }
+        if let RateParams::Wifi(w) = &mut self.rate {
+            Some(w)
+        } else {
+            None
+        }
     }
 
     /// The exact [`McsDescriptor`](ndn_radio_hal::McsDescriptor) this decision means, when it carries a
@@ -269,7 +301,11 @@ pub struct DataPlaneConfig {
 
 impl DataPlaneConfig {
     /// Everything inert — a plain smart-modem (matches a freshly-flashed dongle).
-    pub const OFF: Self = Self { dedup: false, cs_serve: false, hop: false };
+    pub const OFF: Self = Self {
+        dedup: false,
+        cs_serve: false,
+        hop: false,
+    };
 }
 
 /// The full cross-layer, multi-radio decision for one named object.
@@ -321,7 +357,7 @@ impl RadioPlan {
 }
 
 /// Applied to one radio by its face (the actuator API the control plane drives).
-/// The `MonitorWifiFace`/backend implements this over its knobs; a LoRa/BLE face
+/// The `WifiPhy`/backend implements this over its knobs; a LoRa/BLE face
 /// implements what it can; an RX-only SDR sensor implements none of the TX side.
 /// The `LinkServiceFeature` splits a [`RadioPlan`] across the node's face group
 /// and calls `apply` on each radio's [`RadioAllocation`] (channel + params).

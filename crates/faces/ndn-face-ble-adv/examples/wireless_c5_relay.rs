@@ -20,8 +20,8 @@ use std::time::Duration;
 
 use ndn_app::{EngineAppExt, EngineBuilder};
 use ndn_engine::builder::EngineConfig;
-use ndn_face_ble_adv::{BleAdvFace, SharedBleBackend};
-use ndn_face_monitor_wifi::MonitorWifiFace;
+use ndn_face_ble_adv::{BlePhy, SharedBleBackend};
+use ndn_face_monitor_wifi::WifiPhy;
 use ndn_face_wireless::{PhyKind, Radio, TransportPhy, WirelessPhy};
 use ndn_packet::Name;
 use ndn_packet::encode::DataBuilder;
@@ -37,12 +37,10 @@ fn build_wireless(port: &str) -> Result<Radio, Box<dyn std::error::Error>> {
     let ble_backend = Arc::new(SharedBleBackend::new(wifi.shared_mux()));
     let io: Arc<dyn FrameIo> = wifi.clone();
     let phys: Vec<Arc<dyn WirelessPhy>> = vec![
-        Arc::new(
-            TransportPhy::new(MonitorWifiFace::new(FaceId(1), io), PhyKind::Wifi, 1).with_mtu(2272),
-        ),
+        Arc::new(TransportPhy::new(WifiPhy::new(FaceId(1), io), PhyKind::Wifi, 1).with_mtu(2272)),
         Arc::new(
             TransportPhy::new(
-                BleAdvFace::new(FaceId(2), ble_backend)
+                BlePhy::new(FaceId(2), ble_backend)
                     .ndnts_framing()
                     .with_mtu(200),
                 PhyKind::Ble,

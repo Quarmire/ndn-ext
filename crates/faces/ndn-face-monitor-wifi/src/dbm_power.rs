@@ -152,7 +152,14 @@ impl Mac80211Knobs {
             }
             Some(Mechanism::Nl80211) => {
                 let mbm = i32::from(dbm) * 100;
-                run_iw(&["dev", &self.iface, "set", "txpower", "fixed", &mbm.to_string()])?;
+                run_iw(&[
+                    "dev",
+                    &self.iface,
+                    "set",
+                    "txpower",
+                    "fixed",
+                    &mbm.to_string(),
+                ])?;
                 Ok(iw_iface_txpower_dbm(&self.iface).unwrap_or(dbm))
             }
             None => Err(io::Error::new(

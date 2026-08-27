@@ -23,7 +23,11 @@ fn prefixes(salt: u32, d: usize) -> Vec<Vec<u8>> {
     let mut cur = Vec::new();
     for c in 0..d {
         cur.push(b'/');
-        let v = if c == 0 { salt % 8 } else { salt.wrapping_mul(2654435761).wrapping_add(c as u32 * 40503) };
+        let v = if c == 0 {
+            salt % 8
+        } else {
+            salt.wrapping_mul(2654435761).wrapping_add(c as u32 * 40503)
+        };
         cur.extend_from_slice(format!("{:04x}", v & 0xffff).as_bytes());
         out.push(cur.clone());
     }
@@ -58,8 +62,13 @@ fn gcs(set: &[Vec<u8>], m: u64) -> (u64, Vec<u64>, u64) {
 
 fn main() {
     const TRIALS: u32 = 200_000;
-    println!("Same hash + name model. FN=0 for both (membership structures). d=8 (deep, clamped).\n");
-    println!("{:<7} {:>12} {:>12} {:>10}   {:>12} {:>12} {:>10}", "target", "GCS b/elem", "GCS FP", "GCS/94b", "Bloom b/elem", "Bloom FP", "Bloom/94b");
+    println!(
+        "Same hash + name model. FN=0 for both (membership structures). d=8 (deep, clamped).\n"
+    );
+    println!(
+        "{:<7} {:>12} {:>12} {:>10}   {:>12} {:>12} {:>10}",
+        "target", "GCS b/elem", "GCS FP", "GCS/94b", "Bloom b/elem", "Bloom FP", "Bloom/94b"
+    );
 
     for (label, eps) in [("~1%", 0.01f64), ("~0.1%", 0.001)] {
         let d = 8usize;
@@ -83,7 +92,9 @@ fn main() {
                 }
             }
             // Query a disjoint prefix (different low bits ⇒ genuinely different components).
-            let q = prefixes(t.wrapping_mul(40507).wrapping_add(1_234_567), 3).pop().unwrap();
+            let q = prefixes(t.wrapping_mul(40507).wrapping_add(1_234_567), 3)
+                .pop()
+                .unwrap();
             if hs.binary_search(&(h(&q, 0xC5) % u)).is_ok() {
                 gcs_fp += 1;
             }
@@ -96,9 +107,16 @@ fn main() {
         let b_fp = bloom_fp as f64 * 100.0 / TRIALS as f64;
         println!(
             "{:<7} {:>11.2}b {:>11.3}% {:>9.1} {:>11}b {:>11.3}% {:>9.1}",
-            label, gcs_be, g_fp, 94.0 / gcs_be,
-            format!("{bits_per_elem_bloom}"), b_fp, 94.0 / bits_per_elem_bloom as f64
+            label,
+            gcs_be,
+            g_fp,
+            94.0 / gcs_be,
+            format!("{bits_per_elem_bloom}"),
+            b_fp,
+            94.0 / bits_per_elem_bloom as f64
         );
     }
-    println!("\n'/94b' = prefix-levels that fit in a 94-bit field at that FP. Higher = more crammed in.");
+    println!(
+        "\n'/94b' = prefix-levels that fit in a 94-bit field at that FP. Higher = more crammed in."
+    );
 }

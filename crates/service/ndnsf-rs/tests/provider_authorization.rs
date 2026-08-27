@@ -12,12 +12,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use ndnsf_rs::{NdnsfCarrier, ServicePolicy};
 use ndn_packet::Name;
 use ndn_service_core::{
     Carrier, Dispatch, Invocation, OpId, SelectCarrier, ServiceError, ServiceId, Strategy,
 };
 use ndn_sync::{SvSyncConfig, SvsConfig, SvsPubSub};
+use ndnsf_rs::{NdnsfCarrier, ServicePolicy};
 use tokio::sync::mpsc;
 
 fn name(s: &str) -> Name {
@@ -43,7 +43,13 @@ fn hub(nodes: &[&str], group: &Name) -> Vec<SvsPubSub> {
     for n in nodes {
         let (out_tx, out_rx) = mpsc::channel::<Bytes>(256);
         let (in_tx, in_rx) = mpsc::channel::<Bytes>(256);
-        pubsubs.push(SvsPubSub::join(group.clone(), name(n), out_tx, in_rx, cfg()));
+        pubsubs.push(SvsPubSub::join(
+            group.clone(),
+            name(n),
+            out_tx,
+            in_rx,
+            cfg(),
+        ));
         outs.push(out_rx);
         ins.push(in_tx);
     }
@@ -84,7 +90,12 @@ const POLICY: &str = r#"
 async fn tags(carrier: &NdnsfCarrier, svc: &ServiceId) -> Vec<String> {
     let resps = tokio::time::timeout(
         Duration::from_secs(10),
-        carrier.invoke_select(svc, &OpId::new("echo"), Bytes::from_static(b"hi"), Strategy::All),
+        carrier.invoke_select(
+            svc,
+            &OpId::new("echo"),
+            Bytes::from_static(b"hi"),
+            Strategy::All,
+        ),
     )
     .await
     .expect("select did not complete")
@@ -112,7 +123,9 @@ async fn unauthorized_provider_ack_is_refused() {
     // Both providers serve the same service in the group (insecure isolates the
     // authorization decision from signing, which trust_validated_four_phase covers).
     let bob = NdnsfCarrier::new(bob_ps, name("/muas/bob"), group.clone()).insecure();
-    bob.serve(&svc, Arc::new(TagDispatch(b"bob"))).await.unwrap();
+    bob.serve(&svc, Arc::new(TagDispatch(b"bob")))
+        .await
+        .unwrap();
     let mallory = NdnsfCarrier::new(mallory_ps, name("/muas/mallory"), group.clone()).insecure();
     mallory
         .serve(&svc, Arc::new(TagDispatch(b"mallory")))

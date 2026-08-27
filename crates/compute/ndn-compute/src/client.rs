@@ -7,8 +7,8 @@
 //! [`call_opaque`](ComputeClient::call_opaque) appends an unpredictable nonce
 //! component and requests a fresh result, so opaque calls never alias.
 
-use std::sync::atomic::Ordering;
 use portable_atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;

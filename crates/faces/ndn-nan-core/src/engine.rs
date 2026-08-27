@@ -42,10 +42,12 @@ use alloc::collections::{BTreeSet, VecDeque};
 use alloc::vec::Vec;
 
 use crate::attr::{
-    AttributeId, Cluster, DeviceCapability, MasterIndication, Ndpe, NdpStatus, NdpType, Sdea,
+    AttributeId, Cluster, DeviceCapability, MasterIndication, NdpStatus, NdpType, Ndpe, Sdea,
     ServiceControlType, ServiceDescriptor, ServiceIdList,
 };
-use crate::frame::{FrameType, NafSubtype, NanActionFrame, NanBeacon, ServiceDiscoveryFrame, classify};
+use crate::frame::{
+    FrameType, NafSubtype, NanActionFrame, NanBeacon, ServiceDiscoveryFrame, classify,
+};
 use crate::rendezvous::{DiscoveryWindow, Rendezvous};
 use crate::service::service_id;
 use crate::{BROADCAST, NAN_CLUSTER_ID_BASE, NAN_NETWORK_ID, SYNC_BEACON_INTERVAL_TU, ServiceId};
@@ -890,7 +892,8 @@ impl NanEngine {
         let Some(i) = self.ndp_index(peer, ndpe) else {
             return;
         };
-        if self.ndps[i].role != NdpRole::Initiator || self.ndps[i].state != NdpState::AwaitingResponse
+        if self.ndps[i].role != NdpRole::Initiator
+            || self.ndps[i].state != NdpState::AwaitingResponse
         {
             return;
         }
@@ -1276,7 +1279,11 @@ mod tests {
 
         let a_id = m.a.request_ndp(B);
         let b_id = m.b.request_ndp(A);
-        assert_eq!((a_id, b_id), (1, 1), "both allocate id 1 — that is the trap");
+        assert_eq!(
+            (a_id, b_id),
+            (1, 1),
+            "both allocate id 1 — that is the trap"
+        );
 
         let (mut a_up, mut b_up) = (0, 0);
         for _ in 0..300 {
@@ -1349,7 +1356,11 @@ mod tests {
             }
         );
         assert_eq!(m.a.established_ndps(), 0);
-        assert_eq!(m.b.established_ndps(), 0, "a refused path leaves no session");
+        assert_eq!(
+            m.b.established_ndps(),
+            0,
+            "a refused path leaves no session"
+        );
     }
 
     /// An unanswered request must give up, not retry forever — and must say so.
@@ -1405,9 +1416,14 @@ mod tests {
         let mut attrs = Vec::new();
         Ndpe::request(1, 1, A, eui64_iid(A)).encode(&mut attrs);
         // Addressed to OTHER, sent by A; B merely overhears it.
-        let naf =
-            NanActionFrame::new(NafSubtype::DataPathRequest, OTHER, A, NAN_CLUSTER_ID_BASE, 1)
-                .encode(&attrs);
+        let naf = NanActionFrame::new(
+            NafSubtype::DataPathRequest,
+            OTHER,
+            A,
+            NAN_CLUSTER_ID_BASE,
+            1,
+        )
+        .encode(&attrs);
 
         let mut b = NanEngine::new(NanConfig::new(B, 6, 180));
         let step = b.poll(

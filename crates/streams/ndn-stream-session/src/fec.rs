@@ -107,12 +107,7 @@ impl GroupEncoder {
         if self.cfg.r == 0 {
             return Vec::new();
         }
-        let width = self
-            .current
-            .iter()
-            .map(|p| 4 + p.len())
-            .max()
-            .unwrap_or(4);
+        let width = self.current.iter().map(|p| 4 + p.len()).max().unwrap_or(4);
         let n = self.cfg.k + self.cfg.r;
         let Ok(mut enc) = Encoder::new(self.cfg.k, n) else {
             tracing::warn!(k = self.cfg.k, n, "invalid FEC shape — emitting no parity");

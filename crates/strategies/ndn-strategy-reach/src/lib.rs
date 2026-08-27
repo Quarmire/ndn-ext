@@ -29,22 +29,32 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ndn_packet::{Name, NameComponent};
-use ndn_strategy::{register_strategy, ErasedStrategy, Strategy, StrategyContext};
+use ndn_strategy::{ErasedStrategy, Strategy, StrategyContext, register_strategy};
 use ndn_transport::{FaceId, ForwardingAction, NackReason};
-use smallvec::{smallvec, SmallVec};
+use smallvec::{SmallVec, smallvec};
 
 register_strategy!(SOFT_PREFIX_REACH_REG, b"soft-prefix-reach", 1, || Arc::new(
     SoftPrefixReachStrategy::new(Mode::Probabilistic)
-) as Arc<dyn ErasedStrategy>,);
-register_strategy!(SOFT_PREFIX_REACH_DEFER_REG, b"soft-prefix-reach-defer", 1, || Arc::new(
-    SoftPrefixReachStrategy::new(Mode::Defer)
-) as Arc<dyn ErasedStrategy>,);
-register_strategy!(SOFT_PREFIX_REACH_BANDIT_REG, b"soft-prefix-reach-bandit", 1, || Arc::new(
-    SoftPrefixReachStrategy::new(Mode::Bandit)
-) as Arc<dyn ErasedStrategy>,);
-register_strategy!(SOFT_PREFIX_REACH_BLOOM_REG, b"soft-prefix-reach-bloom", 1, || Arc::new(
-    SoftPrefixReachStrategy::new(Mode::BloomDefer)
-) as Arc<dyn ErasedStrategy>,);
+)
+    as Arc<dyn ErasedStrategy>,);
+register_strategy!(
+    SOFT_PREFIX_REACH_DEFER_REG,
+    b"soft-prefix-reach-defer",
+    1,
+    || Arc::new(SoftPrefixReachStrategy::new(Mode::Defer)) as Arc<dyn ErasedStrategy>,
+);
+register_strategy!(
+    SOFT_PREFIX_REACH_BANDIT_REG,
+    b"soft-prefix-reach-bandit",
+    1,
+    || Arc::new(SoftPrefixReachStrategy::new(Mode::Bandit)) as Arc<dyn ErasedStrategy>,
+);
+register_strategy!(
+    SOFT_PREFIX_REACH_BLOOM_REG,
+    b"soft-prefix-reach-bloom",
+    1,
+    || Arc::new(SoftPrefixReachStrategy::new(Mode::BloomDefer)) as Arc<dyn ErasedStrategy>,
+);
 
 /// Counting-Bloom default width (cells) and hash count. Width is env-tunable (`NDR_BLOOM_CELLS`) so a
 /// multi-producer scenario can force saturation at a low prefix count and expose the graceful-degradation
@@ -56,8 +66,8 @@ const BLOOM_K: usize = 4;
 enum Mode {
     Probabilistic, // v1: re-broadcast with prob p(reach); else suppress.
     Defer,         // v2: defer by delay(reach); engine overhear-cancels the redundant ones.
-    Bandit,        // v3: defer, reach = Thompson sample from a Beta posterior (explore under uncertainty).
-    BloomDefer,    // v4: defer, memory = counting/decaying Bloom over prefixes (vs the scalar map).
+    Bandit, // v3: defer, reach = Thompson sample from a Beta posterior (explore under uncertainty).
+    BloomDefer, // v4: defer, memory = counting/decaying Bloom over prefixes (vs the scalar map).
 }
 
 /// Env-overridable tunables (doc §8). Read once at construction.
@@ -78,8 +88,18 @@ struct Params {
 
 impl Params {
     fn from_env() -> Self {
-        let env = |k: &str, d: f64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
-        let envu = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        let env = |k: &str, d: f64| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
+        let envu = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
         Self {
             p_floor: env("NDR_PFLOOR", 0.2),
             reinforce: env("NDR_REINFORCE", 1.0),
@@ -119,7 +139,10 @@ struct CountingBloom {
 
 impl CountingBloom {
     fn new(cells: usize) -> Self {
-        Self { cells: vec![0.0; cells], last_ms: 0 }
+        Self {
+            cells: vec![0.0; cells],
+            last_ms: 0,
+        }
     }
     fn decay_to(&mut self, now_ms: u64, tau_ms: f64) {
         let dt = now_ms.saturating_sub(self.last_ms) as f64;
@@ -150,7 +173,10 @@ impl CountingBloom {
     }
     /// Counting-Bloom membership strength = min over the k cells.
     fn query(&self, key: u64) -> f64 {
-        self.idxs(key).into_iter().map(|i| self.cells[i]).fold(f64::INFINITY, f64::min)
+        self.idxs(key)
+            .into_iter()
+            .map(|i| self.cells[i])
+            .fold(f64::INFINITY, f64::min)
     }
 }
 
@@ -272,7 +298,11 @@ impl SoftPrefixReachStrategy {
     fn note_attempt(&self, key: u64, now_ms: u64) {
         if self.mode == Mode::Bandit {
             let mut map = self.bandit.lock().unwrap();
-            let b = map.entry(key).or_insert(Beta { alpha: 0.0, beta: 0.0, last_ms: now_ms });
+            let b = map.entry(key).or_insert(Beta {
+                alpha: 0.0,
+                beta: 0.0,
+                last_ms: now_ms,
+            });
             let f = (-(now_ms.saturating_sub(b.last_ms) as f64) / self.params.tau_ms).exp();
             b.beta = b.beta * f + 1.0;
             b.alpha *= f;
@@ -295,7 +325,11 @@ impl Strategy for SoftPrefixReachStrategy {
             return smallvec![ForwardingAction::Nack(NackReason::NoRoute)];
         }
         // Genuine hops always forward immediately; only a pure re-broadcast on the arrival face is gated.
-        let other: SmallVec<[FaceId; 4]> = faces.iter().copied().filter(|&f| f != ctx.in_face).collect();
+        let other: SmallVec<[FaceId; 4]> = faces
+            .iter()
+            .copied()
+            .filter(|&f| f != ctx.in_face)
+            .collect();
         if !other.is_empty() {
             return smallvec![ForwardingAction::Forward(other)];
         }
@@ -314,7 +348,10 @@ impl Strategy for SoftPrefixReachStrategy {
             }
             Mode::Defer | Mode::Bandit | Mode::BloomDefer => {
                 self.note_attempt(key, now);
-                smallvec![ForwardingAction::ForwardAfter { faces, delay: self.defer_delay(reach) }]
+                smallvec![ForwardingAction::ForwardAfter {
+                    faces,
+                    delay: self.defer_delay(reach)
+                }]
             }
         }
     }
@@ -327,7 +364,10 @@ impl Strategy for SoftPrefixReachStrategy {
         match self.mode {
             Mode::Probabilistic | Mode::Defer => {
                 let mut map = self.prior.lock().unwrap();
-                let r = map.entry(key).or_insert(Reach { weight: 0.0, last_ms: now });
+                let r = map.entry(key).or_insert(Reach {
+                    weight: 0.0,
+                    last_ms: now,
+                });
                 r.weight = (r.weight * (-(now.saturating_sub(r.last_ms) as f64) / p.tau_ms).exp()
                     + p.reinforce)
                     .min(p.w_max);
@@ -340,7 +380,11 @@ impl Strategy for SoftPrefixReachStrategy {
             }
             Mode::Bandit => {
                 let mut map = self.bandit.lock().unwrap();
-                let b = map.entry(key).or_insert(Beta { alpha: 0.0, beta: 0.0, last_ms: now });
+                let b = map.entry(key).or_insert(Beta {
+                    alpha: 0.0,
+                    beta: 0.0,
+                    last_ms: now,
+                });
                 let f = (-(now.saturating_sub(b.last_ms) as f64) / p.tau_ms).exp();
                 b.alpha = b.alpha * f + p.reinforce; // a success
                 b.beta *= f;

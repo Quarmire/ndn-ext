@@ -1,7 +1,7 @@
 //! **Full NDN-over-BLE roundtrip** on two ESP32-C5 BLE backends: a consumer expresses an Interest, a
 //! producer answers with a **large Data that fragments across BLE 5 extended advertisements** and is
 //! reassembled + decoded on the consumer. Real NDN packets (verified with `ndn_packet::{Interest,Data}
-//! ::decode`); fragmentation is the `BleAdvFace` NDNts per-sender path (no engine needed for the demo).
+//! ::decode`); fragmentation is the `BlePhy` NDNts per-sender path (no engine needed for the demo).
 //!
 //! ```sh
 //! BLE_A=/dev/cu.usbmodem101 BLE_B=/dev/cu.usbmodem11101 \
@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use ndn_face_ble_adv::{BleAdvFace, Esp32BleBackend};
+use ndn_face_ble_adv::{BlePhy, Esp32BleBackend};
 use ndn_packet::{Data, Interest};
 use ndn_transport::{FaceId, Transport};
 
@@ -74,10 +74,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::time::sleep(Duration::from_millis(400)).await;
 
     // NDNts framing = per-sender fragmentation/reassembly inside the face. MTU 200 < the C5's 240B ext-adv cap.
-    let producer = BleAdvFace::new(FaceId(1), a_backend.clone())
+    let producer = BlePhy::new(FaceId(1), a_backend.clone())
         .ndnts_framing()
         .with_mtu(200);
-    let consumer = BleAdvFace::new(FaceId(2), b_backend.clone())
+    let consumer = BlePhy::new(FaceId(2), b_backend.clone())
         .ndnts_framing()
         .with_mtu(200);
 

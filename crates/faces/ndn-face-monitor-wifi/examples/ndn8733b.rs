@@ -1,5 +1,5 @@
-//! NDN over the RTL8733BU: wire the 8733b under a `MonitorWifiFace` and send a real
-//! NDN Data packet over the air, decoded on a second `MonitorWifiFace` over the
+//! NDN over the RTL8733BU: wire the 8733b under a `WifiPhy` and send a real
+//! NDN Data packet over the air, decoded on a second `WifiPhy` over the
 //! RTL8812AU — the userspace 8733b driver carrying a genuine NDN packet end-to-end.
 //!
 //!   cargo run --features libusb-backend --example ndn8733b -- 1
@@ -42,24 +42,27 @@ fn build_data(components: &[&[u8]], content: &[u8]) -> bytes::Bytes {
 
 #[cfg(feature = "libusb-backend")]
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    use ndn_face_monitor_wifi::{MonitorWifiFace, Rtl8733buBackend, Rtl8812auBackend};
+    use ndn_face_monitor_wifi::{Rtl8733buBackend, Rtl8812auBackend, WifiPhy};
     use ndn_packet::Data;
     use ndn_transport::{FaceId, Transport};
     use std::sync::Arc;
     use std::time::Duration;
 
-    let ch: u8 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(1);
+    let ch: u8 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
 
-    // Receiver: the RTL8812AU under a MonitorWifiFace.
+    // Receiver: the RTL8812AU under a WifiPhy.
     let rx = Rtl8812auBackend::open()?;
     rx.bring_up_monitor(ch)?;
-    let rx_face = MonitorWifiFace::new(FaceId(2), Arc::new(rx));
+    let rx_face = WifiPhy::new(FaceId(2), Arc::new(rx));
     println!("(receiver: RTL8812AU on ch{ch})");
 
-    // Sender: the RTL8733BU under a MonitorWifiFace.
+    // Sender: the RTL8733BU under a WifiPhy.
     let tx = Rtl8733buBackend::open()?;
     tx.bring_up_monitor(ch)?;
-    let tx_face = MonitorWifiFace::new(FaceId(1), Arc::new(tx));
+    let tx_face = WifiPhy::new(FaceId(1), Arc::new(tx));
     println!("(sender:   RTL8733BU on ch{ch})");
 
     let data = build_data(&[b"ndn", b"8733b"], b"hello-over-8733b-radio");
@@ -85,14 +88,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         {
             if let Ok(d) = Data::decode(wire) {
                 let content = d.content().map(|c| String::from_utf8_lossy(c).into_owned());
-                println!("  ✅ decoded NDN Data over the air: name={} content={:?}", d.name, content);
+                println!(
+                    "  ✅ decoded NDN Data over the air: name={} content={:?}",
+                    d.name, content
+                );
                 got = true;
                 break;
             }
         }
     }
     sender.abort();
-    println!("{}", if got { "NDN-over-8733b: OK 🎉" } else { "no NDN Data decoded" });
+    println!(
+        "{}",
+        if got {
+            "NDN-over-8733b: OK 🎉"
+        } else {
+            "no NDN Data decoded"
+        }
+    );
     Ok(())
 }
 

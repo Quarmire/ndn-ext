@@ -30,7 +30,10 @@ fn main() {
 
     const TRIALS: u32 = 200_000;
     println!("m=94 bits, k=4.  Per-mask FP measured over {TRIALS} disjoint depth-3 registrations.");
-    println!("{:>5} {:>10} {:>12} {:>14} {:>14} {:>14}", "depth", "bits set", "per-mask FP", "unionE=8", "unionE=32", "unionE=128");
+    println!(
+        "{:>5} {:>10} {:>12} {:>14} {:>14} {:>14}",
+        "depth", "bits set", "per-mask FP", "unionE=8", "unionE=32", "unionE=128"
+    );
     for d in [1usize, 2, 3, 4, 6, 8, 10, 12] {
         // Average bits set across many names of this depth.
         let mut bits_tot = 0u64;
@@ -56,7 +59,12 @@ fn main() {
         let union = |e: i32| (1.0 - (1.0 - p).powi(e)) * 100.0;
         println!(
             "{:>5} {:>10.1} {:>11.4}% {:>13.2}% {:>13.2}% {:>13.2}%",
-            d, bits, p * 100.0, union(8), union(32), union(128)
+            d,
+            bits,
+            p * 100.0,
+            union(8),
+            union(32),
+            union(128)
         );
     }
 }

@@ -180,8 +180,8 @@ impl RpcHandler for CarrierHandler {
         // The request travels as an opaque metadata+payload envelope: recover the
         // carrier-uniform slot (a trace context, etc.) and the inner request.
         let params = interest.app_parameters().cloned().unwrap_or_default();
-        let (metadata, request) = framing::decode_envelope(&params)
-            .map_err(|e| RpcError::BadRequest(e.to_string()))?;
+        let (metadata, request) =
+            framing::decode_envelope(&params).map_err(|e| RpcError::BadRequest(e.to_string()))?;
         let invocation = Invocation {
             op,
             request,

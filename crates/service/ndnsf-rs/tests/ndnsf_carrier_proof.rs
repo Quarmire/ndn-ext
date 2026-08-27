@@ -13,12 +13,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use ndnsf_rs::NdnsfCarrier;
 use ndn_packet::Name;
 use ndn_service_core::{
     Carrier, Dispatch, Frame, Invocation, OpId, SelectCarrier, ServiceError, ServiceId, Strategy,
 };
 use ndn_sync::{SvSyncConfig, SvsConfig, SvsPubSub};
+use ndnsf_rs::NdnsfCarrier;
 use tokio::sync::mpsc;
 
 fn name(s: &str) -> Name {

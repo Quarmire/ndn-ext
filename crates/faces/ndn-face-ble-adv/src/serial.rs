@@ -7,10 +7,10 @@
 //! (a `FrameIo`); this is its BLE peer, using distinct `T_BLE_*` message types on the shared protocol.
 //!
 //! ```no_run
-//! # use ndn_face_ble_adv::{Esp32BleBackend, BleAdvFace};
+//! # use ndn_face_ble_adv::{Esp32BleBackend, BlePhy};
 //! # use std::sync::Arc;
 //! let backend = Arc::new(Esp32BleBackend::open("/dev/cu.usbmodem1101")?);
-//! let face = BleAdvFace::new(ndn_transport::FaceId(0), backend);
+//! let face = BlePhy::new(ndn_transport::FaceId(0), backend);
 //! # Ok::<(), ndn_transport::FaceError>(())
 //! ```
 
@@ -53,7 +53,9 @@ impl Esp32BleBackend {
         let _ = port.write_request_to_send(false);
         let _ = port.write_data_terminal_ready(false);
         let _ = port.clear(serialport::ClearBuffer::Input);
-        let reader = port.try_clone().map_err(|e| io_err(format!("ble clone: {e}")))?;
+        let reader = port
+            .try_clone()
+            .map_err(|e| io_err(format!("ble clone: {e}")))?;
         let (txch, rxch) = mpsc::unbounded_channel();
         std::thread::spawn(move || reader_loop(reader, txch));
         Ok(Self {
@@ -77,10 +79,20 @@ impl Esp32BleBackend {
     fn send_framed(&self, ty: u8, payload: &[u8]) -> Result<(), FaceError> {
         use std::io::Write;
         let mut buf = Vec::with_capacity(5 + payload.len());
-        buf.extend_from_slice(&[SYNC0, SYNC1, ty, (payload.len() & 0xff) as u8, (payload.len() >> 8) as u8]);
+        buf.extend_from_slice(&[
+            SYNC0,
+            SYNC1,
+            ty,
+            (payload.len() & 0xff) as u8,
+            (payload.len() >> 8) as u8,
+        ]);
         buf.extend_from_slice(payload);
-        let mut port = self.tx.lock().map_err(|_| io_err("ble tx lock poisoned".into()))?;
-        port.write_all(&buf).map_err(|e| io_err(format!("ble write: {e}")))?;
+        let mut port = self
+            .tx
+            .lock()
+            .map_err(|_| io_err("ble tx lock poisoned".into()))?;
+        port.write_all(&buf)
+            .map_err(|e| io_err(format!("ble write: {e}")))?;
         let _ = port.flush();
         Ok(())
     }
@@ -126,7 +138,11 @@ fn reader_loop(mut port: Box<dyn serialport::SerialPort>, tx: mpsc::UnboundedSen
                         addr.copy_from_slice(&p[1..7]);
                         let frame = Bytes::copy_from_slice(&p[7..]);
                         if tx
-                            .send(ScannedFrame { frame, addr: Some(addr), rssi_dbm: Some(rssi) })
+                            .send(ScannedFrame {
+                                frame,
+                                addr: Some(addr),
+                                rssi_dbm: Some(rssi),
+                            })
                             .is_err()
                         {
                             return; // face dropped

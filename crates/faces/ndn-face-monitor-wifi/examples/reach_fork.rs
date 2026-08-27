@@ -128,7 +128,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ONE reader (rx_raw + poll_frame together steal transfers and read as 50%
     // loss). poll_frame, because it carries the RSSI.
     while t0.elapsed() < Duration::from_secs(secs) {
-        let Ok(Some(cf)) = b.poll_frame() else { continue };
+        let Ok(Some(cf)) = b.poll_frame() else {
+            continue;
+        };
         let f = &cf.payload;
         let Some(p) = f.windows(2).position(|w| w == MAGIC) else {
             continue;

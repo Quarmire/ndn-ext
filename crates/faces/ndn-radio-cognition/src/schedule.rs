@@ -94,7 +94,11 @@ impl SlotSchedule {
     /// frame's on-air time plus a guard band (sized from the PHY airtime + the clock's residual
     /// jitter); `slots` is the superframe length (the per-name access period). Both are clamped to ≥1.
     pub fn new(slot_us: u64, slots: u64) -> Self {
-        Self { slot_us: slot_us.max(1), slots: slots.max(1), reserved_stride: 0 }
+        Self {
+            slot_us: slot_us.max(1),
+            slots: slots.max(1),
+            reserved_stride: 0,
+        }
     }
 
     /// **Reserve every `stride`-th slot as a latency lane** (#93). `0` (the default) reserves
@@ -117,7 +121,11 @@ impl SlotSchedule {
 
     /// How many slots per superframe are reserved lanes.
     pub fn reserved_slots(&self) -> u64 {
-        if self.reserved_stride < 2 { 0 } else { self.slots.div_ceil(self.reserved_stride) }
+        if self.reserved_stride < 2 {
+            0
+        } else {
+            self.slots.div_ceil(self.reserved_stride)
+        }
     }
 
     /// How many slots per superframe are open to bulk leases.
@@ -320,7 +328,10 @@ impl HopSchedule {
     /// back to a single fixed channel `[0]` if `classes` is empty; `dwell_us` clamped to ≥1.
     pub fn new(classes: Vec<u8>, dwell_us: u64) -> Self {
         let classes = if classes.is_empty() { vec![0] } else { classes };
-        Self { classes, dwell_us: dwell_us.max(1) }
+        Self {
+            classes,
+            dwell_us: dwell_us.max(1),
+        }
     }
 
     /// How long this schedule sits on each channel (µs) — read by
@@ -391,7 +402,11 @@ mod tests {
                 if w > 0 {
                     let arrival = now + w;
                     assert_eq!(arrival % 500, 0, "arrival not on a slot boundary");
-                    assert_eq!(s.current_slot(arrival), s.owner_slot(h), "arrived in the wrong slot");
+                    assert_eq!(
+                        s.current_slot(arrival),
+                        s.owner_slot(h),
+                        "arrived in the wrong slot"
+                    );
                 }
             }
         }
@@ -486,7 +501,6 @@ mod tests {
         assert!(wifi_airtime_us(0, Some(7)) > 0);
     }
 
-
     /// **A second radio must buy additional turns, not parallel copies of one turn** (#89).
     ///
     /// `owner_slot` is `hash % slots` with no medium term, so every bearer ran the identical
@@ -501,7 +515,9 @@ mod tests {
         // The face's key: `hash ^ channel * K`.
         let keyed = |h: u64, ch: u8| h ^ u64::from(ch).wrapping_mul(0x9E37_79B9);
 
-        let names: Vec<u64> = (0..64u64).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
+        let names: Vec<u64> = (0..64u64)
+            .map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+            .collect();
 
         // Same medium ⇒ identical schedule on every bearer: two radios on one channel are ONE
         // medium and must not both think they own it independently.
@@ -528,16 +544,24 @@ mod tests {
         // And the concurrency that buys: for each slot index, the set of names owning it on ch36
         // differs from the set owning it on ch149 — otherwise the second radio is redundant.
         let owners = |ch: u8, k: u64| {
-            names.iter().filter(|n| s.owner_slot(keyed(**n, ch)) == k).count()
+            names
+                .iter()
+                .filter(|n| s.owner_slot(keyed(**n, ch)) == k)
+                .count()
         };
-        let differing = (0..SLOTS).filter(|k| owners(36, *k) != owners(149, *k) ||
-            names.iter().any(|n| (s.owner_slot(keyed(*n, 36)) == *k) != (s.owner_slot(keyed(*n, 149)) == *k))).count();
+        let differing = (0..SLOTS)
+            .filter(|k| {
+                owners(36, *k) != owners(149, *k)
+                    || names.iter().any(|n| {
+                        (s.owner_slot(keyed(*n, 36)) == *k) != (s.owner_slot(keyed(*n, 149)) == *k)
+                    })
+            })
+            .count();
         assert!(
             differing >= SLOTS as usize - 1,
             "nearly every slot should serve a different name set per medium, got {differing}/{SLOTS}"
         );
     }
-
 }
 
 /// **The named airtime lease** (#93) — the properties the design rests on, tested rather than argued.
@@ -560,12 +584,18 @@ mod lease_tests {
         // No bulk name, for any hash, lands on a reserved lane.
         for h in 0..2_000u64 {
             let slot = s.owner_slot_in(h, LeaseClass::Bulk);
-            assert!(!s.is_reserved(slot), "bulk name {h} landed on reserved lane {slot}");
+            assert!(
+                !s.is_reserved(slot),
+                "bulk name {h} landed on reserved lane {slot}"
+            );
         }
         // Every latency name lands on one.
         for h in 0..2_000u64 {
             let slot = s.owner_slot_in(h, LeaseClass::Latency);
-            assert!(s.is_reserved(slot), "latency name {h} landed on open slot {slot}");
+            assert!(
+                s.is_reserved(slot),
+                "latency name {h} landed on open slot {slot}"
+            );
         }
     }
 
@@ -580,16 +610,25 @@ mod lease_tests {
         // Starting in slot 1 with L=8 requested: slots 1,2,3 are open, 4 is reserved -> 3 slots.
         let now = 1 * 1000 + 10; // inside slot 1
         assert_eq!(s.current_slot(now), 1);
-        assert_eq!(s.lease_deadline_us(now, LeaseClass::Bulk, 8), 1000 + 3 * 1000);
+        assert_eq!(
+            s.lease_deadline_us(now, LeaseClass::Bulk, 8),
+            1000 + 3 * 1000
+        );
 
         // Starting in slot 5: 5,6,7 open, then wraps to 0 which is reserved -> 3 slots.
         let now = 5 * 1000 + 10;
-        assert_eq!(s.lease_deadline_us(now, LeaseClass::Bulk, 8), 5000 + 3 * 1000);
+        assert_eq!(
+            s.lease_deadline_us(now, LeaseClass::Bulk, 8),
+            5000 + 3 * 1000
+        );
 
         // Latency is always exactly one slot: a reserved lane exists to bound someone else's delay,
         // so holding it longer defeats the thing it is for.
         let now = 4 * 1000 + 10;
-        assert_eq!(s.lease_deadline_us(now, LeaseClass::Latency, 8), 4000 + 1000);
+        assert_eq!(
+            s.lease_deadline_us(now, LeaseClass::Latency, 8),
+            4000 + 1000
+        );
     }
 
     /// **The generalisation must be behaviour-preserving at the default**, or every on-air number
@@ -607,7 +646,10 @@ mod lease_tests {
         }
         // L=1 reproduces the single-slot hold the +119% claim result was measured with.
         let now = 3 * 20_000 + 5;
-        assert_eq!(s.lease_deadline_us(now, LeaseClass::Bulk, 1), 3 * 20_000 + 20_000);
+        assert_eq!(
+            s.lease_deadline_us(now, LeaseClass::Bulk, 1),
+            3 * 20_000 + 20_000
+        );
     }
 
     /// A stride of 1 would reserve every slot and starve bulk entirely; it is clamped to "none".
@@ -615,7 +657,11 @@ mod lease_tests {
     fn a_degenerate_stride_cannot_starve_bulk() {
         for stride in [0, 1] {
             let s = SlotSchedule::new(1000, 8).with_reserved_stride(stride);
-            assert_eq!(s.reserved_slots(), 0, "stride {stride} must reserve nothing");
+            assert_eq!(
+                s.reserved_slots(),
+                0,
+                "stride {stride} must reserve nothing"
+            );
             assert_eq!(s.open_slots(), 8);
         }
         // And the smallest real stride still leaves bulk half the medium.

@@ -1,5 +1,5 @@
 //! **Engine-level NDN roundtrip over BLE** — the BLE face driven by a real forwarding engine (PIT/FIB),
-//! not the raw face. Two `ForwarderEngine`s, one per ESP32-C5, linked *only* by a [`BleAdvFace`]:
+//! not the raw face. Two `ForwarderEngine`s, one per ESP32-C5, linked *only* by a [`BlePhy`]:
 //!
 //! ```text
 //!  consumer engine (dev B)                          producer engine (dev A)
@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use ndn_app::{EngineAppExt, EngineBuilder};
 use ndn_engine::EngineConfig;
-use ndn_face_ble_adv::{BleAdvFace, SharedBleBackend};
+use ndn_face_ble_adv::{BlePhy, SharedBleBackend};
 use ndn_packet::Name;
 use ndn_packet::encode::DataBuilder;
 use ndn_radio_drivers::Esp32SerialBackend;
@@ -49,7 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     a_mux.set_ble_share(0.9, 256)?; // this demo is all-BLE; give the scan the airtime
     let a_ble = Arc::new(SharedBleBackend::new(a_mux));
     let (engine_p, shutdown_p) = EngineBuilder::new(EngineConfig::default())
-        .face(BleAdvFace::new(BLE_FACE_A, a_ble)) // default NDNLPv2 framing → engine's LpLinkService
+        .face(BlePhy::new(BLE_FACE_A, a_ble)) // default NDNLPv2 framing → engine's LpLinkService
         .build()
         .await?;
     let cancel_p = CancellationToken::new();
@@ -63,7 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     b_mux.set_ble_share(0.9, 256)?;
     let b_ble = Arc::new(SharedBleBackend::new(b_mux));
     let (engine_c, shutdown_c) = EngineBuilder::new(EngineConfig::default())
-        .face(BleAdvFace::new(BLE_FACE_B, b_ble))
+        .face(BlePhy::new(BLE_FACE_B, b_ble))
         .build()
         .await?;
     engine_c.fib().add_nexthop(&prefix, BLE_FACE_B, 0); // /ndn/ble/eng → the BLE face

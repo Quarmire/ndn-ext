@@ -414,8 +414,7 @@ impl SelectionProviderEntry {
             let (typ, val) = r.read_tlv().map_err(|_| MsgError::Malformed)?;
             match typ {
                 PROVIDER_NAME => {
-                    provider_name =
-                        Some(as_str(&val)?.parse().map_err(|_| MsgError::Malformed)?);
+                    provider_name = Some(as_str(&val)?.parse().map_err(|_| MsgError::Malformed)?);
                 }
                 PROVIDER_TOKEN => provider_token_hash = as_str(&val)?,
                 ASSIGNMENT_PAYLOAD => assignment_payload = val,
@@ -489,7 +488,8 @@ impl SelectionMessage {
                 REQUEST_ID => m.request_id = as_str(&val)?,
                 ATTEMPT => m.attempt = as_nonneg(&val),
                 SELECTION_PROVIDER_ENTRY => {
-                    m.provider_entries.push(SelectionProviderEntry::decode(val)?);
+                    m.provider_entries
+                        .push(SelectionProviderEntry::decode(val)?);
                 }
                 _ => {}
             }

@@ -32,7 +32,12 @@ impl<S> tracing_subscriber::Layer<S> for LatLayer
 where
     S: tracing::Subscriber + for<'a> LookupSpan<'a>,
 {
-    fn on_new_span(&self, _a: &tracing::span::Attributes<'_>, id: &tracing::span::Id, ctx: Context<'_, S>) {
+    fn on_new_span(
+        &self,
+        _a: &tracing::span::Attributes<'_>,
+        id: &tracing::span::Id,
+        ctx: Context<'_, S>,
+    ) {
         if let Some(s) = ctx.span(id) {
             s.extensions_mut().insert(Instant::now());
         }
@@ -40,7 +45,12 @@ where
     fn on_close(&self, id: tracing::span::Id, ctx: Context<'_, S>) {
         if let Some(s) = ctx.span(&id) {
             if let Some(t0) = s.extensions().get::<Instant>() {
-                self.d.lock().unwrap().entry(s.name()).or_default().push(t0.elapsed().as_nanos() as u64);
+                self.d
+                    .lock()
+                    .unwrap()
+                    .entry(s.name())
+                    .or_default()
+                    .push(t0.elapsed().as_nanos() as u64);
             }
         }
     }
@@ -50,7 +60,9 @@ where
 struct Rng(u64);
 impl Rng {
     fn new(s: u64) -> Self {
-        Rng(s.wrapping_mul(0x243f_6a88_85a3_08d3).wrapping_add(0x9e37_79b9))
+        Rng(s
+            .wrapping_mul(0x243f_6a88_85a3_08d3)
+            .wrapping_add(0x9e37_79b9))
     }
     fn next(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
@@ -67,7 +79,12 @@ impl Rng {
     }
     fn zipf(&mut self, n: usize, s: f64) -> usize {
         // inverse-CDF-ish Zipf via rejection on a harmonic table (n small here).
-        let h: Vec<f64> = (1..=n).scan(0.0, |acc, k| { *acc += 1.0 / (k as f64).powf(s); Some(*acc) }).collect();
+        let h: Vec<f64> = (1..=n)
+            .scan(0.0, |acc, k| {
+                *acc += 1.0 / (k as f64).powf(s);
+                Some(*acc)
+            })
+            .collect();
         let target = self.f() * h[n - 1];
         h.iter().position(|&c| c >= target).unwrap_or(n - 1)
     }
@@ -152,11 +169,24 @@ const CLAMP: usize = 12; // deepest level encoded (raised from 8 to fit deep nam
 fn k_schedule(alloc: &str, level: usize, importance: &[f64]) -> usize {
     match alloc {
         "full" => 4,
-        "head3" => if level <= 3 { 4 } else { 0 },
-        "graduated" => match level { 1..=3 => 4, 4..=7 => 3, _ => 2 },
+        "head3" => {
+            if level <= 3 {
+                4
+            } else {
+                0
+            }
+        }
+        "graduated" => match level {
+            1..=3 => 4,
+            4..=7 => 3,
+            _ => 2,
+        },
         "importance" => {
             // 1..4 bits by the level's measured importance (registration frequency), floor 1.
-            let w = importance.get(level.saturating_sub(1)).copied().unwrap_or(0.0);
+            let w = importance
+                .get(level.saturating_sub(1))
+                .copied()
+                .unwrap_or(0.0);
             (1.0 + 3.0 * w).round().clamp(1.0, 4.0) as usize
         }
         _ => 4,
@@ -208,34 +238,48 @@ fn xor_pos(key: u64, i: usize, seed: u64, block: usize) -> usize {
     i * block + (hh(&key.to_le_bytes(), seed ^ (i as u64 * 0xabcd)) % block as u64) as usize
 }
 fn xor_build(name: &Name) -> Option<(Vec<u8>, usize, u64)> {
-    let keys: Vec<u64> = prefixes(name).iter().take(CLAMP).map(|p| hh(&slash(p), 0x777)).collect();
+    let keys: Vec<u64> = prefixes(name)
+        .iter()
+        .take(CLAMP)
+        .map(|p| hh(&slash(p), 0x777))
+        .collect();
     let n = keys.len();
     let block = ((1.23 * n as f64) as usize + 32).max(3) / 3 + 1;
     let cap = block * 3;
     for seed in 0..128u64 {
         let mut sets: Vec<Vec<usize>> = vec![Vec::new(); cap];
         for (ki, &k) in keys.iter().enumerate() {
-            for i in 0..3 { sets[xor_pos(k, i, seed, block)].push(ki); }
+            for i in 0..3 {
+                sets[xor_pos(k, i, seed, block)].push(ki);
+            }
         }
         let mut stack: Vec<(usize, usize)> = Vec::new();
         let mut queue: Vec<usize> = (0..cap).filter(|&s| sets[s].len() == 1).collect();
         let mut removed = vec![false; n];
         while let Some(s) = queue.pop() {
             let live: Vec<usize> = sets[s].iter().copied().filter(|&ki| !removed[ki]).collect();
-            if live.len() != 1 { continue; }
+            if live.len() != 1 {
+                continue;
+            }
             let ki = live[0];
             removed[ki] = true;
             stack.push((ki, s));
             for i in 0..3 {
                 let s2 = xor_pos(keys[ki], i, seed, block);
-                if sets[s2].iter().copied().filter(|&x| !removed[x]).count() == 1 { queue.push(s2); }
+                if sets[s2].iter().copied().filter(|&x| !removed[x]).count() == 1 {
+                    queue.push(s2);
+                }
             }
         }
-        if stack.len() != n { continue; }
+        if stack.len() != n {
+            continue;
+        }
         let mut table = vec![0u8; cap];
         for &(ki, s) in stack.iter().rev() {
             let fp = (hh(&keys[ki].to_le_bytes(), 0x5eed) & 0xff) as u8;
-            let x: u8 = (0..3).map(|i| xor_pos(keys[ki], i, seed, block)).filter(|&p| p != s)
+            let x: u8 = (0..3)
+                .map(|i| xor_pos(keys[ki], i, seed, block))
+                .filter(|&p| p != s)
                 .fold(fp, |a, p| a ^ table[p]);
             table[s] = x;
         }
@@ -261,22 +305,38 @@ fn main() {
     let corpus = gen_corpus(1, 20_000);
     let dmode = {
         let mut h = HashMap::new();
-        for &d in &corpus.depths { *h.entry(d).or_insert(0u32) += 1; }
+        for &d in &corpus.depths {
+            *h.entry(d).or_insert(0u32) += 1;
+        }
         let (mut best, mut bc) = (0, 0);
-        for (d, c) in h { if c > bc { bc = c; best = d; } }
+        for (d, c) in h {
+            if c > bc {
+                bc = c;
+                best = d;
+            }
+        }
         best
     };
     let avg_depth = corpus.depths.iter().sum::<usize>() as f64 / corpus.depths.len() as f64;
-    println!("Corpus: {} names, avg depth {:.1}, modal depth {}, {} FIB prefixes.",
-        corpus.names.len(), avg_depth, dmode, corpus.fib.len());
+    println!(
+        "Corpus: {} names, avg depth {:.1}, modal depth {}, {} FIB prefixes.",
+        corpus.names.len(),
+        avg_depth,
+        dmode,
+        corpus.fib.len()
+    );
 
     // Importance profile = registration frequency at each depth (calibration pass).
     let mut imp = vec![0.0f64; CLAMP];
     for f in &corpus.fib {
-        for j in 0..f.len().min(CLAMP) { imp[j] += 1.0; }
+        for j in 0..f.len().min(CLAMP) {
+            imp[j] += 1.0;
+        }
     }
     let maxi = imp.iter().cloned().fold(0.0, f64::max).max(1.0);
-    for x in imp.iter_mut() { *x /= maxi; }
+    for x in imp.iter_mut() {
+        *x /= maxi;
+    }
 
     // ---------- Sweep 1: DEPTH (FP vs name depth, full Bloom m=94) ----------
     {
@@ -285,7 +345,9 @@ fn main() {
         let m = 94u64;
         // bucket corpus names by depth
         let mut by_depth: HashMap<usize, Vec<&Name>> = HashMap::new();
-        for nm in &corpus.names { by_depth.entry(nm.len()).or_default().push(nm); }
+        for nm in &corpus.names {
+            by_depth.entry(nm.len()).or_default().push(nm);
+        }
         let mut depths: Vec<usize> = by_depth.keys().copied().collect();
         depths.sort_unstable();
         for d in depths {
@@ -298,12 +360,20 @@ fn main() {
                 let dr = &corpus.fib[(t + 7) % corpus.fib.len()];
                 if !nm.starts_with(&dr[..dr.len().min(nm.len())]) {
                     let mask = bloom_mask(dr, m, 4);
-                    if f & mask == mask { fp += 1; }
+                    if f & mask == mask {
+                        fp += 1;
+                    }
                     trials += 1;
                 }
             }
             let n = names.len().min(4000) as u64;
-            writeln!(w, "{d},{:.2},{:.5}", bits as f64 / n.max(1) as f64, fp as f64 / trials.max(1) as f64).unwrap();
+            writeln!(
+                w,
+                "{d},{:.2},{:.5}",
+                bits as f64 / n.max(1) as f64,
+                fp as f64 / trials.max(1) as f64
+            )
+            .unwrap();
         }
         println!("wrote depth.csv");
     }
@@ -329,7 +399,9 @@ fn main() {
                         fnn += 1; // level not encoded ⇒ receiver at this depth misses it
                     } else {
                         let mask = bloom_mask(&nm[..jr], m, k);
-                        if f & mask != mask { fnn += 1; }
+                        if f & mask != mask {
+                            fnn += 1;
+                        }
                     }
                 }
                 // FP: a disjoint FIB prefix (different root).
@@ -338,12 +410,20 @@ fn main() {
                     let k = k_schedule(alloc, dr.len(), &imp).max(1);
                     let mask = bloom_mask(dr, m, k);
                     fptot += 1;
-                    if f & mask == mask { fp += 1; }
+                    if f & mask == mask {
+                        fp += 1;
+                    }
                 }
             }
             let n = corpus.names.len().min(8000) as u64;
-            writeln!(w, "{alloc},{:.2},{:.5},{:.5}", bits as f64 / n as f64,
-                fnn as f64 / fntot.max(1) as f64, fp as f64 / fptot.max(1) as f64).unwrap();
+            writeln!(
+                w,
+                "{alloc},{:.2},{:.5},{:.5}",
+                bits as f64 / n as f64,
+                fnn as f64 / fntot.max(1) as f64,
+                fp as f64 / fptot.max(1) as f64
+            )
+            .unwrap();
         }
         println!("wrote allocation.csv");
     }
@@ -354,15 +434,20 @@ fn main() {
         writeln!(w, "structure,target_fp,avg_bits,measured_fp,measured_fn").unwrap();
         for (tgt, mgol, k, m) in [("1pct", 100u64, 7usize, 128u64), ("0.1pct", 1000, 10, 256)] {
             // Bloom at optimal k, m sized to ~ same target.
-            let (mut b_bits, mut b_fp, mut b_fpt, mut b_fn, mut b_fnt) = (0u64, 0u64, 0u64, 0u64, 0u64);
-            let (mut g_bits, mut g_fp, mut g_fpt, mut g_fn, mut g_fnt) = (0u64, 0u64, 0u64, 0u64, 0u64);
-            let (mut x_bits, mut x_fp, mut x_fpt, mut x_fn, mut x_fnt, mut x_ok) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+            let (mut b_bits, mut b_fp, mut b_fpt, mut b_fn, mut b_fnt) =
+                (0u64, 0u64, 0u64, 0u64, 0u64);
+            let (mut g_bits, mut g_fp, mut g_fpt, mut g_fn, mut g_fnt) =
+                (0u64, 0u64, 0u64, 0u64, 0u64);
+            let (mut x_bits, mut x_fp, mut x_fpt, mut x_fn, mut x_fnt, mut x_ok) =
+                (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
             for (t, nm) in corpus.names.iter().enumerate().take(6000) {
                 // Bloom (m bits, k) — but m as u128 cap 128; use m up to 128 for 1pct, 256 needs bigger -> use bit array.
                 // Use a Vec<bool> bloom to allow m>128.
                 let mut bf = vec![false; m as usize];
                 for pfx in prefixes(nm).iter().take(CLAMP) {
-                    for i in 0..k { bf[(hh(&slash(pfx), 0x100 + i as u64) % m) as usize] = true; }
+                    for i in 0..k {
+                        bf[(hh(&slash(pfx), 0x100 + i as u64) % m) as usize] = true;
+                    }
                 }
                 b_bits += m; // fixed field
                 // GCS
@@ -370,38 +455,74 @@ fn main() {
                 g_bits += gb;
                 // xor
                 let xr = xor_build(nm);
-                if let Some((_, cap, _)) = xr { x_bits += (cap * 8) as u64; x_ok += 1; }
+                if let Some((_, cap, _)) = xr {
+                    x_bits += (cap * 8) as u64;
+                    x_ok += 1;
+                }
 
                 // genuine prefix (root, depth 3) — must match (FN check)
                 let gp = &nm[..3.min(nm.len())];
                 let gpk = hh(&slash(gp), 0x777);
                 b_fnt += 1;
-                if !(0..k).all(|i| bf[(hh(&slash(gp), 0x100 + i as u64) % m) as usize]) { b_fn += 1; }
+                if !(0..k).all(|i| bf[(hh(&slash(gp), 0x100 + i as u64) % m) as usize]) {
+                    b_fn += 1;
+                }
                 g_fnt += 1;
-                if ghs.binary_search(&(hh(&slash(gp), 0xC5) % gu)).is_err() { g_fn += 1; }
+                if ghs.binary_search(&(hh(&slash(gp), 0xC5) % gu)).is_err() {
+                    g_fn += 1;
+                }
                 if let Some((ref tbl, cap, sd)) = xr {
                     x_fnt += 1;
-                    if !xor_contains(tbl, cap, sd, gpk) { x_fn += 1; }
+                    if !xor_contains(tbl, cap, sd, gpk) {
+                        x_fn += 1;
+                    }
                 }
                 // disjoint prefix (FP check)
                 let dr = &corpus.fib[(t + 11) % corpus.fib.len()];
                 if !nm.starts_with(&dr[..dr.len().min(nm.len())]) {
                     let drk = hh(&slash(dr), 0x777);
                     b_fpt += 1;
-                    if (0..k).all(|i| bf[(hh(&slash(dr), 0x100 + i as u64) % m) as usize]) { b_fp += 1; }
+                    if (0..k).all(|i| bf[(hh(&slash(dr), 0x100 + i as u64) % m) as usize]) {
+                        b_fp += 1;
+                    }
                     g_fpt += 1;
-                    if ghs.binary_search(&(hh(&slash(dr), 0xC5) % gu)).is_ok() { g_fp += 1; }
+                    if ghs.binary_search(&(hh(&slash(dr), 0xC5) % gu)).is_ok() {
+                        g_fp += 1;
+                    }
                     if let Some((ref tbl, cap, sd)) = xr {
                         x_fpt += 1;
-                        if xor_contains(tbl, cap, sd, drk) { x_fp += 1; }
+                        if xor_contains(tbl, cap, sd, drk) {
+                            x_fp += 1;
+                        }
                     }
                 }
             }
             let n = corpus.names.len().min(6000) as u64;
             let np = CLAMP as u64; // ~prefixes per name
-            writeln!(w, "bloom,{tgt},{:.2},{:.5},{:.5}", b_bits as f64 / n as f64 / np as f64, b_fp as f64 / b_fpt.max(1) as f64, b_fn as f64 / b_fnt.max(1) as f64).unwrap();
-            writeln!(w, "gcs,{tgt},{:.2},{:.5},{:.5}", g_bits as f64 / n as f64 / np as f64, g_fp as f64 / g_fpt.max(1) as f64, g_fn as f64 / g_fnt.max(1) as f64).unwrap();
-            writeln!(w, "xor,{tgt},{:.2},{:.5},{:.5}", x_bits as f64 / x_ok.max(1) as f64 / np as f64, x_fp as f64 / x_fpt.max(1) as f64, x_fn as f64 / x_fnt.max(1) as f64).unwrap();
+            writeln!(
+                w,
+                "bloom,{tgt},{:.2},{:.5},{:.5}",
+                b_bits as f64 / n as f64 / np as f64,
+                b_fp as f64 / b_fpt.max(1) as f64,
+                b_fn as f64 / b_fnt.max(1) as f64
+            )
+            .unwrap();
+            writeln!(
+                w,
+                "gcs,{tgt},{:.2},{:.5},{:.5}",
+                g_bits as f64 / n as f64 / np as f64,
+                g_fp as f64 / g_fpt.max(1) as f64,
+                g_fn as f64 / g_fnt.max(1) as f64
+            )
+            .unwrap();
+            writeln!(
+                w,
+                "xor,{tgt},{:.2},{:.5},{:.5}",
+                x_bits as f64 / x_ok.max(1) as f64 / np as f64,
+                x_fp as f64 / x_fpt.max(1) as f64,
+                x_fn as f64 / x_fnt.max(1) as f64
+            )
+            .unwrap();
         }
         println!("wrote structure.csv");
     }
@@ -478,11 +599,16 @@ fn main() {
                 writeln!(
                     w,
                     "{{\"trace\":\"{}\",\"span\":\"{}\",\"data_wire_bytes\":{}}}",
-                    hex(trace), hex(span), wire.len()
-                ).unwrap();
+                    hex(trace),
+                    hex(span),
+                    wire.len()
+                )
+                .unwrap();
             }
         }
-        println!("OTLP-in-Data: {total} spans produced through ndn-observability; sampled 20 → traces.ndjson");
+        println!(
+            "OTLP-in-Data: {total} spans produced through ndn-observability; sampled 20 → traces.ndjson"
+        );
     }
     println!("Sweeps done. ID sweep is id_deconflict.rs; all data under {dir}/.");
 }

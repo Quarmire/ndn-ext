@@ -52,11 +52,11 @@ const PONG: usize = 64; // consumer → producer (own cache line)
 #[cfg(unix)]
 fn producer() {
     use ndn_face_shm::{SharedBuffer, send_fds};
+    use portable_atomic::AtomicU64;
     use std::io::{Read, Write};
     use std::os::unix::io::AsRawFd;
     use std::os::unix::net::UnixListener;
     use std::sync::atomic::Ordering;
-    use portable_atomic::AtomicU64;
     use std::time::Instant;
 
     let path = format!("/tmp/.ndn-zc-demo-{}.sock", std::process::id());
@@ -170,12 +170,12 @@ fn producer() {
 #[cfg(unix)]
 fn consumer(sock_path: &str) {
     use ndn_face_shm::{SharedBuffer, recv_fds};
+    use portable_atomic::AtomicU64;
     use std::hint::black_box;
     use std::io::{Read, Write};
     use std::os::unix::io::AsRawFd;
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::Ordering;
-    use portable_atomic::AtomicU64;
 
     let mut sock = UnixStream::connect(sock_path).unwrap();
 

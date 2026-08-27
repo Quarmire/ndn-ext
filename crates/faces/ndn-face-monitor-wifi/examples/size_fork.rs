@@ -1,7 +1,7 @@
 //! Task #25's unresolved fork, in one probe: is the >=2200 B cliff **TX or RX**?
 //!
 //! Every hypothesis so far quietly assumed one side. This decides it, below both
-//! `MonitorWifiFace` and NDNLPv2 — just raw 802.11 data frames at a size sweep.
+//! `WifiPhy` and NDNLPv2 — just raw 802.11 data frames at a size sweep.
 //!
 //!   tx  — inject N data frames at each of 800/1400/1800/2200/2600/3000 B, tagged
 //!         so the peer can size them from the payload alone.

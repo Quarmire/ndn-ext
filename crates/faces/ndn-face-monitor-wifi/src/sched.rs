@@ -30,12 +30,12 @@
 //!   fixed owner-only slots. Best on the sub-µs `cv` clock, where µs slots + µs guards make it tight.
 //! Unset ⇒ scheduler disabled ⇒ the send path is byte-for-byte unchanged.
 
+use portable_atomic::AtomicU64;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
-use portable_atomic::AtomicU64;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ndn_radio_cognition::{LeaseClass, HopSchedule, SlotSchedule, prefix_hash, wifi_airtime_us};
+use ndn_radio_cognition::{HopSchedule, LeaseClass, SlotSchedule, prefix_hash, wifi_airtime_us};
 
 use crate::radio::{Bandwidth, RadioKnobs};
 use ndn_frame_io::LinkStamp;
@@ -166,7 +166,10 @@ impl GroupTable {
             });
         }
         entries.sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
-        Self { entries, slot_depth: depth }
+        Self {
+            entries,
+            slot_depth: depth,
+        }
     }
 
     /// Mark the entries matching `prefixes` as [`LeaseClass::Latency`] (#93): placed among the
@@ -178,7 +181,10 @@ impl GroupTable {
             // Truncate the caller's prefixes to the shared slot depth before comparing, so a latency
             // registration deeper than the slot granularity still marks its slot group. If two
             // registrations under one slot group disagree, latency wins (the safer lane).
-            if prefixes.iter().any(|p| slot_trunc(p.as_ref(), depth).0 == e.prefix) {
+            if prefixes
+                .iter()
+                .any(|p| slot_trunc(p.as_ref(), depth).0 == e.prefix)
+            {
                 e.class = LeaseClass::Latency;
             }
         }
@@ -203,7 +209,10 @@ impl GroupTable {
     /// Slot key + class for a received Tier-0 filter: first (= longest) registered mask it may be
     /// under.
     fn hash_for_filter(&self, f: &crate::PrefixFilter) -> Option<(u64, LeaseClass)> {
-        self.entries.iter().find(|e| f.may_match(&e.mask)).map(|e| (e.hash, e.class))
+        self.entries
+            .iter()
+            .find(|e| f.may_match(&e.mask))
+            .map(|e| (e.hash, e.class))
     }
 }
 
@@ -213,7 +222,10 @@ impl GroupTable {
 /// depends on how deep a given node happened to register. Used by [`GroupTable`] construction and the
 /// scheduler's no-table fallback, so both derive the same key for the same name.
 fn slot_trunc(slash: &[u8], depth: usize) -> (Vec<u8>, u64) {
-    let comps: Vec<&[u8]> = slash.split(|&b| b == b'/').filter(|c| !c.is_empty()).collect();
+    let comps: Vec<&[u8]> = slash
+        .split(|&b| b == b'/')
+        .filter(|c| !c.is_empty())
+        .collect();
     let take = depth.max(1).min(comps.len());
     let mut out = Vec::new();
     for c in &comps[..take] {
@@ -291,10 +303,17 @@ impl SchedParams {
         hop: Option<&HopSchedule>,
     ) -> Self {
         let (slot_us, slots, reserved) = slot
-            .map(|s| (s.slot_us() as u32, s.slots() as u16, s.reserved_slots() as u16))
+            .map(|s| {
+                (
+                    s.slot_us() as u32,
+                    s.slots() as u16,
+                    s.reserved_slots() as u16,
+                )
+            })
             .unwrap_or((0, 0, 0));
-        let (hop_dwell_us, channels_digest) =
-            hop.map(|h| (h.dwell_us() as u32, fnv32(h.classes()))).unwrap_or((0, 0));
+        let (hop_dwell_us, channels_digest) = hop
+            .map(|h| (h.dwell_us() as u32, fnv32(h.classes())))
+            .unwrap_or((0, 0));
         Self {
             version: SCHED_PARAMS_VERSION,
             slot_depth,
@@ -326,7 +345,10 @@ impl SchedParams {
         self.slots.to_le_bytes().iter().for_each(|b| mix(*b));
         self.reserved.to_le_bytes().iter().for_each(|b| mix(*b));
         self.hop_dwell_us.to_le_bytes().iter().for_each(|b| mix(*b));
-        self.channels_digest.to_le_bytes().iter().for_each(|b| mix(*b));
+        self.channels_digest
+            .to_le_bytes()
+            .iter()
+            .for_each(|b| mix(*b));
         h
     }
 }
@@ -380,7 +402,6 @@ pub const TIME_BEACON_MAGIC: [u8; 3] = [0x7E, b'T', b'B'];
 /// continuously known, short enough that a departed neighbour stops vetoing claims within one
 /// human-noticeable beat.
 const PRESENCE_WINDOW_US: u64 = 5_000_000;
-
 
 /// How many frame-airtimes wide the CCLF draw is. The draw only has to order contenders far enough
 /// apart that the loser hears the winner and cancels; 8 gives a handful of separable positions
@@ -580,9 +601,12 @@ impl FaceScheduler {
             Some("cv") | Some("common-view") => ClockSource::CommonView,
             _ => ClockSource::Wall,
         };
-        let slot =
-            std::env::var("NDN_SCHED_SLOT").ok().and_then(|s| parse_slot(&s, mtu, clock_source));
-        let hop = std::env::var("NDN_SCHED_HOP").ok().and_then(|s| parse_hop(&s));
+        let slot = std::env::var("NDN_SCHED_SLOT")
+            .ok()
+            .and_then(|s| parse_slot(&s, mtu, clock_source));
+        let hop = std::env::var("NDN_SCHED_HOP")
+            .ok()
+            .and_then(|s| parse_hop(&s));
         if slot.is_none() && hop.is_none() {
             return None;
         }
@@ -594,9 +618,16 @@ impl FaceScheduler {
         // Our node id for the network-reference election (#75): lowest id wins. Default u64::MAX = "never
         // the reference, always sync to a neighbour" (a pure follower); a node meant to be a candidate
         // sets its ephemeral nonce here via NDN_SCHED_NODE_ID.
-        let node_id: u64 = std::env::var("NDN_SCHED_NODE_ID").ok().and_then(|s| s.parse().ok()).unwrap_or(u64::MAX);
+        let node_id: u64 = std::env::var("NDN_SCHED_NODE_ID")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(u64::MAX);
         // One evidence cell per slot in the superframe (1 when there is no slot schedule at all).
-        let slot_count = slot.as_ref().map(|s| s.slots() as usize).unwrap_or(1).max(1);
+        let slot_count = slot
+            .as_ref()
+            .map(|s| s.slots() as usize)
+            .unwrap_or(1)
+            .max(1);
         // Capture the shared schedule pin (D2) from the parsed inputs BEFORE they move into the
         // struct. slot_depth defaults to 1; `with_groups` syncs it up if a deeper table is attached.
         let sched_params = SchedParams::capture(1, clock_source, slot.as_ref(), hop.as_ref());
@@ -788,8 +819,18 @@ impl FaceScheduler {
     ///
     /// [`ingest_common_view`]: Self::ingest_common_view
     pub fn ingest_mesh_beacon(&self, peer_tsf: u64, our_rxtsfl: u64, bssid: [u8; 6]) {
-        let ref_id = u64::from_le_bytes([bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5], 0, 0]);
-        self.ingest_common_view(peer_tsf, our_rxtsfl, RefBelief { ref_id, stratum: 0, offset_to_ref: 0 });
+        let ref_id = u64::from_le_bytes([
+            bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5], 0, 0,
+        ]);
+        self.ingest_common_view(
+            peer_tsf,
+            our_rxtsfl,
+            RefBelief {
+                ref_id,
+                stratum: 0,
+                offset_to_ref: 0,
+            },
+        );
     }
 
     /// A one-line description of the active schedule, for the face's startup log.
@@ -806,7 +847,11 @@ impl FaceScheduler {
             ));
         }
         if let Some(h) = &self.hop {
-            parts.push(format!("hop({:?}, dwell {}µs)", h.classes(), h.dwell_remaining_us(0)));
+            parts.push(format!(
+                "hop({:?}, dwell {}µs)",
+                h.classes(),
+                h.dwell_remaining_us(0)
+            ));
         }
         let role = if self.master { " [clock-master]" } else { "" };
         format!(
@@ -993,7 +1038,9 @@ impl FaceScheduler {
         // 2: too small collides claimants (they draw the same µs and neither hears the other in
         // time), too large only wastes airtime we were going to lose anyway.
         let detect = airtime_us.max(1);
-        let window = (slot_us / 2).max(1).min(detect.saturating_mul(CCLF_SPREAD).max(2));
+        let window = (slot_us / 2)
+            .max(1)
+            .min(detect.saturating_mul(CCLF_SPREAD).max(2));
         //
         // **`epoch` is mixed in so the winner rotates** (#87). Without it the jitter was a pure
         // function of the name: the same claimant drew the same, smallest delay every idle slot and
@@ -1087,7 +1134,13 @@ impl FaceScheduler {
     ///
     /// Covers both halves of #95: continuing a hold we already won, and starting a fresh CCLF
     /// election for an idle slot whose owner we can hear.
-    async fn try_claim(&self, slot: &SlotSchedule, hash: u64, class: LeaseClass, airtime: u64) -> bool {
+    async fn try_claim(
+        &self,
+        slot: &SlotSchedule,
+        hash: u64,
+        class: LeaseClass,
+        airtime: u64,
+    ) -> bool {
         if !self.claimable {
             return false;
         }
@@ -1122,7 +1175,9 @@ impl FaceScheduler {
                 // A continuation is NOT an election: no jitter was paid, no contention happened.
                 // (claim_wins keeps counting it for compatibility with the +119% methodology's
                 // "attempts ≈ wins ⇒ throttled gate" diagnostic — documented at claim_counts.)
-                self.stats.hold_continuations.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .hold_continuations
+                    .fetch_add(1, Ordering::Relaxed);
                 self.stats.claim_wins.fetch_add(1, Ordering::Relaxed);
                 self.note_sent(hash);
                 return true; // still ours, still room — continue the burst.
@@ -1200,7 +1255,10 @@ impl FaceScheduler {
     /// diagnostic "attempts ≈ frames ⇒ throttled gate" depends on that meaning); for election cost
     /// use [`election_counts`](Self::election_counts).
     pub fn claim_counts(&self) -> (u64, u64) {
-        (self.stats.claim_attempts.load(Ordering::Relaxed), self.stats.claim_wins.load(Ordering::Relaxed))
+        (
+            self.stats.claim_attempts.load(Ordering::Relaxed),
+            self.stats.claim_wins.load(Ordering::Relaxed),
+        )
     }
 
     /// **Do we have live evidence that slot `k`'s owner is within earshot?** (#94), extracted so the
@@ -1216,9 +1274,17 @@ impl FaceScheduler {
     /// So the window is a presence timeout, with the superframe only as a floor: a schedule slower
     /// than the timeout must still let at least one silent turn pass without forgetting the owner.
     fn owner_in_range(&self, slot: &SlotSchedule, k: usize, now: u64) -> bool {
-        let last_heard = self.slots.heard.get(k).map(|c| c.load(Ordering::Relaxed)).unwrap_or(0);
-        let window =
-            PRESENCE_WINDOW_US.max(slot.slot_us().saturating_mul(slot.slots()).saturating_mul(2));
+        let last_heard = self
+            .slots
+            .heard
+            .get(k)
+            .map(|c| c.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        let window = PRESENCE_WINDOW_US.max(
+            slot.slot_us()
+                .saturating_mul(slot.slots())
+                .saturating_mul(2),
+        );
         if last_heard == 0 || now.saturating_sub(last_heard) > window {
             return false;
         }
@@ -1241,17 +1307,28 @@ impl FaceScheduler {
         // that case needs second-hand knowledge (the reception-report plane), not more local
         // inference. §2 nonce ROTATION also unlinks the two sightings once the nonce turns over,
         // reopening the window until the rotated nonce is seen twice again.
-        let nonce = self.slots.nonce.get(k).map(|c| c.load(Ordering::Relaxed)).unwrap_or(0);
+        let nonce = self
+            .slots
+            .nonce
+            .get(k)
+            .map(|c| c.load(Ordering::Relaxed))
+            .unwrap_or(0);
         if nonce == 0 {
             return true;
         }
         let elsewhere = self
-            .slots.nonce
+            .slots
+            .nonce
             .iter()
             .enumerate()
             .filter(|(j, c)| *j != k && c.load(Ordering::Relaxed) == nonce)
             .filter(|(j, _)| {
-                let t = self.slots.heard.get(*j).map(|c| c.load(Ordering::Relaxed)).unwrap_or(0);
+                let t = self
+                    .slots
+                    .heard
+                    .get(*j)
+                    .map(|c| c.load(Ordering::Relaxed))
+                    .unwrap_or(0);
                 t != 0 && now.saturating_sub(t) <= window
             })
             .count();
@@ -1264,23 +1341,35 @@ impl FaceScheduler {
     fn deferred_for(&self, prefix_hash: u64) -> u32 {
         let Some(slot) = &self.slot else { return 0 };
         let k = slot.owner_slot(prefix_hash) as usize;
-        self.slots.deferred.get(k).map(|c| c.load(Ordering::Relaxed)).unwrap_or(0)
+        self.slots
+            .deferred
+            .get(k)
+            .map(|c| c.load(Ordering::Relaxed))
+            .unwrap_or(0)
     }
 
     /// Record that a frame of this group had to wait — the demand signal accumulating.
     fn note_deferred(&self, prefix_hash: u64) {
         if let Some(slot) = &self.slot
-            && let Some(c) = self.slots.deferred.get(slot.owner_slot(prefix_hash) as usize)
+            && let Some(c) = self
+                .slots
+                .deferred
+                .get(slot.owner_slot(prefix_hash) as usize)
         {
             // Saturating: the backlog is a bias, not a counter anyone reads for magnitude.
-            let _ = c.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_add(1)));
+            let _ = c.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_add(1))
+            });
         }
     }
 
     /// This group got its turn — the backlog is spent.
     fn note_sent(&self, prefix_hash: u64) {
         if let Some(slot) = &self.slot
-            && let Some(c) = self.slots.deferred.get(slot.owner_slot(prefix_hash) as usize)
+            && let Some(c) = self
+                .slots
+                .deferred
+                .get(slot.owner_slot(prefix_hash) as usize)
         {
             c.store(0, Ordering::Relaxed);
         }
@@ -1309,14 +1398,23 @@ impl FaceScheduler {
         // pre-keying). `observe_rx` stores the witness at `owner_slot_in(medium_keyed(h))`, so this
         // reads the same cell iff it keys exactly once, as the caller already did.
         let k = slot.owner_slot_in(keyed, class) as usize;
-        let witness = self.slots.co_owner_hash.get(k).map(|c| c.load(Ordering::Relaxed)).unwrap_or(0);
+        let witness = self
+            .slots
+            .co_owner_hash
+            .get(k)
+            .map(|c| c.load(Ordering::Relaxed))
+            .unwrap_or(0);
         if witness == 0 || witness == keyed {
             return false; // nothing heard here, or only our own group — no co-owner
         }
-        let heard = self.slots.heard.get(k).map(|c| c.load(Ordering::Relaxed)).unwrap_or(0);
+        let heard = self
+            .slots
+            .heard
+            .get(k)
+            .map(|c| c.load(Ordering::Relaxed))
+            .unwrap_or(0);
         now.saturating_sub(heard) < PRESENCE_WINDOW_US
     }
-
 
     /// How many times the D1 shared-slot backoff fired — the on-air signal that `hash % N` co-ownership
     /// was locally detected and turn-taking was bought instead of a deaf collision. `0` in the common
@@ -1350,13 +1448,21 @@ impl FaceScheduler {
     /// A one-shot snapshot of the common-view time state — `(now_us, hw_synced, offset_us)`.
     pub fn time_status(&self) -> TimeStatus {
         let offset_us = self.cv_offset_us();
-        TimeStatus { now_us: self.now_us(), hw_synced: offset_us.is_some(), offset_us }
+        TimeStatus {
+            now_us: self.now_us(),
+            hw_synced: offset_us.is_some(),
+            offset_us,
+        }
     }
 
     /// This node's current network-time belief (#75) — what it advertises in its own timing beacon so
     /// the next hop composes off it (`ref_id`, `stratum`, `offset_to_ref`).
     pub fn my_belief(&self) -> RefBelief {
-        self.net.lock().map(|n| n.belief()).unwrap_or(RefBelief { ref_id: u64::MAX, stratum: 0, offset_to_ref: 0 })
+        self.net.lock().map(|n| n.belief()).unwrap_or(RefBelief {
+            ref_id: u64::MAX,
+            stratum: 0,
+            offset_to_ref: 0,
+        })
     }
 
     /// The common-view epoch clock, in microseconds.
@@ -1369,7 +1475,10 @@ impl FaceScheduler {
                 .saturating_add_signed(self.clock_skew_us),
             ClockSource::Hardware => {
                 let host_now = self.base.elapsed().as_micros() as u64;
-                self.hw.lock().map(|hw| hw.now(host_now)).unwrap_or(host_now)
+                self.hw
+                    .lock()
+                    .map(|hw| hw.now(host_now))
+                    .unwrap_or(host_now)
             }
             ClockSource::CommonView => {
                 let host_now = self.base.elapsed().as_micros() as u64;
@@ -1377,10 +1486,17 @@ impl FaceScheduler {
                 // been heard: our local hardware clock projected onto the peer's timeline. Fall back to
                 // the software beacon (ms) until then.
                 if let Some(off) = self.cv_hw.lock().ok().and_then(|o| *o) {
-                    let local = self.hw.lock().map(|hw| hw.now(host_now)).unwrap_or(host_now);
+                    let local = self
+                        .hw
+                        .lock()
+                        .map(|hw| hw.now(host_now))
+                        .unwrap_or(host_now);
                     (local as i64).wrapping_add(off) as u64
                 } else {
-                    self.cv.lock().map(|cv| cv.now(host_now)).unwrap_or(host_now)
+                    self.cv
+                        .lock()
+                        .map(|cv| cv.now(host_now))
+                        .unwrap_or(host_now)
                 }
             }
         }
@@ -1411,7 +1527,8 @@ impl FaceScheduler {
     /// deployment is byte-for-byte unaffected — this is a pure opt-in fast path.
     pub fn hw_slot_wait(&self, wire: &[u8]) -> Option<u64> {
         static HW_TX: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let on = *HW_TX.get_or_init(|| std::env::var("NDN_SCHED_HW_TX").ok().as_deref() == Some("1"));
+        let on =
+            *HW_TX.get_or_init(|| std::env::var("NDN_SCHED_HW_TX").ok().as_deref() == Some("1"));
         if !on {
             return None;
         }
@@ -1495,11 +1612,14 @@ impl FaceScheduler {
                         return;
                     }
                     let slot_start = slot.slot_start_us(now);
-                    let jitter = self.cclf_jitter_us(hash, slot.slot_us(), slot.epoch(now), airtime);
+                    let jitter =
+                        self.cclf_jitter_us(hash, slot.slot_us(), slot.epoch(now), airtime);
                     // Only back off if the jittered wait AND the frame still fit; otherwise take the
                     // turn rather than let the draw push the frame across the boundary (#84).
                     if slot.slot_remaining_us(now) > jitter + airtime {
-                        self.stats.shared_slot_backoffs.fetch_add(1, Ordering::Relaxed);
+                        self.stats
+                            .shared_slot_backoffs
+                            .fetch_add(1, Ordering::Relaxed);
                         tokio::time::sleep(Duration::from_micros(jitter)).await;
                         if self.last_domain_rx.load(Ordering::Relaxed) < slot_start {
                             // Still idle after our draw — no co-owner beat us; take the turn.
@@ -1615,7 +1735,10 @@ impl FaceScheduler {
         }
         let h = self.name_group_hash(wire)?; // cold path: first sighting only
         if learned.len() >= LEARNED_GROUP_CAP
-            && let Some(oldest) = learned.iter().min_by_key(|(_, (_, seen))| *seen).map(|(k, _)| *k)
+            && let Some(oldest) = learned
+                .iter()
+                .min_by_key(|(_, (_, seen))| *seen)
+                .map(|(k, _)| *k)
         {
             // Oldest-last-heard first = LRU = presence-pinning in one rule: a presence-active
             // group is by definition recently heard, so it is never the eviction victim.
@@ -1677,8 +1800,12 @@ fn name_components(name_tlv: &[u8], depth: usize) -> Vec<&[u8]> {
     let end = (start + len as usize).min(name_tlv.len());
     let mut body = &name_tlv[start.min(name_tlv.len())..end];
     while out.len() < depth && !body.is_empty() {
-        let Ok((_ct, ctn)) = ndn_tlv::read_varu64(body) else { break };
-        let Ok((clen, cln)) = ndn_tlv::read_varu64(&body[ctn.min(body.len())..]) else { break };
+        let Ok((_ct, ctn)) = ndn_tlv::read_varu64(body) else {
+            break;
+        };
+        let Ok((clen, cln)) = ndn_tlv::read_varu64(&body[ctn.min(body.len())..]) else {
+            break;
+        };
         let vstart = ctn + cln;
         let vend = vstart + clen as usize;
         if vend > body.len() {
@@ -1717,7 +1844,11 @@ fn parse_slot(s: &str, mtu: usize, clock: ClockSource) -> Option<SlotSchedule> {
         }
         None => {
             let n: u64 = s.trim().parse().ok()?;
-            Some(SlotSchedule::from_airtime(mtu_airtime_us(mtu), clock.guard_us(), n))
+            Some(SlotSchedule::from_airtime(
+                mtu_airtime_us(mtu),
+                clock.guard_us(),
+                n,
+            ))
         }
     };
     sched.map(|x| x.with_reserved_stride(stride))
@@ -1737,7 +1868,10 @@ fn mtu_airtime_us(mtu: usize) -> u64 {
 /// `NDN_SCHED_HOP=ch,ch,…:dwell_us`.
 fn parse_hop(s: &str) -> Option<HopSchedule> {
     let (chans, dwell) = s.split_once(':')?;
-    let classes: Vec<u8> = chans.split(',').filter_map(|c| c.trim().parse().ok()).collect();
+    let classes: Vec<u8> = chans
+        .split(',')
+        .filter_map(|c| c.trim().parse().ok())
+        .collect();
     if classes.is_empty() {
         return None;
     }
@@ -1818,8 +1952,14 @@ mod tests {
         b.ingest_mesh_beacon(5_000_000, 8_000_000, bssid);
         // Both now read the peer's timeline (~5_000_000 + their small elapsed) → same slot epoch.
         let (ea, eb) = (a.now_us() / 3000, b.now_us() / 3000);
-        assert_eq!(ea, eb, "hardware common-view did not align the two nodes' epochs");
-        assert!(a.now_us() >= 5_000_000, "should read the peer's hardware timeline, not the fallback");
+        assert_eq!(
+            ea, eb,
+            "hardware common-view did not align the two nodes' epochs"
+        );
+        assert!(
+            a.now_us() >= 5_000_000,
+            "should read the peer's hardware timeline, not the fallback"
+        );
     }
 
     #[test]
@@ -1856,14 +1996,20 @@ mod tests {
 
         // Within one slot the draw is deterministic — that is what lets every node compute the same
         // election with no message, since all share the common-view clock and so the same epoch.
-        assert_eq!(s.cclf_jitter_us(a, 3000, 7, 200), s.cclf_jitter_us(a, 3000, 7, 200));
+        assert_eq!(
+            s.cclf_jitter_us(a, 3000, 7, 200),
+            s.cclf_jitter_us(a, 3000, 7, 200)
+        );
         // Bounded to the front half of the slot, so a claim leaves room to transmit.
         for e in 0..64 {
             assert!(s.cclf_jitter_us(a, 3000, e, 200) < 1500);
             assert!(s.cclf_jitter_us(b, 3000, e, 200) < 1500);
         }
         // Different names draw an ordering within a slot.
-        assert_ne!(s.cclf_jitter_us(a, 3000, 7, 200), s.cclf_jitter_us(b, 3000, 7, 200));
+        assert_ne!(
+            s.cclf_jitter_us(a, 3000, 7, 200),
+            s.cclf_jitter_us(b, 3000, 7, 200)
+        );
 
         // **The winner must rotate** (#87). The jitter used to be a pure function of the name, so
         // whichever name folded to the smallest value won *every* idle slot, forever — starvation
@@ -1880,7 +2026,11 @@ mod tests {
                 .unwrap();
             *wins.entry(*winner).or_insert(0usize) += 1;
         }
-        assert_eq!(wins.len(), names.len(), "every name must win some slots, got {wins:?}");
+        assert_eq!(
+            wins.len(),
+            names.len(),
+            "every name must win some slots, got {wins:?}"
+        );
         let most = *wins.values().max().unwrap();
         assert!(
             most < 2_000 / 2,
@@ -1977,7 +2127,9 @@ mod tests {
         // Small frames are where the clock really pays: guard, not airtime, is the whole slot.
         let (small_wall, small_hw) = (
             parse_slot("8", 64, ClockSource::Wall).unwrap().slot_us(),
-            parse_slot("8", 64, ClockSource::Hardware).unwrap().slot_us(),
+            parse_slot("8", 64, ClockSource::Hardware)
+                .unwrap()
+                .slot_us(),
         );
         assert!(
             small_hw * 10 <= small_wall,
@@ -1995,7 +2147,11 @@ mod tests {
 
         // The explicit form still works — it is the debug-bisect escape hatch, not the default.
         let explicit = parse_slot("8:20000", 1500, ClockSource::Hardware).expect("explicit");
-        assert_eq!(explicit.slot_us(), 20_000, "an explicit width overrides the derivation");
+        assert_eq!(
+            explicit.slot_us(),
+            20_000,
+            "an explicit width overrides the derivation"
+        );
     }
 
     /// **A hop schedule the radio cannot serve must be refused, not attempted** (#97/#98).
@@ -2009,28 +2165,60 @@ mod tests {
     fn a_hop_the_radio_cannot_serve_is_refused() {
         use ndn_radio_cognition::RadioCapability;
         let wifi = RadioCapability::wifi_monitor_5ghz(vec![36, 40, 44]);
-        assert_eq!(wifi.retune_us, Some(16_000), "the measured ~16 ms set_channel");
+        assert_eq!(
+            wifi.retune_us,
+            Some(16_000),
+            "the measured ~16 ms set_channel"
+        );
 
         // A 20 ms dwell against a 16 ms retune: refused, and the hop schedule is gone.
-        let fast = FaceScheduler { hop: parse_hop("36,40,44:20000"), ..mk_claim_sched() };
-        assert!(fast.hop.is_some(), "fixture check: the schedule exists before vetting");
-        assert!(fast.vet_hop(&wifi).hop.is_none(), "a 16 ms retune cannot serve a 20 ms dwell");
+        let fast = FaceScheduler {
+            hop: parse_hop("36,40,44:20000"),
+            ..mk_claim_sched()
+        };
+        assert!(
+            fast.hop.is_some(),
+            "fixture check: the schedule exists before vetting"
+        );
+        assert!(
+            fast.vet_hop(&wifi).hop.is_none(),
+            "a 16 ms retune cannot serve a 20 ms dwell"
+        );
 
         // A 10 s dwell: 0.16% overhead, allowed. The point of a measured number over a boolean —
         // the same radio is un-hoppable at 20 ms and perfectly hoppable at 10 s.
-        let slow = FaceScheduler { hop: parse_hop("36,40,44:10000000"), ..mk_claim_sched() };
-        assert!(slow.vet_hop(&wifi).hop.is_some(), "16 ms against a 10 s dwell is free");
+        let slow = FaceScheduler {
+            hop: parse_hop("36,40,44:10000000"),
+            ..mk_claim_sched()
+        };
+        assert!(
+            slow.vet_hop(&wifi).hop.is_some(),
+            "16 ms against a 10 s dwell is free"
+        );
 
         // Never measured ⇒ refused. We do not silently pay an unknown cost.
         let lora = RadioCapability::lora(vec![0]);
         assert_eq!(lora.retune_us, None);
-        let unknown = FaceScheduler { hop: parse_hop("36,40,44:10000000"), ..mk_claim_sched() };
-        assert!(unknown.vet_hop(&lora).hop.is_none(), "an unmeasured retune cost is not a fast one");
+        let unknown = FaceScheduler {
+            hop: parse_hop("36,40,44:10000000"),
+            ..mk_claim_sched()
+        };
+        assert!(
+            unknown.vet_hop(&lora).hop.is_none(),
+            "an unmeasured retune cost is not a fast one"
+        );
 
         assert_eq!(wifi.can_hop(20_000), Some(false));
         assert_eq!(wifi.can_hop(10_000_000), Some(true));
-        assert_eq!(lora.can_hop(20_000), None, "unmeasured answers 'I cannot say', never a guess");
-        assert!(wifi.retune_overhead(20_000).unwrap() > 0.79, "80% of the dwell is retune");
+        assert_eq!(
+            lora.can_hop(20_000),
+            None,
+            "unmeasured answers 'I cannot say', never a guess"
+        );
+        assert!(
+            wifi.retune_overhead(20_000).unwrap() > 0.79,
+            "80% of the dwell is retune"
+        );
     }
 
     #[test]
@@ -2101,12 +2289,20 @@ mod tests {
             d
         };
         let owned = slot.owner_slot(
-            sched.medium_keyed(sched.name_group_hash(&wire).expect("the frame carries a name")),
+            sched.medium_keyed(
+                sched
+                    .name_group_hash(&wire)
+                    .expect("the frame carries a name"),
+            ),
         ) as usize;
 
         // Nothing heard yet: every slot's owner is unknown — the hidden-terminal case.
         assert!(
-            sched.slots.heard.iter().all(|c| c.load(super::Ordering::Relaxed) == 0),
+            sched
+                .slots
+                .heard
+                .iter()
+                .all(|c| c.load(super::Ordering::Relaxed) == 0),
             "no evidence before any frame is observed"
         );
 
@@ -2117,7 +2313,8 @@ mod tests {
             "hearing /ndn/alarm must mark the slot /ndn/alarm owns"
         );
         let others = sched
-            .slots.heard
+            .slots
+            .heard
             .iter()
             .enumerate()
             .filter(|(i, c)| *i != owned && c.load(super::Ordering::Relaxed) > 0)
@@ -2167,12 +2364,21 @@ mod tests {
             "but it must still be counted, or an on-air run cannot tell a busy slot from a busy channel"
         );
         assert!(
-            sched.slots.heard.iter().all(|c| c.load(super::Ordering::Relaxed) == 0),
+            sched
+                .slots
+                .heard
+                .iter()
+                .all(|c| c.load(super::Ordering::Relaxed) == 0),
             "and it is evidence about nobody's presence"
         );
 
         // The contrast: a frame of ours does mark it, so this is a discrimination and not a mute.
-        sched.observe_rx(Some(&ndn_radio_hal::BROADCAST), None, None, &data_wire(&[b"ndn", b"alarm"]));
+        sched.observe_rx(
+            Some(&ndn_radio_hal::BROADCAST),
+            None,
+            None,
+            &data_wire(&[b"ndn", b"alarm"]),
+        );
         assert!(
             sched.last_domain_rx.load(super::Ordering::Relaxed) > 0,
             "our own domain's traffic must still mark the slot taken"
@@ -2208,7 +2414,10 @@ mod tests {
             "evidence must expire, or a node that left keeps its slot reserved forever"
         );
         // And never-heard is never known — the hidden-terminal case #94 exists for.
-        assert!(!sched.owner_in_range(slot, 5, 1_000_000), "silence from an unheard owner is not evidence");
+        assert!(
+            !sched.owner_in_range(slot, 5, 1_000_000),
+            "silence from an unheard owner is not evidence"
+        );
     }
 
     /// **The CCLF draw must not spend the slot it is competing for** — suppressor three.
@@ -2234,7 +2443,10 @@ mod tests {
                 airtime * CCLF_SPREAD,
                 slot_us / 2
             );
-            assert!(d >= 1, "and is never zero — zero is a collision, not an ordering");
+            assert!(
+                d >= 1,
+                "and is never zero — zero is a collision, not an ordering"
+            );
         }
 
         // The cap still binds the other way: a frame so long that 8 airtimes exceed half the slot
@@ -2307,7 +2519,10 @@ mod tests {
         s.gate(&wire).await;
 
         let (attempts, wins) = s.claim_counts();
-        assert_eq!(wins, 0, "fixture check: with no presence evidence nothing may be claimed");
+        assert_eq!(
+            wins, 0,
+            "fixture check: with no presence evidence nothing may be claimed"
+        );
         assert!(
             attempts >= 3,
             "a frame waiting ~4 slots must contend for each one it passes; it contended {attempts} \
@@ -2336,7 +2551,11 @@ mod tests {
         // lease is 3 base slots — the geometry stops it, nobody has to signal.
         let start = slot.slot_us(); // slot 1
         let deadline = slot.lease_deadline_us(start + 10, super::LeaseClass::Bulk, s.lease_max);
-        assert_eq!(deadline, start + 3 * slot.slot_us(), "1,2,3 open then 4 reserved");
+        assert_eq!(
+            deadline,
+            start + 3 * slot.slot_us(),
+            "1,2,3 open then 4 reserved"
+        );
         s.hold_slot_start.store(start, super::Ordering::Relaxed);
         s.lease_until.store(deadline, super::Ordering::Relaxed);
         s.last_domain_rx.store(start - 5, super::Ordering::Relaxed);
@@ -2364,8 +2583,12 @@ mod tests {
         // computing the same map rather than by anyone being told.
         s.last_domain_rx.store(start - 5, super::Ordering::Relaxed);
         let in_lane_4 = 4 * slot.slot_us() + 10;
-        s.lease_until.store(in_lane_4 + slot.slot_us(), super::Ordering::Relaxed); // pretend it ran on
-        assert!(slot.is_reserved(slot.current_slot(in_lane_4)), "fixture: slot 4 is a lane");
+        s.lease_until
+            .store(in_lane_4 + slot.slot_us(), super::Ordering::Relaxed); // pretend it ran on
+        assert!(
+            slot.is_reserved(slot.current_slot(in_lane_4)),
+            "fixture: slot 4 is a lane"
+        );
         assert_eq!(
             s.hold_status(&slot, slot.slot_start_us(in_lane_4), in_lane_4, air),
             HoldStatus::Ended,
@@ -2406,7 +2629,11 @@ mod tests {
 
         // Same channel ⇒ same medium ⇒ same schedule.
         let c = mk_claim_sched_slots("8:3000").with_operating_channel(Some(149));
-        assert_eq!(a.medium_keyed(name), c.medium_keyed(name), "one channel, one schedule");
+        assert_eq!(
+            a.medium_keyed(name),
+            c.medium_keyed(name),
+            "one channel, one schedule"
+        );
 
         // `None` keeps the sentinel — behaviour-preserving with the pre-fix default (a static radio
         // that names no channel keys exactly as it did before).
@@ -2440,30 +2667,49 @@ mod tests {
         // constant, not the per-node longest registration; both regs truncate to /ndn and dedup).
         let wire = data_wire(&[b"ndn", b"alarm", b"7"]);
         let tx_hash = s.name_group_hash(&wire).expect("keyed");
-        assert_eq!(tx_hash, prefix_hash(&[b"ndn".as_slice()]), "shared depth-1 group keys TX");
+        assert_eq!(
+            tx_hash,
+            prefix_hash(&[b"ndn".as_slice()]),
+            "shared depth-1 group keys TX"
+        );
 
         // RX path: the same object's Tier-0 bytes attribute to the same hash via mask AND — no parse
         // (the wire handed over is garbage on purpose: reaching the parser would panic the premise).
         let mut f = crate::PrefixFilter::default();
         f.insert_name(crate::bloom_key64(&key), b"/ndn/alarm/7");
         let w = f.to_wire();
-        let (rx_hash, _) =
-            s.attribute_filter(w, b"\xff not parseable", s.now_us()).expect("attributed");
-        assert_eq!(rx_hash, tx_hash, "RX mask attribution and TX keying disagree — two maps");
+        let (rx_hash, _) = s
+            .attribute_filter(w, b"\xff not parseable", s.now_us())
+            .expect("attributed");
+        assert_eq!(
+            rx_hash, tx_hash,
+            "RX mask attribution and TX keying disagree — two maps"
+        );
 
         // Foreign unicast (U/L=0 first octet): ambient at the origin gate, nothing marked.
         let mut foreign = w;
         foreign[0] = 0x00;
-        assert_eq!(s.attribute_filter(foreign, b"", s.now_us()), None, "foreign unicast is ambient");
+        assert_eq!(
+            s.attribute_filter(foreign, b"", s.now_us()),
+            None,
+            "foreign unicast is ambient"
+        );
 
         // Unregistered group: parse-once, then cache hits keep the slot claimable with no parse.
         let mut other = crate::PrefixFilter::default();
         other.insert_name(crate::bloom_key64(&key), b"/zzz/bulk");
         let ow = other.to_wire();
         let good_wire = data_wire(&[b"zzz", b"bulk"]);
-        let (first, _) = s.attribute_filter(ow, &good_wire, s.now_us()).expect("cold parse");
-        let (second, _) = s.attribute_filter(ow, b"unparseable", s.now_us()).expect("cache hit");
-        assert_eq!(first, second, "the learned cache must return the parsed hash");
+        let (first, _) = s
+            .attribute_filter(ow, &good_wire, s.now_us())
+            .expect("cold parse");
+        let (second, _) = s
+            .attribute_filter(ow, b"unparseable", s.now_us())
+            .expect("cache hit");
+        assert_eq!(
+            first, second,
+            "the learned cache must return the parsed hash"
+        );
     }
 
     /// **D3 regression — the slot key is shared across heterogeneous registration tables.** The roles
@@ -2475,17 +2721,26 @@ mod tests {
     fn slot_key_is_shared_across_heterogeneous_registrations() {
         let key = crate::GroupKey([7u8; 16]);
         let name = b"/ndn/x/y/z".as_slice();
-        let comps: Vec<&[u8]> =
-            name.split(|&c| c == b'/').filter(|c| !c.is_empty()).collect();
+        let comps: Vec<&[u8]> = name
+            .split(|&c| c == b'/')
+            .filter(|c| !c.is_empty())
+            .collect();
         for depth in [1usize, 2] {
             // Node A registered shallow, node B registered deep — different tables, same shared depth.
             let a = super::GroupTable::new_with_depth(&key, &[b"/ndn/x".as_slice()], depth);
             let b = super::GroupTable::new_with_depth(&key, &[b"/ndn/x/y".as_slice()], depth);
             let ka = a.hash_for_name(name).map(|(h, _)| h);
             let kb = b.hash_for_name(name).map(|(h, _)| h);
-            assert_eq!(ka, kb, "heterogeneous tables must key one name to one slot at depth {depth}");
+            assert_eq!(
+                ka, kb,
+                "heterogeneous tables must key one name to one slot at depth {depth}"
+            );
             // …and it is the NAME's shared depth-N group, independent of what was registered.
-            assert_eq!(ka, Some(prefix_hash(&comps[..depth])), "key = H(first {depth} name components)");
+            assert_eq!(
+                ka,
+                Some(prefix_hash(&comps[..depth])),
+                "key = H(first {depth} name components)"
+            );
         }
         // The pre-fix behaviour would have diverged: the deep node's OWN registration hashed elsewhere.
         let b2 = super::GroupTable::new_with_depth(&key, &[b"/ndn/x/y".as_slice()], 2);
@@ -2502,19 +2757,45 @@ mod tests {
     #[test]
     fn sched_params_digest_pins_the_shared_set() {
         let base = super::SchedParams::default();
-        assert_eq!(base.digest(), super::SchedParams::default().digest(), "same params, same digest");
+        assert_eq!(
+            base.digest(),
+            super::SchedParams::default().digest(),
+            "same params, same digest"
+        );
         // Each pinned field, changed alone, must change the digest.
         for m in [
-            super::SchedParams { slot_depth: 2, ..base },
+            super::SchedParams {
+                slot_depth: 2,
+                ..base
+            },
             super::SchedParams { clock: 2, ..base },
-            super::SchedParams { slot_us: 20_000, ..base },
+            super::SchedParams {
+                slot_us: 20_000,
+                ..base
+            },
             super::SchedParams { slots: 8, ..base },
-            super::SchedParams { reserved: 2, ..base },
-            super::SchedParams { hop_dwell_us: 3_000, ..base },
-            super::SchedParams { channels_digest: 0x1234_5678, ..base },
-            super::SchedParams { version: base.version + 1, ..base },
+            super::SchedParams {
+                reserved: 2,
+                ..base
+            },
+            super::SchedParams {
+                hop_dwell_us: 3_000,
+                ..base
+            },
+            super::SchedParams {
+                channels_digest: 0x1234_5678,
+                ..base
+            },
+            super::SchedParams {
+                version: base.version + 1,
+                ..base
+            },
         ] {
-            assert_ne!(base.digest(), m.digest(), "a change to {m:?} must move the digest");
+            assert_ne!(
+                base.digest(),
+                m.digest(),
+                "a change to {m:?} must move the digest"
+            );
         }
     }
 
@@ -2530,11 +2811,17 @@ mod tests {
             Some(sched.map_digest()),
             "own beacon round-trips our map digest"
         );
-        assert!(!sched.beacon_indicates_partition(&wire), "our own beacon is not a partition");
+        assert!(
+            !sched.beacon_indicates_partition(&wire),
+            "our own beacon is not a partition"
+        );
         // A beacon whose digest differs from ours ⇒ partition detected.
         let mut foreign = wire.to_vec();
         foreign[11..19].copy_from_slice(&(sched.map_digest() ^ 0xdead_beef).to_le_bytes());
-        assert!(sched.beacon_indicates_partition(&foreign), "a foreign map digest is a partition");
+        assert!(
+            sched.beacon_indicates_partition(&foreign),
+            "a foreign map digest is a partition"
+        );
         // A legacy beacon (ref only, no digest) is no signal — not a false positive.
         assert!(
             !sched.beacon_indicates_partition(&foreign[..11]),
@@ -2559,16 +2846,25 @@ mod tests {
         // co_owner_evident takes the ALREADY medium-keyed hash (as the gate passes it) — pass `keyed`,
         // not `h`. Passing raw `h` here was the exact self-consistency that let the double-key bug
         // slip past the unit test; the on-air run is what caught it.
-        assert!(!s.co_owner_evident(keyed, LeaseClass::Bulk, now), "no witness ⇒ sole owner (deaf path)");
+        assert!(
+            !s.co_owner_evident(keyed, LeaseClass::Bulk, now),
+            "no witness ⇒ sole owner (deaf path)"
+        );
 
         // Our OWN group heard in the slot is not a co-owner.
         s.slots.co_owner_hash[k].store(keyed, Ordering::Relaxed);
         s.slots.heard[k].store(now, Ordering::Relaxed);
-        assert!(!s.co_owner_evident(keyed, LeaseClass::Bulk, now), "our own group is not a co-owner");
+        assert!(
+            !s.co_owner_evident(keyed, LeaseClass::Bulk, now),
+            "our own group is not a co-owner"
+        );
 
         // A DIFFERENT group's hash in our slot ⇒ co-ownership locally evident.
         s.slots.co_owner_hash[k].store(keyed ^ 0xABCD, Ordering::Relaxed);
-        assert!(s.co_owner_evident(keyed, LeaseClass::Bulk, now), "a foreign hash in our slot is a co-owner");
+        assert!(
+            s.co_owner_evident(keyed, LeaseClass::Bulk, now),
+            "a foreign hash in our slot is a co-owner"
+        );
 
         // …but only while recent: after a presence window the witness is stale (the co-owner left).
         assert!(
@@ -2588,14 +2884,21 @@ mod tests {
         let mut s = mk_claim_sched_slots("2:3000");
         s.claimable = false; // owner-only node: slots on, claiming off — the on-air D1 config
         let wire = data_wire(&[b"c"]); // a foreign group /c, broadcast-addressed
-        let hash = s.name_group_hash(&wire).expect("the fixture must be attributable");
+        let hash = s
+            .name_group_hash(&wire)
+            .expect("the fixture must be attributable");
         let keyed = s.medium_keyed(hash);
-        let k = s.slot.as_ref().unwrap().owner_slot_in(keyed, LeaseClass::Bulk) as usize;
+        let k = s
+            .slot
+            .as_ref()
+            .unwrap()
+            .owner_slot_in(keyed, LeaseClass::Bulk) as usize;
 
         s.observe_rx(Some(&ndn_radio_hal::BROADCAST), None, None, &wire);
 
         assert_eq!(
-            s.slots.co_owner_hash[k].load(Ordering::Relaxed), keyed,
+            s.slots.co_owner_hash[k].load(Ordering::Relaxed),
+            keyed,
             "observe must record the co-owner witness with !claimable (the gate bug the on-air run found)"
         );
         assert!(
@@ -2603,7 +2906,6 @@ mod tests {
             "the witness needs a recency stamp too, or co_owner_evident cannot use it"
         );
     }
-
 
     /// A Data frame carrying `comps` as its name — what a neighbour of that group puts on air.
     fn data_wire(comps: &[&[u8]]) -> Vec<u8> {
@@ -2665,21 +2967,30 @@ mod tests {
         let h = prefix_hash(&[b"ndn", b"bulk"]);
 
         let idle_draw = s.cclf_jitter_us(h, 3000, 7, 200);
-        assert!(idle_draw >= 1, "a draw is never zero — zero is a collision, not an ordering");
+        assert!(
+            idle_draw >= 1,
+            "a draw is never zero — zero is a collision, not an ordering"
+        );
 
         // Each deferral is a frame that wanted the medium and did not get it.
         let mut prev = idle_draw;
         for _ in 0..4 {
             s.note_deferred(h);
             let d = s.cclf_jitter_us(h, 3000, 7, 200);
-            assert!(d <= prev, "backlog must not lengthen the wait: {d} > {prev}");
+            assert!(
+                d <= prev,
+                "backlog must not lengthen the wait: {d} > {prev}"
+            );
             prev = d;
         }
         assert!(
             prev < idle_draw,
             "a backlogged group must draw shorter than an idle one ({prev} vs {idle_draw})"
         );
-        assert!(prev >= 1, "and still keep a floor, or contenders collide instead of ordering");
+        assert!(
+            prev >= 1,
+            "and still keep a floor, or contenders collide instead of ordering"
+        );
 
         // Getting a turn spends the backlog — otherwise one busy burst would win forever, which is
         // the starvation #87 just removed, reintroduced through a different door.
@@ -2722,12 +3033,16 @@ mod tests {
         let air = wifi_airtime_us(200, Some(7));
 
         // No claim yet ⇒ nothing to continue.
-        assert_eq!(s.hold_status(&slot, start, start + 10, air), HoldStatus::None);
+        assert_eq!(
+            s.hold_status(&slot, start, start + 10, air),
+            HoldStatus::None
+        );
 
         // Win the slot. A win now takes a *lease*; with the default `lease_max = 1` that lease is
         // exactly this one base slot, which is the behaviour #95 shipped and the +119% run measured.
         s.hold_slot_start.store(start, super::Ordering::Relaxed);
-        s.lease_until.store(start + slot.slot_us(), super::Ordering::Relaxed);
+        s.lease_until
+            .store(start + slot.slot_us(), super::Ordering::Relaxed);
         s.last_domain_rx.store(start - 5, super::Ordering::Relaxed); // last heard BEFORE this slot began
         assert_eq!(
             s.hold_status(&slot, start, start + 10, air),
@@ -2736,7 +3051,8 @@ mod tests {
         );
 
         // **Owner-return contract**: anything overheard inside the slot ends the hold at once.
-        s.last_domain_rx.store(start + 100, super::Ordering::Relaxed);
+        s.last_domain_rx
+            .store(start + 100, super::Ordering::Relaxed);
         assert_eq!(
             s.hold_status(&slot, start, start + 150, air),
             HoldStatus::Ended,
@@ -2761,5 +3077,4 @@ mod tests {
             "winning one slot does not grant the next"
         );
     }
-
 }

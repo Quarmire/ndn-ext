@@ -15,14 +15,14 @@
 use std::time::Duration;
 
 use bytes::Bytes;
+use ndn_packet::Name;
+use ndn_sync::{SvSyncConfig, SvsConfig, SvsPubSub};
 use ndnsf_rs::driver::{call, select_and_call, serve_provider};
 use ndnsf_rs::flow::{make_request, make_selection};
 use ndnsf_rs::messages::{AckMessage, ResponseMessage, Strategy, reason};
 use ndnsf_rs::names;
 use ndnsf_rs::tokens::PendingCoordination;
 use ndnsf_rs::trust::TrustCtx;
-use ndn_packet::Name;
-use ndn_sync::{SvSyncConfig, SvsConfig, SvsPubSub};
 use tokio::sync::mpsc;
 
 fn n(s: &str) -> Name {
@@ -87,7 +87,10 @@ async fn legacy_selection_shape_still_accepted() {
         let req = make_request("/r1", "utok", Bytes::from_static(b"ping"));
         let req_name = names::request_name(&requester, &service, &reqid);
         user_ps
-            .publish(req_name.clone(), trust.seal(req_name, req.encode()).as_ref())
+            .publish(
+                req_name.clone(),
+                trust.seal(req_name, req.encode()).as_ref(),
+            )
             .await
             .unwrap();
 
@@ -108,7 +111,10 @@ async fn legacy_selection_shape_still_accepted() {
         let sel = make_selection(&ack, "/r1");
         let sel_name = names::selection_name(&requester, &provider, &service, &reqid);
         user_ps
-            .publish(sel_name.clone(), trust.seal(sel_name, sel.encode()).as_ref())
+            .publish(
+                sel_name.clone(),
+                trust.seal(sel_name, sel.encode()).as_ref(),
+            )
             .await
             .unwrap();
 

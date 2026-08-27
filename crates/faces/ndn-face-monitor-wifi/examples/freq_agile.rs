@@ -24,7 +24,8 @@
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use bytes::Bytes;
     use ndn_face_monitor_wifi::{
-        ChannelBw, FrameIo, InjectFrame, LibUsbRtl88xxBackend, McsDescriptor, TxIntent, };
+        ChannelBw, FrameIo, InjectFrame, LibUsbRtl88xxBackend, McsDescriptor, TxIntent,
+    };
     use std::sync::Arc;
 
     let mut args = std::env::args().skip(1);

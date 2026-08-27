@@ -148,7 +148,7 @@ impl RateCalibrator {
 /// *initial* estimate the calibrator then refines from delivery. Monotone-decreasing in SF: a lower
 /// (faster) SF needs a stronger signal, so it carries a higher threshold.
 pub const STATIC_REQ_RSSI_SF: [f32; 13] = [
-    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, // SF0–6 unused
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,    // SF0–6 unused
     -80.0,  // SF7
     -90.0,  // SF8
     -100.0, // SF9
@@ -355,11 +355,23 @@ mod tests {
         let m = 4.0;
         // −92/−94 sit right on the −90 SF8/SF9 line — the on-air chatter case. A node already at
         // SF9 must HOLD SF9 (not flip to SF8) across the wiggle, so a converged pair stays paired.
-        assert_eq!(pick_sf_hysteretic(-92, 9, &t, m), 9, "hold SF9 in the deadband");
+        assert_eq!(
+            pick_sf_hysteretic(-92, 9, &t, m),
+            9,
+            "hold SF9 in the deadband"
+        );
         assert_eq!(pick_sf_hysteretic(-94, 9, &t, m), 9);
-        assert_eq!(pick_sf_hysteretic(-88, 9, &t, m), 9, "still hold: not a full margin past −90");
+        assert_eq!(
+            pick_sf_hysteretic(-88, 9, &t, m),
+            9,
+            "still hold: not a full margin past −90"
+        );
         // And a node at SF8 must not chatter up either until decisively out of band.
-        assert_eq!(pick_sf_hysteretic(-92, 8, &t, m), 8, "hold SF8 inside its deadband");
+        assert_eq!(
+            pick_sf_hysteretic(-92, 8, &t, m),
+            8,
+            "hold SF8 inside its deadband"
+        );
     }
 
     #[test]
@@ -367,11 +379,22 @@ mod tests {
         let t = STATIC_REQ_RSSI_SF;
         let m = 4.0;
         // From a strong-link SF7, a decisively weak reading jumps straight to the robust SF.
-        assert_eq!(pick_sf_hysteretic(-105, 7, &t, m), 10, "climb SF7→SF10 on a strong drop");
+        assert_eq!(
+            pick_sf_hysteretic(-105, 7, &t, m),
+            10,
+            "climb SF7→SF10 on a strong drop"
+        );
         // A node stuck robust at SF11 with the link recovered drops toward the faster SF.
-        assert!(pick_sf_hysteretic(-70, 11, &t, m) < 11, "recovered link drops SF");
+        assert!(
+            pick_sf_hysteretic(-70, 11, &t, m) < 11,
+            "recovered link drops SF"
+        );
         // A single call never overshoots the ideal in either direction.
-        assert_eq!(pick_sf_hysteretic(-94, 7, &t, m), 9, "climb lands on the RSSI's ideal");
+        assert_eq!(
+            pick_sf_hysteretic(-94, 7, &t, m),
+            9,
+            "climb lands on the RSSI's ideal"
+        );
     }
 
     #[test]
@@ -385,7 +408,10 @@ mod tests {
             cal.observe(before, -80, false);
         }
         let after = pick_sf(-80, &cal.thresholds());
-        assert!(after > before, "persistent SF failure raises SF: {after} > {before}");
+        assert!(
+            after > before,
+            "persistent SF failure raises SF: {after} > {before}"
+        );
     }
 
     #[test]
@@ -398,7 +424,10 @@ mod tests {
         }
         let t = cal.thresholds();
         for sf in 8..=12 {
-            assert!(t[sf] <= t[sf - 1], "SF thresholds must be nonincreasing at {sf}: {t:?}");
+            assert!(
+                t[sf] <= t[sf - 1],
+                "SF thresholds must be nonincreasing at {sf}: {t:?}"
+            );
         }
     }
 }
@@ -425,7 +454,10 @@ mod snr_ceiling_tests {
     fn loud_but_dirty_link_is_capped() {
         let rssi_only = pick_mcs(-40, 9, &STATIC_REQ_RSSI);
         let with_snr = pick_mcs_snr(-40, Some(9.0), 9, &STATIC_REQ_RSSI);
-        assert!(with_snr < rssi_only, "SNR ceiling did not bite: {with_snr} vs {rssi_only}");
+        assert!(
+            with_snr < rssi_only,
+            "SNR ceiling did not bite: {with_snr} vs {rssi_only}"
+        );
         assert_eq!(with_snr, 1, "9 dB SNR should allow MCS1, not {with_snr}");
     }
 
@@ -434,7 +466,10 @@ mod snr_ceiling_tests {
     #[test]
     fn ceiling_never_promotes() {
         let rssi_only = pick_mcs(-80, 9, &STATIC_REQ_RSSI);
-        assert_eq!(pick_mcs_snr(-80, Some(40.0), 9, &STATIC_REQ_RSSI), rssi_only);
+        assert_eq!(
+            pick_mcs_snr(-80, Some(40.0), 9, &STATIC_REQ_RSSI),
+            rssi_only
+        );
     }
 
     #[test]

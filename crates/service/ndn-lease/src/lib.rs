@@ -545,7 +545,9 @@ mod tests {
     fn full_lifecycle_prepare_commit_activate_release() {
         let mut t = LeaseTable::new(7);
         let alice = name("/muas/alice");
-        let lease = t.prepare(0, &req("/muas/alice", &["gpu0"], "plan-a", None)).unwrap();
+        let lease = t
+            .prepare(0, &req("/muas/alice", &["gpu0"], "plan-a", None))
+            .unwrap();
         assert_eq!(lease.boot_epoch, 7);
         assert_eq!(t.state(0, &lease.id), Some(LeaseState::Prepared));
 
@@ -567,7 +569,10 @@ mod tests {
         let alice = name("/muas/alice");
         let lease = t.prepare(0, &req("/muas/alice", &[], "p", None)).unwrap();
         // A lease from "another boot" (wrong epoch) drives nothing.
-        assert_eq!(t.commit(1, &lease.id, &alice, 6), Err(LeaseError::StaleEpoch));
+        assert_eq!(
+            t.commit(1, &lease.id, &alice, 6),
+            Err(LeaseError::StaleEpoch)
+        );
         assert_eq!(t.state(1, &lease.id), Some(LeaseState::Prepared));
     }
 
@@ -576,7 +581,9 @@ mod tests {
         // Boot 1 issues; boot 2 (fresh table, new epoch) knows nothing — the
         // holder gets a typed refusal, never a silent grant.
         let mut boot1 = LeaseTable::new(1);
-        let lease = boot1.prepare(0, &req("/muas/alice", &["gpu0"], "p", None)).unwrap();
+        let lease = boot1
+            .prepare(0, &req("/muas/alice", &["gpu0"], "p", None))
+            .unwrap();
         let mut boot2 = LeaseTable::new(2);
         assert_eq!(
             boot2.commit(0, &lease.id, &name("/muas/alice"), lease.boot_epoch),
@@ -588,25 +595,33 @@ mod tests {
     fn conflict_keys_are_exclusive_until_terminal() {
         let mut t = LeaseTable::new(7);
         let alice = name("/muas/alice");
-        let a = t.prepare(0, &req("/muas/alice", &["gpu0", "model-q"], "p1", None)).unwrap();
+        let a = t
+            .prepare(0, &req("/muas/alice", &["gpu0", "model-q"], "p1", None))
+            .unwrap();
         // Overlap on one key refuses the whole prepare.
         assert_eq!(
             t.prepare(0, &req("/muas/bob", &["net", "gpu0"], "p2", None)),
             Err(LeaseError::Conflict("gpu0".into()))
         );
         // Non-overlapping keys coexist.
-        t.prepare(0, &req("/muas/bob", &["gpu1"], "p3", None)).unwrap();
+        t.prepare(0, &req("/muas/bob", &["gpu1"], "p3", None))
+            .unwrap();
         // Abort frees the keys.
         t.abort(1, &a.id, &alice, 7).unwrap();
-        t.prepare(2, &req("/muas/bob", &["gpu0"], "p4", None)).unwrap();
+        t.prepare(2, &req("/muas/bob", &["gpu0"], "p4", None))
+            .unwrap();
     }
 
     #[test]
     fn idempotent_replay_returns_same_lease_conflicting_replay_refused() {
         let mut t = LeaseTable::new(7);
-        let a = t.prepare(0, &req("/muas/alice", &["gpu0"], "plan-a", Some("job-1"))).unwrap();
+        let a = t
+            .prepare(0, &req("/muas/alice", &["gpu0"], "plan-a", Some("job-1")))
+            .unwrap();
         // Same key + same digest: the SAME lease, no double reservation.
-        let b = t.prepare(1, &req("/muas/alice", &["gpu0"], "plan-a", Some("job-1"))).unwrap();
+        let b = t
+            .prepare(1, &req("/muas/alice", &["gpu0"], "plan-a", Some("job-1")))
+            .unwrap();
         assert_eq!(a.id, b.id);
         assert_eq!(t.counters().replayed, 1);
         assert_eq!(t.live_count(), 1);
@@ -621,7 +636,9 @@ mod tests {
     fn replay_after_completion_fails_closed() {
         let mut t = LeaseTable::new(7);
         let alice = name("/muas/alice");
-        let a = t.prepare(0, &req("/muas/alice", &[], "p", Some("job-1"))).unwrap();
+        let a = t
+            .prepare(0, &req("/muas/alice", &[], "p", Some("job-1")))
+            .unwrap();
         t.commit(1, &a.id, &alice, 7).unwrap();
         t.activate(1, &a.id, &alice, 7, "p").unwrap();
         t.release(2, &a.id, &alice, 7).unwrap();
@@ -635,10 +652,18 @@ mod tests {
     #[test]
     fn wrong_holder_cannot_drive_and_burns_nothing() {
         let mut t = LeaseTable::new(7);
-        let a = t.prepare(0, &req("/muas/alice", &["gpu0"], "p", None)).unwrap();
+        let a = t
+            .prepare(0, &req("/muas/alice", &["gpu0"], "p", None))
+            .unwrap();
         for (op, err) in [
-            (t.commit(1, &a.id, &name("/muas/mallory"), 7), LeaseError::WrongHolder),
-            (t.abort(1, &a.id, &name("/muas/mallory"), 7), LeaseError::WrongHolder),
+            (
+                t.commit(1, &a.id, &name("/muas/mallory"), 7),
+                LeaseError::WrongHolder,
+            ),
+            (
+                t.abort(1, &a.id, &name("/muas/mallory"), 7),
+                LeaseError::WrongHolder,
+            ),
         ] {
             assert_eq!(op, Err(err));
         }
@@ -649,13 +674,16 @@ mod tests {
     fn expiry_is_lazy_typed_and_frees_keys() {
         let mut t = LeaseTable::new(7);
         let alice = name("/muas/alice");
-        let a = t.prepare(0, &req("/muas/alice", &["gpu0"], "p", None)).unwrap();
+        let a = t
+            .prepare(0, &req("/muas/alice", &["gpu0"], "p", None))
+            .unwrap();
         // At the TTL the next touch expires it, with a typed reason.
         assert_eq!(t.commit(60, &a.id, &alice, 7), Err(LeaseError::Expired));
         assert_eq!(t.state(60, &a.id), Some(LeaseState::Expired));
         assert_eq!(t.counters().expired, 1);
         // The key is free again.
-        t.prepare(61, &req("/muas/bob", &["gpu0"], "p2", None)).unwrap();
+        t.prepare(61, &req("/muas/bob", &["gpu0"], "p2", None))
+            .unwrap();
     }
 
     #[test]
@@ -674,7 +702,9 @@ mod tests {
     fn activation_revalidates_the_plan() {
         let mut t = LeaseTable::new(7);
         let alice = name("/muas/alice");
-        let a = t.prepare(0, &req("/muas/alice", &[], "plan-a", None)).unwrap();
+        let a = t
+            .prepare(0, &req("/muas/alice", &[], "plan-a", None))
+            .unwrap();
         t.commit(1, &a.id, &alice, 7).unwrap();
         assert_eq!(
             t.activate(2, &a.id, &alice, 7, "plan-b"),
@@ -721,14 +751,18 @@ mod tests {
     fn cleanup_reaps_terminal_and_expired() {
         let mut t = LeaseTable::new(7);
         let alice = name("/muas/alice");
-        let a = t.prepare(0, &req("/muas/alice", &[], "p", Some("job-1"))).unwrap();
+        let a = t
+            .prepare(0, &req("/muas/alice", &[], "p", Some("job-1")))
+            .unwrap();
         t.abort(1, &a.id, &alice, 7).unwrap();
         let _b = t.prepare(0, &req("/muas/bob", &[], "p", None)).unwrap(); // will expire
         let c = t.prepare(70, &req("/muas/carol", &[], "p", None)).unwrap(); // stays live
         assert_eq!(t.cleanup(70), 2, "aborted + expired reaped");
         assert_eq!(t.state(70, &c.id), Some(LeaseState::Prepared));
         // The reaped idempotency slot is free for a fresh life.
-        let a2 = t.prepare(71, &req("/muas/alice", &[], "p", Some("job-1"))).unwrap();
+        let a2 = t
+            .prepare(71, &req("/muas/alice", &[], "p", Some("job-1")))
+            .unwrap();
         assert_ne!(a2.id, a.id);
     }
 
@@ -736,7 +770,8 @@ mod tests {
     fn table_is_capped_with_typed_refusal() {
         let mut t = LeaseTable::new(7);
         for i in 0..MAX_LEASES {
-            t.prepare(0, &req(&format!("/u/{i}"), &[], "p", None)).unwrap();
+            t.prepare(0, &req(&format!("/u/{i}"), &[], "p", None))
+                .unwrap();
         }
         assert_eq!(
             t.prepare(0, &req("/u/last", &[], "p", None)),

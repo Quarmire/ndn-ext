@@ -15,13 +15,21 @@ fn main() {
                 return;
             }
         };
-        println!("NDI up: {} mac={:02x?} link_local={}", n.name(), n.mac(), n.link_local());
+        println!(
+            "NDI up: {} mac={:02x?} link_local={}",
+            n.name(),
+            n.mac(),
+            n.link_local()
+        );
         let scope = DataInterface::index(&n);
         println!("ifindex (link-local scope) = {scope}");
         assert_ne!(scope, 0, "a scope of 0 would make the address unroutable");
 
         // Exactly what request_ndp does once the handshake settles.
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async {
             let local = std::net::SocketAddrV6::new(n.link_local(), 6363, 0, scope);
             match tokio::net::UdpSocket::bind(local).await {
@@ -29,7 +37,11 @@ fn main() {
                 Err(e) => println!("BIND FAILED {local}: {e}"),
             }
             let peer = std::net::SocketAddrV6::new(
-                link_local_addr(ndn_nan_core::eui64_iid(PEER_NDI)), 6363, 0, scope);
+                link_local_addr(ndn_nan_core::eui64_iid(PEER_NDI)),
+                6363,
+                0,
+                scope,
+            );
             println!("peer would be: {peer}");
         });
     }

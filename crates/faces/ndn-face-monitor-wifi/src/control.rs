@@ -10,14 +10,14 @@
 //! - **ACT** — the plan's per-radio [`RadioAllocation`] is `apply`-ed: stateful
 //!   knobs (channel/CSD/EDCCA) hit the backend directly; the per-frame [`TxParams`]
 //!   land in a shared cell the face's `select_mcs` reads
-//!   ([`MonitorWifiFace::with_planned_params`]). That shared cell is what makes a
+//!   ([`WifiPhy::with_planned_params`]). That shared cell is what makes a
 //!   *decision* actually change the transmitted rate/coding — the closed loop.
 //!
 //! `RadioControl` is a [`LinkServiceFeature`], so once mounted via
 //! [`LpLinkService::with_extra_feature`] the engine's existing per-face tick pump
 //! drives the loop with no extra task management.
 //!
-//! [`MonitorWifiFace::with_planned_params`]: crate::MonitorWifiFace::with_planned_params
+//! [`WifiPhy::with_planned_params`]: crate::WifiPhy::with_planned_params
 //! [`LpLinkService::with_extra_feature`]: ndn_transport::link_service::LpLinkService::with_extra_feature
 
 use std::collections::HashMap;
@@ -30,15 +30,15 @@ use ndn_radio_cognition::RadioAllocation;
 use ndn_radio_cognition::{
     ARMS, ChannelOccupancy, Context, ContextualBandit, DEFAULT_SATURATION_FPS, DecisionRationale,
     Demand, DemandTracker, MediumState, MediumView, NameContext, NeighborReport, PolicyConfig,
-    RadioActuators, RadioCapability, RadioId, RadioPlan, RadioPolicy, RadioStrategy, RateCalibrator,
-    SfCalibrator, TxParams, apply_arm, decode_report, default_sf_thresholds, default_thresholds,
-    encode_report, lora_airtime_ms, prefix_hash, reward,
+    RadioActuators, RadioCapability, RadioId, RadioPlan, RadioPolicy, RadioStrategy,
+    RateCalibrator, SfCalibrator, TxParams, apply_arm, decode_report, default_sf_thresholds,
+    default_thresholds, encode_report, lora_airtime_ms, prefix_hash, reward,
 };
 use ndn_signals_core::SignalView;
-use tracing::Instrument;
 use ndn_transport::link_service::{
     EgressCtx, InboundLpFrame, IngressCtx, LinkServiceFeature, OutboundLpFrame, TickCtx,
 };
+use tracing::Instrument;
 
 use crate::FaceId;
 
@@ -240,12 +240,12 @@ impl RadioControl {
 
     /// Convenience: build a [`LibUsbActuator`] over any
     /// [`RadioKnobs`](crate::RadioKnobs) backend and return the shared
-    /// [`TxParams`] cell to hand to [`MonitorWifiFace::with_planned_params`], so the
+    /// [`TxParams`] cell to hand to [`WifiPhy::with_planned_params`], so the
     /// decided params flow into transmitted frames. An `Arc<ConcreteBackend>`
     /// coerces to `Arc<dyn RadioKnobs>` at the call site, so existing RTL callers
     /// are unchanged while `Mt7612uBackend` now plugs in identically.
     ///
-    /// [`MonitorWifiFace::with_planned_params`]: crate::MonitorWifiFace::with_planned_params
+    /// [`WifiPhy::with_planned_params`]: crate::WifiPhy::with_planned_params
     #[cfg(feature = "libusb-backend")]
     pub fn libusb_actuator(
         &mut self,
@@ -522,9 +522,14 @@ impl RadioControl {
         interval: Duration,
     ) -> tokio::task::JoinHandle<()> {
         let started = self.started;
-        spawn_occupancy_sampler(Arc::clone(self), radio, channel, knobs, interval, move || {
-            started.elapsed().as_millis() as u64
-        })
+        spawn_occupancy_sampler(
+            Arc::clone(self),
+            radio,
+            channel,
+            knobs,
+            interval,
+            move || started.elapsed().as_millis() as u64,
+        )
     }
     pub fn observe_demand(&self, prefix_hash: u64, demand: Demand) {
         self.medium
@@ -902,10 +907,11 @@ impl LinkServiceFeature for RadioControl {
         // than the zeros it decides on today.
         if let Some(p) = ndn_packet::lp::peek_lp_name(&frame.wire)
             && p.is_interest
-                && let Some(ph) = self.demand_key(&p.components) {
-                    let downstream = ctx.source.unwrap_or(ctx.face_id);
-                    self.on_interest(ph, downstream, self.now_ms());
-                }
+            && let Some(ph) = self.demand_key(&p.components)
+        {
+            let downstream = ctx.source.unwrap_or(ctx.face_id);
+            self.on_interest(ph, downstream, self.now_ms());
+        }
     }
 
     fn on_ingress(&self, frame: &InboundLpFrame, _ctx: &IngressCtx) {
@@ -919,28 +925,30 @@ impl LinkServiceFeature for RadioControl {
             if !p.is_interest && is_report_name(&p.components) {
                 if let Some(ndn) = ndn_packet::lp::lp_ndn_packet_bytes(&frame.wire)
                     && let Ok(data) = ndn_packet::Data::decode(Bytes::copy_from_slice(ndn))
-                        && let Some(content) = data.content() {
-                            // Attribute the report to the radio that actually received it
-                            // (threaded from the medium's per-bearer reader). Falls back to
-                            // radio 0 for single-bearer transports that carry no tag.
-                            let rx_radio = frame.radio_id.map(RadioId).unwrap_or(RadioId(0));
-                            let now = self.now_ms();
-                            if self.ingest_report(rx_radio, content, now) {
-                                let recv = self.medium.lock().unwrap().receiver_count(now);
-                                tracing::debug!(
-                                    target: "face.radio",
-                                    rx_radio = rx_radio.0,
-                                    receivers = recv,
-                                    "reception report ingested — attributed to receiving radio (phy^n pooling)"
-                                );
-                            }
-                        }
+                    && let Some(content) = data.content()
+                {
+                    // Attribute the report to the radio that actually received it
+                    // (threaded from the medium's per-bearer reader). Falls back to
+                    // radio 0 for single-bearer transports that carry no tag.
+                    let rx_radio = frame.radio_id.map(RadioId).unwrap_or(RadioId(0));
+                    let now = self.now_ms();
+                    if self.ingest_report(rx_radio, content, now) {
+                        let recv = self.medium.lock().unwrap().receiver_count(now);
+                        tracing::debug!(
+                            target: "face.radio",
+                            rx_radio = rx_radio.0,
+                            receivers = recv,
+                            "reception report ingested — attributed to receiving radio (phy^n pooling)"
+                        );
+                    }
+                }
                 return;
             }
             if !p.is_interest
-                && let Some(ph) = self.demand_key(&p.components) {
-                    self.on_data(ph, self.now_ms());
-                }
+                && let Some(ph) = self.demand_key(&p.components)
+            {
+                self.on_data(ph, self.now_ms());
+            }
         }
         // Liveness: note we heard a peer on this face (RSSI itself is read from the
         // signal store in `tick`). The address, when present, is the seed for
@@ -1109,7 +1117,9 @@ pub fn spawn_occupancy_sampler(
             // Time the frame-free counter read (a USB control transfer, off the hot
             // path) as its own span under the sampler.
             let read = tokio::task::spawn_blocking(move || k.read_channel_activity())
-                .instrument(tracing::debug_span!(target: "named_radio", "occupancy_read", radio = radio.0))
+                .instrument(
+                    tracing::debug_span!(target: "named_radio", "occupancy_read", radio = radio.0),
+                )
                 .await;
             let cur = match read {
                 Ok(Ok(Some(v))) => v,
@@ -1298,7 +1308,14 @@ mod tests {
             c_broad.on_interest(0xABCD, FaceId(face), 1_000); // 4 listeners
         }
         c_broad.tick_now(1_000);
-        let broad_mcs = mock_broad.last.read().unwrap().unwrap().params.mcs().unwrap();
+        let broad_mcs = mock_broad
+            .last
+            .read()
+            .unwrap()
+            .unwrap()
+            .params
+            .mcs()
+            .unwrap();
 
         let (c_uni, mock_uni) = control_with_mock();
         c_uni.observe_rx(W, 50, Some(-50), 1_000);
@@ -1427,13 +1444,25 @@ mod tests {
 
         // A has a *second* radio (id 3); the frame is tagged as received on radio 3.
         let mut a = RadioControl::new(RadioPolicy::default()).with_node_id(1);
-        a.register_radio(RadioId(3), FaceId(10), RadioCapability::wifi_monitor_5ghz(vec![149]));
+        a.register_radio(
+            RadioId(3),
+            FaceId(10),
+            RadioCapability::wifi_monitor_5ghz(vec![149]),
+        );
         a.on_ingress(
             &InboundLpFrame::with_meta(frame, None, Some(3)),
             &IngressCtx::new(FaceId(10)),
         );
-        assert_eq!(a.neighbor_rssi(RadioId(3), 2), Some(-55), "keyed on the RX radio");
-        assert_eq!(a.neighbor_rssi(RadioId(0), 2), None, "not on the fallback radio 0");
+        assert_eq!(
+            a.neighbor_rssi(RadioId(3), 2),
+            Some(-55),
+            "keyed on the RX radio"
+        );
+        assert_eq!(
+            a.neighbor_rssi(RadioId(0), 2),
+            None,
+            "not on the fallback radio 0"
+        );
     }
 
     #[test]
@@ -1486,7 +1515,10 @@ mod tests {
         let hi_frame = hi.broadcast_report_frame().expect("report due");
         let mut b = RadioControl::new(RadioPolicy::default()).with_node_id(1);
         b.register_radio(W, FaceId(10), RadioCapability::wifi_monitor_5ghz(vec![149]));
-        b.on_ingress(&InboundLpFrame::bare(hi_frame), &IngressCtx::new(FaceId(10)));
+        b.on_ingress(
+            &InboundLpFrame::bare(hi_frame),
+            &IngressCtx::new(FaceId(10)),
+        );
         assert_eq!(b.worst_neighbor_rx_mcs(b.now_ms()), Some(FULL_RX_MCS));
     }
 
@@ -1507,7 +1539,10 @@ mod tests {
         // The frame is a Data on /localhop/radio/report/* the ingress matcher recognises.
         let peeked = ndn_packet::lp::peek_lp_name(&frame).expect("peekable name");
         assert!(!peeked.is_interest, "a report is Data, not Interest");
-        assert!(is_report_name(&peeked.components), "on /localhop/radio/report");
+        assert!(
+            is_report_name(&peeked.components),
+            "on /localhop/radio/report"
+        );
 
         let mut a = RadioControl::new(RadioPolicy::default()).with_node_id(1);
         a.register_radio(W, FaceId(10), RadioCapability::wifi_monitor_5ghz(vec![149]));

@@ -66,10 +66,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let secs: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(30);
     let mine = args.get(3).cloned().unwrap_or_else(|| "a".into());
     let peer = args.get(4).cloned().unwrap_or_else(|| "b".into());
-    let pid = u16::from_str_radix(&std::env::var("NDN_PID").unwrap_or_else(|_| "a81a".into()), 16)?;
+    let pid = u16::from_str_radix(
+        &std::env::var("NDN_PID").unwrap_or_else(|_| "a81a".into()),
+        16,
+    )?;
     // Well under the 881a's measured ~200 frame/s RX ceiling, so the ceiling cannot masquerade as
     // on-air loss (see the `wifi-drop-ratio-is-rx-ceiling` note — that mistake has been made here).
-    let per_sec: u64 = std::env::var("RATE").ok().and_then(|s| s.parse().ok()).unwrap_or(100);
+    let per_sec: u64 = std::env::var("RATE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100);
 
     fn data_pkt(group: &str, seq: u32) -> Bytes {
         let s = seq.to_string();
@@ -112,16 +118,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Report the slot map the gate will use, so a same-slot collision of the two names is visible
     // rather than silently making the arms incomparable.
     let sched_env = std::env::var("NDN_SCHED_SLOT").ok();
-    let keyed = |g: &str| {
-        prefix_hash(&[g.as_bytes()]) ^ u64::from(channel).wrapping_mul(0x9E37_79B9)
-    };
+    let keyed =
+        |g: &str| prefix_hash(&[g.as_bytes()]) ^ u64::from(channel).wrapping_mul(0x9E37_79B9);
     if let Some(spec) = &sched_env {
         let mut it = spec.split(':');
         let slots: u64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(8);
         let slot_us: u64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(20_000);
         let s = SlotSchedule::new(slot_us, slots);
         let (ms, ps) = (s.owner_slot(keyed(&mine)), s.owner_slot(keyed(&peer)));
-        println!("SCHED ON  {slots} x {slot_us}us   /{mine} owns slot {ms}   /{peer} owns slot {ps}");
+        println!(
+            "SCHED ON  {slots} x {slot_us}us   /{mine} owns slot {ms}   /{peer} owns slot {ps}"
+        );
         if ms == ps {
             // For the ORIGINAL slot A/B a same-slot pair is useless (the schedule can't separate
             // them). For the **D1 shared-slot backoff** it is exactly the case under test:
@@ -176,7 +183,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut unparsed = 0u64;
     let end = Instant::now() + Duration::from_secs(secs);
     while Instant::now() < end {
-        match tokio::time::timeout(Duration::from_millis(300), medium.recv_bytes_with_addr()).await {
+        match tokio::time::timeout(Duration::from_millis(300), medium.recv_bytes_with_addr()).await
+        {
             Ok(Ok((wire, _))) => match first_component(&wire) {
                 Some(g) => *heard.entry(g).or_default() += 1,
                 None => unparsed += 1,
@@ -201,7 +209,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // gain while the same claim with the gate forced open measured 4×. If this number is large and
     // the claim still shows no gain, the suppressor is somewhere else — do not re-blame ambient load.
     if let Some(s) = medium.scheduler() {
-        println!("ambient frames    : {}   <-- other people's traffic; no longer vetoes a claim", s.ambient_frames());
+        println!(
+            "ambient frames    : {}   <-- other people's traffic; no longer vetoes a claim",
+            s.ambient_frames()
+        );
         // The claim path's own instrumentation. `attempts ≈ sent` with a gate that is plainly
         // throttling means each waiting frame contended exactly once and then slept through every
         // slot it could have taken — the 2026-08-11 defect. Many attempts, few wins means the
@@ -211,7 +222,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // D1: the shared-slot backoff firing on air. > 0 means this node HEARD a different group's hash
         // in its own slot (a real hash % N co-owner) and bought within-slot turn-taking instead of a
         // deaf collision. 0 with NDN_SCHED_NO_BACKOFF=1 (the baseline) or with no co-owner in range.
-        println!("shared_slot_backoffs  : {}   <-- D1: turns bought on a shared slot", s.shared_slot_backoffs());
+        println!(
+            "shared_slot_backoffs  : {}   <-- D1: turns bought on a shared slot",
+            s.shared_slot_backoffs()
+        );
     }
     println!(
         "\nCompare heard_peer between the OFF and ON arms at BOTH nodes. Slotting should raise it: \

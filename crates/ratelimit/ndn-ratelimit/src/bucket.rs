@@ -2,9 +2,9 @@
 //! with the ndn-rs error type. Supports variable cost — one Interest
 //! = 1 token, one Data packet = N bytes of token.
 
+use portable_atomic::AtomicU64;
 use std::num::NonZeroU32;
 use std::sync::atomic::Ordering;
-use portable_atomic::AtomicU64;
 
 use governor::clock::DefaultClock;
 use governor::state::{InMemoryState, NotKeyed};

@@ -77,7 +77,11 @@ fn run(arm: Arm, b: u32, n: usize, ptx: f64, seed: u64) -> (f64, f64, f64, f64) 
         }
     }
     let avg_nbr = nbr_sum / n as f64;
-    let hidden_frac = if tot_pairs > 0 { hid_pairs as f64 / tot_pairs as f64 } else { 0.0 };
+    let hidden_frac = if tot_pairs > 0 {
+        hid_pairs as f64 / tot_pairs as f64
+    } else {
+        0.0
+    };
 
     let mut id: Vec<u32> = (0..n).map(|_| rng.u(space) as u32).collect();
     // observed[v]: id -> (sender -> last_round)
@@ -143,7 +147,10 @@ fn run(arm: Arm, b: u32, n: usize, ptx: f64, seed: u64) -> (f64, f64, f64, f64) 
             for v in 0..n {
                 let (mut distinct, mut aliased) = (0u32, 0u32);
                 for (&idk, senders) in obs[v].iter() {
-                    let live = senders.values().filter(|&&t| r.saturating_sub(t) <= W).count();
+                    let live = senders
+                        .values()
+                        .filter(|&&t| r.saturating_sub(t) <= W)
+                        .count();
                     if live == 0 {
                         continue;
                     }
@@ -177,7 +184,12 @@ fn avg(arm: Arm, b: u32, n: usize, ptx: f64) -> (f64, f64, f64, f64) {
         nb += nn;
         hf += hh;
     }
-    (a / SEEDS as f64, c / SEEDS as f64, nb / SEEDS as f64, hf / SEEDS as f64)
+    (
+        a / SEEDS as f64,
+        c / SEEDS as f64,
+        nb / SEEDS as f64,
+        hf / SEEDS as f64,
+    )
 }
 
 fn main() {
@@ -189,29 +201,53 @@ fn main() {
         hf * 100.0
     );
     println!("NO BEACONS: the DAR hint rides the common neighbour's data frames only.\n");
-    println!("ALIAS RATE (% of a neighbour's ID-view that is ambiguous) / reactive rotations per node per 1000 rounds:");
-    println!("{:<10} {:>16} {:>16} {:>16}", "arm", "b=6 (64)", "b=8 (256)", "b=10 (1024)");
-    for (name, arm) in [("random", Arm::Random), ("pfs", Arm::Pfs), ("pfs+dar", Arm::PfsDar)] {
+    println!(
+        "ALIAS RATE (% of a neighbour's ID-view that is ambiguous) / reactive rotations per node per 1000 rounds:"
+    );
+    println!(
+        "{:<10} {:>16} {:>16} {:>16}",
+        "arm", "b=6 (64)", "b=8 (256)", "b=10 (1024)"
+    );
+    for (name, arm) in [
+        ("random", Arm::Random),
+        ("pfs", Arm::Pfs),
+        ("pfs+dar", Arm::PfsDar),
+    ] {
         let mut cells = Vec::new();
         for b in [6u32, 8, 10] {
             let (a, c, _, _) = avg(arm, b, nmed, dtx);
             cells.push(format!("{a:5.2}% / {c:4.1}"));
         }
-        println!("{:<10} {:>16} {:>16} {:>16}", name, cells[0], cells[1], cells[2]);
+        println!(
+            "{:<10} {:>16} {:>16} {:>16}",
+            name, cells[0], cells[1], cells[2]
+        );
     }
 
-    println!("\nTRAFFIC sweep at b=8 — does piggyback survive when the network is quiet? (PTX = per-round tx prob)");
-    println!("{:<10} {:>16} {:>16} {:>16} {:>16}", "arm", "PTX=0.05", "PTX=0.15", "PTX=0.30", "PTX=0.60");
+    println!(
+        "\nTRAFFIC sweep at b=8 — does piggyback survive when the network is quiet? (PTX = per-round tx prob)"
+    );
+    println!(
+        "{:<10} {:>16} {:>16} {:>16} {:>16}",
+        "arm", "PTX=0.05", "PTX=0.15", "PTX=0.30", "PTX=0.60"
+    );
     for (name, arm) in [("random", Arm::Random), ("pfs+dar", Arm::PfsDar)] {
         let mut cells = Vec::new();
         for ptx in [0.05f64, 0.15, 0.30, 0.60] {
             let (a, c, _, _) = avg(arm, 8, nmed, ptx);
             cells.push(format!("{a:5.2}%/{c:4.1}"));
         }
-        println!("{:<10} {:>16} {:>16} {:>16} {:>16}", name, cells[0], cells[1], cells[2], cells[3]);
+        println!(
+            "{:<10} {:>16} {:>16} {:>16} {:>16}",
+            name, cells[0], cells[1], cells[2], cells[3]
+        );
     }
-    println!("\nalias% = ambiguous fraction of the ID-view (lower=clearer); churn = reactive rotations/node/1000r.");
-    println!("If pfs+dar stays well under random across PTX, the hint needs no beacon — data frames carry it.");
+    println!(
+        "\nalias% = ambiguous fraction of the ID-view (lower=clearer); churn = reactive rotations/node/1000r."
+    );
+    println!(
+        "If pfs+dar stays well under random across PTX, the hint needs no beacon — data frames carry it."
+    );
 
     // Record to CSV for the chapter's evidence set.
     let dir = "docs/data/name-filter";
@@ -219,7 +255,11 @@ fn main() {
     if let Ok(mut f) = std::fs::File::create(format!("{dir}/id.csv")) {
         use std::io::Write;
         writeln!(f, "sweep,arm,bits,density_n,ptx,alias_pct,churn").unwrap();
-        for (name, arm) in [("random", Arm::Random), ("pfs", Arm::Pfs), ("pfs+dar", Arm::PfsDar)] {
+        for (name, arm) in [
+            ("random", Arm::Random),
+            ("pfs", Arm::Pfs),
+            ("pfs+dar", Arm::PfsDar),
+        ] {
             for b in [6u32, 8, 10] {
                 let (a, c, _, _) = avg(arm, b, nmed, dtx);
                 writeln!(f, "width,{name},{b},{nmed},{dtx},{a:.4},{c:.3}").unwrap();

@@ -96,7 +96,13 @@ pub struct CoopRelay {
 
 impl CoopRelay {
     pub fn new(scope: Vec<Prefix>, jitter: u64, ttl: u64) -> Self {
-        Self { scope, pending: HashMap::new(), jitter, ttl, emitted: Vec::new() }
+        Self {
+            scope,
+            pending: HashMap::new(),
+            jitter,
+            ttl,
+            emitted: Vec::new(),
+        }
     }
 
     /// The trust scope — the prefixes this node relays for. Setting it wider is
@@ -123,7 +129,12 @@ impl CoopRelay {
         }
         self.pending.insert(
             name,
-            Pending { dir: Dir::Interest, fire_at: now + self.jitter, suppressed: false, done: false },
+            Pending {
+                dir: Dir::Interest,
+                fire_at: now + self.jitter,
+                suppressed: false,
+                done: false,
+            },
         );
     }
 
@@ -137,7 +148,12 @@ impl CoopRelay {
             Some(_) => {
                 self.pending.insert(
                     name,
-                    Pending { dir: Dir::Data, fire_at: now + self.jitter, suppressed: false, done: false },
+                    Pending {
+                        dir: Dir::Data,
+                        fire_at: now + self.jitter,
+                        suppressed: false,
+                        done: false,
+                    },
                 );
             }
             None => { /* unsolicited: drop */ }
@@ -201,8 +217,13 @@ mod tests {
     /// Roles: a Consumer emits the Interest and records the Data; a Producer answers a
     /// matching Interest with Data; Relays run [`CoopRelay`].
     enum Role {
-        Consumer { want: Name, got_data_at: Option<u64> },
-        Producer { prefix: Prefix },
+        Consumer {
+            want: Name,
+            got_data_at: Option<u64>,
+        },
+        Producer {
+            prefix: Prefix,
+        },
         Relay,
     }
 
@@ -257,7 +278,8 @@ mod tests {
                                 }
                             }
                             Dir::Data => {
-                                if let Role::Consumer { want, got_data_at } = &mut self.nodes[j].role
+                                if let Role::Consumer { want, got_data_at } =
+                                    &mut self.nodes[j].role
                                     && *want == name
                                     && got_data_at.is_none()
                                 {
@@ -293,16 +315,38 @@ mod tests {
     fn interest_reaches_producer_two_hops_and_data_returns() {
         let mut mesh = Mesh {
             nodes: vec![
-                Node { relay: relay(9), role: Role::Consumer { want: XY, got_data_at: None }, produce: None }, // 0 C
-                Node { relay: relay(1), role: Role::Relay, produce: None }, // 1 R1
-                Node { relay: relay(1), role: Role::Relay, produce: None }, // 2 R2
-                Node { relay: relay(9), role: Role::Producer { prefix: SCOPE_X }, produce: None }, // 3 P
+                Node {
+                    relay: relay(9),
+                    role: Role::Consumer {
+                        want: XY,
+                        got_data_at: None,
+                    },
+                    produce: None,
+                }, // 0 C
+                Node {
+                    relay: relay(1),
+                    role: Role::Relay,
+                    produce: None,
+                }, // 1 R1
+                Node {
+                    relay: relay(1),
+                    role: Role::Relay,
+                    produce: None,
+                }, // 2 R2
+                Node {
+                    relay: relay(9),
+                    role: Role::Producer { prefix: SCOPE_X },
+                    produce: None,
+                }, // 3 P
             ],
             adj: vec![vec![1], vec![0, 2], vec![1, 3], vec![2]], // C<->R1<->R2<->P
         };
         mesh.run(30);
         let got = mesh.consumer_got(0);
-        assert!(got.is_some(), "consumer must receive the Data via two relays");
+        assert!(
+            got.is_some(),
+            "consumer must receive the Data via two relays"
+        );
         // Both relays must have carried it in each direction (4 emissions total).
         assert!(mesh.nodes[1].relay.emitted.contains(&(XY, Dir::Interest)));
         assert!(mesh.nodes[2].relay.emitted.contains(&(XY, Dir::Interest)));
@@ -317,20 +361,52 @@ mod tests {
     fn redundant_relays_are_cclf_suppressed() {
         let mut mesh = Mesh {
             nodes: vec![
-                Node { relay: relay(9), role: Role::Consumer { want: XY, got_data_at: None }, produce: None }, // 0 C
-                Node { relay: relay(2), role: Role::Relay, produce: None }, // 1 R1  (wins)
-                Node { relay: relay(5), role: Role::Relay, produce: None }, // 2 R1' (suppressed)
-                Node { relay: relay(1), role: Role::Relay, produce: None }, // 3 R2
-                Node { relay: relay(9), role: Role::Producer { prefix: SCOPE_X }, produce: None }, // 4 P
+                Node {
+                    relay: relay(9),
+                    role: Role::Consumer {
+                        want: XY,
+                        got_data_at: None,
+                    },
+                    produce: None,
+                }, // 0 C
+                Node {
+                    relay: relay(2),
+                    role: Role::Relay,
+                    produce: None,
+                }, // 1 R1  (wins)
+                Node {
+                    relay: relay(5),
+                    role: Role::Relay,
+                    produce: None,
+                }, // 2 R1' (suppressed)
+                Node {
+                    relay: relay(1),
+                    role: Role::Relay,
+                    produce: None,
+                }, // 3 R2
+                Node {
+                    relay: relay(9),
+                    role: Role::Producer { prefix: SCOPE_X },
+                    produce: None,
+                }, // 4 P
             ],
             // C heard by R1,R1'; R1 and R1' heard by C,R2 (and each other); R2 by R1,R1',P.
-            adj: vec![vec![1, 2], vec![0, 2, 3], vec![0, 1, 3], vec![1, 2, 4], vec![3]],
+            adj: vec![
+                vec![1, 2],
+                vec![0, 2, 3],
+                vec![0, 1, 3],
+                vec![1, 2, 4],
+                vec![3],
+            ],
         };
         mesh.run(30);
         assert!(mesh.consumer_got(0).is_some(), "consumer still gets Data");
         let r1 = mesh.nodes[1].relay.emitted.contains(&(XY, Dir::Interest));
         let r1p = mesh.nodes[2].relay.emitted.contains(&(XY, Dir::Interest));
-        assert!(r1 && !r1p, "exactly the better-placed relay forwards the Interest (CCLF)");
+        assert!(
+            r1 && !r1p,
+            "exactly the better-placed relay forwards the Interest (CCLF)"
+        );
     }
 
     /// Scope bounds cooperation: a node hears the Interest but its trust scope does not
@@ -341,8 +417,15 @@ mod tests {
         let mut n = CoopRelay::new(vec![2 /* /z, not /x */], 1, 1000);
         n.rx_interest(XY, 0); // hears /x/y
         let fired = n.tick(5);
-        assert!(fired.is_empty(), "out-of-scope Interest is heard but not relayed");
-        assert_eq!(n.pending_len(), 0, "no forwarding state created for out-of-scope names");
+        assert!(
+            fired.is_empty(),
+            "out-of-scope Interest is heard but not relayed"
+        );
+        assert_eq!(
+            n.pending_len(),
+            0,
+            "no forwarding state created for out-of-scope names"
+        );
     }
 
     /// Unsolicited Data (no matching pending Interest) is dropped — the DoS gate, and
@@ -368,7 +451,10 @@ mod tests {
         r.rx_interest(XY, 0);
         let _ = r.tick(5); // relay the Interest
         r.rx_data(XY, 6);
-        assert!(r.tick(10).contains(&(XY, Dir::Data)), "with the breadcrumb, Data is forwarded");
+        assert!(
+            r.tick(10).contains(&(XY, Dir::Data)),
+            "with the breadcrumb, Data is forwarded"
+        );
 
         // Soft-state LOSS: the whole projection is wiped (crash / eviction / recompile).
         r.clear_projection();
@@ -377,7 +463,10 @@ mod tests {
         // PERFORMANCE cost: Data arriving now has no breadcrumb → dropped as unsolicited. That round
         // is wasted — but it is NOT a correctness failure: nothing is forwarded wrongly.
         r.rx_data(XY, 20);
-        assert!(r.tick(25).is_empty(), "post-loss Data is dropped (perf cost), never mis-forwarded");
+        assert!(
+            r.tick(25).is_empty(),
+            "post-loss Data is dropped (perf cost), never mis-forwarded"
+        );
 
         // CORRECTNESS preserved: a re-expressed Interest recompiles the projection from live demand,
         // and forwarding resumes exactly as before the loss.
@@ -399,11 +488,17 @@ mod tests {
         let mut r = relay(1); // scope = {/x}
         r.set_scope(vec![]); // lose the filter set (leaf node / eviction)
         r.rx_interest(XY, 0);
-        assert!(r.tick(5).is_empty(), "with no scope, the Interest is heard but not relayed");
+        assert!(
+            r.tick(5).is_empty(),
+            "with no scope, the Interest is heard but not relayed"
+        );
         assert_eq!(r.pending_len(), 0, "no forwarding state without the role");
 
         r.set_scope(vec![SCOPE_X]); // recompile the filter from roles
         r.rx_interest(XY, 10);
-        assert!(r.tick(15).contains(&(XY, Dir::Interest)), "filter recompiled; relaying resumes");
+        assert!(
+            r.tick(15).contains(&(XY, Dir::Interest)),
+            "filter recompiled; relaying resumes"
+        );
     }
 }

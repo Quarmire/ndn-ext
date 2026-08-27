@@ -10,7 +10,7 @@
 //!
 //! On-air version (manual, needs the OPi receiver): mount `RadioControl` on the
 //! `radio-ping` TX via `LpLinkService::with_extra_feature` + `face_composed`, run
-//! it vs `MonitorWifiFace::with_fixed_mcs`, and feed measured delivered-bytes /
+//! it vs `WifiPhy::with_fixed_mcs`, and feed measured delivered-bytes /
 //! airtime into the same `score_arm` scoring.
 
 use ndn_face_monitor_wifi::measure::{Score, ab_sweep};

@@ -14,12 +14,9 @@
 //! state machine drives deterministically under
 //! `tokio::time::advance`.
 
-use std::collections::HashMap;
-use std::sync::{
-    Arc, Mutex,
-    atomic::Ordering,
-};
 use portable_atomic::AtomicU64;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, atomic::Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;

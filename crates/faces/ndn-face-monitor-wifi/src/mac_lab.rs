@@ -117,17 +117,31 @@ fn prop_p1_map_agreement() {
     let key = crate::GroupKey([1u8; 16]);
     let table = || {
         Arc::new(
-            GroupTable::new(&key, &[b"/alarm".as_slice(), b"/bulk".as_slice(), b"/ndn".as_slice()])
-                .with_latency(&[b"/alarm".as_slice()]),
+            GroupTable::new(
+                &key,
+                &[
+                    b"/alarm".as_slice(),
+                    b"/bulk".as_slice(),
+                    b"/ndn".as_slice(),
+                ],
+            )
+            .with_latency(&[b"/alarm".as_slice()]),
         )
     };
     let slot = SlotSchedule::new(3000, 8).with_reserved_stride(4);
     let nodes: Vec<FaceScheduler> = (0..5).map(|_| lab_sched(slot, Some(table()))).collect();
 
-    for name in [&b"/alarm/1"[..], b"/bulk/x/y", b"/ndn/z", b"/unregistered/q"] {
+    for name in [
+        &b"/alarm/1"[..],
+        b"/bulk/x/y",
+        b"/ndn/z",
+        b"/unregistered/q",
+    ] {
         let wire = {
-            let comps: Vec<&[u8]> =
-                name.split(|&b| b == b'/').filter(|c| !c.is_empty()).collect();
+            let comps: Vec<&[u8]> = name
+                .split(|&b| b == b'/')
+                .filter(|c| !c.is_empty())
+                .collect();
             data_wire(&comps)
         };
         let views: Vec<(u64, LeaseClass, u64)> = nodes
@@ -189,7 +203,9 @@ async fn prop_p2_lanes_inviolate_under_claim_pressure() {
     // epoch's draw was long".
     for _ in 0..6 {
         wait_for_slot(&s, |k, now| {
-            !slot.is_reserved(k) && k != own && slot.wait_us_in(h, LeaseClass::Bulk, now) > slot.slot_us()
+            !slot.is_reserved(k)
+                && k != own
+                && slot.wait_us_in(h, LeaseClass::Bulk, now) > slot.slot_us()
         })
         .await;
         for c in s.slots.heard.iter() {
@@ -201,7 +217,10 @@ async fn prop_p2_lanes_inviolate_under_claim_pressure() {
             break;
         }
     }
-    assert!(claimed, "an idle, evidenced open slot must still be claimable");
+    assert!(
+        claimed,
+        "an idle, evidenced open slot must still be claimable"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -245,7 +264,10 @@ async fn prop_p3_latency_delay_bounded_under_saturating_bulk() {
         t = Instant::now();
     }
     let sent = blast.await.unwrap();
-    assert!(sent > 20, "fixture: bulk must actually have been saturating (sent {sent})");
+    assert!(
+        sent > 20,
+        "fixture: bulk must actually have been saturating (sent {sent})"
+    );
 
     // Bound: one full superframe (its lane's period is stride*slot = 12 ms; the superframe, 24 ms,
     // is the conservative statement) + generous scheduler-timing slack. The property is that the
@@ -272,7 +294,10 @@ async fn prop_p4_p5_audible_owner_and_foreign_blindness() {
 
     // P4: the owner of the current slot speaks (any domain frame since slot start) — no claim.
     let own = slot.owner_slot(h);
-    wait_for_slot(&s, |k, now| k != own && slot.wait_us(h, now) > slot.slot_us()).await;
+    wait_for_slot(&s, |k, now| {
+        k != own && slot.wait_us(h, now) > slot.slot_us()
+    })
+    .await;
     for c in s.slots.heard.iter() {
         c.store(s.now_us(), Ordering::Relaxed);
     }
@@ -285,8 +310,12 @@ async fn prop_p4_p5_audible_owner_and_foreign_blindness() {
     // P5: foreign frames — real-MAC unicast, the all-ones frame, and a just-under-cap flood — are
     // ambient at ANY rate: they neither mark the domain busy nor forge presence.
     let s2 = lab_sched(slot, None);
-    let before_presence: Vec<u64> =
-        s2.slots.heard.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let before_presence: Vec<u64> = s2
+        .slots
+        .heard
+        .iter()
+        .map(|c| c.load(Ordering::Relaxed))
+        .collect();
     let mut near_cap = [0u8; 12];
     near_cap[0] = 0b0000_0011; // passes the origin bits…
     for i in 1..8 {
@@ -295,17 +324,39 @@ async fn prop_p4_p5_audible_owner_and_foreign_blindness() {
     for i in 0..5_000u32 {
         let mut foreign = [0x00u8, 0x1b, 0x44, 0x11, 0x3a, 0xb7]; // real-OUI unicast, U/L=0
         foreign[5] = i as u8;
-        s2.observe_rx(Some(&foreign), Some(&[0x00, 0x1b, 0x44, 0, 0, 1]), None, b"");
+        s2.observe_rx(
+            Some(&foreign),
+            Some(&[0x00, 0x1b, 0x44, 0, 0, 1]),
+            None,
+            b"",
+        );
         s2.observe_rx(Some(&[0xffu8; 6]), Some(&[0xffu8; 6]), None, b""); // all-ones
-        s2.observe_rx(Some(near_cap[..6].try_into().unwrap()), Some(near_cap[6..12].try_into().unwrap()), None, b"");
+        s2.observe_rx(
+            Some(near_cap[..6].try_into().unwrap()),
+            Some(near_cap[6..12].try_into().unwrap()),
+            None,
+            b"",
+        );
     }
-    assert_eq!(s2.last_domain_rx.load(Ordering::Relaxed), 0, "foreign frames marked the domain busy");
     assert_eq!(
-        s2.slots.heard.iter().map(|c| c.load(Ordering::Relaxed)).collect::<Vec<_>>(),
+        s2.last_domain_rx.load(Ordering::Relaxed),
+        0,
+        "foreign frames marked the domain busy"
+    );
+    assert_eq!(
+        s2.slots
+            .heard
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .collect::<Vec<_>>(),
         before_presence,
         "foreign frames forged presence"
     );
-    assert_eq!(s2.ambient_frames(), 15_000, "and every one of them was counted, not dropped silently");
+    assert_eq!(
+        s2.ambient_frames(),
+        15_000,
+        "and every one of them was counted, not dropped silently"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -317,11 +368,14 @@ async fn prop_p4_p5_audible_owner_and_foreign_blindness() {
 /// Build the A–B–C chain (A–B, B–C audible; A–C hidden) and return everything the two P6 arms need.
 async fn p6_setup() -> (Medium<3>, u64, u64, u64) {
     let slot = SlotSchedule::new(3000, 8);
-    let nodes: Vec<Arc<FaceScheduler>> =
-        (0..3).map(|_| Arc::new(lab_sched(slot, None))).collect();
+    let nodes: Vec<Arc<FaceScheduler>> = (0..3).map(|_| Arc::new(lab_sched(slot, None))).collect();
     let m = Medium::<3> {
         nodes,
-        hear: [[false, true, false], [true, false, true], [false, true, false]],
+        hear: [
+            [false, true, false],
+            [true, false, true],
+            [false, true, false],
+        ],
     };
     let a = &m.nodes[0];
     let c_wire = data_wire(&[b"c", b"data"]);
@@ -361,7 +415,12 @@ async fn prop_p6_hidden_terminal_refused_when_the_relay_is_recognizable() {
             slot.owner_slot(a.medium_keyed(h)) != c_slot
         })
         .unwrap();
-    m.deliver(1, Some(&ndn_radio_hal::BROADCAST), None, &data_wire(&[b_name.as_bytes()]));
+    m.deliver(
+        1,
+        Some(&ndn_radio_hal::BROADCAST),
+        None,
+        &data_wire(&[b_name.as_bytes()]),
+    );
     m.deliver(1, Some(&ndn_radio_hal::BROADCAST), None, &c_wire); // the relay of /c
 
     let mut claimed = false;
@@ -436,7 +495,13 @@ async fn prop_p11_skew_times_long_frames_defeats_lanes_and_cv_restores_them() {
 
     /// Drive A (bulk owner, long frames, skewed by `skew_us`) and C (alarm at each lane start,
     /// unskewed) for `dur_ms`; return (alarms, alarms overlapped by an A-frame in flight).
-    async fn run(slot: SlotSchedule, air: u64, skew_us: i64, dur_ms: u64, lane_period_ms: u64) -> (u32, u32) {
+    async fn run(
+        slot: SlotSchedule,
+        air: u64,
+        skew_us: i64,
+        dur_ms: u64,
+        lane_period_ms: u64,
+    ) -> (u32, u32) {
         let mut a = lab_sched(slot, None);
         a.clock_skew_us = skew_us;
         a.lease_max = 8; // the campaign shape: leases across the open slots, ~66% duty
@@ -563,7 +628,10 @@ async fn prop_p10_a_lease_burst_pays_one_election() {
     assert!(won, "fixture: the election must be winnable");
     let (elections, elections_won, holds) = s.election_counts();
     assert_eq!(elections_won, 1, "one win");
-    assert!(holds == 0, "no continuations yet — the win itself is not a continuation");
+    assert!(
+        holds == 0,
+        "no continuations yet — the win itself is not a continuation"
+    );
     let elections_paid = elections; // could be >1: earlier attempts may have lost their draw
 
     // The burst: every further frame inside the leased window must be a CONTINUATION — zero new
@@ -578,11 +646,15 @@ async fn prop_p10_a_lease_burst_pays_one_election() {
     }
     let (e2, w2, h2) = s.election_counts();
     assert_eq!(
-        e2, elections_paid,
+        e2,
+        elections_paid,
         "a burst inside a won lease paid {} extra election(s) — the lease is not amortizing",
         e2 - elections_paid
     );
-    assert_eq!(h2 as usize, continued, "every burst frame is a continuation");
+    assert_eq!(
+        h2 as usize, continued,
+        "every burst frame is a continuation"
+    );
     assert_eq!(w2, 1, "and none of them is a new election win");
 
     // And the compat counter still conflates them, by documented design — the reason B needed
@@ -608,7 +680,9 @@ fn prop_p7_channels_stagger_the_map() {
         .collect();
     let differing = names
         .iter()
-        .filter(|h| slot.owner_slot(s36.medium_keyed(**h)) != slot.owner_slot(s149.medium_keyed(**h)))
+        .filter(|h| {
+            slot.owner_slot(s36.medium_keyed(**h)) != slot.owner_slot(s149.medium_keyed(**h))
+        })
         .count();
     assert!(
         differing >= names.len() / 2,
@@ -645,16 +719,24 @@ fn prop_p8_no_transmission_crosses_a_boundary() {
 fn prop_p9_claimant_fairness_demand_weighted() {
     let slot = SlotSchedule::new(3_000, 8);
     let s = lab_sched(slot, None);
-    let names: Vec<u64> = (0..8u32).map(|i| prefix_hash(&[format!("g{i}").as_bytes()])).collect();
+    let names: Vec<u64> = (0..8u32)
+        .map(|i| prefix_hash(&[format!("g{i}").as_bytes()]))
+        .collect();
 
     // Equal demand: every name wins some epochs, none dominates (the #87 rotation, at lab scale).
     let mut wins = std::collections::HashMap::new();
     for e in 0..2_000u64 {
-        let w = names.iter().min_by_key(|n| s.cclf_jitter_us(**n, 3_000, e, 200)).unwrap();
+        let w = names
+            .iter()
+            .min_by_key(|n| s.cclf_jitter_us(**n, 3_000, e, 200))
+            .unwrap();
         *wins.entry(*w).or_insert(0u32) += 1;
     }
     assert_eq!(wins.len(), names.len(), "a claimant is starved: {wins:?}");
-    assert!(*wins.values().max().unwrap() < 1_000, "a claimant dominates: {wins:?}");
+    assert!(
+        *wins.values().max().unwrap() < 1_000,
+        "a claimant dominates: {wins:?}"
+    );
 
     // Demand weighting (#95): give one name backlog; its win share must rise, and the rest must
     // still win — bias, not capture.
@@ -664,7 +746,10 @@ fn prop_p9_claimant_fairness_demand_weighted() {
     }
     let mut wins2 = std::collections::HashMap::new();
     for e in 0..2_000u64 {
-        let w = names.iter().min_by_key(|n| s.cclf_jitter_us(**n, 3_000, e, 200)).unwrap();
+        let w = names
+            .iter()
+            .min_by_key(|n| s.cclf_jitter_us(**n, 3_000, e, 200))
+            .unwrap();
         *wins2.entry(*w).or_insert(0u32) += 1;
     }
     assert!(
@@ -673,5 +758,9 @@ fn prop_p9_claimant_fairness_demand_weighted() {
         wins[&favored],
         wins2[&favored]
     );
-    assert_eq!(wins2.len(), names.len(), "demand bias starved someone: {wins2:?}");
+    assert_eq!(
+        wins2.len(),
+        names.len(),
+        "demand bias starved someone: {wins2:?}"
+    );
 }

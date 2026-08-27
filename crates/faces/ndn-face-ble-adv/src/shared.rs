@@ -2,7 +2,7 @@
 //! ESP32-C5 firmware's one port/reader), so a single host connection carries **both** bearers of the named
 //! radio: the Wi-Fi `FrameIo` and this BLE advertiser/scanner. The `SerialRadioBackend` reader demuxes
 //! `T_RX_TS` (Wi-Fi) and `T_BLE_RX` (BLE) off the same stream; this wrapper just exposes its BLE side as an
-//! `AdvBackend` for [`BleAdvFace`](crate::BleAdvFace).
+//! `AdvBackend` for [`BlePhy`](crate::BlePhy).
 //!
 //! Get the shared handle from the Wi-Fi view — `Esp32SerialBackend::shared_mux()` — so both views ride one
 //! serial link (the alternative, opening the port twice, is what the old `Esp32BleBackend::open` did and it
@@ -10,11 +10,11 @@
 //!
 //! ```no_run
 //! # use std::sync::Arc;
-//! # use ndn_face_ble_adv::{SharedBleBackend, BleAdvFace};
+//! # use ndn_face_ble_adv::{SharedBleBackend, BlePhy};
 //! # fn demo(wifi: &ndn_radio_drivers::Esp32SerialBackend) -> Result<(), ndn_transport::FaceError> {
 //! let mux = wifi.shared_mux();                 // the Arc<SerialRadioBackend> behind the Wi-Fi FrameIo
 //! let ble = Arc::new(SharedBleBackend::new(mux.clone()));
-//! let face = BleAdvFace::new(ndn_transport::FaceId(0), ble);
+//! let face = BlePhy::new(ndn_transport::FaceId(0), ble);
 //! // The BLE<->Wi-Fi airtime split is cognition-driven, not a constant:
 //! mux.clone().spawn_demand_coex(std::time::Duration::from_secs(1), 0.15, 0.9, 256);
 //! # let _ = face; Ok(()) }
@@ -57,6 +57,10 @@ impl AdvBackend for SharedBleBackend {
 
     async fn next_scanned(&self) -> Result<ScannedFrame, FaceError> {
         let (rssi, addr, frame) = self.mux.ble_next_scanned().await?;
-        Ok(ScannedFrame { frame, addr: Some(addr), rssi_dbm: Some(rssi) })
+        Ok(ScannedFrame {
+            frame,
+            addr: Some(addr),
+            rssi_dbm: Some(rssi),
+        })
     }
 }

@@ -150,7 +150,10 @@ impl GcsFilter {
         vs.sort_unstable();
 
         let mut bytes = [0u8; GCS_MAX_BYTES];
-        let mut w = BitW { buf: &mut bytes, pos: 0 };
+        let mut w = BitW {
+            buf: &mut bytes,
+            pos: 0,
+        };
         let mut prev = 0u64;
         let mut first = true;
         for &v in vs.iter() {
@@ -161,7 +164,11 @@ impl GcsFilter {
             prev = v;
             first = false;
         }
-        Self { n: n as u8, bit_len: w.pos as u16, bytes }
+        Self {
+            n: n as u8,
+            bit_len: w.pos as u16,
+            bytes,
+        }
     }
 
     /// Could a name carrying this filter be under `prefix`? `false` is **exact** (zero false negatives).
@@ -172,7 +179,11 @@ impl GcsFilter {
             return false;
         }
         let qv = name_hash(key, prefix) % m;
-        let mut r = BitR { buf: &self.bytes, pos: 0, len: self.bit_len as usize };
+        let mut r = BitR {
+            buf: &self.bytes,
+            pos: 0,
+            len: self.bit_len as usize,
+        };
         let mut acc = 0u64;
         while let Some(gap) = r.rice(GCS_P) {
             acc += gap;
@@ -206,7 +217,11 @@ impl GcsFilter {
         let nb = body.len().min(GCS_MAX_BYTES);
         let mut bytes = [0u8; GCS_MAX_BYTES];
         bytes[..nb].copy_from_slice(&body[..nb]);
-        Self { n, bit_len: (nb * 8) as u16, bytes }
+        Self {
+            n,
+            bit_len: (nb * 8) as u16,
+            bytes,
+        }
     }
 }
 
@@ -234,9 +249,15 @@ mod tests {
             let len = f.to_wire(&mut wire);
             let back = GcsFilter::from_wire(&wire[..len]);
             for d in 1..=depth.min(MAX_DEPTH - 1) {
-                assert!(back.may_match(&KEY, &deep(d)), "FALSE NEGATIVE depth {depth}/{d}");
+                assert!(
+                    back.may_match(&KEY, &deep(d)),
+                    "FALSE NEGATIVE depth {depth}/{d}"
+                );
             }
-            assert!(back.may_match(&KEY, b"/"), "root must match at depth {depth}");
+            assert!(
+                back.may_match(&KEY, b"/"),
+                "root must match at depth {depth}"
+            );
         }
     }
 
@@ -244,7 +265,10 @@ mod tests {
     fn gcs_is_smaller_than_the_address_bloom() {
         for depth in [4usize, 6, 8] {
             let gcs = GcsFilter::from_name(&KEY, &deep(depth)).wire_len();
-            assert!(gcs < 16, "GCS ({gcs} B) should undercut the 16 B Bloom at depth {depth}");
+            assert!(
+                gcs < 16,
+                "GCS ({gcs} B) should undercut the 16 B Bloom at depth {depth}"
+            );
         }
     }
 

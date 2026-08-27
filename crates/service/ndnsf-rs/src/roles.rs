@@ -27,9 +27,9 @@
 //! # }
 //! ```
 
+use portable_atomic::AtomicU64;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use portable_atomic::AtomicU64;
 use std::time::Duration;
 
 use bytes::Bytes;

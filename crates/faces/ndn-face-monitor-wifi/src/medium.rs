@@ -22,7 +22,7 @@
 //!   bearer's decided rate ([`TxParams`] from the control plane, robust default
 //!   otherwise). On a broadcast medium, replicating one frame across radios *is*
 //!   spatial/frequency diversity. With one bearer this collapses to exactly the
-//!   [`MonitorWifiFace`](crate::MonitorWifiFace) behaviour.
+//!   [`WifiPhy`](crate::WifiPhy) behaviour.
 //!
 //! The cognitive plane ([`RadioControl`](crate::RadioControl)) is already
 //! medium-shaped — it holds a `MediumState` of *N* registered radios and decides a
@@ -35,15 +35,15 @@
 //! subset the `RadioPlan` selects, honouring per-radio channel) remains a follow-up; the
 //! abstraction (one face, N capabilities, union RX, fan-out TX) is complete here.
 //!
-//! The feature gap versus [`MonitorWifiFace`] that this note used to describe is closed (#82):
+//! The feature gap versus [`WifiPhy`] that this note used to describe is closed (#82):
 //! name-group addressing and link-FEC arrived earlier, the shared [`NameGate`](crate::NameGate)
 //! landed in part 1, and A-MSDU — the last genuinely one-sided feature — landed in part 2. What
-//! remains of #82 is the structural half: `MonitorWifiFace` becoming a one-bearer construction of
+//! remains of #82 is the structural half: `WifiPhy` becoming a one-bearer construction of
 //! this face rather than a parallel implementation of it.
 
+use portable_atomic::AtomicU64;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
-use portable_atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -53,8 +53,8 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::RadioControl;
-use ndn_radio_cognition::{NameContext, RadioActuators, RadioAllocation, RadioError};
 use ndn_radio_cognition::ephemeral_id::IdDeconfliction;
+use ndn_radio_cognition::{NameContext, RadioActuators, RadioAllocation, RadioError};
 use ndn_signals_core::{LinkSignals, NodeSignals, SignalStore, SignalView};
 use ndn_transport::link_service::{LinkServiceFeature, LpLinkService};
 use ndn_transport::{
@@ -62,10 +62,8 @@ use ndn_transport::{
 };
 
 use crate::{
-    Bandwidth, BROADCAST, DbmRange, EphemeralSource, FaceError, FaceId,
-    FrameIo, InjectFrame,
-    McsDescriptor, MONITOR_MTU, OpenRadio, RadioCapability, RadioKnobs, RadioProfile,
-    RadioTime,
+    BROADCAST, Bandwidth, DbmRange, EphemeralSource, FaceError, FaceId, FrameIo, InjectFrame,
+    MONITOR_MTU, McsDescriptor, OpenRadio, RadioCapability, RadioKnobs, RadioProfile, RadioTime,
     Reliability, TxIntent, mcs_phy_rate_bps,
 };
 
@@ -178,7 +176,15 @@ pub struct RadioBearer {
 impl RadioBearer {
     /// A bearer over **any** [`FrameIo`] radio (LoRa, BLE, …).
     pub fn new(id: RadioId, radio: Arc<dyn FrameIo>, cap: RadioCapability) -> Self {
-        Self { id, radio, cap, knobs: None, time: None, profile: None, channel: None }
+        Self {
+            id,
+            radio,
+            cap,
+            knobs: None,
+            time: None,
+            profile: None,
+            channel: None,
+        }
     }
 
     /// **A bearer from the standardized opener** (#78) — the capability-complete path.
@@ -188,7 +194,15 @@ impl RadioBearer {
     /// standardized opener and name a concrete backend, which is precisely the leak the opener was
     /// created to close — it had fixed the on-air FORMAT leak and left the CAPABILITY leak open.
     pub fn from_open(id: RadioId, r: OpenRadio, cap: RadioCapability) -> Self {
-        Self { id, radio: r.io, cap, knobs: r.knobs, time: r.time, profile: r.profile, channel: None }
+        Self {
+            id,
+            radio: r.io,
+            cap,
+            knobs: r.knobs,
+            time: r.time,
+            profile: r.profile,
+            channel: None,
+        }
     }
 
     /// **The capability that governs** — the radio's own when it declares one, else the caller's
@@ -222,7 +236,15 @@ impl RadioBearer {
     /// handle to the bearer-agnostic data-plane view. Kept as a convenience for
     /// callers holding an `Arc<dyn FrameIo>` from a driver.
     pub fn wifi(id: RadioId, radio: Arc<dyn FrameIo>, cap: RadioCapability) -> Self {
-        Self { id, radio, cap, knobs: None, time: None, profile: None, channel: None }
+        Self {
+            id,
+            radio,
+            cap,
+            knobs: None,
+            time: None,
+            profile: None,
+            channel: None,
+        }
     }
 
     /// Attach the radio's control seam, and let it describe itself: a seam that
@@ -274,7 +296,12 @@ impl LinkSignalStore {
     /// Every neighbour currently known, by source nonce → its last link signals. The per-frame
     /// RSSI-per-neighbour map the doctrine's §2 nonce buys (density / macro-diversity input).
     pub fn neighbours(&self) -> Vec<([u8; 6], LinkSignals)> {
-        self.per_source.lock().unwrap().iter().map(|(k, v)| (*k, *v)).collect()
+        self.per_source
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (*k, *v))
+            .collect()
     }
 }
 
@@ -353,11 +380,7 @@ pub struct MediumActuator {
 impl MediumActuator {
     /// Actuate `radio`: set its rate on `io`, and (if `knobs` is given) its
     /// channel/power/etc. `knobs` is `None` for a bearer without a control seam.
-    pub fn new(
-        radio: RadioId,
-        io: Arc<dyn FrameIo>,
-        knobs: Option<Arc<dyn RadioKnobs>>,
-    ) -> Self {
+    pub fn new(radio: RadioId, io: Arc<dyn FrameIo>, knobs: Option<Arc<dyn RadioKnobs>>) -> Self {
         Self {
             radio,
             io,
@@ -551,7 +574,7 @@ pub struct RadioMediumFace {
     /// **A-MSDU bundling** (#82 part 2), when enabled: outbound data frames are coalesced and handed
     /// to the bearer's [`FrameIo::inject_batch`], which the AF_PACKET and RTL/MT7612 backends
     /// override with real aggregation. This was the one genuinely one-sided feature in #82 —
-    /// `MonitorWifiFace` had it and the medium did not.
+    /// `WifiPhy` had it and the medium did not.
     amsdu: Option<AmsduCfg>,
 }
 
@@ -566,7 +589,7 @@ struct AmsduCfg {
 /// The medium's send-coalescer: one per bearer, submitting whole batches to that bearer's
 /// [`FrameIo::inject_batch`].
 ///
-/// It carries no MCS, unlike `MonitorWifiFace`'s batcher. The medium models rate as **bearer state**
+/// It carries no MCS, unlike `WifiPhy`'s batcher. The medium models rate as **bearer state**
 /// (the driver holds it; the face sends [`TxIntent`]s), so there is no per-frame descriptor to
 /// attach — which is exactly why `ndn-frame-io`'s AF_PACKET backend gained an `inject_batch` that
 /// aggregates at the currently-set rate. Aggregating only through the rate-carrying spelling would
@@ -656,7 +679,9 @@ impl MediumBatcher {
                         )
                         .await
                 } else {
-                    radio.inject_batch(batch.into_iter().map(|(f, _)| f).collect()).await
+                    radio
+                        .inject_batch(batch.into_iter().map(|(f, _)| f).collect())
+                        .await
                 };
                 inj_c.fetch_add(1, Ordering::Relaxed);
                 if r.is_err() {
@@ -718,13 +743,20 @@ impl RadioMediumFace {
     /// source nonce moved to `addr3`; inbound frames are dropped before the engine unless their
     /// filter could be under one of `registered_prefixes` (given as `/`-strings). A relay passes
     /// several prefixes (its forwarding family); a leaf, one. Broadcast frames always pass.
-    pub fn with_bloom(mut self, key: &crate::GroupKey, registered_prefixes: &[impl AsRef<[u8]>]) -> Self {
+    pub fn with_bloom(
+        mut self,
+        key: &crate::GroupKey,
+        registered_prefixes: &[impl AsRef<[u8]>],
+    ) -> Self {
         let masks = crate::bloom_masks_for(key, registered_prefixes);
         // P1 ("one filter, one map"): the same (key, prefixes) that gate RX also key the slot map,
         // built HERE so the gate and the scheduler cannot disagree about what is registered.
         self.group_table = Some(Arc::new(crate::GroupTable::new(key, registered_prefixes)));
         self.with_tx_bloom(*key)
-            .with_rx_gate(Arc::new(crate::NameGate::new(crate::RxFilter::Bloom(masks), None)))
+            .with_rx_gate(Arc::new(crate::NameGate::new(
+                crate::RxFilter::Bloom(masks),
+                None,
+            )))
     }
 
     /// [`with_bloom`](Self::with_bloom), with some registered prefixes marked **latency-class**
@@ -808,7 +840,7 @@ impl RadioMediumFace {
     /// cognitive control plane's decided [`TxParams`] when `planned` carries one, else `policy`
     /// (adaptive from observed RSSI, or fixed).
     ///
-    /// This closes #82's last one-sided feature. `MonitorWifiFace` could act on a decided MCS and
+    /// This closes #82's last one-sided feature. `WifiPhy` could act on a decided MCS and
     /// this face could not, so a `RadioPlan` mounted on a medium face decided a rate that nothing
     /// applied — the quietest kind of gap, because a plan whose rate is never actuated looks exactly
     /// like a plan that chose the rate you were already transmitting at.
@@ -872,7 +904,7 @@ impl RadioMediumFace {
 
     /// Build a [`Face`] pairing the running medium transport with the engine's
     /// `LpLinkService`, so NDN packets fragment/reassemble across injected frames —
-    /// exactly as [`MonitorWifiFace::into_face`](crate::MonitorWifiFace::into_face).
+    /// exactly as [`WifiPhy::into_face`](crate::WifiPhy::into_face).
     pub fn into_face(self) -> Face {
         Face::from_transport(self.build())
     }
@@ -1063,53 +1095,56 @@ impl TxBearer {
         // for an ineligible class (real-time/best-effort) a late-recovered frame is dead
         // weight — all bypass and inject directly. The peer's decoder passes an uncoded
         // frame straight through, so mixing coded/uncoded frames is safe.
-        if !robust
-            && let Some((bridge, r)) = &self.fec {
-                // The plan is the authority when one is bound; the shared `AtomicU16` is the
-                // channel cognition's `MediumActuator` writes when it is not. Reading only the
-                // atomic meant a `RadioPlan` could decide `link_fec_redundancy` and have nothing
-                // apply it unless a separate actuator happened to be running — the defect this
-                // crate is named for in `decided-but-unactuated`.
-                let parity = self
-                    .rate
-                    .as_ref()
-                    .and_then(|rp| rp.planned_redundancy())
-                    .unwrap_or_else(|| r.load(Ordering::Relaxed));
-                let eligible = self.eligible.as_ref().is_none_or(|pred| pred(&wire));
-                if parity > 0 && eligible {
-                    // The generation takes the opening frame's address, intent AND rate, so coded
-                    // traffic keeps Tier-0 addressing, the legacy-rate cap, and the decided MCS.
-                    //
-                    // `mcs` was `None` here until an on-air run caught it. The reasoning was "this
-                    // face holds rate as bearer state" — true before `with_rate_policy` existed,
-                    // false after: with a policy bound and FEC on, EVERY data frame takes this
-                    // branch, so `inject_at` was never reached and no frame ever carried a decided
-                    // rate. The old `MonitorWifiFace` pinned `mcs: Some(..)` into its `WifiPin`;
-                    // unifying the sink dropped that, and the loopback test missed it because it
-                    // exercised rate and FEC separately, never together.
-                    //
-                    // MEASURED (a81a → 881a, ch149, 2684 coded frames): the receiver decoded every
-                    // `new`-arm frame at the *previous* period's MCS — the rate some other caller
-                    // had last left in the bearer — while the direct-inject control arm tracked its
-                    // plan exactly. A decided rate that reaches no frame is this codebase's
-                    // signature defect, reintroduced by a refactor and invisible to every test that
-                    // did not put both features on at once.
-                    TXD_FEC.fetch_add(1, Ordering::Relaxed);
-                    let r = bridge.send(
-                        wire,
-                        crate::RadioFecPin {
-                            dst,
-                            src,
-                            addr3,
-                            intent,
-                            mcs: decided,
-                        },
-                        Some(parity),
-                    );
-                    if r.is_ok() { TXD_DONE_OK.fetch_add(1, Ordering::Relaxed); } else { TXD_DONE_ERR.fetch_add(1, Ordering::Relaxed); }
-                    return r;
+        if !robust && let Some((bridge, r)) = &self.fec {
+            // The plan is the authority when one is bound; the shared `AtomicU16` is the
+            // channel cognition's `MediumActuator` writes when it is not. Reading only the
+            // atomic meant a `RadioPlan` could decide `link_fec_redundancy` and have nothing
+            // apply it unless a separate actuator happened to be running — the defect this
+            // crate is named for in `decided-but-unactuated`.
+            let parity = self
+                .rate
+                .as_ref()
+                .and_then(|rp| rp.planned_redundancy())
+                .unwrap_or_else(|| r.load(Ordering::Relaxed));
+            let eligible = self.eligible.as_ref().is_none_or(|pred| pred(&wire));
+            if parity > 0 && eligible {
+                // The generation takes the opening frame's address, intent AND rate, so coded
+                // traffic keeps Tier-0 addressing, the legacy-rate cap, and the decided MCS.
+                //
+                // `mcs` was `None` here until an on-air run caught it. The reasoning was "this
+                // face holds rate as bearer state" — true before `with_rate_policy` existed,
+                // false after: with a policy bound and FEC on, EVERY data frame takes this
+                // branch, so `inject_at` was never reached and no frame ever carried a decided
+                // rate. The old `WifiPhy` pinned `mcs: Some(..)` into its `WifiPin`;
+                // unifying the sink dropped that, and the loopback test missed it because it
+                // exercised rate and FEC separately, never together.
+                //
+                // MEASURED (a81a → 881a, ch149, 2684 coded frames): the receiver decoded every
+                // `new`-arm frame at the *previous* period's MCS — the rate some other caller
+                // had last left in the bearer — while the direct-inject control arm tracked its
+                // plan exactly. A decided rate that reaches no frame is this codebase's
+                // signature defect, reintroduced by a refactor and invisible to every test that
+                // did not put both features on at once.
+                TXD_FEC.fetch_add(1, Ordering::Relaxed);
+                let r = bridge.send(
+                    wire,
+                    crate::RadioFecPin {
+                        dst,
+                        src,
+                        addr3,
+                        intent,
+                        mcs: decided,
+                    },
+                    Some(parity),
+                );
+                if r.is_ok() {
+                    TXD_DONE_OK.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    TXD_DONE_ERR.fetch_add(1, Ordering::Relaxed);
                 }
+                return r;
             }
+        }
 
         let frame = InjectFrame {
             payload: wire,
@@ -1133,7 +1168,11 @@ impl TxBearer {
             .and_then(|r| r.planned_amsdu_msdus())
             .is_some_and(|n| n == 0);
         // Hardware slot placement is per-frame (one MPDU at its instant), so it bypasses A-MSDU batching.
-        if !robust && !no_aggregate && hw_delay.is_none() && let Some(bat) = &self.batcher {
+        if !robust
+            && !no_aggregate
+            && hw_delay.is_none()
+            && let Some(bat) = &self.batcher
+        {
             return bat.submit(frame, decided);
         }
         // Per-frame rate (#82), when a policy is bound. Skipped for robust frames and whenever the
@@ -1152,7 +1191,11 @@ impl TxBearer {
         } else {
             self.radio.inject(frame).await
         };
-        if r.is_ok() { TXD_DONE_OK.fetch_add(1, Ordering::Relaxed); } else { TXD_DONE_ERR.fetch_add(1, Ordering::Relaxed); }
+        if r.is_ok() {
+            TXD_DONE_OK.fetch_add(1, Ordering::Relaxed);
+        } else {
+            TXD_DONE_ERR.fetch_add(1, Ordering::Relaxed);
+        }
         r
     }
 }
@@ -1256,7 +1299,11 @@ impl RunningMedium {
         let source = Arc::new(EphemeralSource::new(boot_seed, NONCE_ROTATION_MS));
         // The 8-bit ephemeral ID + PFS/DAR deconfliction (wire-format-spec §4), shared per node like
         // the nonce. stale = the rotation period; alias window = 2 s of soft state.
-        let dedup = Arc::new(Mutex::new(IdDeconfliction::new(boot_seed, NONCE_ROTATION_MS, 2_000)));
+        let dedup = Arc::new(Mutex::new(IdDeconfliction::new(
+            boot_seed,
+            NONCE_ROTATION_MS,
+            2_000,
+        )));
 
         // One Tier-0 addresser for the whole face (not per bearer): its cache is keyed by LP base
         // sequence, i.e. by *object*, and an object's fragments may fan out across bearers.
@@ -1282,52 +1329,53 @@ impl RunningMedium {
             // injects each coded frame on this bearer, and the reader feeds captured frames through
             // the same bridge's decoder.
             //
-            // The sink is `crate::RadioFecSink`, shared with `MonitorWifiFace` (#82). It replaced
+            // The sink is `crate::RadioFecSink`, shared with `WifiPhy` (#82). It replaced
             // `ndn-coding`'s generic `FrameIoSink`, which took a fixed broadcast dst and **one nonce
             // snapshotted for the bridge's whole lifetime** — so turning link-FEC on turned Tier-0
             // addressing and §2 nonce rotation off. Address, nonce and intent now ride the
             // per-generation pin, resolved by the same code the direct send path uses.
-            let bridge = fec
-                .as_ref()
-                .map(|fc| {
-                    Arc::new(LinkFecBridge::spawn(
-                        crate::RadioFecSink { radio: b.radio.clone() },
-                        fc.k,
-                        0,
-                        fc.window,
-                    ))
-                });
+            let bridge = fec.as_ref().map(|fc| {
+                Arc::new(LinkFecBridge::spawn(
+                    crate::RadioFecSink {
+                        radio: b.radio.clone(),
+                    },
+                    fc.k,
+                    0,
+                    fc.window,
+                ))
+            });
             // The data-centric time-slice/FHSS scheduler (#61/#40), per bearer so a hop retunes its own
             // radio via that bearer's knobs. Constructed from `NDN_SCHED_*`; `None` ⇒ send path
             // unchanged. Shared (Arc) with this bearer's RX reader so inbound hardware stamps feed the
             // scheduler's disciplined clock (#41). Bandwidth defaults to 20 MHz for hops across
             // non-overlapping channels.
-            let sched = crate::FaceScheduler::from_env(b.knobs.clone(), crate::Bandwidth::default(), mtu)
-                .map(|s| {
-                    // Give the scheduler this bearer's rate policy so the #84 guard band sizes its
-                    // airtime estimate from the rate we will actually transmit at, not from the
-                    // conservative worst case (which would defer frames that would have fitted).
-                    let s = match &rate {
-                        Some(r) => s.with_rate(r.clone()),
-                        None => s,
-                    };
-                    // §9.3: seed the slot key with this bearer's operating channel, so a static radio
-                    // no longer keys on the FHSS sentinel and two of them on different channels get
-                    // distinct schedules.
-                    let s = s.with_operating_channel(b.channel);
-                    // P1: slot key = longest registered prefix; RX attribution by mask AND.
-                    match &group_table {
-                        Some(t) => s.with_groups(t.clone()),
-                        None => s,
-                    }
-                })
-                // **Refuse a hop schedule this radio cannot serve** (#97/#98). `set_channel` on the
-                // Wi-Fi monitor parts is a ~16 ms blocking call; against a short dwell the radio
-                // spends most of its life retuning and the "schedule" is thrashing, not frequency
-                // diversity. That was known and written in a comment; now the capability carries the
-                // measured cost and the face acts on it instead of hopping anyway.
-                .map(|s| s.vet_hop(&b.cap))
-                .map(Arc::new);
+            let sched =
+                crate::FaceScheduler::from_env(b.knobs.clone(), crate::Bandwidth::default(), mtu)
+                    .map(|s| {
+                        // Give the scheduler this bearer's rate policy so the #84 guard band sizes its
+                        // airtime estimate from the rate we will actually transmit at, not from the
+                        // conservative worst case (which would defer frames that would have fitted).
+                        let s = match &rate {
+                            Some(r) => s.with_rate(r.clone()),
+                            None => s,
+                        };
+                        // §9.3: seed the slot key with this bearer's operating channel, so a static radio
+                        // no longer keys on the FHSS sentinel and two of them on different channels get
+                        // distinct schedules.
+                        let s = s.with_operating_channel(b.channel);
+                        // P1: slot key = longest registered prefix; RX attribution by mask AND.
+                        match &group_table {
+                            Some(t) => s.with_groups(t.clone()),
+                            None => s,
+                        }
+                    })
+                    // **Refuse a hop schedule this radio cannot serve** (#97/#98). `set_channel` on the
+                    // Wi-Fi monitor parts is a ~16 ms blocking call; against a short dwell the radio
+                    // spends most of its life retuning and the "schedule" is thrashing, not frequency
+                    // diversity. That was known and written in a comment; now the capability carries the
+                    // measured cost and the face acts on it instead of hopping anyway.
+                    .map(|s| s.vet_hop(&b.cap))
+                    .map(Arc::new);
             if let Some(s) = &sched {
                 tracing::info!(target: "monitor-wifi", face = id.0, "{}", s.describe());
                 // **What was this run actually configured with?** (#81) 129 NDN_* variables exist
@@ -1344,8 +1392,7 @@ impl RunningMedium {
             // top of it would only add the flush window to every generation's latency.
             let batcher = match (&amsdu, &fec) {
                 (Some(cfg), None) => {
-                    let (bat, handle) =
-                        MediumBatcher::spawn(b.radio.clone(), *cfg, rate.clone());
+                    let (bat, handle) = MediumBatcher::spawn(b.radio.clone(), *cfg, rate.clone());
                     tasks.push(handle);
                     Some(bat)
                 }
@@ -1483,7 +1530,7 @@ impl RunningMedium {
                             // Tier-0 name filter (#91c): drop frames not under any registered prefix
                             // before they reach signals or the engine. The frame's filter is
                             // addr1‖addr2 (f.group‖f.addr); broadcast (no group) always passes.
-                            // #82: the SAME gate `MonitorWifiFace` uses, from the same code. This
+                            // #82: the SAME gate `WifiPhy` uses, from the same code. This
                             // was an open-coded Tier-0-only copy — no Tier-1, no NDN-NIC baseline, no
                             // drop accounting — and every filtering feature added recently landed
                             // only on the other face. Sharing it is what stops the two diverging.
@@ -1857,25 +1904,43 @@ mod tests {
         let bus = LoopbackMonitorBus::new();
         let producer = RadioMediumFace::new(
             FaceId(1),
-            vec![RadioBearer::new(RadioId(1), Arc::new(bus.endpoint(1, -50)), cap())],
+            vec![RadioBearer::new(
+                RadioId(1),
+                Arc::new(bus.endpoint(1, -50)),
+                cap(),
+            )],
         )
         .with_bloom(&key, &["/x"])
         .build();
         let relay = RadioMediumFace::new(
             FaceId(2),
-            vec![RadioBearer::new(RadioId(2), Arc::new(bus.endpoint(2, -50)), cap())],
+            vec![RadioBearer::new(
+                RadioId(2),
+                Arc::new(bus.endpoint(2, -50)),
+                cap(),
+            )],
         )
         .with_bloom(&key, &["/x"])
         .build();
         let other = RadioMediumFace::new(
             FaceId(3),
-            vec![RadioBearer::new(RadioId(3), Arc::new(bus.endpoint(3, -50)), cap())],
+            vec![RadioBearer::new(
+                RadioId(3),
+                Arc::new(bus.endpoint(3, -50)),
+                cap(),
+            )],
         )
         .with_bloom(&key, &["/w"])
         .build();
 
-        producer.send_bytes(data_pkt(&name_tlv(&[b"x", b"y"]))).await.unwrap();
-        producer.send_bytes(data_pkt(&name_tlv(&[b"x", b"z"]))).await.unwrap();
+        producer
+            .send_bytes(data_pkt(&name_tlv(&[b"x", b"y"])))
+            .await
+            .unwrap();
+        producer
+            .send_bytes(data_pkt(&name_tlv(&[b"x", b"z"])))
+            .await
+            .unwrap();
 
         // The /x relay hears both names; capture their neighbour addresses (the ether bytes).
         let mut addrs = Vec::new();
@@ -1896,8 +1961,12 @@ mod tests {
         );
 
         // The /w node hears neither (Tier-0 filter drops before the engine).
-        let none = tokio::time::timeout(Duration::from_millis(200), other.recv_bytes_with_addr()).await;
-        assert!(none.is_err(), "an unrelated prefix must not pass the medium's Bloom filter");
+        let none =
+            tokio::time::timeout(Duration::from_millis(200), other.recv_bytes_with_addr()).await;
+        assert!(
+            none.is_err(),
+            "an unrelated prefix must not pass the medium's Bloom filter"
+        );
     }
 
     /// Two radios on two disjoint media, one medium face spanning both: a frame put
@@ -1936,17 +2005,21 @@ mod tests {
 
         let mut got = Vec::new();
         for _ in 0..2 {
-            let (b, _) = tokio::time::timeout(Duration::from_secs(2), medium.recv_bytes_with_addr())
-                .await
-                .expect("union should deliver frames from both media")
-                .unwrap();
+            let (b, _) =
+                tokio::time::timeout(Duration::from_secs(2), medium.recv_bytes_with_addr())
+                    .await
+                    .expect("union should deliver frames from both media")
+                    .unwrap();
             got.push(b[0]);
         }
         got.sort();
         assert_eq!(got, vec![0xAA, 0xBB], "RX unions both radio capabilities");
 
         // TX fan-out: one send reaches a listener on *each* medium.
-        medium.send_bytes(Bytes::from(vec![0xCC; 16])).await.unwrap();
+        medium
+            .send_bytes(Bytes::from(vec![0xCC; 16]))
+            .await
+            .unwrap();
         for peer in [peer_a, peer_b] {
             let f = tokio::time::timeout(Duration::from_secs(2), peer.recv_frame())
                 .await
@@ -2028,7 +2101,11 @@ mod tests {
         let bus = LoopbackMonitorBus::new();
         let tx = RadioMediumFace::new(
             FaceId(1),
-            vec![RadioBearer::wifi(RadioId(0), Arc::new(bus.endpoint(1, -50)), cap())],
+            vec![RadioBearer::wifi(
+                RadioId(0),
+                Arc::new(bus.endpoint(1, -50)),
+                cap(),
+            )],
         )
         .with_link_fec(
             3,
@@ -2039,7 +2116,11 @@ mod tests {
         .build();
         let rx = RadioMediumFace::new(
             FaceId(2),
-            vec![RadioBearer::wifi(RadioId(0), Arc::new(bus.endpoint(2, -50)), cap())],
+            vec![RadioBearer::wifi(
+                RadioId(0),
+                Arc::new(bus.endpoint(2, -50)),
+                cap(),
+            )],
         )
         .with_link_fec(
             3,
@@ -2064,7 +2145,10 @@ mod tests {
         got.sort();
         let mut want = sent;
         want.sort();
-        assert_eq!(got, want, "link-FEC round-trips the generation through the medium face");
+        assert_eq!(
+            got, want,
+            "link-FEC round-trips the generation through the medium face"
+        );
     }
 
     /// One bearer ⇒ the medium face is exactly the single-radio path: send on the
@@ -2075,11 +2159,18 @@ mod tests {
         let peer: Arc<dyn FrameIo> = Arc::new(bus.endpoint(9, -50));
         let medium = RadioMediumFace::new(
             FaceId(3),
-            vec![RadioBearer::new(RadioId(1), Arc::new(bus.endpoint(1, -55)), cap())],
+            vec![RadioBearer::new(
+                RadioId(1),
+                Arc::new(bus.endpoint(1, -55)),
+                cap(),
+            )],
         )
         .build();
 
-        medium.send_bytes(Bytes::from(vec![0x42; 16])).await.unwrap();
+        medium
+            .send_bytes(Bytes::from(vec![0x42; 16]))
+            .await
+            .unwrap();
         let f = tokio::time::timeout(Duration::from_secs(2), peer.recv_frame())
             .await
             .unwrap()
@@ -2131,10 +2222,16 @@ mod tests {
         .build();
 
         for i in 0..4u8 {
-            medium.send_bytes(data_pkt(&name_tlv(&[b"x", &[i]]))).await.unwrap();
+            medium
+                .send_bytes(data_pkt(&name_tlv(&[b"x", &[i]])))
+                .await
+                .unwrap();
         }
         // A cooperative report — must go out immediately, not into the batch.
-        medium.send_robust(Bytes::from_static(b"report")).await.unwrap();
+        medium
+            .send_robust(Bytes::from_static(b"report"))
+            .await
+            .unwrap();
 
         tokio::time::sleep(Duration::from_millis(60)).await;
 
@@ -2163,7 +2260,7 @@ mod tests {
     /// `BROADCAST` dst and one nonce snapshotted for the bridge's whole lifetime — and the FEC
     /// branch returned *before* the block that computes Tier-0 addressing. So enabling link-FEC
     /// silently switched off both name addressing and nonce rotation on this face, the same defect
-    /// `MonitorWifiFace` had in its own dialect (#82).
+    /// `WifiPhy` had in its own dialect (#82).
     ///
     /// Both faces now share `RadioFecSink` and pin the address the direct path resolves. This
     /// asserts the coded frames land under the registered prefix, and that addr3 carries a nonce
@@ -2180,7 +2277,11 @@ mod tests {
         let sniffer = Arc::new(bus.endpoint(99, -70));
         let medium = RadioMediumFace::new(
             FaceId(5),
-            vec![RadioBearer::new(RadioId(0), Arc::new(bus.endpoint(5, -50)), cap())],
+            vec![RadioBearer::new(
+                RadioId(0),
+                Arc::new(bus.endpoint(5, -50)),
+                cap(),
+            )],
         )
         .with_bloom(&key, &[b"/x/y".as_slice()])
         .with_link_fec(
@@ -2208,7 +2309,10 @@ mod tests {
         }
         let frames = collector.await.unwrap();
 
-        assert!(!frames.is_empty(), "the coded generation must reach the bus");
+        assert!(
+            !frames.is_empty(),
+            "the coded generation must reach the bus"
+        );
         for (i, (a1, a2, a3)) in frames.iter().enumerate() {
             let (Some(a1), Some(a2)) = (a1, a2) else {
                 panic!("coded frame {i} carries no address pair");
@@ -2251,7 +2355,7 @@ mod tests {
     /// **Every fragment of one object must carry that object's Tier-0 filter, not just the first.**
     ///
     /// Only fragment 0 of an LP-fragmented object contains the Name TLV, so a filter derived
-    /// per-frame can only be computed once. `MonitorWifiFace` handles this with a cache keyed by LP
+    /// per-frame can only be computed once. `WifiPhy` handles this with a cache keyed by LP
     /// base sequence (`sequence - frag_index`), so fragments 1..n reuse the opening fragment's
     /// filter. The medium's `bloom_wire_for_wire` had no cache: it called `inner_name(wire)`, got
     /// `None` for every continuation fragment, and fell back to broadcast.
@@ -2271,7 +2375,11 @@ mod tests {
         let sniffer = Arc::new(bus.endpoint(99, -70));
         let medium = RadioMediumFace::new(
             FaceId(6),
-            vec![RadioBearer::new(RadioId(0), Arc::new(bus.endpoint(6, -50)), cap())],
+            vec![RadioBearer::new(
+                RadioId(0),
+                Arc::new(bus.endpoint(6, -50)),
+                cap(),
+            )],
         )
         .with_bloom(&key, &[b"/x/y".as_slice()])
         .build();
@@ -2290,8 +2398,14 @@ mod tests {
         // One object /x/y split across three fragments; only fragment 0 carries the Name.
         let named = data_pkt(&name_tlv(&[b"x", b"y"]));
         medium.send_bytes(lp_frag(100, 0, 3, &named)).await.unwrap();
-        medium.send_bytes(lp_frag(101, 1, 3, b"tail-a")).await.unwrap();
-        medium.send_bytes(lp_frag(102, 2, 3, b"tail-b")).await.unwrap();
+        medium
+            .send_bytes(lp_frag(101, 1, 3, b"tail-a"))
+            .await
+            .unwrap();
+        medium
+            .send_bytes(lp_frag(102, 2, 3, b"tail-b"))
+            .await
+            .unwrap();
 
         let frames = collector.await.unwrap();
         assert_eq!(frames.len(), 3, "all three fragments must reach the bus");
@@ -2315,7 +2429,7 @@ mod tests {
     /// **A rate the plan decides must change what the medium transmits — and must still lose to the
     /// worst-receiver cap.**
     ///
-    /// `MonitorWifiFace` could act on a decided MCS; this face could not, so a `RadioPlan` mounted
+    /// `WifiPhy` could act on a decided MCS; this face could not, so a `RadioPlan` mounted
     /// on a medium face chose a rate that nothing applied (#82's last one-sided feature). That gap
     /// is invisible from the decision side, so this asserts on which call the backend received.
     ///
@@ -2346,7 +2460,10 @@ mod tests {
         #[async_trait::async_trait]
         impl FrameIo for RateSpy {
             async fn inject(&self, f: InjectFrame) -> Result<(), FaceError> {
-                self.calls.lock().unwrap().push(Call::Plain(f.tx.reliability));
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(Call::Plain(f.tx.reliability));
                 Ok(())
             }
             async fn inject_at(
@@ -2385,10 +2502,16 @@ mod tests {
         ))
         .build();
 
-        medium.send_bytes(Bytes::from_static(b"planned")).await.unwrap();
+        medium
+            .send_bytes(Bytes::from_static(b"planned"))
+            .await
+            .unwrap();
         // A legacy-only-RX neighbour appears: reach beats throughput.
         gate.store(true, Ordering::Relaxed);
-        medium.send_bytes(Bytes::from_static(b"capped")).await.unwrap();
+        medium
+            .send_bytes(Bytes::from_static(b"capped"))
+            .await
+            .unwrap();
 
         let calls = spy.calls.lock().unwrap();
         assert_eq!(
@@ -2429,7 +2552,11 @@ mod tests {
                 *self.plain.lock().unwrap() += 1;
                 Ok(())
             }
-            async fn inject_at(&self, _f: InjectFrame, mcs: McsDescriptor) -> Result<(), FaceError> {
+            async fn inject_at(
+                &self,
+                _f: InjectFrame,
+                mcs: McsDescriptor,
+            ) -> Result<(), FaceError> {
                 self.at.lock().unwrap().push(mcs.index);
                 Ok(())
             }
@@ -2557,7 +2684,10 @@ mod tests {
             .build();
 
             for i in 0..n {
-                medium.send_bytes(Bytes::from(vec![i as u8; 16])).await.unwrap();
+                medium
+                    .send_bytes(Bytes::from(vec![i as u8; 16]))
+                    .await
+                    .unwrap();
             }
             tokio::time::sleep(Duration::from_millis(60)).await;
             let b = spy.batches.lock().unwrap().clone();
@@ -2567,7 +2697,11 @@ mod tests {
 
         // No opinion → the configured cap of 8 governs: 8 frames land in one batch.
         let (batches, singles) = run(None, 8).await;
-        assert_eq!(batches, vec![8], "None must keep the configured cap (singles={singles})");
+        assert_eq!(
+            batches,
+            vec![8],
+            "None must keep the configured cap (singles={singles})"
+        );
 
         // The plan asks for 2 → batches cap at 2, so 8 frames become four of them.
         let (batches, singles) = run(Some(2), 8).await;
@@ -2575,7 +2709,11 @@ mod tests {
             !batches.is_empty() && batches.iter().all(|n| *n <= 2),
             "the plan's target must bound every batch, got {batches:?} (singles={singles})"
         );
-        assert_eq!(batches.iter().sum::<usize>(), 8, "and every frame still goes out");
+        assert_eq!(
+            batches.iter().sum::<usize>(),
+            8,
+            "and every frame still goes out"
+        );
 
         // The plan asks for no aggregation → nothing is batched at all.
         let (batches, singles) = run(Some(0), 4).await;
@@ -2615,7 +2753,10 @@ mod tests {
         // The caller guesses 5 GHz ch149; the radio knows it is really S1G on ch1/2.
         let asserted = RadioCapability::wifi_monitor_5ghz(vec![149]);
         let real = RadioCapability::wifi_halow_s1g(vec![1, 2]);
-        assert_ne!(real, asserted, "the two must actually differ or this proves nothing");
+        assert_ne!(
+            real, asserted,
+            "the two must actually differ or this proves nothing"
+        );
 
         let guessed = RadioBearer::new(RadioId(0), Arc::new(Dummy), asserted.clone());
         assert_eq!(

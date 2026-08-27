@@ -39,7 +39,12 @@ impl EphemeralId {
     /// A fresh ID, PFS-picked from an empty neighbour view (so effectively random at boot). `boot_seed`
     /// seeds the xorshift picker; `stale_ms` is how long an overheard ID stays "taken".
     pub fn new(boot_seed: u64, stale_ms: u64) -> Self {
-        let mut s = Self { id: 0, seen: [0; ID_SPACE], stale_ms: stale_ms.max(1), rng: boot_seed | 1 };
+        let mut s = Self {
+            id: 0,
+            seen: [0; ID_SPACE],
+            stale_ms: stale_ms.max(1),
+            rng: boot_seed | 1,
+        };
         s.id = s.pick_free(0);
         s
     }
@@ -129,7 +134,10 @@ impl AliasDetector {
     /// `window_ms` is how close in time two different-fingerprint frames on one ID must be to read as a
     /// live alias rather than the same node having simply moved on to new content.
     pub fn new(window_ms: u64) -> Self {
-        Self { last: [(0, 0); ID_SPACE], window_ms: window_ms.max(1) }
+        Self {
+            last: [(0, 0); ID_SPACE],
+            window_ms: window_ms.max(1),
+        }
     }
 
     /// Observe a frame from `id` carrying `fingerprint` at `now_ms`. Returns `true` if this looks like an
@@ -235,8 +243,9 @@ mod tests {
     fn pfs_stays_alias_free_across_a_neighbourhood() {
         // 16 nodes each pick via PFS while overhearing the others' picks in turn — the beacon-free
         // deconfliction should keep them distinct (well under the 8-bit birthday bound of ~19).
-        let mut nodes: Vec<EphemeralId> =
-            (0..16).map(|i| EphemeralId::new(0x9E37_79B9 ^ (i as u64 * 0x100_0001), 10_000)).collect();
+        let mut nodes: Vec<EphemeralId> = (0..16)
+            .map(|i| EphemeralId::new(0x9E37_79B9 ^ (i as u64 * 0x100_0001), 10_000))
+            .collect();
         // Gossip round: each node hears every already-placed node, then re-picks.
         for i in 0..nodes.len() {
             for j in 0..i {
@@ -269,12 +278,19 @@ mod tests {
         // The hint is one-shot — the following TX is back to our own ID.
         let (id2, f2) = d.tx_id();
         assert_eq!(f2, 0);
-        assert_eq!(id2, id0, "our own ID is unchanged by sending a hint about someone else");
+        assert_eq!(
+            id2, id0,
+            "our own ID is unchanged by sending a hint about someone else"
+        );
 
         // Receiving a hint that names OUR id rotates us; the return is `true` (a hint, not a neighbour).
         let mine = d.current();
         assert!(d.rx(mine, FLAG_ID_COLLISION, Some(-50), 2_000));
-        assert_ne!(d.current(), mine, "a collision hint for our ID must rotate us");
+        assert_ne!(
+            d.current(),
+            mine,
+            "a collision hint for our ID must rotate us"
+        );
         // A hint for someone else's ID leaves us put.
         let now = d.current();
         let other = now.wrapping_add(7);
@@ -287,12 +303,21 @@ mod tests {
         let mut d = AliasDetector::new(500);
         // One sender, one ID, evolving content over time — NOT an alias (spaced beyond the window).
         assert!(!d.observe(42, 0x1111, 1_000));
-        assert!(!d.observe(42, 0x2222, 2_000), "same id, later content, outside window = not an alias");
+        assert!(
+            !d.observe(42, 0x2222, 2_000),
+            "same id, later content, outside window = not an alias"
+        );
         // Two senders on ID 42 within the window, different fingerprints → alias.
         assert!(!d.observe(42, 0xAAAA, 3_000));
-        assert!(d.observe(42, 0xBBBB, 3_100), "same id, different content, within window = alias");
+        assert!(
+            d.observe(42, 0xBBBB, 3_100),
+            "same id, different content, within window = alias"
+        );
         // Same content within the window (a retransmit) is NOT an alias.
         assert!(!d.observe(7, 0xCAFE, 4_000));
-        assert!(!d.observe(7, 0xCAFE, 4_050), "same content = one sender, not an alias");
+        assert!(
+            !d.observe(7, 0xCAFE, 4_050),
+            "same content = one sender, not an alias"
+        );
     }
 }

@@ -422,7 +422,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let bringup = || -> Result<(), Box<dyn std::error::Error>> {
                     // --useinit: exercise the encapsulated library bring-up
                     // (LibUsbRtl88xxBackend::bring_up) that the bearer's
-                    // MonitorWifiFace::open_libusb uses — instead of the
+                    // WifiPhy::open_libusb uses — instead of the
                     // step-by-step diagnostic path below.
                     if std::env::args().any(|a| a == "--useinit") {
                         let chan: u8 = std::env::args()

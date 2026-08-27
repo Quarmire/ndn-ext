@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ndn_face_ble_adv::{AdvBackend, BleAdvFace, EXTENDED_ADV_MTU, LoopbackAdvBus};
+use ndn_face_ble_adv::{AdvBackend, BlePhy, EXTENDED_ADV_MTU, LoopbackAdvBus};
 use ndn_packet::encode::DataBuilder;
 use ndn_transport::{Face, FaceId};
 
@@ -16,7 +16,7 @@ async fn large_packet_fragments_into_multiple_adverts() {
 
     // The sender, wrapped in a Face so the LpLinkService applies fragmentation
     // at the advertising MTU.
-    let sender = BleAdvFace::new(FaceId(1), Arc::new(bus.endpoint(1, [0xA0; 6], -50)));
+    let sender = BlePhy::new(FaceId(1), Arc::new(bus.endpoint(1, [0xA0; 6], -50)));
     let face = Face::from_transport(sender);
 
     // A passive observer endpoint to count advertisements on the medium.

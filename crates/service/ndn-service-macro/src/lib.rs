@@ -214,8 +214,9 @@ pub fn ndn_service(_attr: TokenStream, item: TokenStream) -> TokenStream {
              carrier-reflected response slot — the same slot round-tripped, which \
              the service never interprets."
         );
-        let select_doc =
-            format!("Invoke `{op}` across many providers per `strategy` (requires `C: SelectCarrier`).");
+        let select_doc = format!(
+            "Invoke `{op}` across many providers per `strategy` (requires `C: SelectCarrier`)."
+        );
         let select_meta_doc = format!(
             "Invoke `{op}` across many providers per `strategy`, carrying an opaque \
              request `Metadata` slot. Each result is `(provider, value, response_slot)`."

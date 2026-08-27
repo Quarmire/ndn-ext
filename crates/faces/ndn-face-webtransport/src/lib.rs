@@ -12,9 +12,9 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
+use portable_atomic::AtomicU64;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use portable_atomic::AtomicU64;
 
 use bytes::Bytes;
 use thiserror::Error;

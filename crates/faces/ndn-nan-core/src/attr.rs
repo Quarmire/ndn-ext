@@ -1134,21 +1134,29 @@ mod tests {
         let mut buf = Vec::new();
         m1.encode(&mut buf);
         assert_eq!(buf[0], AttributeId::NdpExtension as u8);
-        let body = Attributes::find(&buf, AttributeId::NdpExtension).unwrap().body;
+        let body = Attributes::find(&buf, AttributeId::NdpExtension)
+            .unwrap()
+            .body;
         // Minimum body is 11 bytes through the control byte; ours adds the IID TLV.
         assert!(body.len() >= 11);
         // type in the low nibble, status in the high nibble, of one byte.
         assert_eq!(body[1] & 0x0f, NdpType::Request as u8);
         let back = Ndpe::decode(body).unwrap();
         assert_eq!(back, m1);
-        assert_eq!(back.ipv6_iid(), Some(INIT_IID), "M1 advertises our NDI's IID");
+        assert_eq!(
+            back.ipv6_iid(),
+            Some(INIT_IID),
+            "M1 advertises our NDI's IID"
+        );
         assert_eq!(back.responder_ndi, None, "a request has no responder NDI");
 
         // --- M2: accept ---
         let m2 = Ndpe::accept(0x42, 7, INIT_NDI, RESP_NDI, RESP_IID);
         let mut buf = Vec::new();
         m2.encode(&mut buf);
-        let body = Attributes::find(&buf, AttributeId::NdpExtension).unwrap().body;
+        let body = Attributes::find(&buf, AttributeId::NdpExtension)
+            .unwrap()
+            .body;
         assert_eq!(body[1] & 0x0f, NdpType::Response as u8);
         assert_eq!((body[1] >> 4) & 0x0f, NdpStatus::Accepted as u8);
         let back = Ndpe::decode(body).unwrap();
@@ -1163,7 +1171,9 @@ mod tests {
         let m3 = Ndpe::confirm(0x42, 7, INIT_NDI);
         let mut buf = Vec::new();
         m3.encode(&mut buf);
-        let body = Attributes::find(&buf, AttributeId::NdpExtension).unwrap().body;
+        let body = Attributes::find(&buf, AttributeId::NdpExtension)
+            .unwrap()
+            .body;
         assert_eq!(Ndpe::decode(body).unwrap(), m3);
     }
 
@@ -1179,7 +1189,9 @@ mod tests {
         lying.control = ndpe_control::PUBLISH_ID_PRESENT | ndpe_control::RESPONDER_NDI_PRESENT;
         let mut buf = Vec::new();
         lying.encode(&mut buf);
-        let body = Attributes::find(&buf, AttributeId::NdpExtension).unwrap().body;
+        let body = Attributes::find(&buf, AttributeId::NdpExtension)
+            .unwrap()
+            .body;
         // The encoder corrects the claim rather than emitting an unreadable body.
         assert_eq!(body[10] & ndpe_control::PUBLISH_ID_PRESENT, 0);
         assert_eq!(body[10] & ndpe_control::RESPONDER_NDI_PRESENT, 0);
@@ -1192,8 +1204,13 @@ mod tests {
         req.publish_id = Some(0x09);
         let mut buf = Vec::new();
         req.encode(&mut buf);
-        let body = Attributes::find(&buf, AttributeId::NdpExtension).unwrap().body;
-        assert_eq!(body[10] & ndpe_control::PUBLISH_ID_PRESENT, ndpe_control::PUBLISH_ID_PRESENT);
+        let body = Attributes::find(&buf, AttributeId::NdpExtension)
+            .unwrap()
+            .body;
+        assert_eq!(
+            body[10] & ndpe_control::PUBLISH_ID_PRESENT,
+            ndpe_control::PUBLISH_ID_PRESENT
+        );
         assert_eq!(Ndpe::decode(body).unwrap().publish_id, Some(0x09));
     }
 
@@ -1211,14 +1228,19 @@ mod tests {
         });
         let mut buf = Vec::new();
         m.encode(&mut buf);
-        let body = Attributes::find(&buf, AttributeId::NdpExtension).unwrap().body;
+        let body = Attributes::find(&buf, AttributeId::NdpExtension)
+            .unwrap()
+            .body;
         // An unknown TLV survives a decode/encode cycle unchanged.
         assert_eq!(Ndpe::decode(body).unwrap(), m);
     }
 
     #[test]
     fn ndpe_rejects_truncated_and_reserved_values() {
-        assert!(Ndpe::decode(&[0u8; 10]).is_err(), "shorter than the 11-byte minimum");
+        assert!(
+            Ndpe::decode(&[0u8; 10]).is_err(),
+            "shorter than the 11-byte minimum"
+        );
         // Reserved NDP type (5..=15).
         let mut body = [0u8; 11];
         body[1] = 0x05;

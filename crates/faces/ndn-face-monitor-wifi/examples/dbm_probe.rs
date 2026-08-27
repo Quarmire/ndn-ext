@@ -8,8 +8,8 @@
 //! dbm_probe <iface> <dBm>...   # discover, then set each power in turn
 //! ```
 
-use ndn_face_monitor_wifi::dbm_power::Mac80211Knobs;
 use ndn_face_monitor_wifi::RadioKnobs;
+use ndn_face_monitor_wifi::dbm_power::Mac80211Knobs;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -22,7 +22,12 @@ fn main() {
     println!("iface     : {iface}");
     println!("mechanism : {}", knobs.mechanism_name());
     match knobs.tx_power_range() {
-        Some(r) => println!("range     : {}..={} dBm (span {} dB)", r.min, r.max, r.span_db()),
+        Some(r) => println!(
+            "range     : {}..={} dBm (span {} dB)",
+            r.min,
+            r.max,
+            r.span_db()
+        ),
         None => println!("range     : none — no absolute control found (index-only radio)"),
     }
 
@@ -35,7 +40,9 @@ fn main() {
             }
         };
         match knobs.set_tx_power_dbm(want) {
-            Ok(applied) if applied == want => println!("set {want:>3} dBm -> applied {applied} dBm"),
+            Ok(applied) if applied == want => {
+                println!("set {want:>3} dBm -> applied {applied} dBm")
+            }
             Ok(applied) => println!("set {want:>3} dBm -> applied {applied} dBm  (clamped)"),
             Err(e) => println!("set {want:>3} dBm -> FAILED: {e}"),
         }

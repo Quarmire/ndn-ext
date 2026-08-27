@@ -155,7 +155,8 @@ impl Table {
 
     /// The fast-path test: is `name` possibly present? Reads the mirror only.
     pub fn may_contain(&self, name: &[u8]) -> bool {
-        self.positions(name).all(|p| self.mirror[p / 8] & (1 << (p % 8)) != 0)
+        self.positions(name)
+            .all(|p| self.mirror[p / 8] & (1 << (p % 8)) != 0)
     }
 
     /// Bits set in the mirror — occupancy, which drives the false-positive rate.
@@ -322,7 +323,10 @@ mod tests {
         let mut t = t1();
         t.cache(b"/a/b/c/d");
         t.sync();
-        assert!(t.lookup(b"/a/b").cs, "prefix-seeking Interest missed a cached descendant");
+        assert!(
+            t.lookup(b"/a/b").cs,
+            "prefix-seeking Interest missed a cached descendant"
+        );
         assert!(t.lookup(b"/a/b/c/d").cs, "exact cached name missed");
         assert!(!t.lookup(b"/z/z").cs, "unrelated name hit the CS");
     }
@@ -336,7 +340,10 @@ mod tests {
             t.register_prefix(format!("/ns{i:04x}").as_bytes());
         }
         t.sync();
-        assert!(t.lookup(b"/ns0007/x/y").fib, "name under a registered prefix missed");
+        assert!(
+            t.lookup(b"/ns0007/x/y").fib,
+            "name under a registered prefix missed"
+        );
         assert!(!t.lookup(b"/other/x").fib, "unregistered namespace hit");
     }
 
@@ -348,8 +355,12 @@ mod tests {
     #[test]
     fn sync_never_opens_a_false_negative_window() {
         let mut t = Table::new(&KEY, BITS, K);
-        let keep: Vec<Vec<u8>> = (0..40u32).map(|i| format!("/keep{i:03}").into_bytes()).collect();
-        let drop: Vec<Vec<u8>> = (0..40u32).map(|i| format!("/drop{i:03}").into_bytes()).collect();
+        let keep: Vec<Vec<u8>> = (0..40u32)
+            .map(|i| format!("/keep{i:03}").into_bytes())
+            .collect();
+        let drop: Vec<Vec<u8>> = (0..40u32)
+            .map(|i| format!("/drop{i:03}").into_bytes())
+            .collect();
         for n in keep.iter().chain(drop.iter()) {
             t.insert(n);
         }
@@ -362,8 +373,10 @@ mod tests {
         for n in &drop {
             t.remove(n);
         }
-        let probe: Vec<Vec<usize>> =
-            keep.iter().map(|n| t.positions(n).collect::<Vec<_>>()).collect();
+        let probe: Vec<Vec<usize>> = keep
+            .iter()
+            .map(|n| t.positions(n).collect::<Vec<_>>())
+            .collect();
         let mut writes = 0u32;
         let mut violations = 0u32;
         t.sync_observed(|mirror| {
@@ -375,7 +388,10 @@ mod tests {
             }
         });
         assert!(writes > 0, "sync did nothing — the test would be vacuous");
-        assert_eq!(violations, 0, "a keeper became unfindable mid-sync: false-negative window");
+        assert_eq!(
+            violations, 0,
+            "a keeper became unfindable mid-sync: false-negative window"
+        );
         for n in &keep {
             assert!(t.may_contain(n), "keeper lost after sync");
         }
@@ -386,8 +402,12 @@ mod tests {
     #[test]
     fn clear_first_would_open_the_window_that_sync_avoids() {
         let mut t = Table::new(&KEY, BITS, K);
-        let keep: Vec<Vec<u8>> = (0..40u32).map(|i| format!("/keep{i:03}").into_bytes()).collect();
-        let drop: Vec<Vec<u8>> = (0..40u32).map(|i| format!("/drop{i:03}").into_bytes()).collect();
+        let keep: Vec<Vec<u8>> = (0..40u32)
+            .map(|i| format!("/keep{i:03}").into_bytes())
+            .collect();
+        let drop: Vec<Vec<u8>> = (0..40u32)
+            .map(|i| format!("/drop{i:03}").into_bytes())
+            .collect();
         for n in keep.iter().chain(drop.iter()) {
             t.insert(n);
         }
@@ -432,10 +452,17 @@ mod tests {
         t.cache(b"/served/a/b");
         t.cache(b"/elsewhere/a/b");
         t.sync();
-        assert_eq!(t.cs_skipped(), 1, "a FIB-covered name was still inserted into BF-CS");
+        assert_eq!(
+            t.cs_skipped(),
+            1,
+            "a FIB-covered name was still inserted into BF-CS"
+        );
         // Still reachable — via the FIB, which is the point of the optimisation.
         assert!(t.lookup(b"/served/a/b").fib);
-        assert!(t.lookup(b"/elsewhere").cs, "the non-covered name should be in BF-CS");
+        assert!(
+            t.lookup(b"/elsewhere").cs,
+            "the non-covered name should be in BF-CS"
+        );
     }
 
     /// A clean miss must be a miss on all three, so the forwarder can skip Tier-2 entirely.
@@ -462,7 +489,10 @@ mod tests {
     fn an_insert_is_visible_without_waiting_for_a_batch_sync() {
         let mut t = t1();
         t.add_pit(b"/urgent/reply");
-        assert!(t.lookup(b"/urgent/reply").pit, "PIT insert not visible before sync");
+        assert!(
+            t.lookup(b"/urgent/reply").pit,
+            "PIT insert not visible before sync"
+        );
         t.cache(b"/cached/now");
         assert!(t.lookup(b"/cached").cs, "CS insert not visible before sync");
     }
@@ -518,7 +548,10 @@ mod tests {
         let mut pit = ObservedPit::new(TinyPit::default(), feed);
 
         let comps: Vec<&[u8]> = vec![b"asked", b"for", b"this"];
-        assert!(!shared.read().unwrap().lookup(b"/asked/for/this").pit, "matched before recording");
+        assert!(
+            !shared.read().unwrap().lookup(b"/asked/for/this").pit,
+            "matched before recording"
+        );
 
         // Record: must be visible IMMEDIATELY, with no sync — the Data can already be in flight.
         pit.record_pending(&comps, 1, 42, 4000, 0);
@@ -538,7 +571,10 @@ mod tests {
 
         // A removal that removed nothing must NOT be reported — decrementing a counter for an entry
         // that was never inserted corrupts a counting Bloom filter unrecoverably.
-        assert!(!pit.discard_pending(&comps), "second discard should find nothing");
+        assert!(
+            !pit.discard_pending(&comps),
+            "second discard should find nothing"
+        );
         assert_eq!(
             shared.read().unwrap().pit.anomalies(),
             0,
@@ -583,7 +619,10 @@ mod tests {
         // Explicit removal.
         assert!(pit.remove(&PitToken(1)).is_some());
         shared.write().unwrap().sync();
-        assert!(!shared.read().unwrap().lookup(b"/a/b").pit, "removal did not reach Tier-1");
+        assert!(
+            !shared.read().unwrap().lookup(b"/a/b").pit,
+            "removal did not reach Tier-1"
+        );
 
         // Expiry — the path most likely to be forgotten, because nothing calls it explicitly.
         // 1 ms lifetime -> expires_at = 1e6 ns; drained below at 2e6 ns.
@@ -596,7 +635,11 @@ mod tests {
             !shared.read().unwrap().lookup(b"/c/d").pit,
             "an EXPIRED entry still matches — the mirror leaks entries that timed out"
         );
-        assert_eq!(shared.read().unwrap().pit.anomalies(), 0, "counter under/overflow");
+        assert_eq!(
+            shared.read().unwrap().pit.anomalies(),
+            0,
+            "counter under/overflow"
+        );
     }
 
     /// **CS eviction must decrement BF-CS**, or the filter claims to hold what it has thrown away.
@@ -621,17 +664,29 @@ mod tests {
             std::sync::Arc::new(std::sync::RwLock::new(Tier1::new(&KEY, BITS, K)));
         let feed = Tier1Feed::new(shared.clone());
 
-        feed.on_event(CsEvent::Insert { name: name(&["x", "y", "z"]), bytes: 32 });
+        feed.on_event(CsEvent::Insert {
+            name: name(&["x", "y", "z"]),
+            bytes: 32,
+        });
         // Direction (b): a prefix-seeking Interest finds the cached descendant.
-        assert!(shared.read().unwrap().lookup(b"/x/y").cs, "cached name not visible");
+        assert!(
+            shared.read().unwrap().lookup(b"/x/y").cs,
+            "cached name not visible"
+        );
 
-        feed.on_event(CsEvent::Evict { name: name(&["x", "y", "z"]) });
+        feed.on_event(CsEvent::Evict {
+            name: name(&["x", "y", "z"]),
+        });
         shared.write().unwrap().sync();
         assert!(
             !shared.read().unwrap().lookup(b"/x/y").cs,
             "evicted Data still matches — the CS mirror only grows"
         );
-        assert_eq!(shared.read().unwrap().cs.anomalies(), 0, "counter under/overflow on evict");
+        assert_eq!(
+            shared.read().unwrap().cs.anomalies(),
+            0,
+            "counter under/overflow on evict"
+        );
     }
 
     /// Removal must actually remove — the property a plain Bloom filter cannot provide and the
@@ -644,8 +699,15 @@ mod tests {
         assert!(t.lookup(b"/i/want/this").pit);
         t.remove_pit(b"/i/want/this");
         t.sync();
-        assert!(!t.lookup(b"/i/want/this").pit, "satisfied PIT entry still matches");
-        assert_eq!(t.pit.anomalies(), 0, "counter under/overflow during a legal cycle");
+        assert!(
+            !t.lookup(b"/i/want/this").pit,
+            "satisfied PIT entry still matches"
+        );
+        assert_eq!(
+            t.pit.anomalies(),
+            0,
+            "counter under/overflow during a legal cycle"
+        );
     }
 }
 
@@ -653,7 +715,7 @@ mod tests {
 
 /// A shared, live Tier-1 the forwarder can drive.
 ///
-/// [`MonitorWifiFace::tier1_handle`](crate::MonitorWifiFace::tier1_handle) hands one of these out;
+/// [`WifiPhy::tier1_handle`](crate::WifiPhy::tier1_handle) hands one of these out;
 /// wrapping the forwarder's PIT and CS in `ObservedPit` / `ObservedCs` from `ndn-fwd-core` keeps the
 /// filter's tables in step with the real ones.
 pub type SharedTier1 = std::sync::Arc<std::sync::RwLock<Tier1>>;
@@ -729,7 +791,9 @@ impl ndn_store::pit::PitObserver for Tier1Feed {
 impl ndn_store::observable_cs::CsObserver for Tier1Feed {
     fn on_event(&self, event: ndn_store::observable_cs::CsEvent) {
         use ndn_store::observable_cs::CsEvent;
-        let Ok(mut t) = self.tier1.write() else { return };
+        let Ok(mut t) = self.tier1.write() else {
+            return;
+        };
         match event {
             CsEvent::Insert { name, .. } => t.cache(&Self::slash_name(&name)),
             CsEvent::Evict { name } => t.uncache(&Self::slash_name(&name)),
@@ -810,9 +874,9 @@ mod keyspace_tests {
         for comps in &cases {
             let from_wire = crate::ndn_name_to_slash(&wire_name(comps));
             let from_slices = Tier1Feed::slash(comps);
-            let name = ndn_foundation_types::Name::from_components(
-                comps.iter().map(|c| ndn_foundation_types::NameComponent::generic(bytes::Bytes::from(c.to_vec()))),
-            );
+            let name = ndn_foundation_types::Name::from_components(comps.iter().map(|c| {
+                ndn_foundation_types::NameComponent::generic(bytes::Bytes::from(c.to_vec()))
+            }));
             let from_name = Tier1Feed::slash_name(&name);
             assert_eq!(
                 from_wire, from_slices,

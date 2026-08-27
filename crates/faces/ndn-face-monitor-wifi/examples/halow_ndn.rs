@@ -18,14 +18,15 @@
 //! `rx` hearing `tx`'s marker frames proves the HaLow radio radiates
 //! named-data frames on-air and a peer recovers the NDN payload — the same
 //! `FrameFormat::RawNdnS1g` build/parse the engine uses through
-//! `MonitorWifiFace::halow`.
+//! `WifiPhy::halow`.
 
 #[cfg(target_os = "linux")]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use bytes::Bytes;
     use ndn_face_monitor_wifi::{
-        AfPacketBackend, FrameFormat, FrameIo, InjectFrame, McsDescriptor, TxIntent, };
+        AfPacketBackend, FrameFormat, FrameIo, InjectFrame, McsDescriptor, TxIntent,
+    };
     use std::time::Duration;
 
     let role = std::env::args().nth(1).unwrap_or_else(|| "rx".into());
@@ -36,7 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(200);
     const MARKER: &[u8] = b"NDN-HALOW-onair";
 
-    // Same format the pooled `MonitorWifiFace::halow` uses: an NDN data frame on
+    // Same format the pooled `WifiPhy::halow` uses: an NDN data frame on
     // the S1G PHY (radiotap names no MCS — the NRC7292 MAC sets the sub-GHz rate).
     let backend = AfPacketBackend::new(&iface, FrameFormat::RawNdnS1g { ethertype: 0x8624 })?;
     println!("halow_ndn: role={role} iface={iface}");
@@ -81,8 +82,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut sent = 0u32;
                 while sent < count {
                     let n = batch.min((count - sent) as usize);
-                    let frames: Vec<(InjectFrame, McsDescriptor)> =
-                        (0..n).map(|k| (mk(sent + k as u32), McsDescriptor::ht(0))).collect();
+                    let frames: Vec<(InjectFrame, McsDescriptor)> = (0..n)
+                        .map(|k| (mk(sent + k as u32), McsDescriptor::ht(0)))
+                        .collect();
                     backend.inject_batch_at(frames).await?;
                     sent += n as u32;
                     if delay_ms > 0 {
@@ -143,5 +145,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
-    eprintln!("halow_ndn requires Linux AF_PACKET (run it on the NRC7292 host, e.g. the ODROID-C4 / OPi 5 Pro)");
+    eprintln!(
+        "halow_ndn requires Linux AF_PACKET (run it on the NRC7292 host, e.g. the ODROID-C4 / OPi 5 Pro)"
+    );
 }

@@ -1,6 +1,6 @@
 //! NDN over the BW16: wire a BW16 (RTL8720DN, serial-bridged) under a
-//! `MonitorWifiFace` and send a real NDN Data packet over the air, decoded on a
-//! second `MonitorWifiFace` (over the RTL8812EU) — two independent radio backends,
+//! `WifiPhy` and send a real NDN Data packet over the air, decoded on a
+//! second `WifiPhy` (over the RTL8812EU) — two independent radio backends,
 //! the same face, a genuine NDN packet on 5 GHz.
 //!
 //!   cargo run --features serial-radio,libusb-backend --example bw16_ndn -- /dev/cu.usbserial-1110 149
@@ -43,7 +43,7 @@ fn build_data(components: &[&[u8]], content: &[u8]) -> bytes::Bytes {
 
 #[cfg(all(feature = "serial-radio", feature = "libusb-backend"))]
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    use ndn_face_monitor_wifi::{SerialRadioBackend, LibUsbRtl88xxBackend, MonitorWifiFace};
+    use ndn_face_monitor_wifi::{LibUsbRtl88xxBackend, SerialRadioBackend, WifiPhy};
     use ndn_packet::Data;
     use ndn_transport::{FaceId, Transport};
     use std::sync::Arc;
@@ -54,10 +54,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let ch: u8 = a.next().and_then(|s| s.parse().ok()).unwrap_or(149);
     let rx_port = a.next(); // optional: a second BW16 serial port as the receiver
 
-    // Sender: the BW16 under a MonitorWifiFace.
+    // Sender: the BW16 under a WifiPhy.
     let bw = SerialRadioBackend::open(&port)?;
     bw.set_channel(ch)?;
-    let tx_face = MonitorWifiFace::new(FaceId(1), Arc::new(bw));
+    let tx_face = WifiPhy::new(FaceId(1), Arc::new(bw));
 
     // Receiver: a second BW16 if given, else the RTL8812EU (pumped for full-rate RX).
     let rx_face = match &rx_port {
@@ -65,14 +65,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let rb = SerialRadioBackend::open(p)?;
             rb.set_channel(ch)?;
             println!("(receiver: second BW16 {p})");
-            MonitorWifiFace::new(FaceId(2), Arc::new(rb))
+            WifiPhy::new(FaceId(2), Arc::new(rb))
         }
         None => {
             let eu = Arc::new(LibUsbRtl88xxBackend::open_monitor(ch)?);
             let _pumps = eu.spawn_rx_pump(8);
             std::mem::forget(_pumps); // keep the RX pump threads alive
             println!("(receiver: RTL8812EU)");
-            MonitorWifiFace::new(FaceId(2), eu)
+            WifiPhy::new(FaceId(2), eu)
         }
     };
 

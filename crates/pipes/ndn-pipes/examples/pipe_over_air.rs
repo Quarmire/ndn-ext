@@ -28,7 +28,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use ndn_engine::EngineConfig;
     use ndn_face::local::InProcFace;
     use ndn_face_monitor_wifi::{
-        AfPacketBackend, FrameFormat, McsDescriptor, MonitorWifiFace, OPEN_GROUP_KEY, };
+        AfPacketBackend, FrameFormat, McsDescriptor, OPEN_GROUP_KEY, WifiPhy,
+    };
     use ndn_packet::Name;
     use ndn_pipes::{Confidentiality, PipeConsumer, PipeParams, PipeProducer};
     use ndn_transport::FaceId;
@@ -50,12 +51,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let nth = |i: usize| rest.get(i).and_then(|s| s.parse::<usize>().ok());
 
     let root: Name = "/".parse().unwrap();
-    let backend: Arc<dyn FrameIo> =
-        Arc::new(AfPacketBackend::new(&iface, FrameFormat::default())?);
+    let backend: Arc<dyn FrameIo> = Arc::new(AfPacketBackend::new(&iface, FrameFormat::default())?);
     // The radio is bound to the namespace as its name-group (the coupling) and
     // injects at a fixed, robust MCS.
     let mk_radio = |mcs: u8| {
-        MonitorWifiFace::new(FaceId(10), Arc::clone(&backend))
+        WifiPhy::new(FaceId(10), Arc::clone(&backend))
             .with_bloom_consumer(&OPEN_GROUP_KEY, namespace.as_str())
             .with_fixed_mcs(McsDescriptor::ht(mcs))
             .into_face()

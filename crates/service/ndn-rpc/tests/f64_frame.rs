@@ -59,9 +59,17 @@ fn f64_field_is_per_field_length_prefixed() {
     // One f64 field on the wire is `[u32 len = 8][8 LE bytes]` = 12 bytes — the
     // per-field length prefix, not a positional or JSON encoding.
     let wire = OneF64 { v: 1.5 }.encode();
-    assert_eq!(wire.len(), 12, "one f64 field = 4-byte length + 8-byte value");
+    assert_eq!(
+        wire.len(),
+        12,
+        "one f64 field = 4-byte length + 8-byte value"
+    );
     assert_eq!(&wire[0..4], &8u32.to_le_bytes(), "length prefix is 8");
-    assert_eq!(&wire[4..12], &1.5f64.to_le_bytes(), "little-endian f64 body");
+    assert_eq!(
+        &wire[4..12],
+        &1.5f64.to_le_bytes(),
+        "little-endian f64 body"
+    );
 }
 
 #[test]

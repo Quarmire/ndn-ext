@@ -36,7 +36,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_target(true)
         .init();
 
-    let env_u64 = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+    let env_u64 = |k: &str, d: u64| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
     // The cognitive control plane runs on the RTL8822E (0bda:a81a) — the chip
     // LibUsbRtl88xxBackend actually drives (and the only RTL part that implements
     // RadioKnobs). Default to it explicitly; open_monitor() would grab the first
@@ -49,12 +54,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let radio = RadioId(0);
     let backend = Arc::new(LibUsbRtl88xxBackend::open_monitor_pid(pid, ch)?);
     let _ = ChannelBw::Bw20; // bring_up already tuned the channel
-    println!("RTL8822E (0bda:{pid:04x}) up on ch{ch}; sampling occupancy every {interval:?} for {secs}s");
+    println!(
+        "RTL8822E (0bda:{pid:04x}) up on ch{ch}; sampling occupancy every {interval:?} for {secs}s"
+    );
 
     // Bring-up: build the plane, bind the backend as actuator, then start the
     // face's frame-free occupancy sampler over the same handle (ACT + SENSE).
     let mut control = RadioControl::new(RadioPolicy::default());
-    control.register_radio(radio, FaceId(0), RadioCapability::wifi_monitor_5ghz(vec![ch]));
+    control.register_radio(
+        radio,
+        FaceId(0),
+        RadioCapability::wifi_monitor_5ghz(vec![ch]),
+    );
     let _cell = control.libusb_actuator(radio, backend.clone());
     // An active object so each tick makes a real decision — its `decision` span
     // tree then shows the sensed occupancy as a decision INPUT beside the chosen

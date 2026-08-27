@@ -181,8 +181,7 @@ fn selection_matches_service(name: &Name, service: &Name) -> bool {
         return false;
     };
     let slice_eq = |start: usize| {
-        start <= end
-            && Name::from_components(comps[start..end].iter().cloned()) == *service
+        start <= end && Name::from_components(comps[start..end].iter().cloned()) == *service
     };
     slice_eq(idx + 2) || slice_eq(idx + 3)
 }

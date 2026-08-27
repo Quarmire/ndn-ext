@@ -15,11 +15,8 @@
 //!
 //! C++ ref: `NLSR/src/communication/sync-{logic-handler,protocol-adapter}.{hpp,cpp}`.
 
-use std::sync::{
-    Arc,
-    atomic::Ordering,
-};
 use portable_atomic::AtomicU64;
+use std::sync::{Arc, atomic::Ordering};
 
 use ndn_engine::observability::targets as t;
 use ndn_packet::Name;

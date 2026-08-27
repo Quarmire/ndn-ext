@@ -17,7 +17,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use ndn_face_monitor_wifi::Esp32SerialBackend;
 use ndn_frame_io::{ClockDomainId, FrameIo, InjectFrame, TxIntent};
-use ndn_radio_cognition::{prefix_hash, LeaseClass, SlotSchedule};
+use ndn_radio_cognition::{LeaseClass, SlotSchedule, prefix_hash};
 
 const SLOTS: u64 = 4;
 const SLOT_US: u64 = 20_000; // 20 ms slots → 80 ms period
@@ -44,15 +44,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let name_b: &[&[u8]] = &[b"ndn", b"lease", b"node-b"];
     let slot_a = sched.owner_slot(prefix_hash(name_a));
     let slot_b = sched.owner_slot(prefix_hash(name_b));
-    println!("SlotSchedule: {SLOTS} slots × {}ms. /ndn/lease/node-a → slot {slot_a}; node-b → slot {slot_b}",
-        SLOT_US / 1000);
+    println!(
+        "SlotSchedule: {SLOTS} slots × {}ms. /ndn/lease/node-a → slot {slot_a}; node-b → slot {slot_b}",
+        SLOT_US / 1000
+    );
     if slot_a == slot_b {
-        println!("(names hash to the SAME slot — they'd share airtime; that is the schedule's answer, not a bug)");
+        println!(
+            "(names hash to the SAME slot — they'd share airtime; that is the schedule's answer, not a bug)"
+        );
     }
 
     // Put both schedule clocks on one timeline (read back-to-back; offset = A_esp - B_esp).
     let (ca, cb) = (a.read_schedule_clock().await, b.read_schedule_clock().await);
-    let (ca, cb) = (ca.ok_or("A clock read failed")?, cb.ok_or("B clock read failed")?);
+    let (ca, cb) = (
+        ca.ok_or("A clock read failed")?,
+        cb.ok_or("B clock read failed")?,
+    );
     let offset = ca as i64 - cb as i64;
     println!("schedule-clock offset A-B = {offset} µs");
 
@@ -71,10 +78,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("scheduled {K} periods; collecting on-air confirmations…");
 
     // Verify: fold each node's ACTUAL on-air instant into the period, on the common timeline.
-    async fn collect(dev: &Esp32SerialBackend, is_a: bool, offset: i64, epoch: u64, period: u64) -> Vec<u64> {
+    async fn collect(
+        dev: &Esp32SerialBackend,
+        is_a: bool,
+        offset: i64,
+        epoch: u64,
+        period: u64,
+    ) -> Vec<u64> {
         let mut ph = Vec::new();
         while let Some((_t, actual)) = dev.recv_tx_confirm().await {
-            let on_a = if is_a { actual as i64 } else { actual as i64 + offset };
+            let on_a = if is_a {
+                actual as i64
+            } else {
+                actual as i64 + offset
+            };
             ph.push(((on_a - epoch as i64).rem_euclid(period as i64)) as u64);
         }
         ph
@@ -84,7 +101,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         collect(&b, false, offset, epoch, period),
     );
     let stat = |ph: &[u64]| -> (usize, f64, f64) {
-        if ph.is_empty() { return (0, 0.0, 0.0); }
+        if ph.is_empty() {
+            return (0, 0.0, 0.0);
+        }
         let m = ph.iter().sum::<u64>() as f64 / ph.len() as f64;
         let sd = (ph.iter().map(|&x| (x as f64 - m).powi(2)).sum::<f64>() / ph.len() as f64).sqrt();
         (ph.len(), m, sd)
@@ -92,11 +111,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (na, ma, sa) = stat(&pha);
     let (nb, mb, sb) = stat(&phb);
     let in_slot = |ph: &[u64], slot: u64| ph.iter().filter(|&&p| p / SLOT_US == slot).count();
-    println!("\nnode-a: {na} beacons, phase {:.2}±{:.2} ms → slot {} ; in slot {}: {}/{}",
-        ma / 1000.0, sa / 1000.0, (ma as u64) / SLOT_US, slot_a, in_slot(&pha, slot_a), na);
-    println!("node-b: {nb} beacons, phase {:.2}±{:.2} ms → slot {} ; in slot {}: {}/{}",
-        mb / 1000.0, sb / 1000.0, (mb as u64) / SLOT_US, slot_b, in_slot(&phb, slot_b), nb);
-    println!("→ each node transmits in the slot its NAME owns (SlotSchedule), placed by the HAL knob — \
-        the airtime lease, reusing the one design. LeaseClass::{:?} default.", LeaseClass::Bulk);
+    println!(
+        "\nnode-a: {na} beacons, phase {:.2}±{:.2} ms → slot {} ; in slot {}: {}/{}",
+        ma / 1000.0,
+        sa / 1000.0,
+        (ma as u64) / SLOT_US,
+        slot_a,
+        in_slot(&pha, slot_a),
+        na
+    );
+    println!(
+        "node-b: {nb} beacons, phase {:.2}±{:.2} ms → slot {} ; in slot {}: {}/{}",
+        mb / 1000.0,
+        sb / 1000.0,
+        (mb as u64) / SLOT_US,
+        slot_b,
+        in_slot(&phb, slot_b),
+        nb
+    );
+    println!(
+        "→ each node transmits in the slot its NAME owns (SlotSchedule), placed by the HAL knob — \
+        the airtime lease, reusing the one design. LeaseClass::{:?} default.",
+        LeaseClass::Bulk
+    );
     Ok(())
 }

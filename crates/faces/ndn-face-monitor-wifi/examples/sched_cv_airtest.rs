@@ -34,10 +34,18 @@ fn timing_beacon() -> Vec<u8> {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let ch: u8 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(40);
-    let secs: u64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(25);
-    let pid: u16 = std::env::var("NDN_PID").ok()
-        .and_then(|s| u16::from_str_radix(s.trim_start_matches("0x"), 16).ok()).unwrap_or(0xa81a);
+    let ch: u8 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40);
+    let secs: u64 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(25);
+    let pid: u16 = std::env::var("NDN_PID")
+        .ok()
+        .and_then(|s| u16::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+        .unwrap_or(0xa81a);
     let master = std::env::var("NDN_ROLE").as_deref() == Ok("master");
 
     let d = Arc::new(LibUsbRtl88xxBackend::open_monitor_pid(pid, ch)?);
@@ -47,7 +55,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if master {
         // Reference node: arm the hardware timing beacon (a self-contained window) and hold.
         d.emit_timing_frame(&timing_beacon(), 100)?;
-        println!("sched_cv_airtest MASTER: HW timing beacon armed on {BSSID:02x?} ch{ch} for {secs}s");
+        println!(
+            "sched_cv_airtest MASTER: HW timing beacon armed on {BSSID:02x?} ch{ch} for {secs}s"
+        );
         while Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
@@ -89,18 +99,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let st = sched.time_status();
     println!(
         "\n=== SLAVE RESULT ===\nhw_synced={}  common_view_now={} µs  offset={:?} µs  beacons={}",
-        st.hw_synced, st.now_us, st.offset_us, offsets.len(),
+        st.hw_synced,
+        st.now_us,
+        st.offset_us,
+        offsets.len(),
     );
     if offsets.len() >= 3 {
-        let diffs: Vec<i64> = offsets.windows(2).map(|w| w[1] - w[0]).filter(|d| d.abs() < 100_000).collect();
+        let diffs: Vec<i64> = offsets
+            .windows(2)
+            .map(|w| w[1] - w[0])
+            .filter(|d| d.abs() < 100_000)
+            .collect();
         let mean = diffs.iter().sum::<i64>() as f64 / diffs.len().max(1) as f64;
-        let var = diffs.iter().map(|&x| (x as f64 - mean).powi(2)).sum::<f64>() / diffs.len().max(1) as f64;
+        let var = diffs
+            .iter()
+            .map(|&x| (x as f64 - mean).powi(2))
+            .sum::<f64>()
+            / diffs.len().max(1) as f64;
         let (lo, hi) = (offsets.iter().min().unwrap(), offsets.iter().max().unwrap());
         println!(
             "scheduler CommonView precision: first-diff std={:.2} µs, offset spread={} µs  → {}",
             var.sqrt(),
             hi - lo,
-            if var.sqrt() < 10.0 { "SUB-µs..µs HARDWARE common-view, self-contained (no AP)" } else { "check sync" },
+            if var.sqrt() < 10.0 {
+                "SUB-µs..µs HARDWARE common-view, self-contained (no AP)"
+            } else {
+                "check sync"
+            },
         );
     } else {
         println!("no mesh beacons heard — is the master emitting on this channel?");

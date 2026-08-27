@@ -29,19 +29,19 @@ use ndn_packet::encode::InterestBuilder;
 use ndn_packet::{Data, Name, NameComponent};
 #[cfg(feature = "libusb-backend")]
 use ndn_packet::{Interest, encode::DataBuilder, encode::encode_data_unsigned};
+use ndn_radio_cognition::{NameContext, RadioCapability, RadioId, RadioPolicy, prefix_hash};
 #[cfg(feature = "libusb-backend")]
 use ndn_radio_cognition::{PolicyConfig, TxParams};
-#[cfg(feature = "libusb-backend")]
-use ndn_security::{Certificate, Ed25519Signer, SecurityManager, SignWith, encode_cert_data};
-#[cfg(feature = "libusb-backend")]
-use std::sync::RwLock;
-use ndn_radio_cognition::{NameContext, RadioCapability, RadioId, RadioPolicy, prefix_hash};
 #[cfg(not(feature = "libusb-backend"))]
 use ndn_radio_cognition::{RadioActuators, RadioAllocation, RadioError};
+#[cfg(feature = "libusb-backend")]
+use ndn_security::{Certificate, Ed25519Signer, SecurityManager, SignWith, encode_cert_data};
 use ndn_transport::FaceId as TransportFaceId;
 use ndn_transport::link_service::features::{
     install_global_egress_source, install_global_ingress_sink,
 };
+#[cfg(feature = "libusb-backend")]
+use std::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
@@ -80,7 +80,10 @@ fn demo_name(seq: u64, rssi: i8, ack: u8) -> Name {
 
 #[cfg(feature = "libusb-backend")]
 fn comp_i32(name: &Name, i: usize) -> Option<i32> {
-    std::str::from_utf8(name.components().get(i)?.value.as_ref()).ok()?.parse().ok()
+    std::str::from_utf8(name.components().get(i)?.value.as_ref())
+        .ok()?
+        .parse()
+        .ok()
 }
 /// Reported RSSI = component [2]; delivery-ack of the previous frame = component [3].
 #[cfg(feature = "libusb-backend")]
@@ -98,7 +101,9 @@ fn parse_ack(name: &Name) -> Option<bool> {
 /// a round where it heard nothing reads `None` (→ back off).
 #[cfg(feature = "libusb-backend")]
 #[derive(Default)]
-struct RssiStore(std::sync::Mutex<std::collections::HashMap<FaceId, ndn_signals_core::LinkSignals>>);
+struct RssiStore(
+    std::sync::Mutex<std::collections::HashMap<FaceId, ndn_signals_core::LinkSignals>>,
+);
 
 #[cfg(feature = "libusb-backend")]
 impl ndn_signals_core::SignalView<FaceId> for RssiStore {
@@ -202,7 +207,10 @@ impl RadioActuators for NoopActuator {
 }
 
 fn env_u64(k: &str, d: u64) -> u64 {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(d)
 }
 
 /// Bind this node's observability layer to the process-global TraceContext hooks
@@ -216,7 +224,9 @@ fn bind_global_trace_stitch(layer: &NdnObservabilityLayer) {
     let egress = layer.clone();
     install_global_egress_source(Arc::new(move || Some(egress.current_outbound_context())));
     let ingress = layer.clone();
-    install_global_ingress_sink(Arc::new(move |tc| ingress.set_inbound_trace_id(tc.trace_id.0)));
+    install_global_ingress_sink(Arc::new(move |tc| {
+        ingress.set_inbound_trace_id(tc.trace_id.0)
+    }));
 }
 
 #[tokio::main]
@@ -237,7 +247,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| "named_radio=info".into()),
     );
-    tracing::subscriber::set_global_default(tracing_subscriber::registry().with(layer).with(console))?;
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::registry().with(layer).with(console),
+    )?;
 
     // --- Engine + app face (+ the radio as a real NDN Face when a role is set). ---
     let ch = env_u64("NODE_CH", 149) as u8;
@@ -260,7 +272,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let signal_store: Arc<RssiStore> = Arc::new(RssiStore::default());
     #[cfg(feature = "libusb-backend")]
     let radio_backend = if role == "consumer" || role == "producer" {
-        use ndn_face_monitor_wifi::{FaceId, LibUsbRtl88xxBackend, MonitorWifiFace};
+        use ndn_face_monitor_wifi::{FaceId, LibUsbRtl88xxBackend, WifiPhy};
         let pid = env_u64("NODE_PID", 0xa81a) as u16;
         let backend = Arc::new(LibUsbRtl88xxBackend::open_monitor_pid(pid, ch)?);
         // NODE_TXPWR: lower the TXAGC to make the bench link marginal (induce real
@@ -274,7 +286,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Broadcast/open by default — the paired LpLinkService fragments NDN packets
         // across injected frames and runs the per-frame feature pipeline (incl. the
         // TraceContextFeature that carries our stitch TLV).
-        let mut mf = MonitorWifiFace::new(FaceId(RADIO_FACE_ID.0), backend.clone());
+        let mut mf = WifiPhy::new(FaceId(RADIO_FACE_ID.0), backend.clone());
         // NODE_FEC=R: link-layer FEC (K=1 ⇒ repetition, R redundant frames) — the
         // broadcast reliability lever with no ARQ. Both ends must match. Encodes
         // below the LP features, so it wraps (and preserves) the stitch TLV. 0 = off.
@@ -332,7 +344,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // it against the CA anchor on the way in; then producer Data validates
             // producer→CA. The consumer never hard-coded the producer's key.
             {
-                let ci = InterestBuilder::new(producer_key_name()).can_be_prefix().build();
+                let ci = InterestBuilder::new(producer_key_name())
+                    .can_be_prefix()
+                    .build();
                 app_handle.send(ci).await?;
                 match tokio::time::timeout(Duration::from_millis(2500), app_handle.recv()).await {
                     Ok(Some(w)) => match Certificate::decode(&Data::decode(w)?) {
@@ -393,23 +407,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Self-running loop: report the REAL RSSI the face measured for the last
             // producer frame; when nothing was heard (loss), report a conservative
             // floor so the producer backs off. NODE_RSSI_BIAS is an optional offset.
-            let bias: i32 = std::env::var("NODE_RSSI_BIAS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-            let floor: i32 = std::env::var("NODE_RSSI_FLOOR").ok().and_then(|v| v.parse().ok()).unwrap_or(-90);
+            let bias: i32 = std::env::var("NODE_RSSI_BIAS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            let floor: i32 = std::env::var("NODE_RSSI_FLOOR")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(-90);
             // NODE_FIX_RSSI pins the report (ignoring measurement) so the policy stays
             // over-aggressive and the BANDIT must correct the rate from real reward.
-            let fixed: Option<i32> = std::env::var("NODE_FIX_RSSI").ok().and_then(|v| v.parse().ok());
+            let fixed: Option<i32> = std::env::var("NODE_FIX_RSSI")
+                .ok()
+                .and_then(|v| v.parse().ok());
             let face_id = FaceId(RADIO_FACE_ID.0);
-            println!("consumer: reporting {} link RSSI (floor {floor}, bias {bias})",
-                if fixed.is_some() { "FIXED" } else { "MEASURED" });
-            println!("consumer: engine chain-validates Data producer→CA (only valid Data reaches here)");
+            println!(
+                "consumer: reporting {} link RSSI (floor {floor}, bias {bias})",
+                if fixed.is_some() { "FIXED" } else { "MEASURED" }
+            );
+            println!(
+                "consumer: engine chain-validates Data producer→CA (only valid Data reaches here)"
+            );
             let mut got = 0u32;
             let mut rejected = 0u32;
             let mut got_prev = true; // ack of the previous Data (real bandit reward)
             for seq in 0..ticks as u64 {
                 let measured = signal_store.take_rssi(face_id);
-                let reported =
-                    (fixed.unwrap_or_else(|| measured.map(i32::from).unwrap_or(floor)) + bias)
-                        .clamp(-110, -20) as i8;
+                let reported = (fixed.unwrap_or_else(|| measured.map(i32::from).unwrap_or(floor))
+                    + bias)
+                    .clamp(-110, -20) as i8;
                 let name = demo_name(seq, reported, got_prev as u8);
                 app_handle
                     .send(InterestBuilder::new(name.clone()).must_be_fresh().build())
@@ -420,19 +446,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let d = Data::decode(wire)?;
                         got += 1;
                         got_prev = true;
-                        println!("  seq {seq}: reported {reported} → got ({} B) ✓ chain-verified", d.content().map(|c| c.len()).unwrap_or(0));
+                        println!(
+                            "  seq {seq}: reported {reported} → got ({} B) ✓ chain-verified",
+                            d.content().map(|c| c.len()).unwrap_or(0)
+                        );
                     }
                     _ => {
                         // A forged producer's Data is DROPPED by the engine (no valid
                         // chain to the CA), so it never arrives — it reads as a loss.
                         rejected += 1;
                         got_prev = false;
-                        println!("  seq {seq}: reported {reported} → no valid Data (forgery dropped or lost)");
+                        println!(
+                            "  seq {seq}: reported {reported} → no valid Data (forgery dropped or lost)"
+                        );
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(tick_ms)).await;
             }
-            println!("DELIVERY: {got}/{ticks} chain-verified round-trips over the radio ({rejected} lost/dropped)");
+            println!(
+                "DELIVERY: {got}/{ticks} chain-verified round-trips over the radio ({rejected} lost/dropped)"
+            );
         } else {
             // PRODUCER: close the cognition loop — fold the consumer's REPORTED link
             // RSSI into the medium, let the policy decide, and write the decided TX
@@ -449,14 +482,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 RadioControl::new(RadioPolicy::default())
             };
-            control.register_radio(radio, FaceId(0), RadioCapability::wifi_monitor_5ghz(vec![ch]));
+            control.register_radio(
+                radio,
+                FaceId(0),
+                RadioCapability::wifi_monitor_5ghz(vec![ch]),
+            );
             control.set_active(vec![NameContext::new(prefix_hash(&[b"radio-demo"]))]);
             let fake_reward = env_u64("NODE_FAKE_REWARD", 0) == 1;
             // Sign every Data with the producer's Ed25519 key (NODE_FORGE=1 uses an
             // impostor key so the consumer rejects it — the trust demo).
-            let seed = if env_u64("NODE_FORGE", 0) == 1 { FORGED_SEED } else { PRODUCER_SEED };
+            let seed = if env_u64("NODE_FORGE", 0) == 1 {
+                FORGED_SEED
+            } else {
+                PRODUCER_SEED
+            };
             let signer = Ed25519Signer::from_seed(&seed, producer_key_name());
-            println!("producer: signing Data with Ed25519 ({})", if env_u64("NODE_FORGE", 0) == 1 { "FORGED key" } else { "real key" });
+            println!(
+                "producer: signing Data with Ed25519 ({})",
+                if env_u64("NODE_FORGE", 0) == 1 {
+                    "FORGED key"
+                } else {
+                    "real key"
+                }
+            );
             // Publish this producer's cert — its REAL key certified by the CA — to
             // serve when a consumer fetches it. (A forged producer still serves the
             // real cert but signs Data with the impostor key, so it fails validation.)
@@ -466,7 +514,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (cert_wire, _) = build_cert(&producer_key_name(), real_pubkey, &ca_signer)
                 .await
                 .map_err(|e| format!("cert: {e}"))?;
-            println!("producer: published CA-signed cert for {}", producer_key_name());
+            println!(
+                "producer: published CA-signed cert for {}",
+                producer_key_name()
+            );
             let run = Duration::from_secs(env_u64("NODE_SECS", 60));
             let start = tokio::time::Instant::now();
             let mut served = 0u32;
@@ -540,7 +591,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             println!("producer served {served} Data over the radio");
         }
-        println!("published {} OTLP spans (trace stitched across the hop)", publisher.len());
+        println!(
+            "published {} OTLP spans (trace stitched across the hop)",
+            publisher.len()
+        );
         cancel.cancel();
         return Ok(());
     }
@@ -552,7 +606,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let radio = RadioId(0);
     let mut control = RadioControl::new(RadioPolicy::default());
     // Single operating channel so channel selection never tunes to an untested one.
-    control.register_radio(radio, FaceId(0), RadioCapability::wifi_monitor_5ghz(vec![ch]));
+    control.register_radio(
+        radio,
+        FaceId(0),
+        RadioCapability::wifi_monitor_5ghz(vec![ch]),
+    );
 
     #[cfg(feature = "libusb-backend")]
     let backend = {
@@ -566,21 +624,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(feature = "libusb-backend"))]
     control.add_actuator(Arc::new(NoopActuator(radio)));
 
-    control.set_active(vec![NameContext::new(prefix_hash(&[b"named-radio", b"demo"]))]);
+    control.set_active(vec![NameContext::new(prefix_hash(&[
+        b"named-radio",
+        b"demo",
+    ]))]);
     let control = Arc::new(control);
 
     // SENSE: on-air, spawn the frame-free occupancy sampler over the same handle.
     #[cfg(feature = "libusb-backend")]
-    let _sampler =
-        control.start_occupancy_sampling(radio, ch, backend, Duration::from_millis(500));
+    let _sampler = control.start_occupancy_sampling(radio, ch, backend, Duration::from_millis(500));
 
-    println!("named-radio node up — observability prefix = {}", obs_prefix());
+    println!(
+        "named-radio node up — observability prefix = {}",
+        obs_prefix()
+    );
     println!("ticking the control plane {ticks}× (each tick emits the decision span tree)…");
     for _ in 0..ticks {
         control.tick_now(control.now_ms());
         tokio::time::sleep(Duration::from_millis(tick_ms)).await;
     }
-    println!("published {} OTLP spans to the observability ring", publisher.len());
+    println!(
+        "published {} OTLP spans to the observability ring",
+        publisher.len()
+    );
 
     // --- Prove end-to-end: take a just-emitted span's Data name, Interest it
     //     through the ENGINE, and decode the response as an OTLP Span protobuf. ---
@@ -615,7 +681,7 @@ mod tests {
     use super::*;
     use ndn_observability::{NdnObservabilityLayer, SpanPublisher, SpanRetention, ratio_sampler};
     use ndn_transport::link_service::{
-        EgressCtx, IngressCtx, InboundLpFrame, LinkServiceFeature, OutboundLpFrame,
+        EgressCtx, InboundLpFrame, IngressCtx, LinkServiceFeature, OutboundLpFrame,
         TraceContextFeature,
     };
 
@@ -665,7 +731,9 @@ mod tests {
         let feat_b = TraceContextFeature::new();
         {
             let b = node_b.clone();
-            feat_b.set_ingress_sink(Some(Arc::new(move |tc| b.set_inbound_trace_id(tc.trace_id.0))));
+            feat_b.set_ingress_sink(Some(Arc::new(move |tc| {
+                b.set_inbound_trace_id(tc.trace_id.0)
+            })));
         }
 
         // Node A transmits a frame: on_egress splices A's trace context (0x520 TLV).
@@ -673,7 +741,10 @@ mod tests {
         feat_a.on_egress(&mut out, &EgressCtx::new(APP_FACE_ID, None));
 
         // Node B receives it: on_ingress → sink → B adopts A's trace-id.
-        feat_b.on_ingress(&InboundLpFrame::bare(out.wire), &IngressCtx::new(APP_FACE_ID));
+        feat_b.on_ingress(
+            &InboundLpFrame::bare(out.wire),
+            &IngressCtx::new(APP_FACE_ID),
+        );
 
         // B's subsequent spans now share A's trace-id — one trace, two nodes.
         assert_eq!(

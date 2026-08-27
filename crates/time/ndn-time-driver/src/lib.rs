@@ -31,7 +31,7 @@ use ndn_time::{
     Authenticity, ClockCapability, Discipline, KeyId, MeasurementProvenance, PathId, TimePolicy,
 };
 use ndn_time_sources::TimeSource;
-use ndn_timekeeper::{beacon_wire, Timekeeper};
+use ndn_timekeeper::{Timekeeper, beacon_wire};
 use std::sync::Mutex;
 
 /// A peer beacon that has passed [`BeaconAuth::open`] — only these reach the Timekeeper.
@@ -112,7 +112,6 @@ pub trait ClockSteer: Send + Sync {
     /// applied, or `None` if the steerer declined (inside its deadband, or saturated).
     fn steer_ppb(&self, skew_ppb: i64) -> Option<f32>;
 }
-
 
 impl TimeService {
     /// How many inbound peer beacons have passed [`BeaconAuth::open`] and been ingested so far.
@@ -351,7 +350,7 @@ pub mod wifi {
     use super::BeaconTransport;
     use async_trait::async_trait;
     use bytes::Bytes;
-    use ndn_frame_io::{FrameIo, InjectFrame, BROADCAST, DEFAULT_SRC, TxIntent};
+    use ndn_frame_io::{BROADCAST, DEFAULT_SRC, FrameIo, InjectFrame, TxIntent};
     use std::sync::Arc;
 
     /// A [`BeaconTransport`] over any [`FrameIo`] radio (e.g. a monitor-wifi face). Each beacon is a
@@ -363,7 +362,7 @@ pub mod wifi {
     }
 
     impl FrameIoTransport {
-        /// Wrap a radio backend (a `MonitorWifiFace` / `Rtl8733buBackend` / `LibUsbRtl88xxBackend`).
+        /// Wrap a radio backend (a `WifiPhy` / `Rtl8733buBackend` / `LibUsbRtl88xxBackend`).
         pub fn new(radio: Arc<dyn FrameIo>) -> Self {
             Self { radio }
         }
@@ -450,10 +449,27 @@ mod tests {
     #[test]
     fn beacon_flows_and_disciplines_toward_reference() {
         let (la, lb) = Loopback::pair();
-        let (ca, cb) = (Arc::new(RecordingClock::new()), Arc::new(RecordingClock::new()));
+        let (ca, cb) = (
+            Arc::new(RecordingClock::new()),
+            Arc::new(RecordingClock::new()),
+        );
         // A: reference — tight 1 ms clock at T. B: 200 ms-uncertain clock at T + 50 ms.
-        let a = service(0, T, 1_000_000, ClockCapability::gnss_disciplined(), Arc::new(la), ca.clone());
-        let b = service(1, T + OFFSET_NS, 200_000_000, ClockCapability::oscillator_tcxo(), Arc::new(lb), cb.clone());
+        let a = service(
+            0,
+            T,
+            1_000_000,
+            ClockCapability::gnss_disciplined(),
+            Arc::new(la),
+            ca.clone(),
+        );
+        let b = service(
+            1,
+            T + OFFSET_NS,
+            200_000_000,
+            ClockCapability::oscillator_tcxo(),
+            Arc::new(lb),
+            cb.clone(),
+        );
 
         // Drive rounds directly (deterministic): A beacons, B ingests + disciplines.
         let mut mono = 0u64;
@@ -467,7 +483,10 @@ mod tests {
             let _ = b.discipline_once(mono);
         }
 
-        assert!(b_admitted, "B never admitted A's beacon (transport+auth+decode path)");
+        assert!(
+            b_admitted,
+            "B never admitted A's beacon (transport+auth+decode path)"
+        );
         let b_ms = cb.last_ms().expect("B never wrote clock_ms (ACT path)");
         let truth_ms = T / 1_000_000;
         let raw_ms = (T + OFFSET_NS) / 1_000_000;
@@ -485,7 +504,14 @@ mod tests {
         // Smoke-test the async run() wiring: A runs, B ingests what arrives over the real Loopback.
         let (la, lb) = Loopback::pair();
         let ca = Arc::new(RecordingClock::new());
-        let a = Arc::new(service(0, T, 1_000_000, ClockCapability::gnss_disciplined(), Arc::new(la), ca));
+        let a = Arc::new(service(
+            0,
+            T,
+            1_000_000,
+            ClockCapability::gnss_disciplined(),
+            Arc::new(la),
+            ca,
+        ));
         let lb = Arc::new(lb);
         let a2 = a.clone();
         tokio::spawn(async move { a2.run(std::time::Duration::from_millis(20)).await });

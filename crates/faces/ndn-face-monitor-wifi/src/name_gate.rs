@@ -2,7 +2,7 @@
 //!
 //! Before this, the same decision was implemented twice and differently:
 //!
-//! | | `MonitorWifiFace::rx_accepts` | `RadioMediumFace`'s RX loop |
+//! | | `WifiPhy::rx_accepts` | `RadioMediumFace`'s RX loop |
 //! |---|---|---|
 //! | Tier-0 prefix-set filter | yes | yes, open-coded inline |
 //! | Tier-1 (BF-FIB/PIT/CS) | yes | **no** |
@@ -11,16 +11,16 @@
 //!
 //! Two faces doing one job, with the features on opposite sides — which is the whole of #82. The
 //! copies had already begun to drift: every filtering feature added recently landed only in
-//! `MonitorWifiFace`, the face #82 says should *disappear* into `RadioMediumFace`. Extracting the
+//! `WifiPhy`, the face #82 says should *disappear* into `RadioMediumFace`. Extracting the
 //! gate is the step that stops the drift; the remaining collapse can then happen without carrying two
 //! divergent filter paths through it.
 //!
 //! The gate is deliberately **one type with one `admits`**, not a trait: there is exactly one policy
 //! here and a trait would invite a second implementation, which is the situation being fixed.
 
+use portable_atomic::AtomicU64;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use portable_atomic::AtomicU64;
 
 use crate::tier0::PrefixFilter;
 use crate::{BROADCAST, inner_name, ndn_name_to_slash};
