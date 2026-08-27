@@ -15,11 +15,16 @@ serial = ["dep:serialport"]
 # Shared-mux BLE backend: BLE over a shared `ndn_radio_drivers::SerialRadioBackend`, so one host connection
 # carries BOTH the Wi-Fi FrameIo and the BLE bearer of the unified ESP32-C5 firmware (`SharedBleBackend`).
 shared-mux = ["dep:ndn-radio-drivers", "ndn-radio-drivers/serial-radio"]
+# The host's own Bluetooth as a (receive-capable) BLE PHY via btleplug (CoreBluetooth/WinRT/BlueZ):
+# `MacBleBackend` scans for ND named adverts. Pulls btleplug + futures.
+mac = ["dep:btleplug", "dep:futures"]
 
 [dependencies]
 ndn-transport    = { workspace = true }
 serialport       = { version = "4", optional = true, default-features = false }
 ndn-radio-drivers = { path = "../../../../ndn-radio-drivers", optional = true }
+btleplug         = { workspace = true, optional = true }
+futures          = { workspace = true, optional = true }
 ndn-signals-core = { workspace = true }
 ndn-ble-framing  = { workspace = true }
 bytes            = { workspace = true, features = ["std"] }
@@ -72,3 +77,7 @@ required-features = ["shared-mux"]
 [[example]]
 name = "wireless_c5_relay"
 required-features = ["shared-mux"]
+
+[[example]]
+name = "ble_c6_mac"
+required-features = ["shared-mux", "mac"]

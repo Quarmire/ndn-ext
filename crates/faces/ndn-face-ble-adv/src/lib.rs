@@ -292,6 +292,12 @@ mod shared;
 #[cfg(feature = "shared-mux")]
 pub use shared::SharedBleBackend;
 
+// The Mac's built-in Bluetooth (CoreBluetooth via btleplug) as a receive-capable named-radio BLE PHY.
+#[cfg(feature = "mac")]
+mod mac;
+#[cfg(feature = "mac")]
+pub use mac::MacBleBackend;
+
 #[cfg(test)]
 mod tests {
     use super::*;
