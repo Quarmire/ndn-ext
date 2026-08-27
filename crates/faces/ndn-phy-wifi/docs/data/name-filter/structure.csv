@@ -1,7 +1,0 @@
-structure,target_fp,avg_bits,measured_fp,measured_fn
-bloom,1pct,10.67,0.00342,0.00000
-gcs,1pct,6.96,0.00942,0.00000
-xor,1pct,30.26,0.00188,0.00000
-bloom,0.1pct,21.33,0.00000,0.00000
-gcs,0.1pct,9.72,0.00240,0.00000
-xor,0.1pct,30.26,0.00188,0.00000
