@@ -28,8 +28,8 @@ use std::time::Duration;
 use ndn_app::{EngineAppExt, EngineBuilder};
 use ndn_engine::EngineConfig;
 use ndn_face_ble_adv::{BleAdvFace, SharedBleBackend};
-use ndn_packet::encode::DataBuilder;
 use ndn_packet::Name;
+use ndn_packet::encode::DataBuilder;
 use ndn_radio_drivers::Esp32SerialBackend;
 use ndn_transport::FaceId;
 use tokio_util::sync::CancellationToken;
@@ -120,6 +120,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let _ = shutdown_p.shutdown().await;
     let _ = shutdown_c.shutdown().await;
-    println!("✔ engine-level NDN roundtrip over BLE: Interest routed by FIB → on air → producer → Data via PIT");
+    println!(
+        "✔ engine-level NDN roundtrip over BLE: Interest routed by FIB → on air → producer → Data via PIT"
+    );
     Ok(())
 }

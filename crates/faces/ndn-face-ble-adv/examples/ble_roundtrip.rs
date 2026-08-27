@@ -30,7 +30,10 @@ fn tlv(ty: u8, val: &[u8]) -> Vec<u8> {
     v
 }
 fn name_tlv(comps: &[&[u8]]) -> Vec<u8> {
-    tlv(0x07, &comps.iter().flat_map(|c| tlv(0x08, c)).collect::<Vec<u8>>())
+    tlv(
+        0x07,
+        &comps.iter().flat_map(|c| tlv(0x08, c)).collect::<Vec<u8>>(),
+    )
 }
 fn interest_pkt(comps: &[&[u8]]) -> Bytes {
     let mut body = name_tlv(comps);
@@ -60,15 +63,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let content: Vec<u8> = (0..250u32).map(|i| (i % 251) as u8).collect();
     let data = data_pkt(NAME, &content);
     let interest = interest_pkt(NAME);
-    println!("Data wire size = {} B (frag MTU 200 → ~{} advertisements)", data.len(), data.len().div_ceil(200));
+    println!(
+        "Data wire size = {} B (frag MTU 200 → ~{} advertisements)",
+        data.len(),
+        data.len().div_ceil(200)
+    );
 
     // The consumer raises its BLE share so it catches every fragment (the split is a lever, not a constant).
     b_backend.set_ble_share(0.9)?;
     tokio::time::sleep(Duration::from_millis(400)).await;
 
     // NDNts framing = per-sender fragmentation/reassembly inside the face. MTU 200 < the C5's 240B ext-adv cap.
-    let producer = BleAdvFace::new(FaceId(1), a_backend.clone()).ndnts_framing().with_mtu(200);
-    let consumer = BleAdvFace::new(FaceId(2), b_backend.clone()).ndnts_framing().with_mtu(200);
+    let producer = BleAdvFace::new(FaceId(1), a_backend.clone())
+        .ndnts_framing()
+        .with_mtu(200);
+    let consumer = BleAdvFace::new(FaceId(2), b_backend.clone())
+        .ndnts_framing()
+        .with_mtu(200);
 
     // Producer: answer any Interest for our name with the large Data; also keep re-emitting it (broadcast is
     // lossy, so redundancy lets the consumer collect a full fragment set).
@@ -78,7 +89,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         for _ in 0..120 {
             if !served {
                 if let Ok(Ok((wire, _))) =
-                    tokio::time::timeout(Duration::from_millis(60), producer.recv_bytes_with_addr()).await
+                    tokio::time::timeout(Duration::from_millis(60), producer.recv_bytes_with_addr())
+                        .await
                 {
                     if Interest::decode(wire.clone()).is_ok() {
                         if wire.windows(want.len()).any(|w| w == want.as_slice()) {
@@ -106,15 +118,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::time::timeout(Duration::from_millis(800), consumer.recv_bytes_with_addr()).await
         {
             if let Ok(d) = Data::decode(wire.clone()) {
-                if d.content().map(|c| c.as_ref() == content.as_slice()).unwrap_or(false) {
-                    println!("consumer: REASSEMBLED + decoded Data /ndn/ble/big ({} B content) from {:02x?} ✔", content.len(), addr);
+                if d.content()
+                    .map(|c| c.as_ref() == content.as_slice())
+                    .unwrap_or(false)
+                {
+                    println!(
+                        "consumer: REASSEMBLED + decoded Data /ndn/ble/big ({} B content) from {:02x?} ✔",
+                        content.len(),
+                        addr
+                    );
                     ok = true;
                 }
             }
         }
     }
     prod.abort();
-    assert!(ok, "consumer did not reassemble the fragmented Data over BLE");
+    assert!(
+        ok,
+        "consumer did not reassemble the fragmented Data over BLE"
+    );
     println!("✔ full NDN roundtrip over BLE: Interest → fragmented Data → reassembled, C5 ↔ C5");
     Ok(())
 }

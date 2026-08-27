@@ -1,6 +1,6 @@
-//! In-process tests for the `WirelessFace` using a loopback bearer that does **real bearer-native
-//! fragmentation** (splits a whole packet to its MTU and reassembles), so the face's job — bearer selection,
-//! RX merge, cross-bearer dedup, and per-bearer MTU — is exercised without hardware.
+//! In-process tests for the `Radio` using a loopback phy that does **real phy-native
+//! fragmentation** (splits a whole packet to its MTU and reassembles), so the face's job — phy selection,
+//! RX merge, cross-phy dedup, and per-phy MTU — is exercised without hardware.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -9,11 +9,11 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use bytes::Bytes;
 use ndn_transport::{FaceError, FaceId, Transport};
-use tokio::sync::{broadcast, Mutex as AsyncMutex};
+use tokio::sync::{Mutex as AsyncMutex, broadcast};
 
 use super::*;
 
-/// One in-process broadcast medium (a bus). Bearers on the same bus hear each other.
+/// One in-process broadcast medium (a bus). Phys on the same bus hear each other.
 #[derive(Clone)]
 struct LoopbackBus {
     tx: broadcast::Sender<Frame>,
@@ -28,27 +28,29 @@ struct Frame {
 }
 impl LoopbackBus {
     fn new() -> Arc<Self> {
-        Arc::new(Self { tx: broadcast::channel(4096).0 })
+        Arc::new(Self {
+            tx: broadcast::channel(4096).0,
+        })
     }
 }
 
 static BEARER_IDS: AtomicU64 = AtomicU64::new(1);
 
-/// A loopback bearer over a [`LoopbackBus`] with a configurable MTU/kind/reach — it fragments a whole packet
+/// A loopback phy over a [`LoopbackBus`] with a configurable MTU/kind/reach — it fragments a whole packet
 /// into `mtu`-sized chunks on send and reassembles per `(src, obj)` on recv (skipping its own echoes).
 struct LoopbackBearer {
     id: u64,
     bus: Arc<LoopbackBus>,
     rx: AsyncMutex<broadcast::Receiver<Frame>>,
     mtu: usize,
-    kind: BearerKind,
+    kind: PhyKind,
     range_rank: u8,
     next_obj: AtomicU64,
     reasm: Mutex<HashMap<(u64, u64), Vec<Bytes>>>,
 }
 
 impl LoopbackBearer {
-    fn new(bus: &Arc<LoopbackBus>, mtu: usize, kind: BearerKind, range_rank: u8) -> Arc<Self> {
+    fn new(bus: &Arc<LoopbackBus>, mtu: usize, kind: PhyKind, range_rank: u8) -> Arc<Self> {
         Arc::new(Self {
             id: BEARER_IDS.fetch_add(1, Ordering::Relaxed),
             bus: Arc::clone(bus),
@@ -63,8 +65,8 @@ impl LoopbackBearer {
 }
 
 #[async_trait]
-impl WirelessBearer for LoopbackBearer {
-    fn kind(&self) -> BearerKind {
+impl WirelessPhy for LoopbackBearer {
+    fn kind(&self) -> PhyKind {
         self.kind
     }
     fn mtu(&self) -> usize {
@@ -83,7 +85,13 @@ impl WirelessBearer for LoopbackBearer {
         };
         let n = chunks.len();
         for (seq, data) in chunks.into_iter().enumerate() {
-            let _ = self.bus.tx.send(Frame { src: self.id, obj, seq: seq as u16, last: seq + 1 == n, data });
+            let _ = self.bus.tx.send(Frame {
+                src: self.id,
+                obj,
+                seq: seq as u16,
+                last: seq + 1 == n,
+                data,
+            });
         }
         Ok(())
     }
@@ -122,25 +130,25 @@ fn ndn_wire(name: &[u8], content: &[u8]) -> Bytes {
     Bytes::from(v)
 }
 
-/// Two nodes, each a WirelessFace over a Wi-Fi bus + a BLE bus. A broadcasts on ALL bearers (macrodiversity);
-/// B must receive the object EXACTLY ONCE despite it arriving on both bearers (cross-bearer dedup).
+/// Two nodes, each a Radio over a Wi-Fi bus + a BLE bus. A broadcasts on ALL phys (macrodiversity);
+/// B must receive the object EXACTLY ONCE despite it arriving on both phys (cross-phy dedup).
 #[tokio::test]
 async fn broadcast_all_bearers_delivers_once_despite_two_paths() {
     let wifi = LoopbackBus::new();
     let ble = LoopbackBus::new();
 
-    let a = WirelessFace::broadcast(
+    let a = Radio::broadcast(
         FaceId(1),
         vec![
-            LoopbackBearer::new(&wifi, 2000, BearerKind::Wifi, 1),
-            LoopbackBearer::new(&ble, 200, BearerKind::Ble, 3),
+            LoopbackBearer::new(&wifi, 2000, PhyKind::Wifi, 1),
+            LoopbackBearer::new(&ble, 200, PhyKind::Ble, 3),
         ],
     );
-    let b = WirelessFace::broadcast(
+    let b = Radio::broadcast(
         FaceId(2),
         vec![
-            LoopbackBearer::new(&wifi, 2000, BearerKind::Wifi, 1),
-            LoopbackBearer::new(&ble, 200, BearerKind::Ble, 3),
+            LoopbackBearer::new(&wifi, 2000, PhyKind::Wifi, 1),
+            LoopbackBearer::new(&ble, 200, PhyKind::Ble, 3),
         ],
     );
 
@@ -148,23 +156,32 @@ async fn broadcast_all_bearers_delivers_once_despite_two_paths() {
     a.send_bytes(obj.clone()).await.unwrap();
 
     // First recv is the object; a second recv within a short window must NOT re-deliver it (deduped).
-    let got = tokio::time::timeout(std::time::Duration::from_secs(1), b.recv_bytes()).await.unwrap().unwrap();
-    assert_eq!(got, obj, "reassembled object matches (bearer-native fragmentation on BLE, whole on Wi-Fi)");
+    let got = tokio::time::timeout(std::time::Duration::from_secs(1), b.recv_bytes())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        got, obj,
+        "reassembled object matches (phy-native fragmentation on BLE, whole on Wi-Fi)"
+    );
 
     let second = tokio::time::timeout(std::time::Duration::from_millis(200), b.recv_bytes()).await;
-    assert!(second.is_err(), "the duplicate (same object via the other bearer) was deduped, not re-delivered");
+    assert!(
+        second.is_err(),
+        "the duplicate (same object via the other phy) was deduped, not re-delivered"
+    );
 }
 
-/// The reach lever: a `ReachClassPolicy` sends Robust-class traffic on the highest-range bearer (BLE here) and
-/// Throughput-class on the highest-MTU bearer (Wi-Fi). Prove each lands only on the intended bus.
+/// The reach lever: a `ReachClassPolicy` sends Robust-class traffic on the highest-range phy (BLE here) and
+/// Throughput-class on the highest-MTU phy (Wi-Fi). Prove each lands only on the intended bus.
 #[tokio::test]
 async fn reach_class_policy_selects_the_intended_bearer() {
     let wifi = LoopbackBus::new();
     let ble = LoopbackBus::new();
 
-    // A witness on each bus (a lone bearer that only receives).
-    let wifi_witness = LoopbackBearer::new(&wifi, 2000, BearerKind::Wifi, 1);
-    let ble_witness = LoopbackBearer::new(&ble, 200, BearerKind::Ble, 3);
+    // A witness on each bus (a lone phy that only receives).
+    let wifi_witness = LoopbackBearer::new(&wifi, 2000, PhyKind::Wifi, 1);
+    let ble_witness = LoopbackBearer::new(&ble, 200, PhyKind::Ble, 3);
 
     // classify: first name byte 'R' ⇒ Robust, 'T' ⇒ Throughput.
     let policy = Arc::new(ReachClassPolicy {
@@ -174,11 +191,11 @@ async fn reach_class_policy_selects_the_intended_bearer() {
             _ => ReachClass::Redundant,
         },
     });
-    let a = WirelessFace::new(
+    let a = Radio::new(
         FaceId(1),
         vec![
-            LoopbackBearer::new(&wifi, 2000, BearerKind::Wifi, 1), // highest MTU
-            LoopbackBearer::new(&ble, 200, BearerKind::Ble, 3),    // highest range_rank
+            LoopbackBearer::new(&wifi, 2000, PhyKind::Wifi, 1), // highest MTU
+            LoopbackBearer::new(&ble, 200, PhyKind::Ble, 3),    // highest range_rank
         ],
         policy,
     );
@@ -186,45 +203,87 @@ async fn reach_class_policy_selects_the_intended_bearer() {
     a.send_bytes(ndn_wire(b"R-far", b"x")).await.unwrap(); // Robust → BLE
     a.send_bytes(ndn_wire(b"T-fast", b"y")).await.unwrap(); // Throughput → Wi-Fi
 
-    let ble_got =
-        tokio::time::timeout(std::time::Duration::from_secs(1), ble_witness.recv()).await.unwrap().unwrap();
-    assert_eq!(&ble_got[..1], b"R", "Robust class went out the long-reach (BLE) bearer");
-    let wifi_got =
-        tokio::time::timeout(std::time::Duration::from_secs(1), wifi_witness.recv()).await.unwrap().unwrap();
-    assert_eq!(&wifi_got[..1], b"T", "Throughput class went out the high-MTU (Wi-Fi) bearer");
+    let ble_got = tokio::time::timeout(std::time::Duration::from_secs(1), ble_witness.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        &ble_got[..1],
+        b"R",
+        "Robust class went out the long-reach (BLE) phy"
+    );
+    let wifi_got = tokio::time::timeout(std::time::Duration::from_secs(1), wifi_witness.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        &wifi_got[..1],
+        b"T",
+        "Throughput class went out the high-MTU (Wi-Fi) phy"
+    );
 
     // And the cross-check: the Robust object did NOT appear on Wi-Fi (a second wifi recv times out).
-    let no_more_wifi = tokio::time::timeout(std::time::Duration::from_millis(200), wifi_witness.recv()).await;
-    assert!(no_more_wifi.is_err(), "only the Throughput object rode Wi-Fi — selection, not broadcast");
+    let no_more_wifi =
+        tokio::time::timeout(std::time::Duration::from_millis(200), wifi_witness.recv()).await;
+    assert!(
+        no_more_wifi.is_err(),
+        "only the Throughput object rode Wi-Fi — selection, not broadcast"
+    );
 }
 
-/// No single face MTU — the face reports `None`; each bearer fragments to its own ceiling. A packet larger than
+/// No single face MTU — the face reports `None`; each phy fragments to its own ceiling. A packet larger than
 /// the BLE MTU but smaller than Wi-Fi's rides one Wi-Fi frame and several BLE fragments, and reassembles.
 #[tokio::test]
 async fn no_single_face_mtu_bearer_native_fragmentation() {
-    let a = WirelessFace::broadcast(FaceId(1), vec![LoopbackBearer::new(&LoopbackBus::new(), 200, BearerKind::Ble, 3)]);
-    assert_eq!(a.send_mtu(), None, "the wireless face exposes no single MTU upward");
+    let a = Radio::broadcast(
+        FaceId(1),
+        vec![LoopbackBearer::new(
+            &LoopbackBus::new(),
+            200,
+            PhyKind::Ble,
+            3,
+        )],
+    );
+    assert_eq!(
+        a.send_mtu(),
+        None,
+        "the wireless face exposes no single MTU upward"
+    );
 
     let ble = LoopbackBus::new();
-    let tx = WirelessFace::broadcast(FaceId(1), vec![LoopbackBearer::new(&ble, 200, BearerKind::Ble, 3)]);
-    let rx = WirelessFace::broadcast(FaceId(2), vec![LoopbackBearer::new(&ble, 200, BearerKind::Ble, 3)]);
+    let tx = Radio::broadcast(
+        FaceId(1),
+        vec![LoopbackBearer::new(&ble, 200, PhyKind::Ble, 3)],
+    );
+    let rx = Radio::broadcast(
+        FaceId(2),
+        vec![LoopbackBearer::new(&ble, 200, PhyKind::Ble, 3)],
+    );
     let big = ndn_wire(b"/big", &vec![9u8; 1000]); // 1000 B ≫ 200 B BLE MTU ⇒ ~5 fragments
     tx.send_bytes(big.clone()).await.unwrap();
-    let got = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv_bytes()).await.unwrap().unwrap();
-    assert_eq!(got, big, "the oversize packet reassembled from bearer-native BLE fragments");
+    let got = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv_bytes())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        got, big,
+        "the oversize packet reassembled from phy-native BLE fragments"
+    );
 }
 
 // --- adapter / classifier / engine-integration ---
 
-/// A whole-packet loopback **Transport** over a shared bus — to wrap in [`TransportBearer`] and to serve as the
-/// bearer under a real engine's WirelessFace.
+/// A whole-packet loopback **Transport** over a shared bus — to wrap in [`TransportPhy`] and to serve as the
+/// phy under a real engine's Radio.
 #[derive(Clone)]
 struct WholeBus {
     tx: broadcast::Sender<(u64, Bytes)>,
 }
 impl WholeBus {
     fn new() -> Arc<Self> {
-        Arc::new(Self { tx: broadcast::channel(4096).0 })
+        Arc::new(Self {
+            tx: broadcast::channel(4096).0,
+        })
     }
 }
 
@@ -235,7 +294,11 @@ struct LoopbackTransport {
 }
 impl LoopbackTransport {
     fn new(bus: &Arc<WholeBus>) -> Self {
-        Self { id: BEARER_IDS.fetch_add(1, Ordering::Relaxed), bus: Arc::clone(bus), rx: AsyncMutex::new(bus.tx.subscribe()) }
+        Self {
+            id: BEARER_IDS.fetch_add(1, Ordering::Relaxed),
+            bus: Arc::clone(bus),
+            rx: AsyncMutex::new(bus.tx.subscribe()),
+        }
     }
 }
 impl Transport for LoopbackTransport {
@@ -269,54 +332,73 @@ impl Transport for LoopbackTransport {
     }
 }
 
-fn wifi_bearer(bus: &Arc<WholeBus>) -> Arc<dyn WirelessBearer> {
-    Arc::new(TransportBearer::new(LoopbackTransport::new(bus), BearerKind::Wifi, 1))
+fn wifi_bearer(bus: &Arc<WholeBus>) -> Arc<dyn WirelessPhy> {
+    Arc::new(TransportPhy::new(
+        LoopbackTransport::new(bus),
+        PhyKind::Wifi,
+        1,
+    ))
 }
 
-/// `TransportBearer` turns any `Transport` into a bearer the face multiplexes.
+/// `TransportPhy` turns any `Transport` into a phy the face multiplexes.
 #[tokio::test]
 async fn transport_bearer_adapts_any_transport() {
     let bus = WholeBus::new();
-    let a = WirelessFace::broadcast(FaceId(1), vec![wifi_bearer(&bus)]);
-    let b = WirelessFace::broadcast(FaceId(2), vec![wifi_bearer(&bus)]);
+    let a = Radio::broadcast(FaceId(1), vec![wifi_bearer(&bus)]);
+    let b = Radio::broadcast(FaceId(2), vec![wifi_bearer(&bus)]);
     let obj = ndn_wire(b"/t", b"hello");
     a.send_bytes(obj.clone()).await.unwrap();
-    let got = tokio::time::timeout(std::time::Duration::from_secs(1), b.recv_bytes()).await.unwrap().unwrap();
+    let got = tokio::time::timeout(std::time::Duration::from_secs(1), b.recv_bytes())
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(got, obj);
 }
 
 /// The name-computed classifier maps real Interest names to reach classes by longest-prefix rule.
 #[tokio::test]
 async fn name_reach_classifier_maps_names_to_classes() {
-    use ndn_packet::encode::InterestBuilder;
     use ndn_packet::Name;
+    use ndn_packet::encode::InterestBuilder;
     let clf = NameReachClassifier::new(ReachClass::Redundant)
         .rule("/emergency".parse::<Name>().unwrap(), ReachClass::Robust)
         .rule("/video".parse::<Name>().unwrap(), ReachClass::Throughput);
     let emerg = InterestBuilder::new("/emergency/fire/1".parse::<Name>().unwrap()).build();
     let vid = InterestBuilder::new("/video/stream/9".parse::<Name>().unwrap()).build();
     let other = InterestBuilder::new("/misc/x".parse::<Name>().unwrap()).build();
-    assert_eq!(clf.classify(&emerg), ReachClass::Robust, "/emergency → Robust (long reach)");
-    assert_eq!(clf.classify(&vid), ReachClass::Throughput, "/video → Throughput (high MTU)");
-    assert_eq!(clf.classify(&other), ReachClass::Redundant, "unmatched → default");
+    assert_eq!(
+        clf.classify(&emerg),
+        ReachClass::Robust,
+        "/emergency → Robust (long reach)"
+    );
+    assert_eq!(
+        clf.classify(&vid),
+        ReachClass::Throughput,
+        "/video → Throughput (high MTU)"
+    );
+    assert_eq!(
+        clf.classify(&other),
+        ReachClass::Redundant,
+        "unmatched → default"
+    );
 }
 
-/// The payoff: a real `ForwarderEngine` forwards a full NDN roundtrip over ONE `WirelessFace` (the single
-/// wireless face replacing per-bearer faces). Consumer engine routes the prefix out its wireless face; the
+/// The payoff: a real `ForwarderEngine` forwards a full NDN roundtrip over ONE `Radio` (the single
+/// wireless face replacing per-phy faces). Consumer engine routes the prefix out its wireless face; the
 /// producer engine, over its own wireless face on the shared bus, serves the Data back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn engine_forwards_a_roundtrip_over_one_wireless_face() {
     use ndn_app::{EngineAppExt, EngineBuilder};
     use ndn_engine::builder::EngineConfig;
-    use ndn_packet::encode::DataBuilder;
     use ndn_packet::Name;
+    use ndn_packet::encode::DataBuilder;
     use tokio_util::sync::CancellationToken;
 
     let bus = WholeBus::new();
     let prefix: Name = "/ndn/wl/eng".parse().unwrap();
 
     let (engine_p, shutdown_p) = EngineBuilder::new(EngineConfig::default())
-        .face(WirelessFace::broadcast(FaceId(100), vec![wifi_bearer(&bus)]))
+        .face(Radio::broadcast(FaceId(100), vec![wifi_bearer(&bus)]))
         .build()
         .await
         .unwrap();
@@ -324,7 +406,7 @@ async fn engine_forwards_a_roundtrip_over_one_wireless_face() {
     let producer = engine_p.register_producer(prefix.clone(), cancel_p.child_token());
 
     let (engine_c, shutdown_c) = EngineBuilder::new(EngineConfig::default())
-        .face(WirelessFace::broadcast(FaceId(200), vec![wifi_bearer(&bus)]))
+        .face(Radio::broadcast(FaceId(200), vec![wifi_bearer(&bus)]))
         .build()
         .await
         .unwrap();
@@ -332,7 +414,7 @@ async fn engine_forwards_a_roundtrip_over_one_wireless_face() {
     let cancel_c = CancellationToken::new();
     let mut consumer = engine_c.app_consumer(cancel_c.child_token());
 
-    let payload = b"one wireless face, N bearers below".to_vec();
+    let payload = b"one wireless face, N phys below".to_vec();
     let want = payload.clone();
     let producer_task = tokio::spawn(async move {
         let _ = producer
@@ -340,7 +422,10 @@ async fn engine_forwards_a_roundtrip_over_one_wireless_face() {
                 let name = (*interest.name).clone();
                 let body = payload.clone();
                 async move {
-                    responder.respond_bytes(DataBuilder::new(name, &body).build()).await.ok();
+                    responder
+                        .respond_bytes(DataBuilder::new(name, &body).build())
+                        .await
+                        .ok();
                 }
             })
             .await;
@@ -363,66 +448,87 @@ async fn engine_forwards_a_roundtrip_over_one_wireless_face() {
     let _ = shutdown_c.shutdown().await;
 }
 
-fn two_bearers() -> Vec<Arc<dyn WirelessBearer>> {
+fn two_bearers() -> Vec<Arc<dyn WirelessPhy>> {
     let a = LoopbackBus::new();
     let b = LoopbackBus::new();
     vec![
-        LoopbackBearer::new(&a, 2000, BearerKind::Wifi, 1), // bearer 0 = Wi-Fi
-        LoopbackBearer::new(&b, 200, BearerKind::Ble, 3),   // bearer 1 = BLE
+        LoopbackBearer::new(&a, 2000, PhyKind::Wifi, 1), // phy 0 = Wi-Fi
+        LoopbackBearer::new(&b, 200, PhyKind::Ble, 3),   // phy 1 = BLE
     ]
 }
 
-/// The learning policy: cold ⇒ explore all bearers; once Data for a prefix comes back on one bearer, TX for
-/// that prefix goes out ONLY that bearer (airtime saved on the others) — the reach prior selecting a bearer.
+/// The learning policy: cold ⇒ explore all phys; once Data for a prefix comes back on one phy, TX for
+/// that prefix goes out ONLY that phy (airtime saved on the others) — the reach prior selecting a phy.
 #[tokio::test]
 async fn learned_policy_converges_to_the_reaching_bearer() {
-    use ndn_packet::encode::{DataBuilder, InterestBuilder};
     use ndn_packet::Name;
+    use ndn_packet::encode::{DataBuilder, InterestBuilder};
 
-    let policy = LearnedBearerPolicy::new();
-    let bearers = two_bearers();
+    let policy = LearnedPhyPolicy::new();
+    let phys = two_bearers();
     let interest = InterestBuilder::new("/svc/data/1".parse::<Name>().unwrap()).build();
 
-    // Cold: no prior for /svc ⇒ explore every bearer.
-    assert_eq!(policy.select(&interest, &bearers).into_vec(), vec![0, 1], "cold prefix floods all bearers");
+    // Cold: no prior for /svc ⇒ explore every phy.
+    assert_eq!(
+        policy.select(&interest, &phys).into_vec(),
+        vec![0, 1],
+        "cold prefix floods all phys"
+    );
 
-    // Data for /svc arrives on bearer 1 (BLE) — the reaching bearer.
+    // Data for /svc arrives on phy 1 (BLE) — the reaching phy.
     let data = DataBuilder::new("/svc/data/1".parse::<Name>().unwrap(), b"x").build();
     policy.observe_delivery(&data, 1);
 
-    // Now TX for /svc goes out ONLY the learned (BLE) bearer.
-    assert_eq!(policy.select(&interest, &bearers).into_vec(), vec![1], "learned prefix → the reaching bearer only");
+    // Now TX for /svc goes out ONLY the learned (BLE) phy.
+    assert_eq!(
+        policy.select(&interest, &phys).into_vec(),
+        vec![1],
+        "learned prefix → the reaching phy only"
+    );
 
     // A different prefix is still cold ⇒ still explores all.
     let other = InterestBuilder::new("/misc/x".parse::<Name>().unwrap()).build();
-    assert_eq!(policy.select(&other, &bearers).into_vec(), vec![0, 1], "unrelated prefix stays exploratory");
+    assert_eq!(
+        policy.select(&other, &phys).into_vec(),
+        vec![0, 1],
+        "unrelated prefix stays exploratory"
+    );
 }
 
-/// The face feeds RX into the policy: a Data arriving on the BLE bearer teaches the shared policy, so the next
-/// TX for that prefix selects BLE — end to end through `WirelessFace`.
+/// The face feeds RX into the policy: a Data arriving on the BLE phy teaches the shared policy, so the next
+/// TX for that prefix selects BLE — end to end through `Radio`.
 #[tokio::test]
 async fn face_rx_teaches_the_learning_policy() {
-    use ndn_packet::encode::{DataBuilder, InterestBuilder};
     use ndn_packet::Name;
+    use ndn_packet::encode::{DataBuilder, InterestBuilder};
 
     let wifi = LoopbackBus::new();
     let ble = LoopbackBus::new();
-    let policy = Arc::new(LearnedBearerPolicy::new());
-    let learner = WirelessFace::new(
+    let policy = Arc::new(LearnedPhyPolicy::new());
+    let learner = Radio::new(
         FaceId(2),
         vec![
-            LoopbackBearer::new(&wifi, 2000, BearerKind::Wifi, 1), // idx 0
-            LoopbackBearer::new(&ble, 200, BearerKind::Ble, 3),    // idx 1
+            LoopbackBearer::new(&wifi, 2000, PhyKind::Wifi, 1), // idx 0
+            LoopbackBearer::new(&ble, 200, PhyKind::Ble, 3),    // idx 1
         ],
         policy.clone(),
     );
 
     // A lone peer emits one Data for /svc on the BLE bus; the face receives it and teaches the policy.
-    let peer_ble = LoopbackBearer::new(&ble, 200, BearerKind::Ble, 3);
-    peer_ble.send(DataBuilder::new("/svc/0".parse::<Name>().unwrap(), b"x").build()).await.unwrap();
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), learner.recv_bytes()).await.unwrap();
+    let peer_ble = LoopbackBearer::new(&ble, 200, PhyKind::Ble, 3);
+    peer_ble
+        .send(DataBuilder::new("/svc/0".parse::<Name>().unwrap(), b"x").build())
+        .await
+        .unwrap();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), learner.recv_bytes())
+        .await
+        .unwrap();
 
-    // The shared policy now steers /svc traffic to the BLE bearer (index 1).
+    // The shared policy now steers /svc traffic to the BLE phy (index 1).
     let interest = InterestBuilder::new("/svc/1".parse::<Name>().unwrap()).build();
-    assert_eq!(policy.select(&interest, learner.bearers()).into_vec(), vec![1], "face RX taught the policy → BLE");
+    assert_eq!(
+        policy.select(&interest, learner.phys()).into_vec(),
+        vec![1],
+        "face RX taught the policy → BLE"
+    );
 }

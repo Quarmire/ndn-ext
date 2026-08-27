@@ -24,7 +24,10 @@ use ndn_radio_drivers::Esp32SerialBackend;
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let port = std::env::var("WL_C6").unwrap_or_else(|_| "/dev/cu.usbmodem2101".into());
-    let rounds: u32 = std::env::var("NDR_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+    let rounds: u32 = std::env::var("NDR_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
 
     // The C6 as a BLE advertiser (TX), over its serial bridge (unified firmware, shared Wi-Fi/BLE mux).
     let wifi = Arc::new(Esp32SerialBackend::open_c5(&port)?);
@@ -39,7 +42,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut received = 0u32;
     for r in 0..rounds {
         let payload = format!("C6-BLE->MAC #{r}");
-        c6.broadcast(Bytes::from(payload.clone().into_bytes())).await?;
+        c6.broadcast(Bytes::from(payload.clone().into_bytes()))
+            .await?;
 
         // Wait up to 600 ms for the Mac to surface THIS advert (older adverts in the queue are skipped;
         // the controller dedups the 3-event burst so we see each payload once).
@@ -47,7 +51,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         while let Ok(Ok(sf)) = tokio::time::timeout_at(deadline, mac.next_scanned()).await {
             if sf.frame.as_ref() == payload.as_bytes() {
                 received += 1;
-                println!("  #{r}: Mac heard {payload:?}  (link-id {:02x?})", sf.addr.unwrap_or_default());
+                println!(
+                    "  #{r}: Mac heard {payload:?}  (link-id {:02x?})",
+                    sf.addr.unwrap_or_default()
+                );
                 break;
             }
         }

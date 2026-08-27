@@ -16,8 +16,8 @@
 //! SHARED_A=/dev/cu.usbmodem101 SHARED_B=/dev/cu.usbmodem11101 \
 //!   cargo run --example shared_mux --features shared-mux -p ndn-face-ble-adv
 //! ```
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -47,7 +47,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (w, n) = (a_wifi.clone(), wifi_rx.clone());
         tokio::spawn(async move {
             loop {
-                if (tokio::time::timeout(Duration::from_millis(300), w.recv_frame()).await).is_ok() {
+                if (tokio::time::timeout(Duration::from_millis(300), w.recv_frame()).await).is_ok()
+                {
                     n.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -59,7 +60,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (b, n) = (a_ble.clone(), ble_rx.clone());
         tokio::spawn(async move {
             loop {
-                if (tokio::time::timeout(Duration::from_millis(300), b.next_scanned()).await).is_ok() {
+                if (tokio::time::timeout(Duration::from_millis(300), b.next_scanned()).await)
+                    .is_ok()
+                {
                     n.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -80,7 +83,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if (t / PHASE_TICKS) % 2 == 0 {
                     let _ = bb.broadcast(ad.clone()).await; // BLE phase
                 } else {
-                    let _ = bw.inject(InjectFrame::broadcast(wframe.clone(), TxIntent::default())).await; // Wi-Fi phase
+                    let _ = bw
+                        .inject(InjectFrame::broadcast(wframe.clone(), TxIntent::default()))
+                        .await; // Wi-Fi phase
                 }
                 tokio::time::sleep(Duration::from_millis(120)).await;
                 t = t.wrapping_add(1);
@@ -90,7 +95,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- Device A: the demand-driven coex loop (inlined spawn_demand_coex, so we can print) ---
     println!("shared mux on {pa}: one connection, both bearers. B alternates BLE(6s)/Wi-Fi(6s).\n");
-    println!("{:>4}  {:>7} {:>7}  {:>7}  {:<10}  {:>6} {:>6}", "s", "wifi_d", "ble_d", "share", "B phase", "wifiRX", "bleRX");
+    println!(
+        "{:>4}  {:>7} {:>7}  {:>7}  {:<10}  {:>6} {:>6}",
+        "s", "wifi_d", "ble_d", "share", "B phase", "wifiRX", "bleRX"
+    );
     let mut prev_w = a_mux.wifi_frame_count();
     let mut prev_b = a_mux.ble_scan_count();
     for s in 1..=24 {
@@ -102,9 +110,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         prev_w = w;
         prev_b = b;
         let total = dw + db;
-        let share = if total < 1.0 { (FLOOR + CEIL) * 0.5 } else { (db / total).clamp(FLOOR, CEIL) };
+        let share = if total < 1.0 {
+            (FLOOR + CEIL) * 0.5
+        } else {
+            (db / total).clamp(FLOOR, CEIL)
+        };
         a_mux.set_ble_share(share, ITVL)?; // actuate — the cognition lever, driven by measured named demand
-        let phase = if db > dw { "BLE" } else if dw > 0.0 { "Wi-Fi" } else { "idle" };
+        let phase = if db > dw {
+            "BLE"
+        } else if dw > 0.0 {
+            "Wi-Fi"
+        } else {
+            "idle"
+        };
         println!(
             "{s:>4}  {dw:>7.0} {db:>7.0}  {share:>7.2}  {phase:<10}  {:>6} {:>6}",
             wifi_rx.load(Ordering::Relaxed),
@@ -112,10 +130,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let (wf, bf) = (wifi_rx.load(Ordering::Relaxed), ble_rx.load(Ordering::Relaxed));
+    let (wf, bf) = (
+        wifi_rx.load(Ordering::Relaxed),
+        ble_rx.load(Ordering::Relaxed),
+    );
     println!("\ntotals over one connection: Wi-Fi frames = {wf}, BLE ads = {bf}");
-    assert!(wf > 0, "no Wi-Fi frames — the Wi-Fi bearer of the shared mux is dead");
-    assert!(bf > 0, "no BLE ads — the BLE bearer of the shared mux is dead");
-    println!("✔ ONE serial connection served BOTH bearers, and the coex split tracked per-bearer demand");
+    assert!(
+        wf > 0,
+        "no Wi-Fi frames — the Wi-Fi bearer of the shared mux is dead"
+    );
+    assert!(
+        bf > 0,
+        "no BLE ads — the BLE bearer of the shared mux is dead"
+    );
+    println!(
+        "✔ ONE serial connection served BOTH bearers, and the coex split tracked per-bearer demand"
+    );
     Ok(())
 }

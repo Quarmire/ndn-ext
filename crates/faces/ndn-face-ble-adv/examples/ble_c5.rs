@@ -19,8 +19,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::time::sleep(Duration::from_millis(1500)).await; // let NimBLE reach sync on both
 
     // A tiny NDN-ish payload (a Data-shaped blob is enough to prove carriage).
-    let payload = Bytes::from(vec![0x06, 0x12, 0x07, 0x0a, b'/', b'n', b'd', b'n', b'/', b'b', b'l', b'e',
-                                   b'/', b'r', b'u', b's', b't', 0xAB, 0xCD, 0xEF]);
+    let payload = Bytes::from(vec![
+        0x06, 0x12, 0x07, 0x0a, b'/', b'n', b'd', b'n', b'/', b'b', b'l', b'e', b'/', b'r', b'u',
+        b's', b't', 0xAB, 0xCD, 0xEF,
+    ]);
 
     let txc = tx.clone();
     let pl = payload.clone();
@@ -35,7 +37,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut first: Option<(i8, [u8; 6])> = None;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
     while tokio::time::Instant::now() < deadline && matched < 5 {
-        if let Ok(Ok(sf)) = tokio::time::timeout(Duration::from_millis(500), rx.next_scanned()).await {
+        if let Ok(Ok(sf)) =
+            tokio::time::timeout(Duration::from_millis(500), rx.next_scanned()).await
+        {
             got += 1;
             if sf.frame == payload {
                 matched += 1;
@@ -48,7 +52,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     spam.abort();
     println!("A → BLE → B via AdvBackend: scanned {got}, matched {matched}");
     if let Some((rssi, addr)) = first {
-        println!("  first match: rssi {rssi} dBm from {}", addr.map(|x| format!("{x:02x}")).join(":"));
+        println!(
+            "  first match: rssi {rssi} dBm from {}",
+            addr.map(|x| format!("{x:02x}")).join(":")
+        );
     }
     assert!(matched > 0, "no matching BLE advertisements received on B");
     println!("✔ named data carried over BLE 5 extended advertising, C5 → C5");

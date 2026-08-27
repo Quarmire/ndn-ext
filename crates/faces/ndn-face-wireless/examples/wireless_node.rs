@@ -1,23 +1,23 @@
 //! **Any board, one wireless face.** Brings the ESP32 **CYD** (Wi-Fi serial-radio), the **Heltec** /
 //! **S3+LoRa** boards (SX12xx), the **BW16**, and a plain **C5** up to par with the shared-mux C5s: each
-//! becomes a first-class [`WirelessBearer`] of ONE [`WirelessFace`], and a real `ForwarderEngine` runs over
-//! it. Attach whichever bearers this node has by env var — the face fragments per-bearer, dedups across
-//! bearers, and the reach policy chooses which bearer(s) carry each packet.
+//! becomes a first-class [`WirelessPhy`] of ONE [`Radio`], and a real `ForwarderEngine` runs over
+//! it. Attach whichever phys this node has by env var — the face fragments per-phy, dedups across
+//! phys, and the reach policy chooses which phy(s) carry each packet.
 //!
 //! ```text
 //!   WL_WIFI  ─→ SerialRadioBackend ─→ MonitorWifiFace ─┐
-//!                                                       ├─→ WirelessFace ─→ ForwarderEngine (+ strategy)
+//!                                                       ├─→ Radio ─→ ForwarderEngine (+ strategy)
 //!   WL_LORA  ─→ LoraSerialBackend  ─→ LoraFace ────────┘
 //! ```
 //!
 //! Every board here speaks the same host contract as the C5 (the `[4E 44 …]` ND wire protocol for Wi-Fi,
-//! the 7E-A5 protocol for LoRa), so the CYD and a Heltec are just two more bearers — no new face type.
+//! the 7E-A5 protocol for LoRa), so the CYD and a Heltec are just two more phys — no new face type.
 //!
 //! ```sh
-//! # CYD as a Wi-Fi bearer, consumer role, fetch /ndn/wl/svc from a peer producer:
+//! # CYD as a Wi-Fi phy, consumer role, fetch /ndn/wl/svc from a peer producer:
 //! WL_WIFI=/dev/cu.usbserial-11410 WL_ROLE=consumer \
 //!   cargo run --example wireless_node -p ndn-face-wireless
-//! # Heltec (SX1276) as a LoRa bearer, producer role:
+//! # Heltec (SX1276) as a LoRa phy, producer role:
 //! WL_LORA=/dev/cu.usbserial-0001 WL_ROLE=producer \
 //!   cargo run --example wireless_node -p ndn-face-wireless
 //! # A HETEROGENEOUS node: ONE wireless face spanning a CYD (Wi-Fi) AND a Heltec (LoRa), name-routed —
@@ -36,8 +36,7 @@ use ndn_engine::builder::EngineConfig;
 use ndn_face_lora::LoraFace;
 use ndn_face_monitor_wifi::MonitorWifiFace;
 use ndn_face_wireless::{
-    BearerKind, BroadcastAllBearers, NameReachClassifier, ReachClass, TransportBearer, WirelessBearer,
-    WirelessFace,
+    BroadcastAllPhys, NameReachClassifier, PhyKind, Radio, ReachClass, TransportPhy, WirelessPhy,
 };
 use ndn_packet::Name;
 use ndn_packet::encode::DataBuilder;
@@ -52,11 +51,11 @@ fn env_or(k: &str, d: &str) -> String {
     env::var(k).unwrap_or_else(|_| d.into())
 }
 
-/// Assemble a [`WirelessFace`] from whichever boards are wired up (env `WL_WIFI` / `WL_LORA`).
-fn build_wireless(prefix: &Name) -> Result<WirelessFace, Box<dyn std::error::Error>> {
-    let mut bearers: Vec<Arc<dyn WirelessBearer>> = Vec::new();
+/// Assemble a [`Radio`] from whichever boards are wired up (env `WL_WIFI` / `WL_LORA`).
+fn build_wireless(prefix: &Name) -> Result<Radio, Box<dyn std::error::Error>> {
+    let mut phys: Vec<Arc<dyn WirelessPhy>> = Vec::new();
 
-    // Wi-Fi bearer: a CYD / BW16 / plain-C5 running the serial 802.11 bridge. SerialRadioBackend::open
+    // Wi-Fi phy: a CYD / BW16 / plain-C5 running the serial 802.11 bridge. SerialRadioBackend::open
     // pulses DTR→CEN to boot our firmware on a CH340/CP2102 board (the CYD/BW16); a native-USB-JTAG C5
     // would use open_no_reset, but for the CYD the reset pulse is correct.
     if let Ok(port) = env::var("WL_WIFI") {
@@ -67,12 +66,14 @@ fn build_wireless(prefix: &Name) -> Result<WirelessFace, Box<dyn std::error::Err
         }
         let io: Arc<dyn FrameIo> = be;
         let face = MonitorWifiFace::new(FaceId(1), io);
-        // 802.11 airtime-optimal ceiling ~2272 B; range_rank 1 (shortest of the three bearers).
-        bearers.push(Arc::new(TransportBearer::new(face, BearerKind::Wifi, 1).with_mtu(2272)));
-        println!("  + Wi-Fi bearer on {port} (ch {ch}, MTU 2272)");
+        // 802.11 airtime-optimal ceiling ~2272 B; range_rank 1 (shortest of the three phys).
+        phys.push(Arc::new(
+            TransportPhy::new(face, PhyKind::Wifi, 1).with_mtu(2272),
+        ));
+        println!("  + Wi-Fi phy on {port} (ch {ch}, MTU 2272)");
     }
 
-    // Wi-Fi bearer over a libusb Realtek USB dongle (e.g. the 8812au) — `WL_WIFI_USB=8812` (hex PID).
+    // Wi-Fi phy over a libusb Realtek USB dongle (e.g. the 8812au) — `WL_WIFI_USB=8812` (hex PID).
     // open_named_radio brings up monitor + inject and hands back an `Arc<dyn FrameIo>`, same contract as
     // the serial board, so the USB radio is just another PHY. Lets a node produce/relay over a real USB
     // Wi-Fi radio while the CYD consumes over its serial 802.11 PHY — a cross-radio roundtrip on one host.
@@ -82,37 +83,44 @@ fn build_wireless(prefix: &Name) -> Result<WirelessFace, Box<dyn std::error::Err
         let radio = ndn_radio_drivers::open_named_radio(pid, ch)?;
         let io = radio.io();
         let face = MonitorWifiFace::new(FaceId(3), io);
-        bearers.push(Arc::new(TransportBearer::new(face, BearerKind::Wifi, 1).with_mtu(2272)));
-        println!("  + Wi-Fi(USB 0x{pid:04x}) bearer (ch {ch}, MTU 2272)");
+        phys.push(Arc::new(
+            TransportPhy::new(face, PhyKind::Wifi, 1).with_mtu(2272),
+        ));
+        println!("  + Wi-Fi(USB 0x{pid:04x}) phy (ch {ch}, MTU 2272)");
     }
 
-    // LoRa bearer: a Heltec (SX1276) / S3+LoRa (SX126x) / Waveshare dongle on the 7E-A5 Rust firmware.
+    // LoRa phy: a Heltec (SX1276) / S3+LoRa (SX126x) / Waveshare dongle on the 7E-A5 Rust firmware.
     if let Ok(port) = env::var("WL_LORA") {
         let be = Arc::new(LoraSerialBackend::open(&port)?);
         let io: Arc<dyn FrameIo> = be;
         let face = LoraFace::new(FaceId(2), io);
         // One LoRa frame is the MTU (LpLinkService fragments above this); range_rank 5 = longest reach.
-        bearers.push(Arc::new(TransportBearer::new(face, BearerKind::LoRa, 5).with_mtu(MAX_LORA_PAYLOAD)));
-        println!("  + LoRa bearer on {port} (MTU {MAX_LORA_PAYLOAD})");
+        phys.push(Arc::new(
+            TransportPhy::new(face, PhyKind::LoRa, 5).with_mtu(MAX_LORA_PAYLOAD),
+        ));
+        println!("  + LoRa phy on {port} (MTU {MAX_LORA_PAYLOAD})");
     }
 
-    if bearers.is_empty() {
+    if phys.is_empty() {
         return Err("set at least one of WL_WIFI / WL_LORA to a serial port".into());
     }
 
-    // Policy: `classify` routes by name (robust→longest-reach bearer i.e. LoRa, throughput→highest-MTU i.e.
-    // Wi-Fi); anything else broadcasts on all bearers (macrodiversity, the safe default for a single peer).
+    // Policy: `classify` routes by name (robust→longest-reach phy i.e. LoRa, throughput→highest-MTU i.e.
+    // Wi-Fi); anything else broadcasts on all phys (macrodiversity, the safe default for a single peer).
     match env::var("WL_POLICY").as_deref() {
         Ok("classify") => {
             let clf = NameReachClassifier::new(ReachClass::Redundant)
                 .rule(prefix.clone(), ReachClass::Robust)
-                .rule(format!("{prefix}/fast").parse::<Name>().unwrap(), ReachClass::Throughput);
+                .rule(
+                    format!("{prefix}/fast").parse::<Name>().unwrap(),
+                    ReachClass::Throughput,
+                );
             println!("  policy = name-classify (default robust; /fast → throughput)");
-            Ok(WirelessFace::new(WIRELESS_FACE, bearers, Arc::new(clf)))
+            Ok(Radio::new(WIRELESS_FACE, phys, Arc::new(clf)))
         }
         _ => {
-            println!("  policy = broadcast-all-bearers");
-            Ok(WirelessFace::new(WIRELESS_FACE, bearers, Arc::new(BroadcastAllBearers)))
+            println!("  policy = broadcast-all-phys");
+            Ok(Radio::new(WIRELESS_FACE, phys, Arc::new(BroadcastAllPhys)))
         }
     }
 }
@@ -132,7 +140,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("wireless_node: role={role} prefix={prefix}");
 
     let face = build_wireless(&prefix)?;
-    let (engine, shutdown) = EngineBuilder::new(EngineConfig::default()).face(face).build().await?;
+    let (engine, shutdown) = EngineBuilder::new(EngineConfig::default())
+        .face(face)
+        .build()
+        .await?;
     hook_strategy(&engine, &prefix);
     tokio::time::sleep(Duration::from_millis(1500)).await; // reader spin-up / radio settle
 
@@ -141,7 +152,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "producer" => {
             let cancel = CancellationToken::new();
             let producer = engine.register_producer(prefix.clone(), cancel.child_token());
-            let body = env_or("WL_PAYLOAD", "hello from a named-radio bearer").into_bytes();
+            let body = env_or("WL_PAYLOAD", "hello from a named-radio phy").into_bytes();
             let secs: u64 = env_or("WL_SECS", "60").parse().unwrap_or(60);
             println!("producer: serving {prefix} for {secs}s");
             let task = tokio::spawn(async move {
@@ -150,7 +161,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let name = (*i.name).clone();
                         let body = body.clone();
                         async move {
-                            r.respond_bytes(DataBuilder::new(name, &body).build()).await.ok();
+                            r.respond_bytes(DataBuilder::new(name, &body).build())
+                                .await
+                                .ok();
                         }
                     })
                     .await;
