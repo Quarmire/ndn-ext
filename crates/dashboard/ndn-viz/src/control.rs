@@ -206,7 +206,8 @@ impl RadioCognition {
                 tx_power: o.field("tx_power").unwrap_or_default().to_string(),
                 link_fec: o.field("link_fec").unwrap_or_default().to_string(),
                 edcca_ignore: o.field("edcca_ignore").unwrap_or_default().to_string(),
-                defer_threshold_dbm: o.field("defer_threshold_dbm")
+                defer_threshold_dbm: o
+                    .field("defer_threshold_dbm")
                     .unwrap_or_default()
                     .to_string(),
                 suppress: o.field("suppress").unwrap_or_default().to_string(),

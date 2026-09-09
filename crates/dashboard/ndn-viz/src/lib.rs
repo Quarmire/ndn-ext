@@ -29,11 +29,12 @@
 
 pub mod control;
 pub mod observe;
+pub mod service;
 pub mod source;
 
 pub use control::{
-    ControlSurfaces, HardwareInventory, Monitor, Monitors, ObjectStats, RadioCognition, RadioDevice,
-    RadioRow, Subsystem, parse_ext_list,
+    ControlSurfaces, HardwareInventory, Monitor, Monitors, ObjectStats, RadioCognition,
+    RadioDevice, RadioRow, Subsystem, parse_ext_list,
 };
 
 pub use observe::{
@@ -42,5 +43,9 @@ pub use observe::{
     SpanView, TraceView, bridge_status_from_logs, correlated_logs_for_trace, decode_otlp_span,
     filter_traces, group_spans, parse_recent_listing, parse_recent_log_response, pit_fanout_rows,
     span_data_name, span_tree_rows,
+};
+pub use service::{
+    DiscoveryStatus, ServiceReadError, ServiceRecord, ServiceState, parse_discovery_status,
+    parse_service_browse,
 };
 pub use source::{DatasetSource, DatasetState, dataset_state_from_result};
