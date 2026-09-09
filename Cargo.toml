@@ -6,6 +6,7 @@ exclude = [
 members = [
     "crates/surface/ndn-surface",
     "crates/dashboard/ndn-dashboard-core",
+    "crates/dashboard/ndn-viz",
     "crates/ratelimit/ndn-ratelimit",
     "crates/compute/ndn-sealed-box",
     "crates/service/ndn-service-core",

@@ -1,0 +1,22 @@
+[package]
+name = "ndn-viz"
+description = "UI-agnostic data-visualization layer for NDN operator tooling: OTLP span decode, observability fetch contract, trace/span view-model algebra, and the per-dataset freshness model. Shared by ndn-dashboard and ndn-sim; wasm-clean by construction (no std::time/fs/env/net/process — see tests/wasm_clean.rs)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+# UI-agnostic model/wire layer under the dashboard tier, deliberately Dioxus-free
+# and I/O-free so both the dashboard (wasm + desktop) and ndn-sim can depend on it.
+classification = "tooling"
+
+[lib]
+crate-type = ["rlib"]
+
+# Deliberately zero runtime dependencies: everything here is pure decode + model
+# over &[u8]/String, so the crate compiles identically on wasm32 and native and
+# drags nothing into either consumer.
+
+[lints]
+workspace = true
