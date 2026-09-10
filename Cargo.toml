@@ -124,7 +124,7 @@ ndn-storage   = { path = "../ndn-rs/crates/core/ndn-storage" }
 ndn-fwd-core  = { path = "../ndn-rs/crates/forwarding/ndn-fwd-core", default-features = false }
 ndn-crypto-core = { path = "../ndn-rs/crates/core/ndn-crypto-core" }
 ndn-sealed-box  = { path = "crates/compute/ndn-sealed-box" }
-ndn-coding    = { path = "../ndn-radio/crates/coding/ndn-coding" }
+ndn-coding    = { path = "../ndn-radio/crates/coding/ndn-coding", features = ["endpoint", "mgmt"] }
 ndn-signals-core = { path = "../ndn-rs/crates/core/ndn-signals-core", default-features = false }
 ndn-time      = { path = "../ndn-rs/crates/core/ndn-time", default-features = false }
 ndn-time-sources = { path = "crates/time/ndn-time-sources" }
