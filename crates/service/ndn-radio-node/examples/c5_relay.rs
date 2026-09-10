@@ -17,11 +17,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use ndn_engine::{EngineBuilder, EngineConfig};
 use ndn_face_local::InProcFace;
-use ndn_phy_wifi::{
-    Bandwidth, Esp32SerialBackend, FaceId, RadioKnobs, RadioProfile, WifiPhy,
-};
 use ndn_packet::encode::InterestBuilder;
 use ndn_packet::{Data, Name, NameComponent};
+use ndn_phy_wifi::{Bandwidth, Esp32SerialBackend, FaceId, RadioKnobs, RadioProfile, WifiPhy};
 use ndn_transport::FaceId as TransportFaceId;
 
 const APP_FACE_ID: TransportFaceId = TransportFaceId(10_000);

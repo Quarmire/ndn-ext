@@ -22,8 +22,8 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use ndn_app::{EngineAppExt, EngineBuilder};
 use ndn_engine::SignalView; // read radio RSSI/rate from the engine's signal store
-use ndn_phy_wifi::{FaceId, FrameIo, McsDescriptor, WifiPhy};
 use ndn_packet::Name;
+use ndn_phy_wifi::{FaceId, FrameIo, McsDescriptor, WifiPhy};
 use ndn_security::SecurityProfile;
 use tokio_util::sync::CancellationToken;
 
@@ -194,10 +194,8 @@ fn build_backend(args: &[String]) -> Result<Arc<dyn FrameIo>> {
                 .get(_iface_idx)
                 .cloned()
                 .unwrap_or_else(|| "wlu1u1".into());
-            let be = ndn_phy_wifi::AfPacketBackend::new(
-                &iface,
-                ndn_phy_wifi::FrameFormat::default(),
-            )?;
+            let be =
+                ndn_phy_wifi::AfPacketBackend::new(&iface, ndn_phy_wifi::FrameFormat::default())?;
             println!("RTL8812EU (kernel/af_packet) on {iface}");
             return Ok(Arc::new(be));
         }

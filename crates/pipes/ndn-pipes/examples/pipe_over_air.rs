@@ -27,10 +27,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use ndn_coding::FecPolicy;
     use ndn_engine::EngineConfig;
     use ndn_face::local::InProcFace;
-    use ndn_phy_wifi::{
-        AfPacketBackend, FrameFormat, McsDescriptor, OPEN_GROUP_KEY, WifiPhy,
-    };
     use ndn_packet::Name;
+    use ndn_phy_wifi::{AfPacketBackend, FrameFormat, McsDescriptor, OPEN_GROUP_KEY, WifiPhy};
     use ndn_pipes::{Confidentiality, PipeConsumer, PipeParams, PipeProducer};
     use ndn_transport::FaceId;
 

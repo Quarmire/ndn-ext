@@ -21,7 +21,6 @@ use std::time::Duration;
 use bytes::Bytes;
 use ndn_engine::{EngineBuilder, EngineConfig};
 use ndn_face_local::InProcFace;
-use ndn_phy_wifi::{FaceId, RadioControl};
 use ndn_observability::{
     NdnObservabilityLayer, SpanPublisher, SpanRetention, mount_observability, ratio_sampler,
 };
@@ -29,6 +28,7 @@ use ndn_packet::encode::InterestBuilder;
 use ndn_packet::{Data, Name, NameComponent};
 #[cfg(feature = "libusb-backend")]
 use ndn_packet::{Interest, encode::DataBuilder, encode::encode_data_unsigned};
+use ndn_phy_wifi::{FaceId, RadioControl};
 use ndn_radio_cognition::{NameContext, RadioCapability, RadioId, RadioPolicy, prefix_hash};
 #[cfg(feature = "libusb-backend")]
 use ndn_radio_cognition::{PolicyConfig, TxParams};
@@ -580,8 +580,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     // A refusal (e.g. the calibrated scale with no calibration
                                     // resolved) is now visible instead of being swallowed.
                                     match be.set_tx_power(ndn_phy_wifi::PowerRequest::index(pwr)) {
-                                        Ok(applied) if applied.reference
-                                            != ndn_phy_wifi::PowerReference::ChipRaw => {
+                                        Ok(applied)
+                                            if applied.reference
+                                                != ndn_phy_wifi::PowerReference::ChipRaw =>
+                                        {
                                             tracing::debug!(
                                                 requested = pwr, applied = %applied.render(),
                                                 "cognition tx power applied"
@@ -660,7 +662,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let pid = env_u64("NODE_PID", 0xa81a) as u16;
         // ★ **M8: ONE door**, and the same behaviour change as the arm above — this path bypassed
         // `open_named_radio`, so it ran with no RX pump and none of the three overrides.
-        let open = ndn_phy_wifi::open_radio(pid, &DeviceSelect::from_env(), &BringUpRequest::from_env(ch))?;
+        let open = ndn_phy_wifi::open_radio(
+            pid,
+            &DeviceSelect::from_env(),
+            &BringUpRequest::from_env(ch),
+        )?;
         println!("{}", open.report().render());
         let b = open
             .knobs
