@@ -1,5 +1,5 @@
 //! Live driver for named-time — the I/O layer that stands the sans-IO
-//! [`Timekeeper`](ndn_timekeeper::Timekeeper) up on a real transport.
+//! [`ndn_timekeeper::Timekeeper`] up on a real transport.
 //!
 //! The `ndn-time` core and [`ndn_timekeeper`] are pure state machines: they combine samples,
 //! discipline a clock, and *say* what to publish, but touch no hardware. This crate is the driver

@@ -157,7 +157,7 @@ async fn main() -> Result<()> {
 /// Build the radio backend from `--libusb <chan>` (userspace driver, needs the
 /// `libusb` feature) or `--afpacket <iface>` (Linux kernel monitor driver).
 ///
-/// Returns a [`WifiRadio`] (not a bare `FrameIo`): `WifiPhy` injects at
+/// Returns a `WifiRadio` (not a bare `FrameIo`): `WifiPhy` injects at
 /// an exact resolved 802.11 rate, which rides the `WifiRadio` trait — the
 /// generic `FrameIo` seam no longer names an MCS.
 fn build_backend(args: &[String]) -> Result<Arc<dyn FrameIo>> {

@@ -373,8 +373,8 @@ pub trait HintedCarrier: Carrier {
 /// breaking change. (A tag-per-field TLV upgrade — full unordered skippability —
 /// is a later codec revision; it does not change the generated API.)
 ///
-/// The [`encode_envelope`]/[`decode_envelope`] pair layers the carrier-uniform
-/// [`Metadata`](super::Metadata) slot on top of the same length-prefixing.
+/// The [`framing::encode_envelope`]/[`framing::decode_envelope`] pair layers the
+/// carrier-uniform [`Metadata`] slot on top of the same length-prefixing.
 pub mod framing {
     #[cfg(not(feature = "std"))]
     use alloc::string::{String, ToString};
@@ -382,7 +382,7 @@ pub mod framing {
     use super::{Metadata, ServiceError};
     use bytes::{BufMut, Bytes, BytesMut};
 
-    /// Wrap an opaque [`Metadata`](super::Metadata) slot and a `payload` into one
+    /// Wrap an opaque [`Metadata`] slot and a `payload` into one
     /// self-delimiting envelope: the entry count, then each `(key, value)`
     /// length-delimited (keys emitted in `BTreeMap` order, so the encoding is
     /// canonical), then the raw `payload` as the remainder. This is the
@@ -402,7 +402,7 @@ pub mod framing {
         buf.freeze()
     }
 
-    /// Recover the [`Metadata`](super::Metadata) slot and the trailing payload
+    /// Recover the [`Metadata`] slot and the trailing payload
     /// from an [`encode_envelope`] frame. Fails only on a truncated slot header
     /// (the signature of a carrier that mangles the slot); any payload is accepted.
     pub fn decode_envelope(bytes: &[u8]) -> Result<(Metadata, Bytes), ServiceError> {

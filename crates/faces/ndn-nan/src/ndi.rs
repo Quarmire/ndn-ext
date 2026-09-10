@@ -23,7 +23,8 @@
 
 /// What the bridge needs from a data interface.
 ///
-/// A trait rather than the concrete [`NdiInterface`] so the driver's seam stays
+/// A trait rather than the concrete `NdiInterface` (the Linux TAP backing, which
+/// is `cfg`-gated to that target) so the driver's seam stays
 /// platform-neutral (the TAP is Linux-only) and so a test can stand a fake in its
 /// place — the bridge is worth testing without root and a kernel netdev.
 pub trait DataInterface: Send + Sync + 'static {
