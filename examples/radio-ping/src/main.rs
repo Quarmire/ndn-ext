@@ -169,9 +169,19 @@ fn build_backend(args: &[String]) -> Result<Arc<dyn FrameIo>> {
                 .get(_chan_idx)
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(149);
-            let be = ndn_phy_wifi::LibUsbRtl88xxBackend::open_monitor(chan)?;
+            // ★ **M8: ONE door.** `open_monitor(chan)` claimed the FIRST Realtek on the bus —
+            // an 8812AU shares `RTL88XX_PIDS` and would be claimed by mistake — discarded the
+            // bring-up report, and, because it bypassed `open_named_radio`, ran with no RX pump
+            // and none of `NDN_RADIO_BW` / `NDN_TX_PWR` / `NDN_CCA_OFF`. It now names the part,
+            // honours `NDN_USB_ADDR`/`NDN_USB_INDEX`, and prints how it came up.
+            let open = ndn_phy_wifi::open_radio(
+                0xa81a,
+                &ndn_phy_wifi::DeviceSelect::from_env(),
+                &ndn_phy_wifi::BringUpRequest::from_env(chan),
+            )?;
             println!("RTL8812EU (userspace/libusb) up on ch{chan}");
-            return Ok(Arc::new(be));
+            println!("{}", open.report().render());
+            return Ok(open.io.clone());
         }
         #[cfg(not(feature = "libusb"))]
         bail!("--libusb requires building with `--features libusb`");

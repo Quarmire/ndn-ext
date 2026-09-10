@@ -8,6 +8,7 @@
 //!   chip = `8733` (RTL8731BU/8733BU, the *radiating* transmitter) or `8812` (RTL8812EU/8822E).
 //!   pid_hex pins a specific 8812-class dongle when several are attached (e.g. `a81a`).
 use ndn_frame_io::{FrameFormat, FrameIo};
+use ndn_radio_drivers::bringup::{PowerRequest, ProofRequirement, Role};
 use ndn_radio_drivers::{
     FreqAction, FreqDiscipline, LibUsbRtl88xxBackend, PowerTracker, Rtl8733buBackend,
     Rtl8812auBackend,
@@ -76,7 +77,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut steerer: Option<Arc<dyn ClockSteer>> = None;
         let radio: Arc<dyn FrameIo> = if chip == "8733" {
             let r = Arc::new(Rtl8733buBackend::open()?);
-            _tracker = Some(r.bring_up_tx_tracked(ch)?);
+            // M2: `bring_up_tx_tracked` returns `(BringUpReport, PowerTracker)`. Print the report
+            // rather than dropping it — it names the plan, the power reference and the span
+            // actually written, which is what a common-view run needs recorded beside its numbers.
+            // ★ M8: `bring_up_tx_tracked` is deleted. `PLAN_8733B_TX` is `Role::TransmitAndReceive`,
+            // and the thermal `PowerTracker` comes back inside the plan's `Guards` — which this
+            // node must keep alive for the run, exactly as it kept the tracker.
+            let (report, mut guards) = r.bring_up_planned(
+                ch,
+                Role::TransmitAndReceive,
+                ndn_radio_drivers::rtl8733b_env_deviation(),
+                ProofRequirement::BestAvailable,
+                None,
+            )?;
+            println!("{}", report.render());
+            _tracker = guards.take::<PowerTracker>().map(|t| *t);
             r.spawn_rx_pump(4);
             // FREQUENCY discipline, not just offset: this part has a crystal trim, so the loop's
             // skew estimate can be spent on the hardware and the correction HOLDS instead of
@@ -100,15 +115,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let r = Arc::new(
                 Rtl8812auBackend::open()?.with_format(FrameFormat::RawNdn { ethertype: 0x8624 }),
             );
-            r.bring_up_monitor(ch)?;
+            // ★ M8: `bring_up_monitor` is deleted. The role and the power regime are named at
+            // the call site; `PowerRequest::ceiling()` is byte-identical to what the wrapper passed.
+            r.bring_up_planned(
+                ch,
+                Role::TransmitAndReceive,
+                PowerRequest::ceiling(),
+                None,
+                ProofRequirement::BestAvailable,
+            )?;
             r.spawn_rx_pump(4);
             println!("named-time node {id} up: 8812AU ch{ch} (RawNdn, legacy 6M), RX pump depth 4");
             r
         } else {
+            // ★ M8: `open_monitor*` are deleted. Claim, then run the ONE plan (`PLAN_A81A`);
+            // `open_pid_select` honours `NDN_USB_ADDR`/`NDN_USB_INDEX`, which `open_monitor` did
+            // not, and the report is kept rather than discarded.
             let r = Arc::new(match pid {
-                Some(p) => LibUsbRtl88xxBackend::open_monitor_pid(p, ch)?,
-                None => LibUsbRtl88xxBackend::open_monitor(ch)?,
+                Some(p) => LibUsbRtl88xxBackend::open_pid(p)?,
+                None => LibUsbRtl88xxBackend::open()?,
             });
+            let (report, _guards) = r.bring_up_planned(
+                ch,
+                Role::TransmitAndReceive,
+                ndn_radio_drivers::a81a_env_deviation(),
+                ProofRequirement::BestAvailable,
+            )?;
+            println!("{}", report.render());
             // Beacon at robust legacy 6 Mbps (0x04), like real 802.11 beacons — so a legacy-only
             // receiver (the 8733b, no HT/VHT demod) can decode us. Default HT/VHT would be deaf to it.
             r.set_fixed_desc_rate(Some(0x04));

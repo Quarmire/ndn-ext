@@ -272,17 +272,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let signal_store: Arc<RssiStore> = Arc::new(RssiStore::default());
     #[cfg(feature = "libusb-backend")]
     let radio_backend = if role == "consumer" || role == "producer" {
-        use ndn_phy_wifi::{FaceId, LibUsbRtl88xxBackend, WifiPhy};
+        use ndn_phy_wifi::{BringUpRequest, DeviceSelect, FaceId, PowerRequest, WifiPhy};
         let pid = env_u64("NODE_PID", 0xa81a) as u16;
-        let backend = Arc::new(LibUsbRtl88xxBackend::open_monitor_pid(pid, ch)?);
-        // NODE_TXPWR: lower the TXAGC to make the bench link marginal (induce real
-        // loss) so the FEC A/B has something to recover. Unset = bring-up default.
-        if let Ok(p) = std::env::var("NODE_TXPWR") {
-            if let Ok(idx) = p.parse::<u32>() {
-                backend.set_tx_power(idx)?;
-                println!("tx power set to {idx:#04x}");
-            }
+        // ★ **M8: ONE door.** This was `open_monitor_pid(pid, ch)` — a path that bypassed
+        // `open_named_radio` and therefore silently ran with **no RX pump, no `NDN_RADIO_BW`, no
+        // `NDN_TX_PWR` and no `NDN_CCA_OFF`**. It now gets all four, plus a bring-up report that
+        // says which plan ran and into which power regime. A real behaviour change on this node.
+        let mut req = BringUpRequest::from_env(ch);
+        // NODE_TXPWR: lower the TXAGC to make the bench link marginal (induce real loss) so the
+        // FEC A/B has something to recover. Unset = whatever the plan established.
+        //
+        // ★ It now rides ON THE REQUEST rather than being a separate `set_tx_power` after the
+        // bring-up, so the applied value — and its reference, and any clamp — land in the report
+        // instead of in one `println!`. That pair is what the 2026-09-03 bisection was missing.
+        if let Some(idx) = std::env::var("NODE_TXPWR")
+            .ok()
+            .and_then(|p| p.parse::<u8>().ok())
+        {
+            req.power = PowerRequest::index(idx);
         }
+        let open = ndn_phy_wifi::open_radio(pid, &DeviceSelect::from_env(), &req)?;
+        println!("{}", open.report().render());
+        let backend = open.io.clone();
         // Broadcast/open by default — the paired LpLinkService fragments NDN packets
         // across injected frames and runs the per-frame feature pipeline (incl. the
         // TraceContextFeature that carries our stitch TLV).
@@ -317,7 +328,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "radio: RTL8822E 0bda:{pid:04x} as NDN face {} on ch{ch}; link-FEC R={fec_r}",
             RADIO_FACE_ID.0
         );
-        Some(backend)
+        // ★ The cognition ACT edge below needs the CONTROL plane, not the data plane. Before M8
+        // this variable was the concrete backend and served both; `open_radio` hands the two out
+        // separately, which is the point of `OpenRadio`'s four `Option`s — a radio that cannot
+        // actuate says so instead of exposing a knob that lies.
+        Some(
+            open.knobs
+                .clone()
+                .ok_or("the radio opened without RadioKnobs — cognition has no actuator")?,
+        )
     } else {
         None
     };
@@ -554,7 +573,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     .and_then(|v| v.parse::<u8>().ok())
                                     .unwrap_or_else(|| a.params.tx_power.unwrap_or(FULL_PWR));
                                 if let Some(be) = &radio_backend {
-                                    let _ = be.set_tx_power(pwr as u32);
+                                    // ⚠⚠ **RE-BASELINE.** This is the cognition ACT edge, and it
+                                    // now records what the radio APPLIED rather than what the
+                                    // policy REQUESTED. Any on-air A/B spanning this change is
+                                    // invalid — the two runs are not measuring the same quantity.
+                                    // A refusal (e.g. the calibrated scale with no calibration
+                                    // resolved) is now visible instead of being swallowed.
+                                    match be.set_tx_power(ndn_phy_wifi::PowerRequest::index(pwr)) {
+                                        Ok(applied) if applied.reference
+                                            != ndn_phy_wifi::PowerReference::ChipRaw => {
+                                            tracing::debug!(
+                                                requested = pwr, applied = %applied.render(),
+                                                "cognition tx power applied"
+                                            );
+                                        }
+                                        Ok(applied) => tracing::warn!(
+                                            requested = pwr, applied = %applied.render(),
+                                            "cognition tx power landed on the RAW chip axis — off \
+                                             the regulatory scale"
+                                        ),
+                                        Err(e) => tracing::warn!(
+                                            requested = pwr, error = %e,
+                                            "cognition tx power refused; the radio is unchanged"
+                                        ),
+                                    }
                                 }
                                 let now_pair = (a.params.mcs(), pwr);
                                 if now_pair != last {
@@ -614,9 +656,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(feature = "libusb-backend")]
     let backend = {
-        use ndn_phy_wifi::LibUsbRtl88xxBackend;
+        use ndn_phy_wifi::{BringUpRequest, DeviceSelect};
         let pid = env_u64("NODE_PID", 0xa81a) as u16;
-        let b = Arc::new(LibUsbRtl88xxBackend::open_monitor_pid(pid, ch)?);
+        // ★ **M8: ONE door**, and the same behaviour change as the arm above — this path bypassed
+        // `open_named_radio`, so it ran with no RX pump and none of the three overrides.
+        let open = ndn_phy_wifi::open_radio(pid, &DeviceSelect::from_env(), &BringUpRequest::from_env(ch))?;
+        println!("{}", open.report().render());
+        let b = open
+            .knobs
+            .clone()
+            .ok_or("the radio opened without RadioKnobs — cognition has no actuator")?;
         control.libusb_actuator(radio, b.clone()); // ACT: real radio applies the plan
         println!("radio: RTL8822E 0bda:{pid:04x} bound as actuator + sensor on ch{ch}");
         b

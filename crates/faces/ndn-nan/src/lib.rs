@@ -406,7 +406,7 @@ impl EngineTask {
             dst: BROADCAST,
             src,
             addr3: None,
-            addr4: None,
+            extra: None,
             htc: None,
         };
         if let Err(e) = self.frame_io.inject(frame).await {
@@ -481,7 +481,7 @@ impl EngineTask {
                 dst: BROADCAST,
                 src: self.nmi,
                 addr3: None,
-                addr4: None,
+                extra: None,
                 htc: None,
             };
             if let Err(e) = self.frame_io.inject(frame).await {
