@@ -9,6 +9,8 @@ use ndn_packet::Name;
 
 const RING_SIZE: usize = 32;
 
+/// Rolling RTT/liveness measurements kept for one service provider, used to
+/// rank providers when several answer the same discovery query.
 pub struct ProviderMeasurement {
     pub node_name: Name,
     pub last_rtt: Option<Duration>,

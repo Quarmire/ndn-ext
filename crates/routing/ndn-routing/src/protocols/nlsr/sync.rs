@@ -28,6 +28,8 @@ use tracing::warn;
 use crate::protocols::nlsr::lsa::LsaType;
 use crate::protocols::nlsr::lsdb::{InstallResult, Lsdb, LsdbUpdate};
 
+/// A single LSA sequence-number update learned from a sync peer: which router
+/// and LSA type advanced, and to what sequence number.
 pub struct SeqUpdate {
     pub origin_router: Name,
     pub lsa_type: LsaType,
@@ -36,6 +38,8 @@ pub struct SeqUpdate {
     pub incoming_face_id: Option<u64>,
 }
 
+/// Drives LSDB synchronization: reconciles LSA sequence numbers with peers and
+/// requests the LSAs this router is missing.
 pub struct NlsrSync {
     own_router: Name,
     /// C++ NLSR excludes the network component from the IBLT user

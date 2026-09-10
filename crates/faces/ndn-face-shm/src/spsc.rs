@@ -1610,6 +1610,8 @@ impl Transport for SpscFace {
     }
 }
 
+/// A handle to one end of the single-producer/single-consumer shared-memory
+/// ring, tied to the mapped shared-memory region and its ring capacity.
 pub struct SpscHandle {
     shm: ShmRegion,
     capacity: u32,

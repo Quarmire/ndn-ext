@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 use crate::config::DiscoveryConfig;
 use crate::strategy::{NeighborProbeStrategy, ProbeRequest, TriggerEvent};
 
+/// A [`NeighborProbeStrategy`] that probes in response to trigger events,
+/// rate-limited to at most one probe per `min_interval`.
 pub struct ReactiveScheduler {
     min_interval: Duration,
     last_sent: Option<Instant>,

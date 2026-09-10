@@ -16,6 +16,8 @@ use crate::context::DiscoveryContext;
 use crate::probe::NeighborProbeProtocol;
 use crate::protocol::{DiscoveryProtocol, InboundMeta, ProtocolId};
 
+/// Link-local neighbor discovery over raw Ethernet: a thin [`DiscoveryProtocol`]
+/// wrapper around the shared [`NeighborProbeProtocol`] probe/reply engine.
 pub struct EtherNeighborDiscovery(NeighborProbeProtocol);
 
 impl EtherNeighborDiscovery {

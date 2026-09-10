@@ -11,6 +11,8 @@ use ndn_transport::FaceId;
 
 use crate::{DiscoveryContext, DiscoveryProtocol, InboundMeta, ProtocolId};
 
+/// Fans one discovery event out to several [`DiscoveryProtocol`]s at once,
+/// so a node can run more than one discovery mechanism behind a single seam.
 pub struct CompositeDiscovery {
     protocols: Vec<Arc<dyn DiscoveryProtocol>>,
 }

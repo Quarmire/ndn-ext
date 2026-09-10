@@ -40,6 +40,8 @@ pub trait EncryptionHook: Send + Sync {
     fn unwrap(&self, ciphertext: &[u8], rendezvous: &ServiceRecord) -> Result<Bytes, DecryptError>;
 }
 
+/// The identity [`EncryptionHook`]: passes payloads through unchanged, for
+/// deployments that do not encrypt service-discovery traffic.
 pub struct NoEncryption;
 
 impl EncryptionHook for NoEncryption {

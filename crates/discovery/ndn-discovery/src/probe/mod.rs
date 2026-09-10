@@ -47,6 +47,8 @@ impl State {
     }
 }
 
+/// The shared probe/reply engine behind neighbor discovery: it announces the
+/// local name and prefixes and records the neighbors that answer.
 pub struct NeighborProbeProtocol {
     local_name: Name,
     claimed: Vec<Name>,

@@ -47,6 +47,8 @@ impl RoutingSnapshot {
     }
 }
 
+/// Publishes the computed [`RoutingSnapshot`] over a `watch` channel so
+/// consumers always observe the latest converged routing state.
 pub struct RoutingTable {
     snapshot_tx: watch::Sender<Arc<RoutingSnapshot>>,
 }

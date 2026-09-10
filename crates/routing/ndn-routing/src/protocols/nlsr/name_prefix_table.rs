@@ -23,6 +23,8 @@ struct NptEntry {
     dest_routers: HashSet<Name>,
 }
 
+/// NLSR Name Prefix Table: maps advertised name prefixes to the routers that
+/// originate them and the resolved next hops toward each.
 pub struct NamePrefixTable {
     entries: HashMap<Name, NptEntry>,
     router_pool: HashMap<Name, RoutingTableEntry>,

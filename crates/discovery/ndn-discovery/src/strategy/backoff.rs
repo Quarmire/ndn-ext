@@ -6,6 +6,8 @@ use crate::backoff::{BackoffConfig, BackoffState};
 use crate::config::DiscoveryConfig;
 use crate::strategy::{NeighborProbeStrategy, ProbeRequest, TriggerEvent};
 
+/// A [`NeighborProbeStrategy`] that spaces probes out with exponential backoff,
+/// widening the interval while the neighbor set is stable.
 pub struct BackoffScheduler {
     cfg: BackoffConfig,
     state: BackoffState,

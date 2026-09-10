@@ -9,6 +9,8 @@ use crate::backoff::{BackoffConfig, BackoffState};
 use crate::config::DiscoveryConfig;
 use crate::strategy::{NeighborProbeStrategy, ProbeRequest, TriggerEvent};
 
+/// A [`NeighborProbeStrategy`] that never probes on its own; it only reacts to
+/// events, applying backoff so passive nodes stay quiet when idle.
 pub struct PassiveScheduler {
     backoff_cfg: BackoffConfig,
     backoff_state: BackoffState,

@@ -73,6 +73,8 @@ pub fn parse_raw_interest(raw: &Bytes) -> Option<RawInterest> {
     })
 }
 
+/// A decoded Data packet reduced to the fields discovery cares about
+/// (name and optional content), decoupled from the full packet type.
 pub struct RawData {
     pub name: Name,
     pub content: Option<Bytes>,

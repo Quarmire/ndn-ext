@@ -69,6 +69,8 @@ pub struct ExpiredLsa {
     pub lsa: Lsa,
 }
 
+/// An immutable point-in-time view of the LSDB, split into the adjacency and
+/// name LSA sets, for computation and publishing.
 pub struct LsdbSnapshot {
     pub adjacency: Vec<Lsa>,
     pub name: Vec<Lsa>,
@@ -114,6 +116,8 @@ struct LsaEntry {
 /// Refresh when 20% of lifetime remains (= 80% elapsed).
 const REFRESH_THRESHOLD_REMAINING: f64 = 0.20;
 
+/// The Link State Database: every known LSA keyed by origin router and type,
+/// with refresh/expiry tracking for the router's own LSAs.
 pub struct Lsdb {
     store: DashMap<LsaKey, LsaEntry>,
     pub own_router: Name,

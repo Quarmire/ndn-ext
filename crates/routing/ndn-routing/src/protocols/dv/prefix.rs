@@ -27,6 +27,8 @@ pub struct PrefixChange {
     pub new_cost: Option<u32>,
 }
 
+/// Tracks the prefixes this router originates, so local announce/withdraw can
+/// be folded into the outgoing distance-vector advertisement.
 pub struct PrefixTable {
     self_router: Name,
     /// Kept separately so local announce/withdraw can produce outgoing

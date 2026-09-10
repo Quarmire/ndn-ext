@@ -102,6 +102,8 @@ impl RateLimitPolicy {
     }
 }
 
+/// One resolved rate-limit cell: the [`RateLimitPolicy`] in force paired with
+/// the [`TokenBucket`] that enforces it.
 pub struct CellEntry {
     pub policy: RateLimitPolicy,
     pub bucket: Arc<TokenBucket>,

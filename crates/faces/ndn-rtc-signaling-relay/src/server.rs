@@ -59,6 +59,8 @@ impl AppState {
     }
 }
 
+/// The WebRTC signaling relay server: brokers SDP offer/answer and ICE
+/// candidate exchange between peers so they can establish a direct connection.
 pub struct RelayServer;
 
 impl RelayServer {

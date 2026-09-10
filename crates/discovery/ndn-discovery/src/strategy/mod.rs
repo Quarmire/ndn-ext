@@ -32,6 +32,8 @@ pub enum TriggerEvent {
     PassiveDetection,
 }
 
+/// Decides *when* neighbor probes go out. Implementors turn ticks and probe
+/// outcomes into a schedule of [`ProbeRequest`]s; the transport is elsewhere.
 pub trait NeighborProbeStrategy: Send + 'static {
     fn on_tick(&mut self, now: Instant) -> Vec<ProbeRequest>;
     fn on_probe_success(&mut self, rtt: Duration);

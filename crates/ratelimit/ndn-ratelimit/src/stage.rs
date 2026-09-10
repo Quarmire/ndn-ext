@@ -11,6 +11,8 @@ use ndn_transport::FaceId;
 use crate::bucket::BucketOutcome;
 use crate::policy::{Direction, FaceRef, Overflow, SharedPolicyTable};
 
+/// Engine pipeline hook that consults the [`SharedPolicyTable`] and drops or
+/// admits packets according to the matching rate-limit policy.
 pub struct EngineRateLimitHook {
     table: SharedPolicyTable,
 }

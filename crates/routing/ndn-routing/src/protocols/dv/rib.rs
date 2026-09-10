@@ -58,6 +58,8 @@ pub struct RibEntry {
     pub next_hop2: Option<Name>,
 }
 
+/// The distance-vector RIB: best next-hop and cost per prefix, and the source
+/// of the advertisements this router hands its neighbors.
 pub struct DvRib {
     self_name: Name,
     /// Self is pre-installed at `cost=0` so [`produce_advertisement`]

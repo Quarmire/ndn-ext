@@ -69,6 +69,8 @@ pub trait ChainEntry: Sized {
     fn decode_payload_fields(reader: &mut TlvReader) -> Result<Self, ChainError>;
 }
 
+/// Supplies the signature type and key locator used when a chain entry is
+/// signed, so the store stays agnostic to the concrete signing backend.
 pub trait DataSigner {
     fn sig_type(&self) -> SignatureType;
     fn key_locator(&self) -> Option<&Name>;
@@ -90,6 +92,8 @@ pub trait ChainBackend {
     fn append(&mut self, seq: u64, wire: Bytes) -> Result<(), ChainError>;
 }
 
+/// Append-only store of signed Data forming a hash-linked chain, generic over
+/// the entry type `T` and the persistence [`ChainBackend`] `B`.
 pub struct SignedDataChainStore<T: ChainEntry, B: ChainBackend> {
     chain_root: Name,
     backend: B,

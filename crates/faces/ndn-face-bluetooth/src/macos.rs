@@ -111,6 +111,8 @@ const CB_PROP_WRITE_NO_RESP: usize = 0x04;
 const CB_PERM_READABLE: usize = 0x01;
 const CB_PERM_WRITABLE: usize = 0x02;
 
+/// A CoreBluetooth GATT peripheral (macOS/iOS) exposing the NDN service so a
+/// central can connect and exchange packets over BLE.
 pub struct BleServer {
     manager: *mut AnyObject,
     delegate: *mut AnyObject,

@@ -57,6 +57,8 @@ pub struct AdjacencySnapshot {
     pub neighbors: Vec<(Name, NeighborState)>,
 }
 
+/// Static configuration for one NLSR Hello neighbor: its router name and the
+/// face URI Hello probes are sent over.
 pub struct HelloNeighborConfig {
     pub name: Name,
     pub face_uri: String,

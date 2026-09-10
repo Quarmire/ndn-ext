@@ -45,6 +45,8 @@ const ATT_OVERHEAD: usize = 3;
 
 // SC = server→client (notify): forwarder TX. CS = client→server (write): forwarder RX.
 
+/// A BlueZ GATT peripheral (Linux) exposing the NDN service so a central can
+/// connect and exchange packets over BLE.
 pub struct BleServer {
     _app: bluer::gatt::local::ApplicationHandle,
     _adv: bluer::adv::AdvertisementHandle,

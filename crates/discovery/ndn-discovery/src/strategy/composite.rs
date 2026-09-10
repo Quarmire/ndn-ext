@@ -7,6 +7,8 @@ use ndn_transport::FaceId;
 
 use crate::strategy::{NeighborProbeStrategy, ProbeRequest, TriggerEvent};
 
+/// Merges several [`NeighborProbeStrategy`]s, emitting the union of the probes
+/// its members request on each tick.
 pub struct CompositeStrategy {
     members: Vec<Box<dyn NeighborProbeStrategy>>,
 }

@@ -42,6 +42,8 @@ impl WsDirection {
     }
 }
 
+/// An NDN face carried over a WebSocket connection, identified by its
+/// [`FaceId`] and remote address.
 pub struct WebSocketFace {
     id: FaceId,
     remote_addr: String,
