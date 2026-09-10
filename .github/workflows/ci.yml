@@ -42,7 +42,7 @@ jobs:
         with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: 74beb638d3ba7c5654140f827010c6c22b57227f, path: ndn-rs }
       # pinned sibling; bump deliberately when adopting newer ndn-radio-drivers (see workspace STATE.md)
       - uses: actions/checkout@v4
-        with: { repository: "${{ github.repository_owner }}/ndn-radio-drivers", ref: 0315a7ed2f9d11363715cd9edf2e1da4f7d25896, path: ndn-radio-drivers }
+        with: { repository: "${{ github.repository_owner }}/ndn-radio-drivers", ref: 59375bb27c235f98a9de86d175a4e774cf3c03a9, path: ndn-radio-drivers }
       # pinned sibling; bump deliberately when adopting newer ndn-radio (see workspace STATE.md)
       - uses: actions/checkout@v4
         with: { repository: "${{ github.repository_owner }}/ndn-radio", ref: defe18acfabfe757b2f20b39e9fb652a1340722b, path: ndn-radio }
@@ -74,7 +74,7 @@ jobs:
         with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: 74beb638d3ba7c5654140f827010c6c22b57227f, path: ndn-rs }
       # pinned sibling; bump deliberately when adopting newer ndn-radio-drivers (see workspace STATE.md)
       - uses: actions/checkout@v4
-        with: { repository: "${{ github.repository_owner }}/ndn-radio-drivers", ref: 0315a7ed2f9d11363715cd9edf2e1da4f7d25896, path: ndn-radio-drivers }
+        with: { repository: "${{ github.repository_owner }}/ndn-radio-drivers", ref: 59375bb27c235f98a9de86d175a4e774cf3c03a9, path: ndn-radio-drivers }
       # pinned sibling; bump deliberately when adopting newer ndn-radio (see workspace STATE.md)
       - uses: actions/checkout@v4
         with: { repository: "${{ github.repository_owner }}/ndn-radio", ref: defe18acfabfe757b2f20b39e9fb652a1340722b, path: ndn-radio }
@@ -110,7 +110,7 @@ jobs:
         with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: 74beb638d3ba7c5654140f827010c6c22b57227f, path: ndn-rs }
       # pinned sibling; bump deliberately when adopting newer ndn-radio-drivers (see workspace STATE.md)
       - uses: actions/checkout@v4
-        with: { repository: "${{ github.repository_owner }}/ndn-radio-drivers", ref: 0315a7ed2f9d11363715cd9edf2e1da4f7d25896, path: ndn-radio-drivers }
+        with: { repository: "${{ github.repository_owner }}/ndn-radio-drivers", ref: 59375bb27c235f98a9de86d175a4e774cf3c03a9, path: ndn-radio-drivers }
       # pinned sibling; bump deliberately when adopting newer ndn-radio (see workspace STATE.md)
       - uses: actions/checkout@v4
         with: { repository: "${{ github.repository_owner }}/ndn-radio", ref: defe18acfabfe757b2f20b39e9fb652a1340722b, path: ndn-radio }
@@ -136,7 +136,7 @@ jobs:
         with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: 74beb638d3ba7c5654140f827010c6c22b57227f, path: ndn-rs }
       # pinned sibling; bump deliberately when adopting newer ndn-radio-drivers (see workspace STATE.md)
       - uses: actions/checkout@v4
-        with: { repository: "${{ github.repository_owner }}/ndn-radio-drivers", ref: 0315a7ed2f9d11363715cd9edf2e1da4f7d25896, path: ndn-radio-drivers }
+        with: { repository: "${{ github.repository_owner }}/ndn-radio-drivers", ref: 59375bb27c235f98a9de86d175a4e774cf3c03a9, path: ndn-radio-drivers }
       # pinned sibling; bump deliberately when adopting newer ndn-radio (see workspace STATE.md)
       - uses: actions/checkout@v4
         with: { repository: "${{ github.repository_owner }}/ndn-radio", ref: defe18acfabfe757b2f20b39e9fb652a1340722b, path: ndn-radio }
@@ -169,7 +169,7 @@ jobs:
         with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: 74beb638d3ba7c5654140f827010c6c22b57227f, path: ndn-rs }
       # pinned sibling; bump deliberately when adopting newer ndn-radio-drivers (see workspace STATE.md)
       - uses: actions/checkout@v4
-        with: { repository: "${{ github.repository_owner }}/ndn-radio-drivers", ref: 0315a7ed2f9d11363715cd9edf2e1da4f7d25896, path: ndn-radio-drivers }
+        with: { repository: "${{ github.repository_owner }}/ndn-radio-drivers", ref: 59375bb27c235f98a9de86d175a4e774cf3c03a9, path: ndn-radio-drivers }
       # pinned sibling; bump deliberately when adopting newer ndn-radio (see workspace STATE.md)
       - uses: actions/checkout@v4
         with: { repository: "${{ github.repository_owner }}/ndn-radio", ref: defe18acfabfe757b2f20b39e9fb652a1340722b, path: ndn-radio }
@@ -198,7 +198,7 @@ jobs:
         with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: 74beb638d3ba7c5654140f827010c6c22b57227f, path: ndn-rs }
       # pinned sibling; bump deliberately when adopting newer ndn-radio-drivers (see workspace STATE.md)
       - uses: actions/checkout@v4
-        with: { repository: "${{ github.repository_owner }}/ndn-radio-drivers", ref: 0315a7ed2f9d11363715cd9edf2e1da4f7d25896, path: ndn-radio-drivers }
+        with: { repository: "${{ github.repository_owner }}/ndn-radio-drivers", ref: 59375bb27c235f98a9de86d175a4e774cf3c03a9, path: ndn-radio-drivers }
       # pinned sibling; bump deliberately when adopting newer ndn-radio (see workspace STATE.md)
       - uses: actions/checkout@v4
         with: { repository: "${{ github.repository_owner }}/ndn-radio", ref: defe18acfabfe757b2f20b39e9fb652a1340722b, path: ndn-radio }

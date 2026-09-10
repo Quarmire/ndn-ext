@@ -2,6 +2,7 @@
 name = "ndn-time-driver"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 description = "Live driver that wires the sans-IO named-time Timekeeper onto a real transport (monitor-wifi face), sources, auth, and a clock sink — the I/O layer the pure ndn-time core lacks."
 
 [dependencies]
