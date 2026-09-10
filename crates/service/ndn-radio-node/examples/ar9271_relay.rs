@@ -19,7 +19,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use ndn_engine::{EngineBuilder, EngineConfig};
 use ndn_face_local::InProcFace;
-use ndn_phy_wifi::{FaceId, WifiPhy, open_ath9k};
+use ndn_phy_wifi::{AR9271_PID, BringUpRequest, DeviceSelect, FaceId, WifiPhy, open_radio};
 use ndn_packet::encode::InterestBuilder;
 use ndn_packet::{Data, Name, NameComponent};
 use ndn_transport::FaceId as TransportFaceId;
@@ -44,9 +44,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ticks = env_u64("TICKS", 40) as u64;
     let tick_ms = env_u64("NODE_TICK_MS", 100);
 
-    // Open the AR9271 through the production path (loads fw, brings up the PHY, starts the RX pump if
-    // NDN_ATH9K_PUMP is set) and take its FrameIo — the exact `Arc<dyn FrameIo>` a face consumes.
-    let radio = open_ath9k(ch)?;
+    // Open the AR9271 through the production path (loads fw, brings up the PHY, starts the RX pump
+    // if NDN_ATH9K_PUMP is set) and take its FrameIo — the exact `Arc<dyn FrameIo>` a face
+    // consumes. ★ M8: `open_ath9k(ch)` is gone; it is an arm of `open_radio`, and the AR9271's
+    // `NDN_ATH9K_*` knobs are now `BringUpRequest::from_env` fields rather than reads scattered
+    // through the opener.
+    let radio = open_radio(
+        AR9271_PID,
+        &DeviceSelect::First,
+        &BringUpRequest::from_env(ch),
+    )?;
+    println!("{}", radio.report().render());
     let io = radio.io.clone();
     println!(
         "AR9271 open on ch{ch}; wrapping its FrameIo in a WifiPhy (engine face {})",

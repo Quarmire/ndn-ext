@@ -16,7 +16,7 @@ use ndn_app::{Consumer, EngineBuilder, Producer};
 use ndn_coding::FecPolicy;
 use ndn_engine::EngineConfig;
 use ndn_face::local::InProcFace;
-use ndn_phy_wifi::{LoopbackMonitorBus, OPEN_GROUP_KEY, WifiPhy};
+use ndn_phy_wifi::{LoopbackMonitorBus, WifiPhy};
 use ndn_packet::Name;
 use ndn_transport::FaceId;
 
@@ -36,15 +36,11 @@ async fn run(name_group: Option<&'static str>, skip: &'static [u16]) -> (Vec<u8>
     // The shared medium and two radios on it (strong RSSI = high MCS).
     let bus = LoopbackMonitorBus::new();
     let mk = |id: u64, fid: FaceId| {
-        let f = WifiPhy::new(fid, Arc::new(bus.endpoint(id, -55)));
-        match name_group {
-            // Tier-0 (#91): the radio registers the namespace prefix; the producer addresses each
-            // object by its name's prefix-set filter, so names under the namespace are heard and
-            // others dropped — the same coupling `with_name_group` gave, now longest-prefix.
-            Some(g) => f.with_bloom_consumer(&OPEN_GROUP_KEY, g),
-            None => f,
-        }
-        .into_face()
+        // Relevance is parse-the-name now (the in-frame Tier-0 bloom filter is retired): the radio
+        // hears every name on the bus, and the name group is carried in the object names, not a
+        // consumer-side filter. `name_group` is kept only to distinguish the two scenarios below.
+        let _ = name_group;
+        WifiPhy::new(fid, Arc::new(bus.endpoint(id, -55))).into_face()
     };
     let radio_a = mk(1, FaceId(10));
     let radio_b = mk(2, FaceId(11));
