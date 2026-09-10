@@ -26,8 +26,9 @@ ndn-packet    = { workspace = true, features = ["std"] }
 ndn-pathcontrol = { workspace = true }
 ndn-engine    = { workspace = true, optional = true }
 ndn-app       = { workspace = true }
-# Default features (endpoint) for the coded bulk transfer (CodedFetcher/Producer).
-ndn-coding    = { path = "../../../../ndn-radio/crates/coding/ndn-coding" }
+# `endpoint` for the coded bulk transfer (CodedFetcher/Producer) — ndn-coding is lean by
+# default now, so name the feature explicitly.
+ndn-coding    = { path = "../../../../ndn-radio/crates/coding/ndn-coding", features = ["endpoint"] }
 # Tier-0 / NAC-baseline AEAD (ChaCha20-Poly1305, no_std) for encrypt-then-code.
 ndn-crypto-core = { workspace = true }
 # Teardown possession-proof MAC (fixed-format SHA-256 over the pipe key + binding):
