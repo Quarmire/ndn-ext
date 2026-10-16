@@ -113,23 +113,23 @@ pub struct DvSync {
     router: Name,
     svs: SvsLocal,
     faces: RwLock<HashMap<Name, FaceBinding>>,
-    /// Defaults to [`crate::protocols::dv::signing::InsecureTrust`]
+    /// Defaults to [`crate::protocols::dv::signing::DvInsecure`]
     /// (`DigestSha256` outgoing, accepts every incoming packet —
     /// matches ndnd's `KeyChainUri = "insecure"`).
     trust: crate::protocols::dv::signing::DvTrustHandle,
 }
 
 impl DvSync {
-    /// Uses [`crate::protocols::dv::signing::InsecureTrust`]; call
+    /// Uses [`crate::protocols::dv::signing::DvInsecure`]; call
     /// [`Self::with_trust`] to install
-    /// [`crate::protocols::dv::signing::StaticTrust`] or
-    /// [`crate::protocols::dv::signing::LvsTrust`].
+    /// [`crate::protocols::dv::signing::DvStaticKeys`] or
+    /// [`crate::protocols::dv::signing::DvLvs`].
     pub fn new(network: Name, router: Name, boot: u64) -> Self {
         Self::with_trust(
             network,
             router,
             boot,
-            crate::protocols::dv::signing::InsecureTrust::handle(),
+            crate::protocols::dv::signing::DvInsecure::handle(),
         )
     }
 

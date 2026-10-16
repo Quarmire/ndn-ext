@@ -71,12 +71,6 @@ pub struct NlsrConfig {
     pub hello_timeout_secs: u32,
     pub sync_interest_lifetime_ms: u64,
 
-    /// `None` emits `DigestSha256` and accepts everything — matches
-    /// ndnd's `KeyChainUri = "insecure"` mode used in the testbed.
-    /// Production deployments pass [`ndn_security::StaticTrust`] or
-    /// [`ndn_security::LvsTrust`].
-    pub trust_policy: Option<Arc<dyn ndn_security::TrustPolicy>>,
-
     /// `0` = no limit (`MAX_FACES_PER_PREFIX_DEFAULT`).
     pub max_faces_per_prefix: usize,
 }
@@ -125,7 +119,6 @@ impl Default for NlsrConfig {
             hello_retries: 3,
             hello_timeout_secs: 1,
             sync_interest_lifetime_ms: 60_000,
-            trust_policy: None,
             max_faces_per_prefix: 0,
         }
     }

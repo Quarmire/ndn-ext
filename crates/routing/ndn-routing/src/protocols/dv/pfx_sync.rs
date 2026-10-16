@@ -75,14 +75,14 @@ pub struct DvPfxSync {
 }
 
 impl DvPfxSync {
-    /// Uses [`crate::protocols::dv::signing::InsecureTrust`]; call
+    /// Uses [`crate::protocols::dv::signing::DvInsecure`]; call
     /// [`Self::with_trust`] for key-based signing or LVS validation.
     pub fn new(network: Name, router: Name, boot: u64) -> Self {
         Self::with_trust(
             network,
             router,
             boot,
-            crate::protocols::dv::signing::InsecureTrust::handle(),
+            crate::protocols::dv::signing::DvInsecure::handle(),
         )
     }
 

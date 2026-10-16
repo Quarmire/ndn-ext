@@ -16,7 +16,7 @@ everything non-standard or optional, grouped by domain:
 - `crates/coding/` — FEC / content coding · `crates/pipes/` — NDN-Pipes
 - `crates/time/` — named-time runtime (sources → timekeeper → driver)
 - `crates/surface/` — named zero-copy SHM surfaces (consumed by ndf-rs)
-- `crates/dashboard/` — shared dashboard core · `crates/ratelimit/`, `crates/onboarding/`
+- `crates/dashboard/` — shared dashboard core · `crates/ratelimit/`
 
 Removed crates are ledgered in [`ARCHIVE.md`](ARCHIVE.md) (git history is the
 archive). Part of the [ndn-rs](https://github.com/Quarmire/ndn-rs) ecosystem.

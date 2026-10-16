@@ -28,9 +28,9 @@ tracing       = { workspace = true }
 ndn-tlv       = { workspace = true, features = ["std"] }
 ndn-sync      = { workspace = true }
 # Stage 5 — pluggable `DvTrust` for DV's inner-Data signing and
-# receive-path verification. Defaults to `InsecureTrust` (wire-compat
-# with ndnd's insecure mode); operators can swap in `StaticTrust` (5b)
-# or `LvsTrust` (5c) via `with_trust`.
+# receive-path verification. Defaults to `DvInsecure` (wire-compat
+# with ndnd's insecure mode); operators can swap in `DvStaticKeys` (5b)
+# or `DvLvs` (5c) via `with_trust`.
 ndn-security  = { workspace = true }
 # `futures::executor::block_on` used to call ndn-security's async
 # CPU-only verifiers from DV's sync receive paths.

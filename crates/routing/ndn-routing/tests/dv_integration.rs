@@ -93,10 +93,10 @@ fn name(s: &str) -> Name {
 /// between the two test engines; the fetch/produce InProcHandles
 /// stay inside DvProtocol for Consumer/Producer wiring.
 ///
-/// `trust = None` uses [`ndn_routing::protocols::dv::signing::InsecureTrust`]
+/// `trust = None` uses [`ndn_routing::protocols::dv::signing::DvInsecure`]
 /// (the `DigestSha256` default). `Some(_)` wires a custom
 /// [`DvTrust`](`ndn_routing::protocols::dv::signing::DvTrust`) — e.g.
-/// `StaticTrust` for the Stage 5b witness or `LvsTrust` for 5c.
+/// `DvStaticKeys` for the Stage 5b witness or `DvLvs` for 5c.
 async fn build_dv_engine(
     router_name: &str,
     boot: u64,
@@ -283,11 +283,11 @@ async fn pfx_sync_propagates_local_announcement() {
 
 /// Stage 5a + 5b witness — both engines sign with Ed25519 *and*
 /// verify the peer's signature against a pre-shared
-/// [`StaticTrust`] public-key registry. End-to-end convergence
+/// [`DvStaticKeys`] public-key registry. End-to-end convergence
 /// proves:
 ///
 /// 1. (5a) outgoing path encodes Ed25519-signed inner Data,
-/// 2. (5b) receive path runs `StaticTrust::validate` and accepts
+/// 2. (5b) receive path runs `DvStaticKeys::validate` and accepts
 ///    the peer's wire because the KeyLocator name resolves in
 ///    `trusted_keys` and the signature crypto checks out.
 ///
@@ -297,7 +297,7 @@ async fn pfx_sync_propagates_local_announcement() {
 /// fail with `None`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ed25519_signed_routers_converge() {
-    use ndn_routing::protocols::dv::signing::StaticTrust;
+    use ndn_routing::protocols::dv::signing::DvStaticKeys;
     use ndn_security::{Ed25519Signer, Signer};
 
     let r1_key = name("/ndn/r1/KEY/dv");
@@ -314,10 +314,10 @@ async fn ed25519_signed_routers_converge() {
         .expect("Ed25519Signer exposes its public key");
 
     // r1 signs with r1's key; trusts r2's key for incoming.
-    let r1_trust = StaticTrust::new(Some(r1_signer.clone() as Arc<dyn Signer>))
+    let r1_trust = DvStaticKeys::new(Some(r1_signer.clone() as Arc<dyn Signer>))
         .trust_key(r2_key.clone(), r2_public.clone())
         .handle();
-    let r2_trust = StaticTrust::new(Some(r2_signer.clone() as Arc<dyn Signer>))
+    let r2_trust = DvStaticKeys::new(Some(r2_signer.clone() as Arc<dyn Signer>))
         .trust_key(r1_key.clone(), r1_public.clone())
         .handle();
 
@@ -369,12 +369,12 @@ async fn ed25519_signed_routers_converge() {
 /// Stage 5b negative witness — a router signing with an *unknown*
 /// key cannot inject state into a peer that only trusts the legit
 /// key set. The forged Sync Interests still arrive on the link face,
-/// but `StaticTrust::validate` drops them because the attacker's
+/// but `DvStaticKeys::validate` drops them because the attacker's
 /// KeyLocator name isn't in `trusted_keys`. `DvSync.neighbor_seq` on
 /// the victim stays `None`; no FIB or RIB state moves.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn forged_signed_peer_is_rejected_by_static_trust() {
-    use ndn_routing::protocols::dv::signing::StaticTrust;
+    use ndn_routing::protocols::dv::signing::DvStaticKeys;
     use ndn_security::{Ed25519Signer, Signer};
 
     let legit_key = name("/ndn/r1/KEY/dv");
@@ -388,11 +388,11 @@ async fn forged_signed_peer_is_rejected_by_static_trust() {
         name("/attacker/KEY/evil"),
     ));
 
-    let attacker_trust = StaticTrust::new(Some(evil_signer.clone() as Arc<dyn Signer>)).handle();
+    let attacker_trust = DvStaticKeys::new(Some(evil_signer.clone() as Arc<dyn Signer>)).handle();
     // r2 trusts only the legit key. Receiving a packet signed by the
     // attacker (with KeyLocator naming the attacker's key) hits the
     // trusted-keys lookup miss and gets dropped.
-    let victim_trust = StaticTrust::new(Some(legit_signer.clone() as Arc<dyn Signer>))
+    let victim_trust = DvStaticKeys::new(Some(legit_signer.clone() as Arc<dyn Signer>))
         .trust_key(legit_key, legit_public)
         .handle();
 

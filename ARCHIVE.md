@@ -12,3 +12,4 @@ item; recover with `git checkout <sha> -- <path>`.
 | crates/faces/ndn-signal-sources | 348 | be150dc | Superseded by migration: its trait moved to ndn-rs's ndn-signals-core; leftover framework imported by nothing | 2026-08-21 |
 | crates/faces/ndn-remote-signer-webrtc | 106 | 8d34990 | Zero consumers, zero tests, "compile-verified" only; dragged the WebRTC stack into default builds | 2026-08-21 |
 | crates/faces/ndn-face-onion | 773 | f9f0b86 | Research primitive (ANDaNA-style onion crypto), well-written but not a face and consumed by nothing — archived as research, not deleted for cause | 2026-08-21 |
+| crates/onboarding/ndn-trust-envelope | 648 | 8d34990 | Moved (not deleted) to ndn-rs `crates/security/ndn-trust-envelope`: the single `ndn-trust://` onboarding codec, which ndn-cert now depends on (ndn-rs cannot depend on ndn-ext) | 2026-10-14 |

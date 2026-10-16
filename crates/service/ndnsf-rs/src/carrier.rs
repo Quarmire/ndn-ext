@@ -55,7 +55,7 @@ const STATUS_ERROR: u8 = 2;
 /// by the provider that claims it** — a member cannot answer "as" another. But the
 /// flow does **not** check whether that provider is *authorized to serve this
 /// service*: any trusted group member can ACK, and the client may select it
-/// (`FirstResponding` takes whoever ACKs first). In the current TrustContext model
+/// (`FirstResponding` takes whoever ACKs first). In the current SignedTrustContext model
 /// **group membership is the provider authorization** — every member is a peer that
 /// may serve. A finer per-service allow-list exists in `policy::ServicePolicy`
 /// (its `providers` set) but is **not yet enforced** on the client's ACK-acceptance

@@ -323,7 +323,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             mgr.add_trust_anchor(ca_cert);
         }
-        builder = builder.security(mgr);
+        builder = builder.security(Arc::new(mgr));
         println!(
             "radio: RTL8822E 0bda:{pid:04x} as NDN face {} on ch{ch}; link-FEC R={fec_r}",
             RADIO_FACE_ID.0

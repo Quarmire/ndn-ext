@@ -150,7 +150,7 @@ impl DvProtocol {
             None,
             None,
             None,
-            crate::protocols::dv::signing::InsecureTrust::handle(),
+            crate::protocols::dv::signing::DvInsecure::handle(),
         )
     }
 
@@ -180,7 +180,7 @@ impl DvProtocol {
             Some(fetch_handle),
             Some(produce_handle),
             Some(produce_face_id),
-            crate::protocols::dv::signing::InsecureTrust::handle(),
+            crate::protocols::dv::signing::DvInsecure::handle(),
         )
     }
 
@@ -850,7 +850,7 @@ async fn fetch_and_apply_adv(
     match consumer.fetch(target).await {
         Ok(data) => {
             // Refuse to apply Adv Data we can't trust. Insecure
-            // deployments still pass since `InsecureTrust::validate`
+            // deployments still pass since `DvInsecure::validate`
             // returns `true`.
             if !crate::protocols::dv::signing::validate_inner_data(&data, trust) {
                 warn!(

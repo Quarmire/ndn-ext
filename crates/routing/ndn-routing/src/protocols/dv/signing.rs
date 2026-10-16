@@ -4,12 +4,12 @@
 //! `std/object/client_trust.go`): a single object decides what
 //! [`Signer`] to use for outgoing inner Data
 //! ([`DvTrust::suggest_signer`]) and whether an incoming inner Data is
-//! trusted ([`DvTrust::validate`]). [`InsecureTrust`] matches ndnd's
+//! trusted ([`DvTrust::validate`]). [`DvInsecure`] matches ndnd's
 //! `KeyChainUri = "insecure"` mode.
 //!
-//! New call sites should prefer [`ndn_security::TrustPolicy`]; the
-//! DV-local impls below stay because they bundle a `validate(&Data)`
-//! predicate the abstract `TrustPolicy` does not carry.
+//! The DV impls ([`DvInsecure`], [`DvStaticKeys`], [`DvLvs`]) carry a
+//! synchronous `validate(&Data)` predicate over a pre-shared key map,
+//! matching ndnd's wire behaviour; they do not walk certificate chains.
 //!
 //! [`DvSync`]: crate::protocols::dv::sync::DvSync
 //! [`DvPfxSync`]: crate::protocols::dv::pfx_sync::DvPfxSync
@@ -22,7 +22,6 @@ use bytes::Bytes;
 use futures::executor::block_on;
 use ndn_packet::encode::{DataBuilder, encode_data_digest_sha256};
 use ndn_packet::{Data, KeyLocator, Name, SignatureType};
-pub use ndn_security::TrustPolicy as _TrustPolicy;
 use ndn_security::verifier::verify_by_sig_type;
 use ndn_security::{LvsModel, SignWith, Signer, VerifyOutcome};
 
@@ -32,9 +31,9 @@ use ndn_security::{LvsModel, SignWith, Signer, VerifyOutcome};
 ///
 /// | Impl | `suggest_signer` | `validate` |
 /// |---|---|---|
-/// | [`InsecureTrust`] | `None` → `DigestSha256` | always `true` |
-/// | [`StaticTrust`] | configured `default_signer` | hash-only for `DigestSha256`, key-map lookup for key-based sigs |
-/// | [`LvsTrust`] | configured `default_signer` (LVS Suggest is 5c-experimental) | LVS schema check + sig verify |
+/// | [`DvInsecure`] | `None` → `DigestSha256` | always `true` |
+/// | [`DvStaticKeys`] | configured `default_signer` | hash-only for `DigestSha256`, key-map lookup for key-based sigs |
+/// | [`DvLvs`] | configured `default_signer` (LVS Suggest is 5c-experimental) | LVS schema check + sig verify |
 ///
 /// [`DvSync`]: crate::protocols::dv::sync::DvSync
 /// [`DvPfxSync`]: crate::protocols::dv::pfx_sync::DvPfxSync
@@ -59,12 +58,12 @@ pub type DvTrustHandle = Arc<dyn DvTrust>;
 
 /// Wire-compatible with ndnd's `KeyChainUri = "insecure"` mode
 /// (`ndnd/dv/dv/router.go:78`): no signing, validation always passes.
-pub struct InsecureTrust;
-impl DvTrust for InsecureTrust {}
+pub struct DvInsecure;
+impl DvTrust for DvInsecure {}
 
-impl InsecureTrust {
+impl DvInsecure {
     pub fn handle() -> DvTrustHandle {
-        Arc::new(InsecureTrust)
+        Arc::new(DvInsecure)
     }
 }
 
@@ -77,7 +76,7 @@ impl InsecureTrust {
 /// 2. Key-based signatures (Ed25519, RSA, ECDSA, HMAC) — accepted iff
 ///    the [`KeyLocator`] name resolves to a key in `trusted_keys` and
 ///    the cryptographic check passes.
-pub struct StaticTrust {
+pub struct DvStaticKeys {
     /// `None` → emit `DigestSha256`.
     pub default_signer: Option<Arc<dyn Signer>>,
     /// Key = the `KeyLocator` name in the incoming Data's
@@ -89,7 +88,7 @@ pub struct StaticTrust {
     pub accept_digest_sha256: bool,
 }
 
-impl StaticTrust {
+impl DvStaticKeys {
     pub fn new(default_signer: Option<Arc<dyn Signer>>) -> Self {
         Self {
             default_signer,
@@ -113,7 +112,7 @@ impl StaticTrust {
     }
 }
 
-impl DvTrust for StaticTrust {
+impl DvTrust for DvStaticKeys {
     fn suggest_signer(&self, _name: &Name) -> Option<Arc<dyn Signer>> {
         self.default_signer.clone()
     }
@@ -130,13 +129,13 @@ impl DvTrust for StaticTrust {
 /// `suggest_signer` returns the configured `default_signer`. Full
 /// LVS-walk signer selection (`ndnd`'s `client.SuggestSigner`) is
 /// deferred — it requires a runtime keychain.
-pub struct LvsTrust {
+pub struct DvLvs {
     pub model: Arc<LvsModel>,
     pub default_signer: Option<Arc<dyn Signer>>,
     pub trusted_keys: HashMap<Name, Bytes>,
 }
 
-impl LvsTrust {
+impl DvLvs {
     pub fn new(model: Arc<LvsModel>, default_signer: Option<Arc<dyn Signer>>) -> Self {
         Self {
             model,
@@ -155,7 +154,7 @@ impl LvsTrust {
     }
 }
 
-impl DvTrust for LvsTrust {
+impl DvTrust for DvLvs {
     fn suggest_signer(&self, _name: &Name) -> Option<Arc<dyn Signer>> {
         self.default_signer.clone()
     }
@@ -228,7 +227,7 @@ pub fn encode_inner_segmented_data(
     }
 }
 
-fn validate_data_against_static(data: &Data, trust: &StaticTrust) -> bool {
+fn validate_data_against_static(data: &Data, trust: &DvStaticKeys) -> bool {
     let Some(sig_info) = data.sig_info() else {
         return false;
     };
@@ -284,7 +283,7 @@ mod tests {
 
     #[test]
     fn insecure_trust_produces_digest_sha256() {
-        let trust = InsecureTrust;
+        let trust = DvInsecure;
         let bytes = encode_inner_data(&name("/ndn/dv/test"), b"hello", &trust);
         let data = Data::decode(bytes).unwrap();
         assert_eq!(
@@ -299,7 +298,7 @@ mod tests {
             &[7u8; 32],
             name("/ndn/r1/KEY/abc"),
         ));
-        let trust = StaticTrust::new(Some(Arc::clone(&signer)));
+        let trust = DvStaticKeys::new(Some(Arc::clone(&signer)));
         let bytes = encode_inner_data(&name("/ndn/r1/dv/data"), b"sv", &trust);
         let data = Data::decode(bytes).unwrap();
         let sig = data.sig_info().unwrap();
@@ -312,22 +311,22 @@ mod tests {
 
     #[test]
     fn insecure_trust_accepts_anything() {
-        let trust = InsecureTrust;
-        let bytes = encode_inner_data(&name("/foo"), b"x", &InsecureTrust);
+        let trust = DvInsecure;
+        let bytes = encode_inner_data(&name("/foo"), b"x", &DvInsecure);
         assert!(validate_inner_data(&Data::decode(bytes).unwrap(), &trust));
     }
 
     #[test]
     fn static_trust_accepts_digest_sha256_by_default() {
-        let trust = StaticTrust::new(None);
-        let bytes = encode_inner_data(&name("/foo"), b"x", &InsecureTrust);
+        let trust = DvStaticKeys::new(None);
+        let bytes = encode_inner_data(&name("/foo"), b"x", &DvInsecure);
         assert!(validate_inner_data(&Data::decode(bytes).unwrap(), &trust));
     }
 
     #[test]
     fn static_trust_can_reject_digest_sha256_when_signatures_required() {
-        let trust = StaticTrust::new(None).require_signatures();
-        let bytes = encode_inner_data(&name("/foo"), b"x", &InsecureTrust);
+        let trust = DvStaticKeys::new(None).require_signatures();
+        let bytes = encode_inner_data(&name("/foo"), b"x", &DvInsecure);
         assert!(!validate_inner_data(&Data::decode(bytes).unwrap(), &trust));
     }
 
@@ -345,10 +344,10 @@ mod tests {
 
         let signer: Arc<dyn Signer> =
             Arc::new(Ed25519Signer::from_seed(&[3u8; 32], key_name.clone()));
-        let producer = StaticTrust::new(Some(Arc::clone(&signer)));
+        let producer = DvStaticKeys::new(Some(Arc::clone(&signer)));
         let bytes = encode_inner_data(&name("/ndn/r1/dv/data"), b"sv", &producer);
 
-        let consumer = StaticTrust::new(None).trust_key(key_name, public_key);
+        let consumer = DvStaticKeys::new(None).trust_key(key_name, public_key);
         assert!(validate_inner_data(
             &Data::decode(bytes).unwrap(),
             &consumer,
@@ -365,13 +364,13 @@ mod tests {
             &[9u8; 32],
             name("/attacker/KEY/evil"),
         ));
-        let producer = StaticTrust::new(Some(attacker_signer));
+        let producer = DvStaticKeys::new(Some(attacker_signer));
         let bytes = encode_inner_data(&name("/ndn/r1/dv/data"), b"sv", &producer);
 
         // Consumer's only trusted key is /ndn/r1/KEY/abc — the
         // attacker's KeyLocator names /attacker/KEY/evil, which
         // isn't in the map.
-        let consumer = StaticTrust::new(None).trust_key(
+        let consumer = DvStaticKeys::new(None).trust_key(
             name("/ndn/r1/KEY/abc"),
             ed25519_public_key([3u8; 32], &name("/ndn/r1/KEY/abc")),
         );
@@ -383,7 +382,7 @@ mod tests {
 
     /// Empty schema rejects every key-based packet even when the
     /// signature cryptographically checks out — pins the
-    /// `check`-before-`verify` ordering in `LvsTrust::validate`.
+    /// `check`-before-`verify` ordering in `DvLvs::validate`.
     #[test]
     fn lvs_trust_rejects_when_schema_walk_finds_no_signing_path() {
         let model = LvsModel::decode(&minimal_lvs_no_edges())
@@ -392,10 +391,10 @@ mod tests {
         let key_name = name("/ndn/r1/KEY/abc");
         let signer: Arc<dyn Signer> =
             Arc::new(Ed25519Signer::from_seed(&[3u8; 32], key_name.clone()));
-        let producer = StaticTrust::new(Some(Arc::clone(&signer)));
+        let producer = DvStaticKeys::new(Some(Arc::clone(&signer)));
         let bytes = encode_inner_data(&name("/ndn/r1/dv/data"), b"sv", &producer);
 
-        let consumer = LvsTrust::new(Arc::new(model), None).trust_key(
+        let consumer = DvLvs::new(Arc::new(model), None).trust_key(
             key_name,
             ed25519_public_key([3u8; 32], &name("/ndn/r1/KEY/abc")),
         );
@@ -412,7 +411,7 @@ mod tests {
             &[3u8; 32],
             name("/ndn/r1/KEY/abc"),
         ));
-        let trust = LvsTrust::new(Arc::new(model), Some(Arc::clone(&signer)));
+        let trust = DvLvs::new(Arc::new(model), Some(Arc::clone(&signer)));
         let bytes = encode_inner_data(&name("/ndn/r1/dv/data"), b"sv", &trust);
         let data = Data::decode(bytes).unwrap();
         assert_eq!(
