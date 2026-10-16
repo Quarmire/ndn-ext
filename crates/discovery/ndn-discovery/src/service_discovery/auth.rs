@@ -23,8 +23,9 @@ use std::future::Future;
 use std::task::{Context, Poll, Waker};
 
 use bytes::Bytes;
+use ndn_packet::encode::DataBuilder;
 use ndn_packet::{Data, Name, SignatureType};
-use ndn_security::{Ed25519Verifier, Signer, Verifier, VerifyOutcome};
+use ndn_security::{ActiveSigner, Ed25519Verifier, Signer, Verifier, VerifyOutcome};
 
 /// Outcome of verifying an inbound SD Data.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,25 +43,12 @@ pub enum VerifyVerdict {
     Malformed,
 }
 
-#[derive(Debug)]
-pub enum SignError {
-    Internal(String),
-}
-
-impl std::fmt::Display for SignError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Internal(s) => write!(f, "sign error: {s}"),
-        }
-    }
-}
-
-/// Signs the SD Data signed-region. [`signing_info`](Self::signing_info)
-/// supplies the `SignatureType` code + optional KeyLocator name used when
-/// building the Data; [`sign`](Self::sign) produces the SignatureValue.
+/// Signs an SD Data. The SignatureType, KeyLocator and SignatureValue of one
+/// record all come from one key, even when the signer's key changes while
+/// records are being signed ([`ActiveSigner`]).
 pub trait RecordSigner: Send + Sync {
-    fn signing_info(&self) -> (u64, Option<Name>);
-    fn sign(&self, signed_region: &[u8]) -> Result<Bytes, SignError>;
+    /// Finish `builder` into a signed Data wire.
+    fn sign_data(&self, builder: DataBuilder) -> Bytes;
 }
 
 /// Verifies an inbound SD Data before it is stored / acted on.
@@ -83,26 +71,30 @@ fn sha256(data: &[u8]) -> [u8; 32] {
 pub struct DigestSigner;
 
 impl RecordSigner for DigestSigner {
-    fn signing_info(&self) -> (u64, Option<Name>) {
-        (SignatureType::DigestSha256.code(), None)
-    }
-    fn sign(&self, signed_region: &[u8]) -> Result<Bytes, SignError> {
-        Ok(Bytes::copy_from_slice(&sha256(signed_region)))
+    fn sign_data(&self, builder: DataBuilder) -> Bytes {
+        builder.sign_digest_sha256()
     }
 }
 
 /// Adapts an `ndn_security::Signer` (e.g. an `Ed25519Signer` from a
-/// KeyChain) into a [`RecordSigner`] for authenticated announcements.
+/// KeyChain) into a [`RecordSigner`] for authenticated announcements. A
+/// signing failure yields an empty SignatureValue, which no verifier accepts.
 pub struct SignerAdapter(pub std::sync::Arc<dyn Signer>);
 
 impl RecordSigner for SignerAdapter {
-    fn signing_info(&self) -> (u64, Option<Name>) {
-        (self.0.sig_type().code(), Some(self.0.key_name().clone()))
+    fn sign_data(&self, builder: DataBuilder) -> Bytes {
+        let signer = &self.0;
+        builder.sign_sync(signer.sig_type(), Some(signer.key_name()), |region| {
+            signer.sign_sync(region).unwrap_or_default()
+        })
     }
-    fn sign(&self, signed_region: &[u8]) -> Result<Bytes, SignError> {
-        self.0
-            .sign_sync(signed_region)
-            .map_err(|e| SignError::Internal(e.to_string()))
+}
+
+/// Signs each record with the key the node signs with at that moment: one
+/// [`ActiveSigner::current`] snapshot per record.
+impl RecordSigner for ActiveSigner {
+    fn sign_data(&self, builder: DataBuilder) -> Bytes {
+        SignerAdapter(self.current()).sign_data(builder)
     }
 }
 
@@ -195,15 +187,57 @@ fn poll_once<F: Future>(fut: F) -> Option<F::Output> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndn_packet::encode::DataBuilder;
 
     fn sign_data(name: &str, content: &[u8], signer: &dyn RecordSigner) -> Bytes {
-        let (sig_code, kl) = signer.signing_info();
-        DataBuilder::new(name.parse::<Name>().unwrap(), content).sign_sync(
-            SignatureType::from_code(sig_code),
-            kl.as_ref(),
-            |region| signer.sign(region).unwrap_or_default(),
-        )
+        signer.sign_data(DataBuilder::new(name.parse::<Name>().unwrap(), content))
+    }
+
+    /// While another thread keeps switching the node's key, every record
+    /// signed through the [`ActiveSigner`] verifies under the key its
+    /// KeyLocator names.
+    #[test]
+    fn every_record_names_the_key_that_signed_it() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let keys: Vec<Arc<dyn Signer>> = (1u8..=4)
+            .map(|i| {
+                let name = format!("/home/bob/member/d{i}/KEY/k").parse().unwrap();
+                Arc::new(ndn_security::Ed25519Signer::from_seed(&[i; 32], name)) as Arc<dyn Signer>
+            })
+            .collect();
+        let verifier = keys.iter().fold(KeyedVerifier::new(), |v, k| {
+            v.trust(k.key_name().clone(), k.public_key().unwrap().to_vec())
+        });
+        let active = Arc::new(ActiveSigner::new(Arc::clone(&keys[0])));
+        let stop = Arc::new(AtomicBool::new(false));
+        let switches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let switcher = {
+            let (active, stop, keys) = (Arc::clone(&active), Arc::clone(&stop), keys.clone());
+            let switches = Arc::clone(&switches);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let n = switches.fetch_add(1, Ordering::Relaxed) + 1;
+                    active.replace(Arc::clone(&keys[n % keys.len()]));
+                }
+            })
+        };
+        while switches.load(Ordering::Relaxed) == 0 {
+            std::thread::yield_now();
+        }
+        let before = switches.load(Ordering::Relaxed);
+        for n in 0..500 {
+            let wire = sign_data(&format!("/sd/{n}"), b"x", active.as_ref());
+            let verdict = verifier.verify(&Data::decode(wire).unwrap());
+            assert!(
+                matches!(verdict, VerifyVerdict::Verified { authentic: true, .. }),
+                "record {n}: {verdict:?}"
+            );
+        }
+        let during = switches.load(Ordering::Relaxed) - before;
+        stop.store(true, Ordering::Relaxed);
+        switcher.join().unwrap();
+        assert!(during > 0, "the key changed while records were signed");
     }
 
     #[test]

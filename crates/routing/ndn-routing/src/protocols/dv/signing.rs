@@ -23,7 +23,7 @@ use futures::executor::block_on;
 use ndn_packet::encode::{DataBuilder, encode_data_digest_sha256};
 use ndn_packet::{Data, KeyLocator, Name, SignatureType};
 use ndn_security::verifier::verify_by_sig_type;
-use ndn_security::{LvsModel, SignWith, Signer, VerifyOutcome};
+use ndn_security::{ActiveSigner, LvsModel, SignWith, Signer, VerifyOutcome};
 
 /// Decision object owned by [`DvSync`] / [`DvPfxSync`] that controls
 /// both *what we sign with* and *what we accept*. Implementations
@@ -39,7 +39,8 @@ use ndn_security::{LvsModel, SignWith, Signer, VerifyOutcome};
 /// [`DvPfxSync`]: crate::protocols::dv::pfx_sync::DvPfxSync
 pub trait DvTrust: Send + Sync + 'static {
     /// Pick a [`Signer`] for an outgoing Data packet named `_name`.
-    /// `None` → [`DigestSha256`]. Default impl returns `None`.
+    /// `None` → [`DigestSha256`]. Default impl returns `None`. The packet's
+    /// KeyLocator and signature both come from the returned signer.
     ///
     /// [`DigestSha256`]: ndn_packet::SignatureType::DigestSha256
     fn suggest_signer(&self, _name: &Name) -> Option<Arc<dyn Signer>> {
@@ -67,9 +68,10 @@ impl DvInsecure {
     }
 }
 
-/// Pre-shared-key trust. One default signer for every outgoing Data,
-/// plus a name→public-key map for verifying incoming key-based
-/// signatures. Acceptance:
+/// Pre-shared-key trust. One default signer for every outgoing Data — the
+/// node's [`ActiveSigner`], so a key the node switches to at runtime signs
+/// from the next packet on — plus a name→public-key map for verifying
+/// incoming key-based signatures. Acceptance:
 ///
 /// 1. `DigestSha256` — accepted iff the embedded hash matches the
 ///    signed region (gated by [`Self::accept_digest_sha256`]).
@@ -78,7 +80,7 @@ impl DvInsecure {
 ///    the cryptographic check passes.
 pub struct DvStaticKeys {
     /// `None` → emit `DigestSha256`.
-    pub default_signer: Option<Arc<dyn Signer>>,
+    pub default_signer: Option<Arc<ActiveSigner>>,
     /// Key = the `KeyLocator` name in the incoming Data's
     /// `SignatureInfo`. Value = raw public-key bytes for
     /// [`ndn_security::verifier::verify_by_sig_type`].
@@ -89,7 +91,7 @@ pub struct DvStaticKeys {
 }
 
 impl DvStaticKeys {
-    pub fn new(default_signer: Option<Arc<dyn Signer>>) -> Self {
+    pub fn new(default_signer: Option<Arc<ActiveSigner>>) -> Self {
         Self {
             default_signer,
             trusted_keys: HashMap::new(),
@@ -114,7 +116,7 @@ impl DvStaticKeys {
 
 impl DvTrust for DvStaticKeys {
     fn suggest_signer(&self, _name: &Name) -> Option<Arc<dyn Signer>> {
-        self.default_signer.clone()
+        self.default_signer.as_ref().map(|s| s.current())
     }
 
     fn validate(&self, data: &Data) -> bool {
@@ -126,17 +128,17 @@ impl DvTrust for DvStaticKeys {
 /// `model.check(data_name, key_name)` first; only then does it invoke
 /// the signature verifier.
 ///
-/// `suggest_signer` returns the configured `default_signer`. Full
-/// LVS-walk signer selection (`ndnd`'s `client.SuggestSigner`) is
+/// `suggest_signer` returns the configured `default_signer`'s current key.
+/// Full LVS-walk signer selection (`ndnd`'s `client.SuggestSigner`) is
 /// deferred — it requires a runtime keychain.
 pub struct DvLvs {
     pub model: Arc<LvsModel>,
-    pub default_signer: Option<Arc<dyn Signer>>,
+    pub default_signer: Option<Arc<ActiveSigner>>,
     pub trusted_keys: HashMap<Name, Bytes>,
 }
 
 impl DvLvs {
-    pub fn new(model: Arc<LvsModel>, default_signer: Option<Arc<dyn Signer>>) -> Self {
+    pub fn new(model: Arc<LvsModel>, default_signer: Option<Arc<ActiveSigner>>) -> Self {
         Self {
             model,
             default_signer,
@@ -156,7 +158,7 @@ impl DvLvs {
 
 impl DvTrust for DvLvs {
     fn suggest_signer(&self, _name: &Name) -> Option<Arc<dyn Signer>> {
-        self.default_signer.clone()
+        self.default_signer.as_ref().map(|s| s.current())
     }
 
     fn validate(&self, data: &Data) -> bool {
@@ -281,6 +283,10 @@ mod tests {
         Name::from_str(s).unwrap()
     }
 
+    fn active(signer: Arc<dyn Signer>) -> Option<Arc<ActiveSigner>> {
+        Some(Arc::new(ActiveSigner::new(signer)))
+    }
+
     #[test]
     fn insecure_trust_produces_digest_sha256() {
         let trust = DvInsecure;
@@ -298,7 +304,7 @@ mod tests {
             &[7u8; 32],
             name("/ndn/r1/KEY/abc"),
         ));
-        let trust = DvStaticKeys::new(Some(Arc::clone(&signer)));
+        let trust = DvStaticKeys::new(active(Arc::clone(&signer)));
         let bytes = encode_inner_data(&name("/ndn/r1/dv/data"), b"sv", &trust);
         let data = Data::decode(bytes).unwrap();
         let sig = data.sig_info().unwrap();
@@ -344,7 +350,7 @@ mod tests {
 
         let signer: Arc<dyn Signer> =
             Arc::new(Ed25519Signer::from_seed(&[3u8; 32], key_name.clone()));
-        let producer = DvStaticKeys::new(Some(Arc::clone(&signer)));
+        let producer = DvStaticKeys::new(active(Arc::clone(&signer)));
         let bytes = encode_inner_data(&name("/ndn/r1/dv/data"), b"sv", &producer);
 
         let consumer = DvStaticKeys::new(None).trust_key(key_name, public_key);
@@ -364,7 +370,7 @@ mod tests {
             &[9u8; 32],
             name("/attacker/KEY/evil"),
         ));
-        let producer = DvStaticKeys::new(Some(attacker_signer));
+        let producer = DvStaticKeys::new(active(attacker_signer));
         let bytes = encode_inner_data(&name("/ndn/r1/dv/data"), b"sv", &producer);
 
         // Consumer's only trusted key is /ndn/r1/KEY/abc — the
@@ -391,7 +397,7 @@ mod tests {
         let key_name = name("/ndn/r1/KEY/abc");
         let signer: Arc<dyn Signer> =
             Arc::new(Ed25519Signer::from_seed(&[3u8; 32], key_name.clone()));
-        let producer = DvStaticKeys::new(Some(Arc::clone(&signer)));
+        let producer = DvStaticKeys::new(active(Arc::clone(&signer)));
         let bytes = encode_inner_data(&name("/ndn/r1/dv/data"), b"sv", &producer);
 
         let consumer = DvLvs::new(Arc::new(model), None).trust_key(
@@ -411,7 +417,7 @@ mod tests {
             &[3u8; 32],
             name("/ndn/r1/KEY/abc"),
         ));
-        let trust = DvLvs::new(Arc::new(model), Some(Arc::clone(&signer)));
+        let trust = DvLvs::new(Arc::new(model), active(Arc::clone(&signer)));
         let bytes = encode_inner_data(&name("/ndn/r1/dv/data"), b"sv", &trust);
         let data = Data::decode(bytes).unwrap();
         assert_eq!(

@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use ndn_packet::encode::DataBuilder;
-use ndn_packet::{Name, NameComponent, SignatureType, tlv_type};
+use ndn_packet::{Name, NameComponent, tlv_type};
 use ndn_tlv::TlvWriter;
 
 use crate::scope::{sd_root, sd_services_under};
@@ -130,14 +130,10 @@ impl ServiceRecord {
         } else {
             30_000
         };
-        let (sig_code, key_locator) = signer.signing_info();
-        DataBuilder::new(name, content.as_ref())
-            .freshness(Duration::from_millis(freshness_period))
-            .sign_sync(
-                SignatureType::from_code(sig_code),
-                key_locator.as_ref(),
-                |region| signer.sign(region).unwrap_or_default(),
-            )
+        signer.sign_data(
+            DataBuilder::new(name, content.as_ref())
+                .freshness(Duration::from_millis(freshness_period)),
+        )
     }
 
     pub fn from_data_packet(raw: &Bytes) -> Option<Self> {

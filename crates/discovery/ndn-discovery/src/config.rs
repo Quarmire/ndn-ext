@@ -10,8 +10,8 @@ use ndn_packet::Name;
 pub use ndn_discovery_core::DiscoveryScope;
 
 pub use crate::service_discovery::auth::{
-    DigestSigner, DigestVerifier, KeyedVerifier, RecordSigner, RecordVerifier, SignError,
-    SignerAdapter, VerifyVerdict,
+    DigestSigner, DigestVerifier, KeyedVerifier, RecordSigner, RecordVerifier, SignerAdapter,
+    VerifyVerdict,
 };
 pub use crate::service_discovery::encryption::{
     DecryptError, EncryptError, EncryptionHook, NoEncryption,
@@ -221,7 +221,8 @@ pub struct ServiceDiscoveryConfig {
     pub encryption_hook: Arc<dyn EncryptionHook>,
     /// Signs outgoing SD/body/peer Data. Default [`DigestSigner`]
     /// (real DigestSha256 integrity). Supply a [`SignerAdapter`] over a
-    /// KeyChain signer for authenticated announcements.
+    /// KeyChain signer for authenticated announcements, or an
+    /// `ndn_security::ActiveSigner` to follow a key that changes at runtime.
     pub record_signer: Arc<dyn RecordSigner>,
     /// Gates inbound records/bodies. Default `None` is **fail-closed**:
     /// unverified records are browseable but never auto-install FIB

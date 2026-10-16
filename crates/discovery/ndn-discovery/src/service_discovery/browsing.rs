@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use ndn_packet::encode::{DataBuilder, encode_interest};
-use ndn_packet::{Data, Name, SignatureType};
+use ndn_packet::{Data, Name};
 use ndn_tlv::TlvWriter;
 use ndn_transport::FaceId;
 use tokio::sync::oneshot;
@@ -37,14 +37,10 @@ impl ServiceDiscoveryProtocol {
     /// Build a Data signed by the configured [`RecordSigner`]
     /// (default DigestSha256). Replaces the former all-zero stub.
     fn signed_data(&self, name: &Name, content: &[u8], freshness_ms: u64) -> Bytes {
-        let (sig_code, key_locator) = self.config.record_signer.signing_info();
-        DataBuilder::new(name.clone(), content)
-            .freshness(std::time::Duration::from_millis(freshness_ms))
-            .sign_sync(
-                SignatureType::from_code(sig_code),
-                key_locator.as_ref(),
-                |region| self.config.record_signer.sign(region).unwrap_or_default(),
-            )
+        self.config.record_signer.sign_data(
+            DataBuilder::new(name.clone(), content)
+                .freshness(std::time::Duration::from_millis(freshness_ms)),
+        )
     }
 
     /// Verify an inbound SD Data per the configured verifier. `None`

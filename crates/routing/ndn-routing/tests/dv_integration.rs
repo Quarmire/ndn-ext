@@ -298,7 +298,7 @@ async fn pfx_sync_propagates_local_announcement() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ed25519_signed_routers_converge() {
     use ndn_routing::protocols::dv::signing::DvStaticKeys;
-    use ndn_security::{Ed25519Signer, Signer};
+    use ndn_security::{ActiveSigner, Ed25519Signer, Signer};
 
     let r1_key = name("/ndn/r1/KEY/dv");
     let r2_key = name("/ndn/r2/KEY/dv");
@@ -314,10 +314,10 @@ async fn ed25519_signed_routers_converge() {
         .expect("Ed25519Signer exposes its public key");
 
     // r1 signs with r1's key; trusts r2's key for incoming.
-    let r1_trust = DvStaticKeys::new(Some(r1_signer.clone() as Arc<dyn Signer>))
+    let r1_trust = DvStaticKeys::new(Some(Arc::new(ActiveSigner::new(r1_signer.clone()))))
         .trust_key(r2_key.clone(), r2_public.clone())
         .handle();
-    let r2_trust = DvStaticKeys::new(Some(r2_signer.clone() as Arc<dyn Signer>))
+    let r2_trust = DvStaticKeys::new(Some(Arc::new(ActiveSigner::new(r2_signer.clone()))))
         .trust_key(r1_key.clone(), r1_public.clone())
         .handle();
 
@@ -375,7 +375,7 @@ async fn ed25519_signed_routers_converge() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn forged_signed_peer_is_rejected_by_static_trust() {
     use ndn_routing::protocols::dv::signing::DvStaticKeys;
-    use ndn_security::{Ed25519Signer, Signer};
+    use ndn_security::{ActiveSigner, Ed25519Signer, Signer};
 
     let legit_key = name("/ndn/r1/KEY/dv");
     let legit_signer = Arc::new(Ed25519Signer::from_seed(&[1u8; 32], legit_key.clone()));
@@ -388,11 +388,12 @@ async fn forged_signed_peer_is_rejected_by_static_trust() {
         name("/attacker/KEY/evil"),
     ));
 
-    let attacker_trust = DvStaticKeys::new(Some(evil_signer.clone() as Arc<dyn Signer>)).handle();
+    let attacker_trust =
+        DvStaticKeys::new(Some(Arc::new(ActiveSigner::new(evil_signer.clone())))).handle();
     // r2 trusts only the legit key. Receiving a packet signed by the
     // attacker (with KeyLocator naming the attacker's key) hits the
     // trusted-keys lookup miss and gets dropped.
-    let victim_trust = DvStaticKeys::new(Some(legit_signer.clone() as Arc<dyn Signer>))
+    let victim_trust = DvStaticKeys::new(Some(Arc::new(ActiveSigner::new(legit_signer.clone()))))
         .trust_key(legit_key, legit_public)
         .handle();
 
