@@ -31,8 +31,7 @@
 //!
 //! The election math lives in [`election`]; state (C-L tree, neighbor table)
 //! and I/O (scheduling, overhear-cancel) live in the adapters and engine.
-//! See `.claude/notes/signals/cross-layer-signals-design-2026-05-23.md` and the
-//! NDN-Pipes reconciliation note.
+//! See ndn-rs `docs/wiki/src/guides/writing-a-strategy.md` (Cross-layer signals).
 //!
 //! ### A note on the legacy [`cclf_decide`] kernel
 //!

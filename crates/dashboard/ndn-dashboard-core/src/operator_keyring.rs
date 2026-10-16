@@ -208,8 +208,8 @@ fn provision_inner(
 /// [`CustodianRef::Remote`] for a networked signer); it drives the
 /// security-tier badge. Per the 2026-06-01 design decision the operator key
 /// should be ECDSA P-256, so a PWA software key can later upgrade to a native
-/// secure-enclave key without re-keying (see
-/// `.claude/notes/remote-fob-design-2026-06-01.md`).
+/// secure-enclave key without re-keying (see ndn-rs
+/// `docs/wiki/src/guides/remote-signer-pairing.md`).
 pub fn provision_remote_signer(
     key_name: Name,
     cert_name: Option<Name>,

@@ -14,8 +14,7 @@
 //! `NamedEtherFace` (recv/send carry the bare NDN payload).
 //!
 //! Privileges: loading/attaching the XDP program + binding the XSK needs
-//! CAP_BPF/CAP_NET_ADMIN/CAP_NET_RAW (root). Design:
-//! `.claude/notes/afxdp-face-scope-2026-05-24.md`.
+//! CAP_BPF/CAP_NET_ADMIN/CAP_NET_RAW (root).
 
 use std::path::PathBuf;
 use std::sync::Arc;

@@ -31,8 +31,8 @@ pub enum GuardKind {
     /// The key lives on a remote signer — a phone, another machine, a
     /// hardware token — that gates each signature there; the key never touches
     /// this host. Wired via `ndn_security::custodian::RemoteCustodian`; pairing +
-    /// transport land with the signer app (see
-    /// .claude/notes/remote-fob-design-2026-06-01.md).
+    /// transport land with the signer app (see ndn-rs
+    /// `docs/wiki/src/guides/remote-signer-pairing.md`).
     #[serde(rename = "remote-signer")]
     RemoteSigner,
 }
