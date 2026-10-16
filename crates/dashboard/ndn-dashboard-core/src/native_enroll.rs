@@ -1,5 +1,5 @@
-//! Native token-join — NDNCERT enrollment for the native app, plus identity
-//! persistence. The native analogue of the browser `JoinClient` (dioxus-demo,
+//! Native token enrollment — NDNCERT enrollment for the native app, plus identity
+//! persistence. The native analogue of the browser `EnrollClient` (dioxus-demo,
 //! IndexedDB-backed): run the shared [`ndn_cert::client::enroll`] driver
 //! through NEW → token CHALLENGE → issued cert, then persist the result.
 //!
@@ -19,7 +19,7 @@
 //!   key's private half never leaves secure hardware, so it **cannot** go into
 //!   a SafeBag. It persists as the issued cert plus a reference to the enclave
 //!   key handle. That tier lands with Phase 4 (the real Keystore/Enclave key);
-//!   `JoinedIdentity` carries the issued cert for either tier.
+//!   `EnrolledIdentity` carries the issued cert for either tier.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -34,7 +34,7 @@ use ndn_security::safebag::{SafeBag, ed25519_seed_to_pkcs8};
 const TOKEN_CHALLENGE: &str = "token";
 
 #[derive(Debug, thiserror::Error)]
-pub enum JoinError {
+pub enum EnrollError {
     #[error("NDNCERT protocol error: {0}")]
     Protocol(String),
     #[error("certificate: {0}")]
@@ -49,7 +49,7 @@ pub enum JoinError {
 /// persistence tiers; how the *private key* is stored differs (SafeBag for
 /// software keys; cert + handle for enclave keys).
 #[derive(Debug, Clone)]
-pub struct JoinedIdentity {
+pub struct EnrolledIdentity {
     pub key_name: Name,
     pub cert_name: Name,
     pub cert_wire: Bytes,
@@ -64,7 +64,7 @@ pub async fn enroll_via_token<E: CaExchange>(
     signer: Arc<dyn Signer>,
     token: &str,
     validity_secs: u64,
-) -> Result<JoinedIdentity, JoinError> {
+) -> Result<EnrolledIdentity, EnrollError> {
     let key_name = signer.key_name().clone();
     let mut params = serde_json::Map::new();
     params.insert(
@@ -81,16 +81,16 @@ pub async fn enroll_via_token<E: CaExchange>(
         |_| std::future::ready(Ok(params.take())),
     )
     .await
-    .map_err(|e| JoinError::Protocol(format!("token enrollment: {e}")))?;
+    .map_err(|e| EnrollError::Protocol(format!("token enrollment: {e}")))?;
 
     // The certificate *is* a Data packet — keep its wire unchanged.
     let cert_wire = ndn_cert::client::fetch_issued_cert(exchange, &cert_name)
         .await
-        .map_err(|e| JoinError::Cert(format!("fetch {cert_name}: {e}")))?
+        .map_err(|e| EnrollError::Cert(format!("fetch {cert_name}: {e}")))?
         .raw()
         .clone();
 
-    Ok(JoinedIdentity {
+    Ok(EnrolledIdentity {
         key_name,
         cert_name,
         cert_wire,
@@ -113,11 +113,11 @@ pub fn save_software_safebag(
     seed: &[u8; 32],
     cert_wire: &Bytes,
     passphrase: &[u8],
-) -> Result<(), JoinError> {
-    let pkcs8 = ed25519_seed_to_pkcs8(seed).map_err(|e| JoinError::SafeBag(e.to_string()))?;
+) -> Result<(), EnrollError> {
+    let pkcs8 = ed25519_seed_to_pkcs8(seed).map_err(|e| EnrollError::SafeBag(e.to_string()))?;
     let bag = SafeBag::encrypt(cert_wire.clone(), &pkcs8, passphrase)
-        .map_err(|e| JoinError::SafeBag(e.to_string()))?;
-    std::fs::write(path, bag.encode()).map_err(|e| JoinError::Io(e.to_string()))?;
+        .map_err(|e| EnrollError::SafeBag(e.to_string()))?;
+    std::fs::write(path, bag.encode()).map_err(|e| EnrollError::Io(e.to_string()))?;
     Ok(())
 }
 
@@ -125,12 +125,12 @@ pub fn save_software_safebag(
 pub fn load_software_safebag(
     path: &Path,
     passphrase: &[u8],
-) -> Result<RestoredIdentity, JoinError> {
-    let wire = std::fs::read(path).map_err(|e| JoinError::Io(e.to_string()))?;
-    let bag = SafeBag::decode(&wire).map_err(|e| JoinError::SafeBag(e.to_string()))?;
+) -> Result<RestoredIdentity, EnrollError> {
+    let wire = std::fs::read(path).map_err(|e| EnrollError::Io(e.to_string()))?;
+    let bag = SafeBag::decode(&wire).map_err(|e| EnrollError::SafeBag(e.to_string()))?;
     let seed = bag
         .decrypt_ed25519_seed(passphrase)
-        .map_err(|e| JoinError::SafeBag(e.to_string()))?;
+        .map_err(|e| EnrollError::SafeBag(e.to_string()))?;
     Ok(RestoredIdentity {
         seed,
         cert_wire: bag.certificate.clone(),
@@ -157,26 +157,26 @@ pub fn save_enclave_identity(
     path: &Path,
     key_handle: &str,
     cert_wire: &Bytes,
-) -> Result<(), JoinError> {
+) -> Result<(), EnrollError> {
     let mut buf = Vec::with_capacity(4 + key_handle.len() + cert_wire.len());
     buf.extend_from_slice(&(key_handle.len() as u32).to_be_bytes());
     buf.extend_from_slice(key_handle.as_bytes());
     buf.extend_from_slice(cert_wire);
-    std::fs::write(path, buf).map_err(|e| JoinError::Io(e.to_string()))
+    std::fs::write(path, buf).map_err(|e| EnrollError::Io(e.to_string()))
 }
 
 /// Reload an enclave identity persisted by [`save_enclave_identity`].
-pub fn load_enclave_identity(path: &Path) -> Result<EnclaveIdentity, JoinError> {
-    let buf = std::fs::read(path).map_err(|e| JoinError::Io(e.to_string()))?;
+pub fn load_enclave_identity(path: &Path) -> Result<EnclaveIdentity, EnrollError> {
+    let buf = std::fs::read(path).map_err(|e| EnrollError::Io(e.to_string()))?;
     if buf.len() < 4 {
-        return Err(JoinError::Cert("enclave identity file truncated".into()));
+        return Err(EnrollError::Cert("enclave identity file truncated".into()));
     }
     let hl = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
     if buf.len() < 4 + hl {
-        return Err(JoinError::Cert("enclave identity handle truncated".into()));
+        return Err(EnrollError::Cert("enclave identity handle truncated".into()));
     }
     let key_handle = String::from_utf8(buf[4..4 + hl].to_vec())
-        .map_err(|_| JoinError::Cert("enclave key handle is not UTF-8".into()))?;
+        .map_err(|_| EnrollError::Cert("enclave key handle is not UTF-8".into()))?;
     Ok(EnclaveIdentity {
         key_handle,
         cert_wire: Bytes::copy_from_slice(&buf[4 + hl..]),
@@ -261,7 +261,7 @@ mod tests {
         let challenges: Vec<Box<dyn ChallengeHandler>> = vec![Box::new(TokenChallenge::new(store))];
         let config = CaConfig::new(
             "/home/bob/CA".parse().unwrap(),
-            "native-join test CA".into(),
+            "native-enroll test CA".into(),
             Duration::from_secs(86_400),
             Duration::from_secs(7 * 86_400),
             challenges,
@@ -299,7 +299,7 @@ mod tests {
 
         // Persist as a SafeBag and reload.
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("ndn-native-join-{}.safebag", std::process::id()));
+        let path = dir.join(format!("ndn-native-enroll-{}.safebag", std::process::id()));
         let pw = b"correct horse battery staple";
         save_software_safebag(&path, &seed, &joined.cert_wire, pw).expect("persist safebag");
 
@@ -329,7 +329,7 @@ mod tests {
         let err = enroll_via_token(&mut ca, &ca_prefix(), signer, "guessed-wrong", 86_400)
             .await
             .expect_err("a wrong token must not yield a certificate");
-        assert!(matches!(err, JoinError::Protocol(_)));
+        assert!(matches!(err, EnrollError::Protocol(_)));
     }
 
     /// Enclave persistence tier: cert + key-handle round-trips (no SafeBag — an

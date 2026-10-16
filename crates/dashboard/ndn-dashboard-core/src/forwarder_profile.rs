@@ -39,7 +39,7 @@ pub enum ForwarderProfile {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Extension {
-    DemoCa,
+    EmbeddedCa,
     WebTransport,
     WebRtcInbound,
     SharedWorkerFace,
@@ -108,7 +108,7 @@ impl ForwarderProfile {
     pub fn known_extensions(self) -> &'static [Extension] {
         match self {
             ForwarderProfile::NdnFwd => &[
-                Extension::DemoCa,
+                Extension::EmbeddedCa,
                 Extension::WebTransport,
                 Extension::WebRtcInbound,
                 Extension::SharedWorkerFace,
