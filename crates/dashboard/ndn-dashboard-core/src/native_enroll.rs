@@ -233,10 +233,11 @@ mod tests {
                     .ok_or_else(|| proto("CHALLENGE interest has no params".into()))?;
                 self.state.handle_challenge(&request_id, params).await?
             } else {
-                // Cert fetch — the served cert is already a Data wire.
+                // Cert fetch — the served cert is already a Data wire; a
+                // CanBePrefix Interest for a key name gets its newest one.
                 let wire = self
                     .state
-                    .get_served_cert(&interest.name.to_string())
+                    .cert_for_interest(&interest.name, interest.selectors().can_be_prefix)
                     .ok_or_else(|| proto(format!("no served cert {}", interest.name)))?;
                 return Data::decode(Bytes::from(wire))
                     .map_err(|e| proto(format!("decode served cert: {e:?}")));
