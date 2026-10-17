@@ -84,11 +84,12 @@ fn load_blob() -> Option<Vec<SavedIdentity>> {
 #[cfg(feature = "desktop")]
 fn save_blob(all: &[SavedIdentity]) -> Result<(), String> {
     let path = store_path();
+    // Holds passphrase-encrypted SafeBags: owner-only dir and file.
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        ndn_security::secure_fs::create_private_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let json = serde_json::to_string_pretty(all).map_err(|e| e.to_string())?;
-    std::fs::write(&path, json).map_err(|e| e.to_string())
+    ndn_security::secure_fs::write_private(&path, json).map_err(|e| e.to_string())
 }
 
 #[cfg(all(feature = "web", not(feature = "desktop")))]
