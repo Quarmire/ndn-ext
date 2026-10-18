@@ -368,27 +368,31 @@ impl<M: ManagementClient> DashboardEngine<M> {
             .await
     }
 
-    /// Approve a pending device-approval request by id. Signed command.
-    pub async fn ca_approve(&mut self, request_id: &str) -> Result<MgmtResponse, String> {
+    /// Approve the pending request for an admin's approval that `target`
+    /// names: its request id or its six-digit verification code. Signed
+    /// command; the forwarder accepts it only from a local operator, and on
+    /// an admin device decides with its admin key at the namespace's CA.
+    pub async fn ca_approve(&mut self, target: &str) -> Result<MgmtResponse, String> {
         let params = ControlParameters {
-            uri: Some(request_id.to_owned()),
+            uri: Some(target.to_owned()),
             ..Default::default()
         };
         self.client.send_cmd("ca", "approve", Some(&params)).await
     }
 
-    /// Deny a pending request by id. An empty `reason` records the default
-    /// denial detail. Signed command. The id/reason are joined as
-    /// `id:reason` to match the forwarder's `ca/deny` parameter shape.
+    /// Deny the pending request `target` names (request id or code), with
+    /// `reason` (empty: "no reason given"), told to the requesting device.
+    /// Signed command. The target and reason are joined as `target:reason`
+    /// to match the forwarder's `ca/deny` parameter shape.
     pub async fn ca_deny(
         &mut self,
-        request_id: &str,
+        target: &str,
         reason: &str,
     ) -> Result<MgmtResponse, String> {
         let uri = if reason.is_empty() {
-            request_id.to_owned()
+            target.to_owned()
         } else {
-            format!("{request_id}:{reason}")
+            format!("{target}:{reason}")
         };
         let params = ControlParameters {
             uri: Some(uri),
@@ -591,8 +595,15 @@ mod tests {
 
         let wire = ndn_mgmt_wire::PendingApproval::encode_all(&[ndn_mgmt_wire::PendingApproval {
             request_id: "req-1".into(),
-            cert_name: "/lab/alice/devices/laptop".into(),
-            description: "laptop".into(),
+            key_name: "/lab/alice/admin/laptop/KEY/k1".into(),
+            namespace: "/lab/alice".into(),
+            role: "admin".into(),
+            device: "laptop".into(),
+            code: "482 913".into(),
+            state: "pending".into(),
+            created_secs: 1,
+            expires_secs: 2,
+            ..Default::default()
         }]);
         let mut engine = DashboardEngine::new(IdMock(wire));
 
@@ -609,6 +620,7 @@ mod tests {
         let id = engine.identity_state();
         assert_eq!(id.approvals.len(), 1);
         assert_eq!(id.approvals[0].request_id, "req-1");
+        assert_eq!(id.approvals[0].code, "482 913");
         assert_eq!(id.identities.len(), 1);
         assert_eq!(id.identities[0].name, "/lab/alice");
         assert!(id.identities[0].has_cert);
