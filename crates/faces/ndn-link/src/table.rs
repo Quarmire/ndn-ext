@@ -1,9 +1,13 @@
-//! The live links: one per device pair, which one stays when both dial,
-//! links to make again after an enrollment, and links a revocation ends.
+//! The live links: one per device pair, each with its paths (the link
+//! dialled or accepted, and a direct path a punch made), which one stays
+//! when both dial, links to make again after an enrollment, and links a
+//! revocation ends.
 
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use parking_lot::Mutex;
 
@@ -14,6 +18,7 @@ use ndn_transport::FaceId;
 
 use crate::admission::Identity;
 use crate::peer::PeerId;
+use crate::status::{PathKind, PathStatus};
 
 /// Which link stays when a link to a device that is already linked comes
 /// up: each side dialled the other (the directions differ), and both keep
@@ -39,26 +44,36 @@ pub(crate) struct LinkPath {
     pub(crate) face: FaceId,
     pub(crate) handle: LinkHandle,
     pub(crate) direction: Direction,
+    /// [`PathKind::Link`] or [`PathKind::Direct`].
+    pub(crate) kind: PathKind,
+    /// The address of this side's socket.
+    pub(crate) local: Option<SocketAddr>,
+    pub(crate) since: Instant,
+}
+
+/// A path as the table keeps it.
+struct LivePath {
+    path: LinkPath,
+    generation: u64,
 }
 
 /// A link to one device, by its key.
 struct LiveLink {
-    generation: u64,
     peer: Option<PeerId>,
     identity: Option<Identity>,
     /// The namespaces this link is an enrollment link for, on either side,
     /// for this device's enrollment: once this device enrolls in one, the
     /// link is made again as a full link.
     enrolling: Vec<Name>,
-    /// The paths of the link; one today (the one-link rule keeps one
-    /// connection per device pair).
-    paths: Vec<LinkPath>,
+    /// Its paths: at most one of each kind (the one-link rule applies per
+    /// kind).
+    paths: Vec<LivePath>,
 }
 
 impl LiveLink {
     fn close(&self, reason: CloseReason, text: &str) {
-        for path in &self.paths {
-            path.handle.close(reason, text);
+        for p in &self.paths {
+            p.path.handle.close(reason, text);
         }
     }
 }
@@ -72,6 +87,14 @@ pub(crate) struct Registration {
     pub(crate) path: LinkPath,
 }
 
+/// A live link as [`LinkTable::views`] reports it.
+pub(crate) struct LinkView {
+    pub(crate) fingerprint: KeyFingerprint,
+    pub(crate) peer: Option<PeerId>,
+    pub(crate) device: Option<Name>,
+    pub(crate) paths: Vec<PathStatus>,
+}
+
 #[derive(Default)]
 pub(crate) struct LinkTable {
     live: Mutex<HashMap<KeyFingerprint, LiveLink>>,
@@ -82,55 +105,140 @@ pub(crate) struct LinkTable {
 }
 
 const ALREADY_LINKED: &str = "a link between these two devices already exists";
+const ALREADY_DIRECT: &str = "a newer direct path between these two devices took this one's place";
 
 impl LinkTable {
-    /// Record an admitted link and return its generation; `None` when the
-    /// link already in place stays and this one was closed instead.
+    /// Record an admitted path and return its generation; `None` when the
+    /// path of its kind already in place stays and this one was closed
+    /// instead. A path of another kind joins the link: a direct path is a
+    /// second path of the link to that device, not a link of its own.
     pub(crate) fn register(&self, link: Registration, mine: Option<KeyFingerprint>) -> Option<u64> {
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let kind = link.path.kind;
+        let text = match kind {
+            PathKind::Direct => ALREADY_DIRECT,
+            _ => ALREADY_LINKED,
+        };
         let mut live = self.live.lock();
-        if let Some(existing) = live.get(&link.fingerprint) {
-            if existing
-                .paths
-                .iter()
-                .any(|p| keeps_existing(p.direction, link.path.direction, mine, link.fingerprint))
-            {
-                link.path.handle.close(CloseReason::Replaced, ALREADY_LINKED);
-                return None;
-            }
-            existing.close(CloseReason::Replaced, ALREADY_LINKED);
+        let new = LivePath {
+            path: link.path,
+            generation,
+        };
+        let Some(existing) = live.get_mut(&link.fingerprint) else {
+            live.insert(
+                link.fingerprint,
+                LiveLink {
+                    peer: link.peer,
+                    identity: link.identity,
+                    enrolling: link.enrolling,
+                    paths: vec![new],
+                },
+            );
+            return Some(generation);
+        };
+        if existing
+            .paths
+            .iter()
+            .filter(|p| p.path.kind == kind)
+            .any(|p| keeps_existing(p.path.direction, new.path.direction, mine, link.fingerprint))
+        {
+            new.path.handle.close(CloseReason::Replaced, text);
+            return None;
         }
-        live.insert(
-            link.fingerprint,
-            LiveLink {
-                generation,
-                peer: link.peer,
-                identity: link.identity,
-                enrolling: link.enrolling,
-                paths: vec![link.path],
-            },
-        );
+        for p in existing.paths.iter().filter(|p| p.path.kind == kind) {
+            p.path.handle.close(CloseReason::Replaced, text);
+        }
+        existing.paths.retain(|p| p.path.kind != kind);
+        if link.peer.is_some() {
+            existing.peer = link.peer;
+        }
+        if link.identity.is_some() {
+            existing.identity = link.identity;
+        }
+        if kind == PathKind::Link {
+            existing.enrolling = link.enrolling;
+        }
+        existing.paths.push(new);
         Some(generation)
     }
 
-    /// The link of `generation` to `fingerprint` ended.
+    /// The path of `generation` to `fingerprint` ended; the link ends with
+    /// its last path.
     pub(crate) fn unregister(&self, fingerprint: KeyFingerprint, generation: u64) {
         let mut live = self.live.lock();
-        if live
-            .get(&fingerprint)
-            .is_some_and(|l| l.generation == generation)
-        {
-            live.remove(&fingerprint);
+        if let Some(link) = live.get_mut(&fingerprint) {
+            link.paths.retain(|p| p.generation != generation);
+            if link.paths.is_empty() {
+                live.remove(&fingerprint);
+            }
         }
     }
 
-    /// The live link to `peer`, if any.
+    /// The live link path of kind [`PathKind::Link`] to `peer`, if any (the
+    /// one its dial loop keeps).
     pub(crate) fn link_to(&self, peer: PeerId) -> Option<LinkHandle> {
+        self.path_to(|l, _| l.peer == Some(peer), PathKind::Link)
+    }
+
+    /// The direct path to the device with key `fingerprint`, or to `peer`.
+    pub(crate) fn direct_to(&self, fingerprint: Option<KeyFingerprint>, peer: Option<PeerId>) -> Option<LinkHandle> {
+        self.path_to(
+            |l, fp| Some(*fp) == fingerprint || (peer.is_some() && l.peer == peer),
+            PathKind::Direct,
+        )
+    }
+
+    fn path_to(&self, matches: impl Fn(&LiveLink, &KeyFingerprint) -> bool, kind: PathKind) -> Option<LinkHandle> {
         let live = self.live.lock();
-        live.values()
-            .find(|l| l.peer == Some(peer))
-            .and_then(|l| l.paths.first())
-            .map(|p| p.handle.clone())
+        live.iter()
+            .filter(|(fp, l)| matches(l, fp))
+            .flat_map(|(_, l)| l.paths.iter())
+            .find(|p| p.path.kind == kind)
+            .map(|p| p.path.handle.clone())
+    }
+
+    /// The addresses linked devices see this device at, through the socket
+    /// bound at `local`: its reflexive candidates there. From full links
+    /// only (an enrollment link's other side is not confirmed).
+    pub(crate) fn observed(&self, local: SocketAddr) -> Vec<SocketAddr> {
+        let live = self.live.lock();
+        let mut out: Vec<SocketAddr> = Vec::new();
+        for link in live.values().filter(|l| l.enrolling.is_empty()) {
+            for p in &link.paths {
+                if p.path.local == Some(local)
+                    && let Some(addr) = p.path.handle.observed_address()
+                    && !out.contains(&addr)
+                {
+                    out.push(addr);
+                }
+            }
+        }
+        out
+    }
+
+    /// Every live link with its paths, for status.
+    pub(crate) fn views(&self) -> Vec<LinkView> {
+        let now = Instant::now();
+        let live = self.live.lock();
+        live.iter()
+            .map(|(fp, l)| LinkView {
+                fingerprint: *fp,
+                peer: l.peer,
+                device: l.identity.as_ref().map(|id| id.device.clone()),
+                paths: l
+                    .paths
+                    .iter()
+                    .map(|p| PathStatus {
+                        kind: p.path.kind,
+                        face: p.path.face,
+                        remote: Some(p.path.handle.remote_address()),
+                        rtt: Some(p.path.handle.rtt()),
+                        age: now.saturating_duration_since(p.path.since),
+                        via: None,
+                    })
+                    .collect(),
+            })
+            .collect()
     }
 
     /// This device switched to the key certified by `certificate`: close
@@ -151,8 +259,8 @@ impl LinkTable {
                 let text = format!(
                     "this device enrolled in {ns} ({certificate}); it links again as an enrolled device"
                 );
-                for path in &link.paths {
-                    closing.push((path.handle.clone(), path.face, link.peer, text.clone()));
+                for p in &link.paths {
+                    closing.push((p.path.handle.clone(), p.path.face, link.peer, text.clone()));
                 }
             }
         }
@@ -189,8 +297,8 @@ impl LinkTable {
                     ctx.namespace(),
                     ctx.version()
                 );
-                for path in &link.paths {
-                    tracing::warn!(target: "face.quic", face = path.face.0, peer = %id.device, "{text}");
+                for p in &link.paths {
+                    tracing::warn!(target: "face.quic", face = p.path.face.0, peer = %id.device, "{text}");
                 }
                 link.close(CloseReason::Revoked, &text);
             }

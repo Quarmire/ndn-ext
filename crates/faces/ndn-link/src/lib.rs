@@ -94,29 +94,41 @@
 //!
 //! # Direct paths
 //!
-//! A link is one QUIC connection today, on the first path that answers. A
-//! peer behind a NAT is reached through a relay: routes over the relay's
-//! link at [`policy::VIA_RELAY_COST`], so a direct link, when one comes up,
-//! wins. Direct paths to such peers (address discovery and NAT hole
-//! punching, the relay as fallback) belong here: a [`PathSource`] that
-//! learns a peer's addresses yields them as [`PathCandidate::Address`], and
-//! each live link already keeps its paths as a list, so a second path to
-//! the same device becomes a path of that link rather than a link of its
-//! own.
+//! A peer behind a NAT is reached through a relay: routes over the relay's
+//! link at [`policy::VIA_RELAY_COST`]. For each peer reached through a relay
+//! whose `device` its [`PeerSpec`] names, this device punches a direct
+//! path: a signed punch Interest to `<device>/32=link/32=punch/<session>`
+//! through the relay carries its candidate addresses ([`CandidateSource`]s,
+//! plus the reflexive addresses its links report); the peer, having
+//! admitted the sender as it would a link, answers with its own in signed
+//! Data; both probe each other's signed candidates from their link sockets;
+//! the device with the smaller fingerprint dials. The connection is admitted
+//! like a link and joins the link to that device as its direct path, with
+//! routes at cost 0; the relay's routes stay, so traffic falls back when
+//! it ends, and the device punches again with backoff. The link policy
+//! (`direct_paths`) and [`PeerSpec::direct`] turn it off. [`Links::report`]
+//! says, per device, which paths are up and why a direct path is not.
 
 #![cfg(not(target_arch = "wasm32"))]
 
 mod admission;
+mod candidates;
+mod direct;
 mod host;
 mod links;
 mod peer;
 pub mod policy;
+mod punch;
 mod routes;
+mod signal;
 mod slots;
+mod status;
 mod table;
 
+pub use candidates::{AdvertisedCandidates, Candidate, CandidateKind, CandidateSource, HostCandidates};
 pub use host::{ConfiguredEndpoints, FaceSink, LinkHints, LinkTrust, PathCandidate, PathSource, Route};
 pub use links::{LinkSetup, Links};
 pub use peer::{PeerId, PeerSpec};
 pub use policy::Backoff;
+pub use status::{DirectState, DirectStatus, LinkReport, LinkStatus, PathKind, PathStatus};
 pub use table::keeps_existing;

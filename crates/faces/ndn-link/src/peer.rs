@@ -21,7 +21,9 @@ pub struct PeerSpec {
     pub device: Option<Name>,
     /// `host:port` endpoints to dial, in order.
     pub endpoints: Vec<String>,
-    /// The peer this one is reached through.
+    /// The peer this one is reached through. A peer reached through a relay
+    /// that names its `device` gets a direct path when the networks allow
+    /// it (unless `direct` is false).
     pub relay: Option<PeerId>,
     /// The routes over its link, instead of the default ones.
     pub routes: Option<Vec<Name>>,
@@ -29,6 +31,9 @@ pub struct PeerSpec {
     pub persistent: bool,
     /// NDNLPv2 reliability on its link.
     pub reliability: bool,
+    /// Direct paths with it: this device punches them when it is reached
+    /// through a relay, and admits its punches. `false` turns both off.
+    pub direct: bool,
 }
 
 /// The configured peers, with which of them other peers are reached

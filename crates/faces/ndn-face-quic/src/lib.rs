@@ -29,6 +29,15 @@
 //!   keeps a link across an address change ([`LinkEndpoint::rebind`]).
 //!   Inbound attempts are bounded before their handshake
 //!   ([`HandshakeLimits`]).
+//! - **Direct paths.** Each side tells the other the address it sees it at
+//!   ([`LinkHandle::observed_address`]), which is how a device behind a NAT
+//!   learns its address beyond it. The link socket sends and receives the
+//!   probes of a hole punch ([`LinkEndpoint::send_probe`],
+//!   [`LinkEndpoint::watch_probes`]), accepts the punched connection even
+//!   when it does not listen ([`LinkEndpoint::allow_inbound`]), and dials it
+//!   ([`LinkEndpoint::connect_direct`]); the dialer names the punch in its
+//!   hello ([`LinkHello::direct_path`]). When and where to punch is the
+//!   `ndn-link` crate's.
 //!
 //! Crypto is rustls on the **ring** provider, the stack ndn-rs already uses.
 
@@ -38,13 +47,18 @@ mod endpoint;
 mod key;
 mod link;
 mod message;
+mod probe;
 mod scope;
 mod verify;
 
-pub use endpoint::{ALPN_LINK, HandshakeLimits, Incoming, LinkEndpoint, LinkTransportConfig};
+pub use endpoint::{ALPN_LINK, HandshakeLimits, InboundWindow, Incoming, LinkEndpoint, LinkTransportConfig};
 pub use key::{KeyError, KeyFingerprint, LinkKey, LinkKeyAlgorithm, LinkKeySource, PeerKey};
 pub use link::{
     Admission, DATAGRAM_FLOOR, Direction, Handshaken, Link, LinkError, LinkFace, LinkHandle,
 };
-pub use message::{CloseReason, LINK_PROTOCOL_VERSION, LinkHello, LinkVerdict};
+pub use message::{
+    CloseReason, LINK_PROTOCOL_VERSION, LinkHello, LinkVerdict, PathSession, decode_udp_address,
+    encode_udp_address,
+};
+pub use probe::{PROBE_LEN, ProbeWatch, decode_probe, encode_probe};
 pub use scope::{Carries, LinkScope, RateLimit};

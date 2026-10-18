@@ -657,6 +657,7 @@ mod tests {
             routes: None,
             persistent: false,
             reliability: false,
+            direct: true,
         }
     }
 
@@ -780,6 +781,7 @@ mod tests {
         let cert = tlv(t::DATA, &[signed, tlv(t::SIGNATURE_VALUE, digest.as_slice())].concat());
         let hello = LinkHello {
             certificates: vec![Bytes::from(cert)],
+            direct_path: None,
         };
 
         let trust = Bare(Arc::new(keyring), None);

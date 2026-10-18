@@ -1,5 +1,9 @@
 //! One UDP socket for this device's QUIC links: it dials, and (when the
 //! device listens) accepts, with this device's NDN key as its TLS identity.
+//! The same socket sends and receives the probes of direct-path punches,
+//! and a socket that does not listen accepts the direct paths of a punch
+//! from the punched device's candidate addresses only, while that punch
+//! runs.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -12,7 +16,8 @@ use sha2::{Digest, Sha256};
 
 use crate::key::{KeyFingerprint, LinkKeySource};
 use crate::link::{Direction, Handshaken, LinkError};
-use crate::message::CloseReason;
+use crate::message::{CloseReason, PathSession};
+use crate::probe::{ProbeSocket, ProbeTap, ProbeWatch};
 use crate::verify::{DialerKeyVerifier, KeyResolver, ListenerKeyVerifier, Presented};
 
 /// ALPN of the link protocol. A listener speaking anything else (an older
@@ -36,6 +41,14 @@ pub struct LinkTransportConfig {
     /// listens answers nothing (QUIC ignores ICMP), so without it a dial
     /// would wait out the idle timeout.
     pub handshake_timeout: Duration,
+    /// Keep-alive of a direct path this device dials. Shorter than
+    /// `keep_alive`: a direct path crosses NATs that keep a mapping only
+    /// while packets flow, and its loss is noticed sooner, so traffic falls
+    /// back to the relay sooner.
+    pub direct_keep_alive: Duration,
+    /// Idle timeout a dialled direct path offers; a connection takes the
+    /// smaller of both sides' offers, so it applies to both sides.
+    pub direct_idle_timeout: Duration,
     /// Bounds on handshakes not yet admitted.
     pub limits: HandshakeLimits,
 }
@@ -46,6 +59,8 @@ impl Default for LinkTransportConfig {
             keep_alive: Duration::from_secs(10),
             idle_timeout: Duration::from_secs(30),
             handshake_timeout: Duration::from_secs(5),
+            direct_keep_alive: Duration::from_secs(2),
+            direct_idle_timeout: Duration::from_secs(8),
             limits: HandshakeLimits::default(),
         }
     }
@@ -197,20 +212,37 @@ fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
+/// Which addresses a socket that does not listen accepts direct paths from,
+/// while punches run: each address with the number of punches expecting it.
+#[derive(Default)]
+struct Expected {
+    from: HashMap<SocketAddr, usize>,
+    windows: usize,
+}
+
 /// A link endpoint: one UDP socket that dials links and, when bound as a
 /// listener, accepts them.
 pub struct LinkEndpoint {
     endpoint: quinn::Endpoint,
+    socket: Mutex<Arc<ProbeSocket>>,
+    probes: Arc<ProbeTap>,
     key: Arc<dyn LinkKeySource>,
     transport: Arc<quinn::TransportConfig>,
+    direct_transport: Arc<quinn::TransportConfig>,
     handshake_timeout: Duration,
     gate: Arc<Gate>,
     listening: bool,
+    /// The server side of a direct path: a socket that does not listen
+    /// accepts with it only while an [`InboundWindow`] is open.
+    direct_server: quinn::ServerConfig,
+    expected: Arc<Mutex<Expected>>,
 }
 
 impl LinkEndpoint {
     /// Bind `addr`. With `listen`, inbound links are accepted
-    /// ([`accept`](Self::accept)); without, the socket only dials.
+    /// ([`accept`](Self::accept)); without, the socket dials, and accepts
+    /// only the direct paths of the punches it runs
+    /// ([`allow_inbound`](Self::allow_inbound)).
     pub fn bind(
         addr: SocketAddr,
         key: Arc<dyn LinkKeySource>,
@@ -219,24 +251,36 @@ impl LinkEndpoint {
     ) -> Result<Self, LinkError> {
         // Fail at bind, with the reason, when this device has no usable key.
         let current = key.current().map_err(|e| LinkError::NoLinkKey(e.to_string()))?;
-        let transport = Arc::new(transport_config(config));
-        let server_config = listen
+        let transport = Arc::new(transport_config(config.keep_alive, config.idle_timeout));
+        let direct_transport = Arc::new(transport_config(config.direct_keep_alive, config.direct_idle_timeout));
+        let server = listen
             .then(|| server_config(Arc::clone(&key), Arc::clone(&transport)))
             .transpose()?;
-        let socket = std::net::UdpSocket::bind(addr)?;
-        let endpoint = quinn::Endpoint::new(
+        let direct_server = server_config(Arc::clone(&key), Arc::clone(&direct_transport))?;
+        let runtime: Arc<dyn quinn::Runtime> = Arc::new(quinn::TokioRuntime);
+        let probes = Arc::new(ProbeTap::default());
+        let socket = Arc::new(ProbeSocket::new(
+            runtime.wrap_udp_socket(std::net::UdpSocket::bind(addr)?)?,
+            Arc::clone(&probes),
+        ));
+        let endpoint = quinn::Endpoint::new_with_abstract_socket(
             endpoint_config(&current),
-            server_config,
-            socket,
-            Arc::new(quinn::TokioRuntime),
+            server,
+            Arc::clone(&socket) as Arc<dyn quinn::AsyncUdpSocket>,
+            runtime,
         )?;
         Ok(Self {
             endpoint,
+            socket: Mutex::new(socket),
+            probes,
             key,
             transport,
+            direct_transport,
             handshake_timeout: config.handshake_timeout,
             gate: Gate::new(config.limits.clone()),
             listening: listen,
+            direct_server,
+            expected: Arc::new(Mutex::new(Expected::default())),
         })
     }
 
@@ -255,8 +299,26 @@ impl LinkEndpoint {
         addr: SocketAddr,
         expected: Option<KeyFingerprint>,
     ) -> Result<Handshaken, LinkError> {
+        self.connect_with(addr, expected, Arc::clone(&self.transport)).await
+    }
+
+    /// Dial a direct path to `addr`, a candidate address of the device with
+    /// key `expected`, whose punch opened the way: the handshake fails
+    /// unless that device answers, and the path keeps itself alive with
+    /// the direct-path keep-alive and idle timeout.
+    pub async fn connect_direct(&self, addr: SocketAddr, expected: KeyFingerprint) -> Result<Handshaken, LinkError> {
+        self.connect_with(addr, Some(expected), Arc::clone(&self.direct_transport))
+            .await
+    }
+
+    async fn connect_with(
+        &self,
+        addr: SocketAddr,
+        expected: Option<KeyFingerprint>,
+        transport: Arc<quinn::TransportConfig>,
+    ) -> Result<Handshaken, LinkError> {
         let presented = Arc::new(Presented::default());
-        let config = self.client_config(expected, Arc::clone(&presented))?;
+        let config = self.client_config(expected, Arc::clone(&presented), transport)?;
         let connecting = self
             .endpoint
             .connect_with(config, addr, SERVER_NAME)
@@ -284,6 +346,51 @@ impl LinkEndpoint {
         Handshaken::new(connection, Direction::Dialed, None, self.endpoint.local_addr().ok())
     }
 
+    /// Send the probe of a punch's `session` to `to` from this socket.
+    /// Delivery is best effort, like any UDP datagram's.
+    pub async fn send_probe(&self, to: SocketAddr, session: &PathSession) -> std::io::Result<()> {
+        let socket = Arc::clone(&self.socket.lock().unwrap_or_else(PoisonError::into_inner));
+        socket.send_probe(to, session).await
+    }
+
+    /// The probes of `session` this socket receives, until the watch is
+    /// dropped. Probes of sessions nobody watches are dropped.
+    pub fn watch_probes(&self, session: PathSession) -> ProbeWatch {
+        self.probes.watch(session)
+    }
+
+    /// Accept the direct paths of a punch from `from` (the punched device's
+    /// candidate addresses) while the returned window is open. A socket
+    /// that listens accepts every link anyway; one that does not answers
+    /// nothing else, not even a refusal.
+    pub fn allow_inbound(&self, from: &[SocketAddr]) -> InboundWindow {
+        let from: Vec<SocketAddr> = from.iter().map(|a| canonical(*a)).collect();
+        let mut expected = self.expected.lock().unwrap_or_else(PoisonError::into_inner);
+        for addr in &from {
+            *expected.from.entry(*addr).or_default() += 1;
+        }
+        expected.windows += 1;
+        if !self.listening && expected.windows == 1 {
+            self.endpoint.set_server_config(Some(self.direct_server.clone()));
+        }
+        InboundWindow {
+            endpoint: self.endpoint.clone(),
+            expected: Arc::clone(&self.expected),
+            listening: self.listening,
+            from,
+        }
+    }
+
+    /// Whether a socket that does not listen takes a connection from
+    /// `remote` now: a punch expects it.
+    fn expects(&self, remote: SocketAddr) -> bool {
+        self.expected
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .from
+            .contains_key(&canonical(remote))
+    }
+
     /// The next inbound link that completed its handshake. Attempts over the
     /// [`HandshakeLimits`] are refused before their handshake; a handshake
     /// that fails is logged and skipped. `None` once the endpoint is closed.
@@ -291,6 +398,12 @@ impl LinkEndpoint {
         loop {
             let incoming = self.endpoint.accept().await?;
             let remote = incoming.remote_address();
+            let punched = self.expects(remote);
+            if !self.listening && !punched {
+                // Not listening: as if nothing were here.
+                incoming.ignore();
+                continue;
+            }
             // Under load, make a source prove its address (a Retry round
             // trip) before it costs a handshake.
             if self.gate.busy() && !incoming.remote_address_validated() && incoming.may_retry() {
@@ -305,6 +418,9 @@ impl LinkEndpoint {
                         incoming,
                         permit,
                         local: self.endpoint.local_addr().ok(),
+                        // A punch expects it: the connection is kept alive
+                        // as a direct path.
+                        server: punched.then(|| Arc::new(self.direct_server.clone())),
                     });
                 }
                 Err(why) => {
@@ -323,7 +439,14 @@ impl LinkEndpoint {
     /// Move the endpoint to another socket (an address change of this
     /// device): its links migrate with it.
     pub fn rebind(&self, socket: std::net::UdpSocket) -> std::io::Result<()> {
-        self.endpoint.rebind(socket)
+        let wrapped = Arc::new(ProbeSocket::new(
+            quinn::Runtime::wrap_udp_socket(&quinn::TokioRuntime, socket)?,
+            Arc::clone(&self.probes),
+        ));
+        self.endpoint
+            .rebind_abstract(Arc::clone(&wrapped) as Arc<dyn quinn::AsyncUdpSocket>)?;
+        *self.socket.lock().unwrap_or_else(PoisonError::into_inner) = wrapped;
+        Ok(())
     }
 
     /// Close every link with `reason` and wait (up to `grace`) until the
@@ -338,6 +461,7 @@ impl LinkEndpoint {
         &self,
         expected: Option<KeyFingerprint>,
         presented: Arc<Presented>,
+        transport: Arc<quinn::TransportConfig>,
     ) -> Result<quinn::ClientConfig, LinkError> {
         let provider = provider();
         let mut tls = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
@@ -357,8 +481,40 @@ impl LinkEndpoint {
         let quic = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
             .map_err(|e| LinkError::Tls(e.to_string()))?;
         let mut config = quinn::ClientConfig::new(Arc::new(quic));
-        config.transport_config(Arc::clone(&self.transport));
+        config.transport_config(transport);
         Ok(config)
+    }
+}
+
+/// An address as sockets compare it: an IPv4-mapped IPv6 address as IPv4.
+fn canonical(addr: SocketAddr) -> SocketAddr {
+    SocketAddr::new(addr.ip().to_canonical(), addr.port())
+}
+
+/// A punch's permission for its direct paths to come in
+/// ([`LinkEndpoint::allow_inbound`]); closed when dropped.
+pub struct InboundWindow {
+    endpoint: quinn::Endpoint,
+    expected: Arc<Mutex<Expected>>,
+    listening: bool,
+    from: Vec<SocketAddr>,
+}
+
+impl Drop for InboundWindow {
+    fn drop(&mut self) {
+        let mut expected = self.expected.lock().unwrap_or_else(PoisonError::into_inner);
+        for addr in &self.from {
+            if let Some(n) = expected.from.get_mut(addr) {
+                *n -= 1;
+                if *n == 0 {
+                    expected.from.remove(addr);
+                }
+            }
+        }
+        expected.windows -= 1;
+        if !self.listening && expected.windows == 0 {
+            self.endpoint.set_server_config(None);
+        }
     }
 }
 
@@ -368,6 +524,7 @@ pub struct Incoming {
     incoming: quinn::Incoming,
     permit: Permit,
     local: Option<SocketAddr>,
+    server: Option<Arc<quinn::ServerConfig>>,
 }
 
 impl Incoming {
@@ -377,10 +534,11 @@ impl Incoming {
 
     /// Complete the handshake.
     pub async fn handshake(self) -> Result<Handshaken, LinkError> {
-        let connecting = self
-            .incoming
-            .accept()
-            .map_err(|e| LinkError::from_connection(e))?;
+        let accepted = match self.server {
+            Some(server) => self.incoming.accept_with(server),
+            None => self.incoming.accept(),
+        };
+        let connecting = accepted.map_err(LinkError::from_connection)?;
         match connecting.await {
             Ok(connection) => {
                 Handshaken::new(connection, Direction::Accepted, Some(self.permit), self.local)
@@ -393,11 +551,11 @@ impl Incoming {
     }
 }
 
-fn transport_config(config: &LinkTransportConfig) -> quinn::TransportConfig {
+fn transport_config(keep_alive: Duration, idle_timeout: Duration) -> quinn::TransportConfig {
     let mut t = quinn::TransportConfig::default();
-    t.keep_alive_interval(Some(config.keep_alive));
+    t.keep_alive_interval(Some(keep_alive));
     t.max_idle_timeout(Some(
-        quinn::IdleTimeout::try_from(config.idle_timeout).unwrap_or(quinn::VarInt::from_u32(30_000).into()),
+        quinn::IdleTimeout::try_from(idle_timeout).unwrap_or(quinn::VarInt::from_u32(30_000).into()),
     ));
     // NDN packets ride datagrams; the one bidirectional stream is the link's
     // control stream, and no peer needs more.

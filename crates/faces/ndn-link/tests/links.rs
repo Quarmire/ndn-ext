@@ -1,6 +1,7 @@
 //! Two devices over loopback: a link admitted by expected keys gets its face
 //! and routes, and goes away when the link ends; a device nobody expects is
-//! refused and gets nothing.
+//! refused and gets nothing. (Each side also adds its signalling face, an
+//! app face; only link faces are counted here.)
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -15,7 +16,7 @@ use ndn_link::{
 };
 use ndn_packet::Name;
 use ndn_security::{Certificate, Ed25519Signer, Keyring};
-use ndn_transport::{Face, FaceId};
+use ndn_transport::{Face, FaceId, FaceKind};
 use tokio_util::sync::CancellationToken;
 
 fn key(seed: u8) -> LinkKey {
@@ -56,12 +57,17 @@ impl FaceSink for Recorder {
         FaceId(self.next.fetch_add(1, Ordering::SeqCst) + 1)
     }
     fn add_face(&self, face: Face, _: CancellationToken) {
-        self.live.lock().push(face.id());
+        if face.kind() == FaceKind::Quic {
+            self.live.lock().push(face.id());
+        }
     }
     fn remove_face(&self, face: FaceId) {
         self.live.lock().retain(|f| *f != face);
     }
     fn add_routes(&self, face: FaceId, routes: &[Route]) {
+        if !self.live.lock().contains(&face) {
+            return;
+        }
         self.routes
             .lock()
             .extend(routes.iter().map(|r| (face, r.clone())));
@@ -88,6 +94,7 @@ fn peer(key: KeyFingerprint, endpoint: Option<String>, routes: Option<Vec<Name>>
         routes,
         persistent: false,
         reliability: false,
+        direct: true,
     }
 }
 
@@ -106,6 +113,7 @@ fn start(key: LinkKey, peers: Vec<PeerSpec>, listen: bool, cancel: &Cancellation
             trust: Arc::new(NoTrust(Arc::new(Keyring::new()))),
             faces: Arc::clone(&faces) as Arc<dyn FaceSink>,
             paths: Arc::new(ConfiguredEndpoints),
+            candidates: Vec::new(),
             socket,
             transport,
             hints: hints(),

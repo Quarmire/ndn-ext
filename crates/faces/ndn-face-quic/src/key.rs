@@ -250,6 +250,18 @@ impl LinkKey {
         self.signer.key_name()
     }
 
+    /// The key as TLS carries it (its SubjectPublicKeyInfo); a device also
+    /// names itself with it in the signed messages of a direct-path punch.
+    pub fn spki(&self) -> &Bytes {
+        &self.spki
+    }
+
+    /// The NDN signer of this key: the key signs NDN packets too (the
+    /// signed Interest and Data of a direct-path punch).
+    pub fn signer(&self) -> &Arc<dyn Signer> {
+        &self.signer
+    }
+
     pub(crate) fn certified(&self) -> Arc<CertifiedKey> {
         Arc::new(CertifiedKey::new(
             vec![CertificateDer::from(self.spki.to_vec())],

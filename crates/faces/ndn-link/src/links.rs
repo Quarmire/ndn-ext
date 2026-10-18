@@ -1,15 +1,16 @@
-//! Running the links: accepting, dialling, establishing, and keeping them.
+//! Running the links: accepting, dialling, establishing, and keeping them,
+//! and their direct paths.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::sync::{Arc, OnceLock, Weak};
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
 use ndn_face_quic::{
     CloseReason, Handshaken, Incoming, KeyFingerprint, LinkEndpoint, LinkError, LinkHandle, LinkHello,
-    LinkKeySource, LinkTransportConfig,
+    LinkKeySource, LinkTransportConfig, PathSession,
 };
 use ndn_packet::Name;
 use ndn_transport::reliability::ReliabilityConfig;
@@ -17,11 +18,15 @@ use ndn_transport::{Face, FaceId, LpLinkService};
 use tokio_util::sync::CancellationToken;
 
 use crate::admission::{Admitted, Enrollment, Judge, list};
+use crate::candidates::CandidateSource;
+use crate::direct::{Direct, Whom, direct_loop};
 use crate::host::{FaceSink, LinkHints, LinkTrust, PathCandidate, PathSource};
 use crate::peer::{PeerId, PeerSpec, Peers};
 use crate::policy::{Backoff, ENROLLMENT_IDLE, MESSAGE_DEADLINE};
 use crate::routes::routes_for;
+use crate::signal::Signal;
 use crate::slots::EnrollmentSlots;
+use crate::status::{DirectState, DirectStatus, LinkReport, LinkStatus, PathKind, PathStatus};
 use crate::table::{LinkPath, LinkTable, Registration};
 
 /// What a host gives [`Links::start`].
@@ -34,6 +39,12 @@ pub struct LinkSetup {
     pub trust: Arc<dyn LinkTrust>,
     pub faces: Arc<dyn FaceSink>,
     pub paths: Arc<dyn PathSource>,
+    /// Where this device's own direct-path candidates come from, besides
+    /// the reflexive addresses its links report: its interfaces
+    /// ([`HostCandidates`](crate::HostCandidates)), configured addresses
+    /// ([`AdvertisedCandidates`](crate::AdvertisedCandidates)), a port
+    /// mapping.
+    pub candidates: Vec<Arc<dyn CandidateSource>>,
     /// The host's link socket, bound with the same `key` and `transport`:
     /// links are accepted on it when it listens, and dialled from it for
     /// its address family (so other devices see one address for this one).
@@ -44,33 +55,49 @@ pub struct LinkSetup {
     pub hints: LinkHints,
 }
 
+/// How a connection came to be, for [`Links::establish`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Origin {
+    /// This device dialled the peer.
+    Dialed(PeerId),
+    /// Another device dialled this one.
+    Accepted,
+    /// This device dialled the direct path of a punch.
+    Direct(PathSession),
+}
+
 /// This device's links.
 pub struct Links {
-    key: Arc<dyn LinkKeySource>,
-    trust: Arc<dyn LinkTrust>,
+    pub(crate) key: Arc<dyn LinkKeySource>,
+    pub(crate) trust: Arc<dyn LinkTrust>,
     faces: Arc<dyn FaceSink>,
     paths: Arc<dyn PathSource>,
-    peers: Peers,
-    hints: LinkHints,
+    pub(crate) candidates: Vec<Arc<dyn CandidateSource>>,
+    pub(crate) peers: Peers,
+    pub(crate) hints: LinkHints,
     transport: LinkTransportConfig,
     socket: Option<Arc<LinkEndpoint>>,
     /// Dial-only sockets, by address family (`true`: IPv4).
     dialers: Mutex<HashMap<bool, Arc<LinkEndpoint>>>,
-    table: LinkTable,
+    pub(crate) table: LinkTable,
     enrollment_slots: EnrollmentSlots,
-    cancel: CancellationToken,
+    pub(crate) direct: Direct,
+    signal: OnceLock<Arc<Signal>>,
+    pub(crate) cancel: CancellationToken,
 }
 
 impl Links {
     /// Start: accept links on the socket when it listens, dial each peer
-    /// that has a path, and close links a newly adopted trust context
-    /// revokes. Everything stops at `cancel`.
+    /// that has a path, punch direct paths to the peers reached through a
+    /// relay, take the punches of others, and close links a newly adopted
+    /// trust context revokes. Everything stops at `cancel`.
     pub fn start(setup: LinkSetup, cancel: CancellationToken) -> Arc<Self> {
         let links = Arc::new(Self {
             key: setup.key,
             trust: setup.trust,
             faces: setup.faces,
             paths: setup.paths,
+            candidates: setup.candidates,
             peers: Peers::new(setup.peers),
             hints: setup.hints,
             transport: setup.transport,
@@ -78,8 +105,12 @@ impl Links {
             dialers: Mutex::new(HashMap::new()),
             table: LinkTable::default(),
             enrollment_slots: EnrollmentSlots::default(),
+            direct: Direct::default(),
+            signal: OnceLock::new(),
             cancel,
         });
+        let _ = links.signal.set(Signal::start(&links));
+        links.take_punches();
 
         let weak = Arc::downgrade(&links);
         links.trust.keyring().on_revocation(move |ctx, _| {
@@ -87,12 +118,17 @@ impl Links {
                 links.table.close_revoked(ctx);
             }
         });
-        if let Some(socket) = links.socket.as_ref().filter(|s| s.is_listening()) {
+        // Every socket accepts: a listening one any link, a dial-only one
+        // the direct paths of its punches.
+        if let Some(socket) = &links.socket {
             tokio::spawn(accept_loop(Arc::downgrade(&links), Arc::clone(socket)));
         }
         for (id, peer) in links.peers.iter() {
             if !links.paths.candidates(id, peer).is_empty() {
                 tokio::spawn(dial_loop(Arc::downgrade(&links), id));
+            }
+            if peer.relay.is_some() && peer.device.is_some() {
+                tokio::spawn(direct_loop(Arc::downgrade(&links), id));
             }
         }
         links
@@ -115,14 +151,131 @@ impl Links {
 
     /// This device switched to another key (it enrolled): close each
     /// enrollment link for a namespace that key is certified in, and dial it
-    /// again, now as an enrolled device.
+    /// again, now as an enrolled device; take punches under its new name.
     pub fn key_switched(&self) {
         if let Some(cert) = self.judge().own_certificate() {
             self.table.relink_enrolled(&cert.name);
         }
+        self.take_punches();
     }
 
-    fn judge(&self) -> Judge<'_> {
+    /// This device's links now: each device, its paths, and its direct
+    /// path's state.
+    pub fn report(&self) -> LinkReport {
+        let views = self.table.views();
+        let entries = self.direct.entries();
+        let mut used = vec![false; views.len()];
+        let mut links = Vec::new();
+        let direct_status = |whom: Whom, paths: &[PathStatus]| -> DirectStatus {
+            let mut status = entries.get(&whom).map(|e| e.status()).unwrap_or_default();
+            if let Some(p) = paths.iter().find(|p| p.kind == PathKind::Direct) {
+                status = DirectStatus {
+                    state: DirectState::Up,
+                    text: format!("direct path to {}", p.remote.map(|a| a.to_string()).unwrap_or_default()),
+                    retry_in: None,
+                };
+            }
+            status
+        };
+        for (id, peer) in self.peers.iter() {
+            let learned = entries.get(&Whom::Peer(id)).and_then(|e| e.key).or(peer.key);
+            let at = views
+                .iter()
+                .position(|v| v.peer == Some(id) || Some(v.fingerprint) == learned);
+            let mut paths = Vec::new();
+            let mut key = learned;
+            let mut device = peer.device.clone();
+            if let Some(i) = at {
+                used[i] = true;
+                paths.extend(views[i].paths.iter().cloned());
+                key = Some(views[i].fingerprint);
+                device = views[i].device.clone().or(device);
+            }
+            if let Some(relay) = peer.relay
+                && let Some(v) = views.iter().find(|v| v.peer == Some(relay))
+                && let Some(p) = v.paths.iter().find(|p| p.kind == PathKind::Link)
+            {
+                paths.push(PathStatus {
+                    kind: PathKind::Relay,
+                    via: Some(self.peers.get(relay).label.clone()),
+                    ..p.clone()
+                });
+            }
+            let direct = direct_status(Whom::Peer(id), &paths);
+            links.push(LinkStatus {
+                label: peer.label.clone(),
+                key,
+                device,
+                paths,
+                direct,
+            });
+        }
+        for (i, v) in views.iter().enumerate().filter(|(i, _)| !used[*i]) {
+            let _ = i;
+            links.push(LinkStatus {
+                label: v
+                    .device
+                    .as_ref()
+                    .map_or_else(|| format!("key {}", v.fingerprint), ToString::to_string),
+                key: Some(v.fingerprint),
+                device: v.device.clone(),
+                paths: v.paths.clone(),
+                direct: direct_status(Whom::Key(v.fingerprint), &v.paths),
+            });
+        }
+        for (whom, entry) in &entries {
+            let Whom::Key(fp) = whom else { continue };
+            if links.iter().any(|l| l.key == Some(*fp)) {
+                continue;
+            }
+            links.push(LinkStatus {
+                label: entry.label.clone(),
+                key: Some(*fp),
+                device: entry.device.clone(),
+                paths: Vec::new(),
+                direct: entry.status(),
+            });
+        }
+        LinkReport {
+            key: self.my_fingerprint(),
+            probes_sent: self.direct.probes_sent.load(std::sync::atomic::Ordering::Relaxed),
+            punches_refused: self.direct.refused.load(std::sync::atomic::Ordering::Relaxed),
+            links,
+        }
+    }
+
+    pub(crate) fn faces(&self) -> &Arc<dyn FaceSink> {
+        &self.faces
+    }
+
+    pub(crate) fn cancel_token(&self) -> &CancellationToken {
+        &self.cancel
+    }
+
+    pub(crate) fn signal(&self) -> &Arc<Signal> {
+        self.signal.get().expect("the signalling face starts with the links")
+    }
+
+    /// This device's name, from the certificate it links with now.
+    pub(crate) fn own_device(&self) -> Option<Name> {
+        let cert = self.judge().own_certificate()?;
+        let key = cert
+            .name
+            .components()
+            .iter()
+            .position(|c| c.typ == ndn_packet::tlv_type::NAME_COMPONENT && c.value.as_ref() == b"KEY")?;
+        Some(Name::from_components(cert.name.components()[..key].iter().cloned()))
+    }
+
+    /// Route the punches to this device's current name to the signalling
+    /// face.
+    fn take_punches(&self) {
+        if let (Some(device), Some(signal)) = (self.own_device(), self.signal.get()) {
+            signal.take_punches_for(self, &device);
+        }
+    }
+
+    pub(crate) fn judge(&self) -> Judge<'_> {
         Judge {
             trust: self.trust.as_ref(),
             peers: &self.peers,
@@ -133,59 +286,106 @@ impl Links {
     /// The endpoint to dial `addr` from: the host's link socket when it has
     /// that address family (so the other device sees one address for this
     /// one, the one the host bound), else a dial-only socket per family on
-    /// an address the system picks.
-    fn endpoint_for(&self, addr: SocketAddr) -> Result<Arc<LinkEndpoint>, LinkError> {
+    /// an address the system picks (which accepts only the direct paths of
+    /// its punches).
+    pub(crate) fn endpoint_for(self: &Arc<Self>, addr: SocketAddr) -> Result<Arc<LinkEndpoint>, LinkError> {
+        let v4 = addr.ip().to_canonical().is_ipv4();
         if let Some(socket) = &self.socket
-            && socket.local_addr().is_ok_and(|l| l.is_ipv4() == addr.is_ipv4())
+            && socket.local_addr().is_ok_and(|l| l.is_ipv4() == v4 || l.ip().is_unspecified() && l.is_ipv6())
         {
             return Ok(Arc::clone(socket));
         }
         let mut dialers = self.dialers.lock();
-        if let Some(endpoint) = dialers.get(&addr.is_ipv4()) {
+        if let Some(endpoint) = dialers.get(&v4) {
             return Ok(Arc::clone(endpoint));
         }
-        let bind: SocketAddr = if addr.is_ipv4() {
+        let bind: SocketAddr = if v4 {
             SocketAddr::from(([0, 0, 0, 0], 0))
         } else {
             SocketAddr::from(([0u16; 8], 0))
         };
         let endpoint = Arc::new(LinkEndpoint::bind(bind, Arc::clone(&self.key), &self.transport, false)?);
-        dialers.insert(addr.is_ipv4(), Arc::clone(&endpoint));
+        dialers.insert(v4, Arc::clone(&endpoint));
+        tokio::spawn(accept_loop(Arc::downgrade(self), Arc::clone(&endpoint)));
         Ok(endpoint)
     }
 
-    fn my_fingerprint(&self) -> Option<KeyFingerprint> {
+    pub(crate) fn my_fingerprint(&self) -> Option<KeyFingerprint> {
         self.key.current().ok().map(|k| k.fingerprint())
     }
 
     /// Run a handshaken connection to its end: exchange hellos, decide,
-    /// admit (or refuse), and register the link. Returns the link's handle
-    /// once it is up.
-    async fn establish(self: &Arc<Self>, mut hs: Handshaken, dialed: Option<PeerId>) -> Result<LinkHandle, LinkError> {
+    /// admit (or refuse), and register the link or its direct path.
+    /// Returns the path's handle once it is up.
+    pub(crate) async fn establish(self: &Arc<Self>, mut hs: Handshaken, origin: Origin) -> Result<LinkHandle, LinkError> {
         let remote = hs.remote_address();
+        let peer_fp = hs.peer_key().fingerprint();
+        // A direct path is named by both hellos: the dialer's punch session,
+        // and the session the listener punches with that key.
+        let session = match origin {
+            Origin::Direct(session) => Some(session),
+            Origin::Accepted => self.direct.session_with(peer_fp),
+            Origin::Dialed(_) => None,
+        };
         let ours = LinkHello {
             certificates: self.trust.own_chain(),
+            direct_path: session,
         };
         let theirs = hs.exchange_hello(&ours, MESSAGE_DEADLINE).await?;
+        let refuse = |hs: Handshaken, reason: CloseReason, text: String| {
+            tracing::warn!(
+                target: "face.quic",
+                %remote,
+                key = %peer_fp,
+                reason = ?reason,
+                "refused a link: {text}"
+            );
+            hs.refuse(reason, &text);
+            Err(LinkError::RefusedHere { reason, text })
+        };
+        let direct = match (origin, theirs.direct_path) {
+            (Origin::Direct(s), Some(t)) if s == t => Some(s),
+            (Origin::Direct(s), _) => {
+                let text = format!(
+                    "this device dialled the direct path of punch {} and your device did not take it as one",
+                    hex(&s)
+                );
+                return refuse(hs, CloseReason::PathExpired, text);
+            }
+            (_, Some(t)) if session == Some(t) => Some(t),
+            (_, Some(t)) => {
+                let text = format!(
+                    "this device runs no punch {} with your key (it ended); your device punches again",
+                    hex(&t)
+                );
+                return refuse(hs, CloseReason::PathExpired, text);
+            }
+            (_, None) => None,
+        };
+        let dialed = match origin {
+            Origin::Dialed(id) => Some(id),
+            _ => None,
+        };
         let judge = self.judge();
         let admitted = match judge.decide(hs.peer_key(), &theirs, dialed).await {
             Ok(a) => a,
-            Err(refusal) => {
-                tracing::warn!(
-                    target: "face.quic",
-                    %remote,
-                    key = %hs.peer_key().fingerprint(),
-                    reason = ?refusal.reason,
-                    "refused a link: {}",
-                    refusal.text
-                );
-                hs.refuse(refusal.reason, &refusal.text);
-                return Err(LinkError::RefusedHere {
-                    reason: refusal.reason,
-                    text: refusal.text,
-                });
-            }
+            Err(refusal) => return refuse(hs, refusal.reason, refusal.text),
         };
+        if let Some(session) = direct {
+            if admitted.enrollment.is_some() {
+                let text = "a direct path carries a full link only, and this device admits you only on an \
+                            enrollment link"
+                    .to_string();
+                return refuse(hs, CloseReason::Unrecognized, text);
+            }
+            if let Some(why) = self.direct_off(&admitted) {
+                return refuse(hs, CloseReason::DirectPathsOff, why);
+            }
+            if !self.direct.claim(&session, peer_fp) {
+                let text = format!("another path of punch {} came up first", hex(&session));
+                return refuse(hs, CloseReason::Replaced, text);
+            }
+        }
         let slot = match &admitted.enrollment {
             Some(Enrollment::Relay(_)) => match self.enrollment_slots.reserve(remote.ip()) {
                 Ok(slot) => Some(slot),
@@ -207,6 +407,12 @@ impl Links {
             _ => None,
         };
         let direction = hs.direction();
+        let local = hs.local_address();
+        let kind = if direct.is_some() {
+            PathKind::Direct
+        } else {
+            PathKind::Link
+        };
         let face_id = self.faces.alloc_face_id();
         let link = hs
             .admit(face_id, MESSAGE_DEADLINE, judge.admission_for(&admitted))
@@ -235,6 +441,9 @@ impl Links {
                 face: face_id,
                 handle: handle.clone(),
                 direction,
+                kind,
+                local,
+                since: Instant::now(),
             },
         };
         let Some(generation) = self.table.register(registration, self.my_fingerprint()) else {
@@ -258,13 +467,18 @@ impl Links {
             peer = %admitted.describe(),
             direction = ?direction,
             routes = ?routes.iter().map(|r| format!("{} cost {}", r.prefix, r.cost)).collect::<Vec<_>>(),
-            "link up"
+            "{} up",
+            if direct.is_some() { "direct path" } else { "link" }
         );
+        if let Some(session) = direct {
+            self.direct.path_up(&session, &handle);
+        }
         self.explain_enrollment(&admitted, &peer_enrollment, face_id);
         let weak = Arc::downgrade(self);
         let watched = handle.clone();
         let fingerprint = admitted.fingerprint;
         let describe = admitted.describe();
+        let what = kind.as_str();
         tokio::spawn(async move {
             let why = match slot {
                 // An enrollment link that carries nothing for its idle
@@ -296,6 +510,7 @@ impl Links {
                 target: "face.quic",
                 face = face_id.0,
                 peer = %describe,
+                path = what,
                 "link down: {why}"
             );
             if let Some(links) = weak.upgrade() {
@@ -386,7 +601,7 @@ impl Links {
                 };
                 let attempt = async {
                     let hs = socket.connect(addr, peer.key).await?;
-                    self.establish(hs, Some(id)).await
+                    self.establish(hs, Origin::Dialed(id)).await
                 };
                 match attempt.await {
                     Ok(handle) => return Ok(handle),
@@ -423,11 +638,16 @@ async fn inbound(links: Arc<Links>, incoming: Incoming) {
         }
     };
     // A refusal here was logged with its reason where it was decided.
-    if let Err(e) = links.establish(hs, None).await
+    if let Err(e) = links.establish(hs, Origin::Accepted).await
         && !matches!(e, LinkError::RefusedHere { .. })
     {
         tracing::info!(target: "face.quic", %remote, "inbound link did not come up: {e}");
     }
+}
+
+/// A punch session as logs and refusals show it.
+fn hex(session: &PathSession) -> String {
+    session.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Keep `peer` linked: dial its paths in order, and again with backoff

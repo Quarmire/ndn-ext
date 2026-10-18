@@ -8,11 +8,18 @@
 //! link carries NDN packets only once both sides admitted it.
 //!
 //! Wire: TLV-TYPEs in the application range.
-//! `LinkHello = 0x0450 { LinkVersion 0x0451 (1 byte), Data* }` — the first
-//! Data is the sender's certificate, the rest its issuers (nearest first);
+//! `LinkHello = 0x0450 { LinkVersion 0x0451 (1 byte), Data*, DirectPath
+//! 0x045A (8 bytes)? }` — the first Data is the sender's certificate, the
+//! rest its issuers (nearest first); `DirectPath` marks a connection made
+//! for a direct path of the link (the punch's session);
 //! `LinkVerdict = 0x0452 { EnrollmentLink 0x0454 { Name* }? }` — admitted;
 //! with `EnrollmentLink`, admitted as an enrollment link that carries only
-//! the enrollment of the receiver in the namespaces named.
+//! the enrollment of the receiver in the namespaces named;
+//! `ObservedAddress = 0x0458 (UDP address)` — after the verdict, the source
+//! address the sender sees the receiver's packets come from (sent at once,
+//! and again whenever it changes).
+
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use bytes::Bytes;
 use ndn_packet::Name;
@@ -22,8 +29,14 @@ pub(crate) const LINK_HELLO: u64 = 0x0450;
 const LINK_VERSION: u64 = 0x0451;
 pub(crate) const LINK_VERDICT: u64 = 0x0452;
 const ENROLLMENT_LINK: u64 = 0x0454;
+pub(crate) const OBSERVED_ADDRESS: u64 = 0x0458;
+const DIRECT_PATH: u64 = 0x045A;
 const DATA: u64 = 0x06;
 const NAME: u64 = 0x07;
+
+/// The session of a direct-path attempt (its punch), which the dialer of a
+/// direct path names in its [`LinkHello`].
+pub type PathSession = [u8; 8];
 
 /// The link protocol version this crate speaks.
 pub const LINK_PROTOCOL_VERSION: u8 = 1;
@@ -39,6 +52,10 @@ pub struct LinkHello {
     /// has no certificate (a device not enrolled anywhere, linked by its
     /// expected fingerprint alone).
     pub certificates: Vec<Bytes>,
+    /// `Some`: this connection is a direct path made by the punch of this
+    /// session (the dialer names it; the listener repeats it when it takes
+    /// the connection as that direct path).
+    pub direct_path: Option<PathSession>,
 }
 
 impl LinkHello {
@@ -49,6 +66,9 @@ impl LinkHello {
             for cert in &self.certificates {
                 w.write_raw(cert);
             }
+            if let Some(session) = &self.direct_path {
+                w.write_tlv(DIRECT_PATH, session);
+            }
         });
         w.finish()
     }
@@ -56,6 +76,7 @@ impl LinkHello {
     /// Decode the value of a `LinkHello` TLV.
     pub(crate) fn decode(value: &[u8]) -> Result<Self, String> {
         let mut certificates = Vec::new();
+        let mut direct_path = None;
         let mut version = None;
         let mut cur = value;
         while !cur.is_empty() {
@@ -71,13 +92,24 @@ impl LinkHello {
                     }
                 },
                 DATA => certificates.push(Bytes::copy_from_slice(&cur[..end])),
+                DIRECT_PATH => {
+                    direct_path = Some(PathSession::try_from(&cur[start..end]).map_err(|_| {
+                        format!(
+                            "a direct-path session of {} bytes in the link hello (it is 8 bytes)",
+                            end - start
+                        )
+                    })?);
+                }
                 t if skippable(t) => {}
                 t => return Err(format!("unknown critical field {t:#x} in the link hello")),
             }
             cur = &cur[end..];
         }
         match version {
-            Some(LINK_PROTOCOL_VERSION) => Ok(Self { certificates }),
+            Some(LINK_PROTOCOL_VERSION) => Ok(Self {
+                certificates,
+                direct_path,
+            }),
             Some(v) => Err(format!(
                 "the peer speaks link protocol version {v}; this device speaks version \
                  {LINK_PROTOCOL_VERSION}: update the older of the two"
@@ -148,9 +180,46 @@ impl LinkVerdict {
     }
 }
 
+/// An `ObservedAddress` message: the address this side sees the receiver's
+/// packets come from.
+pub(crate) fn encode_observed_address(addr: SocketAddr) -> Bytes {
+    let mut w = TlvWriter::new();
+    w.write_tlv(OBSERVED_ADDRESS, &encode_udp_address(addr));
+    w.finish()
+}
+
+/// A UDP address as link messages and direct-path candidates carry it: the
+/// IPv4 (4 bytes) or IPv6 (16 bytes) address, then the port (2 bytes), in
+/// network byte order. An IPv4-mapped IPv6 address is written as IPv4.
+pub fn encode_udp_address(addr: SocketAddr) -> Vec<u8> {
+    let mut out = match addr.ip().to_canonical() {
+        IpAddr::V4(ip) => ip.octets().to_vec(),
+        IpAddr::V6(ip) => ip.octets().to_vec(),
+    };
+    out.extend_from_slice(&addr.port().to_be_bytes());
+    out
+}
+
+/// Decode a UDP address ([`encode_udp_address`]): 6 or 18 bytes.
+pub fn decode_udp_address(value: &[u8]) -> Result<SocketAddr, String> {
+    let port = |p: &[u8]| u16::from_be_bytes([p[0], p[1]]);
+    match value.len() {
+        6 => Ok(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(value[0], value[1], value[2], value[3])),
+            port(&value[4..]),
+        )),
+        18 => {
+            let mut ip = [0u8; 16];
+            ip.copy_from_slice(&value[..16]);
+            Ok(SocketAddr::new(IpAddr::V6(Ipv6Addr::from(ip)), port(&value[16..])))
+        }
+        n => Err(format!("a UDP address of {n} bytes (it is 6 or 18)")),
+    }
+}
+
 /// Whether an unrecognized TLV-TYPE in a link message may be skipped: an
 /// even type above 31. Types 0–31 are always critical, as in NDN packets.
-fn skippable(t: u64) -> bool {
+pub(crate) fn skippable(t: u64) -> bool {
     t > 31 && t & 1 == 0
 }
 
@@ -181,6 +250,10 @@ pub enum CloseReason {
     /// The device enrolled: it links again holding its certificate, as an
     /// enrolled device, in place of its enrollment link.
     Enrolled,
+    /// A connection names a direct-path session ([`LinkHello::direct_path`])
+    /// this device is not punching (it ended, or never began): the other
+    /// device's next punch makes a new one.
+    PathExpired,
     /// The key has no valid certificate in a namespace this device holds,
     /// and no `[[peer]]` entry expects its fingerprint.
     Unrecognized,
@@ -202,6 +275,10 @@ pub enum CloseReason {
     Busy,
     /// This device has no usable link key.
     NoLinkKey,
+    /// Direct paths between the two devices are turned off: by the link
+    /// policy of the namespace (its trust context), or by this device's
+    /// peer entry for the other. Refuses a direct-path punch.
+    DirectPathsOff,
 }
 
 impl CloseReason {
@@ -211,6 +288,7 @@ impl CloseReason {
             Self::Replaced => 0x01,
             Self::Idle => 0x02,
             Self::Enrolled => 0x03,
+            Self::PathExpired => 0x04,
             Self::Unrecognized => 0x10,
             Self::CertificateForAnotherKey => 0x11,
             Self::Revoked => 0x12,
@@ -219,6 +297,7 @@ impl CloseReason {
             Self::Protocol => 0x15,
             Self::Busy => 0x16,
             Self::NoLinkKey => 0x17,
+            Self::DirectPathsOff => 0x18,
         }
     }
 
@@ -228,6 +307,7 @@ impl CloseReason {
             0x01 => Self::Replaced,
             0x02 => Self::Idle,
             0x03 => Self::Enrolled,
+            0x04 => Self::PathExpired,
             0x10 => Self::Unrecognized,
             0x11 => Self::CertificateForAnotherKey,
             0x12 => Self::Revoked,
@@ -236,18 +316,20 @@ impl CloseReason {
             0x15 => Self::Protocol,
             0x16 => Self::Busy,
             0x17 => Self::NoLinkKey,
+            0x18 => Self::DirectPathsOff,
             _ => return None,
         })
     }
 
     /// Whether the link should be dialled again later without a change on
-    /// either side: a shutdown, a busy listener, an idle enrollment link or
-    /// an enrollment completed pass; a refusal of the key does not (until
-    /// the trust data or the config changes).
+    /// either side: a shutdown, a busy listener, an idle enrollment link,
+    /// an enrollment completed or an expired direct-path session pass; a
+    /// refusal of the key does not (until the trust data or the config
+    /// changes).
     pub fn is_transient(self) -> bool {
         matches!(
             self,
-            Self::Shutdown | Self::Replaced | Self::Idle | Self::Enrolled | Self::Busy
+            Self::Shutdown | Self::Replaced | Self::Idle | Self::Enrolled | Self::PathExpired | Self::Busy
         )
     }
 }
@@ -258,8 +340,66 @@ mod tests {
 
     #[test]
     fn a_hello_round_trips() {
+        for hello in [
+            LinkHello {
+                certificates: vec![Bytes::from_static(&[0x06, 0x01, 0xAA]), Bytes::from_static(&[0x06, 0x00])],
+                direct_path: None,
+            },
+            LinkHello {
+                certificates: Vec::new(),
+                direct_path: Some([1, 2, 3, 4, 5, 6, 7, 8]),
+            },
+        ] {
+            let wire = hello.encode();
+            let (t, start, end) = split_tlv(&wire).unwrap();
+            assert_eq!(t, LINK_HELLO);
+            assert_eq!(LinkHello::decode(&wire[start..end]).unwrap(), hello);
+        }
+    }
+
+    #[test]
+    fn udp_addresses_and_observed_address_messages_round_trip() {
+        for addr in ["192.0.2.7:6363", "[2001:db8::1]:443"] {
+            let addr: SocketAddr = addr.parse().unwrap();
+            assert_eq!(decode_udp_address(&encode_udp_address(addr)).unwrap(), addr);
+        }
+        // An IPv4-mapped IPv6 address is carried as IPv4.
+        let mapped: SocketAddr = "[::ffff:192.0.2.7]:6363".parse().unwrap();
+        assert_eq!(encode_udp_address(mapped), [192, 0, 2, 7, 0x18, 0xDB]);
+        assert!(decode_udp_address(&[1, 2, 3, 4, 5]).is_err());
+        let wire = encode_observed_address("192.0.2.7:6363".parse().unwrap());
+        assert_eq!(wire.as_ref(), [0xFD, 0x04, 0x58, 0x06, 192, 0, 2, 7, 0x18, 0xDB]);
+    }
+
+    #[test]
+    fn a_direct_path_session_is_eight_bytes() {
+        let hello = |len: u8| {
+            let mut v = vec![0xFD, 0x04, 0x51, 0x01, 0x01, 0xFD, 0x04, 0x5A, len];
+            v.extend(std::iter::repeat_n(0xAB, usize::from(len)));
+            LinkHello::decode(&v)
+        };
+        assert_eq!(hello(8).unwrap().direct_path, Some([0xAB; 8]));
+        assert!(hello(7).is_err());
+        assert!(hello(9).is_err());
+        // The vector of ndn-link.md: no certificate, session 01..08.
+        let wire = LinkHello {
+            certificates: Vec::new(),
+            direct_path: Some([1, 2, 3, 4, 5, 6, 7, 8]),
+        }
+        .encode();
+        assert_eq!(
+            wire.as_ref(),
+            [
+                0xFD, 0x04, 0x50, 0x11, 0xFD, 0x04, 0x51, 0x01, 0x01, 0xFD, 0x04, 0x5A, 0x08, 1, 2, 3, 4, 5, 6, 7, 8
+            ]
+        );
+    }
+
+    #[test]
+    fn a_hello_without_extensions_round_trips() {
         let hello = LinkHello {
             certificates: vec![Bytes::from_static(&[0x06, 0x01, 0xAA]), Bytes::from_static(&[0x06, 0x00])],
+            direct_path: None,
         };
         let wire = hello.encode();
         let (t, start, end) = split_tlv(&wire).unwrap();
@@ -302,6 +442,7 @@ mod tests {
             CloseReason::Replaced,
             CloseReason::Idle,
             CloseReason::Enrolled,
+            CloseReason::PathExpired,
             CloseReason::Unrecognized,
             CloseReason::CertificateForAnotherKey,
             CloseReason::Revoked,
@@ -310,6 +451,7 @@ mod tests {
             CloseReason::Protocol,
             CloseReason::Busy,
             CloseReason::NoLinkKey,
+            CloseReason::DirectPathsOff,
         ] {
             assert_eq!(CloseReason::from_code(u64::from(r.code())), Some(r));
         }

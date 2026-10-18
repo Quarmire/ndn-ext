@@ -14,7 +14,8 @@ use ndn_transport::{FaceError, FaceId, FaceKind, Transport, ip_face_uri};
 use crate::endpoint::Permit;
 use crate::key::{KeyFingerprint, PeerKey};
 use crate::message::{
-    CloseReason, LINK_HELLO, LINK_VERDICT, LinkHello, LinkVerdict, MAX_MESSAGE, split_tlv,
+    CloseReason, LINK_HELLO, LINK_VERDICT, LinkHello, LinkVerdict, MAX_MESSAGE, OBSERVED_ADDRESS,
+    decode_udp_address, encode_observed_address, skippable, split_tlv,
 };
 use crate::scope::{Judged, LinkScope, ScopeState, nack_for};
 
@@ -146,6 +147,11 @@ impl Handshaken {
         self.connection.remote_address()
     }
 
+    /// The address of this side's socket.
+    pub fn local_address(&self) -> Option<SocketAddr> {
+        self.local
+    }
+
     /// Send `ours` and receive the peer's hello, within `deadline`. The
     /// dialer speaks first.
     pub async fn exchange_hello(
@@ -205,7 +211,6 @@ impl Handshaken {
         let verdicts = async {
             write(&mut send, &connection, &ours).await?;
             let theirs = read_message(&mut recv, &connection, LINK_VERDICT).await?;
-            let _ = send.finish();
             LinkVerdict::decode(&theirs).map_err(LinkError::Protocol)
         };
         let peer_verdict = match tokio::time::timeout(deadline, verdicts).await {
@@ -222,6 +227,8 @@ impl Handshaken {
             let (tx, rx) = tokio::sync::mpsc::channel(LOCAL_ANSWERS);
             (tx, tokio::sync::Mutex::new(rx))
         });
+        let (observed_tx, observed) = tokio::sync::watch::channel(None);
+        tokio::spawn(observe(self.connection.clone(), send, recv, observed_tx));
         Ok(Link {
             face: LinkFace {
                 id,
@@ -234,6 +241,7 @@ impl Handshaken {
             handle: LinkHandle {
                 connection: self.connection,
                 scope,
+                observed,
             },
             peer_verdict,
         })
@@ -295,6 +303,26 @@ async fn read_message(
     connection: &quinn::Connection,
     expected: u64,
 ) -> Result<Bytes, LinkError> {
+    match read_tlv(recv, connection).await? {
+        Some((t, value)) if t == expected => Ok(value),
+        Some((t, _)) => Err(LinkError::Protocol(format!(
+            "expected link message {expected:#x}, got {t:#x}"
+        ))),
+        None => Err(match connection.close_reason() {
+            Some(reason) => LinkError::from_connection(reason),
+            None => LinkError::Protocol(format!(
+                "the control stream ended where link message {expected:#x} belongs"
+            )),
+        }),
+    }
+}
+
+/// Read one link message: its TLV-TYPE and value. `None` when the stream
+/// ended (FIN) before it.
+async fn read_tlv(
+    recv: &mut quinn::RecvStream,
+    connection: &quinn::Connection,
+) -> Result<Option<(u64, Bytes)>, LinkError> {
     let closed = |e: String| match connection.close_reason() {
         Some(reason) => LinkError::from_connection(reason),
         None => LinkError::Protocol(e),
@@ -304,14 +332,17 @@ async fn read_message(
     let mut buf: Vec<u8> = Vec::with_capacity(512);
     loop {
         let mut byte = [0u8; 1];
-        recv.read_exact(&mut byte).await.map_err(|e| closed(e.to_string()))?;
+        if buf.is_empty() {
+            match recv.read(&mut byte).await.map_err(|e| closed(e.to_string()))? {
+                None => return Ok(None),
+                Some(0) => continue,
+                Some(_) => {}
+            }
+        } else {
+            recv.read_exact(&mut byte).await.map_err(|e| closed(e.to_string()))?;
+        }
         buf.push(byte[0]);
         if let Some((t, start, len)) = header(&buf) {
-            if t != expected {
-                return Err(LinkError::Protocol(format!(
-                    "expected link message {expected:#x}, got {t:#x}"
-                )));
-            }
             if len > MAX_MESSAGE {
                 return Err(LinkError::Protocol(format!(
                     "a link message of {len} bytes is over the {MAX_MESSAGE}-byte limit"
@@ -322,11 +353,69 @@ async fn read_message(
                 .await
                 .map_err(|e| closed(e.to_string()))?;
             let (_, start, end) = split_tlv(&buf).map_err(LinkError::Protocol)?;
-            return Ok(Bytes::copy_from_slice(&buf[start..end]));
+            return Ok(Some((t, Bytes::copy_from_slice(&buf[start..end]))));
         }
         if buf.len() > 20 {
             return Err(LinkError::Protocol("unreadable link message header".into()));
         }
+    }
+}
+
+/// How often a side checks whether the address it sees the peer at
+/// changed (the peer's NAT remapped, or the peer moved), to tell it.
+const OBSERVE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// After the verdicts, for the life of the link: tell the peer the address
+/// its packets come from (`ObservedAddress`, at once and whenever it
+/// changes), and take the peer's word for this side's (`observed`). A peer
+/// that ends its control stream or does not read it (it predates
+/// `ObservedAddress`) ends that half only.
+async fn observe(
+    connection: quinn::Connection,
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+    observed: tokio::sync::watch::Sender<Option<SocketAddr>>,
+) {
+    let tell = async {
+        let mut told = None;
+        loop {
+            let now = connection.remote_address();
+            let now = SocketAddr::new(now.ip().to_canonical(), now.port());
+            if told != Some(now) {
+                if send.write_all(&encode_observed_address(now)).await.is_err() {
+                    return;
+                }
+                told = Some(now);
+            }
+            tokio::time::sleep(OBSERVE_INTERVAL).await;
+        }
+    };
+    let hear = async {
+        loop {
+            match read_tlv(&mut recv, &connection).await {
+                Ok(Some((OBSERVED_ADDRESS, value))) => match decode_udp_address(&value) {
+                    Ok(addr) => {
+                        observed.send_replace(Some(addr));
+                    }
+                    Err(e) => {
+                        let text = format!("malformed ObservedAddress link message: {e}");
+                        connection.close(quinn::VarInt::from_u32(CloseReason::Protocol.code()), text.as_bytes());
+                        return;
+                    }
+                },
+                Ok(Some((t, _))) if skippable(t) => {}
+                Ok(Some((t, _))) => {
+                    let text = format!("unknown critical link message {t:#x} after the verdict");
+                    connection.close(quinn::VarInt::from_u32(CloseReason::Protocol.code()), text.as_bytes());
+                    return;
+                }
+                Ok(None) | Err(_) => return,
+            }
+        }
+    };
+    tokio::select! {
+        _ = connection.closed() => {}
+        _ = async { tokio::join!(tell, hear) } => {}
     }
 }
 
@@ -365,6 +454,7 @@ pub struct Link {
 pub struct LinkHandle {
     connection: quinn::Connection,
     scope: Option<Arc<ScopeState>>,
+    observed: tokio::sync::watch::Receiver<Option<SocketAddr>>,
 }
 
 impl LinkHandle {
@@ -380,6 +470,18 @@ impl LinkHandle {
 
     pub fn remote_address(&self) -> SocketAddr {
         self.connection.remote_address()
+    }
+
+    /// The address the other device sees this one's packets come from, as
+    /// it last said (`ObservedAddress`): this device's address beyond the
+    /// NATs between them. `None` until it says.
+    pub fn observed_address(&self) -> Option<SocketAddr> {
+        *self.observed.borrow()
+    }
+
+    /// The link's current round-trip time estimate.
+    pub fn rtt(&self) -> Duration {
+        self.connection.rtt()
     }
 
     /// The largest NDNLPv2 frame the link carries now.

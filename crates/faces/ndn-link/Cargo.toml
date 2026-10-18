@@ -10,8 +10,10 @@ classification = "extension"
 
 [dependencies]
 ndn-face-quic = { path = "../ndn-face-quic" }
+ndn-face-local = { workspace = true }
 ndn-transport = { workspace = true }
 ndn-packet    = { workspace = true, features = ["std"] }
+ndn-tlv       = { workspace = true }
 ndn-security  = { workspace = true }
 ndn-cert      = { workspace = true }
 bytes         = { workspace = true, features = ["std"] }
@@ -19,6 +21,12 @@ tracing       = { workspace = true }
 tokio         = { workspace = true, features = ["sync", "rt", "macros", "time", "net"] }
 tokio-util    = { workspace = true }
 parking_lot   = "0.12"
+# Punch sessions are random.
+getrandom     = { workspace = true }
+
+# Interface addresses for direct-path host candidates.
+[target.'cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple", target_os = "freebsd"))'.dependencies]
+nix = { version = "0.29", default-features = false, features = ["net"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }

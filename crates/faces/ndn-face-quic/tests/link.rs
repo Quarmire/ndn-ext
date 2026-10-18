@@ -51,6 +51,7 @@ fn addr(e: &LinkEndpoint) -> SocketAddr {
 fn hello(tag: u8) -> LinkHello {
     LinkHello {
         certificates: vec![Bytes::from(vec![0x06, 0x01, tag])],
+        direct_path: None,
     }
 }
 
@@ -363,4 +364,93 @@ async fn a_closed_link_tells_why() {
         other => panic!("expected the close reason, got {other}"),
     }
     assert!(a.face.recv_bytes().await.is_err(), "the face outlived its link");
+}
+
+/// Wait until `handle` says the other side sees this one at `want`.
+async fn observed(link: &Link, want: SocketAddr, within: Duration) {
+    let start = std::time::Instant::now();
+    while link.handle.observed_address() != Some(want) {
+        assert!(
+            start.elapsed() < within,
+            "observed {:?}, expected {want}",
+            link.handle.observed_address()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn each_side_tells_the_other_the_address_it_sees_and_again_when_it_changes() {
+    let dialer = endpoint(ed_key(1), false);
+    let listener = endpoint(ed_key(2), true);
+    let (a, b) = link(&dialer, &listener).await;
+    observed(&a, addr(&dialer), T).await;
+    observed(&b, addr(&listener), T).await;
+    // The dialer moves: the listener tells it its new address.
+    dialer
+        .rebind(std::net::UdpSocket::bind("127.0.0.1:0").unwrap())
+        .unwrap();
+    let pkt = Bytes::from_static(&[0x05, 0x03, 0x07, 0x01, 0x42]);
+    a.face.send_bytes(pkt.clone()).await.unwrap();
+    assert_eq!(tokio::time::timeout(T, b.face.recv_bytes()).await.unwrap().unwrap(), pkt);
+    observed(&a, addr(&dialer), Duration::from_secs(10)).await;
+}
+
+#[tokio::test]
+async fn probes_reach_the_punch_that_watches_them_and_never_quic() {
+    let a = endpoint(ed_key(1), true);
+    let b = endpoint(ed_key(2), true);
+    let session = [7u8; 8];
+    let mut watch = b.watch_probes(session);
+    let mut unwatched = b.watch_probes([8u8; 8]);
+    a.send_probe(addr(&b), &session).await.unwrap();
+    let from = tokio::time::timeout(T, watch.next()).await.unwrap();
+    assert_eq!(from, Some(addr(&a)));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), unwatched.next()).await.is_err(),
+        "a probe of another session was delivered"
+    );
+    // The same sockets still carry links.
+    let (x, y) = link(&a, &b).await;
+    let pkt = Bytes::from_static(&[0x05, 0x03, 0x07, 0x01, 0x42]);
+    x.face.send_bytes(pkt.clone()).await.unwrap();
+    assert_eq!(tokio::time::timeout(T, y.face.recv_bytes()).await.unwrap().unwrap(), pkt);
+}
+
+#[tokio::test]
+async fn a_socket_that_does_not_listen_takes_only_the_direct_path_its_punch_expects() {
+    let quick = LinkTransportConfig {
+        handshake_timeout: Duration::from_millis(800),
+        ..LinkTransportConfig::default()
+    };
+    let punched = Arc::new(endpoint_with(ed_key(2), false, quick.clone()));
+    let peer = endpoint_with(ed_key(1), false, quick.clone());
+    let stranger = endpoint_with(ed_key(3), false, quick);
+    let target = addr(&punched);
+    let key = ed_key(2).fingerprint();
+    // Whatever the socket accepts is handshaken and reported.
+    let (tx, mut accepted) = tokio::sync::mpsc::unbounded_channel();
+    let acceptor = Arc::clone(&punched);
+    tokio::spawn(async move {
+        while let Some(incoming) = acceptor.accept().await {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                if let Ok(hs) = incoming.handshake().await {
+                    let _ = tx.send(hs.peer_key().fingerprint());
+                }
+            });
+        }
+    });
+    // No punch: nothing answers, not even a refusal.
+    assert!(matches!(peer.connect_direct(target, key).await, Err(LinkError::Connect(_))));
+    let window = punched.allow_inbound(&[addr(&peer)]);
+    let dialed = peer.connect_direct(target, key).await.unwrap();
+    assert_eq!(dialed.peer_key().fingerprint(), key);
+    let from = tokio::time::timeout(T, accepted.recv()).await.unwrap();
+    assert_eq!(from, Some(ed_key(1).fingerprint()));
+    // Another address, while the window is open: nothing answers.
+    assert!(matches!(stranger.connect_direct(target, key).await, Err(LinkError::Connect(_))));
+    drop(window);
+    assert!(matches!(peer.connect_direct(target, key).await, Err(LinkError::Connect(_))));
+    assert!(accepted.try_recv().is_err(), "the socket took a connection no punch expected");
 }

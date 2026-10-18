@@ -70,6 +70,7 @@ mod tests {
             routes: None,
             persistent: true,
             reliability: false,
+            direct: true,
         }
     }
 
