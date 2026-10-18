@@ -51,6 +51,10 @@ pub struct IdentityState {
     /// Device-approval requests awaiting an operator decision
     /// (`/localhost/nfd/ca/list-approvals`).
     pub approvals: Vec<ndn_mgmt_wire::PendingApproval>,
+    /// Why `approvals` is incomplete, one line per namespace whose requests
+    /// could not be listed (or the daemon's refusal when none could), with
+    /// what to do. Rows of an unlisted namespace are absent, never stale.
+    pub approval_notes: Vec<String>,
     /// Local identity keys and their certificate expiry
     /// (`/localhost/nfd/security/identity-list`).
     pub identities: Vec<SecurityKeyInfo>,
@@ -282,16 +286,26 @@ impl<M: ManagementClient> DashboardEngine<M> {
 
     /// Refresh the identity/trust plane: the CA pending-approval queue, the
     /// local identity keys, and the configured trust anchors. Each dataset is
-    /// independent — a failed query leaves that axis's prior value in place.
+    /// independent — a failed query leaves that axis's prior value in place,
+    /// except the approval queue: a refused listing empties it (stale rows
+    /// may already be decided) and says why in `approval_notes`.
     /// Returns the `StateUpdate`s that changed. The `security/*` datasets are
     /// ndn-rs extensions; a cross-impl forwarder (NFD/YaNFD) 404s them and they
     /// simply don't refresh.
     pub async fn poll_identity(&mut self) -> Vec<StateUpdate> {
         let mut changed = Vec::new();
-        if let Ok(resp) = self.client.send_cmd("ca", "list-approvals", None).await
-            && resp.is_ok()
-        {
-            self.identity.approvals = ndn_mgmt_wire::PendingApproval::decode_all(&resp.body);
+        if let Ok(resp) = self.client.send_cmd("ca", "list-approvals", None).await {
+            if resp.is_ok() {
+                let listing = ndn_mgmt_wire::ApprovalListing::decode(&resp.body);
+                self.identity.approvals = listing.rows;
+                self.identity.approval_notes = listing.notes;
+            } else {
+                self.identity.approvals.clear();
+                self.identity.approval_notes = vec![format!(
+                    "the forwarder refused to list approval requests ({}): {}",
+                    resp.status_code, resp.status_text
+                )];
+            }
             changed.push(StateUpdate::Approvals);
         }
         if let Ok(resp) = self
@@ -593,7 +607,7 @@ mod tests {
             }
         }
 
-        let wire = ndn_mgmt_wire::PendingApproval::encode_all(&[ndn_mgmt_wire::PendingApproval {
+        let rows = vec![ndn_mgmt_wire::PendingApproval {
             request_id: "req-1".into(),
             key_name: "/lab/alice/admin/laptop/KEY/k1".into(),
             namespace: "/lab/alice".into(),
@@ -604,7 +618,8 @@ mod tests {
             created_secs: 1,
             expires_secs: 2,
             ..Default::default()
-        }]);
+        }];
+        let wire = ndn_mgmt_wire::ApprovalListing { rows, notes: Vec::new() }.encode();
         let mut engine = DashboardEngine::new(IdMock(wire));
 
         let changed = engine.poll_identity().await;

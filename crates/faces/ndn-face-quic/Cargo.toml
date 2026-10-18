@@ -1,6 +1,6 @@
 [package]
 name = "ndn-face-quic"
-description = "Raw-QUIC forwarder-to-forwarder face for ndn-rs (TLS 1.3, connection migration)"
+description = "QUIC links for ndn-rs: NDNLPv2 over QUIC datagrams, mutual TLS 1.3 with the devices' NDN keys as raw public keys"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,24 +11,23 @@ classification = "extension"
 [dependencies]
 ndn-transport = { workspace = true }
 ndn-packet    = { workspace = true, features = ["std"] }
+ndn-security  = { workspace = true }
+ndn-tlv       = { workspace = true }
 bytes         = { workspace = true, features = ["std"] }
 tracing       = { workspace = true }
 thiserror     = { workspace = true }
 tokio         = { workspace = true, features = ["sync", "rt", "macros", "time", "net"] }
 sha2          = { workspace = true }
-rcgen         = { workspace = true }
 # quinn (raw QUIC) + rustls 0.23 on the ring provider — the same crypto stack
-# ndn-rs already uses (rcgen/tokio-rustls), so no new crypto backend.
+# ndn-rs already uses, so no new crypto backend. rustls 0.23 carries RFC 7250
+# raw public keys, which is what lets the TLS identity be the NDN key itself.
 quinn         = { version = "0.11", default-features = false, features = ["ring", "runtime-tokio", "rustls"] }
 rustls        = { version = "0.23", default-features = false, features = ["ring", "std"] }
-rustls-pemfile = { workspace = true }
-# Bundled Mozilla WebPKI roots for the `WebPki` dial path (validate a peer's
-# publicly-trusted/ACME cert without depending on the OS trust store).
-webpki-roots  = "1"
+# The stateless-reset key (an HMAC key quinn takes as `ring::hmac::Key`).
+ring          = { workspace = true }
 
 [dev-dependencies]
 tokio    = { workspace = true, features = ["full"] }
-ndn-tlv  = { workspace = true }
 
 [lints]
 workspace = true
