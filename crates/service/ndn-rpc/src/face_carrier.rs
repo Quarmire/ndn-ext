@@ -249,7 +249,14 @@ impl HintedCarrier for FaceRpcCarrier {
         // name. (No validator ⇒ caller opted out, as before.)
         if let Some(v) = &self.validator {
             match v.validate(&data).await {
-                ValidationResult::Valid(_) => {}
+                ValidationResult::Valid(safe) if safe.is_authenticated() => {}
+                ValidationResult::Valid(_) => {
+                    return Err(ServiceError::Unauthorized(
+                        "response is not signed by a key (a DigestSha256 proves integrity, not \
+                         who made it)"
+                            .into(),
+                    ));
+                }
                 ValidationResult::Pending => {
                     return Err(ServiceError::Unauthorized(
                         "response signer certificate unavailable".into(),

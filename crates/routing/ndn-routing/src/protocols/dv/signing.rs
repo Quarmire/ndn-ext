@@ -22,7 +22,7 @@ use bytes::Bytes;
 use futures::executor::block_on;
 use ndn_packet::encode::{DataBuilder, encode_data_digest_sha256};
 use ndn_packet::{Data, KeyLocator, Name, SignatureType};
-use ndn_security::verifier::verify_by_sig_type;
+use ndn_security::verifier::{verify_by_sig_type, verify_digest};
 use ndn_security::{ActiveSigner, LvsModel, SignWith, Signer, VerifyOutcome};
 
 /// Decision object owned by [`DvSync`] / [`DvPfxSync`] that controls
@@ -242,8 +242,8 @@ fn validate_data_against_static(data: &Data, trust: &DvStaticKeys) -> bool {
     }
 }
 
-/// `key_required = false` bypasses the trusted-keys map
-/// (`DigestSha256` path). Returns `true` iff the algorithm is
+/// `key_required = false` bypasses the trusted-keys map and checks a
+/// digest (`DigestSha256` path). Returns `true` iff the algorithm is
 /// supported, the required key is in `trusted_keys`, and the
 /// cryptographic check passes.
 fn crypto_verify(data: &Data, trusted_keys: &HashMap<Name, Bytes>, key_required: bool) -> bool {
@@ -254,23 +254,18 @@ fn crypto_verify(data: &Data, trusted_keys: &HashMap<Name, Bytes>, key_required:
     let region = data.signed_region();
     let sig_value = data.sig_value();
 
-    let public_key: &[u8] = if key_required {
+    let outcome = if key_required {
         let Some(KeyLocator::Name(key_name)) = sig_info.key_locator.as_ref() else {
             return false;
         };
-        match trusted_keys.get(key_name.as_ref()) {
-            Some(k) => k.as_ref(),
-            None => return false,
-        }
+        let Some(public_key) = trusted_keys.get(key_name.as_ref()) else {
+            return false;
+        };
+        block_on(verify_by_sig_type(sig_type, region, sig_value, public_key))
     } else {
-        &[]
+        verify_digest(sig_type, region, sig_value)
     };
-
-    match block_on(verify_by_sig_type(sig_type, region, sig_value, public_key)) {
-        Ok(VerifyOutcome::Valid) => true,
-        Ok(VerifyOutcome::Invalid) => false,
-        Err(_) => false,
-    }
+    matches!(outcome, Ok(VerifyOutcome::Valid))
 }
 
 #[cfg(test)]

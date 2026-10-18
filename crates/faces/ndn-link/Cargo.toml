@@ -1,0 +1,28 @@
+[package]
+name = "ndn-link"
+description = "Link admission for ndn-rs QUIC links: who may link, under which trust context, with which scope and routes; relinking, dial backoff, one link per device pair"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "extension"
+
+[dependencies]
+ndn-face-quic = { path = "../ndn-face-quic" }
+ndn-transport = { workspace = true }
+ndn-packet    = { workspace = true, features = ["std"] }
+ndn-security  = { workspace = true }
+ndn-cert      = { workspace = true }
+bytes         = { workspace = true, features = ["std"] }
+tracing       = { workspace = true }
+tokio         = { workspace = true, features = ["sync", "rt", "macros", "time", "net"] }
+tokio-util    = { workspace = true }
+parking_lot   = "0.12"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+sha2  = { workspace = true }
+
+[lints]
+workspace = true

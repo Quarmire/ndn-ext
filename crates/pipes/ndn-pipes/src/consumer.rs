@@ -90,7 +90,8 @@ impl PipeConsumer {
         // the cert-chain validator; else the pinned-key check.
         if let Some(validator) = &self.validator {
             match validator.validate(&reply).await {
-                ndn_security::ValidationResult::Valid(_) => {}
+                // A DigestSha256 reply is intact, but anyone could have sent it.
+                ndn_security::ValidationResult::Valid(safe) if safe.is_authenticated() => {}
                 _ => {
                     return Err(PipeError::Crypto(
                         "SEEK reply did not validate to a trusted producer".into(),

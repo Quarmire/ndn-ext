@@ -14,7 +14,8 @@
 //!   from it ([`Handshaken::admit`] with a [`LinkVerdict`],
 //!   [`Handshaken::refuse`] with a [`CloseReason`]). Deciding admission
 //!   (validation against held trust contexts, link policy, expected
-//!   fingerprints) is the caller's: this crate carries the messages.
+//!   fingerprints) is the caller's — the `ndn-link` crate decides it the
+//!   way every implementation must: this crate carries the messages.
 //! - **Scope.** A side may admit a link that carries less than everything —
 //!   an *enrollment link* ([`LinkScope`]): its face drops, both ways, every
 //!   packet outside the scope, Nacks the Interests among them, and

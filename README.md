@@ -3,8 +3,9 @@
 Extensions for the [ndn-rs](https://github.com/Quarmire/ndn-rs) core library —
 everything non-standard or optional, grouped by domain:
 
-- `crates/faces/` — non-standard faces: serial, SHM, Bluetooth, AF_XDP, QUIC,
-  WebSocket, WebRTC, WebTransport, monitor-mode Wi-Fi, BLE-adv, Wi-Fi Aware, LoRa, …
+- `crates/faces/` — non-standard faces: serial, SHM, Bluetooth, AF_XDP, QUIC
+  (`ndn-face-quic`, with link admission in `ndn-link`), WebSocket, WebRTC,
+  WebTransport, monitor-mode Wi-Fi, BLE-adv, Wi-Fi Aware, LoRa, …
   (named-radio docs index:
   [`ndn-face-monitor-wifi/docs/INDEX.md`](crates/faces/ndn-face-monitor-wifi/docs/INDEX.md))
 - `crates/service/` — the service/RPC stack: `#[ndn_service]` macro, carrier seam,

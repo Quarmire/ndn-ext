@@ -281,7 +281,14 @@ impl HintedCarrier for RpcCarrier {
                 // configured: the in-process loopback is digest-only by design.)
                 if let Some(v) = &self.validator {
                     match v.validate(&data).await {
-                        ValidationResult::Valid(_) => {}
+                        ValidationResult::Valid(safe) if safe.is_authenticated() => {}
+                        ValidationResult::Valid(_) => {
+                            return Err(ServiceError::Unauthorized(
+                                "response is not signed by a key (a DigestSha256 proves \
+                                 integrity, not who made it)"
+                                    .into(),
+                            ));
+                        }
                         ValidationResult::Pending => {
                             return Err(ServiceError::Unauthorized(
                                 "response signer certificate unavailable".into(),

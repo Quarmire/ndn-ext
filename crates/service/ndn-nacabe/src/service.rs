@@ -251,7 +251,9 @@ impl ParamFetcher {
     async fn verified_content(&self, data: ndn_packet::Data) -> Result<Bytes, AppError> {
         use ndn_security::validator::ValidationResult;
         match self.aa_validator.validate(&data).await {
-            ValidationResult::Valid(safe) => Ok(safe.data().content().cloned().unwrap_or_default()),
+            ValidationResult::Valid(safe) if safe.is_authenticated() => {
+                Ok(safe.data().content().cloned().unwrap_or_default())
+            }
             other => {
                 // NSF-F2: log the failed name and reason; NSF-F1: invoke the
                 // failure callback exactly once. Then fail closed.
@@ -261,7 +263,9 @@ impl ParamFetcher {
                     ValidationResult::Pending => {
                         "certificate chain unresolved (validation pending)".to_string()
                     }
-                    ValidationResult::Valid(_) => unreachable!(),
+                    ValidationResult::Valid(_) => "signed only with a digest, which proves \
+                                                   integrity, not that the authority made it"
+                        .to_string(),
                 };
                 warn!(name = %name, reason = %reason, "attribute-authority response failed validation");
                 if let Some(cb) = &self.on_failure {

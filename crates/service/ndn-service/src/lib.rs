@@ -242,7 +242,8 @@ impl PolicyAuthority {
 pub async fn verify_grant(validator: &Validator, wire: Bytes) -> Option<Grant> {
     let data = Data::decode(wire).ok()?;
     match validator.validate(&data).await {
-        ValidationResult::Valid(safe) => {
+        // A DigestSha256-only grant is intact, but anyone could have made it.
+        ValidationResult::Valid(safe) if safe.is_authenticated() => {
             let content = safe.data().content()?;
             Grant::decode(content).ok()
         }
@@ -292,7 +293,9 @@ impl GrantCache {
         let data = Data::decode(wire).ok()?;
         let key = grant_principal_key(&data.name)?;
         let grant = match validator.validate(&data).await {
-            ValidationResult::Valid(safe) => Grant::decode(safe.data().content()?).ok()?,
+            ValidationResult::Valid(safe) if safe.is_authenticated() => {
+                Grant::decode(safe.data().content()?).ok()?
+            }
             _ => return None,
         };
         if let Some(&last) = self.seen.get(&key)

@@ -151,7 +151,10 @@ pub fn ingest_validator(validator: Arc<Validator>) -> IngestValidator {
         let validator = validator.clone();
         Box::pin(async move {
             match Data::decode(wire) {
-                Ok(data) => matches!(validator.validate(&data).await, ValidationResult::Valid(_)),
+                Ok(data) => matches!(
+                    validator.validate(&data).await,
+                    ValidationResult::Valid(safe) if safe.is_authenticated()
+                ),
                 Err(_) => false,
             }
         })
