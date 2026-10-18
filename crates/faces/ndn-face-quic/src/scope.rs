@@ -13,7 +13,7 @@
 //! An Interest the scope drops is answered with a Nack (NoRoute) at once,
 //! so the requester stops waiting: one arriving from the peer is Nacked to
 //! the peer, one this side would send is Nacked back to this side. Received
-//! packets are rate-limited before they are judged.
+//! packets are rate-limited before they are judged; acknowledgements are not.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -138,18 +138,21 @@ impl ScopeState {
         self.started.elapsed().saturating_sub(last)
     }
 
-    /// Judge a frame the peer sent.
+    /// Judge a frame the peer sent. A frame carrying no network packet (an
+    /// acknowledgement) passes without a token: acknowledgements of the
+    /// fragments this side sends must not crowd out the peer's packets.
     pub(crate) fn received(&self, frame: &Bytes) -> Judged {
-        if !self.take_token() {
+        let packet = Packet::of(frame);
+        if !matches!(packet, Some(Packet::LinkOnly)) && !self.take_token() {
             self.note_drop("over the rate limit", None);
             return Judged::Drop(None);
         }
-        self.judge(frame, self.scope.receives, &self.inbound)
+        self.judge(packet, self.scope.receives, &self.inbound)
     }
 
     /// Judge a frame this side would send.
     pub(crate) fn sending(&self, frame: &Bytes) -> Judged {
-        self.judge(frame, self.scope.sends, &self.outbound)
+        self.judge(Packet::of(frame), self.scope.sends, &self.outbound)
     }
 
     fn take_token(&self) -> bool {
@@ -166,8 +169,8 @@ impl ScopeState {
         }
     }
 
-    fn judge(&self, frame: &Bytes, carries: Carries, fragmented: &Mutex<Fragmented>) -> Judged {
-        let Some(packet) = Packet::of(frame) else {
+    fn judge(&self, packet: Option<Packet>, carries: Carries, fragmented: &Mutex<Fragmented>) -> Judged {
+        let Some(packet) = packet else {
             self.note_drop("not a packet a link carries", None);
             return Judged::Drop(None);
         };
@@ -398,6 +401,18 @@ mod tests {
         // A later fragment whose first fragment was never seen is dropped.
         let frames = ndn_packet::fragment::fragment_packet(&data("/home/CA/big", 5000), 1200, 300);
         assert_eq!(s.received(&frames[1].clone()), Judged::Drop(None));
+    }
+
+    #[test]
+    fn acknowledgements_pass_without_using_the_rate_bucket() {
+        let s = scope(Carries::Interests, Carries::Answers);
+        let ack_only = Bytes::from_static(&[0x64, 0x05, 0xFD, 0x03, 0x44, 0x01, 0x05]);
+        for _ in 0..100 {
+            assert_eq!(s.received(&ack_only), Judged::Pass);
+        }
+        let inside = ndn_packet::lp::encode_lp_packet(&interest("/home/CA/STATUS"));
+        let passed = (0..10).filter(|_| s.received(&inside) == Judged::Pass).count();
+        assert_eq!(passed, 4, "the whole burst is still there for the peer's Interests");
     }
 
     #[test]

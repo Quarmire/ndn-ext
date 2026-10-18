@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use ndn_face_quic::KeyFingerprint;
 use ndn_packet::Name;
 use ndn_security::{Certificate, Keyring};
 use ndn_transport::{Face, FaceId};
@@ -29,6 +30,12 @@ pub trait LinkTrust: Send + Sync + 'static {
     /// one). Never fetched: a peer's chain is validated before its link is
     /// up.
     fn known_certificate(&self, name: &Name) -> Option<Certificate>;
+
+    /// A certificate this device already has of the key with `fingerprint`
+    /// (SHA-256 of the key as a certificate carries it), whatever its name
+    /// — the newest valid one, else the newest. Never fetched. A key that
+    /// sends no certificate is told revoked by it.
+    fn known_certificate_of_key(&self, fingerprint: &KeyFingerprint) -> Option<Certificate>;
 }
 
 /// A route a link gets.

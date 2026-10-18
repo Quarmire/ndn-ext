@@ -244,7 +244,12 @@ impl Links {
             });
         };
         self.faces.add_face(face, self.cancel.child_token());
-        let routes = routes_for(&self.peers, &admitted);
+        // The namespace route goes to a relay this device dials, whichever
+        // side's dial this link came from (when both dial, one link stays).
+        let dials = admitted
+            .peer
+            .is_some_and(|i| !self.paths.candidates(i, self.peers.get(i)).is_empty());
+        let routes = routes_for(&self.peers, &admitted, dials);
         self.faces.add_routes(face_id, &routes);
         tracing::info!(
             target: "face.quic",

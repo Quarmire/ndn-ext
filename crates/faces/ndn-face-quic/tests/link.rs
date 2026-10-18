@@ -138,6 +138,45 @@ async fn a_refusal_reaches_the_other_side_with_its_reason() {
 }
 
 #[tokio::test]
+async fn a_peer_that_misses_the_message_deadline_is_closed_as_a_protocol_error() {
+    let dialer = endpoint(ed_key(1), false);
+    let listener = endpoint(ed_key(2), true);
+    let target = addr(&listener);
+    // The listener completes its handshake, then says nothing for longer
+    // than the dialer waits for its hello.
+    let slow = async {
+        let mut hs = listener.accept().await.unwrap().handshake().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        match hs.exchange_hello(&hello(2), T).await {
+            Err(e) => e,
+            Ok(_) => hs.admit(FaceId(2), T, Admission::default()).await.err().unwrap(),
+        }
+    };
+    let dial = async {
+        let mut hs = dialer.connect(target, None).await.unwrap();
+        hs.exchange_hello(&hello(1), Duration::from_millis(200)).await.err().unwrap()
+    };
+    let (told, waited) = tokio::join!(slow, dial);
+    assert!(matches!(waited, LinkError::Timeout), "{waited:?}");
+    match told {
+        LinkError::Refused { reason, text } => {
+            assert_eq!(reason, Some(CloseReason::Protocol), "not a shutdown: {text}");
+            assert!(text.contains("no link message"), "{text}");
+            assert!(!told_is_transient(reason), "the slow side does not dial again at once");
+        }
+        other => panic!("expected the dialer's Protocol close, got {other:?}"),
+    }
+}
+
+fn told_is_transient(reason: Option<CloseReason>) -> bool {
+    LinkError::Refused {
+        reason,
+        text: String::new(),
+    }
+    .is_transient()
+}
+
+#[tokio::test]
 async fn packets_ride_datagrams_both_ways_and_large_ones_are_fragmented() {
     let dialer = endpoint(ed_key(1), false);
     let listener = endpoint(ec_key(2), true);

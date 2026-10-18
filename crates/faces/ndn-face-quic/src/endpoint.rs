@@ -61,10 +61,14 @@ pub struct HandshakeLimits {
     pub max_in_flight: usize,
     /// Of those, from one source address.
     pub max_in_flight_per_source: usize,
-    /// Refusals of one source address before it is refused outright…
+    /// Refusals of one source address within `refusal_window` before it is
+    /// refused outright…
     pub refusals_before_cooldown: u32,
     /// …for this long.
     pub cooldown: Duration,
+    /// Refusals older than this are forgotten: the count starts again at
+    /// the first refusal after the window of the previous first one ends.
+    pub refusal_window: Duration,
 }
 
 impl Default for HandshakeLimits {
@@ -74,6 +78,7 @@ impl Default for HandshakeLimits {
             max_in_flight_per_source: 4,
             refusals_before_cooldown: 8,
             cooldown: Duration::from_secs(60),
+            refusal_window: Duration::from_secs(60),
         }
     }
 }
@@ -82,6 +87,8 @@ impl Default for HandshakeLimits {
 struct Source {
     in_flight: usize,
     refusals: u32,
+    /// When the first of `refusals` was counted.
+    window_start: Option<Instant>,
     cooldown_until: Option<Instant>,
 }
 
@@ -101,19 +108,7 @@ pub(crate) struct Permit {
 impl Permit {
     /// The link was refused: count it against the source.
     pub(crate) fn refused(&self) {
-        let mut sources = self.gate.sources.lock().unwrap_or_else(PoisonError::into_inner);
-        let source = sources.entry(self.source).or_default();
-        source.refusals += 1;
-        if source.refusals >= self.gate.limits.refusals_before_cooldown {
-            source.refusals = 0;
-            source.cooldown_until = Some(Instant::now() + self.gate.limits.cooldown);
-            tracing::warn!(
-                target: "face.quic",
-                source = %self.source,
-                cooldown_secs = self.gate.limits.cooldown.as_secs(),
-                "refusing link attempts from this address for a while: too many were refused"
-            );
-        }
+        self.gate.refused(self.source, Instant::now());
     }
 }
 
@@ -137,6 +132,33 @@ impl Gate {
             in_flight: AtomicUsize::new(0),
             sources: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Count a refusal of `ip` at `now`; at `refusals_before_cooldown` within
+    /// `refusal_window`, refuse that source outright for `cooldown`.
+    fn refused(&self, ip: IpAddr, now: Instant) {
+        let limits = &self.limits;
+        let mut sources = self.sources.lock().unwrap_or_else(PoisonError::into_inner);
+        let source = sources.entry(ip).or_default();
+        if source
+            .window_start
+            .is_none_or(|start| now.saturating_duration_since(start) >= limits.refusal_window)
+        {
+            source.refusals = 0;
+            source.window_start = Some(now);
+        }
+        source.refusals += 1;
+        if source.refusals >= limits.refusals_before_cooldown {
+            source.refusals = 0;
+            source.window_start = None;
+            source.cooldown_until = Some(now + limits.cooldown);
+            tracing::warn!(
+                target: "face.quic",
+                source = %ip,
+                cooldown_secs = limits.cooldown.as_secs(),
+                "refusing link attempts from this address for a while: too many were refused"
+            );
+        }
     }
 
     fn admit(self: &Arc<Self>, ip: IpAddr) -> Result<Permit, &'static str> {
@@ -430,5 +452,33 @@ fn endpoint_config(key: &crate::key::LinkKey) -> quinn::EndpointConfig {
             )))
         }
         None => quinn::EndpointConfig::default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cooling(gate: &Gate, ip: IpAddr) -> bool {
+        let sources = gate.sources.lock().unwrap_or_else(PoisonError::into_inner);
+        sources.get(&ip).is_some_and(|s| s.cooldown_until.is_some())
+    }
+
+    #[test]
+    fn refusals_spread_beyond_the_window_never_cool_a_source_down() {
+        let gate = Gate::new(HandshakeLimits::default());
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        let t0 = Instant::now();
+        // 7 refusals, then the window passes: the count starts over.
+        for _ in 0..7 {
+            gate.refused(ip, t0);
+        }
+        let later = t0 + gate.limits.refusal_window;
+        for _ in 0..7 {
+            gate.refused(ip, later);
+        }
+        assert!(!cooling(&gate, ip), "refusals older than the window are forgotten");
+        gate.refused(ip, later + Duration::from_secs(1));
+        assert!(cooling(&gate, ip), "8 refusals within the window cool the source down");
     }
 }

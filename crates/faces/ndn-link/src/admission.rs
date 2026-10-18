@@ -160,6 +160,9 @@ impl Judge<'_> {
 
     /// What the certificates `hello` carries establish about `key`.
     pub(crate) async fn identify(&self, key: &PeerKey, hello: &LinkHello) -> Result<Identified, Refusal> {
+        if let Some(refusal) = self.revoked_key(key) {
+            return Err(refusal);
+        }
         let Some((leaf_wire, issuers)) = hello.certificates.split_first() else {
             return Ok(Identified::Unknown("it sent no certificate".into()));
         };
@@ -287,6 +290,28 @@ impl Judge<'_> {
             }
         }
         ValidationResult::Pending
+    }
+
+    /// A refusal of `key` when this device knows a certificate of it that a
+    /// held trust context revokes, whatever the peer's hello carries: a
+    /// revoked device that sends no certificate gets no enrollment link
+    /// either. A key this device knows no certificate of cannot be told
+    /// from a new one; the CA refuses what it revoked.
+    fn revoked_key(&self, key: &PeerKey) -> Option<Refusal> {
+        let cert = self.trust.known_certificate_of_key(&key.fingerprint())?;
+        let ctx = self.keyring().context_for(&cert.name);
+        if ctx.namespace().is_empty() || !ctx.is_revoked(&cert.name) {
+            return None;
+        }
+        Some(Refusal::new(
+            CloseReason::Revoked,
+            format!(
+                "your key {} is revoked in {} (trust context v{})",
+                cert.key_name(),
+                ctx.namespace(),
+                ctx.version()
+            ),
+        ))
     }
 
     /// Decide whether the link from `key` (which sent `hello`) is admitted.
@@ -591,8 +616,9 @@ mod tests {
         assert!(in_enrollment(&off, &ns, &n("/home/CA/NEW"), false));
     }
 
-    /// Trust data with no certificate of its own.
-    struct Bare(Arc<Keyring>);
+    /// Trust data with no certificate of its own, knowing at most one
+    /// certificate of a peer's key.
+    struct Bare(Arc<Keyring>, Option<Certificate>);
 
     impl LinkTrust for Bare {
         fn keyring(&self) -> &Arc<Keyring> {
@@ -603,6 +629,11 @@ mod tests {
         }
         fn known_certificate(&self, _: &Name) -> Option<Certificate> {
             None
+        }
+        fn known_certificate_of_key(&self, fingerprint: &KeyFingerprint) -> Option<Certificate> {
+            self.1
+                .clone()
+                .filter(|c| KeyFingerprint::of_ndn_key(&c.public_key) == *fingerprint)
         }
     }
 
@@ -637,7 +668,7 @@ mod tests {
         peer: Option<PeerId>,
         dialed: Option<PeerId>,
     ) -> Result<Admitted, Refusal> {
-        let trust = Bare(Arc::new(keyring));
+        let trust = Bare(Arc::new(keyring), None);
         let peers = Peers::new(peers);
         let hints = hints();
         let judge = Judge {
@@ -751,7 +782,7 @@ mod tests {
             certificates: vec![Bytes::from(cert)],
         };
 
-        let trust = Bare(Arc::new(keyring));
+        let trust = Bare(Arc::new(keyring), None);
         let peers = Peers::new(Vec::new());
         let hints = hints();
         let judge = Judge {
@@ -763,6 +794,63 @@ mod tests {
             Ok(Identified::Unknown(why)) => assert!(why.contains("DigestSha256"), "{why}"),
             Ok(Identified::Device(id)) => panic!("a digest-only certificate identified {}", id.device),
             Err(refusal) => panic!("expected an unknown device, refused: {refusal:?}"),
+        }
+    }
+
+    /// A device whose key is revoked sends no certificate, hoping for an
+    /// enrollment link: a relay that knows a certificate of that key refuses
+    /// it as revoked.
+    #[tokio::test]
+    async fn a_revoked_key_sending_no_certificate_is_refused_as_revoked() {
+        let keyring = keyring_with(
+            SignedTrustContext::hierarchical(n("/home"))
+                .with_version(2)
+                .with_ca_endpoint(n("/home/CA"))
+                .with_revocation(n("/home/member/phone/KEY/k1")),
+        );
+        let raw = [5u8; 32];
+        let peer = PeerKey::from_spki(&ndn_security::spki::wrap_ed25519(&raw)).unwrap();
+        let known = |name: &str| Certificate {
+            name: Arc::new(n(name)),
+            public_key: Bytes::copy_from_slice(&raw),
+            valid_from: 0,
+            valid_until: u64::MAX,
+            issuer: None,
+            signed_region: None,
+            sig_value: None,
+            sig_type: ndn_packet::SignatureType::SignatureEd25519,
+        };
+        let peers = Peers::new(Vec::new());
+        let hints = hints();
+        let identify = |trust: Bare| {
+            let peers = &peers;
+            let hints = &hints;
+            let peer = peer.clone();
+            async move {
+                let judge = Judge {
+                    trust: &trust,
+                    peers,
+                    hints,
+                };
+                judge.identify(&peer, &LinkHello::default()).await
+            }
+        };
+        let keyring = Arc::new(keyring);
+        match identify(Bare(Arc::clone(&keyring), Some(known("/home/member/phone/KEY/k1/CA/v=1")))).await {
+            Err(refusal) => {
+                assert_eq!(refusal.reason, CloseReason::Revoked);
+                assert!(refusal.text.contains("/home/member/phone/KEY/k1"), "{}", refusal.text);
+            }
+            Ok(_) => panic!("a revoked key was not refused"),
+        }
+        // A key whose known certificate is not revoked, or one this relay
+        // knows nothing of, is merely unknown (an enrollment link may admit
+        // it).
+        for known in [Some(known("/home/member/laptop/KEY/k2/CA/v=1")), None] {
+            assert!(matches!(
+                identify(Bare(Arc::clone(&keyring), known)).await,
+                Ok(Identified::Unknown(_))
+            ));
         }
     }
 }

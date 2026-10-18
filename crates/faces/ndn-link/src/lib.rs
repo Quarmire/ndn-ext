@@ -39,7 +39,9 @@
 //!   [`policy::ENROLLMENT_LINKS_MAX`] at once
 //!   ([`policy::ENROLLMENT_LINKS_PER_SOURCE`] from one address), closed
 //!   after [`policy::ENROLLMENT_IDLE`] carrying nothing. Its verdict tells
-//!   the device;
+//!   the device. A key the relay knows a revoked certificate of
+//!   ([`LinkTrust::known_certificate_of_key`]) is refused as revoked, with
+//!   or without a certificate in its hello;
 //! - a device holding no certificate in the namespace of the relay its
 //!   [`PeerSpec`] names, which it therefore cannot confirm yet, links to it
 //!   for its enrollment only.
@@ -54,8 +56,9 @@
 //!
 //! Each admitted link is a face (NDNLPv2 over QUIC datagrams) with routes:
 //! the [`PeerSpec`]'s `routes`, else the peer's namespace for a relay (a
-//! `node` device this device dials) or the peer's device name, plus the
-//! routes of the peers reached through it (`relay`, at
+//! `node` device this device dials — its [`PathSource`] gives it a path —
+//! whichever side's dial the link came from) or the peer's device name, plus
+//! the routes of the peers reached through it (`relay`, at
 //! [`policy::VIA_RELAY_COST`]). Persistent peers are dialled again with
 //! [`Backoff`] whenever their link drops. Between two devices there is one
 //! link: when both dial, the link dialled by the device with the smaller key

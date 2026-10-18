@@ -159,7 +159,7 @@ impl Handshaken {
                 Direction::Dialed => {
                     let (mut send, recv) =
                         self.connection.open_bi().await.map_err(LinkError::from_connection)?;
-                    write(&mut send, &wire).await?;
+                    write(&mut send, &self.connection, &wire).await?;
                     (send, recv)
                 }
                 Direction::Accepted => {
@@ -168,14 +168,16 @@ impl Handshaken {
             };
             let theirs = read_message(&mut recv, &self.connection, LINK_HELLO).await?;
             if self.direction == Direction::Accepted {
-                write(&mut send, &wire).await?;
+                write(&mut send, &self.connection, &wire).await?;
             }
             let hello = LinkHello::decode(&theirs).map_err(LinkError::Protocol)?;
             Ok::<_, LinkError>((hello, send, recv))
         };
-        let (hello, send, recv) = tokio::time::timeout(deadline, exchange)
-            .await
-            .map_err(|_| LinkError::Timeout)??;
+        let (hello, send, recv) = match tokio::time::timeout(deadline, exchange).await {
+            Ok(Ok(exchanged)) => exchanged,
+            Ok(Err(e)) => return Err(self.fail(e, deadline)),
+            Err(_) => return Err(self.fail(LinkError::Timeout, deadline)),
+        };
         self.control = Some((send, recv));
         Ok(hello)
     }
@@ -192,9 +194,7 @@ impl Handshaken {
         if self.connection.max_datagram_size().is_none() {
             let text = "the other device does not support QUIC datagrams, which links carry \
                         NDN packets in";
-            self.connection
-                .close(quinn::VarInt::from_u32(CloseReason::Protocol.code()), text.as_bytes());
-            return Err(LinkError::Protocol(text.into()));
+            return Err(self.fail(LinkError::Protocol(text.into()), deadline));
         }
         let (mut send, mut recv) = self
             .control
@@ -203,14 +203,16 @@ impl Handshaken {
         let connection = self.connection.clone();
         let ours = admission.verdict.encode();
         let verdicts = async {
-            write(&mut send, &ours).await?;
+            write(&mut send, &connection, &ours).await?;
             let theirs = read_message(&mut recv, &connection, LINK_VERDICT).await?;
             let _ = send.finish();
             LinkVerdict::decode(&theirs).map_err(LinkError::Protocol)
         };
-        let peer_verdict = tokio::time::timeout(deadline, verdicts)
-            .await
-            .map_err(|_| LinkError::Timeout)??;
+        let peer_verdict = match tokio::time::timeout(deadline, verdicts).await {
+            Ok(Ok(verdict)) => verdict,
+            Ok(Err(e)) => return Err(self.fail(e, deadline)),
+            Err(_) => return Err(self.fail(LinkError::Timeout, deadline)),
+        };
         drop(self.permit.take());
         let local = self.local.map(|addr| ip_face_uri("quic", addr));
         let remote = self.connection.remote_address();
@@ -246,12 +248,44 @@ impl Handshaken {
         self.connection
             .close(quinn::VarInt::from_u32(reason.code()), text.as_bytes());
     }
+
+    /// The hello or verdict exchange failed on this side: a malformed
+    /// message, another protocol version, or no message within `deadline`.
+    /// Close with [`CloseReason::Protocol`] and the reason, so the peer
+    /// neither takes it for a shutdown nor dials again at once, and count it
+    /// against the source like any refusal. Other errors (the peer closed,
+    /// the connection broke) pass unchanged.
+    fn fail(&self, error: LinkError, deadline: Duration) -> LinkError {
+        let text = match &error {
+            LinkError::Protocol(text) => text.clone(),
+            LinkError::Timeout => format!(
+                "your device sent no link message within {} s of the last one",
+                deadline.as_secs()
+            ),
+            _ => return error,
+        };
+        if let Some(permit) = &self.permit {
+            permit.refused();
+        }
+        self.connection
+            .close(quinn::VarInt::from_u32(CloseReason::Protocol.code()), text.as_bytes());
+        match error {
+            LinkError::Protocol(text) => LinkError::RefusedHere {
+                reason: CloseReason::Protocol,
+                text,
+            },
+            other => other,
+        }
+    }
 }
 
-async fn write(send: &mut quinn::SendStream, wire: &[u8]) -> Result<(), LinkError> {
-    send.write_all(wire)
-        .await
-        .map_err(|e| LinkError::Connect(e.to_string()))
+/// Write a link message. A connection the peer closed reports the peer's
+/// reason.
+async fn write(send: &mut quinn::SendStream, connection: &quinn::Connection, wire: &[u8]) -> Result<(), LinkError> {
+    send.write_all(wire).await.map_err(|e| match connection.close_reason() {
+        Some(reason) => LinkError::from_connection(reason),
+        None => LinkError::Connect(e.to_string()),
+    })
 }
 
 /// Read one link message of TLV-TYPE `expected` and return its value. A

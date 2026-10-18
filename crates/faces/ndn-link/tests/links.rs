@@ -39,6 +39,9 @@ impl LinkTrust for NoTrust {
     fn known_certificate(&self, _: &Name) -> Option<Certificate> {
         None
     }
+    fn known_certificate_of_key(&self, _: &KeyFingerprint) -> Option<Certificate> {
+        None
+    }
 }
 
 #[derive(Default)]

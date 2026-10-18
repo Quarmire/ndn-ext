@@ -61,10 +61,17 @@ impl LinkHello {
         while !cur.is_empty() {
             let (t, start, end) = split_tlv(cur)?;
             match t {
-                LINK_VERSION => version = cur[start..end].first().copied(),
+                LINK_VERSION => match &cur[start..end] {
+                    [v] => version = Some(*v),
+                    other => {
+                        return Err(format!(
+                            "a link protocol version of {} bytes in the link hello (it is one byte)",
+                            other.len()
+                        ));
+                    }
+                },
                 DATA => certificates.push(Bytes::copy_from_slice(&cur[..end])),
-                // Non-critical (even) types from a newer version are skipped.
-                t if t & 1 == 0 => {}
+                t if skippable(t) => {}
                 t => return Err(format!("unknown critical field {t:#x} in the link hello")),
             }
             cur = &cur[end..];
@@ -86,7 +93,8 @@ pub struct LinkVerdict {
     /// `Some`: the sender admitted the link only as an enrollment link,
     /// which carries the receiver's enrollment in these namespaces (their
     /// CA, trust context and certificates) and nothing else, until the
-    /// receiver links again holding a certificate. `None`: a full link.
+    /// receiver links again holding a certificate. Never empty: an empty
+    /// list is a malformed verdict. `None`: a full link.
     pub enrollment_link: Option<Vec<Name>>,
 }
 
@@ -126,15 +134,24 @@ impl LinkVerdict {
                         );
                         names = &names[nend..];
                     }
+                    if namespaces.is_empty() {
+                        return Err("an enrollment link for no namespace in the link verdict".into());
+                    }
                     verdict.enrollment_link = Some(namespaces);
                 }
-                t if t & 1 == 0 => {}
+                t if skippable(t) => {}
                 t => return Err(format!("unknown critical field {t:#x} in the link verdict")),
             }
             cur = &cur[end..];
         }
         Ok(verdict)
     }
+}
+
+/// Whether an unrecognized TLV-TYPE in a link message may be skipped: an
+/// even type above 31. Types 0–31 are always critical, as in NDN packets.
+fn skippable(t: u64) -> bool {
+    t > 31 && t & 1 == 0
 }
 
 /// One TLV at the head of `buf`: its type, and where its value starts and the
@@ -263,6 +280,19 @@ mod tests {
             assert_eq!(t, LINK_VERDICT);
             assert_eq!(LinkVerdict::decode(&wire[start..end]).unwrap(), verdict);
         }
+    }
+
+    #[test]
+    fn malformed_link_messages_are_refused() {
+        // LinkVersion of two bytes, even if the first is 1.
+        assert!(LinkHello::decode(&[0xFD, 0x04, 0x51, 0x02, 0x01, 0x00]).is_err());
+        // Unknown even types 0–31 are critical, as in NDN packets; above 31
+        // they are skipped.
+        assert!(LinkHello::decode(&[0xFD, 0x04, 0x51, 0x01, 0x01, 0x0A, 0x00]).is_err());
+        assert!(LinkHello::decode(&[0xFD, 0x04, 0x51, 0x01, 0x01, 0xFD, 0x04, 0x56, 0x00]).is_ok());
+        assert!(LinkVerdict::decode(&[0x08, 0x00]).is_err());
+        // An enrollment link for no namespace means nothing.
+        assert!(LinkVerdict::decode(&[0xFD, 0x04, 0x54, 0x00]).is_err());
     }
 
     #[test]
