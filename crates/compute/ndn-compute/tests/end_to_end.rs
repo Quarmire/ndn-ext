@@ -681,8 +681,8 @@ async fn reflexive_sealed_end_to_end() {
 async fn reflexive_secure_validates_decrypts_and_computes() {
     use bytes::Bytes;
     use ndn_packet::encode::{DataBuilder, InterestBuilder};
-    use ndn_packet::{Data, Interest, random_reflexive_name};
-    use ndn_security::{TrustSchema, Validator};
+    use ndn_packet::{Data, Interest, SignatureType, random_reflexive_name};
+    use ndn_security::{Certificate, Ed25519Signer, SignWith, TrustSchema, Validator};
     use std::sync::Arc;
 
     let mut builder = EngineBuilder::new(EngineConfig::default());
@@ -692,7 +692,23 @@ async fn reflexive_secure_validates_decrypts_and_computes() {
     let (engine, shutdown) = builder.build().await.expect("engine build");
 
     let service = ComputeService::attach(&engine);
-    let validator = Arc::new(Validator::new(TrustSchema::accept_all()));
+    // D2 must carry a real signature: a DigestSha256-only D2 authenticates no
+    // signer and the validator refuses it. accept_all authorizes the arbitrary
+    // reflexive name; the cached self-cert lets the Ed25519 signature verify.
+    let d2_key = name!("/svc/signer/KEY/k1");
+    let d2_signer = Ed25519Signer::from_seed(&[7u8; 32], d2_key.clone());
+    let validator = Validator::new(TrustSchema::accept_all());
+    validator.cert_cache().insert(Certificate {
+        name: Arc::new(d2_key),
+        public_key: Bytes::copy_from_slice(&d2_signer.public_key_bytes()),
+        valid_from: 0,
+        valid_until: u64::MAX,
+        issuer: None,
+        signed_region: None,
+        sig_value: None,
+        sig_type: SignatureType::SignatureEd25519,
+    });
+    let validator = Arc::new(validator);
     service.function_reflexive_secure(
         name!("/svc/secure"),
         validator,
@@ -719,7 +735,9 @@ async fn reflexive_secure_validates_decrypts_and_computes() {
                 let node_pub = i2.name.components().last().expect("pubkey").value.clone();
                 // Seal, then sign the Data carrying the sealed blob.
                 let blob = ndn_compute::seal(&node_pub, &[4u8, 6]).expect("seal");
-                let d2 = DataBuilder::new((*i2.name).clone(), &blob).build();
+                let d2 = DataBuilder::new((*i2.name).clone(), &blob)
+                    .sign_with_sync(&d2_signer)
+                    .expect("sign D2");
                 chandle.send(d2).await.expect("send D2");
             }
             Some(&0x06) => {
