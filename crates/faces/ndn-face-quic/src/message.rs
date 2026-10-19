@@ -8,10 +8,12 @@
 //! link carries NDN packets only once both sides admitted it.
 //!
 //! Wire: TLV-TYPEs in the application range.
-//! `LinkHello = 0x0450 { LinkVersion 0x0451 (1 byte), Data*, DirectPath
-//! 0x045A (8 bytes)? }` — the first Data is the sender's certificate, the
-//! rest its issuers (nearest first); `DirectPath` marks a connection made
-//! for a direct path of the link (the punch's session);
+//! `LinkHello = 0x0450 { LinkVersion 0x0451 (1 byte), Data*, Membership
+//! 0x045C*, DirectPath 0x045A (8 bytes)? }` — the first Data is the
+//! sender's certificate for its link key, the rest its issuers (nearest
+//! first); each [`Membership`] is a namespace the sender is a member of
+//! with another key, bound to this connection; `DirectPath` marks a
+//! connection made for a direct path of the link (the punch's session);
 //! `LinkVerdict = 0x0452 { EnrollmentLink 0x0454 { Name* }? }` — admitted;
 //! with `EnrollmentLink`, admitted as an enrollment link that carries only
 //! the enrollment of the receiver in the namespaces named;
@@ -40,6 +42,7 @@ use ndn_packet::Name;
 use ndn_tlv::{TlvWriter, read_varu64};
 
 use crate::key::KeyFingerprint;
+use crate::membership::{MEMBERSHIP, Membership};
 
 pub(crate) const LINK_HELLO: u64 = 0x0450;
 const LINK_VERSION: u64 = 0x0451;
@@ -53,7 +56,7 @@ const WAKE_TOKEN: u64 = 0x0444;
 pub(crate) const PRESENCE: u64 = 0x0446;
 const PRESENT_DEVICE: u64 = 0x0448;
 const KEY_DIGEST: u64 = 0x044A;
-const DATA: u64 = 0x06;
+pub(crate) const DATA: u64 = 0x06;
 const NAME: u64 = 0x07;
 
 /// The session of a direct-path attempt (its punch), which the dialer of a
@@ -66,7 +69,8 @@ pub const LINK_PROTOCOL_VERSION: u8 = 1;
 /// Upper bound on one link message: a certificate chain is a few KiB.
 pub(crate) const MAX_MESSAGE: usize = 64 * 1024;
 
-/// The first link message: the sender's certificate and its issuers.
+/// The first link message: the sender's certificate and its issuers, and
+/// its memberships of other namespaces.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LinkHello {
     /// Certificate Data wires: the sender's own certificate first, then the
@@ -74,6 +78,10 @@ pub struct LinkHello {
     /// has no certificate (a device not enrolled anywhere, linked by its
     /// expected fingerprint alone).
     pub certificates: Vec<Bytes>,
+    /// The namespaces the sender is a member of with a key other than its
+    /// link key, each bound to this connection. A receiver uses at most
+    /// [`MEMBERSHIPS_MAX`](crate::MEMBERSHIPS_MAX) of them.
+    pub memberships: Vec<Membership>,
     /// `Some`: this connection is a direct path made by the punch of this
     /// session (the dialer names it; the listener repeats it when it takes
     /// the connection as that direct path).
@@ -88,6 +96,9 @@ impl LinkHello {
             for cert in &self.certificates {
                 w.write_raw(cert);
             }
+            for membership in &self.memberships {
+                membership.write(w);
+            }
             if let Some(session) = &self.direct_path {
                 w.write_tlv(DIRECT_PATH, session);
             }
@@ -98,6 +109,7 @@ impl LinkHello {
     /// Decode the value of a `LinkHello` TLV.
     pub(crate) fn decode(value: &[u8]) -> Result<Self, String> {
         let mut certificates = Vec::new();
+        let mut memberships = Vec::new();
         let mut direct_path = None;
         let mut version = None;
         let mut cur = value;
@@ -114,6 +126,9 @@ impl LinkHello {
                     }
                 },
                 DATA => certificates.push(Bytes::copy_from_slice(&cur[..end])),
+                MEMBERSHIP => memberships.push(
+                    Membership::decode(&cur[start..end]).map_err(|e| format!("{e} in the link hello"))?,
+                ),
                 DIRECT_PATH => {
                     direct_path = Some(PathSession::try_from(&cur[start..end]).map_err(|_| {
                         format!(
@@ -130,6 +145,7 @@ impl LinkHello {
         match version {
             Some(LINK_PROTOCOL_VERSION) => Ok(Self {
                 certificates,
+                memberships,
                 direct_path,
             }),
             Some(v) => Err(format!(
@@ -419,8 +435,9 @@ pub enum CloseReason {
     /// An enrollment link carried nothing for longer than its idle
     /// lifetime.
     Idle,
-    /// The device enrolled: it links again holding its certificate, as an
-    /// enrolled device, in place of its enrollment link.
+    /// The device enrolled, or its memberships changed otherwise: it links
+    /// again presenting the certificates it holds now (in place of its
+    /// enrollment link, or of a link whose hello no longer says all it is).
     Enrolled,
     /// A connection names a direct-path session ([`LinkHello::direct_path`])
     /// this device is not punching (it ended, or never began): the other
@@ -466,6 +483,12 @@ pub enum CloseReason {
     /// as its operator chose): use another relay, or ask this relay's
     /// operator to serve the namespace.
     NotServed,
+    /// A [`Membership`] in the hello is not bound to this link: its binding
+    /// does not verify under that certificate's key for the sender's link
+    /// key on this connection — the sender does not hold the certificate's
+    /// key (a forged membership), or the binding was made for another
+    /// connection (a replayed one).
+    MembershipNotBound,
 }
 
 impl CloseReason {
@@ -488,6 +511,7 @@ impl CloseReason {
             Self::NoLinkKey => 0x17,
             Self::DirectPathsOff => 0x18,
             Self::NotServed => 0x19,
+            Self::MembershipNotBound => 0x1A,
         }
     }
 
@@ -510,6 +534,7 @@ impl CloseReason {
             0x17 => Self::NoLinkKey,
             0x18 => Self::DirectPathsOff,
             0x19 => Self::NotServed,
+            0x1A => Self::MembershipNotBound,
             _ => return None,
         })
     }
@@ -543,11 +568,19 @@ mod tests {
         for hello in [
             LinkHello {
                 certificates: vec![Bytes::from_static(&[0x06, 0x01, 0xAA]), Bytes::from_static(&[0x06, 0x00])],
-                direct_path: None,
+                ..LinkHello::default()
             },
             LinkHello {
-                certificates: Vec::new(),
                 direct_path: Some([1, 2, 3, 4, 5, 6, 7, 8]),
+                ..LinkHello::default()
+            },
+            LinkHello {
+                certificates: vec![Bytes::from_static(&[0x06, 0x01, 0xAA])],
+                memberships: vec![Membership {
+                    certificates: vec![Bytes::from_static(&[0x06, 0x01, 0xBB]), Bytes::from_static(&[0x06, 0x00])],
+                    binding: Bytes::from_static(&[1, 2, 3]),
+                }],
+                direct_path: Some([8; 8]),
             },
         ] {
             let wire = hello.encode();
@@ -583,8 +616,8 @@ mod tests {
         assert!(hello(9).is_err());
         // The vector of ndn-link.md: no certificate, session 01..08.
         let wire = LinkHello {
-            certificates: Vec::new(),
             direct_path: Some([1, 2, 3, 4, 5, 6, 7, 8]),
+            ..LinkHello::default()
         }
         .encode();
         assert_eq!(
@@ -596,15 +629,18 @@ mod tests {
     }
 
     #[test]
-    fn a_hello_without_extensions_round_trips() {
-        let hello = LinkHello {
-            certificates: vec![Bytes::from_static(&[0x06, 0x01, 0xAA]), Bytes::from_static(&[0x06, 0x00])],
-            direct_path: None,
+    fn a_membership_needs_a_certificate_and_a_binding() {
+        let hello = |membership: &[u8]| {
+            let mut v = vec![0xFD, 0x04, 0x51, 0x01, 0x01, 0xFD, 0x04, 0x5C, membership.len() as u8];
+            v.extend_from_slice(membership);
+            LinkHello::decode(&v)
         };
-        let wire = hello.encode();
-        let (t, start, end) = split_tlv(&wire).unwrap();
-        assert_eq!(t, LINK_HELLO);
-        assert_eq!(LinkHello::decode(&wire[start..end]).unwrap(), hello);
+        let ok = hello(&[0x06, 0x00, 0xFD, 0x04, 0x5E, 0x01, 0xAA]).unwrap();
+        assert_eq!(ok.memberships[0].binding.as_ref(), [0xAA]);
+        assert!(hello(&[0xFD, 0x04, 0x5E, 0x01, 0xAA]).is_err());
+        assert!(hello(&[0x06, 0x00]).is_err());
+        assert!(hello(&[0x06, 0x00, 0xFD, 0x04, 0x5E, 0x00]).is_err());
+        assert!(hello(&[0x06, 0x00, 0xFD, 0x04, 0x5E, 0x01, 0xAA, 0xFD, 0x04, 0x5F, 0x00]).is_err());
     }
 
     #[test]
@@ -655,6 +691,7 @@ mod tests {
             CloseReason::NoLinkKey,
             CloseReason::DirectPathsOff,
             CloseReason::NotServed,
+            CloseReason::MembershipNotBound,
         ] {
             assert_eq!(CloseReason::from_code(u64::from(r.code())), Some(r));
         }
@@ -663,6 +700,7 @@ mod tests {
             (CloseReason::Asleep, 0x05, true),
             (CloseReason::Released, 0x06, true),
             (CloseReason::NotServed, 0x19, false),
+            (CloseReason::MembershipNotBound, 0x1A, false),
         ] {
             assert_eq!((r.code(), r.is_transient()), (code, transient), "{r:?}");
         }

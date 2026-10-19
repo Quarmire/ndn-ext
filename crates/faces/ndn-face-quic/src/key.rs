@@ -46,6 +46,31 @@ impl LinkKeyAlgorithm {
             Self::EcdsaP256 => SignatureAlgorithm::ECDSA,
         }
     }
+
+    /// The algorithm of a key as an NDN certificate carries it: the raw 32
+    /// bytes (or the SubjectPublicKeyInfo) of an Ed25519 key, the
+    /// SubjectPublicKeyInfo of a P-256 key with its uncompressed point.
+    /// `None` for any other key.
+    pub(crate) fn of_ndn_key(key: &[u8]) -> Option<Self> {
+        if key.len() == 32 || (key.len() == ED25519_SPKI_PREFIX.len() + 32 && key.starts_with(&ED25519_SPKI_PREFIX)) {
+            Some(Self::Ed25519)
+        } else if key.len() == P256_SPKI_PREFIX.len() + 65
+            && key.starts_with(&P256_SPKI_PREFIX)
+            && key[P256_SPKI_PREFIX.len()] == 0x04
+        {
+            Some(Self::EcdsaP256)
+        } else {
+            None
+        }
+    }
+
+    /// The NDN signature type a key of this algorithm signs with.
+    pub(crate) fn signature_type(self) -> SignatureType {
+        match self {
+            Self::Ed25519 => SignatureType::SignatureEd25519,
+            Self::EcdsaP256 => SignatureType::SignatureSha256WithEcdsa,
+        }
+    }
 }
 
 /// SHA-256 over a key as an NDN certificate carries it (the raw 32 bytes of

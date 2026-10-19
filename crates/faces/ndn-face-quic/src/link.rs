@@ -14,6 +14,7 @@ use ndn_transport::{FaceError, FaceId, FaceKind, Transport, ip_face_uri};
 
 use crate::endpoint::Permit;
 use crate::key::{KeyFingerprint, PeerKey};
+use crate::membership::{ChannelBinding, MEMBERSHIP_EXPORTER_LABEL};
 use crate::message::{
     CloseReason, LINK_HELLO, LINK_VERDICT, LinkHello, LinkVerdict, MAX_MESSAGE, OBSERVED_ADDRESS, PRESENCE,
     Presence, REACHABILITY, Reachability, WAKE_TOKEN_MAX, decode_udp_address, encode_observed_address, skippable,
@@ -155,6 +156,19 @@ impl Handshaken {
     /// moved), the new one.
     pub fn local_address(&self) -> Option<SocketAddr> {
         self.endpoint.local_addr().ok()
+    }
+
+    /// The value this connection's [`Membership`](crate::Membership)
+    /// bindings are bound to: 32 bytes of the TLS exporter (RFC 8446 §7.5)
+    /// with label [`MEMBERSHIP_EXPORTER_LABEL`](crate::MEMBERSHIP_EXPORTER_LABEL)
+    /// and an empty context. Both sides of this connection compute the
+    /// same value, and no other connection has it.
+    pub fn channel_binding(&self) -> Result<ChannelBinding, LinkError> {
+        let mut out = [0u8; 32];
+        self.connection
+            .export_keying_material(&mut out, MEMBERSHIP_EXPORTER_LABEL, &[])
+            .map_err(|_| LinkError::Tls("the TLS exporter of the link is not available".into()))?;
+        Ok(out)
     }
 
     /// Send `ours` and receive the peer's hello, within `deadline`. The

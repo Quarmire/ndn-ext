@@ -4,9 +4,10 @@
 //! counted (keep-alives are not), a scoped (enrollment) link carries only
 //! its scope, attempts over the limits are refused, a link survives an
 //! address change (its face then names the new addresses, the other side's
-//! and its own), an endpoint links on a socket the host bound, and the
+//! and its own), an endpoint links on a socket the host bound, the
 //! messages after the verdict (Reachability, Presence) reach the other side,
-//! the latest replacing the earlier.
+//! the latest replacing the earlier, and both sides of a connection share
+//! its membership binding value, which no other connection has.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -56,7 +57,7 @@ fn addr(e: &LinkEndpoint) -> SocketAddr {
 fn hello(tag: u8) -> LinkHello {
     LinkHello {
         certificates: vec![Bytes::from(vec![0x06, 0x01, tag])],
-        direct_path: None,
+        ..LinkHello::default()
     }
 }
 
@@ -91,6 +92,27 @@ async fn each_side_sees_the_other_sides_ndn_key() {
         assert_eq!(dialed.unwrap().peer_key().fingerprint(), fb);
         assert_eq!(accepted.unwrap().peer_key().fingerprint(), fa);
     }
+}
+
+/// The value memberships are bound to is the same on both sides of one
+/// connection and differs on another, between the same two keys: a
+/// binding made for one connection does not hold on the other.
+#[tokio::test]
+async fn both_sides_share_a_connections_binding_value_and_no_other_connection_does() {
+    let dialer = endpoint(ed_key(1), false);
+    let listener = endpoint(ed_key(2), true);
+    let target = addr(&listener);
+    let mut values = Vec::new();
+    for _ in 0..2 {
+        let (dialed, accepted) = tokio::join!(dialer.connect(target, None), async {
+            listener.accept().await.unwrap().handshake().await
+        });
+        let (dialed, accepted) = (dialed.unwrap(), accepted.unwrap());
+        let value = dialed.channel_binding().unwrap();
+        assert_eq!(accepted.channel_binding().unwrap(), value);
+        values.push(value);
+    }
+    assert_ne!(values[0], values[1]);
 }
 
 #[tokio::test]

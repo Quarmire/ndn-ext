@@ -16,6 +16,12 @@
 //!   (validation against held trust contexts, link policy, expected
 //!   fingerprints) is the caller's — the `ndn-link` crate decides it the
 //!   way every implementation must: this crate carries the messages.
+//! - **Memberships.** The TLS key is one per device. A device that is a
+//!   member of other namespaces with other keys adds a [`Membership`] per
+//!   namespace to its hello: that key's certificate chain and its
+//!   signature binding the TLS key to this connection
+//!   ([`Handshaken::channel_binding`], [`binding_transcript`]), which a
+//!   receiver checks with [`Membership::verify`].
 //! - **Scope.** A side may admit a link that carries less than everything —
 //!   an *enrollment link*, or a link bounded only by its rates
 //!   ([`LinkScope`], [`Carries::Everything`]): its face drops, both ways,
@@ -61,6 +67,7 @@
 mod endpoint;
 mod key;
 mod link;
+mod membership;
 mod message;
 mod probe;
 mod scope;
@@ -68,6 +75,10 @@ mod verify;
 
 pub use endpoint::{ALPN_LINK, HandshakeLimits, InboundWindow, Incoming, LinkEndpoint, LinkTransportConfig};
 pub use key::{KeyError, KeyFingerprint, LinkKey, LinkKeyAlgorithm, LinkKeySource, PeerKey};
+pub use membership::{
+    BINDING_LABEL, ChannelBinding, MEMBERSHIP, MEMBERSHIP_EXPORTER_LABEL, MEMBERSHIPS_MAX, Membership,
+    binding_transcript,
+};
 pub use link::{
     Admission, DATAGRAM_FLOOR, Direction, Handshaken, Link, LinkError, LinkFace, LinkHandle,
 };
