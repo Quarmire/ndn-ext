@@ -34,6 +34,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use ndn_face_quic::{CloseReason, KeyFingerprint, RateLimit, SharedRate};
+use ndn_mgmt_wire::{LinkDetail, link_code as code};
 use ndn_packet::Name;
 use parking_lot::Mutex;
 
@@ -59,16 +60,32 @@ pub enum ServePolicy {
 }
 
 impl ServePolicy {
-    /// One line for status: `own namespaces`, `own namespaces + 2 listed
-    /// (quotas: …)`, `open (quotas: …)`.
-    pub fn describe(&self) -> String {
+    /// The policy for status: [`SERVE_OWN`](code::SERVE_OWN),
+    /// [`SERVE_LISTED`](code::SERVE_LISTED) (param `listed`: how many
+    /// roots) or [`SERVE_OPEN`](code::SERVE_OPEN), with the quotas' params
+    /// when bounded ([`Quotas::params`]). Sentences: `own namespaces`, `own
+    /// namespaces + 2 listed (quotas: …)`, `open (quotas: …)`.
+    pub fn detail(&self) -> LinkDetail {
         match self {
-            Self::Own => "own namespaces".into(),
+            Self::Own => LinkDetail::new(code::SERVE_OWN, "own namespaces"),
             Self::Listed { roots, quotas } => {
-                let quotas = quotas.map(|q| format!(" (quotas: {})", q.describe())).unwrap_or_default();
-                format!("own namespaces + {} listed{quotas}", roots.len())
+                let text = quotas
+                    .map(|q| format!(" (quotas: {})", q.describe()))
+                    .unwrap_or_default();
+                let detail = LinkDetail::new(
+                    code::SERVE_LISTED,
+                    format!("own namespaces + {} listed{text}", roots.len()),
+                )
+                .with("listed", roots.len());
+                match quotas {
+                    Some(q) => q.params(detail),
+                    None => detail,
+                }
             }
-            Self::Open { quotas } => format!("open (quotas: {})", quotas.describe()),
+            Self::Open { quotas } => quotas.params(LinkDetail::new(
+                code::SERVE_OPEN,
+                format!("open (quotas: {})", quotas.describe()),
+            )),
         }
     }
 }
@@ -117,6 +134,20 @@ impl Quotas {
             self.interests_per_key.per_sec,
             self.interests_per_namespace.per_sec
         )
+    }
+
+    /// `detail` with the quotas as params: `links_total`,
+    /// `links_per_namespace`, `interests_per_key` and
+    /// `interests_per_namespace` (per second).
+    pub fn params(&self, detail: LinkDetail) -> LinkDetail {
+        detail
+            .with("links_total", self.links_total)
+            .with("links_per_namespace", self.links_per_namespace)
+            .with("interests_per_key", self.interests_per_key.per_sec)
+            .with(
+                "interests_per_namespace",
+                self.interests_per_namespace.per_sec,
+            )
     }
 }
 
@@ -171,18 +202,29 @@ impl Drop for QuotaSlot {
 impl QuotaState {
     /// A slot for a link of `namespace`, whose root key is `root`, under
     /// `quotas` (none: only the one-root-per-name rule).
-    pub(crate) fn take(&self, namespace: &Name, root: KeyFingerprint, quotas: Option<&Quotas>) -> Result<QuotaSlot, Refusal> {
+    pub(crate) fn take(
+        &self,
+        namespace: &Name,
+        root: KeyFingerprint,
+        quotas: Option<&Quotas>,
+    ) -> Result<QuotaSlot, Refusal> {
         let mut live = self.live.lock();
         if let Some((bound, _)) = live.names.get(namespace)
             && *bound != root
         {
             return Err(Refusal::new(
                 CloseReason::NotServed,
-                format!(
-                    "this relay serves {namespace} for the devices of another root key ({bound}) now, \
-                     and yours is {root}: the names collide, and the relay cannot route both. Use a \
-                     relay that does not serve the other {namespace}, or name your namespace apart"
-                ),
+                LinkDetail::new(
+                    code::NAMESPACE_COLLIDES,
+                    format!(
+                        "this relay serves {namespace} for the devices of another root key ({bound}) now, \
+                         and yours is {root}: the names collide, and the relay cannot route both. Use a \
+                         relay that does not serve the other {namespace}, or name your namespace apart"
+                    ),
+                )
+                .with("namespace", namespace)
+                .with("bound_root", bound)
+                .with("root", root),
             ));
         }
         let root_links = live.roots.get(&root).map_or(0, |r| r.links);
@@ -190,22 +232,33 @@ impl QuotaState {
             if root_links >= q.links_per_namespace {
                 return Err(Refusal::new(
                     CloseReason::Busy,
-                    format!(
-                        "this relay serves at most {} links of a namespace at once, and {namespace} has \
-                         {root_links} here now: close another of its devices' links to this relay, try \
-                         again later, or use another relay",
-                        q.links_per_namespace
-                    ),
+                    LinkDetail::new(
+                        code::QUOTA_NAMESPACE_LINKS,
+                        format!(
+                            "this relay serves at most {} links of a namespace at once, and {namespace} has \
+                             {root_links} here now: close another of its devices' links to this relay, try \
+                             again later, or use another relay",
+                            q.links_per_namespace
+                        ),
+                    )
+                    .with("max", q.links_per_namespace)
+                    .with("namespace", namespace)
+                    .with("links", root_links),
                 ));
             }
             if live.total >= q.links_total {
                 return Err(Refusal::new(
                     CloseReason::Busy,
-                    format!(
-                        "this relay serves at most {} links of other namespaces at once and has {} now: \
-                         try again later, or use another relay",
-                        q.links_total, live.total
-                    ),
+                    LinkDetail::new(
+                        code::QUOTA_LINKS,
+                        format!(
+                            "this relay serves at most {} links of other namespaces at once and has {} now: \
+                             try again later, or use another relay",
+                            q.links_total, live.total
+                        ),
+                    )
+                    .with("max", q.links_total)
+                    .with("links", live.total),
                 ));
             }
         }
@@ -215,7 +268,9 @@ impl QuotaState {
             rate: quotas.map(|q| Arc::new(SharedRate::new(q.interests_per_namespace))),
         });
         entry.links += 1;
-        let limits = quotas.zip(entry.rate.clone()).map(|(q, rate)| (q.interests_per_key, rate));
+        let limits = quotas
+            .zip(entry.rate.clone())
+            .map(|(q, rate)| (q.interests_per_key, rate));
         live.names.entry(namespace.clone()).or_insert((root, 0)).1 += 1;
         Ok(QuotaSlot {
             live: Arc::clone(&self.live),
@@ -246,7 +301,18 @@ impl Judge<'_> {
         let own_text = if own.is_empty() {
             "this relay holds no certificate, so it serves no namespace of its own".to_string()
         } else {
-            format!("this relay serves devices of its own namespaces ({})", list(&own))
+            format!(
+                "this relay serves devices of its own namespaces ({})",
+                list(&own)
+            )
+        };
+        // `own`: the namespaces it serves as its own, absent when none.
+        let with_own = |detail: LinkDetail| {
+            if own.is_empty() {
+                detail
+            } else {
+                detail.with("own", list(&own))
+            }
         };
         let root = match id.served {
             Some(root) => root,
@@ -258,26 +324,45 @@ impl Judge<'_> {
                 if let ServePolicy::Listed { roots, quotas } = self.serve
                     && let Some(root) = anchors.iter().find(|a| roots.contains(a))
                 {
-                    return self.quotas.take(&id.namespace, *root, quotas.as_ref()).map(Some);
+                    return self
+                        .quotas
+                        .take(&id.namespace, *root, quotas.as_ref())
+                        .map(Some);
                 }
+                let anchors = anchors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 let listed = match self.serve {
-                    ServePolicy::Listed { roots, .. } => format!(
-                        " and of {} namespaces listed by root key fingerprint, which {}'s ({}) is not",
-                        roots.len(),
-                        id.namespace,
-                        anchors.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
-                    ),
-                    _ => String::new(),
+                    ServePolicy::Listed { roots, .. } => Some(roots.len()),
+                    _ => None,
                 };
-                return Err(Refusal::new(
-                    CloseReason::NotServed,
-                    format!(
-                        "{own_text}{listed}; you are {} of {}, whose trust context it holds but which it \
-                         holds no certificate in. Its operator can serve other namespaces by their root \
-                         key fingerprint, or use a relay that serves yours",
-                        id.device, id.namespace
-                    ),
-                ));
+                let listed_text = listed
+                    .map(|n| {
+                        format!(
+                            " and of {n} namespaces listed by root key fingerprint, which {}'s ({anchors}) is not",
+                            id.namespace,
+                        )
+                    })
+                    .unwrap_or_default();
+                let mut detail = with_own(
+                    LinkDetail::new(
+                        code::NOT_SERVED_UNCERTIFIED,
+                        format!(
+                            "{own_text}{listed_text}; you are {} of {}, whose trust context it holds but which it \
+                             holds no certificate in. Its operator can serve other namespaces by their root \
+                             key fingerprint, or use a relay that serves yours",
+                            id.device, id.namespace
+                        ),
+                    )
+                    .with("device", &id.device)
+                    .with("namespace", &id.namespace),
+                );
+                if let Some(n) = listed {
+                    detail = detail.with("listed", n).with("roots", anchors);
+                }
+                return Err(Refusal::new(CloseReason::NotServed, detail));
             }
         };
         match self.serve {
@@ -287,21 +372,38 @@ impl Judge<'_> {
             ServePolicy::Open { quotas } => self.quotas.take(&id.namespace, root, Some(quotas)).map(Some),
             ServePolicy::Listed { roots, .. } => Err(Refusal::new(
                 CloseReason::NotServed,
-                format!(
-                    "{own_text} and of {} namespaces listed by root key fingerprint; you are {} of {}, \
-                     whose root key {root} is not listed. Its operator can list it, or use a relay that \
-                     serves yours",
-                    roots.len(),
-                    id.device,
-                    id.namespace
+                with_own(
+                    LinkDetail::new(
+                        code::NOT_SERVED_UNLISTED,
+                        format!(
+                            "{own_text} and of {} namespaces listed by root key fingerprint; you are {} of {}, \
+                             whose root key {root} is not listed. Its operator can list it, or use a relay that \
+                             serves yours",
+                            roots.len(),
+                            id.device,
+                            id.namespace
+                        ),
+                    )
+                    .with("listed", roots.len())
+                    .with("device", &id.device)
+                    .with("namespace", &id.namespace)
+                    .with("root", root),
                 ),
             )),
             ServePolicy::Own => Err(Refusal::new(
                 CloseReason::NotServed,
-                format!(
-                    "{own_text}; you are {} of {} (root key {root}). Its operator can serve other \
-                     namespaces by their root key fingerprint, or use a relay that serves yours",
-                    id.device, id.namespace
+                with_own(
+                    LinkDetail::new(
+                        code::NOT_SERVED_OWN,
+                        format!(
+                            "{own_text}; you are {} of {} (root key {root}). Its operator can serve other \
+                             namespaces by their root key fingerprint, or use a relay that serves yours",
+                            id.device, id.namespace
+                        ),
+                    )
+                    .with("device", &id.device)
+                    .with("namespace", &id.namespace)
+                    .with("root", root),
                 ),
             )),
         }

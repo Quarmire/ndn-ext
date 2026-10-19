@@ -5,8 +5,8 @@
 //! next. (Each side also adds its signalling and waiting faces, app faces;
 //! only link faces are counted here.)
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -14,7 +14,7 @@ use parking_lot::Mutex;
 use bytes::Bytes;
 use ndn_face_quic::{KeyFingerprint, LinkEndpoint, LinkKey, LinkKeySource, LinkTransportConfig};
 use ndn_link::{
-    ConfiguredEndpoints, FaceSink, HoldLimits, LinkHints, LinkMode, LinkSetup, LinkTrust, Links, PeerSpec,
+    ConfiguredEndpoints, FaceSink, HoldLimits, LinkMode, LinkSetup, LinkTrust, Links, PeerSpec,
     RelayService, RelaySource, RelayUse, Route, WakeNotifier, WakeRequest,
 };
 use ndn_packet::Name;
@@ -100,16 +100,6 @@ impl FaceSink for Recorder {
     fn transit(&self, _: &Name, _: bool) {}
 }
 
-fn hints() -> LinkHints {
-    LinkHints {
-        enroll: "enroll".into(),
-        renew: "renew".into(),
-        refresh: "refresh".into(),
-        peer_entry: "peer".into(),
-        expect_key: "expect {key}".into(),
-    }
-}
-
 fn peer(key: KeyFingerprint, endpoint: Option<String>, routes: Option<Vec<Name>>) -> PeerSpec {
     PeerSpec {
         label: key.to_string(),
@@ -121,7 +111,12 @@ fn peer(key: KeyFingerprint, endpoint: Option<String>, routes: Option<Vec<Name>>
     }
 }
 
-fn start(key: LinkKey, peers: Vec<PeerSpec>, listen: bool, cancel: &CancellationToken) -> (Arc<Links>, Arc<Recorder>, Option<String>) {
+fn start(
+    key: LinkKey,
+    peers: Vec<PeerSpec>,
+    listen: bool,
+    cancel: &CancellationToken,
+) -> (Arc<Links>, Arc<Recorder>, Option<String>) {
     start_with(key, peers, listen, cancel, RelayService::default())
 }
 
@@ -135,7 +130,15 @@ fn start_with(
     let transport = LinkTransportConfig::default();
     let key: Arc<dyn LinkKeySource> = Arc::new(key);
     let socket = listen.then(|| {
-        Arc::new(LinkEndpoint::bind("127.0.0.1:0".parse().unwrap(), Arc::clone(&key), &transport, true).unwrap())
+        Arc::new(
+            LinkEndpoint::bind(
+                "127.0.0.1:0".parse().unwrap(),
+                Arc::clone(&key),
+                &transport,
+                true,
+            )
+            .unwrap(),
+        )
     });
     let addr = socket.as_ref().map(|s| s.local_addr().unwrap().to_string());
     let faces = Arc::new(Recorder::default());
@@ -149,7 +152,6 @@ fn start_with(
             candidates: Vec::new(),
             socket,
             transport,
-            hints: hints(),
             relays: Default::default(),
             service,
             direct: Default::default(),
@@ -237,12 +239,18 @@ async fn an_off_link_stays_closed_until_asked() {
     };
     let (dialer, at_a, _) = start(a, vec![spec], false, &cancel);
     tokio::time::sleep(Duration::from_secs(1)).await;
-    assert!(at_a.live.lock().is_empty(), "an off link was dialled unasked");
+    assert!(
+        at_a.live.lock().is_empty(),
+        "an off link was dialled unasked"
+    );
     let id = dialer.report().links[0].peer.unwrap();
     dialer.connect(id);
     until("the asked link comes up", || at_a.live.lock().len() == 1).await;
     dialer.disconnect(id);
-    until("the link closes once no longer asked", || at_a.live.lock().is_empty()).await;
+    until("the link closes once no longer asked", || {
+        at_a.live.lock().is_empty()
+    })
+    .await;
     cancel.cancel();
 }
 
@@ -261,13 +269,26 @@ async fn an_on_demand_link_closes_when_idle_and_the_host_is_not_active() {
     };
     let (dialer, at_a, _) = start(a, vec![spec], false, &cancel);
     tokio::time::sleep(Duration::from_millis(800)).await;
-    assert!(at_a.live.lock().is_empty(), "an on-demand link was dialled with no need");
+    assert!(
+        at_a.live.lock().is_empty(),
+        "an on-demand link was dialled with no need"
+    );
     dialer.set_active(true);
-    until("the link comes up while the host is active", || at_a.live.lock().len() == 1).await;
+    until("the link comes up while the host is active", || {
+        at_a.live.lock().len() == 1
+    })
+    .await;
     tokio::time::sleep(Duration::from_secs(2)).await;
-    assert_eq!(at_a.live.lock().len(), 1, "an active host's on-demand link closed");
+    assert_eq!(
+        at_a.live.lock().len(),
+        1,
+        "an active host's on-demand link closed"
+    );
     dialer.set_active(false);
-    until("the idle link closes once the host is not active", || at_a.live.lock().is_empty()).await;
+    until("the idle link closes once the host is not active", || {
+        at_a.live.lock().is_empty()
+    })
+    .await;
     cancel.cancel();
 }
 
@@ -288,23 +309,35 @@ async fn losing_the_preferred_relay_moves_to_the_next() {
         persistent: true,
         ..peer(fp, addr, Some(vec!["/home".parse().unwrap()]))
     };
-    let (_device, at_a, _) = start(a, vec![relay(f1, addr1, 0), relay(f2, addr2, 1)], false, &cancel);
+    let (_device, at_a, _) = start(
+        a,
+        vec![relay(f1, addr1, 0), relay(f2, addr2, 1)],
+        false,
+        &cancel,
+    );
     until("the preferred relay links", || at_r1.live.lock().len() == 1).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(at_r2.live.lock().is_empty(), "the second relay was linked while the first one is");
+    assert!(
+        at_r2.live.lock().is_empty(),
+        "the second relay was linked while the first one is"
+    );
     assert_eq!(at_a.routes.lock()[0].1.cost, 0);
 
     first.shutdown().await;
     relay_cancel.cancel();
     // The relay said it shuts down: the next one stands in at once, with no
     // redial of the first one waiting out its 5 s handshake timeout.
-    within("traffic moves to the next relay", Duration::from_secs(3), || {
-        at_r2.live.lock().len() == 1
-    })
+    within(
+        "traffic moves to the next relay",
+        Duration::from_secs(3),
+        || at_r2.live.lock().len() == 1,
+    )
     .await;
     let routes = at_a.routes.lock().clone();
     assert!(
-        routes.iter().any(|(_, r)| r.prefix == "/home".parse().unwrap() && r.cost == 1),
+        routes
+            .iter()
+            .any(|(_, r)| r.prefix == "/home".parse().unwrap() && r.cost == 1),
         "{routes:?}"
     );
     cancel.cancel();
@@ -359,7 +392,10 @@ async fn a_relay_holds_and_wakes_a_sleeping_device_and_delivers_when_it_links_ag
     dev.connect(id);
     until("the device links", || relay_faces.live.lock().len() == 1).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(at_relay.report().links[0].asleep.is_none(), "a linked device counts as asleep");
+    assert!(
+        at_relay.report().links[0].asleep.is_none(),
+        "a linked device counts as asleep"
+    );
 
     dev.disconnect(id);
     until("the relay counts the device asleep", || {
@@ -368,7 +404,10 @@ async fn a_relay_holds_and_wakes_a_sleeping_device_and_delivers_when_it_links_ag
     .await;
     let waiting = relay_faces.face(false, 1);
     for n in 1..=3 {
-        waiting.send_bytes(interest(&format!("/dev/x{n}"))).await.unwrap();
+        waiting
+            .send_bytes(interest(&format!("/dev/x{n}")))
+            .await
+            .unwrap();
     }
     // The third is over the device's bound: Nacked at once.
     let nack = tokio::time::timeout(Duration::from_secs(2), waiting.recv_bytes())
@@ -377,18 +416,28 @@ async fn a_relay_holds_and_wakes_a_sleeping_device_and_delivers_when_it_links_ag
         .unwrap();
     assert!(ndn_packet::lp::is_lp_packet(&nack));
     until("two Interests are held", || {
-        at_relay.report().links[0].asleep.as_ref().is_some_and(|a| a.held == 2)
+        at_relay.report().links[0]
+            .asleep
+            .as_ref()
+            .is_some_and(|a| a.held == 2)
     })
     .await;
     {
         let wakes = wakes.0.lock();
-        assert_eq!(wakes.len(), 1, "woken once for Interests within the wake interval");
+        assert_eq!(
+            wakes.len(),
+            1,
+            "woken once for Interests within the wake interval"
+        );
         assert_eq!(wakes[0].token.as_ref(), b"tok");
         assert_eq!(wakes[0].key, fd);
     }
 
     dev.connect(id);
-    until("the device links again", || relay_faces.live.lock().len() == 1).await;
+    until("the device links again", || {
+        relay_faces.live.lock().len() == 1
+    })
+    .await;
     let link = dev_faces.face(true, 1);
     let mut names = Vec::new();
     for _ in 0..2 {
@@ -397,7 +446,10 @@ async fn a_relay_holds_and_wakes_a_sleeping_device_and_delivers_when_it_links_ag
             .expect("a held Interest over the new link")
             .unwrap();
         let wire = if ndn_packet::lp::is_lp_packet(&wire) {
-            ndn_packet::lp::LpPacket::decode(wire).unwrap().fragment.expect("a whole Interest")
+            ndn_packet::lp::LpPacket::decode(wire)
+                .unwrap()
+                .fragment
+                .expect("a whole Interest")
         } else {
             wire
         };

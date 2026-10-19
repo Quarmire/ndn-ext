@@ -10,20 +10,23 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 
 use ndn_face_quic::{
-    CloseReason, Handshaken, Incoming, KeyFingerprint, LinkEndpoint, LinkError, LinkHandle, LinkHello,
-    LinkKeySource, LinkTransportConfig, PathSession,
+    CloseReason, Handshaken, Incoming, KeyFingerprint, LinkEndpoint, LinkError, LinkHandle,
+    LinkHello, LinkKeySource, LinkTransportConfig, PathSession,
 };
+use ndn_mgmt_wire::{LinkDetail, link_code as code};
 use ndn_packet::Name;
 use ndn_transport::reliability::ReliabilityConfig;
 use ndn_transport::{Face, FaceId, LpLinkService};
 use tokio_util::sync::CancellationToken;
 
-use crate::admission::{Admitted, Enrollment, Judge, device_of, hello_chain, list, own_memberships};
+use crate::admission::{
+    Admitted, Enrollment, Judge, device_of, hello_chain, list, own_memberships,
+};
 use crate::asleep::{RelayService, Sleepers};
 use crate::candidates::CandidateSource;
 use crate::control::{PeerCtl, idle_check, release};
-use crate::direct::{Direct, Whom};
-use crate::host::{FaceSink, LinkHints, LinkTrust, PathCandidate, PathSource};
+use crate::direct::{Direct, Whom, direct_up};
+use crate::host::{FaceSink, LinkTrust, PathCandidate, PathSource};
 use crate::peer::{LinkMode, PeerId, PeerSpec, Peers};
 use crate::policy::{Backoff, ENROLLMENT_IDLE, MESSAGE_DEADLINE};
 use crate::presence::{DirectOptions, MemberEntry};
@@ -59,7 +62,6 @@ pub struct LinkSetup {
     /// socket on an address the system picks.
     pub socket: Option<Arc<LinkEndpoint>>,
     pub transport: LinkTransportConfig,
-    pub hints: LinkHints,
     /// Which relays this device uses.
     pub relays: RelayOptions,
     /// What this device offers as a relay: whom it serves, and whether it
@@ -88,7 +90,6 @@ pub struct Links {
     pub(crate) paths: Arc<dyn PathSource>,
     pub(crate) candidates: Vec<Arc<dyn CandidateSource>>,
     pub(crate) peers: Peers,
-    pub(crate) hints: LinkHints,
     transport: LinkTransportConfig,
     pub(crate) socket: Option<Arc<LinkEndpoint>>,
     /// Dial-only sockets, by address family (`true`: IPv4).
@@ -127,7 +128,6 @@ impl Links {
             paths: setup.paths,
             candidates: setup.candidates,
             peers: Peers::new(setup.peers),
-            hints: setup.hints,
             transport: setup.transport,
             socket: setup.socket,
             dialers: Mutex::new(HashMap::new()),
@@ -261,14 +261,19 @@ impl Links {
             if let Some(p) = paths.iter().find(|p| p.kind == PathKind::Direct) {
                 status = DirectStatus {
                     state: DirectState::Up,
-                    text: format!("direct path to {}", p.remote.map(|a| a.to_string()).unwrap_or_default()),
+                    detail: Some(direct_up(
+                        p.remote.map(|a| a.to_string()).unwrap_or_default(),
+                    )),
                     retry_in: None,
                 };
             }
             status
         };
         for (id, peer) in self.peers.iter() {
-            let learned = entries.get(&Whom::Peer(id)).and_then(|e| e.key).or(peer.key);
+            let learned = entries
+                .get(&Whom::Peer(id))
+                .and_then(|e| e.key)
+                .or(peer.key);
             let at = views
                 .iter()
                 .position(|v| v.peer == Some(id) || Some(v.fingerprint) == learned);
@@ -364,11 +369,20 @@ impl Links {
         }
         LinkReport {
             key: self.my_fingerprint(),
-            probes_sent: self.direct.probes_sent.load(std::sync::atomic::Ordering::Relaxed),
-            punches_refused: self.direct.refused.load(std::sync::atomic::Ordering::Relaxed),
-            serve: self.service.serve.describe(),
+            probes_sent: self
+                .direct
+                .probes_sent
+                .load(std::sync::atomic::Ordering::Relaxed),
+            punches_refused: self
+                .direct
+                .refused
+                .load(std::sync::atomic::Ordering::Relaxed),
+            serve: self.service.serve.detail(),
             held_total: self.waiting.get().map_or(0, |w| w.total(true)),
-            wakes_sent: self.sleepers.wakes_sent.load(std::sync::atomic::Ordering::Relaxed),
+            wakes_sent: self
+                .sleepers
+                .wakes_sent
+                .load(std::sync::atomic::Ordering::Relaxed),
             links,
         }
     }
@@ -382,11 +396,15 @@ impl Links {
     }
 
     pub(crate) fn signal(&self) -> &Arc<Signal> {
-        self.signal.get().expect("the signalling face starts with the links")
+        self.signal
+            .get()
+            .expect("the signalling face starts with the links")
     }
 
     pub(crate) fn waiting(&self) -> &Arc<Waiting> {
-        self.waiting.get().expect("the waiting face starts with the links")
+        self.waiting
+            .get()
+            .expect("the waiting face starts with the links")
     }
 
     /// This device's names, one per certificate it holds (its link key's
@@ -398,7 +416,9 @@ impl Links {
     /// Route the punches to each of this device's names to the signalling
     /// face.
     fn take_punches(&self) {
-        let Some(signal) = self.signal.get() else { return };
+        let Some(signal) = self.signal.get() else {
+            return;
+        };
         for device in self.own_devices() {
             signal.take_punches_for(self, &device);
         }
@@ -408,7 +428,6 @@ impl Links {
         Judge {
             trust: self.trust.as_ref(),
             peers: &self.peers,
-            hints: &self.hints,
             serve: &self.service.serve,
             quotas: &self.quotas,
         }
@@ -419,10 +438,15 @@ impl Links {
     /// one, the one the host bound), else a dial-only socket per family on
     /// an address the system picks (which accepts only the direct paths of
     /// its punches).
-    pub(crate) fn endpoint_for(self: &Arc<Self>, addr: SocketAddr) -> Result<Arc<LinkEndpoint>, LinkError> {
+    pub(crate) fn endpoint_for(
+        self: &Arc<Self>,
+        addr: SocketAddr,
+    ) -> Result<Arc<LinkEndpoint>, LinkError> {
         let v4 = addr.ip().to_canonical().is_ipv4();
         if let Some(socket) = &self.socket
-            && socket.local_addr().is_ok_and(|l| l.is_ipv4() == v4 || l.ip().is_unspecified() && l.is_ipv6())
+            && socket
+                .local_addr()
+                .is_ok_and(|l| l.is_ipv4() == v4 || l.ip().is_unspecified() && l.is_ipv6())
         {
             return Ok(Arc::clone(socket));
         }
@@ -435,7 +459,12 @@ impl Links {
         } else {
             SocketAddr::from(([0u16; 8], 0))
         };
-        let endpoint = Arc::new(LinkEndpoint::bind(bind, Arc::clone(&self.key), &self.transport, false)?);
+        let endpoint = Arc::new(LinkEndpoint::bind(
+            bind,
+            Arc::clone(&self.key),
+            &self.transport,
+            false,
+        )?);
         dialers.insert(v4, Arc::clone(&endpoint));
         tokio::spawn(accept_loop(Arc::downgrade(self), Arc::clone(&endpoint)));
         Ok(endpoint)
@@ -448,7 +477,11 @@ impl Links {
     /// Run a handshaken connection to its end: exchange hellos, decide,
     /// admit (or refuse), and register the link or its direct path.
     /// Returns the path's handle once it is up.
-    pub(crate) async fn establish(self: &Arc<Self>, mut hs: Handshaken, origin: Origin) -> Result<LinkHandle, LinkError> {
+    pub(crate) async fn establish(
+        self: &Arc<Self>,
+        mut hs: Handshaken,
+        origin: Origin,
+    ) -> Result<LinkHandle, NotLinked> {
         let remote = hs.remote_address();
         let peer_fp = hs.peer_key().fingerprint();
         // A direct path is named by both hellos: the dialer's punch session,
@@ -465,19 +498,23 @@ impl Links {
         let enrolling = match origin {
             Origin::Dialed(id) => self.peers.get(id).is_some_and(|p| {
                 let judge = self.judge();
-                p.key.is_none() && p.device.as_ref().is_some_and(|d| judge.own_role_in(&judge.namespace_of(d)).is_none())
+                p.key.is_none()
+                    && p.device
+                        .as_ref()
+                        .is_some_and(|d| judge.own_role_in(&judge.namespace_of(d)).is_none())
             }),
             _ => false,
         };
         let channel = match hs.channel_binding() {
             Ok(channel) => channel,
             Err(e) => {
-                let text = format!("this device cannot bind its memberships to the link: {e}");
-                hs.refuse(CloseReason::Protocol, &text);
-                return Err(LinkError::RefusedHere {
-                    reason: CloseReason::Protocol,
-                    text,
-                });
+                let detail = LinkDetail::new(
+                    code::BINDING_UNAVAILABLE,
+                    format!("this device cannot bind its memberships to the link: {e}"),
+                )
+                .with("error", &e);
+                hs.refuse(CloseReason::Protocol, &detail.text);
+                return Err(NotLinked::refused_here(CloseReason::Protocol, detail));
             }
         };
         let (ours, shown) = if enrolling {
@@ -491,7 +528,8 @@ impl Links {
         } else {
             // Bound to the key this connection's handshake presented, not
             // one the device switched to since.
-            let memberships = own_memberships(self.trust.as_ref(), hs.local_key(), &channel, None).await;
+            let memberships =
+                own_memberships(self.trust.as_ref(), hs.local_key(), &channel, None).await;
             (
                 LinkHello {
                     certificates: hello_chain(self.trust.as_ref()),
@@ -502,33 +540,42 @@ impl Links {
             )
         };
         let theirs = hs.exchange_hello(&ours, MESSAGE_DEADLINE).await?;
-        let refuse = |hs: Handshaken, reason: CloseReason, text: String| {
+        let refuse = |hs: Handshaken, reason: CloseReason, detail: LinkDetail| {
             tracing::warn!(
                 target: "face.quic",
                 %remote,
                 key = %peer_fp,
                 reason = ?reason,
-                "refused a link: {text}"
+                "refused a link: {}",
+                detail.text
             );
-            hs.refuse(reason, &text);
-            Err(LinkError::RefusedHere { reason, text })
+            hs.refuse(reason, &detail.text);
+            NotLinked::refused_here(reason, detail)
         };
         let direct = match (origin, theirs.direct_path) {
             (Origin::Direct(s), Some(t)) if s == t => Some(s),
             (Origin::Direct(s), _) => {
-                let text = format!(
-                    "this device dialled the direct path of punch {} and your device did not take it as one",
-                    hex(&s)
-                );
-                return refuse(hs, CloseReason::PathExpired, text);
+                let detail = LinkDetail::new(
+                    code::PATH_NOT_TAKEN,
+                    format!(
+                        "this device dialled the direct path of punch {} and your device did not take it as one",
+                        hex(&s)
+                    ),
+                )
+                .with("session", hex(&s));
+                return Err(refuse(hs, CloseReason::PathExpired, detail));
             }
             (_, Some(t)) if session == Some(t) => Some(t),
             (_, Some(t)) => {
-                let text = format!(
-                    "this device runs no punch {} with your key (it ended); your device punches again",
-                    hex(&t)
-                );
-                return refuse(hs, CloseReason::PathExpired, text);
+                let detail = LinkDetail::new(
+                    code::PATH_NO_PUNCH,
+                    format!(
+                        "this device runs no punch {} with your key (it ended); your device punches again",
+                        hex(&t)
+                    ),
+                )
+                .with("session", hex(&t));
+                return Err(refuse(hs, CloseReason::PathExpired, detail));
             }
             (_, None) => None,
         };
@@ -539,21 +586,27 @@ impl Links {
         let judge = self.judge();
         let mut admitted = match judge.decide(hs.peer_key(), &theirs, &channel, dialed).await {
             Ok(a) => a,
-            Err(refusal) => return refuse(hs, refusal.reason, refusal.text),
+            Err(refusal) => return Err(refuse(hs, refusal.reason, refusal.detail)),
         };
         if let Some(session) = direct {
             if admitted.enrollment.is_some() {
-                let text = "a direct path carries a full link only, and this device admits you only on an \
-                            enrollment link"
-                    .to_string();
-                return refuse(hs, CloseReason::Unrecognized, text);
+                let detail = LinkDetail::new(
+                    code::PATH_ENROLLMENT_ONLY,
+                    "a direct path carries a full link only, and this device admits you only on an \
+                     enrollment link",
+                );
+                return Err(refuse(hs, CloseReason::Unrecognized, detail));
             }
             if let Some(why) = self.direct_off(&admitted) {
-                return refuse(hs, CloseReason::DirectPathsOff, why);
+                return Err(refuse(hs, CloseReason::DirectPathsOff, why));
             }
             if !self.direct.claim(&session, peer_fp) {
-                let text = format!("another path of punch {} came up first", hex(&session));
-                return refuse(hs, CloseReason::Replaced, text);
+                let detail = LinkDetail::new(
+                    code::PATH_TAKEN,
+                    format!("another path of punch {} came up first", hex(&session)),
+                )
+                .with("session", hex(&session));
+                return Err(refuse(hs, CloseReason::Replaced, detail));
             }
         }
         let slot = match &admitted.enrollment {
@@ -565,13 +618,10 @@ impl Links {
                         %remote,
                         key = %hs.peer_key().fingerprint(),
                         "refused an enrollment link: {}",
-                        refusal.text
+                        refusal.detail.text
                     );
-                    hs.refuse(refusal.reason, &refusal.text);
-                    return Err(LinkError::RefusedHere {
-                        reason: refusal.reason,
-                        text: refusal.text,
-                    });
+                    hs.refuse(refusal.reason, &refusal.detail.text);
+                    return Err(NotLinked::refused_here(refusal.reason, refusal.detail));
                 }
             },
             _ => None,
@@ -592,7 +642,9 @@ impl Links {
         let link = hs.admit(face_id, MESSAGE_DEADLINE, admission).await?;
         let reliability = peer.as_ref().is_some_and(|p| p.reliability);
         let link_service: Arc<dyn ndn_transport::LinkService> = if reliability {
-            Arc::new(LpLinkService::with_reliability(ReliabilityConfig::ethernet()))
+            Arc::new(LpLinkService::with_reliability(
+                ReliabilityConfig::ethernet(),
+            ))
         } else {
             ndn_transport::default_link_service_for_kind(ndn_transport::FaceKind::Quic)
         };
@@ -616,10 +668,12 @@ impl Links {
             .zip(peer.as_ref())
             .is_some_and(|(i, p)| !self.paths.candidates(i, p).is_empty());
         let relay_routes = match (admitted.peer, &peer) {
-            (Some(i), Some(p)) if p.relay_use.is_some() && kind == PathKind::Link => Some(RelayRoutes {
-                namespaces: self.relay_namespaces(p),
-                cost: self.relay_cost(i),
-            }),
+            (Some(i), Some(p)) if p.relay_use.is_some() && kind == PathKind::Link => {
+                Some(RelayRoutes {
+                    namespaces: self.relay_namespaces(p),
+                    cost: self.relay_cost(i),
+                })
+            }
             _ => None,
         };
         let routes = routes_for(&self.peers, &admitted, dials, relay_routes);
@@ -641,10 +695,13 @@ impl Links {
             },
         };
         let Some(generation) = self.table.register(registration, self.my_fingerprint()) else {
-            return Err(LinkError::RefusedHere {
-                reason: CloseReason::Replaced,
-                text: "a link between these two devices already exists".into(),
-            });
+            return Err(NotLinked::refused_here(
+                CloseReason::Replaced,
+                LinkDetail::new(
+                    code::LINK_EXISTS,
+                    "a link between these two devices already exists",
+                ),
+            ));
         };
         self.faces.add_face(face, self.cancel.child_token());
         self.faces.add_routes(face_id, &routes);
@@ -694,7 +751,10 @@ impl Links {
                             why = watched.closed() => break why,
                             () = tokio::time::sleep(ENROLLMENT_IDLE / 4) => {}
                         }
-                        if watched.scope_idle_for().is_some_and(|idle| idle >= ENROLLMENT_IDLE) {
+                        if watched
+                            .scope_idle_for()
+                            .is_some_and(|idle| idle >= ENROLLMENT_IDLE)
+                        {
                             watched.close(
                                 CloseReason::Idle,
                                 &format!(
@@ -748,7 +808,12 @@ impl Links {
     /// while asleep, follows its presence list when it is a relay, and tells
     /// the members of each namespace the device was admitted in, linked
     /// here.
-    async fn link_up(self: &Arc<Self>, admitted: &Admitted, peer: Option<&PeerSpec>, handle: &LinkHandle) {
+    async fn link_up(
+        self: &Arc<Self>,
+        admitted: &Admitted,
+        peer: Option<&PeerSpec>,
+        handle: &LinkHandle,
+    ) {
         self.awake(admitted.fingerprint).await;
         if let (Some(id), Some(peer)) = (admitted.peer, peer) {
             let ctl = self.ctl(id);
@@ -786,7 +851,6 @@ impl Links {
     fn explain_enrollment(&self, admitted: &Admitted, peer_enrollment: &[Name], face: FaceId) {
         let judge = self.judge();
         let peer = judge.label(admitted);
-        let enroll = &self.hints.enroll;
         match &admitted.enrollment {
             Some(Enrollment::Relay(namespaces)) => tracing::info!(
                 target: "face.quic",
@@ -800,8 +864,8 @@ impl Links {
                 target: "face.quic",
                 face = face.0,
                 "linked to {peer} for this device's enrollment in {ns} only: it holds no \
-                 certificate in {ns}, so it cannot confirm the device there yet. Enroll it \
-                 ({enroll}); the link is made again as a full link then"
+                 certificate in {ns}, so it cannot confirm the device there yet. Enroll it; \
+                 the link is made again as a full link then"
             ),
             None => {}
         }
@@ -817,8 +881,7 @@ impl Links {
                 target: "face.quic",
                 face = face.0,
                 "{peer} admitted this device on an enrollment link: it carries only this device's \
-                 enrollment in {} until it enrolls ({enroll}); the link is made again as a full \
-                 link then",
+                 enrollment in {} until it enrolls; the link is made again as a full link then",
                 list(peer_enrollment)
             );
         } else {
@@ -827,9 +890,8 @@ impl Links {
                 face = face.0,
                 "{peer} admitted this device only on an enrollment link, although it holds a \
                  certificate in {}: that device cannot validate it — it may hold an older version \
-                 of the trust context ({} there) or lack the issuer chain. This device's key: {}",
+                 of the trust context (refresh it there) or lack the issuer chain. This device's key: {}",
                 enrolled.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", "),
-                self.hints.refresh,
                 admitted.fingerprint
             );
         }
@@ -837,24 +899,35 @@ impl Links {
 
     /// One attempt over every path of `peer`; the first that links wins,
     /// else the last failure.
-    async fn dial_once(self: &Arc<Self>, id: PeerId, peer: &PeerSpec) -> Result<LinkHandle, LinkError> {
-        let mut last = LinkError::Connect(format!("{} has no endpoint", peer.label));
+    async fn dial_once(
+        self: &Arc<Self>,
+        id: PeerId,
+        peer: &PeerSpec,
+    ) -> Result<LinkHandle, NotLinked> {
+        let mut last = NotLinked::from(LinkError::Connect(format!(
+            "{} has no endpoint",
+            peer.label
+        )));
         for candidate in self.paths.candidates(id, peer) {
             let addrs: Vec<SocketAddr> = match candidate {
                 PathCandidate::Address(addr) => vec![addr],
-                PathCandidate::Endpoint(endpoint) => match tokio::net::lookup_host(endpoint.as_str()).await {
-                    Ok(addrs) => addrs.collect(),
-                    Err(e) => {
-                        last = LinkError::Connect(format!("cannot resolve {endpoint}: {e}"));
-                        continue;
+                PathCandidate::Endpoint(endpoint) => {
+                    match tokio::net::lookup_host(endpoint.as_str()).await {
+                        Ok(addrs) => addrs.collect(),
+                        Err(e) => {
+                            last = LinkError::Connect(format!("cannot resolve {endpoint}: {e}"))
+                                .into();
+                            continue;
+                        }
                     }
-                },
+                }
             };
             for addr in addrs {
                 let socket = match self.endpoint_for(addr) {
                     Ok(s) => s,
                     Err(e) => {
-                        last = LinkError::Connect(format!("no socket to dial {addr} from: {e}"));
+                        last = LinkError::Connect(format!("no socket to dial {addr} from: {e}"))
+                            .into();
                         continue;
                     }
                 };
@@ -896,10 +969,12 @@ impl Links {
             // Traffic is looked for every idle_check; once none came, sleep
             // to the idle deadline itself rather than to the next check.
             let check = match self.peers.get(id).map(|p| p.mode) {
-                Some(LinkMode::OnDemand { idle }) => match idle.saturating_sub(quiet_since.elapsed()) {
-                    left if left.is_zero() => idle_check(idle),
-                    left => left.min(idle_check(idle)),
-                },
+                Some(LinkMode::OnDemand { idle }) => {
+                    match idle.saturating_sub(quiet_since.elapsed()) {
+                        left if left.is_zero() => idle_check(idle),
+                        left => left.min(idle_check(idle)),
+                    }
+                }
                 _ => Duration::from_secs(60),
             };
             tokio::select! {
@@ -914,7 +989,11 @@ impl Links {
                 quiet_since = Instant::now();
             }
             let Some(peer) = self.peers.get(id) else {
-                release(handle, false, "this device no longer uses this link (the host removed it)");
+                release(
+                    handle,
+                    false,
+                    "this device no longer uses this link (the host removed it)",
+                );
                 return true;
             };
             if peer.relay_use.is_some() && !self.relay_wanted(id) {
@@ -926,7 +1005,11 @@ impl Links {
             }
             match peer.mode {
                 LinkMode::Off if !ctl.asked() => {
-                    release(handle, true, "this device turned its link off; it links again when asked");
+                    release(
+                        handle,
+                        true,
+                        "this device turned its link off; it links again when asked",
+                    );
                     return true;
                 }
                 LinkMode::OnDemand { idle }
@@ -973,15 +1056,86 @@ async fn inbound(links: Arc<Links>, incoming: Incoming) {
     };
     // A refusal here was logged with its reason where it was decided.
     if let Err(e) = links.establish(hs, Origin::Accepted).await
-        && !matches!(e, LinkError::RefusedHere { .. })
+        && !matches!(e.error, LinkError::RefusedHere { .. })
     {
-        tracing::info!(target: "face.quic", %remote, "inbound link did not come up: {e}");
+        tracing::info!(target: "face.quic", %remote, "inbound link did not come up: {}", e.error);
     }
 }
 
 /// A punch session as logs and refusals show it.
 fn hex(session: &PathSession) -> String {
     session.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The close reason `reason` as details carry it: its code (§6.1), hex.
+pub(crate) fn close_code(reason: CloseReason) -> String {
+    format!("0x{:02x}", reason.code())
+}
+
+/// What a link error says, as a detail (its sentence is the error's).
+pub(crate) fn link_error_detail(error: &LinkError) -> LinkDetail {
+    let text = error.to_string();
+    match error {
+        LinkError::NoLinkKey(e) => LinkDetail::new(code::LINK_NO_KEY, text).with("error", e),
+        LinkError::Tls(e) => LinkDetail::new(code::LINK_TLS, text).with("error", e),
+        LinkError::Connect(e) => LinkDetail::new(code::LINK_CONNECT, text).with("error", e),
+        LinkError::UnexpectedKey {
+            expected,
+            presented,
+        } => LinkDetail::new(code::LINK_UNEXPECTED_KEY, text)
+            .with("expected", expected)
+            .with("presented", presented),
+        LinkError::Refused {
+            reason,
+            text: theirs,
+        } => {
+            let detail = LinkDetail::new(code::LINK_CLOSED_BY_PEER, text).with("text", theirs);
+            match reason {
+                Some(r) => detail.with("reason", close_code(*r)),
+                None => detail,
+            }
+        }
+        LinkError::RefusedHere { reason, text: ours } => {
+            LinkDetail::new(code::LINK_CLOSED_HERE, text)
+                .with("reason", close_code(*reason))
+                .with("text", ours)
+        }
+        LinkError::Protocol(e) => LinkDetail::new(code::LINK_PROTOCOL, text).with("error", e),
+        LinkError::Timeout => LinkDetail::new(code::LINK_TIMEOUT, text),
+        LinkError::Io(e) => LinkDetail::new(code::LINK_IO, text).with("error", e),
+    }
+}
+
+/// A link that did not come up: the error, and what it says as a detail —
+/// for a link this device refused, with the refusal as its cause.
+#[derive(Debug)]
+pub(crate) struct NotLinked {
+    pub(crate) error: LinkError,
+    pub(crate) detail: LinkDetail,
+}
+
+impl NotLinked {
+    /// This device refused the link with `reason`, saying `why` (already
+    /// told to the other device).
+    pub(crate) fn refused_here(reason: CloseReason, why: LinkDetail) -> Self {
+        let error = LinkError::RefusedHere {
+            reason,
+            text: why.text.clone(),
+        };
+        let detail = LinkDetail::new(code::LINK_CLOSED_HERE, error.to_string())
+            .with("reason", close_code(reason))
+            .caused_by(why);
+        Self { error, detail }
+    }
+}
+
+impl From<LinkError> for NotLinked {
+    fn from(error: LinkError) -> Self {
+        Self {
+            detail: link_error_detail(&error),
+            error,
+        }
+    }
 }
 
 /// Keep peer `id` linked as its mode and the relay choice say: dial its
@@ -995,7 +1149,11 @@ pub(crate) async fn dial_loop(links: Weak<Links>, id: PeerId, ctl: Arc<PeerCtl>)
         let cancel = this.cancel.clone();
         let Some(peer) = this.peers.get(id) else {
             if let Some(handle) = this.table.link_to(id) {
-                release(&handle, false, "this device no longer uses this link (the host removed it)");
+                release(
+                    &handle,
+                    false,
+                    "this device no longer uses this link (the host removed it)",
+                );
             }
             return;
         };
@@ -1012,9 +1170,15 @@ pub(crate) async fn dial_loop(links: Weak<Links>, id: PeerId, ctl: Arc<PeerCtl>)
             // backoff.
             if !closed_here
                 && peer.relay_use.is_some()
-                && let LinkError::Refused { reason: Some(CloseReason::Shutdown), .. } = handle.closed().await
+                && let LinkError::Refused {
+                    reason: Some(CloseReason::Shutdown),
+                    ..
+                } = handle.closed().await
             {
-                ctl.dialled(Some("it closed its link: it is shutting down".into()));
+                ctl.dialled(Some(LinkDetail::new(
+                    code::PEER_SHUTTING_DOWN,
+                    "it closed its link: it is shutting down",
+                )));
                 this.reselect_relays();
             }
             drop(this);
@@ -1051,16 +1215,28 @@ pub(crate) async fn dial_loop(links: Weak<Links>, id: PeerId, ctl: Arc<PeerCtl>)
                 continue;
             }
             Err(e) => {
-                let refused = !e.is_transient();
+                let refused = !e.error.is_transient();
                 let wait = backoff.after_failure(refused);
                 tracing::warn!(
                     target: "face.quic",
                     peer = %peer.label,
                     retry_in_secs = wait.as_secs_f32(),
-                    "link to {} failed: {e}",
-                    peer.label
+                    "link to {} failed: {}",
+                    peer.label,
+                    e.error
                 );
-                ctl.dialled(Some(format!("its last dial failed: {e}; retried after {:.1} s", wait.as_secs_f32())));
+                let retry = format!("{:.1}", wait.as_secs_f32());
+                ctl.dialled(Some(
+                    LinkDetail::new(
+                        code::DIAL_FAILED,
+                        format!(
+                            "its last dial failed: {}; retried after {retry} s",
+                            e.detail.text
+                        ),
+                    )
+                    .with("retry_secs", retry)
+                    .caused_by(e.detail),
+                ));
                 if peer.relay_use.is_some() {
                     this.reselect_relays();
                 }

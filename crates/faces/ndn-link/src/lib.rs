@@ -95,13 +95,16 @@
 //!   the host's configuration.
 //! - **The link socket**, when it listens (a [`ndn_face_quic::LinkEndpoint`]);
 //!   dial-only sockets are bound here when needed.
-//! - **Hints** ([`LinkHints`]): how a person at this device enrolls it or
-//!   renews a certificate, quoted in refusals and logs.
 //! - **Identity changes**: [`Links::identities_changed`] after the device's
 //!   link key or memberships changed (it enrolled in a namespace).
 //!
-//! The host keeps the rest: parsing its configuration, the forwarder, and
-//! management.
+//! The host keeps the rest: parsing its configuration, the forwarder,
+//! management, and the words its users read. What this crate reports or
+//! refuses in words is a [`LinkDetail`] (a code of [`link_code`] with
+//! parameters, and a neutral sentence that names no host's commands or
+//! configuration); a host words the codes in its own terms
+//! ([`LinkDetail::render`]; [`LinkWords`] says the ones that stand in for
+//! its peer entries, renewal and expected keys).
 //!
 //! # Direct paths
 //!
@@ -180,18 +183,24 @@ mod table;
 mod waiting;
 
 pub use asleep::{HoldLimits, RelayService, WAKE_INTERVAL, WakeNotifier, WakeRequest};
-pub use candidates::{AdvertisedCandidates, Candidate, CandidateKind, CandidateSource, HostCandidates};
+pub use candidates::{
+    AdvertisedCandidates, Candidate, CandidateKind, CandidateSource, HostCandidates,
+};
 #[cfg(feature = "engine")]
 pub use engine::EngineFaces;
-pub use host::{ConfiguredEndpoints, FaceSink, LinkHints, LinkTrust, OwnMembership, PathCandidate, PathSource, Route};
+pub use host::{
+    ConfiguredEndpoints, FaceSink, LinkTrust, OwnMembership, PathCandidate, PathSource, Route,
+};
 pub use links::{LinkSetup, Links};
+pub use ndn_mgmt_wire::{LinkDetail, LinkWords, link_code};
 pub use peer::{LinkMode, PeerId, PeerSpec, RelaySource, RelayUse};
 pub use policy::Backoff;
 pub use presence::{DirectOptions, PRESENCE_MAX};
 pub use relays::RelayOptions;
 pub use serving::{Quotas, ServePolicy};
 pub use status::{
-    AsleepStatus, DirectState, DirectStatus, LinkReport, LinkStatus, PathKind, PathStatus, RelayState, RelayStatus,
+    AsleepStatus, DirectState, DirectStatus, LinkReport, LinkStatus, PathKind, PathStatus,
+    RelayState, RelayStatus,
 };
 pub use table::keeps_existing;
 pub use waiting::{DEMAND_PER_PEER, DEMAND_TOTAL, WAITING_COST};

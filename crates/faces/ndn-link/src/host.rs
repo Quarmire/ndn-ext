@@ -1,5 +1,5 @@
 //! What the host provides: trust data, the forwarder's faces and routes,
-//! where to dial, and the words its users know.
+//! and where to dial.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -132,27 +132,10 @@ pub struct ConfiguredEndpoints;
 
 impl PathSource for ConfiguredEndpoints {
     fn candidates(&self, _: PeerId, peer: &PeerSpec) -> Vec<PathCandidate> {
-        peer.endpoints.iter().cloned().map(PathCandidate::Endpoint).collect()
+        peer.endpoints
+            .iter()
+            .cloned()
+            .map(PathCandidate::Endpoint)
+            .collect()
     }
-}
-
-/// How the person at a device does what a refusal or a log line asks of
-/// them, in the host's own terms (its commands, its configuration).
-#[derive(Clone, Debug)]
-pub struct LinkHints {
-    /// How to enroll this device, e.g. "`ndn-fwd enroll <invite link>`, or
-    /// by an admin's approval".
-    pub enroll: String,
-    /// How to renew a certificate, e.g. "`ndn-fwd renew`".
-    pub renew: String,
-    /// How to fetch the newest trust context, e.g. "`ndn-fwd context
-    /// refresh`".
-    pub refresh: String,
-    /// What the host's configuration calls a [`PeerSpec`], e.g.
-    /// "[[peer]]".
-    pub peer_entry: String,
-    /// How to make this device expect a key; `{key}` stands for the key's
-    /// fingerprint. E.g. "add [[peer]] key = \"{key}\" to the other
-    /// device's config".
-    pub expect_key: String,
 }

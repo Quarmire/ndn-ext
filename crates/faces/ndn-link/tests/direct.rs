@@ -13,11 +13,14 @@ use bytes::Bytes;
 use ndn_engine::{EngineBuilder, EngineConfig, ShutdownHandle};
 use ndn_face_quic::{KeyFingerprint, LinkEndpoint, LinkKey, LinkKeySource, LinkTransportConfig};
 use ndn_link::{
-    ConfiguredEndpoints, EngineFaces, HostCandidates, LinkHints, LinkSetup, LinkTrust, Links, PathKind, PeerSpec,
-    RelaySource, RelayUse,
+    ConfiguredEndpoints, EngineFaces, HostCandidates, LinkSetup, LinkTrust, Links, PathKind,
+    PeerSpec, RelaySource, RelayUse,
 };
 use ndn_packet::Name;
-use ndn_security::{Certificate, Ed25519Signer, Keyring, SecurityManager, SecurityProfile, SignedTrustContext, Signer};
+use ndn_security::{
+    Certificate, Ed25519Signer, Keyring, SecurityManager, SecurityProfile, SignedTrustContext,
+    Signer,
+};
 use tokio_util::sync::CancellationToken;
 
 const NS: &str = "/home";
@@ -117,7 +120,15 @@ async fn device(home: &Home, name: &str, seed: u8, listen: bool, peers: Vec<Peer
     assert!(keyring.adopt(Arc::clone(&home.context)));
     let transport = LinkTransportConfig::default();
     let key: Arc<dyn LinkKeySource> = Arc::new(key);
-    let socket = Arc::new(LinkEndpoint::bind("127.0.0.1:0".parse().unwrap(), Arc::clone(&key), &transport, listen).unwrap());
+    let socket = Arc::new(
+        LinkEndpoint::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::clone(&key),
+            &transport,
+            listen,
+        )
+        .unwrap(),
+    );
     let addr = socket.local_addr().unwrap();
     let cancel = CancellationToken::new();
     let links = Links::start(
@@ -131,16 +142,11 @@ async fn device(home: &Home, name: &str, seed: u8, listen: bool, peers: Vec<Peer
             faces: Arc::new(EngineFaces(engine)),
             paths: Arc::new(ConfiguredEndpoints),
             // Devices on one machine: loopback host candidates.
-            candidates: vec![Arc::new(HostCandidates { include_local: true })],
+            candidates: vec![Arc::new(HostCandidates {
+                include_local: true,
+            })],
             socket: Some(socket),
             transport,
-            hints: LinkHints {
-                enroll: "enroll it".into(),
-                renew: "renew it".into(),
-                refresh: "refresh it".into(),
-                peer_entry: "[[peer]]".into(),
-                expect_key: "expect {key}".into(),
-            },
             relays: Default::default(),
             service: Default::default(),
             direct: Default::default(),
@@ -169,7 +175,14 @@ async fn member(home: &Home, name: &str, seed: u8, relay: &Device) -> Device {
         }),
         ..Default::default()
     };
-    device(home, &format!("/member/{name}"), seed, false, vec![to_relay]).await
+    device(
+        home,
+        &format!("/member/{name}"),
+        seed,
+        false,
+        vec![to_relay],
+    )
+    .await
 }
 
 /// The remote address of `on`'s direct path to the device with key `to`.
@@ -201,10 +214,16 @@ async fn a_moved_member_gets_its_direct_path_again(larger: bool) {
     let relay = device(&home, "/node/relay", 1, true, Vec::new()).await;
     let a = member(&home, "a", 2, &relay).await;
     let b = member(&home, "b", 3, &relay).await;
-    let (mover, other) = if (a.key > b.key) == larger { (&a, &b) } else { (&b, &a) };
-    within("a direct path between the members", Duration::from_secs(20), || {
-        direct_to(mover, other.key).is_some() && direct_to(other, mover.key) == Some(mover.addr)
-    })
+    let (mover, other) = if (a.key > b.key) == larger {
+        (&a, &b)
+    } else {
+        (&b, &a)
+    };
+    within(
+        "a direct path between the members",
+        Duration::from_secs(20),
+        || direct_to(mover, other.key).is_some() && direct_to(other, mover.key) == Some(mover.addr),
+    )
     .await;
 
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();

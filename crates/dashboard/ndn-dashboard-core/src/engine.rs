@@ -298,12 +298,20 @@ impl<M: ManagementClient> DashboardEngine<M> {
             if resp.is_ok() {
                 let listing = ndn_mgmt_wire::ApprovalListing::decode(&resp.body);
                 self.identity.approvals = listing.rows;
-                self.identity.approval_notes = listing.notes;
+                // A note's neutral sentence (its code and params are
+                // there for a client that words its own).
+                self.identity.approval_notes =
+                    listing.notes.into_iter().map(|note| note.text).collect();
             } else {
                 self.identity.approvals.clear();
+                // A refusal is structured: its neutral sentence is `reason`.
+                let reason = serde_json::from_str::<serde_json::Value>(&resp.status_text)
+                    .ok()
+                    .and_then(|v| v.get("reason")?.as_str().map(str::to_owned))
+                    .unwrap_or(resp.status_text);
                 self.identity.approval_notes = vec![format!(
-                    "the forwarder refused to list approval requests ({}): {}",
-                    resp.status_code, resp.status_text
+                    "the forwarder refused to list approval requests ({}): {reason}",
+                    resp.status_code
                 )];
             }
             changed.push(StateUpdate::Approvals);
@@ -398,11 +406,7 @@ impl<M: ManagementClient> DashboardEngine<M> {
     /// `reason` (empty: "no reason given"), told to the requesting device.
     /// Signed command. The target and reason are joined as `target:reason`
     /// to match the forwarder's `ca/deny` parameter shape.
-    pub async fn ca_deny(
-        &mut self,
-        target: &str,
-        reason: &str,
-    ) -> Result<MgmtResponse, String> {
+    pub async fn ca_deny(&mut self, target: &str, reason: &str) -> Result<MgmtResponse, String> {
         let uri = if reason.is_empty() {
             target.to_owned()
         } else {
@@ -619,7 +623,11 @@ mod tests {
             expires_secs: 2,
             ..Default::default()
         }];
-        let wire = ndn_mgmt_wire::ApprovalListing { rows, notes: Vec::new() }.encode();
+        let wire = ndn_mgmt_wire::ApprovalListing {
+            rows,
+            notes: Vec::new(),
+        }
+        .encode();
         let mut engine = DashboardEngine::new(IdMock(wire));
 
         let changed = engine.poll_identity().await;

@@ -12,6 +12,7 @@ use parking_lot::Mutex;
 use tokio::sync::Notify;
 
 use ndn_face_quic::{CloseReason, Reachability};
+use ndn_mgmt_wire::{LinkDetail, link_code as code};
 use ndn_packet::Name;
 use ndn_packet::nack::NackReason;
 
@@ -35,7 +36,7 @@ pub(crate) struct PeerCtl {
     /// Skip the rest of the current backoff: the host asked, or the network
     /// changed.
     kick: AtomicBool,
-    last_error: Mutex<Option<String>>,
+    last_error: Mutex<Option<LinkDetail>>,
     wake_token: Mutex<Option<Bytes>>,
 }
 
@@ -74,12 +75,12 @@ impl PeerCtl {
         self.failing.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn last_error(&self) -> Option<String> {
+    pub(crate) fn last_error(&self) -> Option<LinkDetail> {
         self.last_error.lock().clone()
     }
 
-    /// Record a dial's outcome: `None` when it linked.
-    pub(crate) fn dialled(&self, error: Option<String>) {
+    /// Record a dial's outcome: `None` when it linked, else why not.
+    pub(crate) fn dialled(&self, error: Option<LinkDetail>) {
         self.failing.store(error.is_some(), Ordering::SeqCst);
         *self.last_error.lock() = error;
     }
@@ -129,7 +130,10 @@ impl Links {
         {
             self.dismissed.lock().insert(peer.label.clone());
         }
-        self.drop_peer(id, "this device no longer uses this link (the host removed it)");
+        self.drop_peer(
+            id,
+            "this device no longer uses this link (the host removed it)",
+        );
     }
 
     /// Change when peer `id`'s link is up.
@@ -216,7 +220,12 @@ impl Links {
         {
             tracing::warn!(target: "face.quic", "cannot move the link socket to the new network: {e}");
         }
-        let dialers: Vec<_> = self.dialers.lock().iter().map(|(v4, e)| (*v4, Arc::clone(e))).collect();
+        let dialers: Vec<_> = self
+            .dialers
+            .lock()
+            .iter()
+            .map(|(v4, e)| (*v4, Arc::clone(e)))
+            .collect();
         for (v4, endpoint) in dialers {
             let bind: std::net::SocketAddr = if v4 {
                 std::net::SocketAddr::from(([0, 0, 0, 0], 0))
@@ -225,7 +234,9 @@ impl Links {
             };
             match std::net::UdpSocket::bind(bind).and_then(|s| endpoint.rebind(s)) {
                 Ok(()) => {}
-                Err(e) => tracing::warn!(target: "face.quic", "cannot move a dial socket to the new network: {e}"),
+                Err(e) => {
+                    tracing::warn!(target: "face.quic", "cannot move a dial socket to the new network: {e}")
+                }
             }
         }
         for (id, _) in self.peers.iter() {
@@ -241,10 +252,15 @@ impl Links {
     /// Route what peer `id`'s link would carry to the waiting face while it
     /// links on demand; take those routes away otherwise.
     pub(crate) fn route_demand(&self, id: PeerId) {
-        let Some(waiting) = self.waiting.get() else { return };
+        let Some(waiting) = self.waiting.get() else {
+            return;
+        };
         let target = WaitFor::Peer(id);
         match self.peers.get(id) {
-            Some(p) if matches!(p.mode, LinkMode::OnDemand { .. }) && !self.paths.candidates(id, &p).is_empty() => {
+            Some(p)
+                if matches!(p.mode, LinkMode::OnDemand { .. })
+                    && !self.paths.candidates(id, &p).is_empty() =>
+            {
                 let prefixes = predicted_routes(&p, &self.relay_namespaces(&p));
                 waiting.route(self, target, prefixes);
             }
@@ -306,7 +322,9 @@ impl Links {
     /// If what `target` waits for is linked, send it its waiting Interests
     /// over the link.
     pub(crate) async fn flush_if_linked(&self, target: &WaitFor) {
-        let Some(waiting) = self.waiting.get() else { return };
+        let Some(waiting) = self.waiting.get() else {
+            return;
+        };
         let sender = match target {
             WaitFor::Peer(id) => self.table.peer_sender(*id).map(|(_, s)| s),
             WaitFor::Asleep(fp) => self.table.sender_to(fp),
@@ -331,30 +349,39 @@ impl Links {
     }
 
     /// Why peer `id` is not linked now, for status.
-    pub(crate) fn why_down(&self, id: PeerId, peer: &PeerSpec) -> Option<String> {
+    pub(crate) fn why_down(&self, id: PeerId, peer: &PeerSpec) -> Option<LinkDetail> {
         if self.table.link_to(id).is_some() {
             return None;
         }
         let ctl = self.ctl(id);
         if self.paths.candidates(id, peer).is_empty() {
-            return Some("it links in to this device (no endpoint to dial)".into());
+            return Some(LinkDetail::new(
+                code::DOWN_LINKS_IN,
+                "it links in to this device (no endpoint to dial)",
+            ));
         }
         if peer.relay_use.is_some()
             && !self.relay_wanted(id)
-            && !(peer.mode == LinkMode::Off && !ctl.asked())
+            && (peer.mode != LinkMode::Off || ctl.asked())
         {
-            return Some("a standby relay: not needed now".into());
+            return Some(LinkDetail::new(
+                code::DOWN_STANDBY_RELAY,
+                "a standby relay: not needed now",
+            ));
         }
         let why = match peer.mode {
-            LinkMode::Off if !ctl.asked() => "its mode is off: it links when asked".to_string(),
-            LinkMode::OnDemand { idle } if !ctl.asked() && !self.is_active() && !ctl.demand() => format!(
-                "on demand: closed (after {} s idle, or not needed yet); it links on traffic or when the host is active",
-                idle.as_secs()
-            ),
-            _ => match ctl.last_error() {
-                Some(e) => e,
-                None => "dialling".to_string(),
-            },
+            LinkMode::Off if !ctl.asked() => LinkDetail::new(code::DOWN_OFF, "its mode is off: it links when asked"),
+            LinkMode::OnDemand { idle } if !ctl.asked() && !self.is_active() && !ctl.demand() => LinkDetail::new(
+                code::DOWN_ON_DEMAND,
+                format!(
+                    "on demand: closed (after {} s idle, or not needed yet); it links on traffic or when the host is active",
+                    idle.as_secs()
+                ),
+            )
+            .with("idle_secs", idle.as_secs()),
+            _ => ctl
+                .last_error()
+                .unwrap_or_else(|| LinkDetail::new(code::DOWN_DIALLING, "dialling")),
         };
         Some(why)
     }
@@ -367,6 +394,10 @@ pub(crate) fn idle_check(idle: Duration) -> Duration {
 
 /// The close of a link this device no longer wants: to sleep, or released.
 pub(crate) fn release(handle: &ndn_face_quic::LinkHandle, asleep: bool, text: &str) {
-    let reason = if asleep { CloseReason::Asleep } else { CloseReason::Released };
+    let reason = if asleep {
+        CloseReason::Asleep
+    } else {
+        CloseReason::Released
+    };
     handle.close(reason, text);
 }

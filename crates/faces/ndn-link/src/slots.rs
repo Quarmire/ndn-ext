@@ -7,6 +7,7 @@ use std::sync::{Arc, Weak};
 use parking_lot::Mutex;
 
 use ndn_face_quic::CloseReason;
+use ndn_mgmt_wire::{LinkDetail, link_code as code};
 
 use crate::admission::Refusal;
 use crate::policy::{ENROLLMENT_LINKS_MAX, ENROLLMENT_LINKS_PER_SOURCE};
@@ -37,12 +38,19 @@ impl EnrollmentSlots {
         if slots.total >= ENROLLMENT_LINKS_MAX || from_source >= ENROLLMENT_LINKS_PER_SOURCE {
             return Err(Refusal::new(
                 CloseReason::Busy,
-                format!(
-                    "this relay holds {} enrollment links ({from_source} from your address; it \
-                     takes {ENROLLMENT_LINKS_MAX}, {ENROLLMENT_LINKS_PER_SOURCE} from one address); \
-                     your device dials again by itself — or enroll it over another path",
-                    slots.total
-                ),
+                LinkDetail::new(
+                    code::ENROLLMENT_LINKS_FULL,
+                    format!(
+                        "this relay holds {} enrollment links ({from_source} from your address; it \
+                         takes {ENROLLMENT_LINKS_MAX}, {ENROLLMENT_LINKS_PER_SOURCE} from one address); \
+                         your device dials again by itself — or enroll it over another path",
+                        slots.total
+                    ),
+                )
+                .with("links", slots.total)
+                .with("from_source", from_source)
+                .with("max", ENROLLMENT_LINKS_MAX)
+                .with("max_per_source", ENROLLMENT_LINKS_PER_SOURCE),
             ));
         }
         slots.total += 1;
@@ -56,7 +64,9 @@ impl EnrollmentSlots {
 
 impl Drop for EnrollmentSlot {
     fn drop(&mut self) {
-        let Some(counts) = self.counts.upgrade() else { return };
+        let Some(counts) = self.counts.upgrade() else {
+            return;
+        };
         let mut slots = counts.lock();
         slots.total = slots.total.saturating_sub(1);
         if let Some(n) = slots.by_source.get_mut(&self.source) {
@@ -82,7 +92,12 @@ mod tests {
         assert_eq!(slots.reserve(a).err().unwrap().reason, CloseReason::Busy);
         drop(held);
         let mut held: Vec<_> = (0..ENROLLMENT_LINKS_MAX)
-            .map(|i| slots.reserve(IpAddr::from([10, 0, (i / 250) as u8, (i % 250) as u8])).ok().unwrap())
+            .map(|i| {
+                slots
+                    .reserve(IpAddr::from([10, 0, (i / 250) as u8, (i % 250) as u8]))
+                    .ok()
+                    .unwrap()
+            })
             .collect();
         assert_eq!(slots.reserve(a).err().unwrap().reason, CloseReason::Busy);
         held.pop();

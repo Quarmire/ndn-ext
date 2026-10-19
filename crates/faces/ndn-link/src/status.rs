@@ -1,11 +1,14 @@
 //! What a host shows about this device's links: each device it links with,
 //! the paths that reach it, and whether a direct path is up, being tried,
-//! or why not.
+//! or why not. Whatever it says in words is a [`LinkDetail`]: a code from
+//! [`link_code`](crate::link_code) with parameters and a neutral sentence;
+//! the host words the codes itself.
 
 use std::net::SocketAddr;
 use std::time::Duration;
 
 use ndn_face_quic::KeyFingerprint;
+use ndn_mgmt_wire::LinkDetail;
 use ndn_packet::Name;
 use ndn_transport::FaceId;
 
@@ -16,14 +19,14 @@ use crate::peer::{LinkMode, PeerId, RelaySource};
 #[derive(Clone, Debug, Default)]
 pub struct LinkReport {
     /// The fingerprint of the key this device links with now (what other
-    /// devices name in `[[peer]] key`).
+    /// devices' peer entries expect).
     pub key: Option<KeyFingerprint>,
     /// Probe datagrams this device sent for direct-path punches, in total.
     pub probes_sent: u64,
     /// Punch requests this device refused, in total.
     pub punches_refused: u64,
-    /// Whom this device serves as a relay (its serving policy, one line).
-    pub serve: String,
+    /// Whom this device serves as a relay (its serving policy).
+    pub serve: LinkDetail,
     /// Interests this device holds now for devices asleep here.
     pub held_total: usize,
     /// Times this device invoked its wake notifier, in total.
@@ -55,7 +58,7 @@ pub struct LinkStatus {
     /// For a relay this device uses: where it came from and its state.
     pub relay: Option<RelayStatus>,
     /// Why it is not linked now, when it is a peer entry that is not.
-    pub down: Option<String>,
+    pub down: Option<LinkDetail>,
     /// On a relay: the device is asleep here (its link ended, and it asked
     /// for its Interests to be held or for a wake).
     pub asleep: Option<AsleepStatus>,
@@ -68,8 +71,8 @@ pub struct RelayStatus {
     /// Lower is preferred.
     pub preference: u32,
     pub state: RelayState,
-    /// For a person: why it is in that state.
-    pub text: String,
+    /// Why it is in that state.
+    pub detail: LinkDetail,
 }
 
 /// Where a relay stands in this device's choice of relays.
@@ -191,8 +194,8 @@ impl DirectState {
 #[derive(Clone, Debug)]
 pub struct DirectStatus {
     pub state: DirectState,
-    /// For a person: why, and what to do if anything.
-    pub text: String,
+    /// Why, and what to do if anything (`None`: nothing to say).
+    pub detail: Option<LinkDetail>,
     /// When the next punch is due, for `NotPossible` and `Refused`.
     pub retry_in: Option<Duration>,
 }
@@ -201,7 +204,7 @@ impl Default for DirectStatus {
     fn default() -> Self {
         Self {
             state: DirectState::None,
-            text: String::new(),
+            detail: None,
             retry_in: None,
         }
     }

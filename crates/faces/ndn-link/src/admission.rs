@@ -11,14 +11,17 @@ use bytes::Bytes;
 use ndn_cert::onboarding::rdr_prefix;
 use ndn_cert::roles::{Role, parse_device_key};
 use ndn_face_quic::{
-    Admission, Carries, ChannelBinding, CloseReason, KeyFingerprint, LinkHello, LinkKey, LinkScope, LinkVerdict,
-    MEMBERSHIPS_MAX, Membership, PeerKey,
+    Admission, Carries, ChannelBinding, CloseReason, KeyFingerprint, LinkHello, LinkKey, LinkScope,
+    LinkVerdict, MEMBERSHIPS_MAX, Membership, PeerKey,
 };
+use ndn_mgmt_wire::{LinkDetail, link_code as code};
 use ndn_packet::{Data, Name};
 use ndn_security::cert_name::key_name_of;
-use ndn_security::{CertCache, Certificate, Keyring, SignedTrustContext, ValidationResult, Validator};
+use ndn_security::{
+    CertCache, Certificate, Keyring, SignedTrustContext, ValidationResult, Validator,
+};
 
-use crate::host::{LinkHints, LinkTrust, OwnMembership};
+use crate::host::{LinkTrust, OwnMembership};
 use crate::peer::{PeerId, Peers};
 use crate::policy::{ENROLLMENT_ANSWERS, ENROLLMENT_INTERESTS, MAX_CHAIN};
 use crate::serving::{QuotaSlot, QuotaState, ServePolicy};
@@ -63,31 +66,30 @@ pub(crate) struct Proven {
 pub(crate) enum Unidentified {
     /// Its hello carries no certificate.
     NoCertificate,
-    /// One this device cannot validate (the reason).
-    Unusable(String),
+    /// One this device cannot validate (why).
+    Unusable(LinkDetail),
 }
 
-impl std::fmt::Display for Unidentified {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Unidentified {
+    pub(crate) fn detail(&self) -> LinkDetail {
         match self {
-            Self::NoCertificate => f.write_str("it sent no certificate"),
-            Self::Unusable(why) => f.write_str(why),
+            Self::NoCertificate => LinkDetail::new(code::NO_CERTIFICATE, "it sent no certificate"),
+            Self::Unusable(why) => why.clone(),
         }
     }
 }
 
+/// Why a link is refused: the close reason the other device gets, and what
+/// this device says (its sentence is the close text).
 #[derive(Debug)]
 pub(crate) struct Refusal {
     pub(crate) reason: CloseReason,
-    pub(crate) text: String,
+    pub(crate) detail: LinkDetail,
 }
 
 impl Refusal {
-    pub(crate) fn new(reason: CloseReason, text: impl Into<String>) -> Self {
-        Self {
-            reason,
-            text: text.into(),
-        }
+    pub(crate) fn new(reason: CloseReason, detail: LinkDetail) -> Self {
+        Self { reason, detail }
     }
 }
 
@@ -130,7 +132,11 @@ impl Admitted {
         if self.identities.is_empty() {
             return format!("key {}", self.fingerprint);
         }
-        let devices: Vec<String> = self.identities.iter().map(|id| id.device.to_string()).collect();
+        let devices: Vec<String> = self
+            .identities
+            .iter()
+            .map(|id| id.device.to_string())
+            .collect();
         format!("{} (key {})", devices.join(", "), self.fingerprint)
     }
 }
@@ -139,7 +145,6 @@ impl Admitted {
 pub(crate) struct Judge<'a> {
     pub(crate) trust: &'a dyn LinkTrust,
     pub(crate) peers: &'a Peers,
-    pub(crate) hints: &'a LinkHints,
     pub(crate) serve: &'a ServePolicy,
     pub(crate) quotas: &'a QuotaState,
 }
@@ -161,7 +166,10 @@ impl Judge<'_> {
             let Some(cert) = m.chain.first().and_then(decode_certificate) else {
                 continue;
             };
-            if out.iter().any(|(c, _)| c.name == cert.name || c.public_key == cert.public_key) {
+            if out
+                .iter()
+                .any(|(c, _)| c.name == cert.name || c.public_key == cert.public_key)
+            {
                 continue;
             }
             out.push((cert, Some(m)));
@@ -203,8 +211,10 @@ impl Judge<'_> {
     /// The namespaces this relay admits enrollment links for: held ones
     /// whose link policy allows them and whose trust context names a CA
     /// endpoint, where this device holds a certificate of a role the policy
-    /// lets relay. `Err`: why none, for the refusal.
-    fn enrollment_namespaces(&self) -> Result<Vec<Name>, String> {
+    /// lets relay. `Err`: why none, for the refusal
+    /// ([`NO_ENROLLMENT_LINK`](code::NO_ENROLLMENT_LINK), one cause per
+    /// namespace).
+    fn enrollment_namespaces(&self) -> Result<Vec<Name>, LinkDetail> {
         let mut namespaces = Vec::new();
         let mut why_not = Vec::new();
         for ctx in self.keyring().contexts() {
@@ -214,30 +224,64 @@ impl Judge<'_> {
             }
             let policy = ctx.link_policy();
             if !policy.enrollment_links {
-                why_not.push(format!("{ns}'s link policy turns enrollment links off"));
+                why_not.push(
+                    LinkDetail::new(
+                        code::ENROLLMENT_LINKS_OFF,
+                        format!("{ns}'s link policy turns enrollment links off"),
+                    )
+                    .with("namespace", ns),
+                );
                 continue;
             }
             if ctx.ca_endpoints().is_empty() {
-                why_not.push(format!("{ns}'s trust context names no CA to enroll at"));
+                why_not.push(
+                    LinkDetail::new(
+                        code::ENROLLMENT_NO_CA,
+                        format!("{ns}'s trust context names no CA to enroll at"),
+                    )
+                    .with("namespace", ns),
+                );
                 continue;
             }
             match self.own_role_in(ns) {
                 Some(role) if policy.allows_relay(role.as_str()) => namespaces.push(ns.clone()),
-                Some(role) => why_not.push(format!(
-                    "{ns}'s link policy does not let {role} devices (this one) relay"
-                )),
-                None => why_not.push(format!("this device holds no certificate in {ns}")),
+                Some(role) => why_not.push(
+                    LinkDetail::new(
+                        code::ENROLLMENT_ROLE_MAY_NOT_RELAY,
+                        format!("{ns}'s link policy does not let {role} devices (this one) relay"),
+                    )
+                    .with("namespace", ns)
+                    .with("role", role),
+                ),
+                None => why_not.push(
+                    LinkDetail::new(
+                        code::ENROLLMENT_NO_CERTIFICATE,
+                        format!("this device holds no certificate in {ns}"),
+                    )
+                    .with("namespace", ns),
+                ),
             }
         }
-        if namespaces.is_empty() {
-            Err(if why_not.is_empty() {
-                "it holds no namespace".into()
-            } else {
-                why_not.join("; ")
-            })
-        } else {
-            Ok(namespaces)
+        if !namespaces.is_empty() {
+            return Ok(namespaces);
         }
+        if why_not.is_empty() {
+            why_not.push(LinkDetail::new(
+                code::ENROLLMENT_NO_NAMESPACE,
+                "it holds no namespace",
+            ));
+        }
+        let text = format!(
+            "It admits no enrollment link either: {}.",
+            why_not
+                .iter()
+                .map(|d| d.text.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+        let mut detail = LinkDetail::new(code::NO_ENROLLMENT_LINK, text);
+        detail.causes = why_not;
+        Err(detail)
     }
 
     /// What `hello` (from the link key `key`, on the connection or punch
@@ -248,7 +292,12 @@ impl Judge<'_> {
     /// membership not bound to this link refuse the link. A revoked
     /// certificate (or known revoked key), or a collision with a held name,
     /// only refuses it when no other identity is proved.
-    pub(crate) async fn identify(&self, key: &PeerKey, hello: &LinkHello, channel: &ChannelBinding) -> Result<Proven, Refusal> {
+    pub(crate) async fn identify(
+        &self,
+        key: &PeerKey,
+        hello: &LinkHello,
+        channel: &ChannelBinding,
+    ) -> Result<Proven, Refusal> {
         let mut identities: Vec<Identity> = Vec::new();
         let mut held_back: Option<Refusal> = None;
         let mut why = Unidentified::NoCertificate;
@@ -256,17 +305,29 @@ impl Judge<'_> {
             held_back = Some(refusal);
         } else if let Some((leaf_wire, issuers)) = hello.certificates.split_first() {
             let (leaf_data, leaf) = decode_with_data(leaf_wire).map_err(|e| {
-                Refusal::new(CloseReason::Protocol, format!("the certificate in your link hello does not decode: {e}"))
+                Refusal::new(
+                    CloseReason::Protocol,
+                    LinkDetail::new(
+                        code::CERTIFICATE_UNDECODABLE,
+                        format!("the certificate in your link hello does not decode: {e}"),
+                    )
+                    .with("error", &e),
+                )
             })?;
             if leaf.public_key != key.ndn_public_key() {
                 return Err(Refusal::new(
                     CloseReason::CertificateForAnotherKey,
-                    format!(
-                        "the certificate {} you sent is for another key than the one your link \
-                         handshake proved ({}); a device links with the key its certificate certifies",
-                        leaf.name,
-                        key.fingerprint()
-                    ),
+                    LinkDetail::new(
+                        code::CERTIFICATE_FOR_ANOTHER_KEY,
+                        format!(
+                            "the certificate {} you sent is for another key than the one your link \
+                             handshake proved ({}); a device links with the key its certificate certifies",
+                            leaf.name,
+                            key.fingerprint()
+                        ),
+                    )
+                    .with("certificate", &leaf.name)
+                    .with("key", key.fingerprint()),
                 ));
             }
             match self.identify_chain(&leaf_data, &leaf, issuers).await {
@@ -285,17 +346,26 @@ impl Judge<'_> {
             let (leaf_data, leaf) = decode_with_data(leaf_wire).map_err(|e| {
                 Refusal::new(
                     CloseReason::Protocol,
-                    format!("a membership certificate in your link hello does not decode: {e}"),
+                    LinkDetail::new(
+                        code::MEMBERSHIP_UNDECODABLE,
+                        format!("a membership certificate in your link hello does not decode: {e}"),
+                    )
+                    .with("error", &e),
                 )
             })?;
             membership.verify(&leaf.public_key, &link_key, channel).await.map_err(|e| {
                 Refusal::new(
                     CloseReason::MembershipNotBound,
-                    format!(
-                        "your membership certificate {} is not shown by its key: {e}. A device shows a \
-                         membership only with the key that certificate certifies, bound anew to each link",
-                        leaf.name
-                    ),
+                    LinkDetail::new(
+                        code::MEMBERSHIP_NOT_BOUND,
+                        format!(
+                            "your membership certificate {} is not shown by its key: {e}. A device shows a \
+                             membership only with the key that certificate certifies, bound anew to each link",
+                            leaf.name
+                        ),
+                    )
+                    .with("certificate", &leaf.name)
+                    .with("error", &e),
                 )
             })?;
             match self.identify_chain(&leaf_data, &leaf, issuers).await {
@@ -305,7 +375,12 @@ impl Judge<'_> {
                     }
                 }
                 Ok(Identified::Unknown(w)) => {
-                    tracing::debug!(target: "face.quic", key = %link_key, "a membership identifies nobody here: {w}");
+                    tracing::debug!(
+                        target: "face.quic",
+                        key = %link_key,
+                        "a membership identifies nobody here: {}",
+                        w.detail().text
+                    );
                     if matches!(why, Unidentified::NoCertificate) && hello.certificates.is_empty() {
                         why = w;
                     }
@@ -328,8 +403,13 @@ impl Judge<'_> {
     /// `issuers` sent with it, establishes (§7.1 steps 4–11, or R1–R7 for a
     /// namespace this device does not hold). The key it certifies was
     /// proved already.
-    async fn identify_chain(&self, leaf_data: &Data, leaf: &Certificate, issuers: &[Bytes]) -> Result<Identified, Refusal> {
-        let unusable = |why: String| Ok(Identified::Unknown(Unidentified::Unusable(why)));
+    async fn identify_chain(
+        &self,
+        leaf_data: &Data,
+        leaf: &Certificate,
+        issuers: &[Bytes],
+    ) -> Result<Identified, Refusal> {
+        let unusable = |why: LinkDetail| Ok(Identified::Unknown(Unidentified::Unusable(why)));
         let mut chain: Vec<Certificate> = Vec::new();
         for wire in issuers.iter().take(MAX_CHAIN) {
             match decode_with_data(wire) {
@@ -337,7 +417,13 @@ impl Judge<'_> {
                 Err(e) => {
                     return Err(Refusal::new(
                         CloseReason::Protocol,
-                        format!("an issuer certificate in your link hello does not decode: {e}"),
+                        LinkDetail::new(
+                            code::ISSUER_UNDECODABLE,
+                            format!(
+                                "an issuer certificate in your link hello does not decode: {e}"
+                            ),
+                        )
+                        .with("error", &e),
                     ));
                 }
             }
@@ -351,61 +437,99 @@ impl Judge<'_> {
         if ctx.is_revoked(&leaf.name) {
             return Err(Refusal::new(
                 CloseReason::Revoked,
-                format!("your key {} is revoked in {ns} (trust context v{version})", leaf.key_name()),
+                LinkDetail::new(
+                    code::KEY_REVOKED,
+                    format!(
+                        "your key {} is revoked in {ns} (trust context v{version})",
+                        leaf.key_name()
+                    ),
+                )
+                .with("key", leaf.key_name())
+                .with("namespace", &ns)
+                .with("version", version),
             ));
         }
         let Some(device) = parse_device_key(&ns, &leaf.name) else {
-            return unusable(format!(
-                "{} is not a device certificate of {ns} (/<namespace>/<role>/<device>/KEY/…)",
-                leaf.name
-            ));
+            return unusable(
+                LinkDetail::new(
+                    code::NOT_DEVICE_CERTIFICATE,
+                    format!(
+                        "{} is not a device certificate of {ns} (/<namespace>/<role>/<device>/KEY/…)",
+                        leaf.name
+                    ),
+                )
+                .with("certificate", &leaf.name)
+                .with("namespace", &ns),
+            );
         };
         if !leaf.is_valid_now() {
-            return unusable(format!(
-                "its certificate {} is outside its validity period (renew it: {})",
-                leaf.name, self.hints.renew
-            ));
+            return unusable(certificate_expired(&leaf.name));
         }
         if let Some(revoked) = chain.iter().find(|c| ctx.is_revoked(&c.name)) {
             return Err(Refusal::new(
                 CloseReason::Revoked,
-                format!(
-                    "your certificate's issuer {} is revoked in {ns} (trust context v{version})",
-                    revoked.name
-                ),
+                LinkDetail::new(
+                    code::ISSUER_REVOKED,
+                    format!(
+                        "your certificate's issuer {} is revoked in {ns} (trust context v{version})",
+                        revoked.name
+                    ),
+                )
+                .with("issuer", &revoked.name)
+                .with("namespace", &ns)
+                .with("version", version),
             ));
         }
         let why = match self.validate(leaf_data, &chain).await {
             ValidationResult::Valid(safe) if safe.is_authenticated() => None,
-            ValidationResult::Valid(_) => Some(format!(
-                "its certificate {} is not signed by a key of {ns} (a DigestSha256 proves \
-                 integrity, not who made it)",
-                leaf.name
-            )),
-            ValidationResult::Invalid(e) => Some(format!(
-                "its certificate {} does not validate in {ns} v{version}: {e}",
-                leaf.name
-            )),
-            ValidationResult::Pending => Some(format!(
-                "its certificate {}'s issuer chain was not sent and is not known here",
-                leaf.name
-            )),
+            ValidationResult::Valid(_) => Some(certificate_unauthenticated(&leaf.name, &ns)),
+            ValidationResult::Invalid(e) => Some(
+                LinkDetail::new(
+                    code::CERTIFICATE_INVALID,
+                    format!(
+                        "its certificate {} does not validate in {ns} v{version}: {e}",
+                        leaf.name
+                    ),
+                )
+                .with("certificate", &leaf.name)
+                .with("namespace", &ns)
+                .with("version", version)
+                .with("error", &e),
+            ),
+            ValidationResult::Pending => Some(
+                LinkDetail::new(
+                    code::CERTIFICATE_CHAIN_UNKNOWN,
+                    format!(
+                        "its certificate {}'s issuer chain was not sent and is not known here",
+                        leaf.name
+                    ),
+                )
+                .with("certificate", &leaf.name),
+            ),
         };
         if let Some(why) = why {
             // A namespace of another root under a held name: a relay
             // serving other namespaces says why it cannot.
             if !matches!(self.serve, ServePolicy::Own)
-                && let Some(root) = chain.last().filter(|c| is_self_signed(c) && !ctx.is_anchor(&c.name))
+                && let Some(root) = chain
+                    .last()
+                    .filter(|c| is_self_signed(c) && !ctx.is_anchor(&c.name))
             {
+                let root = KeyFingerprint::of_ndn_key(&root.public_key);
                 return Err(Refusal::new(
                     CloseReason::NotServed,
-                    format!(
-                        "your certificate {} chains to the root key {}, and this relay holds {ns} \
-                         with another root key: the names collide, and the relay cannot route both. \
-                         Use a relay that does not hold {ns}",
-                        leaf.name,
-                        KeyFingerprint::of_ndn_key(&root.public_key)
-                    ),
+                    LinkDetail::new(
+                        code::ROOT_COLLIDES,
+                        format!(
+                            "your certificate {} chains to the root key {root}, and this relay holds {ns} \
+                             with another root key: the names collide, and the relay cannot route both. \
+                             Use a relay that does not hold {ns}",
+                            leaf.name,
+                        ),
+                    )
+                    .with("certificate", &leaf.name)
+                    .with("root", root)
+                    .with("namespace", &ns),
                 ));
             }
             return unusable(why);
@@ -431,36 +555,76 @@ impl Judge<'_> {
     /// of the chain its hello carries, under the rules of a namespace as
     /// `ndn-cert` makes them ([`namespace_context`]). Nothing can be
     /// revoked without the trust context.
-    async fn identify_foreign(&self, leaf_data: &Data, leaf: &Certificate, chain: &[Certificate]) -> Identified {
-        let unusable = |why: String| Identified::Unknown(Unidentified::Unusable(why));
+    async fn identify_foreign(
+        &self,
+        leaf_data: &Data,
+        leaf: &Certificate,
+        chain: &[Certificate],
+    ) -> Identified {
+        let unusable = |why: LinkDetail| Identified::Unknown(Unidentified::Unusable(why));
         let Some(root) = chain.last().filter(|c| is_self_signed(c)) else {
-            return unusable(format!(
-                "its certificate {} is not of a namespace this device holds, and its hello carries \
-                 no self-signed root certificate to check it against",
-                leaf.name
-            ));
+            return unusable(
+                LinkDetail::new(
+                    code::FOREIGN_NO_ROOT,
+                    format!(
+                        "its certificate {} is not of a namespace this device holds, and its hello carries \
+                         no self-signed root certificate to check it against",
+                        leaf.name
+                    ),
+                )
+                .with("certificate", &leaf.name),
+            );
         };
         let Some(ns) = key_identity(&root.key_name()).filter(|ns| !ns.is_empty()) else {
-            return unusable(format!("its root certificate {} names no namespace", root.name));
+            return unusable(
+                LinkDetail::new(
+                    code::FOREIGN_ROOT_NO_NAMESPACE,
+                    format!("its root certificate {} names no namespace", root.name),
+                )
+                .with("root", &root.name),
+            );
         };
         let Some(device) = parse_device_key(&ns, &leaf.name) else {
-            return unusable(format!(
-                "{} is not a device certificate of {ns}, the namespace of its root {} \
-                 (/<namespace>/<role>/<device>/KEY/…)",
-                leaf.name, root.name
-            ));
+            return unusable(
+                LinkDetail::new(
+                    code::FOREIGN_NOT_DEVICE_CERTIFICATE,
+                    format!(
+                        "{} is not a device certificate of {ns}, the namespace of its root {} \
+                         (/<namespace>/<role>/<device>/KEY/…)",
+                        leaf.name, root.name
+                    ),
+                )
+                .with("certificate", &leaf.name)
+                .with("namespace", &ns)
+                .with("root", &root.name),
+            );
         };
         if !leaf.is_valid_now() {
-            return unusable(format!(
-                "its certificate {} is outside its validity period (renew it: {})",
-                leaf.name, self.hints.renew
-            ));
+            return unusable(certificate_expired(&leaf.name));
         }
         let Some(ctx) = namespace_context(&ns) else {
-            return unusable(format!("its root certificate {} names no valid namespace", root.name));
+            return unusable(
+                LinkDetail::new(
+                    code::FOREIGN_ROOT_INVALID_NAMESPACE,
+                    format!(
+                        "its root certificate {} names no valid namespace",
+                        root.name
+                    ),
+                )
+                .with("root", &root.name),
+            );
         };
         if !ctx.add_anchor(root.clone()) {
-            return unusable(format!("its root certificate {} is outside its validity period", root.name));
+            return unusable(
+                LinkDetail::new(
+                    code::FOREIGN_ROOT_EXPIRED,
+                    format!(
+                        "its root certificate {} is outside its validity period",
+                        root.name
+                    ),
+                )
+                .with("root", &root.name),
+            );
         }
         let keyring = Keyring::new();
         keyring.adopt(Arc::new(ctx));
@@ -472,23 +636,34 @@ impl Judge<'_> {
         match validator.validate_chain_cached(leaf_data).await.0 {
             ValidationResult::Valid(safe) if safe.is_authenticated() => {}
             ValidationResult::Valid(_) => {
-                return unusable(format!(
-                    "its certificate {} is not signed by a key of {ns} (a DigestSha256 proves \
-                     integrity, not who made it)",
-                    leaf.name
-                ));
+                return unusable(certificate_unauthenticated(&leaf.name, &ns));
             }
             ValidationResult::Invalid(e) => {
-                return unusable(format!(
-                    "its certificate {} does not validate against its root {}: {e}",
-                    leaf.name, root.name
-                ));
+                return unusable(
+                    LinkDetail::new(
+                        code::FOREIGN_CERTIFICATE_INVALID,
+                        format!(
+                            "its certificate {} does not validate against its root {}: {e}",
+                            leaf.name, root.name
+                        ),
+                    )
+                    .with("certificate", &leaf.name)
+                    .with("root", &root.name)
+                    .with("error", &e),
+                );
             }
             ValidationResult::Pending => {
-                return unusable(format!(
-                    "its hello does not carry the whole chain of its certificate {} to its root {}",
-                    leaf.name, root.name
-                ));
+                return unusable(
+                    LinkDetail::new(
+                        code::FOREIGN_CHAIN_INCOMPLETE,
+                        format!(
+                            "its hello does not carry the whole chain of its certificate {} to its root {}",
+                            leaf.name, root.name
+                        ),
+                    )
+                    .with("certificate", &leaf.name)
+                    .with("root", &root.name),
+                );
             }
         }
         let mut certificates = vec![(*leaf.name).clone()];
@@ -516,13 +691,20 @@ impl Judge<'_> {
         for cert in issuers {
             cache.insert(cert.clone());
         }
-        let validator = Validator::with_keyring(Arc::clone(self.keyring()), Arc::clone(&cache), None, MAX_CHAIN);
+        let validator = Validator::with_keyring(
+            Arc::clone(self.keyring()),
+            Arc::clone(&cache),
+            None,
+            MAX_CHAIN,
+        );
         for _ in 0..MAX_CHAIN {
             match validator.validate_chain_cached(leaf).await {
-                (ValidationResult::Pending, Some(missing)) => match self.trust.known_certificate(&missing) {
-                    Some(cert) => cache.insert(cert),
-                    None => return ValidationResult::Pending,
-                },
+                (ValidationResult::Pending, Some(missing)) => {
+                    match self.trust.known_certificate(&missing) {
+                        Some(cert) => cache.insert(cert),
+                        None => return ValidationResult::Pending,
+                    }
+                }
                 (result, _) => return result,
             }
         }
@@ -542,12 +724,18 @@ impl Judge<'_> {
         }
         Some(Refusal::new(
             CloseReason::Revoked,
-            format!(
-                "your key {} is revoked in {} (trust context v{})",
-                cert.key_name(),
-                ctx.namespace(),
-                ctx.version()
-            ),
+            LinkDetail::new(
+                code::KEY_REVOKED,
+                format!(
+                    "your key {} is revoked in {} (trust context v{})",
+                    cert.key_name(),
+                    ctx.namespace(),
+                    ctx.version()
+                ),
+            )
+            .with("key", cert.key_name())
+            .with("namespace", ctx.namespace())
+            .with("version", ctx.version()),
         ))
     }
 
@@ -585,7 +773,11 @@ impl Judge<'_> {
     /// link carries.
     pub(crate) fn admission_for(&self, admitted: &Admitted) -> Admission {
         match &admitted.enrollment {
-            None => match admitted.quota.as_ref().and_then(|slot| slot.limits.clone().map(|l| (slot, l))) {
+            None => match admitted
+                .quota
+                .as_ref()
+                .and_then(|slot| slot.limits.clone().map(|l| (slot, l)))
+            {
                 None => Admission::default(),
                 Some((slot, (rate, shared))) => Admission {
                     verdict: LinkVerdict::default(),
@@ -616,7 +808,9 @@ impl Judge<'_> {
                     scope: Some(LinkScope {
                         receives: Carries::Interests,
                         sends: Carries::Answers,
-                        names: Box::new(move |name: &Name| in_enrollment(&keyring, &scoped, name, true)),
+                        names: Box::new(move |name: &Name| {
+                            in_enrollment(&keyring, &scoped, name, true)
+                        }),
                         rate: ENROLLMENT_INTERESTS,
                         shared: None,
                         explain: format!(
@@ -638,13 +832,14 @@ impl Judge<'_> {
                     scope: Some(LinkScope {
                         receives: Carries::Answers,
                         sends: Carries::Interests,
-                        names: Box::new(move |name: &Name| in_enrollment(&keyring, &scoped, name, false)),
+                        names: Box::new(move |name: &Name| {
+                            in_enrollment(&keyring, &scoped, name, false)
+                        }),
                         rate: ENROLLMENT_ANSWERS,
                         shared: None,
                         explain: format!(
                             "the link to {label} carries only this device's enrollment in {ns} (its \
-                             CA, trust context and certificates) until this device enrolls: {}",
-                            self.hints.enroll
+                             CA, trust context and certificates) until this device enrolls"
                         ),
                     }),
                 }
@@ -672,19 +867,25 @@ fn decide_identified(
     peer: Option<PeerId>,
     dialed: Option<PeerId>,
 ) -> Result<Admitted, Refusal> {
-    let hints = judge.hints;
     let config = peer.and_then(|i| judge.peers.get(i));
     let key_expected = config.as_ref().is_some_and(|p| p.key == Some(fingerprint));
     // Only a held namespace confirms a device a peer entry names.
     let identities = match identities {
         Ok(ids) if config.is_some() => {
-            let (held, served): (Vec<Identity>, Vec<Identity>) = ids.into_iter().partition(|id| id.served.is_none());
+            let (held, served): (Vec<Identity>, Vec<Identity>) =
+                ids.into_iter().partition(|id| id.served.is_none());
             if held.is_empty() {
                 let namespaces: Vec<Name> = served.into_iter().map(|id| id.namespace).collect();
-                Err(Unidentified::Unusable(format!(
-                    "its certificate is of {}, a namespace this device does not hold",
-                    list(&namespaces)
-                )))
+                Err(Unidentified::Unusable(
+                    LinkDetail::new(
+                        code::NAMESPACE_NOT_HELD,
+                        format!(
+                            "its certificate is of {}, a namespace this device does not hold",
+                            list(&namespaces)
+                        ),
+                    )
+                    .with("namespaces", list(&namespaces)),
+                ))
             } else {
                 Ok(held)
             }
@@ -706,11 +907,17 @@ fn decide_identified(
         {
             return Err(Refusal::new(
                 CloseReason::NotTheExpectedDevice,
-                format!(
-                    "this device expects {} to link with key {expected}, and yours is \
-                     {fingerprint}",
-                    p.label
-                ),
+                LinkDetail::new(
+                    code::NOT_EXPECTED_KEY,
+                    format!(
+                        "this device expects {} to link with key {expected}, and yours is \
+                         {fingerprint}",
+                        p.label
+                    ),
+                )
+                .with("peer", &p.label)
+                .with("expected", expected)
+                .with("key", fingerprint),
             ));
         }
         if let Some(device) = &p.device {
@@ -719,7 +926,15 @@ fn decide_identified(
                     let devices: Vec<Name> = ids.iter().map(|id| id.device.clone()).collect();
                     return Err(Refusal::new(
                         CloseReason::NotTheExpectedDevice,
-                        format!("this device expects {device} here, and you are {}", list(&devices)),
+                        LinkDetail::new(
+                            code::NOT_EXPECTED_DEVICE,
+                            format!(
+                                "this device expects {device} here, and you are {}",
+                                list(&devices)
+                            ),
+                        )
+                        .with("expected", device)
+                        .with("devices", list(&devices)),
                     ));
                 }
                 Err(why) if !key_expected => {
@@ -728,16 +943,27 @@ fn decide_identified(
                     // links to it for its enrollment only.
                     let ns = judge.namespace_of(device);
                     if dialed.is_some() && judge.own_role_in(&ns).is_none() {
-                        return Ok(admitted(Vec::new(), Some(Enrollment::Device(ns)), None, Vec::new()));
+                        return Ok(admitted(
+                            Vec::new(),
+                            Some(Enrollment::Device(ns)),
+                            None,
+                            Vec::new(),
+                        ));
                     }
+                    let why = why.detail();
                     return Err(Refusal::new(
                         CloseReason::Unrecognized,
-                        format!(
-                            "this device expects {device} here and cannot confirm you are it: \
-                             {why}. It links once it holds {device}'s namespace, or once its \
-                             {} names your key",
-                            hints.peer_entry
-                        ),
+                        LinkDetail::new(
+                            code::EXPECTED_DEVICE_UNCONFIRMED,
+                            format!(
+                                "this device expects {device} here and cannot confirm you are it: \
+                                 {}. It links once it holds {device}'s namespace, or once its \
+                                 peer entry names your key",
+                                why.text
+                            ),
+                        )
+                        .with("device", device)
+                        .caused_by(why),
                     ));
                 }
                 _ => {}
@@ -782,29 +1008,46 @@ fn decide_identified(
             let no_enrollment_link = if unasked {
                 match judge.enrollment_namespaces() {
                     Ok(namespaces) => {
-                        return Ok(admitted(Vec::new(), Some(Enrollment::Relay(namespaces)), None, Vec::new()));
+                        return Ok(admitted(
+                            Vec::new(),
+                            Some(Enrollment::Relay(namespaces)),
+                            None,
+                            Vec::new(),
+                        ));
                     }
-                    Err(why_not) => format!(" It admits no enrollment link either: {why_not}."),
+                    Err(why_not) => Some(why_not),
                 }
             } else {
-                String::new()
+                None
             };
-            let expect_key = hints.expect_key.replace("{key}", &fingerprint.to_string());
+            let fragment = no_enrollment_link
+                .as_ref()
+                .map(|d| format!(" {}", d.text))
+                .unwrap_or_default();
             if matches!(why, Unidentified::NoCertificate) && config.is_none() {
                 let serves = match judge.serve {
                     ServePolicy::Own => None,
-                    ServePolicy::Listed { .. } => Some("this relay serves devices of its own and of listed namespaces"),
-                    ServePolicy::Open { .. } => Some("an open relay serves devices of namespaces"),
+                    ServePolicy::Listed { .. } => Some((
+                        "listed",
+                        "this relay serves devices of its own and of listed namespaces",
+                    )),
+                    ServePolicy::Open { .. } => {
+                        Some(("open", "an open relay serves devices of namespaces"))
+                    }
                 };
-                if let Some(serves) = serves {
-                    return Err(Refusal::new(
-                        CloseReason::NotServed,
+                if let Some((policy, serves)) = serves {
+                    let mut detail = LinkDetail::new(
+                        code::NOT_SERVED_NO_CERTIFICATE,
                         format!(
                             "{serves}: it routes your device name from your certificate, and your \
-                             hello carries none.{no_enrollment_link} Enroll this device in a \
-                             namespace, or {expect_key}"
+                             hello carries none.{fragment} Enroll this device in a namespace, or have \
+                             the other device expect key {fingerprint}"
                         ),
-                    ));
+                    )
+                    .with("policy", policy)
+                    .with("key", fingerprint);
+                    detail.causes.extend(no_enrollment_link);
+                    return Err(Refusal::new(CloseReason::NotServed, detail));
                 }
             }
             let held: Vec<String> = judge
@@ -813,20 +1056,26 @@ fn decide_identified(
                 .iter()
                 .map(|c| c.namespace().to_string())
                 .collect();
-            let held = if held.is_empty() {
-                "none".to_string()
-            } else {
-                held.join(", ")
-            };
-            Err(Refusal::new(
-                CloseReason::Unrecognized,
+            let held = held.join(", ");
+            let why = why.detail();
+            let mut detail = LinkDetail::new(
+                code::UNRECOGNIZED_KEY,
                 format!(
-                    "this device links with devices of the namespaces it holds ({held}) and with \
-                     the keys its {} entries expect; your key {fingerprint} is neither \
-                     ({why}).{no_enrollment_link} Enroll this device in the namespace, or {expect_key}",
-                    hints.peer_entry,
+                    "this device links with devices of the namespaces it holds ({}) and with \
+                     the keys its peer entries expect; your key {fingerprint} is neither \
+                     ({}).{fragment} Enroll this device in the namespace, or have the other device \
+                     expect key {fingerprint}",
+                    if held.is_empty() { "none" } else { &held },
+                    why.text
                 ),
-            ))
+            )
+            .with("key", fingerprint)
+            .caused_by(why);
+            if !held.is_empty() {
+                detail = detail.with("held", held);
+            }
+            detail.causes.extend(no_enrollment_link);
+            Err(Refusal::new(CloseReason::Unrecognized, detail))
         }
         Err(_) => Ok(admitted(Vec::new(), None, None, Vec::new())),
     }
@@ -844,20 +1093,32 @@ fn link_policy_refusal(judge: &Judge<'_>, id: &Identity, peer: Option<PeerId>) -
     if !policy.allows_link(id.role.as_str()) {
         return Some(Refusal::new(
             CloseReason::RoleNotAllowed,
-            format!(
-                "{}'s link policy (trust context v{}) does not let {} devices link",
-                id.namespace, id.version, id.role
-            ),
+            LinkDetail::new(
+                code::ROLE_MAY_NOT_LINK,
+                format!(
+                    "{}'s link policy (trust context v{}) does not let {} devices link",
+                    id.namespace, id.version, id.role
+                ),
+            )
+            .with("namespace", &id.namespace)
+            .with("version", id.version)
+            .with("role", id.role.as_str()),
         ));
     }
     if peer.is_some_and(|p| judge.peers.is_relay(p)) && !policy.allows_relay(id.role.as_str()) {
         return Some(Refusal::new(
             CloseReason::RoleNotAllowed,
-            format!(
-                "this device reaches others through you, and {}'s link policy (trust \
-                 context v{}) does not let {} devices relay",
-                id.namespace, id.version, id.role
-            ),
+            LinkDetail::new(
+                code::ROLE_MAY_NOT_RELAY,
+                format!(
+                    "this device reaches others through you, and {}'s link policy (trust \
+                     context v{}) does not let {} devices relay",
+                    id.namespace, id.version, id.role
+                ),
+            )
+            .with("namespace", &id.namespace)
+            .with("version", id.version)
+            .with("role", id.role.as_str()),
         ));
     }
     None
@@ -895,11 +1156,18 @@ fn serve(
             && unasked
             && let Ok(namespaces) = judge.enrollment_namespaces()
         {
-            refusal.text.push_str(&format!(
-                ". A device enrolls in {} over this relay while its hello holds no \
-                 certificate of another namespace",
-                list(&namespaces)
-            ));
+            refusal.detail.append(
+                ". ",
+                LinkDetail::new(
+                    code::ENROLLMENT_POSSIBLE,
+                    format!(
+                        "A device enrolls in {} over this relay while its hello holds no \
+                         certificate of another namespace",
+                        list(&namespaces)
+                    ),
+                )
+                .with("namespaces", list(&namespaces)),
+            );
         }
         return Err(refusal);
     }
@@ -940,7 +1208,11 @@ pub(crate) fn hello_chain(trust: &dyn LinkTrust) -> Vec<Bytes> {
 /// not hold — so a relay that does not hold the namespace can check it
 /// against its root.
 pub(crate) fn with_root(keyring: &Keyring, mut chain: Vec<Bytes>) -> Vec<Bytes> {
-    let Some(last) = chain.last().and_then(decode_certificate).filter(|c| !is_self_signed(c)) else {
+    let Some(last) = chain
+        .last()
+        .and_then(decode_certificate)
+        .filter(|c| !is_self_signed(c))
+    else {
         return chain;
     };
     let anchor = last.issuer.as_deref().and_then(|issuer| {
@@ -968,7 +1240,9 @@ pub(crate) async fn own_memberships(
     channel: &ChannelBinding,
     namespace: Option<&Name>,
 ) -> Vec<Membership> {
-    let link_public = PeerKey::from_spki(link.spki()).map(|k| k.ndn_public_key()).ok();
+    let link_public = PeerKey::from_spki(link.spki())
+        .map(|k| k.ndn_public_key())
+        .ok();
     let fingerprint = link.fingerprint();
     let mut shown: Vec<Name> = Vec::new();
     let mut out = Vec::new();
@@ -1017,11 +1291,12 @@ fn decode_with_data(wire: &Bytes) -> Result<(Data, Certificate), String> {
 /// The device a certificate name `/<ns>/<role>/<device>/KEY/…` is of: the
 /// name before its first `KEY` component.
 pub(crate) fn device_of(cert: &Name) -> Option<Name> {
-    let key = cert
-        .components()
-        .iter()
-        .position(|c| c.typ == ndn_packet::tlv_type::NAME_COMPONENT && c.value.as_ref() == b"KEY")?;
-    Some(Name::from_components(cert.components()[..key].iter().cloned()))
+    let key = cert.components().iter().position(|c| {
+        c.typ == ndn_packet::tlv_type::NAME_COMPONENT && c.value.as_ref() == b"KEY"
+    })?;
+    Some(Name::from_components(
+        cert.components()[..key].iter().cloned(),
+    ))
 }
 
 /// The trust context of `ns` as `ndn-cert` makes a namespace — its schema
@@ -1046,7 +1321,8 @@ fn is_self_signed(cert: &Certificate) -> bool {
 fn key_identity(key: &Name) -> Option<Name> {
     let components = key.components();
     let at = components.len().checked_sub(2)?;
-    (components[at].value.as_ref() == b"KEY").then(|| Name::from_components(components[..at].iter().cloned()))
+    (components[at].value.as_ref() == b"KEY")
+        .then(|| Name::from_components(components[..at].iter().cloned()))
 }
 
 /// Whether `name` is within the enrollment in one of `namespaces`: an
@@ -1056,7 +1332,12 @@ fn key_identity(key: &Name) -> Option<Name> {
 /// an enrollment fetches, the issued one and its issuers). On a relay
 /// (`relay`), only while the namespace's link policy still admits
 /// enrollment links.
-pub(crate) fn in_enrollment(keyring: &Keyring, namespaces: &[Name], name: &Name, relay: bool) -> bool {
+pub(crate) fn in_enrollment(
+    keyring: &Keyring,
+    namespaces: &[Name],
+    name: &Name,
+    relay: bool,
+) -> bool {
     namespaces.iter().any(|ns| {
         if !name.has_prefix(ns) {
             return false;
@@ -1080,7 +1361,34 @@ fn is_key_or_certificate_name(components: &[ndn_packet::NameComponent]) -> bool 
 }
 
 pub(crate) fn list(names: &[Name]) -> String {
-    names.iter().map(Name::to_string).collect::<Vec<_>>().join(", ")
+    names
+        .iter()
+        .map(Name::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// A peer's certificate `certificate` is outside its validity period: it
+/// renews it.
+fn certificate_expired(certificate: &Name) -> LinkDetail {
+    LinkDetail::new(
+        code::CERTIFICATE_EXPIRED,
+        format!("its certificate {certificate} is outside its validity period (renew it)"),
+    )
+    .with("certificate", certificate)
+}
+
+/// A peer's certificate `certificate` is not signed by a key of `ns`.
+fn certificate_unauthenticated(certificate: &Name, ns: &Name) -> LinkDetail {
+    LinkDetail::new(
+        code::CERTIFICATE_UNAUTHENTICATED,
+        format!(
+            "its certificate {certificate} is not signed by a key of {ns} (a DigestSha256 proves \
+             integrity, not who made it)"
+        ),
+    )
+    .with("certificate", certificate)
+    .with("namespace", ns)
 }
 
 #[cfg(test)]
@@ -1123,7 +1431,11 @@ mod tests {
             (n("/elsewhere/CA/NEW"), false),
         ] {
             for relay in [true, false] {
-                assert_eq!(in_enrollment(&keyring, &ns, &name, relay), carried, "{name} (relay: {relay})");
+                assert_eq!(
+                    in_enrollment(&keyring, &ns, &name, relay),
+                    carried,
+                    "{name} (relay: {relay})"
+                );
             }
         }
         // A relay stops carrying enrollments once the namespace's link
@@ -1157,21 +1469,10 @@ mod tests {
         }
     }
 
-    fn hints() -> LinkHints {
-        LinkHints {
-            enroll: "enroll it".into(),
-            renew: "renew it".into(),
-            refresh: "refresh".into(),
-            peer_entry: "[[peer]]".into(),
-            expect_key: "expect {key}".into(),
-        }
-    }
-
     /// What a judge judges over.
     struct World {
         trust: Bare,
         peers: Peers,
-        hints: LinkHints,
         serve: ServePolicy,
         quotas: QuotaState,
     }
@@ -1181,7 +1482,6 @@ mod tests {
             Self {
                 trust,
                 peers: Peers::new(peers),
-                hints: hints(),
                 serve,
                 quotas: QuotaState::default(),
             }
@@ -1191,7 +1491,6 @@ mod tests {
             Judge {
                 trust: &self.trust,
                 peers: &self.peers,
-                hints: &self.hints,
                 serve: &self.serve,
                 quotas: &self.quotas,
             }
@@ -1216,23 +1515,46 @@ mod tests {
         peer: Option<PeerId>,
         dialed: Option<PeerId>,
     ) -> Result<Admitted, Refusal> {
-        let world = World::new(Bare(Arc::new(keyring), None, Vec::new()), peers, ServePolicy::Own);
-        decide_identified(&world.judge(), THEIRS, Err(Unidentified::NoCertificate), peer, dialed)
+        let world = World::new(
+            Bare(Arc::new(keyring), None, Vec::new()),
+            peers,
+            ServePolicy::Own,
+        );
+        decide_identified(
+            &world.judge(),
+            THEIRS,
+            Err(Unidentified::NoCertificate),
+            peer,
+            dialed,
+        )
     }
 
     fn now_ns() -> u64 {
-        let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+        let since = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
         u64::try_from(since.as_nanos()).unwrap()
     }
 
     /// A certificate Data of `key` (a key name) for `public_key`, issued by
     /// `issuer`, valid from an hour ago for a day.
-    async fn certificate(key: &Name, public_key: [u8; 32], issuer: &Ed25519Signer, issuer_id: &str) -> Bytes {
+    async fn certificate(
+        key: &Name,
+        public_key: [u8; 32],
+        issuer: &Ed25519Signer,
+        issuer_id: &str,
+    ) -> Bytes {
         let hour = 3_600_000_000_000;
         let name = ndn_security::cert_name::new_cert_name(key, issuer_id);
-        encode_cert_data(&name, &public_key, issuer, now_ns() - hour, now_ns() + 24 * hour)
-            .await
-            .unwrap()
+        encode_cert_data(
+            &name,
+            &public_key,
+            issuer,
+            now_ns() - hour,
+            now_ns() + 24 * hour,
+        )
+        .await
+        .unwrap()
     }
 
     /// A namespace as `ndn-cert` makes one: a root key with its self-signed
@@ -1249,7 +1571,10 @@ mod tests {
         let name = n(name);
         let root = Ed25519Signer::from_seed(&[seed; 32], name.clone().append("KEY").append("root"));
         let root_cert = certificate(root.key_name(), root.public_key_bytes(), &root, "self").await;
-        let ca = Ed25519Signer::from_seed(&[seed + 1; 32], name.clone().append("CA").append("KEY").append("ca"));
+        let ca = Ed25519Signer::from_seed(
+            &[seed + 1; 32],
+            name.clone().append("CA").append("KEY").append("ca"),
+        );
         let ca_cert = certificate(ca.key_name(), ca.public_key_bytes(), &root, "NA").await;
         Namespace {
             name,
@@ -1268,17 +1593,28 @@ mod tests {
         /// Its trust context, as a device holding it has it.
         fn context(&self) -> SignedTrustContext {
             let ctx = namespace_context(&self.name).unwrap().with_version(1);
-            assert!(ctx.add_anchor(Certificate::decode(&Data::decode(self.root.clone()).unwrap()).unwrap()));
+            assert!(ctx.add_anchor(
+                Certificate::decode(&Data::decode(self.root.clone()).unwrap()).unwrap()
+            ));
             ctx
         }
 
         /// A device `/<ns>/<role>/<device>`: its link key and its
         /// certificate chain as it keeps it (its certificate, then its CA's).
         async fn device(&self, role: &str, device: &str, seed: u8) -> (PeerKey, Vec<Bytes>) {
-            let name = self.name.clone().append(role).append(device).append("KEY").append("k");
+            let name = self
+                .name
+                .clone()
+                .append(role)
+                .append(device)
+                .append("KEY")
+                .append("k");
             let key = Ed25519Signer::from_seed(&[seed; 32], name);
-            let cert = certificate(key.key_name(), key.public_key_bytes(), &self.ca, "NDNCERT").await;
-            let peer = PeerKey::from_spki(&ndn_security::spki::wrap_ed25519(&key.public_key_bytes())).unwrap();
+            let cert =
+                certificate(key.key_name(), key.public_key_bytes(), &self.ca, "NDNCERT").await;
+            let peer =
+                PeerKey::from_spki(&ndn_security::spki::wrap_ed25519(&key.public_key_bytes()))
+                    .unwrap();
             (peer, vec![cert, self.ca_cert.clone()])
         }
     }
@@ -1298,10 +1634,12 @@ mod tests {
     /// enrollment links off, so refusals are not softened into them.
     async fn relay(own: &Namespace, held: &[&Namespace], serve: ServePolicy) -> World {
         let keyring = Keyring::new();
-        assert!(keyring.adopt(Arc::new(own.context().with_link_policy(LinkPolicy {
-            enrollment_links: false,
-            ..LinkPolicy::default()
-        }))));
+        assert!(
+            keyring.adopt(Arc::new(own.context().with_link_policy(LinkPolicy {
+                enrollment_links: false,
+                ..LinkPolicy::default()
+            })))
+        );
         for ns in held {
             assert!(keyring.adopt(Arc::new(ns.context())));
         }
@@ -1315,7 +1653,11 @@ mod tests {
     /// whom it serves.
     #[tokio::test]
     async fn own_serves_only_the_namespaces_this_device_is_in() {
-        let (a, b, c) = (namespace("/a", 10).await, namespace("/b", 20).await, namespace("/c", 30).await);
+        let (a, b, c) = (
+            namespace("/a", 10).await,
+            namespace("/b", 20).await,
+            namespace("/c", 30).await,
+        );
         let world = relay(&a, &[&b], ServePolicy::Own).await;
         let judge = world.judge();
 
@@ -1325,15 +1667,46 @@ mod tests {
         assert_eq!(admitted.identity().unwrap().device, n("/a/member/laptop"));
 
         let (key, chain) = b.device("member", "phone", 22).await;
-        let refusal = judge.decide(&key, &hello(chain), &CH, None).await.err().unwrap();
-        assert_eq!(refusal.reason, CloseReason::NotServed, "{}", refusal.text);
-        assert!(refusal.text.contains("its own namespaces (/a)"), "{}", refusal.text);
+        let refusal = judge
+            .decide(&key, &hello(chain), &CH, None)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(
+            refusal.reason,
+            CloseReason::NotServed,
+            "{}",
+            refusal.detail.text
+        );
+        assert!(
+            refusal.detail.is(code::NOT_SERVED_UNCERTIFIED),
+            "{:?}",
+            refusal.detail
+        );
+        assert_eq!(refusal.detail.param("own"), Some("/a"));
 
         let (key, mut chain) = c.device("member", "phone", 32).await;
         chain.push(c.root.clone());
-        let refusal = judge.decide(&key, &hello(chain), &CH, None).await.err().unwrap();
-        assert_eq!(refusal.reason, CloseReason::NotServed, "{}", refusal.text);
-        assert!(refusal.text.contains(&c.root_fingerprint().to_string()), "{}", refusal.text);
+        let refusal = judge
+            .decide(&key, &hello(chain), &CH, None)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(
+            refusal.reason,
+            CloseReason::NotServed,
+            "{}",
+            refusal.detail.text
+        );
+        assert!(
+            refusal.detail.is(code::NOT_SERVED_OWN),
+            "{:?}",
+            refusal.detail
+        );
+        assert_eq!(
+            refusal.detail.param("root"),
+            Some(c.root_fingerprint().to_string().as_str())
+        );
     }
 
     /// A listed relay serves a namespace it does not hold by its root key:
@@ -1341,7 +1714,11 @@ mod tests {
     /// against which its chain is checked offline. Another root is refused.
     #[tokio::test]
     async fn listed_serves_listed_roots_only() {
-        let (a, c, d) = (namespace("/a", 10).await, namespace("/c", 30).await, namespace("/d", 40).await);
+        let (a, c, d) = (
+            namespace("/a", 10).await,
+            namespace("/c", 30).await,
+            namespace("/d", 40).await,
+        );
         let serve = ServePolicy::Listed {
             roots: vec![c.root_fingerprint()],
             quotas: None,
@@ -1351,16 +1728,36 @@ mod tests {
 
         let (key, chain) = c.device("member", "phone", 32).await;
         let device_side = Bare(Arc::new(keyring_with(c.context())), None, chain);
-        let admitted = judge.decide(&key, &hello(hello_chain(&device_side)), &CH, None).await.unwrap();
+        let admitted = judge
+            .decide(&key, &hello(hello_chain(&device_side)), &CH, None)
+            .await
+            .unwrap();
         let id = admitted.identity().unwrap();
-        assert_eq!((id.device.clone(), id.served), (n("/c/member/phone"), Some(c.root_fingerprint())));
+        assert_eq!(
+            (id.device.clone(), id.served),
+            (n("/c/member/phone"), Some(c.root_fingerprint()))
+        );
         assert!(admitted.quota.as_ref().is_some_and(|q| q.limits.is_none()));
         assert!(judge.admission_for(&admitted).scope.is_none());
 
         let (key, mut chain) = d.device("member", "phone", 42).await;
         chain.push(d.root.clone());
-        let refusal = judge.decide(&key, &hello(chain), &CH, None).await.err().unwrap();
-        assert_eq!(refusal.reason, CloseReason::NotServed, "{}", refusal.text);
+        let refusal = judge
+            .decide(&key, &hello(chain), &CH, None)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(
+            refusal.reason,
+            CloseReason::NotServed,
+            "{}",
+            refusal.detail.text
+        );
+        assert!(
+            refusal.detail.is(code::NOT_SERVED_UNLISTED),
+            "{:?}",
+            refusal.detail
+        );
     }
 
     /// A relay that admits enrollment links still refuses a device that
@@ -1371,16 +1768,40 @@ mod tests {
         let (a, c) = (namespace("/a", 10).await, namespace("/c", 30).await);
         let keyring = keyring_with(a.context());
         let (_, own) = a.device("node", "relay", 90).await;
-        let world = World::new(Bare(Arc::new(keyring), None, own), Vec::new(), ServePolicy::Own);
+        let world = World::new(
+            Bare(Arc::new(keyring), None, own),
+            Vec::new(),
+            ServePolicy::Own,
+        );
         let judge = world.judge();
 
         let (key, mut chain) = c.device("member", "phone", 32).await;
         chain.push(c.root.clone());
-        let refusal = judge.decide(&key, &hello(chain), &CH, None).await.err().unwrap();
-        assert_eq!(refusal.reason, CloseReason::NotServed, "{}", refusal.text);
-        assert!(refusal.text.contains("enrolls in /a"), "{}", refusal.text);
+        let refusal = judge
+            .decide(&key, &hello(chain), &CH, None)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(
+            refusal.reason,
+            CloseReason::NotServed,
+            "{}",
+            refusal.detail.text
+        );
+        assert!(
+            refusal
+                .detail
+                .causes
+                .iter()
+                .any(|d| d.is(code::ENROLLMENT_POSSIBLE) && d.param("namespaces") == Some("/a")),
+            "{:?}",
+            refusal.detail
+        );
 
-        let admitted = judge.decide(&key, &hello(Vec::new()), &CH, None).await.unwrap();
+        let admitted = judge
+            .decide(&key, &hello(Vec::new()), &CH, None)
+            .await
+            .unwrap();
         assert_eq!(admitted.enrollment, Some(Enrollment::Relay(vec![n("/a")])));
     }
 
@@ -1408,42 +1829,92 @@ mod tests {
                 ..Quotas::default()
             },
         };
-        let world = World::new(Bare(Arc::new(Keyring::new()), None, Vec::new()), Vec::new(), serve);
+        let world = World::new(
+            Bare(Arc::new(Keyring::new()), None, Vec::new()),
+            Vec::new(),
+            serve,
+        );
         let judge = world.judge();
-        let (c, d, x) = (KeyFingerprint([3; 32]), KeyFingerprint([4; 32]), KeyFingerprint([5; 32]));
+        let (c, d, x) = (
+            KeyFingerprint([3; 32]),
+            KeyFingerprint([4; 32]),
+            KeyFingerprint([5; 32]),
+        );
         let decide = |id: Identity| decide_identified(&judge, THEIRS, Ok(vec![id]), None, None);
 
         let first = decide(served("/c", "/c/member/a", c)).unwrap();
         let scope = judge.admission_for(&first).scope.unwrap();
-        assert_eq!((scope.receives, scope.sends), (Carries::Everything, Carries::Everything));
+        assert_eq!(
+            (scope.receives, scope.sends),
+            (Carries::Everything, Carries::Everything)
+        );
         assert!(scope.shared.is_some());
         let refusal = decide(served("/c", "/c/member/b", c)).err().unwrap();
-        assert_eq!(refusal.reason, CloseReason::Busy, "{}", refusal.text);
+        assert_eq!(refusal.reason, CloseReason::Busy, "{}", refusal.detail.text);
+        assert!(
+            refusal.detail.is(code::QUOTA_NAMESPACE_LINKS),
+            "{:?}",
+            refusal.detail
+        );
         let _second = decide(served("/d", "/d/member/a", d)).unwrap();
         let refusal = decide(served("/d", "/d/member/b", x)).err().unwrap();
-        assert_eq!(refusal.reason, CloseReason::NotServed, "{}", refusal.text);
+        assert_eq!(
+            refusal.reason,
+            CloseReason::NotServed,
+            "{}",
+            refusal.detail.text
+        );
+        assert!(
+            refusal.detail.is(code::NAMESPACE_COLLIDES),
+            "{:?}",
+            refusal.detail
+        );
         let refusal = decide(served("/x", "/x/member/a", x)).err().unwrap();
-        assert_eq!(refusal.reason, CloseReason::Busy, "{}", refusal.text);
+        assert_eq!(refusal.reason, CloseReason::Busy, "{}", refusal.detail.text);
+        assert!(refusal.detail.is(code::QUOTA_LINKS), "{:?}", refusal.detail);
         // A link that ends gives its place back.
         drop(first);
         let _third = decide(served("/x", "/x/member/a", x)).unwrap();
 
-        let refusal = decide_identified(&judge, THEIRS, Err(Unidentified::NoCertificate), None, None)
-            .err()
-            .unwrap();
-        assert_eq!(refusal.reason, CloseReason::NotServed, "{}", refusal.text);
-        assert!(refusal.text.contains("carries none"), "{}", refusal.text);
+        let refusal =
+            decide_identified(&judge, THEIRS, Err(Unidentified::NoCertificate), None, None)
+                .err()
+                .unwrap();
+        assert_eq!(
+            refusal.reason,
+            CloseReason::NotServed,
+            "{}",
+            refusal.detail.text
+        );
+        assert!(
+            refusal.detail.is(code::NOT_SERVED_NO_CERTIFICATE),
+            "{:?}",
+            refusal.detail
+        );
+        assert_eq!(refusal.detail.param("policy"), Some("open"));
     }
 
     #[test]
     fn an_expected_key_admits_an_unknown_device() {
-        let admitted = decide(Keyring::new(), vec![spec(Some(THEIRS), None)], Some(PeerId(0)), None).unwrap();
+        let admitted = decide(
+            Keyring::new(),
+            vec![spec(Some(THEIRS), None)],
+            Some(PeerId(0)),
+            None,
+        )
+        .unwrap();
         assert_eq!(admitted.peer, Some(PeerId(0)));
         assert!(admitted.enrollment.is_none() && admitted.identity().is_none());
         // Also a device of a namespace this device holds and is not in,
         // which the serving policy (own) does not serve.
         let world = World::new(
-            Bare(Arc::new(keyring_with(SignedTrustContext::hierarchical(n("/b")).with_version(1))), None, Vec::new()),
+            Bare(
+                Arc::new(keyring_with(
+                    SignedTrustContext::hierarchical(n("/b")).with_version(1),
+                )),
+                None,
+                Vec::new(),
+            ),
             vec![spec(Some(THEIRS), None)],
             ServePolicy::Own,
         );
@@ -1452,27 +1923,56 @@ mod tests {
             version: 1,
             ..served("/b", "/b/member/phone", THEIRS)
         };
-        let admitted = decide_identified(&world.judge(), THEIRS, Ok(vec![id]), Some(PeerId(0)), None).unwrap();
+        let admitted =
+            decide_identified(&world.judge(), THEIRS, Ok(vec![id]), Some(PeerId(0)), None).unwrap();
         assert!(admitted.identity().is_some() && admitted.quota.is_none());
     }
 
     #[test]
     fn another_key_than_the_expected_one_is_refused() {
         let other = KeyFingerprint([9; 32]);
-        let refusal = decide(Keyring::new(), vec![spec(Some(other), None)], Some(PeerId(0)), Some(PeerId(0)))
-            .err()
-            .unwrap();
+        let refusal = decide(
+            Keyring::new(),
+            vec![spec(Some(other), None)],
+            Some(PeerId(0)),
+            Some(PeerId(0)),
+        )
+        .err()
+        .unwrap();
         assert_eq!(refusal.reason, CloseReason::NotTheExpectedDevice);
+        assert!(
+            refusal.detail.is(code::NOT_EXPECTED_KEY),
+            "{:?}",
+            refusal.detail
+        );
     }
 
     #[test]
     fn a_device_dialling_a_relay_of_a_namespace_it_is_not_in_links_for_its_enrollment() {
         let peers = vec![spec(None, Some("/home/node/relay"))];
-        let admitted = decide(Keyring::new(), peers.clone(), Some(PeerId(0)), Some(PeerId(0))).unwrap();
+        let admitted = decide(
+            Keyring::new(),
+            peers.clone(),
+            Some(PeerId(0)),
+            Some(PeerId(0)),
+        )
+        .unwrap();
         assert_eq!(admitted.enrollment, Some(Enrollment::Device(n("/home"))));
         // The same peer linking in is not confirmed.
-        let refusal = decide(Keyring::new(), peers, Some(PeerId(0)), None).err().unwrap();
+        let refusal = decide(Keyring::new(), peers, Some(PeerId(0)), None)
+            .err()
+            .unwrap();
         assert_eq!(refusal.reason, CloseReason::Unrecognized);
+        assert!(
+            refusal.detail.is(code::EXPECTED_DEVICE_UNCONFIRMED),
+            "{:?}",
+            refusal.detail
+        );
+        assert!(
+            refusal.detail.causes[0].is(code::NO_CERTIFICATE),
+            "{:?}",
+            refusal.detail
+        );
     }
 
     #[test]
@@ -1485,11 +1985,29 @@ mod tests {
         let refusal = decide(keyring, Vec::new(), None, None).err().unwrap();
         assert_eq!(refusal.reason, CloseReason::Unrecognized);
         assert!(
-            refusal.text.contains("this device holds no certificate in /home"),
-            "{}",
-            refusal.text
+            refusal.detail.is(code::UNRECOGNIZED_KEY),
+            "{:?}",
+            refusal.detail
         );
-        assert!(refusal.text.contains(&format!("expect {THEIRS}")), "{}", refusal.text);
+        assert_eq!(
+            refusal.detail.param("key"),
+            Some(THEIRS.to_string().as_str())
+        );
+        let no_enrollment = refusal
+            .detail
+            .causes
+            .iter()
+            .find(|d| d.is(code::NO_ENROLLMENT_LINK))
+            .unwrap();
+        assert!(
+            no_enrollment
+                .causes
+                .iter()
+                .any(|d| d.is(code::ENROLLMENT_NO_CERTIFICATE)
+                    && d.param("namespace") == Some("/home")),
+            "{:?}",
+            refusal.detail
+        );
     }
 
     /// One TLV element (types and lengths in NDN's variable-size encoding).
@@ -1528,11 +2046,7 @@ mod tests {
             .chain(tlv(0x36, &[1]))
             .collect();
         // ValidityPeriod (0xfd) { NotBefore (0xfe), NotAfter (0xff) }.
-        let validity = [
-            tlv(0xfe, b"20200101T000000"),
-            tlv(0xff, b"20990101T000000"),
-        ]
-        .concat();
+        let validity = [tlv(0xfe, b"20200101T000000"), tlv(0xff, b"20990101T000000")].concat();
         let signed = [
             tlv(t::NAME, &name),
             tlv(t::META_INFO, &tlv(t::CONTENT_TYPE, &[2])),
@@ -1547,16 +2061,30 @@ mod tests {
             use sha2::{Digest, Sha256};
             Sha256::digest(&signed)
         };
-        let cert = tlv(t::DATA, &[signed, tlv(t::SIGNATURE_VALUE, digest.as_slice())].concat());
+        let cert = tlv(
+            t::DATA,
+            &[signed, tlv(t::SIGNATURE_VALUE, digest.as_slice())].concat(),
+        );
         let hello = hello(vec![Bytes::from(cert)]);
 
-        let world = World::new(Bare(Arc::new(keyring), None, Vec::new()), Vec::new(), ServePolicy::Own);
+        let world = World::new(
+            Bare(Arc::new(keyring), None, Vec::new()),
+            Vec::new(),
+            ServePolicy::Own,
+        );
         let judge = world.judge();
         match judge.identify(&peer, &hello, &CH).await {
             Ok(proven) if proven.identities.is_empty() => {
-                assert!(proven.why.to_string().contains("DigestSha256"), "{}", proven.why)
+                assert!(
+                    proven.why.detail().is(code::CERTIFICATE_UNAUTHENTICATED),
+                    "{:?}",
+                    proven.why
+                );
             }
-            Ok(proven) => panic!("a digest-only certificate identified {}", proven.identities[0].device),
+            Ok(proven) => panic!(
+                "a digest-only certificate identified {}",
+                proven.identities[0].device
+            ),
             Err(refusal) => panic!("expected an unknown device, refused: {refusal:?}"),
         }
     }
@@ -1588,14 +2116,27 @@ mod tests {
             let peer = peer.clone();
             async move {
                 let world = World::new(trust, Vec::new(), ServePolicy::Own);
-                world.judge().identify(&peer, &LinkHello::default(), &CH).await
+                world
+                    .judge()
+                    .identify(&peer, &LinkHello::default(), &CH)
+                    .await
             }
         };
         let keyring = Arc::new(keyring);
-        match identify(Bare(Arc::clone(&keyring), Some(known("/home/member/phone/KEY/k1/CA/v=1")), Vec::new())).await {
+        match identify(Bare(
+            Arc::clone(&keyring),
+            Some(known("/home/member/phone/KEY/k1/CA/v=1")),
+            Vec::new(),
+        ))
+        .await
+        {
             Err(refusal) => {
                 assert_eq!(refusal.reason, CloseReason::Revoked);
-                assert!(refusal.text.contains("/home/member/phone/KEY/k1"), "{}", refusal.text);
+                assert!(refusal.detail.is(code::KEY_REVOKED), "{:?}", refusal.detail);
+                assert_eq!(
+                    refusal.detail.param("key"),
+                    Some("/home/member/phone/KEY/k1")
+                );
             }
             Ok(_) => panic!("a revoked key was not refused"),
         }

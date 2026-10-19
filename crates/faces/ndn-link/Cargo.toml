@@ -25,12 +25,13 @@ parking_lot   = "0.12"
 getrandom     = { workspace = true }
 # The value a punch's memberships are bound to.
 sha2          = { workspace = true }
+# What the library reports or refuses in words: `LinkDetail`, `link_code`.
+ndn-mgmt-wire = { workspace = true }
 # `EngineFaces`: the FaceSink over an ndn-rs forwarder engine.
 ndn-engine    = { workspace = true, optional = true }
-ndn-mgmt-wire = { workspace = true, optional = true }
 
 [features]
-engine = ["dep:ndn-engine", "dep:ndn-mgmt-wire"]
+engine = ["dep:ndn-engine"]
 
 # Interface addresses for direct-path host candidates.
 [target.'cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple", target_os = "freebsd"))'.dependencies]

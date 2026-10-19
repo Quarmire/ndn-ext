@@ -25,17 +25,20 @@ use tokio::sync::{Notify, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use bytes::Bytes;
-use ndn_face_quic::{CloseReason, KeyFingerprint, LinkEndpoint, LinkHandle, LinkHello, LinkKey, PathSession, PeerKey};
+use ndn_face_quic::{
+    CloseReason, KeyFingerprint, LinkEndpoint, LinkHandle, LinkHello, LinkKey, PathSession, PeerKey,
+};
+use ndn_mgmt_wire::{LinkDetail, link_code as code};
 use ndn_packet::{Data, Interest, Name};
 use ndn_security::{ReplayCheck, ReplayGuard, Signer};
 
 use crate::admission::{Admitted, own_memberships};
 use crate::candidates::{Candidate, CandidateKind, dial_order, interfaces, probe_targets};
-use crate::links::{Links, Origin};
+use crate::links::{Links, NotLinked, Origin, close_code, link_error_detail};
 use crate::peer::PeerId;
 use crate::policy::{
-    Backoff, CANDIDATES_MAX, DIAL_STAGGER, PROBE_INTERVAL, PROBE_WINDOW, PUNCH_ANSWER_TIMEOUT, PUNCH_BURST,
-    PUNCH_CHECKS, PUNCH_GRACE, PUNCH_REFILL, PUNCH_WINDOW, PUNCHES_MAX,
+    Backoff, CANDIDATES_MAX, DIAL_STAGGER, PROBE_INTERVAL, PROBE_WINDOW, PUNCH_ANSWER_TIMEOUT,
+    PUNCH_BURST, PUNCH_CHECKS, PUNCH_GRACE, PUNCH_REFILL, PUNCH_WINDOW, PUNCHES_MAX,
 };
 use crate::punch::{self, PunchMessage};
 use crate::signal::Answer;
@@ -84,7 +87,7 @@ pub(crate) struct Entry {
     pub(crate) key: Option<KeyFingerprint>,
     pub(crate) device: Option<Name>,
     pub(crate) state: DirectState,
-    pub(crate) text: String,
+    pub(crate) detail: Option<LinkDetail>,
     pub(crate) retry_at: Option<Instant>,
 }
 
@@ -92,8 +95,10 @@ impl Entry {
     pub(crate) fn status(&self) -> DirectStatus {
         DirectStatus {
             state: self.state,
-            text: self.text.clone(),
-            retry_in: self.retry_at.map(|at| at.saturating_duration_since(Instant::now())),
+            detail: self.detail.clone(),
+            retry_in: self
+                .retry_at
+                .map(|at| at.saturating_duration_since(Instant::now())),
         }
     }
 }
@@ -126,7 +131,8 @@ impl Bucket {
 
     fn take(&mut self, burst: u32, per_sec: f64) -> bool {
         let now = Instant::now();
-        self.tokens = (self.tokens + now.duration_since(self.at).as_secs_f64() * per_sec).min(f64::from(burst));
+        self.tokens = (self.tokens + now.duration_since(self.at).as_secs_f64() * per_sec)
+            .min(f64::from(burst));
         self.at = now;
         if self.tokens >= 1.0 {
             self.tokens -= 1.0;
@@ -223,7 +229,12 @@ impl Direct {
 
     /// The direct path of `session` is admitted.
     pub(crate) fn path_up(&self, session: &PathSession, handle: &LinkHandle) {
-        if let Some(tx) = self.sessions.lock().get_mut(session).and_then(|s| s.up.take()) {
+        if let Some(tx) = self
+            .sessions
+            .lock()
+            .get_mut(session)
+            .and_then(|s| s.up.take())
+        {
             let _ = tx.send(handle.clone());
         }
     }
@@ -239,16 +250,16 @@ impl Direct {
             key: None,
             device: None,
             state: DirectState::None,
-            text: String::new(),
+            detail: None,
             retry_at: None,
         });
         update(entry);
     }
 
-    fn state(&self, whom: Whom, state: DirectState, text: String, retry: Option<Duration>) {
+    fn state(&self, whom: Whom, state: DirectState, detail: LinkDetail, retry: Option<Duration>) {
         self.set(whom, |e| {
             e.state = state;
-            e.text = text;
+            e.detail = Some(detail);
             e.retry_at = retry.map(|d| Instant::now() + d);
         });
     }
@@ -280,24 +291,49 @@ impl Drop for SessionGuard<'_> {
 
 /// Why a punch made no direct path, and whether it was refused.
 pub(crate) struct Failure {
-    text: String,
+    detail: LinkDetail,
     refused: bool,
 }
 
 impl Failure {
-    fn new(text: impl Into<String>) -> Self {
+    fn new(detail: LinkDetail) -> Self {
         Self {
-            text: text.into(),
+            detail,
             refused: false,
         }
     }
 
-    fn refused(text: impl Into<String>) -> Self {
+    fn refused(detail: LinkDetail) -> Self {
         Self {
-            text: text.into(),
+            detail,
             refused: true,
         }
     }
+}
+
+/// A direct path is up to `remote`.
+pub(crate) fn direct_up(remote: impl std::fmt::Display) -> LinkDetail {
+    let remote = remote.to_string();
+    LinkDetail::new(code::DIRECT_UP, format!("direct path to {remote}")).with("remote", remote)
+}
+
+/// `cause`, and that `peer` punches again.
+fn peer_punches_again(peer: &str, cause: LinkDetail) -> LinkDetail {
+    LinkDetail::new(
+        code::DIRECT_PEER_PUNCHES_AGAIN,
+        format!("{}; {peer} punches again", cause.text),
+    )
+    .with("peer", peer)
+    .caused_by(cause)
+}
+
+/// No link socket to punch from: `error`.
+fn no_socket(error: &ndn_face_quic::LinkError) -> LinkDetail {
+    LinkDetail::new(
+        code::PUNCH_NO_SOCKET,
+        format!("no link socket to punch from: {error}"),
+    )
+    .with("error", error)
 }
 
 fn random_session() -> PathSession {
@@ -345,17 +381,27 @@ impl Links {
     /// peer entry says `direct = false`, or the link policy of each
     /// namespace it was admitted in turns them off or does not pair its role
     /// with this device's (one namespace that pairs them is enough).
-    pub(crate) fn direct_off(&self, admitted: &Admitted) -> Option<String> {
+    pub(crate) fn direct_off(&self, admitted: &Admitted) -> Option<LinkDetail> {
         let peer = admitted.peer.and_then(|i| self.peers.get(i));
         if let Some(p) = &peer
             && !p.direct
         {
-            return Some(format!(
-                "this device's {} for {} turns direct paths off (direct = false)",
-                self.hints.peer_entry, p.label
-            ));
+            return Some(
+                LinkDetail::new(
+                    code::DIRECT_REFUSED_PEER_ENTRY,
+                    format!(
+                        "this device's peer entry for {} turns direct paths off",
+                        p.label
+                    ),
+                )
+                .with("peer", &p.label),
+            );
         }
-        let mut devices: Vec<Name> = admitted.identities.iter().map(|id| id.device.clone()).collect();
+        let mut devices: Vec<Name> = admitted
+            .identities
+            .iter()
+            .map(|id| id.device.clone())
+            .collect();
         if devices.is_empty() {
             devices.extend(peer.and_then(|p| p.device.clone()));
         }
@@ -374,7 +420,7 @@ impl Links {
     /// Why the link policy of `device`'s namespace allows no direct path
     /// between it and this device, if it does not: direct paths are off, or
     /// its role matrix does not pair their roles.
-    pub(crate) fn pair_off(&self, device: &Name) -> Option<String> {
+    pub(crate) fn pair_off(&self, device: &Name) -> Option<LinkDetail> {
         let ctx = self.trust.keyring().context_for(device);
         let ns = ctx.namespace();
         if ns.is_empty() {
@@ -382,10 +428,17 @@ impl Links {
         }
         let policy = ctx.link_policy();
         if !policy.allows_direct_paths() {
-            return Some(format!(
-                "{ns}'s link policy (trust context v{}) turns direct paths off",
-                ctx.version()
-            ));
+            return Some(
+                LinkDetail::new(
+                    code::DIRECT_OFF_POLICY,
+                    format!(
+                        "{ns}'s link policy (trust context v{}) turns direct paths off",
+                        ctx.version()
+                    ),
+                )
+                .with("namespace", ns)
+                .with("version", ctx.version()),
+            );
         }
         let theirs = device
             .components()
@@ -395,20 +448,36 @@ impl Links {
         if policy.allows_direct_path(mine.as_str(), &theirs) {
             return None;
         }
-        Some(format!(
-            "{ns}'s link policy (trust context v{}) allows no direct path between {mine} and {theirs} \
-             devices (its direct-path role matrix); traffic goes through the relay",
-            ctx.version()
-        ))
+        Some(
+            LinkDetail::new(
+                code::DIRECT_OFF_ROLES,
+                format!(
+                    "{ns}'s link policy (trust context v{}) allows no direct path between {mine} and {theirs} \
+                     devices (its direct-path role matrix); traffic goes through the relay",
+                    ctx.version()
+                ),
+            )
+            .with("namespace", ns)
+            .with("version", ctx.version())
+            .with("role", mine.as_str())
+            .with("peer_role", theirs),
+        )
     }
 
     /// Why this device makes no more direct paths now, if it does not: it
     /// has as many up as it may.
-    pub(crate) fn direct_full(&self) -> Option<String> {
+    pub(crate) fn direct_full(&self) -> Option<LinkDetail> {
         let up = self.table.direct_count();
         let max = self.direct_options.max_paths;
         (up >= max).then(|| {
-            format!("this device has {up} direct paths up, its limit (max_paths = {max}); traffic goes through the relay")
+            LinkDetail::new(
+                code::DIRECT_FULL,
+                format!(
+                    "this device has {up} direct paths up, its limit (max_paths = {max}); traffic goes through the relay"
+                ),
+            )
+            .with("up", up)
+            .with("max", max)
         })
     }
 
@@ -432,19 +501,19 @@ impl Links {
             .copied()
             .filter(|fp| self.table.direct_to(Some(*fp), None).is_none())
             .collect();
-        waiting.sort_by(|a, b| {
-            traffic
-                .get(b)
-                .cmp(&traffic.get(a))
-                .then_with(|| a.cmp(b))
-        });
+        waiting.sort_by(|a, b| traffic.get(b).cmp(&traffic.get(a)).then_with(|| a.cmp(b)));
         waiting.iter().take(free).any(|fp| *fp == key)
     }
 
     /// One round of the direct-path loop of `target`, punched through
     /// `relay`: wait while a direct path is up, or punch one; how long to
     /// wait before the next round.
-    async fn direct_round(self: &Arc<Self>, target: &Target, relay: PeerId, backoff: &mut Backoff) -> Duration {
+    async fn direct_round(
+        self: &Arc<Self>,
+        target: &Target,
+        relay: PeerId,
+        backoff: &mut Backoff,
+    ) -> Duration {
         let whom = target.whom;
         let relay_label = self.peers.label(relay);
         if let Some(id) = target.peer {
@@ -469,7 +538,7 @@ impl Links {
         if let Some((key, path)) = self.table.direct_to(known_key, target.peer) {
             let remote = path.remote_address();
             self.direct
-                .state(whom, DirectState::Up, format!("direct path to {remote}"), None);
+                .state(whom, DirectState::Up, direct_up(remote), None);
             let why = tokio::select! {
                 () = self.cancel.cancelled() => return Duration::ZERO,
                 why = path.closed() => why,
@@ -487,7 +556,8 @@ impl Links {
                 return match ended {
                     Some(Repunched::Failed { refused }) => {
                         let wait = backoff.after_failure(refused);
-                        self.direct.set(whom, |e| e.retry_at = Some(Instant::now() + wait));
+                        self.direct
+                            .set(whom, |e| e.retry_at = Some(Instant::now() + wait));
                         wait
                     }
                     Some(Repunched::Up) | None => {
@@ -501,19 +571,34 @@ impl Links {
                 return Duration::ZERO;
             }
             let wait = backoff.after_drop();
-            let text = format!(
-                "the direct path to {remote} ended ({why}); traffic goes through {relay_label} until \
-                 the next punch"
-            );
-            tracing::info!(target: "face.quic", peer = %target.label, "{text}");
-            self.direct.state(whom, DirectState::NotPossible, text, Some(wait));
+            let why = link_error_detail(&why);
+            let detail = LinkDetail::new(
+                code::DIRECT_ENDED,
+                format!(
+                    "the direct path to {remote} ended ({}); traffic goes through {relay_label} until \
+                     the next punch",
+                    why.text
+                ),
+            )
+            .with("remote", remote)
+            .with("relay", &relay_label)
+            .caused_by(why);
+            tracing::info!(target: "face.quic", peer = %target.label, "{}", detail.text);
+            self.direct
+                .state(whom, DirectState::NotPossible, detail, Some(wait));
             return wait;
         }
-        if target.peer.is_some_and(|id| self.table.link_to(id).is_some()) {
+        if target
+            .peer
+            .is_some_and(|id| self.table.link_to(id).is_some())
+        {
             self.direct.state(
                 whom,
                 DirectState::None,
-                "linked over its configured endpoint; no punch needed".into(),
+                LinkDetail::new(
+                    code::DIRECT_LINKED,
+                    "linked over its configured endpoint; no punch needed",
+                ),
                 None,
             );
             return Duration::from_secs(5);
@@ -522,7 +607,11 @@ impl Links {
             self.direct.state(
                 whom,
                 DirectState::None,
-                format!("waiting for the link to {relay_label}, through which the punch goes"),
+                LinkDetail::new(
+                    code::DIRECT_WAITING_FOR_RELAY,
+                    format!("waiting for the link to {relay_label}, through which the punch goes"),
+                )
+                .with("relay", &relay_label),
                 None,
             );
             return Duration::from_secs(1);
@@ -533,7 +622,14 @@ impl Links {
             self.direct.state(
                 whom,
                 DirectState::Off,
-                format!("this device's {} for {} says direct = false", self.hints.peer_entry, peer.label),
+                LinkDetail::new(
+                    code::DIRECT_OFF_PEER_ENTRY,
+                    format!(
+                        "this device's peer entry for {} turns direct paths off",
+                        peer.label
+                    ),
+                )
+                .with("peer", &peer.label),
                 None,
             );
             return Duration::MAX;
@@ -545,9 +641,11 @@ impl Links {
         let full = match target.key {
             Some(key) if target.peer.is_none() => (!self.member_turn(key)).then(|| {
                 self.direct_full().unwrap_or_else(|| {
-                    "other members wait for the free direct paths first (their direct paths carried \
-                     traffic more recently)"
-                        .to_string()
+                    LinkDetail::new(
+                        code::DIRECT_MEMBERS_FIRST,
+                        "other members wait for the free direct paths first (their direct paths carried \
+                         traffic more recently)",
+                    )
                 })
             }),
             _ => self.direct_full(),
@@ -556,8 +654,16 @@ impl Links {
             self.direct.state(whom, DirectState::None, why, None);
             return Duration::from_secs(5);
         }
-        self.direct
-            .state(whom, DirectState::Trying, format!("punching through {relay_label}"), None);
+        self.direct.state(
+            whom,
+            DirectState::Trying,
+            LinkDetail::new(
+                code::DIRECT_PUNCHING,
+                format!("punching through {relay_label}"),
+            )
+            .with("relay", &relay_label),
+            None,
+        );
         let punched = match self.punch_socket(relay) {
             Ok(socket) => self.punch(target, socket).await,
             Err(failure) => Err(failure),
@@ -587,9 +693,9 @@ impl Links {
                     retry_in_secs = wait.as_secs(),
                     "no direct path to {}: {}; traffic goes through {relay_label}",
                     target.label,
-                    failure.text
+                    failure.detail.text
                 );
-                self.direct.state(whom, state, failure.text, Some(wait));
+                self.direct.state(whom, state, failure.detail, Some(wait));
                 wait
             }
         }
@@ -598,24 +704,35 @@ impl Links {
     /// The link socket a punch through `relay` goes from: its link's, so
     /// the reflexive candidate is the NAT mapping the relay saw.
     fn punch_socket(self: &Arc<Self>, relay: PeerId) -> Result<Arc<LinkEndpoint>, Failure> {
-        let relay_link = self
-            .table
-            .link_to(relay)
-            .ok_or_else(|| Failure::new("the relay's link is down"))?;
+        let relay_link = self.table.link_to(relay).ok_or_else(|| {
+            Failure::new(LinkDetail::new(
+                code::PUNCH_RELAY_DOWN,
+                "the relay's link is down",
+            ))
+        })?;
         self.endpoint_for(relay_link.remote_address())
-            .map_err(|e| Failure::new(format!("no link socket to punch from: {e}")))
+            .map_err(|e| Failure::new(no_socket(&e)))
     }
 
     /// Punch a direct path to `target` from `socket`: ask it through the
     /// routes that reach it (normally its relay's), then probe and dial (or
     /// accept).
-    async fn punch(self: &Arc<Self>, target: &Target, socket: Arc<LinkEndpoint>) -> Result<LinkHandle, Failure> {
+    async fn punch(
+        self: &Arc<Self>,
+        target: &Target,
+        socket: Arc<LinkEndpoint>,
+    ) -> Result<LinkHandle, Failure> {
         let label = target.label.clone();
         let device = target.device.clone();
-        let key = self
-            .key
-            .current()
-            .map_err(|e| Failure::new(format!("this device has no usable link key: {e}")))?;
+        let key = self.key.current().map_err(|e| {
+            Failure::new(
+                LinkDetail::new(
+                    code::PUNCH_NO_KEY,
+                    format!("this device has no usable link key: {e}"),
+                )
+                .with("error", &e),
+            )
+        })?;
         let chain = crate::admission::hello_chain(self.trust.as_ref());
         let ours = self.gather(&socket);
         let session = random_session();
@@ -623,7 +740,13 @@ impl Links {
         // another key than its link key: that membership, bound to this
         // punch, is how the other device knows it there.
         let namespace = self.judge().namespace_of(&device);
-        let memberships = own_memberships(self.trust.as_ref(), &key, &punch::punch_binding(&session), Some(&namespace)).await;
+        let memberships = own_memberships(
+            self.trust.as_ref(),
+            &key,
+            &punch::punch_binding(&session),
+            Some(&namespace),
+        )
+        .await;
         let request = PunchMessage {
             key: key.spki().clone(),
             candidates: ours.clone(),
@@ -642,37 +765,74 @@ impl Links {
         let data = match self.signal().express(wire, PUNCH_ANSWER_TIMEOUT).await {
             Ok(Answer::Data(data)) => *data,
             Ok(Answer::Nack { why, refused: true }) => {
-                return Err(Failure::refused(format!(
-                    "this device's forwarder refused {device}'s answer to the punch ({why}): it cannot \
-                     validate that device's Data, so it holds no trust context of its namespace or lacks \
-                     its certificates; adopt the namespace's trust context to punch it"
-                )));
+                return Err(Failure::refused(
+                    LinkDetail::new(
+                        code::PUNCH_ANSWER_NOT_VALIDATED,
+                        format!(
+                            "this device's forwarder refused {device}'s answer to the punch ({why}): it cannot \
+                             validate that device's Data, so it holds no trust context of its namespace or lacks \
+                             its certificates; adopt the namespace's trust context to punch it"
+                        ),
+                    )
+                    .with("device", &device)
+                    .with("nack", &why),
+                ));
             }
-            Ok(Answer::Nack { why, refused: false }) => {
-                return Err(Failure::new(format!(
-                    "the punch request to {device} was answered with {why}: nothing routes it there now"
-                )));
+            Ok(Answer::Nack {
+                why,
+                refused: false,
+            }) => {
+                return Err(Failure::new(
+                    LinkDetail::new(
+                        code::PUNCH_UNROUTED,
+                        format!("the punch request to {device} was answered with {why}: nothing routes it there now"),
+                    )
+                    .with("device", &device)
+                    .with("nack", &why),
+                ));
             }
             Err(why) => {
-                return Err(Failure::new(format!(
-                    "the punch request to {device} got {why} (is it running and linked to the relay?)"
-                )));
+                return Err(Failure::new(
+                    LinkDetail::new(
+                        code::PUNCH_UNANSWERED,
+                        format!("the punch request to {device} got {why} (is it running and linked to the relay?)"),
+                    )
+                    .with("device", &device)
+                    .with("error", &why),
+                ));
             }
         };
         let (peer_key, theirs) = self.check_answer(&data, target, &session).await?;
-        self.direct.set(target.whom, |e| e.key = Some(peer_key.fingerprint()));
-        if let Some((code, text)) = theirs.refusal {
-            let transient = CloseReason::from_code(code).is_none_or(|r| r.is_transient());
-            let text = format!("{label} refused the direct path: {text}");
+        self.direct
+            .set(target.whom, |e| e.key = Some(peer_key.fingerprint()));
+        if let Some((reason, text)) = theirs.refusal {
+            let close = CloseReason::from_code(reason);
+            let transient = close.is_none_or(|r| r.is_transient());
+            let detail = LinkDetail::new(
+                code::PUNCH_REFUSED_BY_PEER,
+                format!("{label} refused the direct path: {text}"),
+            )
+            .with("peer", &label)
+            .with(
+                "reason",
+                close.map_or_else(|| format!("0x{reason:02x}"), close_code),
+            )
+            .with("text", text);
             return Err(if transient {
-                Failure::new(text)
+                Failure::new(detail)
             } else {
-                Failure::refused(text)
+                Failure::refused(detail)
             });
         }
-        self.run_punch(session, peer_key.fingerprint(), &theirs.candidates, socket, &label)
-            .await
-            .map_err(Failure::new)
+        self.run_punch(
+            session,
+            peer_key.fingerprint(),
+            &theirs.candidates,
+            socket,
+            &label,
+        )
+        .await
+        .map_err(Failure::new)
     }
 
     /// The answer to this device's punch of `target` (of `session`),
@@ -685,17 +845,40 @@ impl Links {
         session: &PathSession,
     ) -> Result<(PeerKey, PunchMessage), Failure> {
         let label = &target.label;
-        let bad = |why: String| Failure::refused(format!("{label}'s punch answer is not usable: {why}"));
-        let content = data.content().ok_or_else(|| bad("it carries no content".into()))?;
-        let theirs = PunchMessage::decode(content).map_err(bad)?;
-        let key = PeerKey::from_spki(&theirs.key).map_err(|e| bad(e.to_string()))?;
-        punch::verify_answer(data, &theirs, &key).await.map_err(bad)?;
-        if target.key.is_some_and(|expected| expected != key.fingerprint()) {
-            return Err(bad(format!(
-                "it is signed by key {}, not the key {} its relay listed",
-                key.fingerprint(),
-                target.key.map(|k| k.to_string()).unwrap_or_default()
-            )));
+        let bad = |why: LinkDetail| {
+            Failure::refused(
+                LinkDetail::new(
+                    code::PUNCH_ANSWER_UNUSABLE,
+                    format!("{label}'s punch answer is not usable: {}", why.text),
+                )
+                .with("peer", label)
+                .caused_by(why),
+            )
+        };
+        let content = data
+            .content()
+            .ok_or_else(|| bad(LinkDetail::new(code::ANSWER_EMPTY, "it carries no content")))?;
+        let theirs = PunchMessage::decode(content).map_err(|e| {
+            bad(LinkDetail::new(code::ANSWER_MALFORMED, e.clone()).with("error", e))
+        })?;
+        let key = PeerKey::from_spki(&theirs.key).map_err(|e| {
+            bad(LinkDetail::new(code::ANSWER_BAD_KEY, e.to_string()).with("error", e))
+        })?;
+        punch::verify_answer(data, &theirs, &key)
+            .await
+            .map_err(|e| {
+                bad(LinkDetail::new(code::ANSWER_BAD_SIGNATURE, e.clone()).with("error", e))
+            })?;
+        if let Some(expected) = target.key.filter(|expected| *expected != key.fingerprint()) {
+            return Err(bad(LinkDetail::new(
+                code::ANSWER_WRONG_KEY,
+                format!(
+                    "it is signed by key {}, not the key {expected} its relay listed",
+                    key.fingerprint(),
+                ),
+            )
+            .with("key", key.fingerprint())
+            .with("expected", expected)));
         }
         let hello = LinkHello {
             certificates: theirs.certificates.clone(),
@@ -707,20 +890,27 @@ impl Links {
             .decide(&key, &hello, &punch::punch_binding(session), target.peer)
             .await
         {
-            Ok(admitted) if admitted.enrollment.is_some() => Err(bad(format!(
-                "this device cannot confirm it is {label} yet (it holds no certificate in its namespace)"
-            ))),
+            Ok(admitted) if admitted.enrollment.is_some() => Err(bad(
+                LinkDetail::new(
+                    code::ANSWER_UNCONFIRMED,
+                    format!("this device cannot confirm it is {label} yet (it holds no certificate in its namespace)"),
+                )
+                .with("peer", label),
+            )),
             Ok(admitted)
                 if target.peer.is_none() && !admitted.identities.iter().any(|id| id.device == target.device) =>
             {
-                Err(bad(format!(
-                    "its certificate is not {}'s ({})",
-                    target.device,
-                    admitted.describe()
-                )))
+                Err(bad(
+                    LinkDetail::new(
+                        code::ANSWER_WRONG_DEVICE,
+                        format!("its certificate is not {}'s ({})", target.device, admitted.describe()),
+                    )
+                    .with("device", &target.device)
+                    .with("presented", admitted.describe()),
+                ))
             }
             Ok(_) => Ok((key, theirs)),
-            Err(refusal) => Err(bad(refusal.text)),
+            Err(refusal) => Err(bad(refusal.detail)),
         }
     }
 
@@ -756,7 +946,10 @@ impl Links {
         };
         // An Interest whose signature does not verify under the key it names
         // could be anyone's: no answer.
-        if punch::verify_request(&interest, &theirs, &key).await.is_err() {
+        if punch::verify_request(&interest, &theirs, &key)
+            .await
+            .is_err()
+        {
             return;
         }
         let fingerprint = key.fingerprint();
@@ -765,31 +958,52 @@ impl Links {
             session,
             namespace: self.judge().namespace_of(&own),
         };
-        let who = |admitted: Option<&Admitted>| admitted.map_or_else(|| format!("key {fingerprint}"), Admitted::describe);
+        let who = |admitted: Option<&Admitted>| {
+            admitted.map_or_else(|| format!("key {fingerprint}"), Admitted::describe)
+        };
         let info = interest.sig_info().expect("verified");
         let signed_at = info.sig_time.unwrap_or(0);
         let now = now_ms();
         if now.abs_diff(signed_at) > PUNCH_GRACE.as_millis() as u64 {
-            let text = format!(
-                "your punch request was signed at {signed_at} ms, more than {} s from this device's clock \
-                 ({now} ms): it is replayed, or a clock is off; check both devices' clocks",
-                PUNCH_GRACE.as_secs()
-            );
-            return self.refuse_punch(&to, &who(None), CloseReason::Protocol, text).await;
+            let detail = LinkDetail::new(
+                code::PUNCH_CLOCK,
+                format!(
+                    "your punch request was signed at {signed_at} ms, more than {} s from this device's clock \
+                     ({now} ms): it is replayed, or a clock is off; check both devices' clocks",
+                    PUNCH_GRACE.as_secs()
+                ),
+            )
+            .with("signed_at_ms", signed_at)
+            .with("grace_secs", PUNCH_GRACE.as_secs())
+            .with("now_ms", now);
+            return self
+                .refuse_punch(&to, &who(None), CloseReason::Protocol, detail)
+                .await;
         }
         if self.direct.replay.check(info) != ReplayCheck::Fresh {
-            let text = "your punch request repeats an earlier one (same SignatureNonce and SignatureTime): a \
-                        replay; sign a new one"
-                .to_string();
-            return self.refuse_punch(&to, &who(None), CloseReason::Protocol, text).await;
+            let detail = LinkDetail::new(
+                code::PUNCH_REPLAY,
+                "your punch request repeats an earlier one (same SignatureNonce and SignatureTime): a \
+                 replay; sign a new one",
+            );
+            return self
+                .refuse_punch(&to, &who(None), CloseReason::Protocol, detail)
+                .await;
         }
         if !self.direct.admit_request(fingerprint) {
-            let text = format!(
-                "this device answers {PUNCH_BURST} punch requests from one key at once, then one per {} s; \
-                 punch again later",
-                PUNCH_REFILL.as_secs()
-            );
-            return self.refuse_punch(&to, &who(None), CloseReason::Busy, text).await;
+            let detail = LinkDetail::new(
+                code::PUNCH_RATE,
+                format!(
+                    "this device answers {PUNCH_BURST} punch requests from one key at once, then one per {} s; \
+                     punch again later",
+                    PUNCH_REFILL.as_secs()
+                ),
+            )
+            .with("burst", PUNCH_BURST)
+            .with("refill_secs", PUNCH_REFILL.as_secs());
+            return self
+                .refuse_punch(&to, &who(None), CloseReason::Busy, detail)
+                .await;
         }
         let hello = LinkHello {
             certificates: theirs.certificates.clone(),
@@ -803,15 +1017,24 @@ impl Links {
         {
             Ok(a) if a.enrollment.is_none() => a,
             Ok(a) => {
-                let text = format!(
-                    "this device would admit {} only on an enrollment link, which no direct path carries; \
-                     enroll first ({})",
-                    a.describe(),
-                    self.hints.enroll
-                );
-                return self.refuse_punch(&to, &who(Some(&a)), CloseReason::Unrecognized, text).await;
+                let detail = LinkDetail::new(
+                    code::PUNCH_ENROLLMENT_ONLY,
+                    format!(
+                        "this device would admit {} only on an enrollment link, which no direct path carries; \
+                         enroll first",
+                        a.describe(),
+                    ),
+                )
+                .with("device", a.describe());
+                return self
+                    .refuse_punch(&to, &who(Some(&a)), CloseReason::Unrecognized, detail)
+                    .await;
             }
-            Err(refusal) => return self.refuse_punch(&to, &who(None), refusal.reason, refusal.text).await,
+            Err(refusal) => {
+                return self
+                    .refuse_punch(&to, &who(None), refusal.reason, refusal.detail)
+                    .await;
+            }
         };
         if let Some(why) = self.direct_off(&admitted) {
             return self
@@ -819,34 +1042,51 @@ impl Links {
                 .await;
         }
         if self.direct.sessions.lock().len() >= PUNCHES_MAX {
-            let text = format!("this device runs {PUNCHES_MAX} punches at once already; punch again later");
+            let detail = LinkDetail::new(
+                code::PUNCH_SESSIONS_FULL,
+                format!(
+                    "this device runs {PUNCHES_MAX} punches at once already; punch again later"
+                ),
+            )
+            .with("max", PUNCHES_MAX);
             return self
-                .refuse_punch(&to, &who(Some(&admitted)), CloseReason::Busy, text)
+                .refuse_punch(&to, &who(Some(&admitted)), CloseReason::Busy, detail)
                 .await;
         }
         if self.table.direct_to(Some(fingerprint), None).is_none()
-            && let Some(text) = self.direct_full()
+            && let Some(detail) = self.direct_full()
         {
             return self
-                .refuse_punch(&to, &who(Some(&admitted)), CloseReason::Busy, text)
+                .refuse_punch(&to, &who(Some(&admitted)), CloseReason::Busy, detail)
                 .await;
         }
         let Some(first) = theirs.candidates.first() else {
-            let text = "your punch request offers no address to reach you at".to_string();
+            let detail = LinkDetail::new(
+                code::PUNCH_NO_CANDIDATE,
+                "your punch request offers no address to reach you at",
+            );
             return self
-                .refuse_punch(&to, &who(Some(&admitted)), CloseReason::Protocol, text)
+                .refuse_punch(&to, &who(Some(&admitted)), CloseReason::Protocol, detail)
                 .await;
         };
         let socket = match self.endpoint_for(first.addr) {
             Ok(s) => s,
             Err(e) => {
-                let text = format!("this device has no link socket for {}: {e}", first.addr);
+                let detail = LinkDetail::new(
+                    code::PUNCH_NO_SOCKET_FOR,
+                    format!("this device has no link socket for {}: {e}", first.addr),
+                )
+                .with("address", first.addr)
+                .with("error", &e);
                 return self
-                    .refuse_punch(&to, &who(Some(&admitted)), CloseReason::Busy, text)
+                    .refuse_punch(&to, &who(Some(&admitted)), CloseReason::Busy, detail)
                     .await;
             }
         };
-        let (Ok(own_key), chain) = (self.key.current(), crate::admission::hello_chain(self.trust.as_ref())) else {
+        let (Ok(own_key), chain) = (
+            self.key.current(),
+            crate::admission::hello_chain(self.trust.as_ref()),
+        ) else {
             return;
         };
         let ours = self.gather(&socket);
@@ -893,8 +1133,16 @@ impl Links {
             e.key = Some(fingerprint);
             e.device = device.clone();
         });
-        self.direct
-            .state(whom, DirectState::Trying, format!("{label} punches a direct path"), None);
+        self.direct.state(
+            whom,
+            DirectState::Trying,
+            LinkDetail::new(
+                code::DIRECT_PEER_PUNCHING,
+                format!("{label} punches a direct path"),
+            )
+            .with("peer", &label),
+            None,
+        );
         tracing::info!(
             target: "face.quic",
             peer = %label,
@@ -906,12 +1154,12 @@ impl Links {
             .await
         {
             Ok(path) => self.follow(whom, fingerprint, &label, path).await,
-            Err(text) => {
-                tracing::info!(target: "face.quic", peer = %label, "no direct path to {label}: {text}");
+            Err(why) => {
+                tracing::info!(target: "face.quic", peer = %label, "no direct path to {label}: {}", why.text);
                 self.direct.state(
                     whom,
                     DirectState::NotPossible,
-                    format!("{text}; {label} punches again"),
+                    peer_punches_again(&label, why),
                     None,
                 );
             }
@@ -925,18 +1173,29 @@ impl Links {
     async fn follow(&self, whom: Whom, key: KeyFingerprint, label: &str, path: LinkHandle) {
         let remote = path.remote_address();
         self.direct
-            .state(whom, DirectState::Up, format!("direct path to {remote}"), None);
+            .state(whom, DirectState::Up, direct_up(remote), None);
         let why = tokio::select! {
             () = self.cancel.cancelled() => return,
             why = path.closed() => why,
         };
-        if self.direct.repunch_of(key).is_some() || self.table.direct_to(Some(key), None).is_some() {
+        if self.direct.repunch_of(key).is_some() || self.table.direct_to(Some(key), None).is_some()
+        {
             return;
         }
+        let why = link_error_detail(&why);
         self.direct.state(
             whom,
             DirectState::NotPossible,
-            format!("the direct path to {remote} ended ({why}); {label} punches again"),
+            LinkDetail::new(
+                code::DIRECT_ENDED_PEER_PUNCHES,
+                format!(
+                    "the direct path to {remote} ended ({}); {label} punches again",
+                    why.text
+                ),
+            )
+            .with("remote", remote)
+            .with("peer", label)
+            .caused_by(why),
             None,
         );
     }
@@ -1000,7 +1259,10 @@ impl Links {
             };
             return Some((target, true));
         }
-        let device = up.device.clone().or_else(|| spec.and_then(|s| s.device.clone()))?;
+        let device = up
+            .device
+            .clone()
+            .or_else(|| spec.and_then(|s| s.device.clone()))?;
         let target = Target {
             whom: Whom::Key(fp),
             label: device.to_string(),
@@ -1013,18 +1275,26 @@ impl Links {
 
     /// Punch `target` again after a network change, from the link socket
     /// that reaches `remote` (where its direct path went).
-    async fn punch_again(self: &Arc<Self>, target: &Target, owned: bool, remote: SocketAddr) -> Result<LinkHandle, Failure> {
+    async fn punch_again(
+        self: &Arc<Self>,
+        target: &Target,
+        owned: bool,
+        remote: SocketAddr,
+    ) -> Result<LinkHandle, Failure> {
         let whom = target.whom;
         let label = &target.label;
         self.direct.state(
             whom,
             DirectState::Trying,
-            "this device's network changed: punching again from its new address".into(),
+            LinkDetail::new(
+                code::DIRECT_REPUNCHING,
+                "this device's network changed: punching again from its new address",
+            ),
             None,
         );
         let punched = match self.endpoint_for(remote) {
             Ok(socket) => self.punch(target, socket).await,
-            Err(e) => Err(Failure::new(format!("no link socket to punch from: {e}"))),
+            Err(e) => Err(Failure::new(no_socket(&e))),
         };
         match &punched {
             Ok(path) => {
@@ -1037,7 +1307,7 @@ impl Links {
                 self.direct.state(
                     whom,
                     DirectState::Up,
-                    format!("direct path to {}", path.remote_address()),
+                    direct_up(path.remote_address()),
                     None,
                 );
             }
@@ -1046,19 +1316,19 @@ impl Links {
                     target: "face.quic",
                     peer = %label,
                     "no direct path to {label} after the network change: {}",
-                    failure.text
+                    failure.detail.text
                 );
                 let state = if failure.refused {
                     DirectState::Refused
                 } else {
                     DirectState::NotPossible
                 };
-                let text = if owned {
-                    failure.text.clone()
+                let detail = if owned {
+                    failure.detail.clone()
                 } else {
-                    format!("{}; {label} punches again", failure.text)
+                    peer_punches_again(label, failure.detail.clone())
                 };
-                self.direct.state(whom, state, text, None);
+                self.direct.state(whom, state, detail, None);
             }
         }
         punched
@@ -1066,15 +1336,15 @@ impl Links {
 
     /// Refuse the punch Interest `to`, with a signed answer saying why,
     /// showing this device's membership of the namespace it was punched in.
-    async fn refuse_punch(&self, to: &Punched, who: &str, reason: CloseReason, text: String) {
+    async fn refuse_punch(&self, to: &Punched, who: &str, reason: CloseReason, why: LinkDetail) {
         self.direct.refused.fetch_add(1, Ordering::Relaxed);
-        tracing::warn!(target: "face.quic", peer = %who, reason = ?reason, "refused a direct-path punch: {text}");
+        tracing::warn!(target: "face.quic", peer = %who, reason = ?reason, "refused a direct-path punch: {}", why.text);
         let Ok(key) = self.key.current() else { return };
         let chain = crate::admission::hello_chain(self.trust.as_ref());
         let msg = PunchMessage {
             key: key.spki().clone(),
             candidates: Vec::new(),
-            refusal: Some((u64::from(reason.code()), text)),
+            refusal: Some((u64::from(reason.code()), why.text)),
             certificates: chain.clone(),
             memberships: own_memberships(
                 self.trust.as_ref(),
@@ -1095,7 +1365,13 @@ impl Links {
     /// (its link key is not certified there), that membership's key —
     /// forwarders on the way validate the punch, named under the
     /// namespace, there — else the link key `key`.
-    fn punch_signer(&self, key: &LinkKey, chain: &[Bytes], msg: &PunchMessage, namespace: &Name) -> (Arc<dyn Signer>, Name) {
+    fn punch_signer(
+        &self,
+        key: &LinkKey,
+        chain: &[Bytes],
+        msg: &PunchMessage,
+        namespace: &Name,
+    ) -> (Arc<dyn Signer>, Name) {
         let own = msg.memberships.first().and_then(|shown| {
             self.trust
                 .own_memberships()
@@ -1116,21 +1392,32 @@ impl Links {
         theirs: &[Candidate],
         socket: Arc<LinkEndpoint>,
         label: &str,
-    ) -> Result<LinkHandle, String> {
-        let local = socket
-            .local_addr()
-            .map_err(|e| format!("the link socket has no address: {e}"))?;
+    ) -> Result<LinkHandle, LinkDetail> {
+        let local = socket.local_addr().map_err(|e| {
+            LinkDetail::new(
+                code::PUNCH_SOCKET_UNBOUND,
+                format!("the link socket has no address: {e}"),
+            )
+            .with("error", &e)
+        })?;
         let targets = probe_targets(theirs, local);
         if targets.is_empty() {
-            return Err(format!(
-                "{label} offered no address this device's link socket ({local}) can reach"
-            ));
+            return Err(LinkDetail::new(
+                code::PUNCH_UNREACHABLE,
+                format!("{label} offered no address this device's link socket ({local}) can reach"),
+            )
+            .with("peer", label)
+            .with("socket", local));
         }
         let (up_tx, up_rx) = oneshot::channel();
         {
             let mut sessions = self.direct.sessions.lock();
             if sessions.len() >= PUNCHES_MAX {
-                return Err(format!("this device runs {PUNCHES_MAX} punches at once already"));
+                return Err(LinkDetail::new(
+                    code::PUNCH_BUSY,
+                    format!("this device runs {PUNCHES_MAX} punches at once already"),
+                )
+                .with("max", PUNCHES_MAX));
             }
             sessions.insert(
                 session,
@@ -1179,7 +1466,8 @@ impl Links {
             }
             // Let the first probes open this side's NAT first.
             tokio::time::sleep(PROBE_INTERVAL).await;
-            self.dial_direct(&socket, &order, peer, session, label).await
+            self.dial_direct(&socket, &order, peer, session, label)
+                .await
         };
         let outcome = tokio::time::timeout(PUNCH_WINDOW, async {
             tokio::pin!(probe, dial, listen, up_rx);
@@ -1192,7 +1480,7 @@ impl Links {
                     () = &mut listen => {}
                     up = &mut up_rx => match up {
                         Ok(path) => return Ok(path),
-                        Err(_) => return Err(last.unwrap_or_else(|| "the punch ended".to_string())),
+                        Err(_) => return Err(last.unwrap_or_else(|| LinkDetail::new(code::PUNCH_ENDED, "the punch ended"))),
                     },
                     dialed = &mut dial, if dialing => match dialed {
                         Ok(path) => return Ok(path),
@@ -1209,21 +1497,41 @@ impl Links {
             Ok(result) => result,
             Err(_) => {
                 let heard = heard.lock().clone();
-                let probed = targets.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
+                let probed = targets
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let secs = PUNCH_WINDOW.as_secs();
                 Err(if heard.is_empty() {
-                    format!(
-                        "no probe from {label} reached this device and no QUIC handshake completed within {} s \
-                         (probed {probed}); both networks drop unsolicited UDP or map each destination to \
-                         another port (symmetric NAT), so the relay carries the traffic",
-                        PUNCH_WINDOW.as_secs()
+                    LinkDetail::new(
+                        code::PUNCH_NO_PROBE,
+                        format!(
+                            "no probe from {label} reached this device and no QUIC handshake completed within {secs} s \
+                             (probed {probed}); both networks drop unsolicited UDP or map each destination to \
+                             another port (symmetric NAT), so the relay carries the traffic"
+                        ),
                     )
+                    .with("peer", label)
+                    .with("secs", secs)
+                    .with("probed", probed)
                 } else {
-                    format!(
-                        "probes from {label} arrived (from {}), but no QUIC handshake completed within {} s \
-                         (probed {probed}): the way back to it stays closed",
-                        heard.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
-                        PUNCH_WINDOW.as_secs()
+                    let heard = heard
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    LinkDetail::new(
+                        code::PUNCH_NO_HANDSHAKE,
+                        format!(
+                            "probes from {label} arrived (from {heard}), but no QUIC handshake completed within \
+                             {secs} s (probed {probed}): the way back to it stays closed"
+                        ),
                     )
+                    .with("peer", label)
+                    .with("heard", heard)
+                    .with("secs", secs)
+                    .with("probed", probed)
                 })
             }
         }
@@ -1238,9 +1546,13 @@ impl Links {
         peer: KeyFingerprint,
         session: PathSession,
         label: &str,
-    ) -> Result<LinkHandle, String> {
+    ) -> Result<LinkHandle, LinkDetail> {
         if order.is_empty() {
-            return Err(format!("{label} offered no address this device dials"));
+            return Err(LinkDetail::new(
+                code::PUNCH_NOTHING_TO_DIAL,
+                format!("{label} offered no address this device dials"),
+            )
+            .with("peer", label));
         }
         let mut dials = tokio::task::JoinSet::new();
         for (i, addr) in order.iter().copied().enumerate() {
@@ -1248,17 +1560,25 @@ impl Links {
             let socket = Arc::clone(socket);
             dials.spawn(async move {
                 tokio::time::sleep(DIAL_STAGGER * u32::try_from(i).unwrap_or(u32::MAX)).await;
+                let failed = |e: NotLinked| {
+                    LinkDetail::new(
+                        code::PUNCH_DIAL_FAILED,
+                        format!("{addr}: {}", e.detail.text),
+                    )
+                    .with("address", addr)
+                    .caused_by(e.detail)
+                };
                 let hs = socket
                     .connect_direct(addr, peer)
                     .await
-                    .map_err(|e| format!("{addr}: {e}"))?;
+                    .map_err(|e| failed(e.into()))?;
                 links
                     .establish(hs, Origin::Direct(session))
                     .await
-                    .map_err(|e| format!("{addr}: {e}"))
+                    .map_err(failed)
             });
         }
-        let mut errors = Vec::new();
+        let mut errors: Vec<LinkDetail> = Vec::new();
         while let Some(done) = dials.join_next().await {
             match done {
                 Ok(Ok(path)) => {
@@ -1269,7 +1589,17 @@ impl Links {
                 Err(_) => {}
             }
         }
-        Err(format!("no dial to {label} came up ({})", errors.join("; ")))
+        let text = format!(
+            "no dial to {label} came up ({})",
+            errors
+                .iter()
+                .map(|e| e.text.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+        let mut detail = LinkDetail::new(code::PUNCH_DIALS_FAILED, text).with("peer", label);
+        detail.causes = errors;
+        Err(detail)
     }
 }
 
@@ -1278,7 +1608,9 @@ impl Links {
 pub(crate) async fn direct_loop(links: std::sync::Weak<Links>, id: PeerId) {
     let (target, relay) = {
         let Some(this) = links.upgrade() else { return };
-        let Some(peer) = this.peers.get(id) else { return };
+        let Some(peer) = this.peers.get(id) else {
+            return;
+        };
         let (Some(relay), Some(device)) = (peer.relay, peer.device.clone()) else {
             return;
         };
@@ -1296,7 +1628,12 @@ pub(crate) async fn direct_loop(links: std::sync::Weak<Links>, id: PeerId) {
 
 /// Keep a direct path to a member relay `relay` listed (presence) until it
 /// no longer lists it (`stop`).
-pub(crate) async fn member_loop(links: std::sync::Weak<Links>, target: Target, relay: PeerId, stop: CancellationToken) {
+pub(crate) async fn member_loop(
+    links: std::sync::Weak<Links>,
+    target: Target,
+    relay: PeerId,
+    stop: CancellationToken,
+) {
     let whom = target.whom;
     punch_loop(links.clone(), target, relay, stop).await;
     if let Some(links) = links.upgrade() {
@@ -1304,7 +1641,12 @@ pub(crate) async fn member_loop(links: std::sync::Weak<Links>, target: Target, r
     }
 }
 
-async fn punch_loop(links: std::sync::Weak<Links>, target: Target, relay: PeerId, stop: CancellationToken) {
+async fn punch_loop(
+    links: std::sync::Weak<Links>,
+    target: Target,
+    relay: PeerId,
+    stop: CancellationToken,
+) {
     let mut backoff = Backoff::direct();
     loop {
         let Some(this) = links.upgrade() else { return };
@@ -1375,7 +1717,12 @@ mod tests {
         let direct = Direct::default();
         let (peer, other) = (KeyFingerprint([1; 32]), KeyFingerprint([2; 32]));
         let start = Instant::now();
-        let session = |peer, started| Session { peer, up: None, claimed: false, started };
+        let session = |peer, started| Session {
+            peer,
+            up: None,
+            claimed: false,
+            started,
+        };
         // Inserted newest first, so map order cannot be what picks it.
         let (old, new, theirs) = ([1; 8], [2; 8], [3; 8]);
         let mut sessions = direct.sessions.lock();

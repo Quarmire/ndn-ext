@@ -16,9 +16,9 @@ use crate::endpoint::Permit;
 use crate::key::{KeyFingerprint, LinkKey, PeerKey};
 use crate::membership::{ChannelBinding, MEMBERSHIP_EXPORTER_LABEL};
 use crate::message::{
-    CloseReason, LINK_HELLO, LINK_VERDICT, LinkHello, LinkVerdict, MAX_MESSAGE, OBSERVED_ADDRESS, PRESENCE,
-    Presence, REACHABILITY, Reachability, WAKE_TOKEN_MAX, decode_udp_address, encode_observed_address, skippable,
-    split_tlv,
+    CloseReason, LINK_HELLO, LINK_VERDICT, LinkHello, LinkVerdict, MAX_MESSAGE, OBSERVED_ADDRESS,
+    PRESENCE, Presence, REACHABILITY, Reachability, WAKE_TOKEN_MAX, decode_udp_address,
+    encode_observed_address, skippable, split_tlv,
 };
 use crate::scope::{Judged, LinkScope, ScopeState, nack_for};
 
@@ -85,8 +85,7 @@ impl LinkError {
                 }
             }
             ConnectionError::TimedOut => Self::Connect(
-                "the other device stopped answering (it went away, or the path to it broke)"
-                    .into(),
+                "the other device stopped answering (it went away, or the path to it broke)".into(),
             ),
             ConnectionError::LocallyClosed => Self::Connect("this device closed the link".into()),
             other => Self::Connect(other.to_string()),
@@ -104,8 +103,8 @@ impl LinkError {
     }
 }
 
-/// A connection whose TLS handshake proved the peer holds [`peer_key`]
-/// (Self::peer_key), not yet admitted as a link.
+/// A connection whose TLS handshake proved the peer holds
+/// [`peer_key`](Self::peer_key), not yet admitted as a link.
 pub struct Handshaken {
     connection: quinn::Connection,
     peer: PeerKey,
@@ -129,7 +128,10 @@ impl Handshaken {
     ) -> Result<Self, LinkError> {
         let peer = connection
             .peer_identity()
-            .and_then(|id| id.downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>().ok())
+            .and_then(|id| {
+                id.downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+                    .ok()
+            })
             .and_then(|certs| certs.first().map(|c| PeerKey::from_spki(c.as_ref())))
             .ok_or_else(|| LinkError::Protocol("the handshake carried no peer key".into()))?
             .map_err(|e| LinkError::Protocol(e.to_string()))?;
@@ -193,14 +195,19 @@ impl Handshaken {
         let exchange = async {
             let (mut send, mut recv) = match self.direction {
                 Direction::Dialed => {
-                    let (mut send, recv) =
-                        self.connection.open_bi().await.map_err(LinkError::from_connection)?;
+                    let (mut send, recv) = self
+                        .connection
+                        .open_bi()
+                        .await
+                        .map_err(LinkError::from_connection)?;
                     write(&mut send, &self.connection, &wire).await?;
                     (send, recv)
                 }
-                Direction::Accepted => {
-                    self.connection.accept_bi().await.map_err(LinkError::from_connection)?
-                }
+                Direction::Accepted => self
+                    .connection
+                    .accept_bi()
+                    .await
+                    .map_err(LinkError::from_connection)?,
             };
             let theirs = read_message(&mut recv, &self.connection, LINK_HELLO).await?;
             if self.direction == Direction::Accepted {
@@ -265,7 +272,13 @@ impl Handshaken {
             reachability: reachability_tx,
             presence: presence_tx,
         };
-        tokio::spawn(observe(self.connection.clone(), send, recv, Arc::clone(&outbox), heard));
+        tokio::spawn(observe(
+            self.connection.clone(),
+            send,
+            recv,
+            Arc::clone(&outbox),
+            heard,
+        ));
         Ok(Link {
             face: LinkFace {
                 id,
@@ -315,8 +328,10 @@ impl Handshaken {
         if let Some(permit) = &self.permit {
             permit.refused();
         }
-        self.connection
-            .close(quinn::VarInt::from_u32(CloseReason::Protocol.code()), text.as_bytes());
+        self.connection.close(
+            quinn::VarInt::from_u32(CloseReason::Protocol.code()),
+            text.as_bytes(),
+        );
         match error {
             LinkError::Protocol(text) => LinkError::RefusedHere {
                 reason: CloseReason::Protocol,
@@ -329,11 +344,17 @@ impl Handshaken {
 
 /// Write a link message. A connection the peer closed reports the peer's
 /// reason.
-async fn write(send: &mut quinn::SendStream, connection: &quinn::Connection, wire: &[u8]) -> Result<(), LinkError> {
-    send.write_all(wire).await.map_err(|e| match connection.close_reason() {
-        Some(reason) => LinkError::from_connection(reason),
-        None => LinkError::Connect(e.to_string()),
-    })
+async fn write(
+    send: &mut quinn::SendStream,
+    connection: &quinn::Connection,
+    wire: &[u8],
+) -> Result<(), LinkError> {
+    send.write_all(wire)
+        .await
+        .map_err(|e| match connection.close_reason() {
+            Some(reason) => LinkError::from_connection(reason),
+            None => LinkError::Connect(e.to_string()),
+        })
 }
 
 /// Read one link message of TLV-TYPE `expected` and return its value. A
@@ -373,13 +394,19 @@ async fn read_tlv(
     loop {
         let mut byte = [0u8; 1];
         if buf.is_empty() {
-            match recv.read(&mut byte).await.map_err(|e| closed(e.to_string()))? {
+            match recv
+                .read(&mut byte)
+                .await
+                .map_err(|e| closed(e.to_string()))?
+            {
                 None => return Ok(None),
                 Some(0) => continue,
                 Some(_) => {}
             }
         } else {
-            recv.read_exact(&mut byte).await.map_err(|e| closed(e.to_string()))?;
+            recv.read_exact(&mut byte)
+                .await
+                .map_err(|e| closed(e.to_string()))?;
         }
         buf.push(byte[0]);
         if let Some((t, start, len)) = header(&buf) {
@@ -426,7 +453,10 @@ struct Pending {
 
 impl Outbox {
     fn put_reachability(&self, wire: Bytes) {
-        self.pending.lock().unwrap_or_else(PoisonError::into_inner).reachability = Some(wire);
+        self.pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .reachability = Some(wire);
         self.ready.notify_one();
     }
 
@@ -463,15 +493,18 @@ impl Heard {
     fn take(&self, t: u64, value: &[u8]) -> Result<(), String> {
         match t {
             OBSERVED_ADDRESS => {
-                let addr = decode_udp_address(value).map_err(|e| format!("malformed ObservedAddress link message: {e}"))?;
+                let addr = decode_udp_address(value)
+                    .map_err(|e| format!("malformed ObservedAddress link message: {e}"))?;
                 self.observed.send_replace(Some(addr));
             }
             REACHABILITY => {
-                let r = Reachability::decode(value).map_err(|e| format!("malformed Reachability link message: {e}"))?;
+                let r = Reachability::decode(value)
+                    .map_err(|e| format!("malformed Reachability link message: {e}"))?;
                 self.reachability.send_replace(Some(r));
             }
             PRESENCE => {
-                let p = Presence::decode(value).map_err(|e| format!("malformed Presence link message: {e}"))?;
+                let p = Presence::decode(value)
+                    .map_err(|e| format!("malformed Presence link message: {e}"))?;
                 let mut over = false;
                 self.presence.send_if_modified(|all| {
                     let at = all.iter().position(|q| q.namespace == p.namespace);
@@ -497,7 +530,11 @@ impl Heard {
                 }
             }
             t if skippable(t) => {}
-            t => return Err(format!("unknown critical link message {t:#x} after the verdict")),
+            t => {
+                return Err(format!(
+                    "unknown critical link message {t:#x} after the verdict"
+                ));
+            }
         }
         Ok(())
     }
@@ -543,7 +580,10 @@ async fn observe(
             match read_tlv(&mut recv, &connection).await {
                 Ok(Some((t, value))) => {
                     if let Err(text) = heard.take(t, &value) {
-                        connection.close(quinn::VarInt::from_u32(CloseReason::Protocol.code()), text.as_bytes());
+                        connection.close(
+                            quinn::VarInt::from_u32(CloseReason::Protocol.code()),
+                            text.as_bytes(),
+                        );
                         return;
                     }
                 }
@@ -713,10 +753,11 @@ impl LinkHandle {
 }
 
 /// The face of a link: each NDNLPv2 frame is one QUIC datagram. The face's
-/// link service frames and fragments packets to [`send_mtu`]
-/// (Transport::send_mtu), the connection's current datagram size, which
-/// grows as path MTU discovery finds room. A scoped link's face drops what
-/// its [`LinkScope`] does not carry, both ways.
+/// link service frames and fragments packets to
+/// [`send_mtu`](ndn_transport::Transport::send_mtu), the connection's
+/// current datagram size, which grows as path MTU discovery finds room. A
+/// scoped link's face drops what its [`LinkScope`] does not carry, both
+/// ways.
 pub struct LinkFace {
     id: FaceId,
     connection: quinn::Connection,
@@ -772,11 +813,18 @@ impl Transport for LinkFace {
     /// This side's socket address now: after a rebind (this device moved)
     /// it is the new one.
     fn local_uri(&self) -> Option<String> {
-        self.endpoint.local_addr().ok().map(|addr| ip_face_uri("quic", addr))
+        self.endpoint
+            .local_addr()
+            .ok()
+            .map(|addr| ip_face_uri("quic", addr))
     }
 
     fn send_mtu(&self) -> Option<usize> {
-        Some(self.connection.max_datagram_size().unwrap_or(DATAGRAM_FLOOR))
+        Some(
+            self.connection
+                .max_datagram_size()
+                .unwrap_or(DATAGRAM_FLOOR),
+        )
     }
 
     async fn send_bytes(&self, wire: Bytes) -> Result<(), FaceError> {

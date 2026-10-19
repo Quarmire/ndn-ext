@@ -21,6 +21,7 @@
 use std::sync::Arc;
 
 use ndn_face_quic::{CloseReason, KeyFingerprint};
+use ndn_mgmt_wire::{LinkDetail, link_code as code};
 use ndn_packet::Name;
 
 use crate::links::Links;
@@ -72,7 +73,11 @@ impl Links {
             .collect();
         relays.sort_by_key(|(id, p)| {
             let used = p.relay_use.as_ref().expect("filtered");
-            (used.preference, matches!(used.source, RelaySource::Namespace(_)), *id)
+            (
+                used.preference,
+                matches!(used.source, RelaySource::Namespace(_)),
+                *id,
+            )
         });
         relays
     }
@@ -181,56 +186,84 @@ impl Links {
         let used = peer.relay_use.clone()?;
         let choice = self.relay_choice();
         let ctl = self.ctl(id);
-        let (state, text) = if self.table.link_to(id).is_some() {
-            (RelayState::Linked, format!("route cost {}", self.relay_cost(id)))
+        // The last dial's failure, quoted first in a `down` state's sentence.
+        let last = ctl.last_error();
+        let last_text = last.as_ref().map(|d| d.text.clone()).unwrap_or_default();
+        let (state, detail) = if self.table.link_to(id).is_some() {
+            let cost = self.relay_cost(id);
+            (
+                RelayState::Linked,
+                LinkDetail::new(code::RELAY_LINKED, format!("route cost {cost}"))
+                    .with("cost", cost),
+            )
         } else if peer.mode == LinkMode::Off && !ctl.asked() {
-            (RelayState::Off, "its mode is off; it links when asked".to_string())
+            (
+                RelayState::Off,
+                LinkDetail::new(code::RELAY_OFF, "its mode is off; it links when asked"),
+            )
         } else if choice.retrying.contains(&id) {
-            let standing_in: Vec<String> = choice.chosen.iter().map(|c| self.peers.label(*c)).collect();
+            let standing_in: Vec<String> =
+                choice.chosen.iter().map(|c| self.peers.label(*c)).collect();
             let meanwhile = if standing_in.is_empty() {
-                "no other relay stands in, so this device is reached through no relay meanwhile".to_string()
+                "no other relay stands in, so this device is reached through no relay meanwhile"
+                    .to_string()
             } else {
                 format!("{} stands in", standing_in.join(", "))
             };
-            (
-                RelayState::Down,
-                format!(
-                    "{}; dialled again with backoff; {meanwhile}",
-                    ctl.last_error().unwrap_or_default()
-                ),
-            )
+            let mut detail = LinkDetail::new(
+                code::RELAY_DOWN,
+                format!("{last_text}; dialled again with backoff; {meanwhile}"),
+            );
+            if !standing_in.is_empty() {
+                detail = detail.with("standing_in", standing_in.join(", "));
+            }
+            detail.causes.extend(last);
+            (RelayState::Down, detail)
         } else if choice.chosen.contains(&id) {
             match peer.mode {
                 LinkMode::OnDemand { .. } => (
                     RelayState::Trying,
-                    "chosen; on demand, it links on traffic or when the host is active".to_string(),
+                    LinkDetail::new(
+                        code::RELAY_CHOSEN_ON_DEMAND,
+                        "chosen; on demand, it links on traffic or when the host is active",
+                    ),
                 ),
-                _ => (RelayState::Trying, "chosen; dialling".to_string()),
+                _ => (
+                    RelayState::Trying,
+                    LinkDetail::new(code::RELAY_CHOSEN, "chosen; dialling"),
+                ),
             }
         } else if ctl.failing() {
-            (
-                RelayState::Down,
+            let mut detail = LinkDetail::new(
+                code::RELAY_DOWN_NOT_NEEDED,
                 format!(
-                    "{}; not needed while {} more preferred relay(s) are chosen",
-                    ctl.last_error().unwrap_or_default(),
+                    "{last_text}; not needed while {} more preferred relay(s) are chosen",
                     choice.chosen.len()
                 ),
             )
+            .with("chosen", choice.chosen.len());
+            detail.causes.extend(last);
+            (RelayState::Down, detail)
         } else {
             (
                 RelayState::Standby,
-                format!(
-                    "not needed: {} more preferred relay(s) are chosen (count = {})",
-                    choice.chosen.len(),
-                    self.relay_options.count
-                ),
+                LinkDetail::new(
+                    code::RELAY_STANDBY,
+                    format!(
+                        "not needed: {} more preferred relay(s) are chosen (count = {})",
+                        choice.chosen.len(),
+                        self.relay_options.count
+                    ),
+                )
+                .with("chosen", choice.chosen.len())
+                .with("count", self.relay_options.count),
             )
         };
         Some(RelayStatus {
             source: used.source,
             preference: used.preference,
             state,
-            text,
+            detail,
         })
     }
 
@@ -293,7 +326,11 @@ impl Links {
                     );
                     self.drop_peer(*id, "the namespace no longer advertises this relay");
                 }
-                Some(a) if a.endpoints != p.endpoints || a.key != p.key || a.relay_use != p.relay_use => {
+                Some(a)
+                    if a.endpoints != p.endpoints
+                        || a.key != p.key
+                        || a.relay_use != p.relay_use =>
+                {
                     self.peers.update(*id, |spec| {
                         spec.endpoints = a.endpoints.clone();
                         spec.key = a.key;
@@ -314,10 +351,12 @@ impl Links {
             }
         }
         for a in advertised {
-            if current.iter().any(|(_, p)| same(p, &a)) || self.dismissed.lock().contains(&a.label) {
+            if current.iter().any(|(_, p)| same(p, &a)) || self.dismissed.lock().contains(&a.label)
+            {
                 continue;
             }
-            let Some(RelaySource::Namespace(ns)) = a.relay_use.as_ref().map(|u| u.source.clone()) else {
+            let Some(RelaySource::Namespace(ns)) = a.relay_use.as_ref().map(|u| u.source.clone())
+            else {
                 continue;
             };
             tracing::info!(

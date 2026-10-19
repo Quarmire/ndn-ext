@@ -19,8 +19,7 @@ use ndn_face_quic::{
     LinkKeySource, LinkTransportConfig, MEMBERSHIP, Membership, PeerKey,
 };
 use ndn_link::{
-    ConfiguredEndpoints, FaceSink, LinkHints, LinkSetup, LinkTrust, Links, OwnMembership, PeerSpec,
-    Route,
+    ConfiguredEndpoints, FaceSink, LinkSetup, LinkTrust, Links, OwnMembership, PeerSpec, Route,
 };
 use ndn_packet::{Data, Name};
 use ndn_security::{
@@ -249,16 +248,6 @@ impl FaceSink for Recorder {
     fn transit(&self, _: &Name, _: bool) {}
 }
 
-fn hints() -> LinkHints {
-    LinkHints {
-        enroll: "enroll".into(),
-        renew: "renew".into(),
-        refresh: "refresh".into(),
-        peer_entry: "peer".into(),
-        expect_key: "expect {key}".into(),
-    }
-}
-
 /// Start a device with link key `key`, trust `trust` and peers `peers`;
 /// listening when `listen`. Returns its links, its forwarder, and the
 /// address it listens at.
@@ -294,7 +283,6 @@ fn start(
             candidates: Vec::new(),
             socket,
             transport,
-            hints: hints(),
             relays: Default::default(),
             service: Default::default(),
             direct: Default::default(),
@@ -447,12 +435,9 @@ async fn dial_with(
     hs.admit(FaceId(1), T, Admission::default()).await.map(drop)
 }
 
-fn refused_with(result: Result<(), LinkError>, code: CloseReason) -> String {
+fn refused_with(result: Result<(), LinkError>, code: CloseReason) {
     match result {
-        Err(LinkError::Refused { reason, text }) => {
-            assert_eq!(reason, Some(code), "{text}");
-            text
-        }
+        Err(LinkError::Refused { reason, text }) => assert_eq!(reason, Some(code), "{text}"),
         Err(e) => panic!("expected a refusal with {code:?}, got {e}"),
         Ok(()) => panic!("expected a refusal with {code:?}, the link was admitted"),
     }
@@ -487,8 +472,7 @@ async fn a_membership_bound_by_another_key_than_its_certificates_is_refused() {
         ]
     })
     .await;
-    let text = refused_with(result, CloseReason::MembershipNotBound);
-    assert!(text.contains("/c/member/phone"), "{text}");
+    refused_with(result, CloseReason::MembershipNotBound);
     assert!(at_relay.live.lock().is_empty());
     cancel.cancel();
 }
@@ -635,27 +619,48 @@ async fn revoking_one_membership_keeps_the_link_by_another_and_the_last_closes_i
     let (a, c) = (namespace("/a", 10).await, namespace("/c", 30).await);
     let relay_c = c.device("node", "relay", 90).await;
     let relay_a = a.device("node", "relay", 91).await;
-    let trust = Trust::new(&[&a, &c], relay_c.chain.clone(), vec![relay_a.membership(&a)]);
+    let trust = Trust::new(
+        &[&a, &c],
+        relay_c.chain.clone(),
+        vec![relay_a.membership(&a)],
+    );
     let keyring = Arc::clone(&trust.keyring);
     let (_relay, at_relay, addr) = start(relay_c.link_key(), trust, Vec::new(), true, &cancel);
     let phone = phone(&a, &c).await;
     let (_phone, at_phone, _) = start(
         phone.a.link_key(),
-        Trust::new(&[&a, &c], phone.a.chain.clone(), vec![phone.c.membership(&c)]),
+        Trust::new(
+            &[&a, &c],
+            phone.a.chain.clone(),
+            vec![phone.c.membership(&c)],
+        ),
         vec![relay_peer("/c/node/relay", addr)],
         false,
         &cancel,
     );
-    until("the relay routes both of the phone's names", || at_relay.routed().len() == 2).await;
+    until("the relay routes both of the phone's names", || {
+        at_relay.routed().len() == 2
+    })
+    .await;
     let mut routed = at_relay.routed();
     routed.sort();
     assert_eq!(routed, [n("/a/member/phone"), n("/c/member/phone")]);
 
     assert!(keyring.adopt(c.context_revoking(2, Some("/c/member/phone/KEY/k"))));
-    until("the C route goes", || at_relay.routed() == [n("/a/member/phone")]).await;
-    assert_eq!(at_relay.live.lock().len(), 1, "the link stays, admitted by A");
+    until("the C route goes", || {
+        at_relay.routed() == [n("/a/member/phone")]
+    })
+    .await;
+    assert_eq!(
+        at_relay.live.lock().len(),
+        1,
+        "the link stays, admitted by A"
+    );
 
     assert!(keyring.adopt(a.context_revoking(2, Some("/a/member/phone/KEY/k"))));
-    until("the link closes", || at_relay.live.lock().is_empty() && at_phone.live.lock().is_empty()).await;
+    until("the link closes", || {
+        at_relay.live.lock().is_empty() && at_phone.live.lock().is_empty()
+    })
+    .await;
     cancel.cancel();
 }
