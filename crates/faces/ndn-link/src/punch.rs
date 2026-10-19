@@ -9,22 +9,29 @@
 //! ApplicationParameters and the answer's Content are a punch message:
 //!
 //! ```text
-//! PunchMessage = PunchKey *Candidate [PunchRefusal] *Data
+//! PunchMessage = PunchKey *Candidate [PunchRefusal] *Data *Membership
 //! PunchKey     = 0x0460 <the sender's link key as a SubjectPublicKeyInfo>
 //! Candidate    = 0x0462 { CandidateKind 0x0464 (1 byte), UdpAddress 0x0466 (6|18 bytes) }
 //! PunchRefusal = 0x0468 { RefusalCode 0x046A (NonNegativeInteger), RefusalText 0x046C (UTF-8) }
 //! Data         = the sender's certificate, then its issuers (as in LinkHello)
+//! Membership   = 0x045C, as in LinkHello: the sender's membership of the
+//!                punched device's namespace when its link key is not
+//!                certified there, bound to the link key for this punch
+//!                ([`punch_binding`])
 //! ```
 //!
 //! An unrecognized TLV-TYPE that is even and above 31 is skipped; any other
 //! is malformed.
 
 use bytes::Bytes;
-use ndn_face_quic::{LinkKey, PathSession, PeerKey, decode_udp_address, encode_udp_address};
+use ndn_face_quic::{
+    ChannelBinding, LinkKey, MEMBERSHIP, Membership, PathSession, PeerKey, decode_udp_address, encode_udp_address,
+};
 use ndn_packet::encode::{DataBuilder, InterestBuilder};
 use ndn_packet::{Data, Interest, Name, NameComponent};
 use ndn_security::{VerifyOutcome, verify_by_sig_type};
 use ndn_tlv::{TlvWriter, read_varu64};
+use sha2::{Digest, Sha256};
 
 use crate::candidates::{Candidate, CandidateKind};
 use crate::policy::{CANDIDATES_MAX, PUNCH_ANSWER_TIMEOUT};
@@ -50,6 +57,9 @@ pub(crate) struct PunchMessage {
     pub(crate) refusal: Option<(u64, String)>,
     /// The sender's certificate and its issuers, nearest first.
     pub(crate) certificates: Vec<Bytes>,
+    /// The sender's membership of the punched device's namespace, when its
+    /// link key is not certified there.
+    pub(crate) memberships: Vec<Membership>,
 }
 
 impl PunchMessage {
@@ -70,6 +80,9 @@ impl PunchMessage {
         }
         for cert in &self.certificates {
             w.write_raw(cert);
+        }
+        for membership in &self.memberships {
+            w.write_raw(&membership.encode());
         }
         w.finish().to_vec()
     }
@@ -92,6 +105,7 @@ impl PunchMessage {
                 }
                 PUNCH_REFUSAL => msg.refusal = Some(decode_refusal(value)?),
                 DATA => msg.certificates.push(Bytes::copy_from_slice(&cur[..end])),
+                MEMBERSHIP => msg.memberships.push(Membership::decode(value)?),
                 t if skippable(t) => {}
                 t => return Err(format!("unknown critical field {t:#x} in the punch message")),
             }
@@ -172,6 +186,17 @@ fn split(buf: &[u8]) -> Result<(u64, &[u8], usize), String> {
         .filter(|&end| end <= buf.len())
         .ok_or_else(|| "truncated TLV value".to_string())?;
     Ok((t, &buf[start..end], end))
+}
+
+/// The value a punch's memberships are bound to, in place of a connection's
+/// TLS exporter: SHA-256(ASCII `ndn-link/1 punch` ‖ the session). The
+/// request and its answer share it; the link keys in their bindings tell
+/// them apart.
+pub(crate) fn punch_binding(session: &PathSession) -> ChannelBinding {
+    let mut hash = Sha256::new();
+    hash.update(b"ndn-link/1 punch");
+    hash.update(session);
+    hash.finalize().into()
 }
 
 /// `<device>/32=link/32=punch`: where a device takes punches.
@@ -282,6 +307,10 @@ mod tests {
             ],
             refusal: None,
             certificates: vec![Bytes::from_static(&[0x06, 0x00])],
+            memberships: vec![Membership {
+                certificates: vec![Bytes::from_static(&[0x06, 0x01, 0xBB])],
+                binding: Bytes::from_static(&[7; 64]),
+            }],
         };
         assert_eq!(PunchMessage::decode(&msg.encode()).unwrap(), msg);
         let refusal = PunchMessage {
@@ -339,6 +368,7 @@ mod tests {
             ],
             refusal: None,
             certificates: Vec::new(),
+            memberships: Vec::new(),
         };
         assert_eq!(
             hex(&request.encode()),
@@ -351,6 +381,7 @@ mod tests {
             candidates: Vec::new(),
             refusal: Some((0x18, "direct paths are off".into())),
             certificates: Vec::new(),
+            memberships: Vec::new(),
         };
         assert_eq!(
             hex(&refusal.encode()),
@@ -361,6 +392,11 @@ mod tests {
         assert_eq!(
             hex(&name.encode_to_tlv()),
             "072c0804686f6d6508066d656d626572080570686f6e6520046c696e6b200570756e636808080102030405060708"
+        );
+        // What the memberships of the punch of session 01..08 are bound to.
+        assert_eq!(
+            hex(&punch_binding(&[1, 2, 3, 4, 5, 6, 7, 8])),
+            "b2d0a9d0b6405643f3fba3edebfb5e1b6d777776ba5a3b90377f3635a6f489fa"
         );
     }
 }

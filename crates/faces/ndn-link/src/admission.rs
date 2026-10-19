@@ -1,4 +1,9 @@
 //! Who a peer is, whether its link is admitted, and what the link carries.
+//!
+//! A peer is identified by its link key's certificate chain and by each
+//! [`Membership`] its hello carries (a namespace it is a member of with
+//! another key, bound to this connection): every one it proves is an
+//! [`Identity`], and the link is admitted by any the local policy accepts.
 
 use std::sync::Arc;
 
@@ -6,13 +11,14 @@ use bytes::Bytes;
 use ndn_cert::onboarding::rdr_prefix;
 use ndn_cert::roles::{Role, parse_device_key};
 use ndn_face_quic::{
-    Admission, Carries, CloseReason, KeyFingerprint, LinkHello, LinkScope, LinkVerdict, PeerKey,
+    Admission, Carries, ChannelBinding, CloseReason, KeyFingerprint, LinkHello, LinkKey, LinkScope, LinkVerdict,
+    MEMBERSHIPS_MAX, Membership, PeerKey,
 };
 use ndn_packet::{Data, Name};
 use ndn_security::cert_name::key_name_of;
 use ndn_security::{CertCache, Certificate, Keyring, SignedTrustContext, ValidationResult, Validator};
 
-use crate::host::{LinkHints, LinkTrust};
+use crate::host::{LinkHints, LinkTrust, OwnMembership};
 use crate::peer::{PeerId, Peers};
 use crate::policy::{ENROLLMENT_ANSWERS, ENROLLMENT_INTERESTS, MAX_CHAIN};
 use crate::serving::{QuotaSlot, QuotaState, ServePolicy};
@@ -34,14 +40,22 @@ pub(crate) struct Identity {
     pub(crate) served: Option<KeyFingerprint>,
 }
 
-/// What the certificate a peer sent establishes.
+/// What one certificate chain a peer sent establishes.
 pub(crate) enum Identified {
     /// A device of a namespace this device holds, or of one whose root
-    /// certificate the hello carries.
+    /// certificate the chain carries.
     Device(Identity),
     /// Nothing this device can use. A peer's expected key may still admit
     /// it.
     Unknown(Unidentified),
+}
+
+/// What a peer's hello establishes: every identity it proves (its link
+/// key's certificate first, then its memberships), and why its link key's
+/// certificate identifies nobody when it does not.
+pub(crate) struct Proven {
+    pub(crate) identities: Vec<Identity>,
+    pub(crate) why: Unidentified,
 }
 
 /// Why a peer's certificate identifies nobody.
@@ -90,20 +104,34 @@ pub(crate) enum Enrollment {
 
 pub(crate) struct Admitted {
     pub(crate) fingerprint: KeyFingerprint,
-    pub(crate) identity: Option<Identity>,
+    /// Every identity the peer proved that this device's policy accepts,
+    /// the one that decides the link (the device a peer entry expects, else
+    /// one of this device's own namespaces) first. Empty for a peer
+    /// admitted by its expected key alone, or on an enrollment link.
+    pub(crate) identities: Vec<Identity>,
     pub(crate) peer: Option<PeerId>,
     pub(crate) enrollment: Option<Enrollment>,
-    /// The link's place among the serving quotas, for a device served for
-    /// a namespace other than this device's own: kept as long as the link.
+    /// The link's place among the serving quotas, when the identity that
+    /// decides it is served for a namespace other than this device's own
+    /// (its limits bound the link): kept as long as the link.
     pub(crate) quota: Option<QuotaSlot>,
+    /// The places of the other identities served for other namespaces:
+    /// they hold their namespace's name and count against its quotas.
+    pub(crate) quotas: Vec<QuotaSlot>,
 }
 
 impl Admitted {
+    /// The identity that decides the link, if any.
+    pub(crate) fn identity(&self) -> Option<&Identity> {
+        self.identities.first()
+    }
+
     pub(crate) fn describe(&self) -> String {
-        match &self.identity {
-            Some(id) => format!("{} (key {})", id.device, self.fingerprint),
-            None => format!("key {}", self.fingerprint),
+        if self.identities.is_empty() {
+            return format!("key {}", self.fingerprint);
         }
+        let devices: Vec<String> = self.identities.iter().map(|id| id.device.to_string()).collect();
+        format!("{} (key {})", devices.join(", "), self.fingerprint)
     }
 }
 
@@ -121,19 +149,41 @@ impl Judge<'_> {
         self.trust.keyring()
     }
 
-    /// The certificate this device links with now, if it has one.
-    pub(crate) fn own_certificate(&self) -> Option<Certificate> {
-        let chain = self.trust.own_chain();
-        let wire = chain.first()?;
-        let data = Data::decode(wire.clone()).ok()?;
-        Certificate::decode(&data).ok()
+    /// This device's certificates: the one of the key it links with now
+    /// (if it has one) first, then the one of each membership with another
+    /// key ([`LinkTrust::own_memberships`]), with that membership.
+    pub(crate) fn own_certificates(&self) -> Vec<(Certificate, Option<OwnMembership>)> {
+        let mut out: Vec<(Certificate, Option<OwnMembership>)> = Vec::new();
+        if let Some(cert) = self.trust.own_chain().first().and_then(decode_certificate) {
+            out.push((cert, None));
+        }
+        for m in self.trust.own_memberships() {
+            let Some(cert) = m.chain.first().and_then(decode_certificate) else {
+                continue;
+            };
+            if out.iter().any(|(c, _)| c.name == cert.name || c.public_key == cert.public_key) {
+                continue;
+            }
+            out.push((cert, Some(m)));
+        }
+        out
     }
 
-    /// This device's role in `namespace`, from the certificate it links
-    /// with now; `None` when that certificate is not of `namespace`.
+    /// This device's role in `namespace`, from the certificate it holds
+    /// there (its link key's or a membership's); `None` when it holds none.
     pub(crate) fn own_role_in(&self, namespace: &Name) -> Option<Role> {
-        let cert = self.own_certificate()?;
-        parse_device_key(namespace, &cert.name).map(|d| d.role)
+        self.own_certificates()
+            .iter()
+            .find_map(|(cert, _)| parse_device_key(namespace, &cert.name).map(|d| d.role))
+    }
+
+    /// This device's names (`/<ns>/<role>/<device>`), one per certificate
+    /// it holds, the link key's first.
+    pub(crate) fn own_devices(&self) -> Vec<Name> {
+        self.own_certificates()
+            .iter()
+            .filter_map(|(cert, _)| device_of(&cert.name))
+            .collect()
     }
 
     /// The namespace of `device` (`/<ns>/<role>/<device>`): the held one it
@@ -190,37 +240,99 @@ impl Judge<'_> {
         }
     }
 
-    /// What the certificates `hello` carries establish about `key`.
-    pub(crate) async fn identify(&self, key: &PeerKey, hello: &LinkHello) -> Result<Identified, Refusal> {
+    /// What `hello` (from the link key `key`, on the connection or punch
+    /// whose binding value is `channel`) establishes: the identity of its
+    /// link key's certificate and of each membership it proves.
+    ///
+    /// A malformed certificate, a link key certificate for another key or a
+    /// membership not bound to this link refuse the link. A revoked
+    /// certificate (or known revoked key), or a collision with a held name,
+    /// only refuses it when no other identity is proved.
+    pub(crate) async fn identify(&self, key: &PeerKey, hello: &LinkHello, channel: &ChannelBinding) -> Result<Proven, Refusal> {
+        let mut identities: Vec<Identity> = Vec::new();
+        let mut held_back: Option<Refusal> = None;
+        let mut why = Unidentified::NoCertificate;
         if let Some(refusal) = self.revoked_key(key) {
+            held_back = Some(refusal);
+        } else if let Some((leaf_wire, issuers)) = hello.certificates.split_first() {
+            let (leaf_data, leaf) = decode_with_data(leaf_wire).map_err(|e| {
+                Refusal::new(CloseReason::Protocol, format!("the certificate in your link hello does not decode: {e}"))
+            })?;
+            if leaf.public_key != key.ndn_public_key() {
+                return Err(Refusal::new(
+                    CloseReason::CertificateForAnotherKey,
+                    format!(
+                        "the certificate {} you sent is for another key than the one your link \
+                         handshake proved ({}); a device links with the key its certificate certifies",
+                        leaf.name,
+                        key.fingerprint()
+                    ),
+                ));
+            }
+            match self.identify_chain(&leaf_data, &leaf, issuers).await {
+                Ok(Identified::Device(id)) => identities.push(id),
+                Ok(Identified::Unknown(w)) => why = w,
+                Err(refusal) if refusal.reason == CloseReason::Protocol => return Err(refusal),
+                Err(refusal) => held_back = Some(refusal),
+            }
+        }
+        let link_key = key.fingerprint();
+        for membership in hello.memberships.iter().take(MEMBERSHIPS_MAX) {
+            let (leaf_wire, issuers) = membership
+                .certificates
+                .split_first()
+                .expect("a decoded membership carries a certificate");
+            let (leaf_data, leaf) = decode_with_data(leaf_wire).map_err(|e| {
+                Refusal::new(
+                    CloseReason::Protocol,
+                    format!("a membership certificate in your link hello does not decode: {e}"),
+                )
+            })?;
+            membership.verify(&leaf.public_key, &link_key, channel).await.map_err(|e| {
+                Refusal::new(
+                    CloseReason::MembershipNotBound,
+                    format!(
+                        "your membership certificate {} is not shown by its key: {e}. A device shows a \
+                         membership only with the key that certificate certifies, bound anew to each link",
+                        leaf.name
+                    ),
+                )
+            })?;
+            match self.identify_chain(&leaf_data, &leaf, issuers).await {
+                Ok(Identified::Device(id)) => {
+                    if !identities.iter().any(|i| i.namespace == id.namespace) {
+                        identities.push(id);
+                    }
+                }
+                Ok(Identified::Unknown(w)) => {
+                    tracing::debug!(target: "face.quic", key = %link_key, "a membership identifies nobody here: {w}");
+                    if matches!(why, Unidentified::NoCertificate) && hello.certificates.is_empty() {
+                        why = w;
+                    }
+                }
+                Err(refusal) if refusal.reason == CloseReason::Protocol => return Err(refusal),
+                Err(refusal) => {
+                    held_back.get_or_insert(refusal);
+                }
+            }
+        }
+        if identities.is_empty()
+            && let Some(refusal) = held_back
+        {
             return Err(refusal);
         }
-        let Some((leaf_wire, issuers)) = hello.certificates.split_first() else {
-            return Ok(Identified::Unknown(Unidentified::NoCertificate));
-        };
+        Ok(Proven { identities, why })
+    }
+
+    /// What the certificate `leaf` (its Data `leaf_data`), with the issuers
+    /// `issuers` sent with it, establishes (§7.1 steps 4–11, or R1–R7 for a
+    /// namespace this device does not hold). The key it certifies was
+    /// proved already.
+    async fn identify_chain(&self, leaf_data: &Data, leaf: &Certificate, issuers: &[Bytes]) -> Result<Identified, Refusal> {
         let unusable = |why: String| Ok(Identified::Unknown(Unidentified::Unusable(why)));
-        let decode = |wire: &Bytes| {
-            Data::decode(wire.clone())
-                .map_err(|e| e.to_string())
-                .and_then(|data| Certificate::decode(&data).map(|c| (data, c)).map_err(|e| e.to_string()))
-        };
-        let (leaf_data, leaf) = decode(leaf_wire).map_err(|e| {
-            Refusal::new(CloseReason::Protocol, format!("the certificate in your link hello does not decode: {e}"))
-        })?;
-        if leaf.public_key != key.ndn_public_key() {
-            return Err(Refusal::new(
-                CloseReason::CertificateForAnotherKey,
-                format!(
-                    "the certificate {} you sent is for another key than the one your link \
-                     handshake proved ({}); a device links with the key its certificate certifies",
-                    leaf.name,
-                    key.fingerprint()
-                ),
-            ));
-        }
         let mut chain: Vec<Certificate> = Vec::new();
         for wire in issuers.iter().take(MAX_CHAIN) {
-            match decode(wire) {
+            match decode_with_data(wire) {
                 Ok((_, cert)) => chain.push(cert),
                 Err(e) => {
                     return Err(Refusal::new(
@@ -232,7 +344,7 @@ impl Judge<'_> {
         }
         let ctx = self.keyring().context_for(&leaf.name);
         if ctx.namespace().is_empty() {
-            return Ok(self.identify_foreign(&leaf_data, &leaf, &chain).await);
+            return Ok(self.identify_foreign(leaf_data, leaf, &chain).await);
         }
         let ns = ctx.namespace().clone();
         let version = ctx.version();
@@ -263,7 +375,7 @@ impl Judge<'_> {
                 ),
             ));
         }
-        let why = match self.validate(&leaf_data, &chain).await {
+        let why = match self.validate(leaf_data, &chain).await {
             ValidationResult::Valid(safe) if safe.is_authenticated() => None,
             ValidationResult::Valid(_) => Some(format!(
                 "its certificate {} is not signed by a key of {ns} (a DigestSha256 proves \
@@ -439,25 +551,34 @@ impl Judge<'_> {
         ))
     }
 
-    /// Decide whether the link from `key` (which sent `hello`) is admitted.
+    /// Decide whether the link from `key` (which sent `hello` on the
+    /// connection or punch whose binding value is `channel`) is admitted.
     /// `dialed` is the peer this device dialed, `None` for a link another
     /// device opened.
     pub(crate) async fn decide(
         &self,
         key: &PeerKey,
         hello: &LinkHello,
+        channel: &ChannelBinding,
         dialed: Option<PeerId>,
     ) -> Result<Admitted, Refusal> {
         let fingerprint = key.fingerprint();
-        let identity = match self.identify(key, hello).await? {
-            Identified::Device(id) => Ok(id),
-            Identified::Unknown(why) => Err(why),
-        };
+        let proven = self.identify(key, hello, channel).await?;
         // A device name only a root this device does not hold vouches for
         // finds no peer entry.
-        let device = identity.as_ref().ok().filter(|id| id.served.is_none()).map(|id| &id.device);
-        let peer = dialed.or_else(|| self.peers.find(fingerprint, device));
-        decide_identified(self, fingerprint, identity, peer, dialed)
+        let devices: Vec<&Name> = proven
+            .identities
+            .iter()
+            .filter(|id| id.served.is_none())
+            .map(|id| &id.device)
+            .collect();
+        let peer = dialed.or_else(|| self.peers.find_any(fingerprint, &devices));
+        let identities = if proven.identities.is_empty() {
+            Err(proven.why)
+        } else {
+            Ok(proven.identities)
+        };
+        decide_identified(self, fingerprint, identities, peer, dialed)
     }
 
     /// How this side admits the link: what it tells the peer, and what the
@@ -541,12 +662,13 @@ impl Judge<'_> {
     }
 }
 
-/// The admission matrix, once the peer's certificate is judged
-/// (`identity`) and its peer entry found (`peer`).
+/// The admission matrix, once the peer's certificates are judged
+/// (`identities`: every identity it proved, never empty when `Ok`) and its
+/// peer entry found (`peer`).
 fn decide_identified(
     judge: &Judge<'_>,
     fingerprint: KeyFingerprint,
-    identity: Result<Identity, Unidentified>,
+    identities: Result<Vec<Identity>, Unidentified>,
     peer: Option<PeerId>,
     dialed: Option<PeerId>,
 ) -> Result<Admitted, Refusal> {
@@ -554,19 +676,28 @@ fn decide_identified(
     let config = peer.and_then(|i| judge.peers.get(i));
     let key_expected = config.as_ref().is_some_and(|p| p.key == Some(fingerprint));
     // Only a held namespace confirms a device a peer entry names.
-    let identity = match identity {
-        Ok(id) if config.is_some() && id.served.is_some() => Err(Unidentified::Unusable(format!(
-            "its certificate is of {}, a namespace this device does not hold",
-            id.namespace
-        ))),
+    let identities = match identities {
+        Ok(ids) if config.is_some() => {
+            let (held, served): (Vec<Identity>, Vec<Identity>) = ids.into_iter().partition(|id| id.served.is_none());
+            if held.is_empty() {
+                let namespaces: Vec<Name> = served.into_iter().map(|id| id.namespace).collect();
+                Err(Unidentified::Unusable(format!(
+                    "its certificate is of {}, a namespace this device does not hold",
+                    list(&namespaces)
+                )))
+            } else {
+                Ok(held)
+            }
+        }
         other => other,
     };
-    let admitted = |identity, enrollment, quota| Admitted {
+    let admitted = |identities, enrollment, quota, quotas| Admitted {
         fingerprint,
-        identity,
+        identities,
         peer,
         enrollment,
         quota,
+        quotas,
     };
 
     if let Some(p) = &config {
@@ -583,11 +714,12 @@ fn decide_identified(
             ));
         }
         if let Some(device) = &p.device {
-            match &identity {
-                Ok(id) if id.device != *device => {
+            match &identities {
+                Ok(ids) if !ids.iter().any(|id| id.device == *device) => {
+                    let devices: Vec<Name> = ids.iter().map(|id| id.device.clone()).collect();
                     return Err(Refusal::new(
                         CloseReason::NotTheExpectedDevice,
-                        format!("this device expects {device} here, and you are {}", id.device),
+                        format!("this device expects {device} here, and you are {}", list(&devices)),
                     ));
                 }
                 Err(why) if !key_expected => {
@@ -596,7 +728,7 @@ fn decide_identified(
                     // links to it for its enrollment only.
                     let ns = judge.namespace_of(device);
                     if dialed.is_some() && judge.own_role_in(&ns).is_none() {
-                        return Ok(admitted(None, Some(Enrollment::Device(ns)), None));
+                        return Ok(admitted(Vec::new(), Some(Enrollment::Device(ns)), None, Vec::new()));
                     }
                     return Err(Refusal::new(
                         CloseReason::Unrecognized,
@@ -615,60 +747,42 @@ fn decide_identified(
 
     // Nobody asked for the link: it may be an enrollment link.
     let unasked = dialed.is_none() && config.is_none();
-    match identity {
-        Ok(id) => {
-            if id.served.is_none() {
-                let ctx = judge.keyring().context_for(&id.device);
-                let policy = ctx.link_policy();
-                if !policy.allows_link(id.role.as_str()) {
-                    return Err(Refusal::new(
-                        CloseReason::RoleNotAllowed,
-                        format!(
-                            "{}'s link policy (trust context v{}) does not let {} devices link",
-                            id.namespace, id.version, id.role
-                        ),
-                    ));
-                }
-                if peer.is_some_and(|p| judge.peers.is_relay(p)) && !policy.allows_relay(id.role.as_str()) {
-                    return Err(Refusal::new(
-                        CloseReason::RoleNotAllowed,
-                        format!(
-                            "this device reaches others through you, and {}'s link policy (trust \
-                             context v{}) does not let {} devices relay",
-                            id.namespace, id.version, id.role
-                        ),
-                    ));
-                }
+    match identities {
+        Ok(mut ids) => {
+            // The device a peer entry expects decides the link.
+            let expected = config.as_ref().and_then(|p| p.device.as_ref());
+            if let Some(at) = expected.and_then(|d| ids.iter().position(|id| id.device == *d)) {
+                let id = ids.remove(at);
+                ids.insert(0, id);
             }
-            if config.is_some() {
-                return Ok(admitted(Some(id), None, None));
-            }
-            match judge.serves(&id) {
-                Ok(quota) => Ok(admitted(Some(id), None, quota)),
-                // A device of another namespace gets no enrollment link: it
-                // proved whom it is, and this relay does not serve it.
-                Err(mut refusal) => {
-                    if refusal.reason == CloseReason::NotServed
-                        && id.served.is_some()
-                        && unasked
-                        && let Ok(namespaces) = judge.enrollment_namespaces()
-                    {
-                        refusal.text.push_str(&format!(
-                            ". A device enrolls in {} over this relay while its hello holds no \
-                             certificate of another namespace",
-                            list(&namespaces)
-                        ));
+            // Each identity in a held namespace is judged by that
+            // namespace's link policy; the peer is admitted by the ones it
+            // allows.
+            let mut refused: Option<Refusal> = None;
+            let mut allowed = Vec::new();
+            for (i, id) in ids.into_iter().enumerate() {
+                match link_policy_refusal(judge, &id, peer) {
+                    None => allowed.push(id),
+                    Some(refusal) if i == 0 && expected.is_some() => return Err(refusal),
+                    Some(refusal) => {
+                        refused.get_or_insert(refusal);
                     }
-                    Err(refusal)
                 }
             }
+            let Some(first) = refused.filter(|_| allowed.is_empty()) else {
+                if config.is_some() {
+                    return Ok(admitted(allowed, None, None, Vec::new()));
+                }
+                return serve(judge, fingerprint, peer, allowed, unasked);
+            };
+            Err(first)
         }
         Err(why) if !key_expected => {
             // A device this relay does not know may enroll over it.
             let no_enrollment_link = if unasked {
                 match judge.enrollment_namespaces() {
                     Ok(namespaces) => {
-                        return Ok(admitted(None, Some(Enrollment::Relay(namespaces)), None));
+                        return Ok(admitted(Vec::new(), Some(Enrollment::Relay(namespaces)), None, Vec::new()));
                     }
                     Err(why_not) => format!(" It admits no enrollment link either: {why_not}."),
                 }
@@ -714,26 +828,123 @@ fn decide_identified(
                 ),
             ))
         }
-        Err(_) => Ok(admitted(None, None, None)),
+        Err(_) => Ok(admitted(Vec::new(), None, None, Vec::new())),
     }
 }
 
+/// Why the link policy of `id`'s namespace refuses it here, if it does:
+/// its role may not link, or may not relay when this device reaches others
+/// through it (`peer` is a relay). A served identity has no policy here.
+fn link_policy_refusal(judge: &Judge<'_>, id: &Identity, peer: Option<PeerId>) -> Option<Refusal> {
+    if id.served.is_some() {
+        return None;
+    }
+    let ctx = judge.keyring().context_for(&id.device);
+    let policy = ctx.link_policy();
+    if !policy.allows_link(id.role.as_str()) {
+        return Some(Refusal::new(
+            CloseReason::RoleNotAllowed,
+            format!(
+                "{}'s link policy (trust context v{}) does not let {} devices link",
+                id.namespace, id.version, id.role
+            ),
+        ));
+    }
+    if peer.is_some_and(|p| judge.peers.is_relay(p)) && !policy.allows_relay(id.role.as_str()) {
+        return Some(Refusal::new(
+            CloseReason::RoleNotAllowed,
+            format!(
+                "this device reaches others through you, and {}'s link policy (trust \
+                 context v{}) does not let {} devices relay",
+                id.namespace, id.version, id.role
+            ),
+        ));
+    }
+    None
+}
+
+/// The serving policy's decision on a peer nobody asked for, over the
+/// identities its link policies allow (`ids`, never empty): it is served by
+/// each identity the policy serves, the ones of this device's own
+/// namespaces (never under quota) first, then those served without limits,
+/// then those under quotas — the first decides the link's scope. Refused
+/// with the first refusal when the policy serves none.
+fn serve(
+    judge: &Judge<'_>,
+    fingerprint: KeyFingerprint,
+    peer: Option<PeerId>,
+    ids: Vec<Identity>,
+    unasked: bool,
+) -> Result<Admitted, Refusal> {
+    let mut served: Vec<(Identity, Option<QuotaSlot>)> = Vec::new();
+    let mut refused: Option<(Refusal, bool)> = None;
+    for id in ids {
+        match judge.serves(&id) {
+            Ok(quota) => served.push((id, quota)),
+            Err(refusal) => {
+                refused.get_or_insert((refusal, id.served.is_some()));
+            }
+        }
+    }
+    if served.is_empty() {
+        let (mut refusal, foreign) = refused.expect("an identity was judged");
+        // A device of another namespace gets no enrollment link: it proved
+        // whom it is, and this relay does not serve it.
+        if refusal.reason == CloseReason::NotServed
+            && foreign
+            && unasked
+            && let Ok(namespaces) = judge.enrollment_namespaces()
+        {
+            refusal.text.push_str(&format!(
+                ". A device enrolls in {} over this relay while its hello holds no \
+                 certificate of another namespace",
+                list(&namespaces)
+            ));
+        }
+        return Err(refusal);
+    }
+    served.sort_by_key(|(_, quota)| match quota {
+        None => 0,
+        Some(slot) if slot.limits.is_none() => 1,
+        Some(_) => 2,
+    });
+    let mut admitted = Admitted {
+        fingerprint,
+        identities: Vec::with_capacity(served.len()),
+        peer,
+        enrollment: None,
+        quota: None,
+        quotas: Vec::new(),
+    };
+    for (i, (id, quota)) in served.into_iter().enumerate() {
+        admitted.identities.push(id);
+        match quota {
+            Some(slot) if i == 0 => admitted.quota = Some(slot),
+            Some(slot) => admitted.quotas.push(slot),
+            None => {}
+        }
+    }
+    Ok(admitted)
+}
+
 /// This device's certificate chain as a link hello (and a punch message)
-/// carries it: [`LinkTrust::own_chain`], ending in the self-signed root
-/// certificate of its namespace — the anchor of the held trust context,
-/// which the chain a device keeps does not hold — so a relay that does not
-/// hold the namespace can check it against its root.
+/// carries it: [`LinkTrust::own_chain`], ending in its namespace's root
+/// ([`with_root`]).
 pub(crate) fn hello_chain(trust: &dyn LinkTrust) -> Vec<Bytes> {
-    let mut chain = trust.own_chain();
-    let last = chain
-        .last()
-        .and_then(|wire| Data::decode(wire.clone()).ok())
-        .and_then(|data| Certificate::decode(&data).ok());
-    let Some(last) = last.filter(|c| !is_self_signed(c)) else {
+    with_root(trust.keyring(), trust.own_chain())
+}
+
+/// `chain` (a certificate and its issuers as this device keeps them),
+/// ending in the self-signed root certificate of its namespace — the
+/// anchor of the held trust context, which the chain a device keeps does
+/// not hold — so a relay that does not hold the namespace can check it
+/// against its root.
+pub(crate) fn with_root(keyring: &Keyring, mut chain: Vec<Bytes>) -> Vec<Bytes> {
+    let Some(last) = chain.last().and_then(decode_certificate).filter(|c| !is_self_signed(c)) else {
         return chain;
     };
     let anchor = last.issuer.as_deref().and_then(|issuer| {
-        let ctx = trust.keyring().context_for(issuer);
+        let ctx = keyring.context_for(issuer);
         if ctx.namespace().is_empty() {
             return None;
         }
@@ -743,6 +954,74 @@ pub(crate) fn hello_chain(trust: &dyn LinkTrust) -> Vec<Bytes> {
         chain.push(wire);
     }
     chain
+}
+
+/// This device's memberships as a hello or a punch message shows them:
+/// one per namespace it is a member of with a key other than `link` (its
+/// link key), its chain ending in the namespace's root, bound to `link` on
+/// `channel`; only the one of `namespace` when given. At most
+/// [`MEMBERSHIPS_MAX`]. A membership whose key cannot sign is left out, and
+/// said so.
+pub(crate) async fn own_memberships(
+    trust: &dyn LinkTrust,
+    link: &LinkKey,
+    channel: &ChannelBinding,
+    namespace: Option<&Name>,
+) -> Vec<Membership> {
+    let link_public = PeerKey::from_spki(link.spki()).map(|k| k.ndn_public_key()).ok();
+    let fingerprint = link.fingerprint();
+    let mut shown: Vec<Name> = Vec::new();
+    let mut out = Vec::new();
+    for m in trust.own_memberships() {
+        if out.len() >= MEMBERSHIPS_MAX {
+            break;
+        }
+        if namespace.is_some_and(|ns| *ns != m.namespace) || shown.contains(&m.namespace) {
+            continue;
+        }
+        let Some(cert) = m.chain.first().and_then(decode_certificate) else {
+            continue;
+        };
+        if link_public.as_ref() == Some(&cert.public_key) {
+            continue;
+        }
+        let chain = with_root(trust.keyring(), m.chain.clone());
+        match Membership::sign(m.signer.as_ref(), &fingerprint, channel, chain).await {
+            Ok(membership) => {
+                shown.push(m.namespace.clone());
+                out.push(membership);
+            }
+            Err(e) => tracing::warn!(
+                target: "face.quic",
+                namespace = %m.namespace,
+                "this device's membership of {} is not shown on its links: {e}",
+                m.namespace
+            ),
+        }
+    }
+    out
+}
+
+/// A certificate Data wire, decoded.
+fn decode_certificate(wire: &Bytes) -> Option<Certificate> {
+    decode_with_data(wire).ok().map(|(_, cert)| cert)
+}
+
+/// A certificate Data wire, decoded, with its Data.
+fn decode_with_data(wire: &Bytes) -> Result<(Data, Certificate), String> {
+    let data = Data::decode(wire.clone()).map_err(|e| e.to_string())?;
+    let cert = Certificate::decode(&data).map_err(|e| e.to_string())?;
+    Ok((data, cert))
+}
+
+/// The device a certificate name `/<ns>/<role>/<device>/KEY/…` is of: the
+/// name before its first `KEY` component.
+pub(crate) fn device_of(cert: &Name) -> Option<Name> {
+    let key = cert
+        .components()
+        .iter()
+        .position(|c| c.typ == ndn_packet::tlv_type::NAME_COMPONENT && c.value.as_ref() == b"KEY")?;
+    Some(Name::from_components(cert.components()[..key].iter().cloned()))
 }
 
 /// The trust context of `ns` as `ndn-cert` makes a namespace — its schema
@@ -1007,9 +1286,12 @@ mod tests {
     fn hello(certificates: Vec<Bytes>) -> LinkHello {
         LinkHello {
             certificates,
-            direct_path: None,
+            ..LinkHello::default()
         }
     }
+
+    /// A connection's binding value, for hellos without memberships.
+    const CH: ChannelBinding = [0; 32];
 
     /// A relay holding `held` and linking with the certificate of
     /// `/a/node/relay` in `own`, under `serve`. Its namespace turns
@@ -1038,18 +1320,18 @@ mod tests {
         let judge = world.judge();
 
         let (key, chain) = a.device("member", "laptop", 12).await;
-        let admitted = judge.decide(&key, &hello(chain), None).await.unwrap();
+        let admitted = judge.decide(&key, &hello(chain), &CH, None).await.unwrap();
         assert!(admitted.quota.is_none());
-        assert_eq!(admitted.identity.unwrap().device, n("/a/member/laptop"));
+        assert_eq!(admitted.identity().unwrap().device, n("/a/member/laptop"));
 
         let (key, chain) = b.device("member", "phone", 22).await;
-        let refusal = judge.decide(&key, &hello(chain), None).await.err().unwrap();
+        let refusal = judge.decide(&key, &hello(chain), &CH, None).await.err().unwrap();
         assert_eq!(refusal.reason, CloseReason::NotServed, "{}", refusal.text);
         assert!(refusal.text.contains("its own namespaces (/a)"), "{}", refusal.text);
 
         let (key, mut chain) = c.device("member", "phone", 32).await;
         chain.push(c.root.clone());
-        let refusal = judge.decide(&key, &hello(chain), None).await.err().unwrap();
+        let refusal = judge.decide(&key, &hello(chain), &CH, None).await.err().unwrap();
         assert_eq!(refusal.reason, CloseReason::NotServed, "{}", refusal.text);
         assert!(refusal.text.contains(&c.root_fingerprint().to_string()), "{}", refusal.text);
     }
@@ -1069,15 +1351,15 @@ mod tests {
 
         let (key, chain) = c.device("member", "phone", 32).await;
         let device_side = Bare(Arc::new(keyring_with(c.context())), None, chain);
-        let admitted = judge.decide(&key, &hello(hello_chain(&device_side)), None).await.unwrap();
-        let id = admitted.identity.as_ref().unwrap();
+        let admitted = judge.decide(&key, &hello(hello_chain(&device_side)), &CH, None).await.unwrap();
+        let id = admitted.identity().unwrap();
         assert_eq!((id.device.clone(), id.served), (n("/c/member/phone"), Some(c.root_fingerprint())));
         assert!(admitted.quota.as_ref().is_some_and(|q| q.limits.is_none()));
         assert!(judge.admission_for(&admitted).scope.is_none());
 
         let (key, mut chain) = d.device("member", "phone", 42).await;
         chain.push(d.root.clone());
-        let refusal = judge.decide(&key, &hello(chain), None).await.err().unwrap();
+        let refusal = judge.decide(&key, &hello(chain), &CH, None).await.err().unwrap();
         assert_eq!(refusal.reason, CloseReason::NotServed, "{}", refusal.text);
     }
 
@@ -1094,11 +1376,11 @@ mod tests {
 
         let (key, mut chain) = c.device("member", "phone", 32).await;
         chain.push(c.root.clone());
-        let refusal = judge.decide(&key, &hello(chain), None).await.err().unwrap();
+        let refusal = judge.decide(&key, &hello(chain), &CH, None).await.err().unwrap();
         assert_eq!(refusal.reason, CloseReason::NotServed, "{}", refusal.text);
         assert!(refusal.text.contains("enrolls in /a"), "{}", refusal.text);
 
-        let admitted = judge.decide(&key, &hello(Vec::new()), None).await.unwrap();
+        let admitted = judge.decide(&key, &hello(Vec::new()), &CH, None).await.unwrap();
         assert_eq!(admitted.enrollment, Some(Enrollment::Relay(vec![n("/a")])));
     }
 
@@ -1129,7 +1411,7 @@ mod tests {
         let world = World::new(Bare(Arc::new(Keyring::new()), None, Vec::new()), Vec::new(), serve);
         let judge = world.judge();
         let (c, d, x) = (KeyFingerprint([3; 32]), KeyFingerprint([4; 32]), KeyFingerprint([5; 32]));
-        let decide = |id: Identity| decide_identified(&judge, THEIRS, Ok(id), None, None);
+        let decide = |id: Identity| decide_identified(&judge, THEIRS, Ok(vec![id]), None, None);
 
         let first = decide(served("/c", "/c/member/a", c)).unwrap();
         let scope = judge.admission_for(&first).scope.unwrap();
@@ -1157,7 +1439,7 @@ mod tests {
     fn an_expected_key_admits_an_unknown_device() {
         let admitted = decide(Keyring::new(), vec![spec(Some(THEIRS), None)], Some(PeerId(0)), None).unwrap();
         assert_eq!(admitted.peer, Some(PeerId(0)));
-        assert!(admitted.enrollment.is_none() && admitted.identity.is_none());
+        assert!(admitted.enrollment.is_none() && admitted.identity().is_none());
         // Also a device of a namespace this device holds and is not in,
         // which the serving policy (own) does not serve.
         let world = World::new(
@@ -1170,8 +1452,8 @@ mod tests {
             version: 1,
             ..served("/b", "/b/member/phone", THEIRS)
         };
-        let admitted = decide_identified(&world.judge(), THEIRS, Ok(id), Some(PeerId(0)), None).unwrap();
-        assert!(admitted.identity.is_some() && admitted.quota.is_none());
+        let admitted = decide_identified(&world.judge(), THEIRS, Ok(vec![id]), Some(PeerId(0)), None).unwrap();
+        assert!(admitted.identity().is_some() && admitted.quota.is_none());
     }
 
     #[test]
@@ -1266,16 +1548,15 @@ mod tests {
             Sha256::digest(&signed)
         };
         let cert = tlv(t::DATA, &[signed, tlv(t::SIGNATURE_VALUE, digest.as_slice())].concat());
-        let hello = LinkHello {
-            certificates: vec![Bytes::from(cert)],
-            direct_path: None,
-        };
+        let hello = hello(vec![Bytes::from(cert)]);
 
         let world = World::new(Bare(Arc::new(keyring), None, Vec::new()), Vec::new(), ServePolicy::Own);
         let judge = world.judge();
-        match judge.identify(&peer, &hello).await {
-            Ok(Identified::Unknown(why)) => assert!(why.to_string().contains("DigestSha256"), "{why}"),
-            Ok(Identified::Device(id)) => panic!("a digest-only certificate identified {}", id.device),
+        match judge.identify(&peer, &hello, &CH).await {
+            Ok(proven) if proven.identities.is_empty() => {
+                assert!(proven.why.to_string().contains("DigestSha256"), "{}", proven.why)
+            }
+            Ok(proven) => panic!("a digest-only certificate identified {}", proven.identities[0].device),
             Err(refusal) => panic!("expected an unknown device, refused: {refusal:?}"),
         }
     }
@@ -1307,7 +1588,7 @@ mod tests {
             let peer = peer.clone();
             async move {
                 let world = World::new(trust, Vec::new(), ServePolicy::Own);
-                world.judge().identify(&peer, &LinkHello::default()).await
+                world.judge().identify(&peer, &LinkHello::default(), &CH).await
             }
         };
         let keyring = Arc::new(keyring);
@@ -1324,7 +1605,7 @@ mod tests {
         for known in [Some(known("/home/member/laptop/KEY/k2/CA/v=1")), None] {
             assert!(matches!(
                 identify(Bare(Arc::clone(&keyring), known, Vec::new())).await,
-                Ok(Identified::Unknown(_))
+                Ok(proven) if proven.identities.is_empty()
             ));
         }
     }

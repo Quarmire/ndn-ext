@@ -5,10 +5,12 @@
 //! device name: it sends a signed punch Interest to the peer's device name
 //! (through the relay) carrying its candidate addresses, and the peer
 //! answers with its own in signed Data, once it has admitted the sender as
-//! it would admit a link from it. Then both send probes from their link
-//! sockets to every candidate the other signed, and the device whose key
-//! fingerprint is smaller dials the other's candidates; the other accepts.
-//! The connection is admitted like any link and becomes the link's direct
+//! it would admit a link from it. Both show the membership of the
+//! namespace the punch is in when their link key is not certified there,
+//! bound to the punch. Then both send probes from their link sockets to
+//! every candidate the other signed, and the device whose key fingerprint
+//! is smaller dials the other's candidates; the other accepts. The
+//! connection is admitted like any link and becomes the link's direct
 //! path; its routes cost 0, so it carries the traffic while the relay's
 //! routes stay as the fallback.
 
@@ -26,7 +28,7 @@ use ndn_face_quic::{CloseReason, KeyFingerprint, LinkEndpoint, LinkHandle, LinkH
 use ndn_packet::{Data, Interest, Name};
 use ndn_security::{ReplayCheck, ReplayGuard};
 
-use crate::admission::Admitted;
+use crate::admission::{Admitted, own_memberships};
 use crate::candidates::{Candidate, CandidateKind, dial_order, interfaces, probe_targets};
 use crate::links::{Links, Origin};
 use crate::peer::PeerId;
@@ -57,6 +59,14 @@ pub(crate) struct Target {
     pub(crate) key: Option<KeyFingerprint>,
     /// Its peer entry, when it has one.
     pub(crate) peer: Option<PeerId>,
+}
+
+/// A punch Interest this device answers: its name and session, and the
+/// namespace of the name of this device it was sent to.
+struct Punched {
+    name: Name,
+    session: PathSession,
+    namespace: Name,
 }
 
 /// How a punch again after a network change ended.
@@ -331,9 +341,9 @@ impl Links {
     }
 
     /// Why direct paths with an admitted device are off, if they are: its
-    /// peer entry says `direct = false`, or the link policy of its
-    /// namespace turns them off or does not pair its role with this
-    /// device's.
+    /// peer entry says `direct = false`, or the link policy of each
+    /// namespace it was admitted in turns them off or does not pair its role
+    /// with this device's (one namespace that pairs them is enough).
     pub(crate) fn direct_off(&self, admitted: &Admitted) -> Option<String> {
         let peer = admitted.peer.and_then(|i| self.peers.get(i));
         if let Some(p) = &peer
@@ -344,12 +354,20 @@ impl Links {
                 self.hints.peer_entry, p.label
             ));
         }
-        let device = admitted
-            .identity
-            .as_ref()
-            .map(|id| id.device.clone())
-            .or_else(|| peer.and_then(|p| p.device.clone()))?;
-        self.pair_off(&device)
+        let mut devices: Vec<Name> = admitted.identities.iter().map(|id| id.device.clone()).collect();
+        if devices.is_empty() {
+            devices.extend(peer.and_then(|p| p.device.clone()));
+        }
+        let mut why = None;
+        for device in &devices {
+            match self.pair_off(device) {
+                None => return None,
+                Some(off) => {
+                    why.get_or_insert(off);
+                }
+            }
+        }
+        why
     }
 
     /// Why the link policy of `device`'s namespace allows no direct path
@@ -600,11 +618,17 @@ impl Links {
         let chain = crate::admission::hello_chain(self.trust.as_ref());
         let ours = self.gather(&socket);
         let session = random_session();
+        // Its device is of a namespace this device may be a member of with
+        // another key than its link key: that membership, bound to this
+        // punch, is how the other device knows it there.
+        let namespace = self.judge().namespace_of(&device);
+        let memberships = own_memberships(self.trust.as_ref(), &key, &punch::punch_binding(&session), Some(&namespace)).await;
         let request = PunchMessage {
             key: key.spki().clone(),
             candidates: ours.clone(),
             refusal: None,
             certificates: chain.clone(),
+            memberships,
         };
         tracing::info!(
             target: "face.quic",
@@ -633,7 +657,7 @@ impl Links {
                 )));
             }
         };
-        let (peer_key, theirs) = self.check_answer(&data, target).await?;
+        let (peer_key, theirs) = self.check_answer(&data, target, &session).await?;
         self.direct.set(target.whom, |e| e.key = Some(peer_key.fingerprint()));
         if let Some((code, text)) = theirs.refusal {
             let transient = CloseReason::from_code(code).is_none_or(|r| r.is_transient());
@@ -649,10 +673,15 @@ impl Links {
             .map_err(Failure::new)
     }
 
-    /// The answer to this device's punch of `target`, verified: signed by
-    /// the key it names, which the device's certificate (or its expected
-    /// fingerprint) makes that device's.
-    async fn check_answer(&self, data: &Data, target: &Target) -> Result<(PeerKey, PunchMessage), Failure> {
+    /// The answer to this device's punch of `target` (of `session`),
+    /// verified: signed by the key it names, which the device's certificate
+    /// or membership (or its expected fingerprint) makes that device's.
+    async fn check_answer(
+        &self,
+        data: &Data,
+        target: &Target,
+        session: &PathSession,
+    ) -> Result<(PeerKey, PunchMessage), Failure> {
         let label = &target.label;
         let bad = |why: String| Failure::refused(format!("{label}'s punch answer is not usable: {why}"));
         let content = data.content().ok_or_else(|| bad("it carries no content".into()))?;
@@ -668,15 +697,19 @@ impl Links {
         }
         let hello = LinkHello {
             certificates: theirs.certificates.clone(),
+            memberships: theirs.memberships.clone(),
             direct_path: None,
         };
-        match self.judge().decide(&key, &hello, target.peer).await {
+        match self
+            .judge()
+            .decide(&key, &hello, &punch::punch_binding(session), target.peer)
+            .await
+        {
             Ok(admitted) if admitted.enrollment.is_some() => Err(bad(format!(
                 "this device cannot confirm it is {label} yet (it holds no certificate in its namespace)"
             ))),
             Ok(admitted)
-                if target.peer.is_none()
-                    && admitted.identity.as_ref().is_none_or(|id| id.device != target.device) =>
+                if target.peer.is_none() && !admitted.identities.iter().any(|id| id.device == target.device) =>
             {
                 Err(bad(format!(
                     "its certificate is not {}'s ({})",
@@ -689,11 +722,15 @@ impl Links {
         }
     }
 
-    /// Answer a punch Interest another device sent this one: refuse it, or
-    /// answer with this device's candidates and punch back.
+    /// Answer a punch Interest another device sent this one (to any of its
+    /// names): refuse it, or answer with this device's candidates and punch
+    /// back.
     pub(crate) async fn answer_punch(self: Arc<Self>, interest: Interest) {
-        let Some(own) = self.own_device() else { return };
-        let Some(session) = punch::session_of(&own, &interest.name) else {
+        let Some((own, session)) = self
+            .own_devices()
+            .into_iter()
+            .find_map(|own| punch::session_of(&own, &interest.name).map(|s| (own, s)))
+        else {
             return;
         };
         // Signature checks cost work before this device knows who asks:
@@ -721,7 +758,11 @@ impl Links {
             return;
         }
         let fingerprint = key.fingerprint();
-        let name = (*interest.name).clone();
+        let to = Punched {
+            name: (*interest.name).clone(),
+            session,
+            namespace: self.judge().namespace_of(&own),
+        };
         let who = |admitted: Option<&Admitted>| admitted.map_or_else(|| format!("key {fingerprint}"), Admitted::describe);
         let info = interest.sig_info().expect("verified");
         let signed_at = info.sig_time.unwrap_or(0);
@@ -732,13 +773,13 @@ impl Links {
                  ({now} ms): it is replayed, or a clock is off; check both devices' clocks",
                 PUNCH_GRACE.as_secs()
             );
-            return self.refuse_punch(&name, &who(None), CloseReason::Protocol, text).await;
+            return self.refuse_punch(&to, &who(None), CloseReason::Protocol, text).await;
         }
         if self.direct.replay.check(info) != ReplayCheck::Fresh {
             let text = "your punch request repeats an earlier one (same SignatureNonce and SignatureTime): a \
                         replay; sign a new one"
                 .to_string();
-            return self.refuse_punch(&name, &who(None), CloseReason::Protocol, text).await;
+            return self.refuse_punch(&to, &who(None), CloseReason::Protocol, text).await;
         }
         if !self.direct.admit_request(fingerprint) {
             let text = format!(
@@ -746,13 +787,18 @@ impl Links {
                  punch again later",
                 PUNCH_REFILL.as_secs()
             );
-            return self.refuse_punch(&name, &who(None), CloseReason::Busy, text).await;
+            return self.refuse_punch(&to, &who(None), CloseReason::Busy, text).await;
         }
         let hello = LinkHello {
             certificates: theirs.certificates.clone(),
+            memberships: theirs.memberships.clone(),
             direct_path: None,
         };
-        let admitted = match self.judge().decide(&key, &hello, None).await {
+        let admitted = match self
+            .judge()
+            .decide(&key, &hello, &punch::punch_binding(&session), None)
+            .await
+        {
             Ok(a) if a.enrollment.is_none() => a,
             Ok(a) => {
                 let text = format!(
@@ -761,32 +807,32 @@ impl Links {
                     a.describe(),
                     self.hints.enroll
                 );
-                return self.refuse_punch(&name, &who(Some(&a)), CloseReason::Unrecognized, text).await;
+                return self.refuse_punch(&to, &who(Some(&a)), CloseReason::Unrecognized, text).await;
             }
-            Err(refusal) => return self.refuse_punch(&name, &who(None), refusal.reason, refusal.text).await,
+            Err(refusal) => return self.refuse_punch(&to, &who(None), refusal.reason, refusal.text).await,
         };
         if let Some(why) = self.direct_off(&admitted) {
             return self
-                .refuse_punch(&name, &who(Some(&admitted)), CloseReason::DirectPathsOff, why)
+                .refuse_punch(&to, &who(Some(&admitted)), CloseReason::DirectPathsOff, why)
                 .await;
         }
         if self.direct.sessions.lock().len() >= PUNCHES_MAX {
             let text = format!("this device runs {PUNCHES_MAX} punches at once already; punch again later");
             return self
-                .refuse_punch(&name, &who(Some(&admitted)), CloseReason::Busy, text)
+                .refuse_punch(&to, &who(Some(&admitted)), CloseReason::Busy, text)
                 .await;
         }
         if self.table.direct_to(Some(fingerprint), None).is_none()
             && let Some(text) = self.direct_full()
         {
             return self
-                .refuse_punch(&name, &who(Some(&admitted)), CloseReason::Busy, text)
+                .refuse_punch(&to, &who(Some(&admitted)), CloseReason::Busy, text)
                 .await;
         }
         let Some(first) = theirs.candidates.first() else {
             let text = "your punch request offers no address to reach you at".to_string();
             return self
-                .refuse_punch(&name, &who(Some(&admitted)), CloseReason::Protocol, text)
+                .refuse_punch(&to, &who(Some(&admitted)), CloseReason::Protocol, text)
                 .await;
         };
         let socket = match self.endpoint_for(first.addr) {
@@ -794,7 +840,7 @@ impl Links {
             Err(e) => {
                 let text = format!("this device has no link socket for {}: {e}", first.addr);
                 return self
-                    .refuse_punch(&name, &who(Some(&admitted)), CloseReason::Busy, text)
+                    .refuse_punch(&to, &who(Some(&admitted)), CloseReason::Busy, text)
                     .await;
             }
         };
@@ -807,6 +853,13 @@ impl Links {
             candidates: ours.clone(),
             refusal: None,
             certificates: chain.clone(),
+            memberships: own_memberships(
+                self.trust.as_ref(),
+                &own_key,
+                &punch::punch_binding(&session),
+                Some(&to.namespace),
+            )
+            .await,
         };
         // The other device punches only while it has no direct path up to
         // this one, or after its network changed: one this device still has
@@ -819,17 +872,23 @@ impl Links {
             );
         }
         self.signal()
-            .send(punch::answer(&name, &answer, &own_key, &punch::locator(&own_key, &chain)))
+            .send(punch::answer(&to.name, &answer, &own_key, &punch::locator(&own_key, &chain)))
             .await;
-        let label = admitted
-            .identity
+        // The device as known in the namespace it punched this one in.
+        let device = admitted
+            .identities
+            .iter()
+            .find(|id| id.namespace == to.namespace)
+            .or(admitted.identity())
+            .map(|id| id.device.clone());
+        let label = device
             .as_ref()
-            .map_or_else(|| format!("key {fingerprint}"), |id| id.device.to_string());
+            .map_or_else(|| format!("key {fingerprint}"), ToString::to_string);
         let whom = Whom::Key(fingerprint);
         self.direct.set(whom, |e| {
             e.label = label.clone();
             e.key = Some(fingerprint);
-            e.device = admitted.identity.as_ref().map(|id| id.device.clone());
+            e.device = device.clone();
         });
         self.direct
             .state(whom, DirectState::Trying, format!("{label} punches a direct path"), None);
@@ -1002,8 +1061,9 @@ impl Links {
         punched
     }
 
-    /// Refuse the punch Interest `name`, with a signed answer saying why.
-    async fn refuse_punch(&self, name: &Name, who: &str, reason: CloseReason, text: String) {
+    /// Refuse the punch Interest `to`, with a signed answer saying why,
+    /// showing this device's membership of the namespace it was punched in.
+    async fn refuse_punch(&self, to: &Punched, who: &str, reason: CloseReason, text: String) {
         self.direct.refused.fetch_add(1, Ordering::Relaxed);
         tracing::warn!(target: "face.quic", peer = %who, reason = ?reason, "refused a direct-path punch: {text}");
         let Ok(key) = self.key.current() else { return };
@@ -1013,9 +1073,16 @@ impl Links {
             candidates: Vec::new(),
             refusal: Some((u64::from(reason.code()), text)),
             certificates: chain.clone(),
+            memberships: own_memberships(
+                self.trust.as_ref(),
+                &key,
+                &punch::punch_binding(&to.session),
+                Some(&to.namespace),
+            )
+            .await,
         };
         self.signal()
-            .send(punch::answer(name, &msg, &key, &punch::locator(&key, &chain)))
+            .send(punch::answer(&to.name, &msg, &key, &punch::locator(&key, &chain)))
             .await;
     }
 

@@ -3,11 +3,14 @@
 //! peer entry for each other.
 //!
 //! A relay that holds a namespace's trust context tells each device of that
-//! namespace linked to it over a full link which other devices of the
-//! namespace are linked to it now — only those the namespace's direct-path
-//! role matrix ([`LinkPolicy::allows_direct_path`]) pairs with the
-//! receiver's role — in a `Presence` message on the link's control stream,
-//! at once and whenever the list changes. The control stream is the link's:
+//! namespace linked to it over a full link (a device identified in it by
+//! its link key's certificate or by a membership) which other devices of
+//! the namespace are linked to it now — only those the namespace's
+//! direct-path role matrix ([`LinkPolicy::allows_direct_path`]) pairs with
+//! the receiver's role — in a `Presence` message on the link's control
+//! stream, at once and whenever the list changes; a device whose
+//! membership is revoked while linked is told the namespace's empty list.
+//! The control stream is the link's:
 //! both keys were proven in its handshake and certified in the namespace at
 //! admission, so a presence list is as authentic as a signed record would be,
 //! reaches only devices the relay admitted as members, and costs no
@@ -18,10 +21,11 @@
 //! (it serves the namespace by its root fingerprint, or is open) sends no
 //! presence for it: it could not apply the namespace's policy.
 //!
-//! A device takes presence from the relays it uses. For each device listed
-//! whose key fingerprint is larger than its own (one side punches; the
-//! other answers), that the role matrix pairs with it, and that no peer
-//! entry of its names, it punches a direct path through that relay, within
+//! A device takes presence from the relays it uses. For each namespace
+//! listed that it is a member of, and each device listed whose key
+//! fingerprint is larger than its own (one side punches; the other
+//! answers), that the role matrix pairs with it, and that no peer entry of
+//! its names, it punches a direct path through that relay, within
 //! [`DirectOptions::max_paths`].
 //!
 //! [`LinkPolicy::allows_direct_path`]: ndn_security::LinkPolicy::allows_direct_path
@@ -142,10 +146,11 @@ impl Links {
     }
 
     /// Relay `relay` lists `list` now: punch the members it newly lists,
-    /// stop punching the ones it no longer does.
+    /// stop punching the ones it no longer does. Each namespace listed is
+    /// judged by this device's membership in it.
     fn take_presence(self: &Arc<Self>, relay: PeerId, list: &[Presence]) {
         let mine = self.my_fingerprint();
-        let own_device = self.own_device();
+        let own_devices = self.own_devices();
         let judge = self.judge();
         let mut wanted: Vec<(KeyFingerprint, Name)> = Vec::new();
         if self.direct_options.membership
@@ -157,11 +162,12 @@ impl Links {
                 }
                 for d in &p.devices {
                     if d.key == mine
-                        || own_device.as_ref() == Some(&d.device)
+                        || own_devices.contains(&d.device)
                         || mine > d.key
                         || !d.device.has_prefix(&p.namespace)
                         || self.peers.find(d.key, Some(&d.device)).is_some()
                         || self.pair_off(&d.device).is_some()
+                        || wanted.iter().any(|(k, _)| *k == d.key)
                     {
                         continue;
                     }

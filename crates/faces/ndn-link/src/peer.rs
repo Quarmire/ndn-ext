@@ -195,12 +195,18 @@ impl Peers {
 
     /// The peer expecting key `fingerprint`, or naming `device`.
     pub(crate) fn find(&self, fingerprint: KeyFingerprint, device: Option<&Name>) -> Option<PeerId> {
+        self.find_any(fingerprint, device.as_slice())
+    }
+
+    /// The first peer expecting key `fingerprint`, or naming one of
+    /// `devices` (the names a device proved, in each of its namespaces).
+    pub(crate) fn find_any(&self, fingerprint: KeyFingerprint, devices: &[&Name]) -> Option<PeerId> {
         self.slots
             .read()
             .iter()
             .position(|p| {
                 p.as_ref().is_some_and(|p| {
-                    p.key == Some(fingerprint) || device.is_some_and(|d| p.device.as_ref() == Some(d))
+                    p.key == Some(fingerprint) || p.device.as_ref().is_some_and(|d| devices.contains(&d))
                 })
             })
             .map(PeerId)

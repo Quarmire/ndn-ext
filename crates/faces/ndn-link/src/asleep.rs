@@ -161,19 +161,20 @@ impl Links {
         ) {
             return;
         }
-        // A revoked device sleeps nowhere.
-        if let Some(id) = &ended.identity {
+        // A revoked device sleeps nowhere (a membership revoked while it
+        // was linked is already gone from the link, with its routes).
+        if ended.identities.iter().any(|id| {
             let ctx = self.trust.keyring().context_for(&id.device);
-            if id.certificates.iter().any(|c| ctx.is_revoked(c)) {
-                return;
-            }
+            id.certificates.iter().any(|c| ctx.is_revoked(c))
+        }) {
+            return;
         }
         let hold = reach.hold && self.service.hold.is_some();
         let token = reach.wake_token.filter(|_| self.service.wake.is_some());
         if !hold && token.is_none() {
             return;
         }
-        let device = ended.identity.as_ref().map(|id| id.device.clone());
+        let device = ended.identities.first().map(|id| id.device.clone());
         let label = device
             .as_ref()
             .map_or_else(|| format!("key {fingerprint}"), ToString::to_string);

@@ -245,7 +245,7 @@ impl Links {
         let target = WaitFor::Peer(id);
         match self.peers.get(id) {
             Some(p) if matches!(p.mode, LinkMode::OnDemand { .. }) && !self.paths.candidates(id, &p).is_empty() => {
-                let prefixes = predicted_routes(&p, &self.own_namespaces());
+                let prefixes = predicted_routes(&p, &self.relay_namespaces(&p));
                 waiting.route(self, target, prefixes);
             }
             _ => waiting.unroute(self, &target),

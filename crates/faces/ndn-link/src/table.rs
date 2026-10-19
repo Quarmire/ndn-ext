@@ -1,6 +1,7 @@
 //! The live links: one per device pair, each with its paths (the link
 //! dialled or accepted, and a direct path a punch made), which one stays
-//! when both dial, links to make again after an enrollment, and links a
+//! when both dial, links to make again after an enrollment or a change of
+//! this device's memberships, and the links (or the memberships of links) a
 //! revocation ends.
 
 use std::collections::{HashMap, HashSet};
@@ -62,7 +63,9 @@ pub(crate) struct LinkPath {
 /// A path that ended, as [`LinkTable::unregister`] reports it.
 pub(crate) struct Ended {
     pub(crate) peer: Option<PeerId>,
-    pub(crate) identity: Option<Identity>,
+    /// The identities the link was admitted by (still), the deciding one
+    /// first.
+    pub(crate) identities: Vec<Identity>,
     pub(crate) kind: PathKind,
     pub(crate) routes: Vec<Route>,
     /// It was an enrollment link.
@@ -71,11 +74,21 @@ pub(crate) struct Ended {
     pub(crate) last: bool,
 }
 
-/// A device linked over a full link, for presence.
+/// A device linked over a full link, for presence: its identity in the
+/// namespace asked for.
 pub(crate) struct Member {
     pub(crate) fingerprint: KeyFingerprint,
     pub(crate) identity: Identity,
     pub(crate) handle: LinkHandle,
+}
+
+/// A membership a revocation took from a link that stays up (another
+/// membership still admits it): the routes its face loses, and the link's
+/// handle, to tell the device it is no longer listed in that namespace.
+pub(crate) struct Dropped {
+    pub(crate) namespace: Name,
+    pub(crate) routes: Vec<(FaceId, Vec<Name>)>,
+    pub(crate) handle: Option<LinkHandle>,
 }
 
 /// A direct path up now, as [`LinkTable::direct_paths`] lists it.
@@ -97,7 +110,12 @@ struct LivePath {
 /// A link to one device, by its key.
 struct LiveLink {
     peer: Option<PeerId>,
-    identity: Option<Identity>,
+    /// The identities it was admitted by, the deciding one first.
+    identities: Vec<Identity>,
+    /// The namespaces this device showed in its hello on the link path
+    /// (its link key's and its memberships'): when they change, the link
+    /// is made again.
+    shown: Vec<Name>,
     /// The namespaces this link is an enrollment link for, on either side,
     /// for this device's enrollment: once this device enrolls in one, the
     /// link is made again as a full link.
@@ -119,7 +137,9 @@ impl LiveLink {
 pub(crate) struct Registration {
     pub(crate) fingerprint: KeyFingerprint,
     pub(crate) peer: Option<PeerId>,
-    pub(crate) identity: Option<Identity>,
+    pub(crate) identities: Vec<Identity>,
+    /// The namespaces this device showed in its hello (sorted).
+    pub(crate) shown: Vec<Name>,
     pub(crate) enrolling: Vec<Name>,
     pub(crate) path: LinkPath,
 }
@@ -166,7 +186,8 @@ impl LinkTable {
                 link.fingerprint,
                 LiveLink {
                     peer: link.peer,
-                    identity: link.identity,
+                    identities: link.identities,
+                    shown: link.shown,
                     enrolling: link.enrolling,
                     paths: vec![new],
                 },
@@ -189,11 +210,12 @@ impl LinkTable {
         if link.peer.is_some() {
             existing.peer = link.peer;
         }
-        if link.identity.is_some() {
-            existing.identity = link.identity;
+        if !link.identities.is_empty() {
+            existing.identities = link.identities;
         }
         if kind == PathKind::Link {
             existing.enrolling = link.enrolling;
+            existing.shown = link.shown;
         }
         existing.paths.push(new);
         Some(generation)
@@ -208,7 +230,7 @@ impl LinkTable {
         let path = link.paths.remove(at).path;
         let ended = Ended {
             peer: link.peer,
-            identity: link.identity.clone(),
+            identities: link.identities.clone(),
             kind: path.kind,
             routes: path.routes,
             enrolling: !link.enrolling.is_empty(),
@@ -259,14 +281,14 @@ impl LinkTable {
         })
     }
 
-    /// The devices linked over a full link path whose identity is in
-    /// `namespace`.
+    /// The devices linked over a full link path with an identity in
+    /// `namespace`, each with that identity.
     pub(crate) fn members(&self, namespace: &Name) -> Vec<Member> {
         let live = self.live.lock();
         live.iter()
             .filter(|(_, l)| l.enrolling.is_empty())
             .filter_map(|(fp, l)| {
-                let identity = l.identity.as_ref().filter(|id| &id.namespace == namespace)?;
+                let identity = l.identities.iter().find(|id| &id.namespace == namespace)?;
                 let path = l.paths.iter().find(|p| p.path.kind == PathKind::Link)?;
                 Some(Member {
                     fingerprint: *fp,
@@ -322,7 +344,7 @@ impl LinkTable {
                     .map(|p| DirectUp {
                         fingerprint: *fp,
                         peer: l.peer,
-                        device: l.identity.as_ref().map(|id| id.device.clone()),
+                        device: l.identities.first().map(|id| id.device.clone()),
                         handle: p.path.handle.clone(),
                         gone: p.path.gone.clone(),
                     })
@@ -366,7 +388,7 @@ impl LinkTable {
             .map(|(fp, l)| LinkView {
                 fingerprint: *fp,
                 peer: l.peer,
-                device: l.identity.as_ref().map(|id| id.device.clone()),
+                device: l.identities.first().map(|id| id.device.clone()),
                 paths: l
                     .paths
                     .iter()
@@ -383,25 +405,53 @@ impl LinkTable {
             .collect()
     }
 
-    /// This device switched to the key certified by `certificate`: close
-    /// each enrollment link for a namespace that key is certified in, and
-    /// mark its peer to be dialled again, now as an enrolled device.
-    pub(crate) fn relink_enrolled(&self, certificate: &Name) {
+    /// This device now holds the certificates `certificates`: close each
+    /// enrollment link for a namespace one of them is certified in, and mark
+    /// its peer to be dialled again, now as an enrolled device.
+    pub(crate) fn relink_enrolled(&self, certificates: &[Name]) {
+        self.relink_where(|link| {
+            let (ns, cert) = link.enrolling.iter().find_map(|ns| {
+                certificates
+                    .iter()
+                    .find(|c| ndn_cert::roles::parse_device_key(ns, c).is_some())
+                    .map(|c| (ns, c))
+            })?;
+            Some(format!(
+                "this device enrolled in {ns} ({cert}); it links again as an enrolled device"
+            ))
+        });
+    }
+
+    /// This device's namespaces are `shown` now (sorted): close each full
+    /// link whose hello showed others, and mark its peer to be dialled again,
+    /// so the other device knows this one in each of them. A link this
+    /// device did not dial is dialled again by the other device (the close
+    /// is transient).
+    pub(crate) fn relink_changed(&self, shown: &[Name]) {
+        self.relink_where(|link| {
+            if !link.enrolling.is_empty() || link.shown == shown {
+                return None;
+            }
+            Some(format!(
+                "this device's trusted prefixes changed (now {}); it links again to show them",
+                if shown.is_empty() {
+                    "none".to_string()
+                } else {
+                    crate::admission::list(shown)
+                }
+            ))
+        });
+    }
+
+    /// Close the link paths of each link `why` gives a reason for, with
+    /// [`CloseReason::Enrolled`], marking their peers to be dialled again.
+    fn relink_where(&self, why: impl Fn(&LiveLink) -> Option<String>) {
         let mut closing = Vec::new();
         {
             let live = self.live.lock();
             for link in live.values() {
-                let Some(ns) = link
-                    .enrolling
-                    .iter()
-                    .find(|ns| ndn_cert::roles::parse_device_key(ns, certificate).is_some())
-                else {
-                    continue;
-                };
-                let text = format!(
-                    "this device enrolled in {ns} ({certificate}); it links again as an enrolled device"
-                );
-                for p in &link.paths {
+                let Some(text) = why(link) else { continue };
+                for p in link.paths.iter().filter(|p| p.path.kind == PathKind::Link) {
                     closing.push((p.path.handle.clone(), p.path.face, link.peer, text.clone()));
                 }
             }
@@ -424,27 +474,69 @@ impl LinkTable {
             .remove(&peer)
     }
 
-    /// Close each link whose certificate (or an issuer of it) `ctx`, newly
-    /// adopted, revokes.
-    pub(crate) fn close_revoked(&self, ctx: &Arc<SignedTrustContext>) {
-        let live = self.live.lock();
-        for link in live.values() {
-            let Some(id) = &link.identity else { continue };
-            if !id.device.has_prefix(ctx.namespace()) {
+    /// `ctx`, newly adopted, revokes certificates: take from each link the
+    /// identities in its namespace whose certificate (or an issuer of it) it
+    /// revokes. A link left with no identity is closed; one that another
+    /// membership still admits stays, losing the routes of that identity
+    /// (returned, for the caller to take from the forwarder).
+    pub(crate) fn close_revoked(&self, ctx: &Arc<SignedTrustContext>) -> Vec<Dropped> {
+        let mut dropped = Vec::new();
+        let mut live = self.live.lock();
+        for link in live.values_mut() {
+            let Some(at) = link.identities.iter().position(|id| {
+                id.device.has_prefix(ctx.namespace()) && id.certificates.iter().any(|c| ctx.is_revoked(c))
+            }) else {
                 continue;
-            }
-            if let Some(revoked) = id.certificates.iter().find(|c| ctx.is_revoked(c)) {
-                let text = format!(
-                    "{revoked} is revoked in {} (trust context v{}); this link is closed",
-                    ctx.namespace(),
-                    ctx.version()
-                );
+            };
+            let id = link.identities.remove(at);
+            let revoked = id.certificates.iter().find(|c| ctx.is_revoked(c)).expect("found above");
+            let text = format!(
+                "{revoked} is revoked in {} (trust context v{})",
+                ctx.namespace(),
+                ctx.version()
+            );
+            if link.identities.is_empty() {
+                let text = format!("{text}; this link is closed");
                 for p in &link.paths {
                     tracing::warn!(target: "face.quic", face = p.path.face.0, peer = %id.device, "{text}");
                 }
                 link.close(CloseReason::Revoked, &text);
+                continue;
             }
+            let prefixes = [id.device.clone(), id.namespace.clone()];
+            let mut routes = Vec::new();
+            for p in &mut link.paths {
+                let gone: Vec<Name> = p
+                    .path
+                    .routes
+                    .iter()
+                    .filter(|r| prefixes.contains(&r.prefix))
+                    .map(|r| r.prefix.clone())
+                    .collect();
+                p.path.routes.retain(|r| !prefixes.contains(&r.prefix));
+                tracing::warn!(
+                    target: "face.quic",
+                    face = p.path.face.0,
+                    peer = %id.device,
+                    "{text}; the link stays, admitted by {}, without its routes in {}",
+                    link.identities.iter().map(|i| i.device.to_string()).collect::<Vec<_>>().join(", "),
+                    ctx.namespace()
+                );
+                if !gone.is_empty() {
+                    routes.push((p.path.face, gone));
+                }
+            }
+            dropped.push(Dropped {
+                namespace: id.namespace,
+                routes,
+                handle: link
+                    .paths
+                    .iter()
+                    .find(|p| p.path.kind == PathKind::Link)
+                    .map(|p| p.path.handle.clone()),
+            });
         }
+        dropped
     }
 }
 

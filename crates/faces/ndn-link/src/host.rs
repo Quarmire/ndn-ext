@@ -7,11 +7,34 @@ use std::sync::Arc;
 use bytes::Bytes;
 use ndn_face_quic::KeyFingerprint;
 use ndn_packet::Name;
-use ndn_security::{Certificate, Keyring};
+use ndn_security::{Certificate, Keyring, Signer};
 use ndn_transport::{Face, FaceId};
 use tokio_util::sync::CancellationToken;
 
 use crate::peer::{PeerId, PeerSpec};
+
+/// A namespace this device is a member of: its certificate there and the
+/// key that certificate certifies.
+#[derive(Clone)]
+pub struct OwnMembership {
+    /// The namespace, e.g. `/work`.
+    pub namespace: Name,
+    /// This device's certificate in the namespace, then that certificate's
+    /// issuers, nearest first (wire-encoded Data).
+    pub chain: Vec<Bytes>,
+    /// The key the certificate certifies, which signs this membership's
+    /// binding to each link ([`ndn_face_quic::Membership`]).
+    pub signer: Arc<dyn Signer>,
+}
+
+impl std::fmt::Debug for OwnMembership {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnMembership")
+            .field("namespace", &self.namespace)
+            .field("key", self.signer.key_name())
+            .finish()
+    }
+}
 
 /// The trust data links are admitted from.
 pub trait LinkTrust: Send + Sync + 'static {
@@ -20,10 +43,20 @@ pub trait LinkTrust: Send + Sync + 'static {
     /// from its revocation events).
     fn keyring(&self) -> &Arc<Keyring>;
 
-    /// This device's hello: the certificate of the key it links with now,
-    /// then that certificate's issuers, nearest first (wire-encoded Data).
-    /// Empty when the current key has no certificate.
+    /// This device's hello: the certificate of the key it links with now
+    /// (its TLS key, the node key), then that certificate's issuers,
+    /// nearest first (wire-encoded Data). Empty when the current key has no
+    /// certificate.
     fn own_chain(&self) -> Vec<Bytes>;
+
+    /// Every namespace this device is a member of, with its certificate
+    /// chain and key there. The one the link key's certificate is in may be
+    /// listed too; the others are shown on each link as a membership bound
+    /// to it, so a peer identifies this device in each. A device holding
+    /// one identity (its link key's) has none beyond it.
+    fn own_memberships(&self) -> Vec<OwnMembership> {
+        Vec::new()
+    }
 
     /// A certificate this device already has — one it serves, or one it
     /// validated and cached — by name (a key name picks the newest valid

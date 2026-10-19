@@ -1,20 +1,22 @@
-//! Which relays this device uses: the ones its namespace advertises (in its
-//! trust context), the ones the person at it added, or none — merged by
-//! preference, the `count` most preferred reachable ones linked at once,
-//! failing over to the next when one is lost and back when it returns.
+//! Which relays this device uses: the ones its namespaces advertise (in
+//! their trust contexts), the ones the person at it added, or none —
+//! merged by preference, the `count` most preferred reachable ones linked
+//! at once for each namespace this device is a member of, failing over to
+//! the next when one is lost and back when it returns.
 //!
-//! A relay is a peer with [`PeerSpec::relay_use`]. Its link routes this
-//! device's namespace (the one its current certificate is in) at a cost by
-//! rank — the most preferred relay 0, the next 1, … — so traffic takes the
-//! most preferred linked relay and moves to the next when it is lost.
-//! Choosing walks the relays by preference (of equal preference, a user's
-//! before the namespace's): a relay is chosen when it is linked or its last
-//! dial did not fail, until `count` are chosen; a more preferred relay
-//! whose dial failed, or that closed its link saying it shuts down, is
-//! dialled again with backoff while a less preferred one stands in, and
-//! once it links again the stand-in is released
-//! ([`CloseReason::Released`]). Relays beyond the chosen ones stand by,
-//! undialled.
+//! A relay is a peer with [`PeerSpec::relay_use`]. Its link routes the
+//! namespaces of this device it is used for (a relay the person added: all
+//! of them; a relay a namespace advertises: each namespace of this device
+//! that advertises it) at a cost by rank — the most preferred relay 0, the
+//! next 1, … — so traffic takes the most preferred linked relay and moves
+//! to the next when it is lost. Choosing walks the relays by preference (of
+//! equal preference, a user's before the namespace's): a relay is chosen
+//! when it is linked or its last dial did not fail, until `count` are
+//! chosen for each namespace it is used for; a more preferred relay whose
+//! dial failed, or that closed its link saying it shuts down, is dialled
+//! again with backoff while a less preferred one stands in, and once it
+//! links again the stand-in is released ([`CloseReason::Released`]).
+//! Relays beyond the chosen ones stand by, undialled.
 
 use std::sync::Arc;
 
@@ -28,7 +30,8 @@ use crate::status::{RelayState, RelayStatus};
 /// How this device chooses its relays.
 #[derive(Clone, Debug)]
 pub struct RelayOptions {
-    /// Relays linked at once.
+    /// Relays linked at once, for each namespace this device is a member
+    /// of.
     pub count: usize,
     /// Use the relays the namespaces this device is enrolled in advertise.
     pub use_namespace: bool,
@@ -79,9 +82,23 @@ impl Links {
             chosen: Vec::new(),
             retrying: Vec::new(),
         };
+        let own = self.own_namespaces();
+        // How many relays are chosen for each namespace; a device in none
+        // counts its relays together.
+        let mut chosen_for: Vec<(Name, usize)> = Vec::new();
         for (id, p) in self.relay_order() {
-            if choice.chosen.len() >= self.relay_options.count {
-                break;
+            let mut serves = self.relay_namespaces_of(&p, &own);
+            if serves.is_empty() {
+                serves.push(Name::root());
+            }
+            let needed = serves.iter().any(|ns| {
+                chosen_for
+                    .iter()
+                    .find(|(n, _)| n == ns)
+                    .is_none_or(|(_, count)| *count < self.relay_options.count)
+            });
+            if !needed {
+                continue;
             }
             let ctl = self.ctl(id);
             let linked = self.table.link_to(id).is_some();
@@ -90,6 +107,12 @@ impl Links {
             }
             if linked || !ctl.failing() {
                 choice.chosen.push(id);
+                for ns in serves {
+                    match chosen_for.iter_mut().find(|(n, _)| *n == ns) {
+                        Some((_, count)) => *count += 1,
+                        None => chosen_for.push((ns, 1)),
+                    }
+                }
             } else {
                 choice.retrying.push(id);
             }
@@ -118,17 +141,39 @@ impl Links {
         }
     }
 
-    /// The namespaces this device's traffic goes to its relays for: the
-    /// namespace of the certificate it links with now.
+    /// The namespaces this device holds a certificate in (its link key's
+    /// and its memberships'), among those it holds.
     pub(crate) fn own_namespaces(&self) -> Vec<Name> {
-        let Some(device) = self.own_device() else {
-            return Vec::new();
-        };
-        let ctx = self.trust.keyring().context_for(&device);
-        if ctx.namespace().is_empty() {
-            return Vec::new();
+        self.judge().own_namespaces()
+    }
+
+    /// The namespaces of this device the relay `peer` is used for: all of
+    /// them for a relay the person added; for a relay a namespace
+    /// advertises, each of them whose trust context advertises it (by
+    /// device name or key).
+    pub(crate) fn relay_namespaces(&self, peer: &PeerSpec) -> Vec<Name> {
+        self.relay_namespaces_of(peer, &self.own_namespaces())
+    }
+
+    fn relay_namespaces_of(&self, peer: &PeerSpec, own: &[Name]) -> Vec<Name> {
+        match peer.relay_use.as_ref().map(|u| &u.source) {
+            Some(RelaySource::Namespace(_)) => {
+                let contexts = self.trust.keyring().contexts();
+                own.iter()
+                    .filter(|ns| {
+                        contexts.iter().filter(|c| c.namespace() == *ns).any(|c| {
+                            c.relays().iter().any(|r| {
+                                peer.device.as_ref() == Some(&r.device)
+                                    || (peer.key.is_some() && peer.key == r.key.map(KeyFingerprint))
+                            })
+                        })
+                    })
+                    .cloned()
+                    .collect()
+            }
+            Some(RelaySource::User) => own.to_vec(),
+            None => Vec::new(),
         }
-        vec![ctx.namespace().clone()]
     }
 
     /// Relay `id`'s place in the choice, for status.
@@ -196,7 +241,7 @@ impl Links {
     /// advertised.
     pub(crate) fn sync_namespace_relays(self: &Arc<Self>) {
         let mine = self.my_fingerprint();
-        let own_device = self.own_device();
+        let own_devices = self.own_devices();
         let mut advertised: Vec<PeerSpec> = Vec::new();
         if self.relay_options.use_namespace {
             let judge = self.judge();
@@ -207,7 +252,7 @@ impl Links {
                 }
                 for relay in ctx.relays() {
                     let key = relay.key.map(KeyFingerprint);
-                    if own_device.as_ref() == Some(&relay.device) || (key.is_some() && key == mine) {
+                    if own_devices.contains(&relay.device) || (key.is_some() && key == mine) {
                         continue;
                     }
                     advertised.push(PeerSpec {

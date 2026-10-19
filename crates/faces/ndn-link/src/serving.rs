@@ -6,7 +6,7 @@
 //! ([`ServePolicy`]), which the deployer chooses:
 //!
 //! - **own** (the default): devices of the namespaces this device holds a
-//!   certificate in (the certificate it links with now). A device of a
+//!   certificate in (its link key's, or a membership's). A device of a
 //!   namespace it holds the trust context of but no certificate in, or of
 //!   one it does not hold, is refused ([`CloseReason::NotServed`]).
 //! - **listed**: also devices of the namespaces whose root key fingerprint

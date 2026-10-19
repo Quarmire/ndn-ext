@@ -18,7 +18,7 @@ use ndn_transport::reliability::ReliabilityConfig;
 use ndn_transport::{Face, FaceId, LpLinkService};
 use tokio_util::sync::CancellationToken;
 
-use crate::admission::{Admitted, Enrollment, Judge, hello_chain, list};
+use crate::admission::{Admitted, Enrollment, Judge, device_of, hello_chain, list, own_memberships};
 use crate::asleep::{RelayService, Sleepers};
 use crate::candidates::CandidateSource;
 use crate::control::{PeerCtl, idle_check, release};
@@ -154,7 +154,7 @@ impl Links {
         let weak = Arc::downgrade(&links);
         links.trust.keyring().on_revocation(move |ctx, _| {
             if let Some(links) = weak.upgrade() {
-                links.table.close_revoked(ctx);
+                links.revoked(ctx);
             }
         });
         // A new version may advertise other relays or pair other roles. The
@@ -191,18 +191,61 @@ impl Links {
         }
     }
 
-    /// This device switched to another key (it enrolled): close each
-    /// enrollment link for a namespace that key is certified in, and dial it
-    /// again, now as an enrolled device; take punches under its new name;
-    /// use the relays its namespace advertises.
-    pub fn key_switched(self: &Arc<Self>) {
-        if let Some(cert) = self.judge().own_certificate() {
-            self.table.relink_enrolled(&cert.name);
-        }
+    /// This device's link key or its memberships changed (it enrolled in a
+    /// namespace, a membership ended, or it links with another key now):
+    /// close each enrollment link for a namespace it now holds a
+    /// certificate in, and each full link whose hello showed other
+    /// namespaces than it holds now, and dial them again (a link the other
+    /// device dialled, it dials again); take punches under each of its
+    /// names; use the relays its namespaces advertise.
+    pub fn identities_changed(self: &Arc<Self>) {
+        let certificates: Vec<Name> = self
+            .judge()
+            .own_certificates()
+            .into_iter()
+            .map(|(cert, _)| (*cert.name).clone())
+            .collect();
+        self.table.relink_enrolled(&certificates);
+        self.table.relink_changed(&self.shown_namespaces());
         self.take_punches();
         self.sync_namespace_relays();
         for (id, _) in self.peers.iter() {
             self.route_demand(id);
+        }
+    }
+
+    /// The namespaces this device shows in a hello: the one of its link
+    /// key's certificate and each of its memberships', sorted.
+    pub(crate) fn shown_namespaces(&self) -> Vec<Name> {
+        let judge = self.judge();
+        let mut shown: Vec<Name> = judge
+            .own_certificates()
+            .into_iter()
+            .filter_map(|(cert, m)| match m {
+                Some(m) => Some(m.namespace),
+                None => device_of(&cert.name).map(|d| judge.namespace_of(&d)),
+            })
+            .collect();
+        shown.sort();
+        shown.dedup();
+        shown
+    }
+
+    /// A newly adopted trust context revokes certificates: close the links
+    /// it leaves with no identity; a link another membership still admits
+    /// loses that membership's routes and presence.
+    fn revoked(&self, ctx: &Arc<ndn_security::SignedTrustContext>) {
+        for dropped in self.table.close_revoked(ctx) {
+            for (face, prefixes) in &dropped.routes {
+                self.faces.remove_routes(*face, prefixes);
+            }
+            if let Some(handle) = &dropped.handle {
+                handle.send_presence(&ndn_face_quic::Presence {
+                    namespace: dropped.namespace.clone(),
+                    devices: Vec::new(),
+                });
+            }
+            self.announce_presence(&dropped.namespace);
         }
     }
 
@@ -346,21 +389,17 @@ impl Links {
         self.waiting.get().expect("the waiting face starts with the links")
     }
 
-    /// This device's name, from the certificate it links with now.
-    pub(crate) fn own_device(&self) -> Option<Name> {
-        let cert = self.judge().own_certificate()?;
-        let key = cert
-            .name
-            .components()
-            .iter()
-            .position(|c| c.typ == ndn_packet::tlv_type::NAME_COMPONENT && c.value.as_ref() == b"KEY")?;
-        Some(Name::from_components(cert.name.components()[..key].iter().cloned()))
+    /// This device's names, one per certificate it holds (its link key's
+    /// first).
+    pub(crate) fn own_devices(&self) -> Vec<Name> {
+        self.judge().own_devices()
     }
 
-    /// Route the punches to this device's current name to the signalling
+    /// Route the punches to each of this device's names to the signalling
     /// face.
     fn take_punches(&self) {
-        if let (Some(device), Some(signal)) = (self.own_device(), self.signal.get()) {
+        let Some(signal) = self.signal.get() else { return };
+        for device in self.own_devices() {
             signal.take_punches_for(self, &device);
         }
     }
@@ -430,9 +469,38 @@ impl Links {
             }),
             _ => false,
         };
-        let ours = LinkHello {
-            certificates: if enrolling { Vec::new() } else { hello_chain(self.trust.as_ref()) },
-            direct_path: session,
+        let channel = match hs.channel_binding() {
+            Ok(channel) => channel,
+            Err(e) => {
+                let text = format!("this device cannot bind its memberships to the link: {e}");
+                hs.refuse(CloseReason::Protocol, &text);
+                return Err(LinkError::RefusedHere {
+                    reason: CloseReason::Protocol,
+                    text,
+                });
+            }
+        };
+        let (ours, shown) = if enrolling {
+            (
+                LinkHello {
+                    direct_path: session,
+                    ..LinkHello::default()
+                },
+                Vec::new(),
+            )
+        } else {
+            let memberships = match self.key.current() {
+                Ok(key) => own_memberships(self.trust.as_ref(), &key, &channel, None).await,
+                Err(_) => Vec::new(),
+            };
+            (
+                LinkHello {
+                    certificates: hello_chain(self.trust.as_ref()),
+                    memberships,
+                    direct_path: session,
+                },
+                self.shown_namespaces(),
+            )
         };
         let theirs = hs.exchange_hello(&ours, MESSAGE_DEADLINE).await?;
         let refuse = |hs: Handshaken, reason: CloseReason, text: String| {
@@ -470,7 +538,7 @@ impl Links {
             _ => None,
         };
         let judge = self.judge();
-        let mut admitted = match judge.decide(hs.peer_key(), &theirs, dialed).await {
+        let mut admitted = match judge.decide(hs.peer_key(), &theirs, &channel, dialed).await {
             Ok(a) => a,
             Err(refusal) => return refuse(hs, refusal.reason, refusal.text),
         };
@@ -509,7 +577,10 @@ impl Links {
             },
             _ => None,
         };
-        let quota = admitted.quota.take();
+        // What the link carries is decided before the quota slots move to
+        // the link's task: the deciding identity's limits bound it.
+        let admission = judge.admission_for(&admitted);
+        let quota = (admitted.quota.take(), std::mem::take(&mut admitted.quotas));
         let direction = hs.direction();
         let gone = CancellationToken::new();
         let kind = if direct.is_some() {
@@ -519,9 +590,7 @@ impl Links {
         };
         let peer = admitted.peer.and_then(|i| self.peers.get(i));
         let face_id = self.faces.alloc_face_id();
-        let link = hs
-            .admit(face_id, MESSAGE_DEADLINE, judge.admission_for(&admitted))
-            .await?;
+        let link = hs.admit(face_id, MESSAGE_DEADLINE, admission).await?;
         let reliability = peer.as_ref().is_some_and(|p| p.reliability);
         let link_service: Arc<dyn ndn_transport::LinkService> = if reliability {
             Arc::new(LpLinkService::with_reliability(ReliabilityConfig::ethernet()))
@@ -549,7 +618,7 @@ impl Links {
             .is_some_and(|(i, p)| !self.paths.candidates(i, p).is_empty());
         let relay_routes = match (admitted.peer, &peer) {
             (Some(i), Some(p)) if p.relay_use.is_some() && kind == PathKind::Link => Some(RelayRoutes {
-                namespaces: self.own_namespaces(),
+                namespaces: self.relay_namespaces(p),
                 cost: self.relay_cost(i),
             }),
             _ => None,
@@ -558,7 +627,8 @@ impl Links {
         let registration = Registration {
             fingerprint: admitted.fingerprint,
             peer: admitted.peer,
-            identity: admitted.identity.clone(),
+            identities: admitted.identities.clone(),
+            shown,
             enrolling: enrolling.clone(),
             path: LinkPath {
                 face: face_id,
@@ -581,12 +651,13 @@ impl Links {
         self.faces.add_routes(face_id, &routes);
         // A served device of a namespace not held here: its Data crosses this
         // forwarder unvalidated while it is linked.
-        let transit = admitted
-            .identity
-            .as_ref()
+        let transit: Vec<Name> = admitted
+            .identities
+            .iter()
             .filter(|id| id.served.is_some())
-            .map(|id| id.namespace.clone());
-        if let Some(ns) = &transit {
+            .map(|id| id.namespace.clone())
+            .collect();
+        for ns in &transit {
             self.faces.transit(ns, true);
         }
         tracing::info!(
@@ -649,7 +720,7 @@ impl Links {
                 "link down: {why}"
             );
             if let Some(links) = weak.upgrade() {
-                if let Some(ns) = &transit {
+                for ns in &transit {
                     links.faces.transit(ns, false);
                 }
                 let ended = links.table.unregister(fingerprint, generation);
@@ -659,10 +730,10 @@ impl Links {
                         links.direct.carried(fingerprint);
                     }
                     links.maybe_asleep(fingerprint, &ended, watched.peer_reachability(), &why);
-                    if let Some(id) = &ended.identity
-                        && ended.last
-                    {
-                        links.announce_presence(&id.namespace);
+                    if ended.last {
+                        for id in &ended.identities {
+                            links.announce_presence(&id.namespace);
+                        }
                     }
                     if ended.peer.is_some_and(|p| links.peers.is_relay(p)) {
                         links.reselect_relays();
@@ -676,7 +747,8 @@ impl Links {
     /// A full link is up: the device is awake if it slept here, what waited
     /// for the link goes over it, this device tells it how to reach it
     /// while asleep, follows its presence list when it is a relay, and tells
-    /// the members of its namespace linked here.
+    /// the members of each namespace the device was admitted in, linked
+    /// here.
     async fn link_up(self: &Arc<Self>, admitted: &Admitted, peer: Option<&PeerSpec>, handle: &LinkHandle) {
         self.awake(admitted.fingerprint).await;
         if let (Some(id), Some(peer)) = (admitted.peer, peer) {
@@ -689,9 +761,9 @@ impl Links {
                 handle.send_reachability(&reach);
             }
             // Presence from a relay this device uses, or from any device
-            // whose role its namespace lets relay (a plain peer entry for the
-            // namespace's relay).
-            let relay_role = admitted.identity.as_ref().is_some_and(|i| {
+            // whose role one of its namespaces lets relay (a plain peer
+            // entry for the namespace's relay).
+            let relay_role = admitted.identities.iter().any(|i| {
                 self.trust
                     .keyring()
                     .context_for(&i.device)
@@ -705,7 +777,7 @@ impl Links {
                 self.reselect_relays();
             }
         }
-        if let Some(id) = &admitted.identity {
+        for id in &admitted.identities {
             self.announce_presence(&id.namespace);
         }
     }

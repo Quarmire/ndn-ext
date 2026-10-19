@@ -11,19 +11,27 @@
 //! # Admission
 //!
 //! A link is identified by the two devices' keys, never by an address.
-//! After the handshake each side sends its certificate and issuer chain; a
-//! link is admitted from signed data, by either rule:
+//! After the handshake each side sends its certificate and issuer chain
+//! for its link key, and a membership for each other namespace it is a
+//! member of with another key (that key's chain, bound to the connection by
+//! that key's signature, [`ndn_face_quic::Membership`]); the peer is
+//! identified in every namespace it proves, and a link is admitted from
+//! signed data, by either rule:
 //!
-//! - the certificate validates in a namespace this device holds, its key is
-//!   the key the handshake proved, it is not revoked, and the namespace's
-//!   link policy (in its trust context) lets the device's role link — and,
-//!   when a [`PeerSpec`] names a `device`, it is that device;
+//! - a certificate (its link key's, or a membership's) validates in a
+//!   namespace this device holds, its key is the key the handshake proved
+//!   (or bound to it), it is not revoked, and the namespace's link policy
+//!   (in its trust context) lets the device's role link — and, when a
+//!   [`PeerSpec`] names a `device`, it is that device; unasked, the
+//!   [`ServePolicy`] serves one of the namespaces proved;
 //! - the key is the expected fingerprint of a [`PeerSpec`] (`key`), for a
 //!   device of another namespace or one not enrolled yet.
 //!
 //! Validation is offline: the chain the peer sent, then certificates the
 //! host already has ([`LinkTrust::known_certificate`]), never a fetch — the
-//! link is not up yet.
+//! link is not up yet. A membership whose binding does not verify (a
+//! certificate of a key the peer does not hold, or a binding made for
+//! another connection) refuses the link.
 //!
 //! Otherwise the link is closed with a reason the other side logs — unless
 //! it can be an **enrollment link**, which carries only a device's
@@ -46,11 +54,12 @@
 //!   [`PeerSpec`] names, which it therefore cannot confirm yet, links to it
 //!   for its enrollment only.
 //!
-//! Once the device enrolls (the host switches to the enrolled key and calls
-//! [`Links::key_switched`]), it closes the enrollment link and dials again,
-//! now presenting its certificate: a full link, without anyone doing
-//! anything. A link whose certificate a newly adopted version of the trust
-//! context revokes is closed at once.
+//! Once the device enrolls (the host adds the enrolled identity to its
+//! memberships and calls [`Links::identities_changed`]), it closes the
+//! enrollment link and dials again, now presenting its certificate: a full
+//! link, without anyone doing anything. A revocation adopted while linked
+//! takes the revoked membership from the link (its routes and presence),
+//! and closes the link when no membership admitting it is left.
 //!
 //! # Routes, redial, one link per pair
 //!
@@ -70,11 +79,13 @@
 //! [`Links`] with a [`LinkSetup`]:
 //!
 //! - **The link key** ([`ndn_face_quic::LinkKeySource`]): the key this
-//!   device links with now. It must sign synchronously (a key that only
-//!   signs asynchronously cannot do a TLS handshake).
+//!   device links with now, one per device (a forwarder's node key). It
+//!   must sign synchronously (a key that only signs asynchronously cannot
+//!   do a TLS handshake).
 //! - **Trust** ([`LinkTrust`]): the keyring holding the trust contexts this
-//!   device adopted, this device's own certificate chain for its current key,
-//!   and certificates it already knows (served or cached).
+//!   device adopted, this device's own certificate chain for its link key,
+//!   its memberships of other namespaces ([`OwnMembership`]), and
+//!   certificates it already knows (served or cached).
 //! - **Faces and routes** ([`FaceSink`]): face ids, adding a link's face to
 //!   the forwarder, removing it when the link ends, adding the routes this
 //!   crate decides.
@@ -86,8 +97,8 @@
 //!   dial-only sockets are bound here when needed.
 //! - **Hints** ([`LinkHints`]): how a person at this device enrolls it or
 //!   renews a certificate, quoted in refusals and logs.
-//! - **Key switches**: [`Links::key_switched`] after the device switched to
-//!   another key (it enrolled).
+//! - **Identity changes**: [`Links::identities_changed`] after the device's
+//!   link key or memberships changed (it enrolled in a namespace).
 //!
 //! The host keeps the rest: parsing its configuration, the forwarder, and
 //! management.
@@ -99,10 +110,12 @@
 //! whose `device` its [`PeerSpec`] names, this device punches a direct
 //! path: a signed punch Interest to `<device>/32=link/32=punch/<session>`
 //! through the relay carries its candidate addresses ([`CandidateSource`]s,
-//! plus the reflexive addresses its links report); the peer, having
-//! admitted the sender as it would a link, answers with its own in signed
-//! Data; both probe each other's signed candidates from their link sockets;
-//! the device with the smaller fingerprint dials. The connection is admitted
+//! plus the reflexive addresses its links report) and, when its link key is
+//! not certified in the punched device's namespace, its membership of it
+//! bound to the punch; the peer, having admitted the sender as it would a
+//! link, answers with its own in signed Data; both probe each other's
+//! signed candidates from their link sockets; the device with the smaller
+//! fingerprint dials. The connection is admitted
 //! like a link and joins the link to that device as its direct path, with
 //! routes at cost 0; the relay's routes stay, so traffic falls back when
 //! it ends, and the device punches again with backoff. The link policy
@@ -111,20 +124,22 @@
 //!
 //! Beyond peer entries, devices of a namespace that meet at a common relay
 //! make direct paths **by membership**: the relay tells each member which
-//! others of its namespace are linked to it (presence, on the link's
-//! control stream, filtered by the namespace's direct-path role matrix;
-//! names and keys, never addresses), and the device with the smaller key
-//! fingerprint punches, at most [`DirectOptions::max_paths`] at once.
+//! others of its namespace are linked to it (presence, per namespace the
+//! member was admitted in, on the link's control stream, filtered by the
+//! namespace's direct-path role matrix; names and keys, never addresses),
+//! and the device with the smaller key fingerprint punches, at most
+//! [`DirectOptions::max_paths`] at once.
 //!
 //! # Relays
 //!
 //! Any device that others can reach is a relay for the devices it serves:
 //! its [`ServePolicy`] says whom (its own namespaces by default; listed
 //! namespaces by root fingerprint; or any, within [`Quotas`]). A device
-//! chooses which relays it uses ([`RelayOptions`]): the ones its namespace
-//! advertises in its trust context, the ones its person added
-//! ([`PeerSpec::relay_use`]), or none; the `count` most preferred reachable
-//! ones are linked, and traffic fails over to the next when one is lost.
+//! chooses which relays it uses ([`RelayOptions`]): the ones its namespaces
+//! advertise in their trust contexts, the ones its person added
+//! ([`PeerSpec::relay_use`]), or none; for each namespace it is a member
+//! of, the `count` most preferred reachable ones are linked, and traffic
+//! fails over to the next when one is lost.
 //! A relay of another namespace forwards signed packets it cannot forge, but
 //! it sees the names it forwards (and any content not encrypted end to
 //! end). It carries the Data of a namespace it serves but does not hold in
@@ -168,7 +183,7 @@ pub use asleep::{HoldLimits, RelayService, WAKE_INTERVAL, WakeNotifier, WakeRequ
 pub use candidates::{AdvertisedCandidates, Candidate, CandidateKind, CandidateSource, HostCandidates};
 #[cfg(feature = "engine")]
 pub use engine::EngineFaces;
-pub use host::{ConfiguredEndpoints, FaceSink, LinkHints, LinkTrust, PathCandidate, PathSource, Route};
+pub use host::{ConfiguredEndpoints, FaceSink, LinkHints, LinkTrust, OwnMembership, PathCandidate, PathSource, Route};
 pub use links::{LinkSetup, Links};
 pub use peer::{LinkMode, PeerId, PeerSpec, RelaySource, RelayUse};
 pub use policy::Backoff;

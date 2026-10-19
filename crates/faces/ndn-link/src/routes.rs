@@ -8,8 +8,8 @@ use crate::host::Route;
 use crate::peer::{PeerSpec, Peers};
 use crate::policy::VIA_RELAY_COST;
 
-/// The routes a relay this device uses gets: this device's namespaces, at
-/// the relay's rank.
+/// The routes a relay this device uses gets: the namespaces of this device
+/// it is used for, at the relay's rank.
 pub(crate) struct RelayRoutes {
     pub(crate) namespaces: Vec<Name>,
     pub(crate) cost: u32,
@@ -17,11 +17,12 @@ pub(crate) struct RelayRoutes {
 
 /// The routes over a link to the admitted peer: the peer's `routes`, else
 /// this device's namespaces for a relay it uses (`relay`: at the relay's
-/// rank), else its namespace for a relay this device dials (a `node` device
-/// whose peer entry has a path — whichever side's dial the link came from),
-/// else its device name; and the routes of the peers reached through it.
-/// An enrollment link: none on the relay (answers return the way their
-/// Interests came), the namespace on the enrolling device.
+/// rank), else, for each identity the peer was admitted by, its namespace
+/// for a relay this device dials (a `node` device whose peer entry has a
+/// path — whichever side's dial the link came from) or its device name;
+/// and the routes of the peers reached through it. An enrollment link:
+/// none on the relay (answers return the way their Interests came), the
+/// namespace on the enrolling device.
 pub(crate) fn routes_for(peers: &Peers, admitted: &Admitted, dials: bool, relay: Option<RelayRoutes>) -> Vec<Route> {
     match &admitted.enrollment {
         Some(Enrollment::Relay(_)) => return Vec::new(),
@@ -38,13 +39,13 @@ pub(crate) fn routes_for(peers: &Peers, admitted: &Admitted, dials: bool, relay:
     let peer = admitted.peer.and_then(|i| peers.get(i));
     let own = match (&relay, peer.as_ref().and_then(|p| p.routes.clone())) {
         (Some(r), None) if !r.namespaces.is_empty() => r.namespaces.clone(),
-        _ => default_routes(peer.as_deref(), admitted.identity.as_ref(), dials),
+        _ => default_routes(peer.as_deref(), &admitted.identities, dials),
     };
     let mut routes: Vec<Route> = own.into_iter().map(at(base)).collect();
     if let Some(index) = admitted.peer {
         for reached in peers.reached_through(index) {
             routes.extend(
-                default_routes(Some(&reached), None, false)
+                default_routes(Some(&reached), &[], false)
                     .into_iter()
                     .map(at(base + VIA_RELAY_COST)),
             );
@@ -54,26 +55,43 @@ pub(crate) fn routes_for(peers: &Peers, admitted: &Admitted, dials: bool, relay:
 }
 
 /// The prefixes a link to `peer` will route, known before it is up (for
-/// the waiting routes of an on-demand link): its `routes`, else this
-/// device's namespaces for a relay it uses, else its device name.
-pub(crate) fn predicted_routes(peer: &PeerSpec, own_namespaces: &[Name]) -> Vec<Name> {
+/// the waiting routes of an on-demand link): its `routes`, else, for a
+/// relay it uses, the namespaces of this device it uses it for
+/// (`relay_namespaces`), else its device name.
+pub(crate) fn predicted_routes(peer: &PeerSpec, relay_namespaces: &[Name]) -> Vec<Name> {
     if let Some(routes) = &peer.routes {
         return routes.clone();
     }
-    if peer.relay_use.is_some() && !own_namespaces.is_empty() {
-        return own_namespaces.to_vec();
+    if peer.relay_use.is_some() && !relay_namespaces.is_empty() {
+        return relay_namespaces.to_vec();
     }
     peer.device.clone().into_iter().collect()
 }
 
-fn default_routes(peer: Option<&PeerSpec>, identity: Option<&Identity>, dials: bool) -> Vec<Name> {
+fn default_routes(peer: Option<&PeerSpec>, identities: &[Identity], dials: bool) -> Vec<Name> {
     if let Some(routes) = peer.and_then(|p| p.routes.clone()) {
         return routes;
     }
-    match identity {
-        Some(id) if id.role == Role::Node && peer.is_some() && dials => vec![id.namespace.clone()],
-        Some(id) => vec![id.device.clone()],
-        None => peer.and_then(|p| p.device.clone()).into_iter().collect(),
+    if identities.is_empty() {
+        return peer.and_then(|p| p.device.clone()).into_iter().collect();
+    }
+    let mut out: Vec<Name> = Vec::new();
+    for id in identities {
+        let prefix = identity_route(id, peer.is_some() && dials);
+        if !out.contains(&prefix) {
+            out.push(prefix);
+        }
+    }
+    out
+}
+
+/// The route a link gets for one identity of its peer: the namespace of a
+/// `node` this device dials, else the device name.
+pub(crate) fn identity_route(id: &Identity, dialled_peer: bool) -> Name {
+    if id.role == Role::Node && dialled_peer {
+        id.namespace.clone()
+    } else {
+        id.device.clone()
     }
 }
 
@@ -99,10 +117,11 @@ mod tests {
     fn admitted(peer: Option<usize>, identity: Option<Identity>, enrollment: Option<Enrollment>) -> Admitted {
         Admitted {
             fingerprint: KeyFingerprint([0; 32]),
-            identity,
+            identities: identity.into_iter().collect(),
             peer: peer.map(PeerId),
             enrollment,
             quota: None,
+            quotas: Vec::new(),
         }
     }
 
