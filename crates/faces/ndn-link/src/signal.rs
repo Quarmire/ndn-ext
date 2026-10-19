@@ -23,7 +23,7 @@ use crate::punch::punch_prefix;
 
 /// What answered a punch Interest.
 pub(crate) enum Answer {
-    Data(Data),
+    Data(Box<Data>),
     /// A Nack, with its reason, and whether this device's own forwarder
     /// refused (a local refusal, e.g. Data it cannot validate).
     Nack { why: String, refused: bool },
@@ -137,7 +137,7 @@ async fn receive(links: Weak<Links>, signal: Arc<Signal>) {
             Some(0x06) => {
                 if let Ok(data) = Data::decode(wire) {
                     let name = (*data.name).clone();
-                    signal.answered(&name, Answer::Data(data));
+                    signal.answered(&name, Answer::Data(Box::new(data)));
                 }
             }
             _ => {}

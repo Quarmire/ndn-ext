@@ -60,6 +60,20 @@ pub trait FaceSink: Send + Sync + 'static {
 
     /// Route `routes` to `face`, each prefix covering the names under it.
     fn add_routes(&self, face: FaceId, routes: &[Route]);
+
+    /// Take the routes of `prefixes` from `face` again (routes this crate
+    /// added with [`add_routes`](Self::add_routes); the face stays).
+    fn remove_routes(&self, face: FaceId, prefixes: &[Name]);
+
+    /// A device of `namespace`, a namespace this device does not hold, is
+    /// linked here and served by the serving policy (`true`), or one such
+    /// link ended (`false`; calls pair up). While any is linked, the
+    /// forwarder carries the namespace's Data **in transit**: it forwards
+    /// it to the Interests pending for it without validating it (it holds
+    /// neither the namespace's trust context nor its certificates; the
+    /// devices that asked validate it) and caches none of it. A forwarder
+    /// that validates nothing in transit anyway does nothing here.
+    fn transit(&self, namespace: &Name, served: bool);
 }
 
 /// Where a peer may be dialled.

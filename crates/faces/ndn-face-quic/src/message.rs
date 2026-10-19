@@ -17,7 +17,21 @@
 //! the enrollment of the receiver in the namespaces named;
 //! `ObservedAddress = 0x0458 (UDP address)` — after the verdict, the source
 //! address the sender sees the receiver's packets come from (sent at once,
-//! and again whenever it changes).
+//! and again whenever it changes);
+//! `Reachability = 0x0440 { HoldInterests 0x0442 (empty)?, WakeToken 0x0444
+//! (1..=1024 bytes)? }` — after the verdict, device to relay: whether the
+//! relay should hold Interests for the device while it is asleep, and the
+//! opaque token the relay's wake notifier gets to wake it; the latest
+//! replaces the earlier ones;
+//! `Presence = 0x0446 { Name, PresentDevice 0x0448 { Name, KeyDigest 0x044A
+//! (32 bytes) }* }` — after the verdict, relay to device: the devices of
+//! namespace `Name` linked to the relay now (device name and key
+//! fingerprint, no address), the full list; the latest for a namespace
+//! replaces the earlier ones, and an empty list says none is.
+//!
+//! Every message after the verdict has an even TLV-TYPE above 31, so a
+//! receiver that predates it skips it. A malformed one closes the link with
+//! [`CloseReason::Protocol`].
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -25,12 +39,20 @@ use bytes::Bytes;
 use ndn_packet::Name;
 use ndn_tlv::{TlvWriter, read_varu64};
 
+use crate::key::KeyFingerprint;
+
 pub(crate) const LINK_HELLO: u64 = 0x0450;
 const LINK_VERSION: u64 = 0x0451;
 pub(crate) const LINK_VERDICT: u64 = 0x0452;
 const ENROLLMENT_LINK: u64 = 0x0454;
 pub(crate) const OBSERVED_ADDRESS: u64 = 0x0458;
 const DIRECT_PATH: u64 = 0x045A;
+pub(crate) const REACHABILITY: u64 = 0x0440;
+const HOLD_INTERESTS: u64 = 0x0442;
+const WAKE_TOKEN: u64 = 0x0444;
+pub(crate) const PRESENCE: u64 = 0x0446;
+const PRESENT_DEVICE: u64 = 0x0448;
+const KEY_DIGEST: u64 = 0x044A;
 const DATA: u64 = 0x06;
 const NAME: u64 = 0x07;
 
@@ -188,6 +210,156 @@ pub(crate) fn encode_observed_address(addr: SocketAddr) -> Bytes {
     w.finish()
 }
 
+/// Most bytes a wake token takes: a platform push token (APNs, FCM, a
+/// UnifiedPush endpoint URL) fits with room to spare.
+pub const WAKE_TOKEN_MAX: usize = 1024;
+
+/// How the sender is reached while it does not keep its link up: a device
+/// tells a relay. The latest a relay received replaces the earlier ones.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Reachability {
+    /// Hold Interests for this device while it is asleep (its link closed
+    /// with [`CloseReason::Asleep`]), within the relay's bounds, and deliver
+    /// them when it links again.
+    pub hold: bool,
+    /// An opaque token (1 to [`WAKE_TOKEN_MAX`] bytes) the relay hands to
+    /// its wake notifier when Interests arrive for this device while it is
+    /// asleep — a platform push token, for instance. `None`: do not wake
+    /// this device.
+    pub wake_token: Option<Bytes>,
+}
+
+impl Reachability {
+    pub(crate) fn encode(&self) -> Bytes {
+        let mut w = TlvWriter::new();
+        w.write_nested(REACHABILITY, |w| {
+            if self.hold {
+                w.write_tlv(HOLD_INTERESTS, &[]);
+            }
+            if let Some(token) = &self.wake_token {
+                w.write_tlv(WAKE_TOKEN, token);
+            }
+        });
+        w.finish()
+    }
+
+    /// Decode the value of a `Reachability` TLV.
+    pub(crate) fn decode(value: &[u8]) -> Result<Self, String> {
+        let mut reachability = Self::default();
+        let mut cur = value;
+        while !cur.is_empty() {
+            let (t, start, end) = split_tlv(cur)?;
+            let field = &cur[start..end];
+            match t {
+                HOLD_INTERESTS if field.is_empty() => reachability.hold = true,
+                HOLD_INTERESTS => {
+                    return Err(format!(
+                        "a HoldInterests of {} bytes in the Reachability message (it is empty)",
+                        field.len()
+                    ));
+                }
+                WAKE_TOKEN if (1..=WAKE_TOKEN_MAX).contains(&field.len()) => {
+                    reachability.wake_token = Some(Bytes::copy_from_slice(field));
+                }
+                WAKE_TOKEN => {
+                    return Err(format!(
+                        "a wake token of {} bytes in the Reachability message (it is 1 to \
+                         {WAKE_TOKEN_MAX} bytes)",
+                        field.len()
+                    ));
+                }
+                t if skippable(t) => {}
+                t => return Err(format!("unknown critical field {t:#x} in the Reachability message")),
+            }
+            cur = &cur[end..];
+        }
+        Ok(reachability)
+    }
+}
+
+/// Which devices of a namespace are linked to the sender (a relay) now.
+/// Carries no address: a device that may make a direct path with one of
+/// them asks for its candidates the usual way.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Presence {
+    pub namespace: Name,
+    /// The full list; empty: no device of the namespace is linked there.
+    pub devices: Vec<PresentDevice>,
+}
+
+/// A device a [`Presence`] lists.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PresentDevice {
+    /// The device's name, normally `/<namespace>/<role>/<device>`.
+    pub device: Name,
+    /// The fingerprint of the key it linked with.
+    pub key: KeyFingerprint,
+}
+
+impl Presence {
+    pub(crate) fn encode(&self) -> Bytes {
+        let mut w = TlvWriter::new();
+        w.write_nested(PRESENCE, |w| {
+            w.write_raw(&self.namespace.encode_to_tlv());
+            for d in &self.devices {
+                w.write_nested(PRESENT_DEVICE, |w| {
+                    w.write_raw(&d.device.encode_to_tlv());
+                    w.write_tlv(KEY_DIGEST, &d.key.0);
+                });
+            }
+        });
+        w.finish()
+    }
+
+    /// Decode the value of a `Presence` TLV.
+    pub(crate) fn decode(value: &[u8]) -> Result<Self, String> {
+        let mut namespace = None;
+        let mut devices = Vec::new();
+        let mut cur = value;
+        while !cur.is_empty() {
+            let (t, start, end) = split_tlv(cur)?;
+            match t {
+                NAME => namespace = Some(decode_name(&cur[start..end], "the namespace of the Presence message")?),
+                PRESENT_DEVICE => devices.push(decode_present_device(&cur[start..end])?),
+                t if skippable(t) => {}
+                t => return Err(format!("unknown critical field {t:#x} in the Presence message")),
+            }
+            cur = &cur[end..];
+        }
+        let namespace = namespace.ok_or("a Presence message names no namespace")?;
+        Ok(Self { namespace, devices })
+    }
+}
+
+fn decode_present_device(value: &[u8]) -> Result<PresentDevice, String> {
+    let mut device = None;
+    let mut key = None;
+    let mut cur = value;
+    while !cur.is_empty() {
+        let (t, start, end) = split_tlv(cur)?;
+        let field = &cur[start..end];
+        match t {
+            NAME => device = Some(decode_name(field, "a device in the Presence message")?),
+            KEY_DIGEST => {
+                key = Some(KeyFingerprint(<[u8; 32]>::try_from(field).map_err(|_| {
+                    format!("a key digest of {} bytes in the Presence message (it is 32)", field.len())
+                })?));
+            }
+            t if skippable(t) => {}
+            t => return Err(format!("unknown critical field {t:#x} in a PresentDevice")),
+        }
+        cur = &cur[end..];
+    }
+    match (device, key) {
+        (Some(device), Some(key)) => Ok(PresentDevice { device, key }),
+        _ => Err("a PresentDevice without its device name or key digest".into()),
+    }
+}
+
+fn decode_name(value: &[u8], what: &str) -> Result<Name, String> {
+    Name::decode(Bytes::copy_from_slice(value)).map_err(|e| format!("{what}: {e}"))
+}
+
 /// A UDP address as link messages and direct-path candidates carry it: the
 /// IPv4 (4 bytes) or IPv6 (16 bytes) address, then the port (2 bytes), in
 /// network byte order. An IPv4-mapped IPv6 address is written as IPv4.
@@ -254,6 +426,16 @@ pub enum CloseReason {
     /// this device is not punching (it ended, or never began): the other
     /// device's next punch makes a new one.
     PathExpired,
+    /// The device closed its link to sleep: its on-demand link carried
+    /// nothing for its idle time, its host went inactive (an app in the
+    /// background), or its link mode was turned off. It links again when it
+    /// has something to send or is woken; a relay it asked to
+    /// ([`Reachability`]) holds Interests for it and wakes it meanwhile.
+    Asleep,
+    /// The device no longer uses this relay: a relay it prefers is back, or
+    /// this relay was removed from its configuration or disconnected by its
+    /// user. Not a fault of either side.
+    Released,
     /// The key has no valid certificate in a namespace this device holds,
     /// and no `[[peer]]` entry expects its fingerprint.
     Unrecognized,
@@ -279,6 +461,11 @@ pub enum CloseReason {
     /// policy of the namespace (its trust context), or by this device's
     /// peer entry for the other. Refuses a direct-path punch.
     DirectPathsOff,
+    /// This relay's serving policy does not serve the device's namespace or
+    /// key (it serves its own namespaces, listed ones, or any within quotas,
+    /// as its operator chose): use another relay, or ask this relay's
+    /// operator to serve the namespace.
+    NotServed,
 }
 
 impl CloseReason {
@@ -289,6 +476,8 @@ impl CloseReason {
             Self::Idle => 0x02,
             Self::Enrolled => 0x03,
             Self::PathExpired => 0x04,
+            Self::Asleep => 0x05,
+            Self::Released => 0x06,
             Self::Unrecognized => 0x10,
             Self::CertificateForAnotherKey => 0x11,
             Self::Revoked => 0x12,
@@ -298,6 +487,7 @@ impl CloseReason {
             Self::Busy => 0x16,
             Self::NoLinkKey => 0x17,
             Self::DirectPathsOff => 0x18,
+            Self::NotServed => 0x19,
         }
     }
 
@@ -308,6 +498,8 @@ impl CloseReason {
             0x02 => Self::Idle,
             0x03 => Self::Enrolled,
             0x04 => Self::PathExpired,
+            0x05 => Self::Asleep,
+            0x06 => Self::Released,
             0x10 => Self::Unrecognized,
             0x11 => Self::CertificateForAnotherKey,
             0x12 => Self::Revoked,
@@ -317,19 +509,27 @@ impl CloseReason {
             0x16 => Self::Busy,
             0x17 => Self::NoLinkKey,
             0x18 => Self::DirectPathsOff,
+            0x19 => Self::NotServed,
             _ => return None,
         })
     }
 
     /// Whether the link should be dialled again later without a change on
     /// either side: a shutdown, a busy listener, an idle enrollment link,
-    /// an enrollment completed or an expired direct-path session pass; a
-    /// refusal of the key does not (until the trust data or the config
-    /// changes).
+    /// an enrollment completed, an expired direct-path session, a device
+    /// gone asleep or a relay released pass; a refusal of the key or of its
+    /// namespace does not (until the trust data or the config changes).
     pub fn is_transient(self) -> bool {
         matches!(
             self,
-            Self::Shutdown | Self::Replaced | Self::Idle | Self::Enrolled | Self::PathExpired | Self::Busy
+            Self::Shutdown
+                | Self::Replaced
+                | Self::Idle
+                | Self::Enrolled
+                | Self::PathExpired
+                | Self::Asleep
+                | Self::Released
+                | Self::Busy
         )
     }
 }
@@ -443,6 +643,8 @@ mod tests {
             CloseReason::Idle,
             CloseReason::Enrolled,
             CloseReason::PathExpired,
+            CloseReason::Asleep,
+            CloseReason::Released,
             CloseReason::Unrecognized,
             CloseReason::CertificateForAnotherKey,
             CloseReason::Revoked,
@@ -452,8 +654,73 @@ mod tests {
             CloseReason::Busy,
             CloseReason::NoLinkKey,
             CloseReason::DirectPathsOff,
+            CloseReason::NotServed,
         ] {
             assert_eq!(CloseReason::from_code(u64::from(r.code())), Some(r));
         }
+        // The codes of ndn-link.md, and which pass with time.
+        for (r, code, transient) in [
+            (CloseReason::Asleep, 0x05, true),
+            (CloseReason::Released, 0x06, true),
+            (CloseReason::NotServed, 0x19, false),
+        ] {
+            assert_eq!((r.code(), r.is_transient()), (code, transient), "{r:?}");
+        }
+    }
+
+    #[test]
+    fn reachability_matches_the_spec_vectors_and_round_trips() {
+        let full = Reachability {
+            hold: true,
+            wake_token: Some(Bytes::from_static(b"tok")),
+        };
+        let wire = full.encode();
+        assert_eq!(
+            wire.as_ref(),
+            [0xFD, 0x04, 0x40, 0x0B, 0xFD, 0x04, 0x42, 0x00, 0xFD, 0x04, 0x44, 0x03, b't', b'o', b'k']
+        );
+        assert_eq!(Reachability::decode(&wire[4..]).unwrap(), full);
+        // Neither: no holding, no waking.
+        assert_eq!(Reachability::default().encode().as_ref(), [0xFD, 0x04, 0x40, 0x00]);
+        assert_eq!(Reachability::decode(&[]).unwrap(), Reachability::default());
+        // HoldInterests is empty; a wake token is 1..=1024 bytes.
+        assert!(Reachability::decode(&[0xFD, 0x04, 0x42, 0x01, 0x01]).is_err());
+        assert!(Reachability::decode(&[0xFD, 0x04, 0x44, 0x00]).is_err());
+        let mut long = vec![0xFD, 0x04, 0x44, 0xFD, 0x04, 0x01];
+        long.extend([0u8; 1025]);
+        assert!(Reachability::decode(&long).is_err());
+        long.truncate(long.len() - 1);
+        long[5] = 0x00;
+        assert_eq!(Reachability::decode(&long).unwrap().wake_token.unwrap().len(), WAKE_TOKEN_MAX);
+    }
+
+    #[test]
+    fn presence_matches_the_spec_vector_and_round_trips() {
+        let presence = Presence {
+            namespace: "/home".parse().unwrap(),
+            devices: vec![PresentDevice {
+                device: "/home/d".parse().unwrap(),
+                key: KeyFingerprint([0xAB; 32]),
+            }],
+        };
+        let mut expected = vec![0xFD, 0x04, 0x46, 0x3B, 0x07, 0x06, 0x08, 0x04, b'h', b'o', b'm', b'e'];
+        expected.extend([0xFD, 0x04, 0x48, 0x2F]);
+        expected.extend([0x07, 0x09, 0x08, 0x04, b'h', b'o', b'm', b'e', 0x08, 0x01, b'd']);
+        expected.extend([0xFD, 0x04, 0x4A, 0x20]);
+        expected.extend([0xAB; 32]);
+        let wire = presence.encode();
+        assert_eq!(wire.as_ref(), expected);
+        assert_eq!(Presence::decode(&wire[4..]).unwrap(), presence);
+        let none = Presence {
+            namespace: "/home".parse().unwrap(),
+            devices: Vec::new(),
+        };
+        assert_eq!(Presence::decode(&none.encode()[4..]).unwrap(), none);
+        // A namespace is required; a key digest is 32 bytes.
+        assert!(Presence::decode(&[]).is_err());
+        let short_key = [0x07, 0x00, 0xFD, 0x04, 0x48, 0x07, 0x07, 0x00, 0xFD, 0x04, 0x4A, 0x01, 0xAB];
+        assert!(Presence::decode(&short_key).is_err());
+        let no_key = [0x07, 0x00, 0xFD, 0x04, 0x48, 0x02, 0x07, 0x00];
+        assert!(Presence::decode(&no_key).is_err());
     }
 }

@@ -1,8 +1,9 @@
 //! Running the links: accepting, dialling, establishing, and keeping them,
 //! and their direct paths.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -17,17 +18,23 @@ use ndn_transport::reliability::ReliabilityConfig;
 use ndn_transport::{Face, FaceId, LpLinkService};
 use tokio_util::sync::CancellationToken;
 
-use crate::admission::{Admitted, Enrollment, Judge, list};
+use crate::admission::{Admitted, Enrollment, Judge, hello_chain, list};
+use crate::asleep::{RelayService, Sleepers};
 use crate::candidates::CandidateSource;
-use crate::direct::{Direct, Whom, direct_loop};
+use crate::control::{PeerCtl, idle_check, release};
+use crate::direct::{Direct, Whom};
 use crate::host::{FaceSink, LinkHints, LinkTrust, PathCandidate, PathSource};
-use crate::peer::{PeerId, PeerSpec, Peers};
+use crate::peer::{LinkMode, PeerId, PeerSpec, Peers};
 use crate::policy::{Backoff, ENROLLMENT_IDLE, MESSAGE_DEADLINE};
-use crate::routes::routes_for;
+use crate::presence::{DirectOptions, MemberEntry};
+use crate::relays::RelayOptions;
+use crate::routes::{RelayRoutes, routes_for};
+use crate::serving::QuotaState;
 use crate::signal::Signal;
 use crate::slots::EnrollmentSlots;
 use crate::status::{DirectState, DirectStatus, LinkReport, LinkStatus, PathKind, PathStatus};
 use crate::table::{LinkPath, LinkTable, Registration};
+use crate::waiting::{WaitFor, Waiting};
 
 /// What a host gives [`Links::start`].
 pub struct LinkSetup {
@@ -53,6 +60,13 @@ pub struct LinkSetup {
     pub socket: Option<Arc<LinkEndpoint>>,
     pub transport: LinkTransportConfig,
     pub hints: LinkHints,
+    /// Which relays this device uses.
+    pub relays: RelayOptions,
+    /// What this device offers as a relay: whom it serves, and whether it
+    /// holds Interests for and wakes devices asleep here.
+    pub service: RelayService,
+    /// Direct paths by membership.
+    pub direct: DirectOptions,
 }
 
 /// How a connection came to be, for [`Links::establish`].
@@ -71,26 +85,40 @@ pub struct Links {
     pub(crate) key: Arc<dyn LinkKeySource>,
     pub(crate) trust: Arc<dyn LinkTrust>,
     faces: Arc<dyn FaceSink>,
-    paths: Arc<dyn PathSource>,
+    pub(crate) paths: Arc<dyn PathSource>,
     pub(crate) candidates: Vec<Arc<dyn CandidateSource>>,
     pub(crate) peers: Peers,
     pub(crate) hints: LinkHints,
     transport: LinkTransportConfig,
-    socket: Option<Arc<LinkEndpoint>>,
+    pub(crate) socket: Option<Arc<LinkEndpoint>>,
     /// Dial-only sockets, by address family (`true`: IPv4).
-    dialers: Mutex<HashMap<bool, Arc<LinkEndpoint>>>,
+    pub(crate) dialers: Mutex<HashMap<bool, Arc<LinkEndpoint>>>,
     pub(crate) table: LinkTable,
     enrollment_slots: EnrollmentSlots,
     pub(crate) direct: Direct,
     signal: OnceLock<Arc<Signal>>,
+    pub(crate) waiting: OnceLock<Arc<Waiting>>,
+    pub(crate) relay_options: RelayOptions,
+    pub(crate) service: RelayService,
+    pub(crate) quotas: QuotaState,
+    pub(crate) direct_options: DirectOptions,
+    pub(crate) ctls: Mutex<HashMap<PeerId, Arc<PeerCtl>>>,
+    pub(crate) active: AtomicBool,
+    /// Namespace relays the host removed: not added again.
+    pub(crate) dismissed: Mutex<HashSet<String>>,
+    pub(crate) sleepers: Sleepers,
+    /// Members this device punches by presence, by key.
+    pub(crate) members: Mutex<HashMap<KeyFingerprint, MemberEntry>>,
     pub(crate) cancel: CancellationToken,
 }
 
 impl Links {
     /// Start: accept links on the socket when it listens, dial each peer
-    /// that has a path, punch direct paths to the peers reached through a
-    /// relay, take the punches of others, and close links a newly adopted
-    /// trust context revokes. Everything stops at `cancel`.
+    /// that has a path (as its mode says), use the relays the namespaces
+    /// advertise, punch direct paths to the peers reached through a relay
+    /// and to members met at one, take the punches of others, hold
+    /// Interests for on-demand links and sleeping devices, and close links
+    /// a newly adopted trust context revokes. Everything stops at `cancel`.
     pub fn start(setup: LinkSetup, cancel: CancellationToken) -> Arc<Self> {
         let links = Arc::new(Self {
             key: setup.key,
@@ -107,9 +135,20 @@ impl Links {
             enrollment_slots: EnrollmentSlots::default(),
             direct: Direct::default(),
             signal: OnceLock::new(),
+            waiting: OnceLock::new(),
+            relay_options: setup.relays,
+            service: setup.service,
+            quotas: QuotaState::default(),
+            direct_options: setup.direct,
+            ctls: Mutex::new(HashMap::new()),
+            active: AtomicBool::new(false),
+            dismissed: Mutex::new(HashSet::new()),
+            sleepers: Sleepers::default(),
+            members: Mutex::new(HashMap::new()),
             cancel,
         });
         let _ = links.signal.set(Signal::start(&links));
+        let _ = links.waiting.set(Waiting::start(&links));
         links.take_punches();
 
         let weak = Arc::downgrade(&links);
@@ -118,19 +157,27 @@ impl Links {
                 links.table.close_revoked(ctx);
             }
         });
+        // A new version may advertise other relays or pair other roles. The
+        // keyring may adopt on any thread: the work goes to this runtime.
+        let weak = Arc::downgrade(&links);
+        let runtime = tokio::runtime::Handle::current();
+        links.trust.keyring().on_adoption(move |_| {
+            if let Some(links) = weak.upgrade() {
+                runtime.spawn(async move {
+                    links.sync_namespace_relays();
+                    links.announce_all();
+                });
+            }
+        });
         // Every socket accepts: a listening one any link, a dial-only one
         // the direct paths of its punches.
         if let Some(socket) = &links.socket {
             tokio::spawn(accept_loop(Arc::downgrade(&links), Arc::clone(socket)));
         }
         for (id, peer) in links.peers.iter() {
-            if !links.paths.candidates(id, peer).is_empty() {
-                tokio::spawn(dial_loop(Arc::downgrade(&links), id));
-            }
-            if peer.relay.is_some() && peer.device.is_some() {
-                tokio::spawn(direct_loop(Arc::downgrade(&links), id));
-            }
+            links.run_peer(id, &peer);
         }
+        links.sync_namespace_relays();
         links
     }
 
@@ -138,12 +185,7 @@ impl Links {
     pub async fn shutdown(&self) {
         let text = "the device is shutting down; it links again when it is back";
         let grace = Duration::from_secs(1);
-        let dialers: Vec<_> = self
-            .dialers
-            .lock()
-            .values()
-            .cloned()
-            .collect();
+        let dialers: Vec<_> = self.dialers.lock().values().cloned().collect();
         for endpoint in self.socket.iter().chain(dialers.iter()) {
             endpoint.close(CloseReason::Shutdown, text, grace).await;
         }
@@ -151,12 +193,17 @@ impl Links {
 
     /// This device switched to another key (it enrolled): close each
     /// enrollment link for a namespace that key is certified in, and dial it
-    /// again, now as an enrolled device; take punches under its new name.
-    pub fn key_switched(&self) {
+    /// again, now as an enrolled device; take punches under its new name;
+    /// use the relays its namespace advertises.
+    pub fn key_switched(self: &Arc<Self>) {
         if let Some(cert) = self.judge().own_certificate() {
             self.table.relink_enrolled(&cert.name);
         }
         self.take_punches();
+        self.sync_namespace_relays();
+        for (id, _) in self.peers.iter() {
+            self.route_demand(id);
+        }
     }
 
     /// This device's links now: each device, its paths, and its direct
@@ -197,7 +244,7 @@ impl Links {
             {
                 paths.push(PathStatus {
                     kind: PathKind::Relay,
-                    via: Some(self.peers.get(relay).label.clone()),
+                    via: Some(self.peers.label(relay)),
                     ..p.clone()
                 });
             }
@@ -208,10 +255,17 @@ impl Links {
                 device,
                 paths,
                 direct,
+                peer: Some(id),
+                mode: Some(peer.mode),
+                relay: self.relay_status(id, &peer),
+                down: self.why_down(id, &peer),
+                asleep: key.and_then(|k| self.asleep_status(&k)),
             });
         }
-        for (i, v) in views.iter().enumerate().filter(|(i, _)| !used[*i]) {
-            let _ = i;
+        for (i, v) in views.iter().enumerate() {
+            if used[i] {
+                continue;
+            }
             links.push(LinkStatus {
                 label: v
                     .device
@@ -221,6 +275,11 @@ impl Links {
                 device: v.device.clone(),
                 paths: v.paths.clone(),
                 direct: direct_status(Whom::Key(v.fingerprint), &v.paths),
+                peer: None,
+                mode: None,
+                relay: None,
+                down: None,
+                asleep: None,
             });
         }
         for (whom, entry) in &entries {
@@ -234,12 +293,39 @@ impl Links {
                 device: entry.device.clone(),
                 paths: Vec::new(),
                 direct: entry.status(),
+                peer: None,
+                mode: None,
+                relay: None,
+                down: None,
+                asleep: self.asleep_status(fp),
+            });
+        }
+        for (fp, device) in self.sleepers() {
+            if links.iter().any(|l| l.key == Some(fp)) {
+                continue;
+            }
+            links.push(LinkStatus {
+                label: device
+                    .as_ref()
+                    .map_or_else(|| format!("key {fp}"), ToString::to_string),
+                key: Some(fp),
+                device,
+                paths: Vec::new(),
+                direct: DirectStatus::default(),
+                peer: None,
+                mode: None,
+                relay: None,
+                down: None,
+                asleep: self.asleep_status(&fp),
             });
         }
         LinkReport {
             key: self.my_fingerprint(),
             probes_sent: self.direct.probes_sent.load(std::sync::atomic::Ordering::Relaxed),
             punches_refused: self.direct.refused.load(std::sync::atomic::Ordering::Relaxed),
+            serve: self.service.serve.describe(),
+            held_total: self.waiting.get().map_or(0, |w| w.total(true)),
+            wakes_sent: self.sleepers.wakes_sent.load(std::sync::atomic::Ordering::Relaxed),
             links,
         }
     }
@@ -254,6 +340,10 @@ impl Links {
 
     pub(crate) fn signal(&self) -> &Arc<Signal> {
         self.signal.get().expect("the signalling face starts with the links")
+    }
+
+    pub(crate) fn waiting(&self) -> &Arc<Waiting> {
+        self.waiting.get().expect("the waiting face starts with the links")
     }
 
     /// This device's name, from the certificate it links with now.
@@ -280,6 +370,8 @@ impl Links {
             trust: self.trust.as_ref(),
             peers: &self.peers,
             hints: &self.hints,
+            serve: &self.service.serve,
+            quotas: &self.quotas,
         }
     }
 
@@ -327,8 +419,19 @@ impl Links {
             Origin::Accepted => self.direct.session_with(peer_fp),
             Origin::Dialed(_) => None,
         };
+        // Dialling a relay of a namespace this device is not in (it names
+        // the relay's device, not its key), this device links for its
+        // enrollment only and sends no certificate: one of another namespace
+        // would have the relay refuse it as a device it does not serve.
+        let enrolling = match origin {
+            Origin::Dialed(id) => self.peers.get(id).is_some_and(|p| {
+                let judge = self.judge();
+                p.key.is_none() && p.device.as_ref().is_some_and(|d| judge.own_role_in(&judge.namespace_of(d)).is_none())
+            }),
+            _ => false,
+        };
         let ours = LinkHello {
-            certificates: self.trust.own_chain(),
+            certificates: if enrolling { Vec::new() } else { hello_chain(self.trust.as_ref()) },
             direct_path: session,
         };
         let theirs = hs.exchange_hello(&ours, MESSAGE_DEADLINE).await?;
@@ -367,7 +470,7 @@ impl Links {
             _ => None,
         };
         let judge = self.judge();
-        let admitted = match judge.decide(hs.peer_key(), &theirs, dialed).await {
+        let mut admitted = match judge.decide(hs.peer_key(), &theirs, dialed).await {
             Ok(a) => a,
             Err(refusal) => return refuse(hs, refusal.reason, refusal.text),
         };
@@ -406,24 +509,28 @@ impl Links {
             },
             _ => None,
         };
+        let quota = admitted.quota.take();
         let direction = hs.direction();
-        let local = hs.local_address();
+        let gone = CancellationToken::new();
         let kind = if direct.is_some() {
             PathKind::Direct
         } else {
             PathKind::Link
         };
+        let peer = admitted.peer.and_then(|i| self.peers.get(i));
         let face_id = self.faces.alloc_face_id();
         let link = hs
             .admit(face_id, MESSAGE_DEADLINE, judge.admission_for(&admitted))
             .await?;
-        let reliability = admitted.peer.is_some_and(|i| self.peers.get(i).reliability);
+        let reliability = peer.as_ref().is_some_and(|p| p.reliability);
         let link_service: Arc<dyn ndn_transport::LinkService> = if reliability {
             Arc::new(LpLinkService::with_reliability(ReliabilityConfig::ethernet()))
         } else {
             ndn_transport::default_link_service_for_kind(ndn_transport::FaceKind::Quic)
         };
-        let face = Face::from_parts(Arc::new(link.face), link_service);
+        let transport: Arc<dyn ndn_transport::ErasedTransport> = Arc::new(link.face);
+        let face = Face::from_parts(Arc::clone(&transport), Arc::clone(&link_service));
+        let sender = Arc::new(Face::from_parts(transport, link_service));
         let handle = link.handle;
         let peer_enrollment = link.peer_verdict.enrollment_link.unwrap_or_default();
         let mut enrolling = peer_enrollment.clone();
@@ -432,18 +539,36 @@ impl Links {
         {
             enrolling.push(ns.clone());
         }
+        // The namespace route goes to a relay this device dials, whichever
+        // side's dial this link came from (when both dial, one link stays);
+        // a relay this device uses routes its namespaces at the relay's
+        // rank.
+        let dials = admitted
+            .peer
+            .zip(peer.as_ref())
+            .is_some_and(|(i, p)| !self.paths.candidates(i, p).is_empty());
+        let relay_routes = match (admitted.peer, &peer) {
+            (Some(i), Some(p)) if p.relay_use.is_some() && kind == PathKind::Link => Some(RelayRoutes {
+                namespaces: self.own_namespaces(),
+                cost: self.relay_cost(i),
+            }),
+            _ => None,
+        };
+        let routes = routes_for(&self.peers, &admitted, dials, relay_routes);
         let registration = Registration {
             fingerprint: admitted.fingerprint,
             peer: admitted.peer,
             identity: admitted.identity.clone(),
-            enrolling,
+            enrolling: enrolling.clone(),
             path: LinkPath {
                 face: face_id,
                 handle: handle.clone(),
                 direction,
                 kind,
-                local,
+                gone: gone.clone(),
                 since: Instant::now(),
+                sender,
+                routes: routes.clone(),
             },
         };
         let Some(generation) = self.table.register(registration, self.my_fingerprint()) else {
@@ -453,13 +578,17 @@ impl Links {
             });
         };
         self.faces.add_face(face, self.cancel.child_token());
-        // The namespace route goes to a relay this device dials, whichever
-        // side's dial this link came from (when both dial, one link stays).
-        let dials = admitted
-            .peer
-            .is_some_and(|i| !self.paths.candidates(i, self.peers.get(i)).is_empty());
-        let routes = routes_for(&self.peers, &admitted, dials);
         self.faces.add_routes(face_id, &routes);
+        // A served device of a namespace not held here: its Data crosses this
+        // forwarder unvalidated while it is linked.
+        let transit = admitted
+            .identity
+            .as_ref()
+            .filter(|id| id.served.is_some())
+            .map(|id| id.namespace.clone());
+        if let Some(ns) = &transit {
+            self.faces.transit(ns, true);
+        }
         tracing::info!(
             target: "face.quic",
             face = face_id.0,
@@ -474,12 +603,17 @@ impl Links {
             self.direct.path_up(&session, &handle);
         }
         self.explain_enrollment(&admitted, &peer_enrollment, face_id);
+        if kind == PathKind::Link && enrolling.is_empty() {
+            self.link_up(&admitted, peer.as_deref(), &handle).await;
+        }
         let weak = Arc::downgrade(self);
         let watched = handle.clone();
         let fingerprint = admitted.fingerprint;
         let describe = admitted.describe();
         let what = kind.as_str();
         tokio::spawn(async move {
+            // Cancelled once this task removed the path's face and routes.
+            let _gone = gone.drop_guard();
             let why = match slot {
                 // An enrollment link that carries nothing for its idle
                 // lifetime is closed; the device dials again if it still
@@ -506,6 +640,7 @@ impl Links {
                 }
                 None => watched.closed().await,
             };
+            drop(quota);
             tracing::info!(
                 target: "face.quic",
                 face = face_id.0,
@@ -514,11 +649,65 @@ impl Links {
                 "link down: {why}"
             );
             if let Some(links) = weak.upgrade() {
-                links.table.unregister(fingerprint, generation);
+                if let Some(ns) = &transit {
+                    links.faces.transit(ns, false);
+                }
+                let ended = links.table.unregister(fingerprint, generation);
                 links.faces.remove_face(face_id);
+                if let Some(ended) = ended {
+                    if ended.kind == PathKind::Direct && watched.datagrams() > 0 {
+                        links.direct.carried(fingerprint);
+                    }
+                    links.maybe_asleep(fingerprint, &ended, watched.peer_reachability(), &why);
+                    if let Some(id) = &ended.identity
+                        && ended.last
+                    {
+                        links.announce_presence(&id.namespace);
+                    }
+                    if ended.peer.is_some_and(|p| links.peers.is_relay(p)) {
+                        links.reselect_relays();
+                    }
+                }
             }
         });
         Ok(handle)
+    }
+
+    /// A full link is up: the device is awake if it slept here, what waited
+    /// for the link goes over it, this device tells it how to reach it
+    /// while asleep, follows its presence list when it is a relay, and tells
+    /// the members of its namespace linked here.
+    async fn link_up(self: &Arc<Self>, admitted: &Admitted, peer: Option<&PeerSpec>, handle: &LinkHandle) {
+        self.awake(admitted.fingerprint).await;
+        if let (Some(id), Some(peer)) = (admitted.peer, peer) {
+            let ctl = self.ctl(id);
+            ctl.dialled(None);
+            self.flush_if_linked(&WaitFor::Peer(id)).await;
+            ctl.clear_demand();
+            let reach = self.reachability_for(id, peer);
+            if reach.hold || reach.wake_token.is_some() {
+                handle.send_reachability(&reach);
+            }
+            // Presence from a relay this device uses, or from any device
+            // whose role its namespace lets relay (a plain peer entry for the
+            // namespace's relay).
+            let relay_role = admitted.identity.as_ref().is_some_and(|i| {
+                self.trust
+                    .keyring()
+                    .context_for(&i.device)
+                    .link_policy()
+                    .allows_relay(i.role.as_str())
+            });
+            if self.peers.is_relay(id) || relay_role {
+                self.follow_presence(id, handle.clone());
+            }
+            if self.peers.is_relay(id) {
+                self.reselect_relays();
+            }
+        }
+        if let Some(id) = &admitted.identity {
+            self.announce_presence(&id.namespace);
+        }
     }
 
     /// Say, once a link is up, what an enrollment link on either side
@@ -577,8 +766,7 @@ impl Links {
 
     /// One attempt over every path of `peer`; the first that links wins,
     /// else the last failure.
-    async fn dial_once(self: &Arc<Self>, id: PeerId) -> Result<LinkHandle, LinkError> {
-        let peer = self.peers.get(id);
+    async fn dial_once(self: &Arc<Self>, id: PeerId, peer: &PeerSpec) -> Result<LinkHandle, LinkError> {
         let mut last = LinkError::Connect(format!("{} has no endpoint", peer.label));
         for candidate in self.paths.candidates(id, peer) {
             let addrs: Vec<SocketAddr> = match candidate {
@@ -610,6 +798,81 @@ impl Links {
             }
         }
         Err(last)
+    }
+
+    /// Whether peer `id`'s link is to be made now: it has a path, it is a
+    /// chosen relay (when it is one), and its mode says so.
+    fn wants_link(&self, id: PeerId, peer: &PeerSpec, ctl: &PeerCtl) -> bool {
+        if peer.relay_use.is_some() && !self.relay_wanted(id) {
+            return false;
+        }
+        match peer.mode {
+            LinkMode::Always => true,
+            LinkMode::Off => ctl.asked(),
+            LinkMode::OnDemand { .. } => ctl.asked() || self.is_active() || ctl.demand(),
+        }
+    }
+
+    /// Keep the link `handle` to peer `id` while it is wanted: closes it
+    /// (as asleep, or released) once it is not — an on-demand link idle
+    /// for its idle time while the host is not active, an off link the host
+    /// no longer asks for, a relay no longer chosen, a removed peer.
+    /// Returns once the link ended, with whether this device closed it.
+    async fn keep(&self, id: PeerId, ctl: &PeerCtl, handle: &LinkHandle) -> bool {
+        let mut seen = handle.datagrams();
+        let mut quiet_since = Instant::now();
+        loop {
+            // Traffic is looked for every idle_check; once none came, sleep
+            // to the idle deadline itself rather than to the next check.
+            let check = match self.peers.get(id).map(|p| p.mode) {
+                Some(LinkMode::OnDemand { idle }) => match idle.saturating_sub(quiet_since.elapsed()) {
+                    left if left.is_zero() => idle_check(idle),
+                    left => left.min(idle_check(idle)),
+                },
+                _ => Duration::from_secs(60),
+            };
+            tokio::select! {
+                () = self.cancel.cancelled() => return true,
+                _ = handle.closed() => return false,
+                () = ctl.changed() => {}
+                () = tokio::time::sleep(check) => {}
+            }
+            let now = handle.datagrams();
+            if now != seen {
+                seen = now;
+                quiet_since = Instant::now();
+            }
+            let Some(peer) = self.peers.get(id) else {
+                release(handle, false, "this device no longer uses this link (the host removed it)");
+                return true;
+            };
+            if peer.relay_use.is_some() && !self.relay_wanted(id) {
+                let text = "this device links to a more preferred relay now; it uses this one again if that \
+                            one is lost";
+                tracing::info!(target: "face.quic", peer = %peer.label, "releasing relay {}: {text}", peer.label);
+                release(handle, false, text);
+                return true;
+            }
+            match peer.mode {
+                LinkMode::Off if !ctl.asked() => {
+                    release(handle, true, "this device turned its link off; it links again when asked");
+                    return true;
+                }
+                LinkMode::OnDemand { idle }
+                    if !ctl.asked() && !self.is_active() && quiet_since.elapsed() >= idle =>
+                {
+                    let text = format!(
+                        "this device's on-demand link carried nothing for {} s and sleeps; it links again \
+                         when it has traffic",
+                        idle.as_secs()
+                    );
+                    tracing::info!(target: "face.quic", peer = %peer.label, "closing the link to {}: {text}", peer.label);
+                    release(handle, true, &text);
+                    return true;
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -650,63 +913,108 @@ fn hex(session: &PathSession) -> String {
     session.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Keep `peer` linked: dial its paths in order, and again with backoff
-/// whenever the link drops (once, unless persistent).
-async fn dial_loop(links: Weak<Links>, id: PeerId) {
+/// Keep peer `id` linked as its mode and the relay choice say: dial its
+/// paths in order when its link is wanted, again with backoff whenever it
+/// drops (once, for a peer that is not persistent and links always), and
+/// close it when it is no longer wanted. Ends when the peer is removed.
+pub(crate) async fn dial_loop(links: Weak<Links>, id: PeerId, ctl: Arc<PeerCtl>) {
     let mut backoff = Backoff::default();
     loop {
         let Some(this) = links.upgrade() else { return };
         let cancel = this.cancel.clone();
-        let peer = this.peers.get(id);
-        let persistent = peer.persistent;
-        let label = peer.label.clone();
-
-        // Already linked (the other device dialled this one): wait for that
-        // link to end.
-        if let Some(handle) = this.table.link_to(id) {
-            drop(this);
-            tokio::select! {
-                () = cancel.cancelled() => return,
-                _ = handle.closed() => {}
+        let Some(peer) = this.peers.get(id) else {
+            if let Some(handle) = this.table.link_to(id) {
+                release(&handle, false, "this device no longer uses this link (the host removed it)");
             }
-            if !relink_once(&links, id) && !persistent {
+            return;
+        };
+        let one_shot = !peer.persistent && peer.mode == LinkMode::Always;
+
+        // Linked (dialled, or the other device dialled this one): keep it
+        // while it is wanted.
+        if let Some(handle) = this.table.link_to(id) {
+            backoff.reset();
+            let closed_here = this.keep(id, &ctl, &handle).await;
+            // A relay that closed its link saying it shuts down is not
+            // there to redial: it counts as failed now, so the next relay
+            // stands in at once while this one is dialled again with
+            // backoff.
+            if !closed_here
+                && peer.relay_use.is_some()
+                && let LinkError::Refused { reason: Some(CloseReason::Shutdown), .. } = handle.closed().await
+            {
+                ctl.dialled(Some("it closed its link: it is shutting down".into()));
+                this.reselect_relays();
+            }
+            drop(this);
+            if cancel.is_cancelled() {
                 return;
+            }
+            if !closed_here && !relink_once(&links, id) && one_shot {
+                return;
+            }
+            if !closed_here {
+                // Dropped: dial again after the first backoff (the other
+                // device may be restarting).
+                tokio::select! {
+                    () = cancel.cancelled() => return,
+                    () = tokio::time::sleep(backoff.after_drop()) => {}
+                }
             }
             continue;
         }
 
-        let attempt = this.dial_once(id).await;
-        drop(this);
+        if !this.wants_link(id, &peer, &ctl) {
+            drop(this);
+            tokio::select! {
+                () = cancel.cancelled() => return,
+                () = ctl.changed() => {}
+            }
+            continue;
+        }
+
+        let attempt = this.dial_once(id, &peer).await;
         let wait = match attempt {
-            Ok(handle) => {
-                backoff.reset();
-                tokio::select! {
-                    () = cancel.cancelled() => return,
-                    _ = handle.closed() => {}
-                }
-                if !relink_once(&links, id) && !persistent {
-                    return;
-                }
-                backoff.after_drop()
+            Ok(_) => {
+                ctl.dialled(None);
+                continue;
             }
             Err(e) => {
                 let refused = !e.is_transient();
                 let wait = backoff.after_failure(refused);
                 tracing::warn!(
                     target: "face.quic",
-                    peer = %label,
+                    peer = %peer.label,
                     retry_in_secs = wait.as_secs_f32(),
-                    "link to {label} failed: {e}"
+                    "link to {} failed: {e}",
+                    peer.label
                 );
-                if !persistent {
+                ctl.dialled(Some(format!("its last dial failed: {e}; retried after {:.1} s", wait.as_secs_f32())));
+                if peer.relay_use.is_some() {
+                    this.reselect_relays();
+                }
+                // What waits for an on-demand link that cannot be made is
+                // answered now rather than at its lifetime's end.
+                if matches!(peer.mode, LinkMode::OnDemand { .. }) && ctl.demand() {
+                    ctl.clear_demand();
+                    this.waiting()
+                        .drop_all(&WaitFor::Peer(id), ndn_packet::nack::NackReason::NoRoute)
+                        .await;
+                }
+                if one_shot {
                     return;
                 }
                 wait
             }
         };
-        tokio::select! {
-            () = cancel.cancelled() => return,
-            () = tokio::time::sleep(wait) => {}
+        drop(this);
+        let until = tokio::time::Instant::now() + wait;
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => return,
+                () = tokio::time::sleep_until(until) => break,
+                () = ctl.changed() => if ctl.take_kick() { break },
+            }
         }
     }
 }

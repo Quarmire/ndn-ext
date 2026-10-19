@@ -9,6 +9,8 @@ use ndn_face_quic::KeyFingerprint;
 use ndn_packet::Name;
 use ndn_transport::FaceId;
 
+use crate::peer::{LinkMode, PeerId, RelaySource};
+
 /// This device's links, as [`Links::report`](crate::Links::report) gives
 /// them.
 #[derive(Clone, Debug, Default)]
@@ -20,6 +22,12 @@ pub struct LinkReport {
     pub probes_sent: u64,
     /// Punch requests this device refused, in total.
     pub punches_refused: u64,
+    /// Whom this device serves as a relay (its serving policy, one line).
+    pub serve: String,
+    /// Interests this device holds now for devices asleep here.
+    pub held_total: usize,
+    /// Times this device invoked its wake notifier, in total.
+    pub wakes_sent: u64,
     pub links: Vec<LinkStatus>,
 }
 
@@ -39,6 +47,72 @@ pub struct LinkStatus {
     pub paths: Vec<PathStatus>,
     /// Its direct path: up, being tried, or why not.
     pub direct: DirectStatus,
+    /// Its peer entry, for the host's per-peer calls; `None` for a device
+    /// nobody configured (it linked in, or punched).
+    pub peer: Option<PeerId>,
+    /// When its link is up, for a peer entry.
+    pub mode: Option<LinkMode>,
+    /// For a relay this device uses: where it came from and its state.
+    pub relay: Option<RelayStatus>,
+    /// Why it is not linked now, when it is a peer entry that is not.
+    pub down: Option<String>,
+    /// On a relay: the device is asleep here (its link ended, and it asked
+    /// for its Interests to be held or for a wake).
+    pub asleep: Option<AsleepStatus>,
+}
+
+/// A relay this device uses.
+#[derive(Clone, Debug)]
+pub struct RelayStatus {
+    pub source: RelaySource,
+    /// Lower is preferred.
+    pub preference: u32,
+    pub state: RelayState,
+    /// For a person: why it is in that state.
+    pub text: String,
+}
+
+/// Where a relay stands in this device's choice of relays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RelayState {
+    /// Linked, carrying routes of this device's namespace.
+    Linked,
+    /// Chosen; being dialled (or waiting for traffic, on demand).
+    Trying,
+    /// Its last dial failed; dialled again with backoff, while a less
+    /// preferred relay stands in.
+    Down,
+    /// Not needed now: enough more preferred relays are linked.
+    Standby,
+    /// Its mode is off.
+    Off,
+}
+
+impl RelayState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Linked => "linked",
+            Self::Trying => "trying",
+            Self::Down => "down",
+            Self::Standby => "standby",
+            Self::Off => "off",
+        }
+    }
+}
+
+/// A device asleep at this relay.
+#[derive(Clone, Debug)]
+pub struct AsleepStatus {
+    /// How long it has been asleep.
+    pub since: Duration,
+    /// Interests held for it now.
+    pub held: usize,
+    /// It asked for its Interests to be held (and this relay holds them).
+    pub hold: bool,
+    /// It registered a wake token (and this relay has a wake notifier).
+    pub wake: bool,
+    /// Times this relay woke it in this sleep.
+    pub wakes: u64,
 }
 
 /// What reaches a device.

@@ -2,10 +2,11 @@
 //! and the face it becomes.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
+use ndn_packet::Name;
 use quinn::{ConnectionError, SendDatagramError};
 use tracing::trace;
 
@@ -14,8 +15,9 @@ use ndn_transport::{FaceError, FaceId, FaceKind, Transport, ip_face_uri};
 use crate::endpoint::Permit;
 use crate::key::{KeyFingerprint, PeerKey};
 use crate::message::{
-    CloseReason, LINK_HELLO, LINK_VERDICT, LinkHello, LinkVerdict, MAX_MESSAGE, OBSERVED_ADDRESS,
-    decode_udp_address, encode_observed_address, skippable, split_tlv,
+    CloseReason, LINK_HELLO, LINK_VERDICT, LinkHello, LinkVerdict, MAX_MESSAGE, OBSERVED_ADDRESS, PRESENCE,
+    Presence, REACHABILITY, Reachability, WAKE_TOKEN_MAX, decode_udp_address, encode_observed_address, skippable,
+    split_tlv,
 };
 use crate::scope::{Judged, LinkScope, ScopeState, nack_for};
 
@@ -108,7 +110,9 @@ pub struct Handshaken {
     peer: PeerKey,
     direction: Direction,
     permit: Option<Permit>,
-    local: Option<SocketAddr>,
+    /// The endpoint the connection runs on: its socket's address is this
+    /// side's, and changes when the endpoint is rebound.
+    endpoint: quinn::Endpoint,
     control: Option<(quinn::SendStream, quinn::RecvStream)>,
 }
 
@@ -117,7 +121,7 @@ impl Handshaken {
         connection: quinn::Connection,
         direction: Direction,
         permit: Option<Permit>,
-        local: Option<SocketAddr>,
+        endpoint: quinn::Endpoint,
     ) -> Result<Self, LinkError> {
         let peer = connection
             .peer_identity()
@@ -130,7 +134,7 @@ impl Handshaken {
             peer,
             direction,
             permit,
-            local,
+            endpoint,
             control: None,
         })
     }
@@ -147,9 +151,10 @@ impl Handshaken {
         self.connection.remote_address()
     }
 
-    /// The address of this side's socket.
+    /// The address of this side's socket now: after a rebind (this device
+    /// moved), the new one.
     pub fn local_address(&self) -> Option<SocketAddr> {
-        self.local
+        self.endpoint.local_addr().ok()
     }
 
     /// Send `ours` and receive the peer's hello, within `deadline`. The
@@ -219,7 +224,6 @@ impl Handshaken {
             Err(_) => return Err(self.fail(LinkError::Timeout, deadline)),
         };
         drop(self.permit.take());
-        let local = self.local.map(|addr| ip_face_uri("quic", addr));
         let remote = self.connection.remote_address();
         trace!(target: "face.quic", face = %id, peer = %remote, scoped = admission.scope.is_some(), "link admitted");
         let scope = admission.scope.map(|s| Arc::new(ScopeState::new(s)));
@@ -228,20 +232,31 @@ impl Handshaken {
             (tx, tokio::sync::Mutex::new(rx))
         });
         let (observed_tx, observed) = tokio::sync::watch::channel(None);
-        tokio::spawn(observe(self.connection.clone(), send, recv, observed_tx));
+        let (reachability_tx, reachability) = tokio::sync::watch::channel(None);
+        let (presence_tx, presence) = tokio::sync::watch::channel(Vec::new());
+        let outbox = Arc::new(Outbox::default());
+        let heard = Heard {
+            observed: observed_tx,
+            reachability: reachability_tx,
+            presence: presence_tx,
+        };
+        tokio::spawn(observe(self.connection.clone(), send, recv, Arc::clone(&outbox), heard));
         Ok(Link {
             face: LinkFace {
                 id,
                 connection: self.connection.clone(),
-                remote_uri: ip_face_uri("quic", remote),
-                local_uri: local,
+                endpoint: self.endpoint.clone(),
                 scope: scope.clone(),
                 local_answers,
             },
             handle: LinkHandle {
                 connection: self.connection,
+                endpoint: self.endpoint,
                 scope,
                 observed,
+                outbox,
+                reachability,
+                presence,
             },
             peer_verdict,
         })
@@ -365,16 +380,116 @@ async fn read_tlv(
 /// changed (the peer's NAT remapped, or the peer moved), to tell it.
 const OBSERVE_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Most namespaces a peer's presence covers at once: a relay tells a device
+/// of the namespaces they share, which are few.
+const PRESENCE_NAMESPACES_MAX: usize = 256;
+
+/// Messages this side has yet to write on the control stream. The latest of
+/// each kind replaces one not yet written (per namespace for presence), so
+/// a peer slow to read costs no memory.
+#[derive(Default)]
+struct Outbox {
+    pending: Mutex<Pending>,
+    ready: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct Pending {
+    reachability: Option<Bytes>,
+    presence: Vec<(Name, Bytes)>,
+}
+
+impl Outbox {
+    fn put_reachability(&self, wire: Bytes) {
+        self.pending.lock().unwrap_or_else(PoisonError::into_inner).reachability = Some(wire);
+        self.ready.notify_one();
+    }
+
+    fn put_presence(&self, namespace: &Name, wire: Bytes) {
+        let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        match pending.presence.iter_mut().find(|(ns, _)| ns == namespace) {
+            Some((_, queued)) => *queued = wire,
+            None => pending.presence.push((namespace.clone(), wire)),
+        }
+        drop(pending);
+        self.ready.notify_one();
+    }
+
+    fn take(&self) -> Vec<Bytes> {
+        let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        let reachability = pending.reachability.take();
+        reachability
+            .into_iter()
+            .chain(pending.presence.drain(..).map(|(_, wire)| wire))
+            .collect()
+    }
+}
+
+/// Where the messages the peer sends after the verdict go.
+struct Heard {
+    observed: tokio::sync::watch::Sender<Option<SocketAddr>>,
+    reachability: tokio::sync::watch::Sender<Option<Reachability>>,
+    presence: tokio::sync::watch::Sender<Vec<Presence>>,
+}
+
+impl Heard {
+    /// Take one message the peer sent after the verdict; `Err` is why the
+    /// link closes as a protocol error.
+    fn take(&self, t: u64, value: &[u8]) -> Result<(), String> {
+        match t {
+            OBSERVED_ADDRESS => {
+                let addr = decode_udp_address(value).map_err(|e| format!("malformed ObservedAddress link message: {e}"))?;
+                self.observed.send_replace(Some(addr));
+            }
+            REACHABILITY => {
+                let r = Reachability::decode(value).map_err(|e| format!("malformed Reachability link message: {e}"))?;
+                self.reachability.send_replace(Some(r));
+            }
+            PRESENCE => {
+                let p = Presence::decode(value).map_err(|e| format!("malformed Presence link message: {e}"))?;
+                let mut over = false;
+                self.presence.send_if_modified(|all| {
+                    let at = all.iter().position(|q| q.namespace == p.namespace);
+                    match (at, p.devices.is_empty()) {
+                        (Some(i), true) => {
+                            all.remove(i);
+                        }
+                        (Some(i), false) => all[i] = p,
+                        (None, true) => return false,
+                        (None, false) if all.len() >= PRESENCE_NAMESPACES_MAX => {
+                            over = true;
+                            return false;
+                        }
+                        (None, false) => all.push(p),
+                    }
+                    true
+                });
+                if over {
+                    return Err(format!(
+                        "presence for more than {PRESENCE_NAMESPACES_MAX} namespaces at once: a relay \
+                         tells a device of the namespaces they share"
+                    ));
+                }
+            }
+            t if skippable(t) => {}
+            t => return Err(format!("unknown critical link message {t:#x} after the verdict")),
+        }
+        Ok(())
+    }
+}
+
 /// After the verdicts, for the life of the link: tell the peer the address
 /// its packets come from (`ObservedAddress`, at once and whenever it
-/// changes), and take the peer's word for this side's (`observed`). A peer
-/// that ends its control stream or does not read it (it predates
-/// `ObservedAddress`) ends that half only.
+/// changes) and write what this side queued (`Reachability`, `Presence`);
+/// take the peer's messages into `heard`. A peer that ends its control
+/// stream or does not read it (it predates these messages) ends that half
+/// only.
 async fn observe(
     connection: quinn::Connection,
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
-    observed: tokio::sync::watch::Sender<Option<SocketAddr>>,
+    outbox: Arc<Outbox>,
+    heard: Heard,
 ) {
     let tell = async {
         let mut told = None;
@@ -387,27 +502,25 @@ async fn observe(
                 }
                 told = Some(now);
             }
-            tokio::time::sleep(OBSERVE_INTERVAL).await;
+            for wire in outbox.take() {
+                if send.write_all(&wire).await.is_err() {
+                    return;
+                }
+            }
+            tokio::select! {
+                () = tokio::time::sleep(OBSERVE_INTERVAL) => {}
+                () = outbox.ready.notified() => {}
+            }
         }
     };
     let hear = async {
         loop {
             match read_tlv(&mut recv, &connection).await {
-                Ok(Some((OBSERVED_ADDRESS, value))) => match decode_udp_address(&value) {
-                    Ok(addr) => {
-                        observed.send_replace(Some(addr));
-                    }
-                    Err(e) => {
-                        let text = format!("malformed ObservedAddress link message: {e}");
+                Ok(Some((t, value))) => {
+                    if let Err(text) = heard.take(t, &value) {
                         connection.close(quinn::VarInt::from_u32(CloseReason::Protocol.code()), text.as_bytes());
                         return;
                     }
-                },
-                Ok(Some((t, _))) if skippable(t) => {}
-                Ok(Some((t, _))) => {
-                    let text = format!("unknown critical link message {t:#x} after the verdict");
-                    connection.close(quinn::VarInt::from_u32(CloseReason::Protocol.code()), text.as_bytes());
-                    return;
                 }
                 Ok(None) | Err(_) => return,
             }
@@ -449,12 +562,17 @@ pub struct Link {
     pub peer_verdict: LinkVerdict,
 }
 
-/// Closes a link and tells when it ended.
+/// Closes a link, tells when it ended, and carries the messages of the
+/// link's control stream after the verdict.
 #[derive(Clone)]
 pub struct LinkHandle {
     connection: quinn::Connection,
+    endpoint: quinn::Endpoint,
     scope: Option<Arc<ScopeState>>,
     observed: tokio::sync::watch::Receiver<Option<SocketAddr>>,
+    outbox: Arc<Outbox>,
+    reachability: tokio::sync::watch::Receiver<Option<Reachability>>,
+    presence: tokio::sync::watch::Receiver<Vec<Presence>>,
 }
 
 impl LinkHandle {
@@ -468,8 +586,20 @@ impl LinkHandle {
         LinkError::from_connection(self.connection.closed().await)
     }
 
+    /// Whether the link ended (or this side closed it), though its end may
+    /// not have been handled yet.
+    pub fn is_closed(&self) -> bool {
+        self.connection.close_reason().is_some()
+    }
+
     pub fn remote_address(&self) -> SocketAddr {
         self.connection.remote_address()
+    }
+
+    /// The address of this side's socket now: after a rebind (this device
+    /// moved), the new one.
+    pub fn local_address(&self) -> Option<SocketAddr> {
+        self.endpoint.local_addr().ok()
     }
 
     /// The address the other device sees this one's packets come from, as
@@ -494,6 +624,67 @@ impl LinkHandle {
     pub fn scope_idle_for(&self) -> Option<Duration> {
         self.scope.as_ref().map(|s| s.idle_for())
     }
+
+    /// Tell the peer (a relay) how this device is reached while its link is
+    /// down ([`Reachability`]); it replaces what was told before. A wake
+    /// token over [`WAKE_TOKEN_MAX`] bytes, or empty, is not sent (the peer
+    /// would close the link over it): the warning says so.
+    pub fn send_reachability(&self, r: &Reachability) {
+        if let Some(token) = &r.wake_token
+            && !(1..=WAKE_TOKEN_MAX).contains(&token.len())
+        {
+            tracing::warn!(
+                target: "face.quic",
+                peer = %self.connection.remote_address(),
+                "not sending a wake token of {} bytes: a wake token is 1 to {WAKE_TOKEN_MAX} bytes; \
+                 register a shorter one (the relay keeps the reachability it was told before)",
+                token.len()
+            );
+            return;
+        }
+        self.outbox.put_reachability(r.encode());
+    }
+
+    /// What the peer last said of how it is reached while its link is down;
+    /// `None` until it says.
+    pub fn peer_reachability(&self) -> Option<Reachability> {
+        self.reachability.borrow().clone()
+    }
+
+    /// Tell the peer which devices of `p.namespace` are linked here now
+    /// ([`Presence`]); it replaces what was told before for that namespace.
+    /// A list over the 64 KiB a link message takes is not sent (the peer
+    /// would close the link over it): the warning says so.
+    pub fn send_presence(&self, p: &Presence) {
+        let wire = p.encode();
+        if wire.len() > MAX_MESSAGE {
+            tracing::warn!(
+                target: "face.quic",
+                peer = %self.connection.remote_address(),
+                "not sending the presence of {} devices of {}: it takes {} bytes, over the {MAX_MESSAGE}-byte \
+                 limit of a link message; list fewer (the peer keeps the presence it was told before)",
+                p.devices.len(),
+                p.namespace,
+                wire.len()
+            );
+            return;
+        }
+        self.outbox.put_presence(&p.namespace, wire);
+    }
+
+    /// The peer's latest presence, one entry per namespace with a device
+    /// present (an empty list from the peer removes the namespace's entry).
+    pub fn presence(&self) -> tokio::sync::watch::Receiver<Vec<Presence>> {
+        self.presence.clone()
+    }
+
+    /// NDN datagrams the link has sent and received so far (QUIC DATAGRAM
+    /// frames; keep-alives and control messages are not counted): whether
+    /// the link carried traffic since an earlier reading.
+    pub fn datagrams(&self) -> u64 {
+        let stats = self.connection.stats();
+        stats.frame_tx.datagram + stats.frame_rx.datagram
+    }
 }
 
 /// The face of a link: each NDNLPv2 frame is one QUIC datagram. The face's
@@ -504,8 +695,8 @@ impl LinkHandle {
 pub struct LinkFace {
     id: FaceId,
     connection: quinn::Connection,
-    remote_uri: String,
-    local_uri: Option<String>,
+    /// The endpoint the connection runs on, for this side's address.
+    endpoint: quinn::Endpoint,
     scope: Option<Arc<ScopeState>>,
     local_answers: Option<(
         tokio::sync::mpsc::Sender<Bytes>,
@@ -547,12 +738,16 @@ impl Transport for LinkFace {
         FaceKind::Quic
     }
 
+    /// The connection's current address: after a migration (the peer's
+    /// address changed, or this side rebound) it is the new one.
     fn remote_uri(&self) -> Option<String> {
-        Some(self.remote_uri.clone())
+        Some(ip_face_uri("quic", self.connection.remote_address()))
     }
 
+    /// This side's socket address now: after a rebind (this device moved)
+    /// it is the new one.
     fn local_uri(&self) -> Option<String> {
-        self.local_uri.clone()
+        self.endpoint.local_addr().ok().map(|addr| ip_face_uri("quic", addr))
     }
 
     fn send_mtu(&self) -> Option<usize> {

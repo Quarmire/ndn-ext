@@ -17,18 +17,33 @@
 //!   fingerprints) is the caller's — the `ndn-link` crate decides it the
 //!   way every implementation must: this crate carries the messages.
 //! - **Scope.** A side may admit a link that carries less than everything —
-//!   an *enrollment link* ([`LinkScope`]): its face drops, both ways, every
-//!   packet outside the scope, Nacks the Interests among them, and
-//!   rate-limits what it receives. The verdict tells the peer.
+//!   an *enrollment link*, or a link bounded only by its rates
+//!   ([`LinkScope`], [`Carries::Everything`]): its face drops, both ways,
+//!   every packet outside the scope, Nacks the Interests among them, and
+//!   rate-limits what it receives, per link and optionally with a bucket
+//!   several links share ([`SharedRate`]). The verdict tells the peer of an
+//!   enrollment link.
 //! - **Framing.** NDN packets ride QUIC DATAGRAM frames as NDNLPv2 frames; the
 //!   face's link service fragments a packet larger than the connection's
 //!   current datagram size ([`LinkFace`]), and NDNLPv2 reliability can be
 //!   enabled per link. No stream, so no head-of-line blocking.
+//!   [`LinkHandle::datagrams`] counts them, so a caller can close a link
+//!   that carried nothing for a while.
 //! - **Transport.** Keep-alive and idle timeout are set explicitly
-//!   ([`LinkTransportConfig`]), sized for NAT bindings; connection migration
-//!   keeps a link across an address change ([`LinkEndpoint::rebind`]).
+//!   ([`LinkTransportConfig`], within NAT-safe bounds with
+//!   [`LinkTransportConfig::bounded`]); connection migration keeps a link
+//!   across an address change ([`LinkEndpoint::rebind`]). A host may hand
+//!   the endpoint a socket it bound itself, to a network interface or a
+//!   phone's Wi-Fi or cellular network ([`LinkEndpoint::from_socket`]).
 //!   Inbound attempts are bounded before their handshake
 //!   ([`HandshakeLimits`]).
+//! - **Reachability.** After the verdict a device tells a relay whether to
+//!   hold Interests for it while it sleeps and how to wake it
+//!   ([`LinkHandle::send_reachability`], [`Reachability`]); a relay tells a
+//!   device which devices of its namespaces are linked there
+//!   ([`LinkHandle::send_presence`], [`Presence`]). A device closing its
+//!   link to sleep says so ([`CloseReason::Asleep`]). What to do with them
+//!   is the `ndn-link` crate's.
 //! - **Direct paths.** Each side tells the other the address it sees it at
 //!   ([`LinkHandle::observed_address`]), which is how a device behind a NAT
 //!   learns its address beyond it. The link socket sends and receives the
@@ -57,8 +72,8 @@ pub use link::{
     Admission, DATAGRAM_FLOOR, Direction, Handshaken, Link, LinkError, LinkFace, LinkHandle,
 };
 pub use message::{
-    CloseReason, LINK_PROTOCOL_VERSION, LinkHello, LinkVerdict, PathSession, decode_udp_address,
-    encode_udp_address,
+    CloseReason, LINK_PROTOCOL_VERSION, LinkHello, LinkVerdict, PathSession, Presence, PresentDevice,
+    Reachability, WAKE_TOKEN_MAX, decode_udp_address, encode_udp_address,
 };
 pub use probe::{PROBE_LEN, ProbeWatch, decode_probe, encode_probe};
-pub use scope::{Carries, LinkScope, RateLimit};
+pub use scope::{Carries, LinkScope, RateLimit, SharedRate};

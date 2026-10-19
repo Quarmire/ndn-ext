@@ -1,6 +1,6 @@
 [package]
 name = "ndn-link"
-description = "Link admission for ndn-rs QUIC links: who may link, under which trust context, with which scope and routes; relinking, dial backoff, one link per device pair"
+description = "QUIC links between devices of personal namespaces for ndn-rs: admission and serving policy, relays and failover, link modes, held Interests and wakes, direct paths by peer entry and by membership"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -23,6 +23,12 @@ tokio-util    = { workspace = true }
 parking_lot   = "0.12"
 # Punch sessions are random.
 getrandom     = { workspace = true }
+# `EngineFaces`: the FaceSink over an ndn-rs forwarder engine.
+ndn-engine    = { workspace = true, optional = true }
+ndn-mgmt-wire = { workspace = true, optional = true }
+
+[features]
+engine = ["dep:ndn-engine", "dep:ndn-mgmt-wire"]
 
 # Interface addresses for direct-path host candidates.
 [target.'cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple", target_os = "freebsd"))'.dependencies]
@@ -31,6 +37,9 @@ nix = { version = "0.29", default-features = false, features = ["net"] }
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
 sha2  = { workspace = true }
+# tests/direct.rs: devices on real forwarders (`EngineFaces`).
+ndn-link   = { path = ".", features = ["engine"] }
+ndn-engine = { workspace = true }
 
 [lints]
 workspace = true

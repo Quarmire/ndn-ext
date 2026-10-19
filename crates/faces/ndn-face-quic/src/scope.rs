@@ -1,8 +1,9 @@
-//! A link that carries less than everything: an *enrollment link*.
+//! A link that carries less than everything: an *enrollment link*, or a
+//! link only rate-bounded (a relay serving another namespace's devices).
 //!
 //! A [`LinkScope`] says which kind of packet each direction carries
-//! (Interests one way, their answers the other) and which names; the face
-//! of a scoped link drops everything else as it crosses, in both
+//! (Interests one way, their answers the other, or both) and which names;
+//! the face of a scoped link drops everything else as it crosses, in both
 //! directions, so the scope holds whatever the forwarder above does. It
 //! judges each NDNLPv2 frame by the network packet it carries: a packet sent
 //! whole, or the first fragment of a fragmented one (the name is at its
@@ -13,11 +14,13 @@
 //! An Interest the scope drops is answered with a Nack (NoRoute) at once,
 //! so the requester stops waiting: one arriving from the peer is Nacked to
 //! the peer, one this side would send is Nacked back to this side. Received
-//! packets are rate-limited before they are judged; acknowledgements are not.
+//! packets are rate-limited before they are judged — by the link's own
+//! bucket, then by a bucket it shares with other links ([`SharedRate`]);
+//! acknowledgements are not.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -43,6 +46,9 @@ pub enum Carries {
     Interests,
     /// Data and Nacks, within the scope's names.
     Answers,
+    /// Interests and their answers, within the scope's names: with every
+    /// name, a full link bounded only by its rates.
+    Everything,
 }
 
 /// Received packets a scoped link takes: `burst` at once, refilled at
@@ -51,6 +57,26 @@ pub enum Carries {
 pub struct RateLimit {
     pub burst: u32,
     pub per_sec: u32,
+}
+
+/// One rate bucket shared by several links (all the links of a namespace a
+/// relay serves, say): together they take no more than its [`RateLimit`].
+pub struct SharedRate {
+    rate: RateLimit,
+    bucket: Mutex<Bucket>,
+}
+
+impl SharedRate {
+    pub fn new(rate: RateLimit) -> Self {
+        Self {
+            bucket: Mutex::new(Bucket::full(rate)),
+            rate,
+        }
+    }
+
+    fn take(&self) -> bool {
+        self.bucket.lock().unwrap_or_else(PoisonError::into_inner).take(self.rate)
+    }
 }
 
 /// What a scoped link carries.
@@ -63,6 +89,9 @@ pub struct LinkScope {
     pub names: Box<dyn Fn(&Name) -> bool + Send + Sync>,
     /// Bound on received packets.
     pub rate: RateLimit,
+    /// A bound on received packets shared with other links, checked after
+    /// `rate`.
+    pub shared: Option<Arc<SharedRate>>,
     /// For the log, when a packet is dropped: what the link carries and
     /// what to do to carry more.
     pub explain: String,
@@ -101,6 +130,30 @@ struct Bucket {
     at: Instant,
 }
 
+impl Bucket {
+    fn full(rate: RateLimit) -> Self {
+        Self {
+            tokens: f64::from(rate.burst),
+            at: Instant::now(),
+        }
+    }
+
+    /// Refill for the time since the last take, then take a token if there
+    /// is one.
+    fn take(&mut self, rate: RateLimit) -> bool {
+        let now = Instant::now();
+        let refill = now.duration_since(self.at).as_secs_f64() * f64::from(rate.per_sec);
+        self.tokens = (self.tokens + refill).min(f64::from(rate.burst));
+        self.at = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// A scope at work on one link: its verdicts, rate bucket and activity.
 pub(crate) struct ScopeState {
     scope: LinkScope,
@@ -118,10 +171,7 @@ impl ScopeState {
     pub(crate) fn new(scope: LinkScope) -> Self {
         let now = Instant::now();
         Self {
-            bucket: Mutex::new(Bucket {
-                tokens: f64::from(scope.rate.burst),
-                at: now,
-            }),
+            bucket: Mutex::new(Bucket::full(scope.rate)),
             scope,
             inbound: Mutex::default(),
             outbound: Mutex::default(),
@@ -143,9 +193,15 @@ impl ScopeState {
     /// fragments this side sends must not crowd out the peer's packets.
     pub(crate) fn received(&self, frame: &Bytes) -> Judged {
         let packet = Packet::of(frame);
-        if !matches!(packet, Some(Packet::LinkOnly)) && !self.take_token() {
-            self.note_drop("over the rate limit", None);
-            return Judged::Drop(None);
+        if !matches!(packet, Some(Packet::LinkOnly)) {
+            if !self.take_token() {
+                self.note_drop("over the rate limit", None);
+                return Judged::Drop(None);
+            }
+            if self.scope.shared.as_ref().is_some_and(|shared| !shared.take()) {
+                self.note_drop("over the rate limit shared with other links", None);
+                return Judged::Drop(None);
+            }
         }
         self.judge(packet, self.scope.receives, &self.inbound)
     }
@@ -156,17 +212,7 @@ impl ScopeState {
     }
 
     fn take_token(&self) -> bool {
-        let mut bucket = self.bucket.lock().unwrap_or_else(PoisonError::into_inner);
-        let now = Instant::now();
-        let refill = now.duration_since(bucket.at).as_secs_f64() * f64::from(self.scope.rate.per_sec);
-        bucket.tokens = (bucket.tokens + refill).min(f64::from(self.scope.rate.burst));
-        bucket.at = now;
-        if bucket.tokens >= 1.0 {
-            bucket.tokens -= 1.0;
-            true
-        } else {
-            false
-        }
+        self.bucket.lock().unwrap_or_else(PoisonError::into_inner).take(self.scope.rate)
     }
 
     fn judge(&self, packet: Option<Packet>, carries: Carries, fragmented: &Mutex<Fragmented>) -> Judged {
@@ -197,6 +243,7 @@ impl ScopeState {
                 let carried = match carries {
                     Carries::Interests => kind == Kind::Interest,
                     Carries::Answers => kind != Kind::Interest,
+                    Carries::Everything => true,
                 };
                 if carried && (self.scope.names)(&name) {
                     if let Some(base) = first_of {
@@ -348,6 +395,7 @@ mod tests {
                 burst: 4,
                 per_sec: 1,
             },
+            shared: None,
             explain: "test".into(),
         })
     }
@@ -421,5 +469,30 @@ mod tests {
         let inside = ndn_packet::lp::encode_lp_packet(&interest("/home/CA/STATUS"));
         let passed = (0..10).filter(|_| s.received(&inside) == Judged::Pass).count();
         assert_eq!(passed, 4, "the burst, then nothing until the bucket refills");
+    }
+
+    #[test]
+    fn links_sharing_a_rate_take_no_more_than_it_together() {
+        let shared = Arc::new(SharedRate::new(RateLimit { burst: 6, per_sec: 1 }));
+        let link = || {
+            ScopeState::new(LinkScope {
+                receives: Carries::Everything,
+                sends: Carries::Everything,
+                names: Box::new(|_: &Name| true),
+                rate: RateLimit { burst: 4, per_sec: 1 },
+                shared: Some(Arc::clone(&shared)),
+                explain: "test".into(),
+            })
+        };
+        let (a, b) = (link(), link());
+        let wire = |p: Bytes| ndn_packet::lp::encode_lp_packet(&p);
+        // Both kinds pass both ways on a link that carries everything.
+        assert_eq!(a.received(&wire(data("/any/x", 10))), Judged::Pass);
+        assert_eq!(a.sending(&wire(interest("/any/y"))), Judged::Pass);
+        assert_eq!(a.sending(&wire(data("/any/y", 10))), Judged::Pass);
+        let inside = wire(interest("/any/z"));
+        let passed = (0..10).filter(|_| a.received(&inside) == Judged::Pass).count()
+            + (0..10).filter(|_| b.received(&inside) == Judged::Pass).count();
+        assert_eq!(passed, 5, "each link within its own burst, both within the shared one");
     }
 }

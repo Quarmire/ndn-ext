@@ -66,6 +66,74 @@ impl Default for LinkTransportConfig {
     }
 }
 
+/// Safe bounds of a link's keep-alive: under the floor, keep-alives cost
+/// battery and data for nothing; over the ceiling, NAT bindings expire.
+const KEEP_ALIVE_MIN: Duration = Duration::from_secs(2);
+const KEEP_ALIVE_MAX: Duration = Duration::from_secs(60);
+/// The idle timeout outlasts this many keep-alives, so a lost one or two
+/// do not count the link as lost.
+const IDLE_KEEP_ALIVES: u32 = 3;
+const IDLE_TIMEOUT_MAX: Duration = Duration::from_secs(600);
+
+impl LinkTransportConfig {
+    /// The default settings with this keep-alive and idle timeout, if they
+    /// are within safe bounds: a keep-alive of 2–60 s, an idle timeout of at
+    /// least 3 keep-alives and at most 600 s. A longer keep-alive saves
+    /// battery and data on a phone; a shorter one keeps a link through NATs
+    /// that forget sooner. The refusal says which bound and why.
+    pub fn bounded(keep_alive: Duration, idle_timeout: Duration) -> Result<Self, String> {
+        let secs = |d: Duration| d.as_secs_f64();
+        if keep_alive < KEEP_ALIVE_MIN {
+            return Err(format!(
+                "a keep-alive every {} s is under the {} s floor: each keep-alive wakes the radio \
+                 and costs battery and data, and no NAT needs them that often; use {}–{} s",
+                secs(keep_alive),
+                KEEP_ALIVE_MIN.as_secs(),
+                KEEP_ALIVE_MIN.as_secs(),
+                KEEP_ALIVE_MAX.as_secs()
+            ));
+        }
+        if keep_alive > KEEP_ALIVE_MAX {
+            return Err(format!(
+                "a keep-alive every {} s is over the {} s ceiling: most NATs drop a UDP binding \
+                 after 30 s or more without traffic, some sooner, and a link whose binding is gone \
+                 receives nothing until it is dialled again; use {}–{} s (a longer keep-alive \
+                 saves battery and data where the NATs on the path allow it)",
+                secs(keep_alive),
+                KEEP_ALIVE_MAX.as_secs(),
+                KEEP_ALIVE_MIN.as_secs(),
+                KEEP_ALIVE_MAX.as_secs()
+            ));
+        }
+        let floor = keep_alive * IDLE_KEEP_ALIVES;
+        if idle_timeout < floor {
+            return Err(format!(
+                "an idle timeout of {} s is under {IDLE_KEEP_ALIVES} keep-alives ({} s): a lost \
+                 keep-alive or two would count a working link as lost; raise it to at least {} s \
+                 or shorten the keep-alive",
+                secs(idle_timeout),
+                secs(floor),
+                secs(floor)
+            ));
+        }
+        if idle_timeout > IDLE_TIMEOUT_MAX {
+            return Err(format!(
+                "an idle timeout of {} s is over the {} s ceiling: a link whose path broke would \
+                 count as up that long, and traffic sent over it would be lost meanwhile; use at \
+                 most {} s",
+                secs(idle_timeout),
+                IDLE_TIMEOUT_MAX.as_secs(),
+                IDLE_TIMEOUT_MAX.as_secs()
+            ));
+        }
+        Ok(Self {
+            keep_alive,
+            idle_timeout,
+            ..Self::default()
+        })
+    }
+}
+
 /// Bounds on inbound connections that have not been admitted as links: an
 /// unauthenticated attempt costs a handshake, so their number is capped in
 /// total and per source address, and a source refused again and again is
@@ -239,12 +307,25 @@ pub struct LinkEndpoint {
 }
 
 impl LinkEndpoint {
-    /// Bind `addr`. With `listen`, inbound links are accepted
-    /// ([`accept`](Self::accept)); without, the socket dials, and accepts
-    /// only the direct paths of the punches it runs
-    /// ([`allow_inbound`](Self::allow_inbound)).
+    /// Bind `addr`: [`from_socket`](Self::from_socket) with a socket bound
+    /// there.
     pub fn bind(
         addr: SocketAddr,
+        key: Arc<dyn LinkKeySource>,
+        config: &LinkTransportConfig,
+        listen: bool,
+    ) -> Result<Self, LinkError> {
+        Self::from_socket(std::net::UdpSocket::bind(addr)?, key, config, listen)
+    }
+
+    /// Use `socket`, bound by the caller — to a network interface or a
+    /// network (a phone's Wi-Fi or cellular network), say. With `listen`,
+    /// inbound links are accepted ([`accept`](Self::accept)); without, the
+    /// socket dials, and accepts only the direct paths of the punches it
+    /// runs ([`allow_inbound`](Self::allow_inbound)). The socket is made
+    /// non-blocking.
+    pub fn from_socket(
+        socket: std::net::UdpSocket,
         key: Arc<dyn LinkKeySource>,
         config: &LinkTransportConfig,
         listen: bool,
@@ -259,10 +340,8 @@ impl LinkEndpoint {
         let direct_server = server_config(Arc::clone(&key), Arc::clone(&direct_transport))?;
         let runtime: Arc<dyn quinn::Runtime> = Arc::new(quinn::TokioRuntime);
         let probes = Arc::new(ProbeTap::default());
-        let socket = Arc::new(ProbeSocket::new(
-            runtime.wrap_udp_socket(std::net::UdpSocket::bind(addr)?)?,
-            Arc::clone(&probes),
-        ));
+        // quinn's socket state sets the socket non-blocking.
+        let socket = Arc::new(ProbeSocket::new(runtime.wrap_udp_socket(socket)?, Arc::clone(&probes)));
         let endpoint = quinn::Endpoint::new_with_abstract_socket(
             endpoint_config(&current),
             server,
@@ -343,7 +422,7 @@ impl LinkEndpoint {
                 });
             }
         };
-        Handshaken::new(connection, Direction::Dialed, None, self.endpoint.local_addr().ok())
+        Handshaken::new(connection, Direction::Dialed, None, self.endpoint.clone())
     }
 
     /// Send the probe of a punch's `session` to `to` from this socket.
@@ -417,7 +496,7 @@ impl LinkEndpoint {
                     return Some(Incoming {
                         incoming,
                         permit,
-                        local: self.endpoint.local_addr().ok(),
+                        endpoint: self.endpoint.clone(),
                         // A punch expects it: the connection is kept alive
                         // as a direct path.
                         server: punched.then(|| Arc::new(self.direct_server.clone())),
@@ -523,7 +602,7 @@ impl Drop for InboundWindow {
 pub struct Incoming {
     incoming: quinn::Incoming,
     permit: Permit,
-    local: Option<SocketAddr>,
+    endpoint: quinn::Endpoint,
     server: Option<Arc<quinn::ServerConfig>>,
 }
 
@@ -541,7 +620,7 @@ impl Incoming {
         let connecting = accepted.map_err(LinkError::from_connection)?;
         match connecting.await {
             Ok(connection) => {
-                Handshaken::new(connection, Direction::Accepted, Some(self.permit), self.local)
+                Handshaken::new(connection, Direction::Accepted, Some(self.permit), self.endpoint)
             }
             Err(e) => {
                 self.permit.refused();
@@ -638,5 +717,16 @@ mod tests {
         assert!(!cooling(&gate, ip), "refusals older than the window are forgotten");
         gate.refused(ip, later + Duration::from_secs(1));
         assert!(cooling(&gate, ip), "8 refusals within the window cool the source down");
+    }
+
+    #[test]
+    fn transport_settings_stay_within_nat_safe_bounds() {
+        let s = Duration::from_secs;
+        assert!(LinkTransportConfig::bounded(s(10), s(30)).is_ok());
+        assert!(LinkTransportConfig::bounded(s(2), s(6)).is_ok());
+        assert!(LinkTransportConfig::bounded(s(60), s(600)).is_ok());
+        for (keep_alive, idle) in [(Duration::from_millis(1500), s(30)), (s(61), s(600)), (s(10), s(29)), (s(10), s(601))] {
+            assert!(LinkTransportConfig::bounded(keep_alive, idle).is_err(), "{keep_alive:?}, {idle:?}");
+        }
     }
 }

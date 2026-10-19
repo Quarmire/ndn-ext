@@ -10,13 +10,15 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use parking_lot::Mutex;
+use tokio_util::sync::CancellationToken;
 
 use ndn_face_quic::{CloseReason, Direction, KeyFingerprint, LinkHandle};
 use ndn_packet::Name;
 use ndn_security::SignedTrustContext;
-use ndn_transport::FaceId;
+use ndn_transport::{Face, FaceId};
 
 use crate::admission::Identity;
+use crate::host::Route;
 use crate::peer::PeerId;
 use crate::status::{PathKind, PathStatus};
 
@@ -46,9 +48,44 @@ pub(crate) struct LinkPath {
     pub(crate) direction: Direction,
     /// [`PathKind::Link`] or [`PathKind::Direct`].
     pub(crate) kind: PathKind,
-    /// The address of this side's socket.
-    pub(crate) local: Option<SocketAddr>,
+    /// Cancelled once the path's face and routes are gone.
+    pub(crate) gone: CancellationToken,
     pub(crate) since: Instant,
+    /// Sends over the path's face directly, past the forwarder: Interests
+    /// that waited for this link (on demand, or held while the device
+    /// slept) go out this way.
+    pub(crate) sender: Arc<Face>,
+    /// The routes the path's face got.
+    pub(crate) routes: Vec<Route>,
+}
+
+/// A path that ended, as [`LinkTable::unregister`] reports it.
+pub(crate) struct Ended {
+    pub(crate) peer: Option<PeerId>,
+    pub(crate) identity: Option<Identity>,
+    pub(crate) kind: PathKind,
+    pub(crate) routes: Vec<Route>,
+    /// It was an enrollment link.
+    pub(crate) enrolling: bool,
+    /// No path of the link is left: the device is not linked any more.
+    pub(crate) last: bool,
+}
+
+/// A device linked over a full link, for presence.
+pub(crate) struct Member {
+    pub(crate) fingerprint: KeyFingerprint,
+    pub(crate) identity: Identity,
+    pub(crate) handle: LinkHandle,
+}
+
+/// A direct path up now, as [`LinkTable::direct_paths`] lists it.
+pub(crate) struct DirectUp {
+    pub(crate) fingerprint: KeyFingerprint,
+    pub(crate) peer: Option<PeerId>,
+    pub(crate) device: Option<Name>,
+    pub(crate) handle: LinkHandle,
+    /// Cancelled once the path's face and routes are gone.
+    pub(crate) gone: CancellationToken,
 }
 
 /// A path as the table keeps it.
@@ -163,15 +200,90 @@ impl LinkTable {
     }
 
     /// The path of `generation` to `fingerprint` ended; the link ends with
-    /// its last path.
-    pub(crate) fn unregister(&self, fingerprint: KeyFingerprint, generation: u64) {
+    /// its last path. `None` when the path was not registered (any more).
+    pub(crate) fn unregister(&self, fingerprint: KeyFingerprint, generation: u64) -> Option<Ended> {
         let mut live = self.live.lock();
-        if let Some(link) = live.get_mut(&fingerprint) {
-            link.paths.retain(|p| p.generation != generation);
-            if link.paths.is_empty() {
-                live.remove(&fingerprint);
-            }
+        let link = live.get_mut(&fingerprint)?;
+        let at = link.paths.iter().position(|p| p.generation == generation)?;
+        let path = link.paths.remove(at).path;
+        let ended = Ended {
+            peer: link.peer,
+            identity: link.identity.clone(),
+            kind: path.kind,
+            routes: path.routes,
+            enrolling: !link.enrolling.is_empty(),
+            last: link.paths.is_empty(),
+        };
+        if ended.last {
+            live.remove(&fingerprint);
         }
+        Some(ended)
+    }
+
+    /// The face of the link path to `peer`.
+    pub(crate) fn link_face(&self, peer: PeerId) -> Option<FaceId> {
+        let live = self.live.lock();
+        live.values()
+            .filter(|l| l.peer == Some(peer))
+            .flat_map(|l| l.paths.iter())
+            .find(|p| p.path.kind == PathKind::Link)
+            .map(|p| p.path.face)
+    }
+
+    /// Whether the device with key `fingerprint` is linked (over any path).
+    pub(crate) fn is_linked(&self, fingerprint: &KeyFingerprint) -> bool {
+        self.live.lock().contains_key(fingerprint)
+    }
+
+    /// The sender of the link to the device with key `fingerprint` (its
+    /// link path, else its direct path).
+    pub(crate) fn sender_to(&self, fingerprint: &KeyFingerprint) -> Option<Arc<Face>> {
+        let live = self.live.lock();
+        let link = live.get(fingerprint)?;
+        link.paths
+            .iter()
+            .find(|p| p.path.kind == PathKind::Link)
+            .or_else(|| link.paths.first())
+            .map(|p| Arc::clone(&p.path.sender))
+    }
+
+    /// The key of the device linked as `peer`, and the sender of its link
+    /// path.
+    pub(crate) fn peer_sender(&self, peer: PeerId) -> Option<(KeyFingerprint, Arc<Face>)> {
+        let live = self.live.lock();
+        live.iter().filter(|(_, l)| l.peer == Some(peer)).find_map(|(fp, l)| {
+            l.paths
+                .iter()
+                .find(|p| p.path.kind == PathKind::Link)
+                .map(|p| (*fp, Arc::clone(&p.path.sender)))
+        })
+    }
+
+    /// The devices linked over a full link path whose identity is in
+    /// `namespace`.
+    pub(crate) fn members(&self, namespace: &Name) -> Vec<Member> {
+        let live = self.live.lock();
+        live.iter()
+            .filter(|(_, l)| l.enrolling.is_empty())
+            .filter_map(|(fp, l)| {
+                let identity = l.identity.as_ref().filter(|id| &id.namespace == namespace)?;
+                let path = l.paths.iter().find(|p| p.path.kind == PathKind::Link)?;
+                Some(Member {
+                    fingerprint: *fp,
+                    identity: identity.clone(),
+                    handle: path.path.handle.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// Direct paths up now.
+    pub(crate) fn direct_count(&self) -> usize {
+        self.live
+            .lock()
+            .values()
+            .filter(|l| l.paths.iter().any(|p| p.path.kind == PathKind::Direct))
+            .count()
     }
 
     /// The live link path of kind [`PathKind::Link`] to `peer`, if any (the
@@ -180,12 +292,42 @@ impl LinkTable {
         self.path_to(|l, _| l.peer == Some(peer), PathKind::Link)
     }
 
-    /// The direct path to the device with key `fingerprint`, or to `peer`.
-    pub(crate) fn direct_to(&self, fingerprint: Option<KeyFingerprint>, peer: Option<PeerId>) -> Option<LinkHandle> {
-        self.path_to(
-            |l, fp| Some(*fp) == fingerprint || (peer.is_some() && l.peer == peer),
-            PathKind::Direct,
-        )
+    /// The direct path up to the device with key `fingerprint`, or to
+    /// `peer`, with that device's key. A path that ended, or that this side
+    /// closed, is not up even before its end is handled.
+    pub(crate) fn direct_to(
+        &self,
+        fingerprint: Option<KeyFingerprint>,
+        peer: Option<PeerId>,
+    ) -> Option<(KeyFingerprint, LinkHandle)> {
+        let live = self.live.lock();
+        live.iter()
+            .filter(|(fp, l)| Some(**fp) == fingerprint || (peer.is_some() && l.peer == peer))
+            .find_map(|(fp, l)| {
+                l.paths
+                    .iter()
+                    .find(|p| p.path.kind == PathKind::Direct && !p.path.handle.is_closed())
+                    .map(|p| (*fp, p.path.handle.clone()))
+            })
+    }
+
+    /// The direct paths up now (as [`LinkTable::direct_to`] counts them).
+    pub(crate) fn direct_paths(&self) -> Vec<DirectUp> {
+        let live = self.live.lock();
+        live.iter()
+            .flat_map(|(fp, l)| {
+                l.paths
+                    .iter()
+                    .filter(|p| p.path.kind == PathKind::Direct && !p.path.handle.is_closed())
+                    .map(|p| DirectUp {
+                        fingerprint: *fp,
+                        peer: l.peer,
+                        device: l.identity.as_ref().map(|id| id.device.clone()),
+                        handle: p.path.handle.clone(),
+                        gone: p.path.gone.clone(),
+                    })
+            })
+            .collect()
     }
 
     fn path_to(&self, matches: impl Fn(&LiveLink, &KeyFingerprint) -> bool, kind: PathKind) -> Option<LinkHandle> {
@@ -198,14 +340,14 @@ impl LinkTable {
     }
 
     /// The addresses linked devices see this device at, through the socket
-    /// bound at `local`: its reflexive candidates there. From full links
+    /// bound at `local` now: its reflexive candidates there. From full links
     /// only (an enrollment link's other side is not confirmed).
     pub(crate) fn observed(&self, local: SocketAddr) -> Vec<SocketAddr> {
         let live = self.live.lock();
         let mut out: Vec<SocketAddr> = Vec::new();
         for link in live.values().filter(|l| l.enrolling.is_empty()) {
             for p in &link.paths {
-                if p.path.local == Some(local)
+                if p.path.handle.local_address() == Some(local)
                     && let Some(addr) = p.path.handle.observed_address()
                     && !out.contains(&addr)
                 {

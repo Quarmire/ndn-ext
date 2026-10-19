@@ -108,27 +108,75 @@
 //! it ends, and the device punches again with backoff. The link policy
 //! (`direct_paths`) and [`PeerSpec::direct`] turn it off. [`Links::report`]
 //! says, per device, which paths are up and why a direct path is not.
+//!
+//! Beyond peer entries, devices of a namespace that meet at a common relay
+//! make direct paths **by membership**: the relay tells each member which
+//! others of its namespace are linked to it (presence, on the link's
+//! control stream, filtered by the namespace's direct-path role matrix;
+//! names and keys, never addresses), and the device with the smaller key
+//! fingerprint punches, at most [`DirectOptions::max_paths`] at once.
+//!
+//! # Relays
+//!
+//! Any device that others can reach is a relay for the devices it serves:
+//! its [`ServePolicy`] says whom (its own namespaces by default; listed
+//! namespaces by root fingerprint; or any, within [`Quotas`]). A device
+//! chooses which relays it uses ([`RelayOptions`]): the ones its namespace
+//! advertises in its trust context, the ones its person added
+//! ([`PeerSpec::relay_use`]), or none; the `count` most preferred reachable
+//! ones are linked, and traffic fails over to the next when one is lost.
+//! A relay of another namespace forwards signed packets it cannot forge, but
+//! it sees the names it forwards (and any content not encrypted end to
+//! end). It carries the Data of a namespace it serves but does not hold in
+//! transit, unvalidated and uncached ([`FaceSink::transit`]): the devices
+//! that asked for it validate it.
+//!
+//! # Link modes and reachability while asleep
+//!
+//! Each link has a [`LinkMode`]: always up, on demand (dialled when the host
+//! is active or an Interest waits for it, closed when idle), or off (until
+//! the host asks). A device may ask its relay to hold its Interests while
+//! it is asleep and to wake it ([`PeerSpec::hold`],
+//! [`Links::set_wake_token`]); a relay offers that per its
+//! [`RelayService`], waking through the host's [`WakeNotifier`].
 
 #![cfg(not(target_arch = "wasm32"))]
 
 mod admission;
+mod asleep;
 mod candidates;
+mod control;
 mod direct;
+#[cfg(feature = "engine")]
+mod engine;
 mod host;
 mod links;
 mod peer;
 pub mod policy;
+mod presence;
 mod punch;
+mod relays;
 mod routes;
+mod serving;
 mod signal;
 mod slots;
 mod status;
 mod table;
+mod waiting;
 
+pub use asleep::{HoldLimits, RelayService, WAKE_INTERVAL, WakeNotifier, WakeRequest};
 pub use candidates::{AdvertisedCandidates, Candidate, CandidateKind, CandidateSource, HostCandidates};
+#[cfg(feature = "engine")]
+pub use engine::EngineFaces;
 pub use host::{ConfiguredEndpoints, FaceSink, LinkHints, LinkTrust, PathCandidate, PathSource, Route};
 pub use links::{LinkSetup, Links};
-pub use peer::{PeerId, PeerSpec};
+pub use peer::{LinkMode, PeerId, PeerSpec, RelaySource, RelayUse};
 pub use policy::Backoff;
-pub use status::{DirectState, DirectStatus, LinkReport, LinkStatus, PathKind, PathStatus};
+pub use presence::{DirectOptions, PRESENCE_MAX};
+pub use relays::RelayOptions;
+pub use serving::{Quotas, ServePolicy};
+pub use status::{
+    AsleepStatus, DirectState, DirectStatus, LinkReport, LinkStatus, PathKind, PathStatus, RelayState, RelayStatus,
+};
 pub use table::keeps_existing;
+pub use waiting::{DEMAND_PER_PEER, DEMAND_TOTAL, WAITING_COST};

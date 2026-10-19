@@ -1,8 +1,12 @@
 //! QUIC link invariants: the handshake proves each side's NDN key, a dial
 //! that expects another key fails, a refusal reaches the other side with its
-//! reason, NDN packets ride datagrams (fragmented when large), a scoped
-//! (enrollment) link carries only its scope, attempts over the limits are
-//! refused, and a link survives an address change.
+//! reason, NDN packets ride datagrams (fragmented when large) and are
+//! counted (keep-alives are not), a scoped (enrollment) link carries only
+//! its scope, attempts over the limits are refused, a link survives an
+//! address change (its face then names the new addresses, the other side's
+//! and its own), an endpoint links on a socket the host bound, and the
+//! messages after the verdict (Reachability, Presence) reach the other side,
+//! the latest replacing the earlier.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -10,8 +14,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use ndn_face_quic::{
-    Admission, Carries, CloseReason, HandshakeLimits, Link, LinkEndpoint, LinkError, LinkHello,
-    LinkKey, LinkScope, LinkTransportConfig, LinkVerdict, RateLimit,
+    Admission, Carries, CloseReason, HandshakeLimits, KeyFingerprint, Link, LinkEndpoint, LinkError,
+    LinkHello, LinkKey, LinkScope, LinkTransportConfig, LinkVerdict, Presence, PresentDevice, RateLimit,
+    Reachability,
 };
 use ndn_packet::Name;
 use ndn_packet::encode::{DataBuilder, InterestBuilder};
@@ -243,6 +248,7 @@ async fn an_enrollment_link_carries_only_its_scope_and_says_so() {
             sends: Carries::Answers,
             names: Box::new(move |n: &Name| n.has_prefix(&ca)),
             rate: RateLimit { burst: 16, per_sec: 4 },
+            shared: None,
             explain: "enrollment only".into(),
         };
         let admission = Admission {
@@ -351,6 +357,49 @@ async fn a_link_survives_its_dialers_address_change() {
 }
 
 #[tokio::test]
+async fn a_migrated_links_face_names_the_new_address() {
+    let dialer = endpoint(ed_key(1), false);
+    let listener = endpoint(ed_key(2), true);
+    let (a, b) = link(&dialer, &listener).await;
+    let uri = |addr: SocketAddr| Some(format!("quic4://{addr}"));
+    assert_eq!(b.face.remote_uri(), uri(addr(&dialer)));
+    let before = addr(&dialer);
+    dialer
+        .rebind(std::net::UdpSocket::bind("127.0.0.1:0").unwrap())
+        .unwrap();
+    let after = addr(&dialer);
+    assert_ne!(before, after);
+    let pkt = Bytes::from_static(&[0x05, 0x03, 0x07, 0x01, 0x42]);
+    a.face.send_bytes(pkt.clone()).await.unwrap();
+    assert_eq!(tokio::time::timeout(T, b.face.recv_bytes()).await.unwrap().unwrap(), pkt);
+    until("the listener's face still names the old address", || {
+        b.face.remote_uri() == uri(after)
+    })
+    .await;
+    assert_eq!(b.face.remote_uri(), uri(b.handle.remote_address()));
+}
+
+#[tokio::test]
+async fn a_rebound_links_face_names_its_new_local_address() {
+    let dialer = endpoint(ed_key(1), false);
+    let listener = endpoint(ed_key(2), true);
+    let (a, b) = link(&dialer, &listener).await;
+    let uri = |addr: SocketAddr| Some(format!("quic4://{addr}"));
+    let before = addr(&dialer);
+    assert_eq!(a.face.local_uri(), uri(before));
+    assert_eq!(a.handle.local_address(), Some(before));
+    assert_eq!(b.face.local_uri(), uri(addr(&listener)));
+    dialer
+        .rebind(std::net::UdpSocket::bind("127.0.0.1:0").unwrap())
+        .unwrap();
+    let after = addr(&dialer);
+    assert_ne!(before, after);
+    assert_eq!(a.face.local_uri(), uri(after));
+    assert_eq!(a.handle.local_address(), Some(after));
+    assert_eq!(b.face.local_uri(), uri(addr(&listener)));
+}
+
+#[tokio::test]
 async fn a_closed_link_tells_why() {
     let dialer = endpoint(ed_key(1), false);
     let listener = endpoint(ed_key(2), true);
@@ -453,4 +502,106 @@ async fn a_socket_that_does_not_listen_takes_only_the_direct_path_its_punch_expe
     drop(window);
     assert!(matches!(peer.connect_direct(target, key).await, Err(LinkError::Connect(_))));
     assert!(accepted.try_recv().is_err(), "the socket took a connection no punch expected");
+}
+
+#[tokio::test]
+async fn an_endpoint_links_on_a_socket_the_host_bound() {
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let bound = socket.local_addr().unwrap();
+    let config = LinkTransportConfig::default();
+    let listener = LinkEndpoint::from_socket(socket, Arc::new(ed_key(2)), &config, true).unwrap();
+    assert_eq!(addr(&listener), bound);
+    let dialer = endpoint(ed_key(1), false);
+    let (a, b) = link(&dialer, &listener).await;
+    let pkt = Bytes::from_static(&[0x05, 0x03, 0x07, 0x01, 0x43]);
+    a.face.send_bytes(pkt.clone()).await.unwrap();
+    assert_eq!(recv(&b.face).await, pkt);
+}
+
+/// Wait until `f` holds, polling.
+async fn until(what: &str, mut f: impl FnMut() -> bool) {
+    let start = std::time::Instant::now();
+    while !f() {
+        assert!(start.elapsed() < T, "{what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn the_peers_latest_reachability_replaces_the_earlier() {
+    let dialer = endpoint(ed_key(1), false);
+    let listener = endpoint(ed_key(2), true);
+    let (device, relay) = link(&dialer, &listener).await;
+    assert_eq!(relay.handle.peer_reachability(), None);
+    let first = Reachability {
+        hold: true,
+        wake_token: Some(Bytes::from_static(b"push-token-1")),
+    };
+    device.handle.send_reachability(&first);
+    until("the relay heard the reachability", || relay.handle.peer_reachability() == Some(first.clone())).await;
+    let newer = Reachability {
+        hold: false,
+        wake_token: None,
+    };
+    device.handle.send_reachability(&newer);
+    until("the newer reachability replaced it", || relay.handle.peer_reachability() == Some(newer.clone())).await;
+    assert_eq!(device.handle.peer_reachability(), None, "only the device told");
+}
+
+#[tokio::test]
+async fn presence_reaches_the_peer_and_replaces_per_namespace() {
+    let dialer = endpoint(ed_key(1), false);
+    let listener = endpoint(ed_key(2), true);
+    let (device, relay) = link(&dialer, &listener).await;
+    let present = |name: &str, key: u8| PresentDevice {
+        device: name.parse().unwrap(),
+        key: KeyFingerprint([key; 32]),
+    };
+    let presence = |ns: &str, devices: Vec<PresentDevice>| Presence {
+        namespace: ns.parse().unwrap(),
+        devices,
+    };
+    let home = presence("/home", vec![present("/home/member/phone", 1)]);
+    let work = presence("/work", vec![present("/work/node/pc", 2)]);
+    relay.handle.send_presence(&home);
+    relay.handle.send_presence(&work);
+    let seen = device.handle.presence();
+    let wait = |want: Vec<Presence>| {
+        let mut seen = seen.clone();
+        async move {
+            tokio::time::timeout(T, seen.wait_for(|p| *p == want)).await.unwrap().unwrap();
+        }
+    };
+    wait(vec![home.clone(), work.clone()]).await;
+    // A newer list for /home replaces it; /work stays.
+    let home2 = presence("/home", vec![present("/home/member/phone", 1), present("/home/member/tab", 3)]);
+    relay.handle.send_presence(&home2);
+    wait(vec![home2, work.clone()]).await;
+    // An empty list: no device of /home is there any more.
+    relay.handle.send_presence(&presence("/home", Vec::new()));
+    wait(vec![work]).await;
+    assert!(relay.handle.presence().borrow().is_empty(), "only the relay told");
+}
+
+#[tokio::test]
+async fn datagrams_count_ndn_traffic_and_not_keep_alives() {
+    let config = LinkTransportConfig {
+        keep_alive: Duration::from_millis(100),
+        idle_timeout: Duration::from_secs(5),
+        ..LinkTransportConfig::default()
+    };
+    let dialer = endpoint_with(ed_key(1), false, config.clone());
+    let listener = endpoint_with(ed_key(2), true, config);
+    let (a, b) = link(&dialer, &listener).await;
+    let (a0, b0) = (a.handle.datagrams(), b.handle.datagrams());
+    // Several keep-alive intervals with no NDN traffic.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!((a.handle.datagrams(), b.handle.datagrams()), (a0, b0), "keep-alives are not counted");
+    let pkt = Bytes::from_static(&[0x05, 0x03, 0x07, 0x01, 0x44]);
+    a.face.send_bytes(pkt.clone()).await.unwrap();
+    assert_eq!(recv(&b.face).await, pkt);
+    b.face.send_bytes(pkt.clone()).await.unwrap();
+    assert_eq!(recv(&a.face).await, pkt);
+    assert_eq!(a.handle.datagrams(), a0 + 2, "one sent, one received");
+    assert_eq!(b.handle.datagrams(), b0 + 2, "one received, one sent");
 }
