@@ -198,7 +198,11 @@ impl Permit {
 impl Drop for Permit {
     fn drop(&mut self) {
         self.gate.in_flight.fetch_sub(1, Ordering::SeqCst);
-        let mut sources = self.gate.sources.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut sources = self
+            .gate
+            .sources
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         if let Some(source) = sources.get_mut(&self.source) {
             source.in_flight = source.in_flight.saturating_sub(1);
             if source.in_flight == 0 && source.refusals == 0 && source.cooldown_until.is_none() {
@@ -331,9 +335,14 @@ impl LinkEndpoint {
         listen: bool,
     ) -> Result<Self, LinkError> {
         // Fail at bind, with the reason, when this device has no usable key.
-        let current = key.current().map_err(|e| LinkError::NoLinkKey(e.to_string()))?;
+        let current = key
+            .current()
+            .map_err(|e| LinkError::NoLinkKey(e.to_string()))?;
         let transport = Arc::new(transport_config(config.keep_alive, config.idle_timeout));
-        let direct_transport = Arc::new(transport_config(config.direct_keep_alive, config.direct_idle_timeout));
+        let direct_transport = Arc::new(transport_config(
+            config.direct_keep_alive,
+            config.direct_idle_timeout,
+        ));
         let server = listen
             .then(|| server_config(Arc::clone(&key), Arc::clone(&transport)))
             .transpose()?;
@@ -341,7 +350,10 @@ impl LinkEndpoint {
         let runtime: Arc<dyn quinn::Runtime> = Arc::new(quinn::TokioRuntime);
         let probes = Arc::new(ProbeTap::default());
         // quinn's socket state sets the socket non-blocking.
-        let socket = Arc::new(ProbeSocket::new(runtime.wrap_udp_socket(socket)?, Arc::clone(&probes)));
+        let socket = Arc::new(ProbeSocket::new(
+            runtime.wrap_udp_socket(socket)?,
+            Arc::clone(&probes),
+        ));
         let endpoint = quinn::Endpoint::new_with_abstract_socket(
             endpoint_config(&current),
             server,
@@ -378,14 +390,19 @@ impl LinkEndpoint {
         addr: SocketAddr,
         expected: Option<KeyFingerprint>,
     ) -> Result<Handshaken, LinkError> {
-        self.connect_with(addr, expected, Arc::clone(&self.transport)).await
+        self.connect_with(addr, expected, Arc::clone(&self.transport))
+            .await
     }
 
     /// Dial a direct path to `addr`, a candidate address of the device with
     /// key `expected`, whose punch opened the way: the handshake fails
     /// unless that device answers, and the path keeps itself alive with
     /// the direct-path keep-alive and idle timeout.
-    pub async fn connect_direct(&self, addr: SocketAddr, expected: KeyFingerprint) -> Result<Handshaken, LinkError> {
+    pub async fn connect_direct(
+        &self,
+        addr: SocketAddr,
+        expected: KeyFingerprint,
+    ) -> Result<Handshaken, LinkError> {
         self.connect_with(addr, Some(expected), Arc::clone(&self.direct_transport))
             .await
     }
@@ -399,7 +416,10 @@ impl LinkEndpoint {
         let presented = Arc::new(Presented::default());
         // The key this connection presents, fixed for its handshake: the
         // memberships its hello shows are bound to it.
-        let key = self.key.current().map_err(|e| LinkError::NoLinkKey(e.to_string()))?;
+        let key = self
+            .key
+            .current()
+            .map_err(|e| LinkError::NoLinkKey(e.to_string()))?;
         let config = self.client_config(expected, Arc::clone(&presented), transport, &key)?;
         let connecting = self
             .endpoint
@@ -425,7 +445,13 @@ impl LinkEndpoint {
                 });
             }
         };
-        Handshaken::new(connection, Direction::Dialed, None, self.endpoint.clone(), key)
+        Handshaken::new(
+            connection,
+            Direction::Dialed,
+            None,
+            self.endpoint.clone(),
+            key,
+        )
     }
 
     /// Send the probe of a punch's `session` to `to` from this socket.
@@ -453,7 +479,8 @@ impl LinkEndpoint {
         }
         expected.windows += 1;
         if !self.listening && expected.windows == 1 {
-            self.endpoint.set_server_config(Some(self.direct_server.clone()));
+            self.endpoint
+                .set_server_config(Some(self.direct_server.clone()));
         }
         InboundWindow {
             endpoint: self.endpoint.clone(),
@@ -500,12 +527,21 @@ impl LinkEndpoint {
                     // handshake: the memberships its hello shows are bound
                     // to it. A punch expects it: the connection is kept
                     // alive as a direct path.
-                    let transport = if punched { &self.direct_transport } else { &self.transport };
+                    let transport = if punched {
+                        &self.direct_transport
+                    } else {
+                        &self.transport
+                    };
                     let fixed = self
                         .key
                         .current()
                         .map_err(|e| LinkError::NoLinkKey(e.to_string()))
-                        .and_then(|key| Ok((server_config(Arc::new(key.clone()), Arc::clone(transport))?, key)));
+                        .and_then(|key| {
+                            Ok((
+                                server_config(Arc::new(key.clone()), Arc::clone(transport))?,
+                                key,
+                            ))
+                        });
                     match fixed {
                         Ok((server, key)) => {
                             return Some(Incoming {
@@ -639,9 +675,13 @@ impl Incoming {
         let accepted = self.incoming.accept_with(self.server);
         let connecting = accepted.map_err(LinkError::from_connection)?;
         match connecting.await {
-            Ok(connection) => {
-                Handshaken::new(connection, Direction::Accepted, Some(self.permit), self.endpoint, self.key)
-            }
+            Ok(connection) => Handshaken::new(
+                connection,
+                Direction::Accepted,
+                Some(self.permit),
+                self.endpoint,
+                self.key,
+            ),
             Err(e) => {
                 self.permit.refused();
                 Err(LinkError::from_connection(e))
@@ -654,7 +694,8 @@ fn transport_config(keep_alive: Duration, idle_timeout: Duration) -> quinn::Tran
     let mut t = quinn::TransportConfig::default();
     t.keep_alive_interval(Some(keep_alive));
     t.max_idle_timeout(Some(
-        quinn::IdleTimeout::try_from(idle_timeout).unwrap_or(quinn::VarInt::from_u32(30_000).into()),
+        quinn::IdleTimeout::try_from(idle_timeout)
+            .unwrap_or(quinn::VarInt::from_u32(30_000).into()),
     ));
     // NDN packets ride datagrams; the one bidirectional stream is the link's
     // control stream, and no peer needs more.
@@ -734,9 +775,15 @@ mod tests {
         for _ in 0..7 {
             gate.refused(ip, later);
         }
-        assert!(!cooling(&gate, ip), "refusals older than the window are forgotten");
+        assert!(
+            !cooling(&gate, ip),
+            "refusals older than the window are forgotten"
+        );
         gate.refused(ip, later + Duration::from_secs(1));
-        assert!(cooling(&gate, ip), "8 refusals within the window cool the source down");
+        assert!(
+            cooling(&gate, ip),
+            "8 refusals within the window cool the source down"
+        );
     }
 
     #[test]
@@ -745,8 +792,16 @@ mod tests {
         assert!(LinkTransportConfig::bounded(s(10), s(30)).is_ok());
         assert!(LinkTransportConfig::bounded(s(2), s(6)).is_ok());
         assert!(LinkTransportConfig::bounded(s(60), s(600)).is_ok());
-        for (keep_alive, idle) in [(Duration::from_millis(1500), s(30)), (s(61), s(600)), (s(10), s(29)), (s(10), s(601))] {
-            assert!(LinkTransportConfig::bounded(keep_alive, idle).is_err(), "{keep_alive:?}, {idle:?}");
+        for (keep_alive, idle) in [
+            (Duration::from_millis(1500), s(30)),
+            (s(61), s(600)),
+            (s(10), s(29)),
+            (s(10), s(601)),
+        ] {
+            assert!(
+                LinkTransportConfig::bounded(keep_alive, idle).is_err(),
+                "{keep_alive:?}, {idle:?}"
+            );
         }
     }
 }

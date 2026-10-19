@@ -6,8 +6,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use parking_lot::Mutex;
@@ -273,12 +273,14 @@ impl LinkTable {
     /// path.
     pub(crate) fn peer_sender(&self, peer: PeerId) -> Option<(KeyFingerprint, Arc<Face>)> {
         let live = self.live.lock();
-        live.iter().filter(|(_, l)| l.peer == Some(peer)).find_map(|(fp, l)| {
-            l.paths
-                .iter()
-                .find(|p| p.path.kind == PathKind::Link)
-                .map(|p| (*fp, Arc::clone(&p.path.sender)))
-        })
+        live.iter()
+            .filter(|(_, l)| l.peer == Some(peer))
+            .find_map(|(fp, l)| {
+                l.paths
+                    .iter()
+                    .find(|p| p.path.kind == PathKind::Link)
+                    .map(|p| (*fp, Arc::clone(&p.path.sender)))
+            })
     }
 
     /// The devices linked over a full link path with an identity in
@@ -352,7 +354,11 @@ impl LinkTable {
             .collect()
     }
 
-    fn path_to(&self, matches: impl Fn(&LiveLink, &KeyFingerprint) -> bool, kind: PathKind) -> Option<LinkHandle> {
+    fn path_to(
+        &self,
+        matches: impl Fn(&LiveLink, &KeyFingerprint) -> bool,
+        kind: PathKind,
+    ) -> Option<LinkHandle> {
         let live = self.live.lock();
         live.iter()
             .filter(|(fp, l)| matches(l, fp))
@@ -469,9 +475,7 @@ impl LinkTable {
 
     /// Whether `peer` is to be dialled again once.
     pub(crate) fn take_relink(&self, peer: PeerId) -> bool {
-        self.relink
-            .lock()
-            .remove(&peer)
+        self.relink.lock().remove(&peer)
     }
 
     /// `ctx`, newly adopted, revokes certificates: take from each link the
@@ -484,12 +488,17 @@ impl LinkTable {
         let mut live = self.live.lock();
         for link in live.values_mut() {
             let Some(at) = link.identities.iter().position(|id| {
-                id.device.has_prefix(ctx.namespace()) && id.certificates.iter().any(|c| ctx.is_revoked(c))
+                id.device.has_prefix(ctx.namespace())
+                    && id.certificates.iter().any(|c| ctx.is_revoked(c))
             }) else {
                 continue;
             };
             let id = link.identities.remove(at);
-            let revoked = id.certificates.iter().find(|c| ctx.is_revoked(c)).expect("found above");
+            let revoked = id
+                .certificates
+                .iter()
+                .find(|c| ctx.is_revoked(c))
+                .expect("found above");
             let text = format!(
                 "{revoked} is revoked in {} (trust context v{})",
                 ctx.namespace(),
@@ -550,15 +559,40 @@ mod tests {
         let large = KeyFingerprint([2; 32]);
         // This device has the smaller key: its own dial stays, the
         // other's is closed, whichever came up first.
-        assert!(keeps_existing(Direction::Dialed, Direction::Accepted, Some(small), large));
-        assert!(!keeps_existing(Direction::Accepted, Direction::Dialed, Some(small), large));
+        assert!(keeps_existing(
+            Direction::Dialed,
+            Direction::Accepted,
+            Some(small),
+            large
+        ));
+        assert!(!keeps_existing(
+            Direction::Accepted,
+            Direction::Dialed,
+            Some(small),
+            large
+        ));
         // The larger key: the other device's dial stays.
-        assert!(keeps_existing(Direction::Accepted, Direction::Dialed, Some(large), small));
-        assert!(!keeps_existing(Direction::Dialed, Direction::Accepted, Some(large), small));
+        assert!(keeps_existing(
+            Direction::Accepted,
+            Direction::Dialed,
+            Some(large),
+            small
+        ));
+        assert!(!keeps_existing(
+            Direction::Dialed,
+            Direction::Accepted,
+            Some(large),
+            small
+        ));
         // Same direction (a redial after a lost link): the newer wins.
         for dir in [Direction::Dialed, Direction::Accepted] {
             assert!(!keeps_existing(dir, dir, Some(small), large));
         }
-        assert!(!keeps_existing(Direction::Dialed, Direction::Accepted, None, large));
+        assert!(!keeps_existing(
+            Direction::Dialed,
+            Direction::Accepted,
+            None,
+            large
+        ));
     }
 }

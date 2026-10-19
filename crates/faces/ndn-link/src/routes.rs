@@ -23,7 +23,12 @@ pub(crate) struct RelayRoutes {
 /// and the routes of the peers reached through it. An enrollment link:
 /// none on the relay (answers return the way their Interests came), the
 /// namespace on the enrolling device.
-pub(crate) fn routes_for(peers: &Peers, admitted: &Admitted, dials: bool, relay: Option<RelayRoutes>) -> Vec<Route> {
+pub(crate) fn routes_for(
+    peers: &Peers,
+    admitted: &Admitted,
+    dials: bool,
+    relay: Option<RelayRoutes>,
+) -> Vec<Route> {
     match &admitted.enrollment {
         Some(Enrollment::Relay(_)) => return Vec::new(),
         Some(Enrollment::Device(ns)) => {
@@ -114,7 +119,11 @@ mod tests {
         }
     }
 
-    fn admitted(peer: Option<usize>, identity: Option<Identity>, enrollment: Option<Enrollment>) -> Admitted {
+    fn admitted(
+        peer: Option<usize>,
+        identity: Option<Identity>,
+        enrollment: Option<Enrollment>,
+    ) -> Admitted {
         Admitted {
             fingerprint: KeyFingerprint([0; 32]),
             identities: identity.into_iter().collect(),
@@ -145,15 +154,24 @@ mod tests {
 
     #[test]
     fn a_dialled_relay_routes_its_namespace_and_the_peers_behind_it() {
-        let peers = Peers::new(vec![spec("/home/node/relay", None), spec("/home/member/laptop", Some(0))]);
+        let peers = Peers::new(vec![
+            spec("/home/node/relay", None),
+            spec("/home/member/laptop", Some(0)),
+        ]);
         let relay = admitted(Some(0), Some(id("/home/node/relay", Role::Node)), None);
         assert_eq!(
             routes_for(&peers, &relay, true, None),
-            [route("/home", 0), route("/home/member/laptop", VIA_RELAY_COST)]
+            [
+                route("/home", 0),
+                route("/home/member/laptop", VIA_RELAY_COST)
+            ]
         );
         // A node that linked in unasked is routed by its device name.
         let unasked = admitted(None, Some(id("/home/node/relay", Role::Node)), None);
-        assert_eq!(routes_for(&peers, &unasked, false, None), [route("/home/node/relay", 0)]);
+        assert_eq!(
+            routes_for(&peers, &unasked, false, None),
+            [route("/home/node/relay", 0)]
+        );
     }
 
     #[test]
@@ -171,7 +189,10 @@ mod tests {
         };
         assert_eq!(
             routes_for(&peers, &relay, true, Some(rank)),
-            [route("/home", 2), route("/home/member/laptop", 2 + VIA_RELAY_COST)]
+            [
+                route("/home", 2),
+                route("/home/member/laptop", 2 + VIA_RELAY_COST)
+            ]
         );
     }
 
@@ -179,18 +200,31 @@ mod tests {
     fn a_node_with_a_peer_entry_this_device_does_not_dial_is_routed_by_its_device_name() {
         let peers = Peers::new(vec![spec("/home/node/relay", None)]);
         let inbound = admitted(Some(0), Some(id("/home/node/relay", Role::Node)), None);
-        assert_eq!(routes_for(&peers, &inbound, false, None), [route("/home/node/relay", 0)]);
+        assert_eq!(
+            routes_for(&peers, &inbound, false, None),
+            [route("/home/node/relay", 0)]
+        );
     }
 
     #[test]
     fn enrollment_links_route_the_namespace_on_the_device_only() {
         let peers = Peers::new(Vec::new());
         assert!(
-            routes_for(&peers, &admitted(None, None, Some(Enrollment::Relay(vec![n("/home")]))), false, None)
-                .is_empty()
+            routes_for(
+                &peers,
+                &admitted(None, None, Some(Enrollment::Relay(vec![n("/home")]))),
+                false,
+                None
+            )
+            .is_empty()
         );
         assert_eq!(
-            routes_for(&peers, &admitted(None, None, Some(Enrollment::Device(n("/home")))), true, None),
+            routes_for(
+                &peers,
+                &admitted(None, None, Some(Enrollment::Device(n("/home")))),
+                true,
+                None
+            ),
             [route("/home", 0)]
         );
     }

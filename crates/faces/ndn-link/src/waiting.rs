@@ -72,7 +72,11 @@ pub(crate) struct Waiting {
 /// What a waiting Interest's owner decided.
 pub(crate) enum Verdict {
     /// Queue it, within these bounds (per target, all targets of its kind).
-    Hold { per_target: usize, total: usize, max_hold: Option<Duration> },
+    Hold {
+        per_target: usize,
+        total: usize,
+        max_hold: Option<Duration>,
+    },
     /// Answer it with a Nack now; the text is logged.
     Nack(NackReason, String),
     /// Drop it silently (another path carries it).
@@ -88,7 +92,10 @@ impl Waiting {
         let (face, handle) = InProcFace::new(id, QUEUE);
         let kind = ndn_transport::Transport::kind(&face);
         faces.add_face(
-            Face::from_parts(Arc::new(face), ndn_transport::default_link_service_for_kind(kind)),
+            Face::from_parts(
+                Arc::new(face),
+                ndn_transport::default_link_service_for_kind(kind),
+            ),
             links.cancel_token().child_token(),
         );
         let waiting = Arc::new(Self {
@@ -150,7 +157,12 @@ impl Waiting {
         self.queues
             .lock()
             .remove(target)
-            .map(|q| q.into_iter().filter(|h| h.until > now).map(|h| h.wire).collect())
+            .map(|q| {
+                q.into_iter()
+                    .filter(|h| h.until > now)
+                    .map(|h| h.wire)
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -217,11 +229,16 @@ impl Waiting {
             .map(|(_, q)| q.len())
             .sum();
         if held >= total {
-            return Err(format!("{held} Interests wait here already (at most {total})"));
+            return Err(format!(
+                "{held} Interests wait here already (at most {total})"
+            ));
         }
         let queue = queues.entry(target.clone()).or_default();
         if queue.len() >= per_target {
-            return Err(format!("{} Interests wait for it already (at most {per_target})", queue.len()));
+            return Err(format!(
+                "{} Interests wait for it already (at most {per_target})",
+                queue.len()
+            ));
         }
         let wait = max_hold.map_or(lifetime, |max| lifetime.min(max));
         queue.push_back(Held {

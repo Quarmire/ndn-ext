@@ -73,18 +73,20 @@ mod probe;
 mod scope;
 mod verify;
 
-pub use endpoint::{ALPN_LINK, HandshakeLimits, InboundWindow, Incoming, LinkEndpoint, LinkTransportConfig};
-pub use key::{KeyError, KeyFingerprint, LinkKey, LinkKeyAlgorithm, LinkKeySource, PeerKey};
-pub use membership::{
-    BINDING_LABEL, ChannelBinding, MEMBERSHIP, MEMBERSHIP_EXPORTER_LABEL, MEMBERSHIPS_MAX, Membership,
-    binding_transcript,
+pub use endpoint::{
+    ALPN_LINK, HandshakeLimits, InboundWindow, Incoming, LinkEndpoint, LinkTransportConfig,
 };
+pub use key::{KeyError, KeyFingerprint, LinkKey, LinkKeyAlgorithm, LinkKeySource, PeerKey};
 pub use link::{
     Admission, DATAGRAM_FLOOR, Direction, Handshaken, Link, LinkError, LinkFace, LinkHandle,
 };
+pub use membership::{
+    BINDING_LABEL, ChannelBinding, MEMBERSHIP, MEMBERSHIP_EXPORTER_LABEL, MEMBERSHIPS_MAX,
+    Membership, binding_transcript,
+};
 pub use message::{
-    CloseReason, LINK_PROTOCOL_VERSION, LinkHello, LinkVerdict, PathSession, Presence, PresentDevice,
-    Reachability, WAKE_TOKEN_MAX, decode_udp_address, encode_udp_address,
+    CloseReason, LINK_PROTOCOL_VERSION, LinkHello, LinkVerdict, PathSession, Presence,
+    PresentDevice, Reachability, WAKE_TOKEN_MAX, decode_udp_address, encode_udp_address,
 };
 pub use probe::{PROBE_LEN, ProbeWatch, decode_probe, encode_probe};
 pub use scope::{Carries, LinkScope, RateLimit, SharedRate};

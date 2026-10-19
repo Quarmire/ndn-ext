@@ -145,7 +145,10 @@ mod tests {
     fn backoff_doubles_to_its_cap_and_refusals_wait_apart() {
         let mut b = Backoff::default();
         let waits: Vec<_> = (0..9).map(|_| b.after_failure(false).as_millis()).collect();
-        assert_eq!(waits, [500, 1000, 2000, 4000, 8000, 16000, 30000, 30000, 30000]);
+        assert_eq!(
+            waits,
+            [500, 1000, 2000, 4000, 8000, 16000, 30000, 30000, 30000]
+        );
         assert_eq!(b.after_failure(true), BACKOFF_REFUSED);
         assert_eq!(b.after_failure(false), BACKOFF_MAX);
         b.reset();

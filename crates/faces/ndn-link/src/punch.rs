@@ -27,7 +27,8 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use ndn_face_quic::{
-    ChannelBinding, LinkKey, MEMBERSHIP, Membership, PathSession, PeerKey, decode_udp_address, encode_udp_address,
+    ChannelBinding, LinkKey, MEMBERSHIP, Membership, PathSession, PeerKey, decode_udp_address,
+    encode_udp_address,
 };
 use ndn_packet::encode::{DataBuilder, InterestBuilder};
 use ndn_packet::{Data, Interest, Name, NameComponent};
@@ -109,7 +110,11 @@ impl PunchMessage {
                 DATA => msg.certificates.push(Bytes::copy_from_slice(&cur[..end])),
                 MEMBERSHIP => msg.memberships.push(Membership::decode(value)?),
                 t if skippable(t) => {}
-                t => return Err(format!("unknown critical field {t:#x} in the punch message")),
+                t => {
+                    return Err(format!(
+                        "unknown critical field {t:#x} in the punch message"
+                    ));
+                }
             }
             cur = &cur[end..];
         }
@@ -261,7 +266,8 @@ pub(crate) async fn request(
     locator: &Name,
 ) -> Bytes {
     InterestBuilder::new(
-        punch_prefix(device).append_component(NameComponent::generic(Bytes::copy_from_slice(session))),
+        punch_prefix(device)
+            .append_component(NameComponent::generic(Bytes::copy_from_slice(session))),
     )
     .lifetime(PUNCH_ANSWER_TIMEOUT)
     .must_be_fresh()
@@ -274,7 +280,12 @@ pub(crate) async fn request(
 }
 
 /// The signed answer to the punch Interest named `name`.
-pub(crate) async fn answer(name: &Name, msg: &PunchMessage, signer: &dyn Signer, locator: &Name) -> Bytes {
+pub(crate) async fn answer(
+    name: &Name,
+    msg: &PunchMessage,
+    signer: &dyn Signer,
+    locator: &Name,
+) -> Bytes {
     DataBuilder::new(name.clone(), &msg.encode())
         .sign(signer.sig_type(), Some(locator), |region| {
             let region = region.to_vec();
@@ -302,9 +313,16 @@ fn signing_key(msg: &PunchMessage, key: &PeerKey) -> Result<Bytes, String> {
 /// Whether `interest` (carrying `msg`) is signed by the key `msg` names —
 /// its membership's, else the link key `key` — with SignatureNonce and
 /// SignatureTime.
-pub(crate) async fn verify_request(interest: &Interest, msg: &PunchMessage, key: &PeerKey) -> Result<(), String> {
-    let (Some(info), Some(region), Some(value)) = (interest.sig_info(), interest.signed_region(), interest.sig_value())
-    else {
+pub(crate) async fn verify_request(
+    interest: &Interest,
+    msg: &PunchMessage,
+    key: &PeerKey,
+) -> Result<(), String> {
+    let (Some(info), Some(region), Some(value)) = (
+        interest.sig_info(),
+        interest.signed_region(),
+        interest.sig_value(),
+    ) else {
         return Err("the punch Interest is not signed".into());
     };
     if info.sig_nonce.is_none() || info.sig_time.is_none() {
@@ -314,18 +332,34 @@ pub(crate) async fn verify_request(interest: &Interest, msg: &PunchMessage, key:
 }
 
 /// Whether `data` (carrying `msg`) is signed by the key `msg` names.
-pub(crate) async fn verify_answer(data: &Data, msg: &PunchMessage, key: &PeerKey) -> Result<(), String> {
+pub(crate) async fn verify_answer(
+    data: &Data,
+    msg: &PunchMessage,
+    key: &PeerKey,
+) -> Result<(), String> {
     let Some(info) = data.sig_info() else {
         return Err("the punch answer is not signed".into());
     };
-    verified(verify_by_sig_type(info.sig_type, data.signed_region(), data.sig_value(), &signing_key(msg, key)?).await)
+    verified(
+        verify_by_sig_type(
+            info.sig_type,
+            data.signed_region(),
+            data.sig_value(),
+            &signing_key(msg, key)?,
+        )
+        .await,
+    )
 }
 
 fn verified(outcome: Result<VerifyOutcome, ndn_security::TrustError>) -> Result<(), String> {
     match outcome {
         Ok(VerifyOutcome::Valid) => Ok(()),
-        Ok(VerifyOutcome::Invalid) => Err("its signature does not verify under the key it names".into()),
-        Err(e) => Err(format!("its signature cannot be verified under the key it names: {e}")),
+        Ok(VerifyOutcome::Invalid) => {
+            Err("its signature does not verify under the key it names".into())
+        }
+        Err(e) => Err(format!(
+            "its signature cannot be verified under the key it names: {e}"
+        )),
     }
 }
 
@@ -348,17 +382,30 @@ mod tests {
     #[tokio::test]
     async fn a_punch_showing_a_membership_is_signed_by_its_key() {
         use ndn_security::{Ed25519Signer, encode_cert_data};
-        let link = Arc::new(Ed25519Signer::from_seed(&[1; 32], "/a/member/phone/KEY/k".parse().unwrap()));
+        let link = Arc::new(Ed25519Signer::from_seed(
+            &[1; 32],
+            "/a/member/phone/KEY/k".parse().unwrap(),
+        ));
         let link_key = LinkKey::from_signer(Arc::clone(&link) as Arc<dyn Signer>).unwrap();
-        let c_key: Arc<dyn Signer> = Arc::new(Ed25519Signer::from_seed(&[2; 32], "/c/member/phone/KEY/k".parse().unwrap()));
+        let c_key: Arc<dyn Signer> = Arc::new(Ed25519Signer::from_seed(
+            &[2; 32],
+            "/c/member/phone/KEY/k".parse().unwrap(),
+        ));
         let ca = Ed25519Signer::from_seed(&[3; 32], "/c/CA/KEY/ca".parse().unwrap());
         let cert_name: Name = "/c/member/phone/KEY/k/NDNCERT/v=1".parse().unwrap();
         let pk: [u8; 32] = c_key.public_key().unwrap().as_ref().try_into().unwrap();
-        let cert = encode_cert_data(&cert_name, &pk, &ca, 0, u64::MAX / 2).await.unwrap();
-        let session = [1; 8];
-        let shown = Membership::sign(c_key.as_ref(), &link_key.fingerprint(), &punch_binding(&session), vec![cert])
+        let cert = encode_cert_data(&cert_name, &pk, &ca, 0, u64::MAX / 2)
             .await
             .unwrap();
+        let session = [1; 8];
+        let shown = Membership::sign(
+            c_key.as_ref(),
+            &link_key.fingerprint(),
+            &punch_binding(&session),
+            vec![cert],
+        )
+        .await
+        .unwrap();
         let msg = PunchMessage {
             key: link_key.spki().clone(),
             memberships: vec![shown.clone()],
@@ -398,7 +445,10 @@ mod tests {
         assert_eq!(PunchMessage::decode(&refusal.encode()).unwrap(), refusal);
         // A candidate of kind 9 is skipped, the rest kept.
         let mut wire = msg.encode();
-        let odd = [0xFD, 0x04, 0x62, 0x0F, 0xFD, 0x04, 0x64, 0x01, 0x09, 0xFD, 0x04, 0x66, 0x06, 1, 2, 3, 4, 0, 1];
+        let odd = [
+            0xFD, 0x04, 0x62, 0x0F, 0xFD, 0x04, 0x64, 0x01, 0x09, 0xFD, 0x04, 0x66, 0x06, 1, 2, 3,
+            4, 0, 1,
+        ];
         // After PunchKey (3 + 1 + 2 bytes).
         wire.splice(6..6, odd);
         assert_eq!(PunchMessage::decode(&wire).unwrap().candidates.len(), 2);
@@ -413,13 +463,18 @@ mod tests {
         let session = [1, 2, 3, 4, 5, 6, 7, 8];
         let name = punch_prefix(&device)
             .append_component(NameComponent::generic(Bytes::copy_from_slice(&session)))
-            .append_component(NameComponent::new(ndn_packet::tlv_type::PARAMETERS_SHA256, Bytes::from(vec![0; 32])));
+            .append_component(NameComponent::new(
+                ndn_packet::tlv_type::PARAMETERS_SHA256,
+                Bytes::from(vec![0; 32]),
+            ));
         assert_eq!(session_of(&device, &name), Some(session));
         let other: Name = "/home/member/tab".parse().unwrap();
         assert_eq!(session_of(&other, &name), None);
         assert_eq!(
             punch_prefix(&device),
-            "/home/member/phone/32=link/32=punch".parse::<Name>().unwrap()
+            "/home/member/phone/32=link/32=punch"
+                .parse::<Name>()
+                .unwrap()
         );
     }
 
@@ -430,10 +485,13 @@ mod tests {
     /// The punch vectors of ndn-link.md (§16.14, §16.15).
     #[test]
     fn the_spec_vectors_are_what_this_code_writes() {
-        let mut spki = vec![0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00];
+        let mut spki = vec![
+            0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+        ];
         spki.extend_from_slice(&[
-            0x8a, 0x88, 0xe3, 0xdd, 0x74, 0x09, 0xf1, 0x95, 0xfd, 0x52, 0xdb, 0x2d, 0x3c, 0xba, 0x5d, 0x72, 0xca,
-            0x67, 0x09, 0xbf, 0x1d, 0x94, 0x12, 0x1b, 0xf3, 0x74, 0x88, 0x01, 0xb4, 0x0f, 0x6f, 0x5c,
+            0x8a, 0x88, 0xe3, 0xdd, 0x74, 0x09, 0xf1, 0x95, 0xfd, 0x52, 0xdb, 0x2d, 0x3c, 0xba,
+            0x5d, 0x72, 0xca, 0x67, 0x09, 0xbf, 0x1d, 0x94, 0x12, 0x1b, 0xf3, 0x74, 0x88, 0x01,
+            0xb4, 0x0f, 0x6f, 0x5c,
         ]);
         let key = Bytes::from(spki);
         let key_hex = "fd04602c302a300506032b65700321008a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c";
@@ -465,7 +523,10 @@ mod tests {
             format!("{key_hex}fd04681dfd046a0118fd046c1464697265637420706174687320617265206f6666")
         );
         let device: Name = "/home/member/phone".parse().unwrap();
-        let name = punch_prefix(&device).append_component(NameComponent::generic(Bytes::from_static(&[1, 2, 3, 4, 5, 6, 7, 8])));
+        let name =
+            punch_prefix(&device).append_component(NameComponent::generic(Bytes::from_static(&[
+                1, 2, 3, 4, 5, 6, 7, 8,
+            ])));
         assert_eq!(
             hex(&name.encode_to_tlv()),
             "072c0804686f6d6508066d656d626572080570686f6e6520046c696e6b200570756e636808080102030405060708"

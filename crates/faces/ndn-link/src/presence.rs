@@ -97,7 +97,9 @@ impl Links {
             let devices: Vec<PresentDevice> = members
                 .iter()
                 .filter(|o| o.fingerprint != to.fingerprint)
-                .filter(|o| policy.allows_direct_path(to.identity.role.as_str(), o.identity.role.as_str()))
+                .filter(|o| {
+                    policy.allows_direct_path(to.identity.role.as_str(), o.identity.role.as_str())
+                })
                 .take(PRESENCE_MAX)
                 .map(|o| PresentDevice {
                     device: o.identity.device.clone(),
@@ -186,7 +188,8 @@ impl Links {
             if let Some(m) = members.remove(&fp) {
                 m.cancel.cancel();
                 if let Some(face) = relay_face {
-                    self.faces().remove_routes(face, std::slice::from_ref(&m.device));
+                    self.faces()
+                        .remove_routes(face, std::slice::from_ref(&m.device));
                 }
                 tracing::info!(
                     target: "face.quic",
@@ -224,8 +227,20 @@ impl Links {
                 key: Some(fp),
                 peer: None,
             };
-            tokio::spawn(member_loop(Arc::downgrade(self), target, relay, cancel.clone()));
-            members.insert(fp, MemberEntry { relay, device, cancel });
+            tokio::spawn(member_loop(
+                Arc::downgrade(self),
+                target,
+                relay,
+                cancel.clone(),
+            ));
+            members.insert(
+                fp,
+                MemberEntry {
+                    relay,
+                    device,
+                    cancel,
+                },
+            );
         }
     }
 }

@@ -111,7 +111,9 @@ pub(crate) struct ProbeSocket {
 
 impl fmt::Debug for ProbeSocket {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ProbeSocket").field("inner", &self.inner).finish()
+        f.debug_struct("ProbeSocket")
+            .field("inner", &self.inner)
+            .finish()
     }
 }
 
@@ -124,7 +126,9 @@ impl ProbeSocket {
     pub(crate) async fn send_probe(&self, to: SocketAddr, session: &PathSession) -> io::Result<()> {
         let probe = encode_probe(session);
         let destination = match (self.inner.local_addr()?.ip(), to.ip()) {
-            (IpAddr::V6(_), IpAddr::V4(v4)) => SocketAddr::new(IpAddr::V6(v4.to_ipv6_mapped()), to.port()),
+            (IpAddr::V6(_), IpAddr::V4(v4)) => {
+                SocketAddr::new(IpAddr::V6(v4.to_ipv6_mapped()), to.port())
+            }
             _ => to,
         };
         let transmit = Transmit {
@@ -170,7 +174,8 @@ impl AsyncUdpSocket for ProbeSocket {
                 continue;
             }
             let segments: Vec<&[u8]> = buf[..m.len].chunks(PROBE_LEN).collect();
-            let sessions: Vec<PathSession> = segments.iter().filter_map(|s| decode_probe(s)).collect();
+            let sessions: Vec<PathSession> =
+                segments.iter().filter_map(|s| decode_probe(s)).collect();
             if sessions.len() != segments.len() {
                 continue;
             }
@@ -212,8 +217,8 @@ mod tests {
         assert_eq!(
             probe,
             [
-                0x00, b'n', b'd', b'n', b'-', b'l', b'i', b'n', b'k', b' ', b'p', b'r', b'o', b'b', b'e', 0x01, 9, 8,
-                7, 6, 5, 4, 3, 2
+                0x00, b'n', b'd', b'n', b'-', b'l', b'i', b'n', b'k', b' ', b'p', b'r', b'o', b'b',
+                b'e', 0x01, 9, 8, 7, 6, 5, 4, 3, 2
             ]
         );
         assert_eq!(decode_probe(&probe), Some(session));

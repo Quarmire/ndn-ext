@@ -192,7 +192,8 @@ impl Links {
             },
         );
         let prefixes = ended.routes.iter().map(|r| r.prefix.clone()).collect();
-        self.waiting().route(self, WaitFor::Asleep(fingerprint), prefixes);
+        self.waiting()
+            .route(self, WaitFor::Asleep(fingerprint), prefixes);
         tracing::info!(
             target: "face.quic",
             peer = %label,
@@ -271,12 +272,17 @@ impl Links {
             );
         };
         if let (Some(token), Some(notifier)) = (&sleeper.token, &self.service.wake)
-            && sleeper.last_wake.is_none_or(|at| now.duration_since(at) >= WAKE_INTERVAL)
+            && sleeper
+                .last_wake
+                .is_none_or(|at| now.duration_since(at) >= WAKE_INTERVAL)
         {
             sleeper.last_wake = Some(now);
             sleeper.wakes += 1;
             self.sleepers.wakes_sent.fetch_add(1, Ordering::Relaxed);
-            let held = self.waiting.get().map_or(0, |w| w.count(&WaitFor::Asleep(fingerprint)));
+            let held = self
+                .waiting
+                .get()
+                .map_or(0, |w| w.count(&WaitFor::Asleep(fingerprint)));
             tracing::info!(
                 target: "face.quic",
                 key = %fingerprint,
@@ -303,7 +309,11 @@ impl Links {
                 NackReason::NoRoute,
                 format!(
                     "the device {name} is for is asleep here and its Interests are not held{}",
-                    if sleeper.token.is_some() { " (it was woken)" } else { "" }
+                    if sleeper.token.is_some() {
+                        " (it was woken)"
+                    } else {
+                        ""
+                    }
                 ),
             ),
         }
@@ -315,7 +325,10 @@ impl Links {
         let s = map.get(fingerprint)?;
         Some(AsleepStatus {
             since: s.since.elapsed(),
-            held: self.waiting.get().map_or(0, |w| w.count(&WaitFor::Asleep(*fingerprint))),
+            held: self
+                .waiting
+                .get()
+                .map_or(0, |w| w.count(&WaitFor::Asleep(*fingerprint))),
             hold: s.hold,
             wake: s.token.is_some(),
             wakes: s.wakes,

@@ -127,7 +127,8 @@ impl LinkHello {
                 },
                 DATA => certificates.push(Bytes::copy_from_slice(&cur[..end])),
                 MEMBERSHIP => memberships.push(
-                    Membership::decode(&cur[start..end]).map_err(|e| format!("{e} in the link hello"))?,
+                    Membership::decode(&cur[start..end])
+                        .map_err(|e| format!("{e} in the link hello"))?,
                 ),
                 DIRECT_PATH => {
                     direct_path = Some(PathSession::try_from(&cur[start..end]).map_err(|_| {
@@ -196,7 +197,9 @@ impl LinkVerdict {
                     while !names.is_empty() {
                         let (nt, nstart, nend) = split_tlv(names)?;
                         if nt != NAME {
-                            return Err(format!("{nt:#x} where a namespace name belongs in the link verdict"));
+                            return Err(format!(
+                                "{nt:#x} where a namespace name belongs in the link verdict"
+                            ));
                         }
                         namespaces.push(
                             Name::decode(Bytes::copy_from_slice(&names[nstart..nend]))
@@ -205,7 +208,9 @@ impl LinkVerdict {
                         names = &names[nend..];
                     }
                     if namespaces.is_empty() {
-                        return Err("an enrollment link for no namespace in the link verdict".into());
+                        return Err(
+                            "an enrollment link for no namespace in the link verdict".into()
+                        );
                     }
                     verdict.enrollment_link = Some(namespaces);
                 }
@@ -285,7 +290,11 @@ impl Reachability {
                     ));
                 }
                 t if skippable(t) => {}
-                t => return Err(format!("unknown critical field {t:#x} in the Reachability message")),
+                t => {
+                    return Err(format!(
+                        "unknown critical field {t:#x} in the Reachability message"
+                    ));
+                }
             }
             cur = &cur[end..];
         }
@@ -335,10 +344,19 @@ impl Presence {
         while !cur.is_empty() {
             let (t, start, end) = split_tlv(cur)?;
             match t {
-                NAME => namespace = Some(decode_name(&cur[start..end], "the namespace of the Presence message")?),
+                NAME => {
+                    namespace = Some(decode_name(
+                        &cur[start..end],
+                        "the namespace of the Presence message",
+                    )?)
+                }
                 PRESENT_DEVICE => devices.push(decode_present_device(&cur[start..end])?),
                 t if skippable(t) => {}
-                t => return Err(format!("unknown critical field {t:#x} in the Presence message")),
+                t => {
+                    return Err(format!(
+                        "unknown critical field {t:#x} in the Presence message"
+                    ));
+                }
             }
             cur = &cur[end..];
         }
@@ -357,9 +375,14 @@ fn decode_present_device(value: &[u8]) -> Result<PresentDevice, String> {
         match t {
             NAME => device = Some(decode_name(field, "a device in the Presence message")?),
             KEY_DIGEST => {
-                key = Some(KeyFingerprint(<[u8; 32]>::try_from(field).map_err(|_| {
-                    format!("a key digest of {} bytes in the Presence message (it is 32)", field.len())
-                })?));
+                key = Some(KeyFingerprint(<[u8; 32]>::try_from(field).map_err(
+                    |_| {
+                        format!(
+                            "a key digest of {} bytes in the Presence message (it is 32)",
+                            field.len()
+                        )
+                    },
+                )?));
             }
             t if skippable(t) => {}
             t => return Err(format!("unknown critical field {t:#x} in a PresentDevice")),
@@ -399,7 +422,10 @@ pub fn decode_udp_address(value: &[u8]) -> Result<SocketAddr, String> {
         18 => {
             let mut ip = [0u8; 16];
             ip.copy_from_slice(&value[..16]);
-            Ok(SocketAddr::new(IpAddr::V6(Ipv6Addr::from(ip)), port(&value[16..])))
+            Ok(SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::from(ip)),
+                port(&value[16..]),
+            ))
         }
         n => Err(format!("a UDP address of {n} bytes (it is 6 or 18)")),
     }
@@ -567,7 +593,10 @@ mod tests {
     fn a_hello_round_trips() {
         for hello in [
             LinkHello {
-                certificates: vec![Bytes::from_static(&[0x06, 0x01, 0xAA]), Bytes::from_static(&[0x06, 0x00])],
+                certificates: vec![
+                    Bytes::from_static(&[0x06, 0x01, 0xAA]),
+                    Bytes::from_static(&[0x06, 0x00]),
+                ],
                 ..LinkHello::default()
             },
             LinkHello {
@@ -577,7 +606,10 @@ mod tests {
             LinkHello {
                 certificates: vec![Bytes::from_static(&[0x06, 0x01, 0xAA])],
                 memberships: vec![Membership {
-                    certificates: vec![Bytes::from_static(&[0x06, 0x01, 0xBB]), Bytes::from_static(&[0x06, 0x00])],
+                    certificates: vec![
+                        Bytes::from_static(&[0x06, 0x01, 0xBB]),
+                        Bytes::from_static(&[0x06, 0x00]),
+                    ],
                     binding: Bytes::from_static(&[1, 2, 3]),
                 }],
                 direct_path: Some([8; 8]),
@@ -601,7 +633,10 @@ mod tests {
         assert_eq!(encode_udp_address(mapped), [192, 0, 2, 7, 0x18, 0xDB]);
         assert!(decode_udp_address(&[1, 2, 3, 4, 5]).is_err());
         let wire = encode_observed_address("192.0.2.7:6363".parse().unwrap());
-        assert_eq!(wire.as_ref(), [0xFD, 0x04, 0x58, 0x06, 192, 0, 2, 7, 0x18, 0xDB]);
+        assert_eq!(
+            wire.as_ref(),
+            [0xFD, 0x04, 0x58, 0x06, 192, 0, 2, 7, 0x18, 0xDB]
+        );
     }
 
     #[test]
@@ -623,7 +658,8 @@ mod tests {
         assert_eq!(
             wire.as_ref(),
             [
-                0xFD, 0x04, 0x50, 0x11, 0xFD, 0x04, 0x51, 0x01, 0x01, 0xFD, 0x04, 0x5A, 0x08, 1, 2, 3, 4, 5, 6, 7, 8
+                0xFD, 0x04, 0x50, 0x11, 0xFD, 0x04, 0x51, 0x01, 0x01, 0xFD, 0x04, 0x5A, 0x08, 1, 2,
+                3, 4, 5, 6, 7, 8
             ]
         );
     }
@@ -631,7 +667,17 @@ mod tests {
     #[test]
     fn a_membership_needs_a_certificate_and_a_binding() {
         let hello = |membership: &[u8]| {
-            let mut v = vec![0xFD, 0x04, 0x51, 0x01, 0x01, 0xFD, 0x04, 0x5C, membership.len() as u8];
+            let mut v = vec![
+                0xFD,
+                0x04,
+                0x51,
+                0x01,
+                0x01,
+                0xFD,
+                0x04,
+                0x5C,
+                membership.len() as u8,
+            ];
             v.extend_from_slice(membership);
             LinkHello::decode(&v)
         };
@@ -640,7 +686,12 @@ mod tests {
         assert!(hello(&[0xFD, 0x04, 0x5E, 0x01, 0xAA]).is_err());
         assert!(hello(&[0x06, 0x00]).is_err());
         assert!(hello(&[0x06, 0x00, 0xFD, 0x04, 0x5E, 0x00]).is_err());
-        assert!(hello(&[0x06, 0x00, 0xFD, 0x04, 0x5E, 0x01, 0xAA, 0xFD, 0x04, 0x5F, 0x00]).is_err());
+        assert!(
+            hello(&[
+                0x06, 0x00, 0xFD, 0x04, 0x5E, 0x01, 0xAA, 0xFD, 0x04, 0x5F, 0x00
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -715,11 +766,17 @@ mod tests {
         let wire = full.encode();
         assert_eq!(
             wire.as_ref(),
-            [0xFD, 0x04, 0x40, 0x0B, 0xFD, 0x04, 0x42, 0x00, 0xFD, 0x04, 0x44, 0x03, b't', b'o', b'k']
+            [
+                0xFD, 0x04, 0x40, 0x0B, 0xFD, 0x04, 0x42, 0x00, 0xFD, 0x04, 0x44, 0x03, b't', b'o',
+                b'k'
+            ]
         );
         assert_eq!(Reachability::decode(&wire[4..]).unwrap(), full);
         // Neither: no holding, no waking.
-        assert_eq!(Reachability::default().encode().as_ref(), [0xFD, 0x04, 0x40, 0x00]);
+        assert_eq!(
+            Reachability::default().encode().as_ref(),
+            [0xFD, 0x04, 0x40, 0x00]
+        );
         assert_eq!(Reachability::decode(&[]).unwrap(), Reachability::default());
         // HoldInterests is empty; a wake token is 1..=1024 bytes.
         assert!(Reachability::decode(&[0xFD, 0x04, 0x42, 0x01, 0x01]).is_err());
@@ -729,7 +786,14 @@ mod tests {
         assert!(Reachability::decode(&long).is_err());
         long.truncate(long.len() - 1);
         long[5] = 0x00;
-        assert_eq!(Reachability::decode(&long).unwrap().wake_token.unwrap().len(), WAKE_TOKEN_MAX);
+        assert_eq!(
+            Reachability::decode(&long)
+                .unwrap()
+                .wake_token
+                .unwrap()
+                .len(),
+            WAKE_TOKEN_MAX
+        );
     }
 
     #[test]
@@ -741,9 +805,13 @@ mod tests {
                 key: KeyFingerprint([0xAB; 32]),
             }],
         };
-        let mut expected = vec![0xFD, 0x04, 0x46, 0x3B, 0x07, 0x06, 0x08, 0x04, b'h', b'o', b'm', b'e'];
+        let mut expected = vec![
+            0xFD, 0x04, 0x46, 0x3B, 0x07, 0x06, 0x08, 0x04, b'h', b'o', b'm', b'e',
+        ];
         expected.extend([0xFD, 0x04, 0x48, 0x2F]);
-        expected.extend([0x07, 0x09, 0x08, 0x04, b'h', b'o', b'm', b'e', 0x08, 0x01, b'd']);
+        expected.extend([
+            0x07, 0x09, 0x08, 0x04, b'h', b'o', b'm', b'e', 0x08, 0x01, b'd',
+        ]);
         expected.extend([0xFD, 0x04, 0x4A, 0x20]);
         expected.extend([0xAB; 32]);
         let wire = presence.encode();
@@ -756,7 +824,9 @@ mod tests {
         assert_eq!(Presence::decode(&none.encode()[4..]).unwrap(), none);
         // A namespace is required; a key digest is 32 bytes.
         assert!(Presence::decode(&[]).is_err());
-        let short_key = [0x07, 0x00, 0xFD, 0x04, 0x48, 0x07, 0x07, 0x00, 0xFD, 0x04, 0x4A, 0x01, 0xAB];
+        let short_key = [
+            0x07, 0x00, 0xFD, 0x04, 0x48, 0x07, 0x07, 0x00, 0xFD, 0x04, 0x4A, 0x01, 0xAB,
+        ];
         assert!(Presence::decode(&short_key).is_err());
         let no_key = [0x07, 0x00, 0xFD, 0x04, 0x48, 0x02, 0x07, 0x00];
         assert!(Presence::decode(&no_key).is_err());

@@ -75,7 +75,10 @@ impl SharedRate {
     }
 
     fn take(&self) -> bool {
-        self.bucket.lock().unwrap_or_else(PoisonError::into_inner).take(self.rate)
+        self.bucket
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take(self.rate)
     }
 }
 
@@ -198,7 +201,12 @@ impl ScopeState {
                 self.note_drop("over the rate limit", None);
                 return Judged::Drop(None);
             }
-            if self.scope.shared.as_ref().is_some_and(|shared| !shared.take()) {
+            if self
+                .scope
+                .shared
+                .as_ref()
+                .is_some_and(|shared| !shared.take())
+            {
                 self.note_drop("over the rate limit shared with other links", None);
                 return Judged::Drop(None);
             }
@@ -212,10 +220,18 @@ impl ScopeState {
     }
 
     fn take_token(&self) -> bool {
-        self.bucket.lock().unwrap_or_else(PoisonError::into_inner).take(self.scope.rate)
+        self.bucket
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take(self.scope.rate)
     }
 
-    fn judge(&self, packet: Option<Packet>, carries: Carries, fragmented: &Mutex<Fragmented>) -> Judged {
+    fn judge(
+        &self,
+        packet: Option<Packet>,
+        carries: Carries,
+        fragmented: &Mutex<Fragmented>,
+    ) -> Judged {
         let Some(packet) = packet else {
             self.note_drop("not a packet a link carries", None);
             return Judged::Drop(None);
@@ -377,7 +393,9 @@ fn head(packet: &[u8]) -> Option<(Kind, Name)> {
     let (nl, nln) = ndn_tlv::read_varu64(rest.get(ntn..)?).ok()?;
     let start = ntn + nln;
     let value = rest.get(start..start.checked_add(usize::try_from(nl).ok()?)?)?;
-    Name::decode(Bytes::copy_from_slice(value)).ok().map(|name| (kind, name))
+    Name::decode(Bytes::copy_from_slice(value))
+        .ok()
+        .map(|name| (kind, name))
 }
 
 #[cfg(test)]
@@ -425,10 +443,19 @@ mod tests {
             Judged::Drop(None)
         );
         // This side sends answers within the names, never Interests.
-        assert_eq!(s.sending(&ndn_packet::lp::encode_lp_packet(&data("/home/CA/NEW", 10))), Judged::Pass);
-        assert!(matches!(s.sending(&ndn_packet::lp::encode_lp_packet(&interest("/home/CA/x"))), Judged::Drop(Some(_))));
         assert_eq!(
-            s.sending(&ndn_packet::lp::encode_lp_packet(&data("/home/member/x", 10))),
+            s.sending(&ndn_packet::lp::encode_lp_packet(&data("/home/CA/NEW", 10))),
+            Judged::Pass
+        );
+        assert!(matches!(
+            s.sending(&ndn_packet::lp::encode_lp_packet(&interest("/home/CA/x"))),
+            Judged::Drop(Some(_))
+        ));
+        assert_eq!(
+            s.sending(&ndn_packet::lp::encode_lp_packet(&data(
+                "/home/member/x",
+                10
+            ))),
             Judged::Drop(None)
         );
     }
@@ -437,13 +464,20 @@ mod tests {
     fn fragments_follow_their_first_fragment() {
         let s = scope(Carries::Answers, Carries::Interests);
         for (name, carried) in [("/home/CA/big", true), ("/elsewhere/big", false)] {
-            let frames = ndn_packet::fragment::fragment_packet(&data(name, 5000), 1200, if carried { 100 } else { 200 });
+            let frames = ndn_packet::fragment::fragment_packet(
+                &data(name, 5000),
+                1200,
+                if carried { 100 } else { 200 },
+            );
             assert!(frames.len() > 1);
             for frame in &frames {
                 let judged = s.received(&frame.clone());
                 assert_eq!(judged == Judged::Pass, carried, "{name}");
                 // Keep the rate bucket out of the way.
-                s.bucket.lock().unwrap_or_else(PoisonError::into_inner).tokens = 4.0;
+                s.bucket
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .tokens = 4.0;
             }
         }
         // A later fragment whose first fragment was never seen is dropped.
@@ -459,27 +493,43 @@ mod tests {
             assert_eq!(s.received(&ack_only), Judged::Pass);
         }
         let inside = ndn_packet::lp::encode_lp_packet(&interest("/home/CA/STATUS"));
-        let passed = (0..10).filter(|_| s.received(&inside) == Judged::Pass).count();
-        assert_eq!(passed, 4, "the whole burst is still there for the peer's Interests");
+        let passed = (0..10)
+            .filter(|_| s.received(&inside) == Judged::Pass)
+            .count();
+        assert_eq!(
+            passed, 4,
+            "the whole burst is still there for the peer's Interests"
+        );
     }
 
     #[test]
     fn received_packets_are_rate_limited() {
         let s = scope(Carries::Interests, Carries::Answers);
         let inside = ndn_packet::lp::encode_lp_packet(&interest("/home/CA/STATUS"));
-        let passed = (0..10).filter(|_| s.received(&inside) == Judged::Pass).count();
-        assert_eq!(passed, 4, "the burst, then nothing until the bucket refills");
+        let passed = (0..10)
+            .filter(|_| s.received(&inside) == Judged::Pass)
+            .count();
+        assert_eq!(
+            passed, 4,
+            "the burst, then nothing until the bucket refills"
+        );
     }
 
     #[test]
     fn links_sharing_a_rate_take_no_more_than_it_together() {
-        let shared = Arc::new(SharedRate::new(RateLimit { burst: 6, per_sec: 1 }));
+        let shared = Arc::new(SharedRate::new(RateLimit {
+            burst: 6,
+            per_sec: 1,
+        }));
         let link = || {
             ScopeState::new(LinkScope {
                 receives: Carries::Everything,
                 sends: Carries::Everything,
                 names: Box::new(|_: &Name| true),
-                rate: RateLimit { burst: 4, per_sec: 1 },
+                rate: RateLimit {
+                    burst: 4,
+                    per_sec: 1,
+                },
                 shared: Some(Arc::clone(&shared)),
                 explain: "test".into(),
             })
@@ -491,8 +541,15 @@ mod tests {
         assert_eq!(a.sending(&wire(interest("/any/y"))), Judged::Pass);
         assert_eq!(a.sending(&wire(data("/any/y", 10))), Judged::Pass);
         let inside = wire(interest("/any/z"));
-        let passed = (0..10).filter(|_| a.received(&inside) == Judged::Pass).count()
-            + (0..10).filter(|_| b.received(&inside) == Judged::Pass).count();
-        assert_eq!(passed, 5, "each link within its own burst, both within the shared one");
+        let passed = (0..10)
+            .filter(|_| a.received(&inside) == Judged::Pass)
+            .count()
+            + (0..10)
+                .filter(|_| b.received(&inside) == Judged::Pass)
+                .count();
+        assert_eq!(
+            passed, 5,
+            "each link within its own burst, both within the shared one"
+        );
     }
 }

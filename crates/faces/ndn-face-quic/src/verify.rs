@@ -47,7 +47,10 @@ pub(crate) struct Presented(Mutex<Option<PeerKey>>);
 
 impl Presented {
     pub(crate) fn get(&self) -> Option<PeerKey> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner).clone()
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -71,7 +74,11 @@ impl ServerCertVerifier for ListenerKeyVerifier {
     ) -> Result<ServerCertVerified, Error> {
         let key = check_raw_key(end_entity)?;
         let fingerprint = key.fingerprint();
-        *self.presented.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(key);
+        *self
+            .presented
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(key);
         match self.expected {
             Some(expected) if expected != fingerprint => Err(Error::General(format!(
                 "the device presents key {fingerprint}, not the expected fingerprint {expected}"

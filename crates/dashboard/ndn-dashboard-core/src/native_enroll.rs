@@ -173,7 +173,9 @@ pub fn load_enclave_identity(path: &Path) -> Result<EnclaveIdentity, EnrollError
     }
     let hl = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
     if buf.len() < 4 + hl {
-        return Err(EnrollError::Cert("enclave identity handle truncated".into()));
+        return Err(EnrollError::Cert(
+            "enclave identity handle truncated".into(),
+        ));
     }
     let key_handle = String::from_utf8(buf[4..4 + hl].to_vec())
         .map_err(|_| EnrollError::Cert("enclave key handle is not UTF-8".into()))?;
@@ -242,7 +244,8 @@ mod tests {
                 return Data::decode(Bytes::from(wire))
                     .map_err(|e| proto(format!("decode served cert: {e:?}")));
             };
-            let reply = DataBuilder::new(interest.name.as_ref().clone(), &body).sign_digest_sha256();
+            let reply =
+                DataBuilder::new(interest.name.as_ref().clone(), &body).sign_digest_sha256();
             Data::decode(reply).map_err(|e| proto(format!("decode reply: {e:?}")))
         }
     }

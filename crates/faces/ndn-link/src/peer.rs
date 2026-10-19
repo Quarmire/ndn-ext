@@ -180,7 +180,11 @@ impl Peers {
     /// device uses it as one.
     pub(crate) fn is_relay(&self, id: PeerId) -> bool {
         let slots = self.slots.read();
-        slots.get(id.0).cloned().flatten().is_some_and(|p| p.relay_use.is_some())
+        slots
+            .get(id.0)
+            .cloned()
+            .flatten()
+            .is_some_and(|p| p.relay_use.is_some())
             || slots.iter().flatten().any(|p| p.relay == Some(id))
     }
 
@@ -194,19 +198,28 @@ impl Peers {
     }
 
     /// The peer expecting key `fingerprint`, or naming `device`.
-    pub(crate) fn find(&self, fingerprint: KeyFingerprint, device: Option<&Name>) -> Option<PeerId> {
+    pub(crate) fn find(
+        &self,
+        fingerprint: KeyFingerprint,
+        device: Option<&Name>,
+    ) -> Option<PeerId> {
         self.find_any(fingerprint, device.as_slice())
     }
 
     /// The first peer expecting key `fingerprint`, or naming one of
     /// `devices` (the names a device proved, in each of its namespaces).
-    pub(crate) fn find_any(&self, fingerprint: KeyFingerprint, devices: &[&Name]) -> Option<PeerId> {
+    pub(crate) fn find_any(
+        &self,
+        fingerprint: KeyFingerprint,
+        devices: &[&Name],
+    ) -> Option<PeerId> {
         self.slots
             .read()
             .iter()
             .position(|p| {
                 p.as_ref().is_some_and(|p| {
-                    p.key == Some(fingerprint) || p.device.as_ref().is_some_and(|d| devices.contains(&d))
+                    p.key == Some(fingerprint)
+                        || p.device.as_ref().is_some_and(|d| devices.contains(&d))
                 })
             })
             .map(PeerId)

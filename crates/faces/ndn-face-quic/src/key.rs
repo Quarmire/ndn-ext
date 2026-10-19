@@ -21,8 +21,8 @@ const ED25519_SPKI_PREFIX: [u8; 12] = [
 /// DER prefix of a P-256 SubjectPublicKeyInfo (id-ecPublicKey, prime256v1),
 /// followed by the 65-byte uncompressed point.
 const P256_SPKI_PREFIX: [u8; 26] = [
-    0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08,
-    0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
+    0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a,
+    0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
 ];
 
 /// The key algorithms a link key can use: the two NDN device key types.
@@ -52,7 +52,10 @@ impl LinkKeyAlgorithm {
     /// SubjectPublicKeyInfo of a P-256 key with its uncompressed point.
     /// `None` for any other key.
     pub(crate) fn of_ndn_key(key: &[u8]) -> Option<Self> {
-        if key.len() == 32 || (key.len() == ED25519_SPKI_PREFIX.len() + 32 && key.starts_with(&ED25519_SPKI_PREFIX)) {
+        if key.len() == 32
+            || (key.len() == ED25519_SPKI_PREFIX.len() + 32
+                && key.starts_with(&ED25519_SPKI_PREFIX))
+        {
             Some(Self::Ed25519)
         } else if key.len() == P256_SPKI_PREFIX.len() + 65
             && key.starts_with(&P256_SPKI_PREFIX)
@@ -230,7 +233,10 @@ impl LinkKey {
                         signer.key_name()
                     ))
                 })?;
-                (LinkKeyAlgorithm::Ed25519, ndn_security::spki::wrap_ed25519(&raw))
+                (
+                    LinkKeyAlgorithm::Ed25519,
+                    ndn_security::spki::wrap_ed25519(&raw),
+                )
             }
             SignatureType::SignatureSha256WithEcdsa => (LinkKeyAlgorithm::EcdsaP256, key),
             other => {
@@ -353,7 +359,9 @@ struct TlsSigner {
 
 impl fmt::Debug for TlsSigner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("TlsSigner").field("scheme", &self.scheme).finish()
+        f.debug_struct("TlsSigner")
+            .field("scheme", &self.scheme)
+            .finish()
     }
 }
 

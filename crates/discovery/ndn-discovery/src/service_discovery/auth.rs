@@ -230,7 +230,13 @@ mod tests {
             let wire = sign_data(&format!("/sd/{n}"), b"x", active.as_ref());
             let verdict = verifier.verify(&Data::decode(wire).unwrap());
             assert!(
-                matches!(verdict, VerifyVerdict::Verified { authentic: true, .. }),
+                matches!(
+                    verdict,
+                    VerifyVerdict::Verified {
+                        authentic: true,
+                        ..
+                    }
+                ),
                 "record {n}: {verdict:?}"
             );
         }

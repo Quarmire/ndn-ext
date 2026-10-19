@@ -22,7 +22,8 @@ impl FaceSink for EngineFaces {
     }
 
     fn add_face(&self, face: Face, cancel: CancellationToken) {
-        self.0.add_composed_face(face, cancel, FacePersistency::Persistent);
+        self.0
+            .add_composed_face(face, cancel, FacePersistency::Persistent);
     }
 
     fn remove_face(&self, face: FaceId) {

@@ -137,7 +137,12 @@ pub(crate) struct Interface {
 }
 
 /// This device's interface addresses.
-#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple", target_os = "freebsd"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "freebsd"
+))]
 pub(crate) fn interfaces() -> Vec<Interface> {
     let Ok(addrs) = nix::ifaddrs::getifaddrs() else {
         return Vec::new();
@@ -164,7 +169,12 @@ pub(crate) fn interfaces() -> Vec<Interface> {
 
 /// No interface enumeration on this platform: a socket bound to a
 /// specific address still offers it.
-#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple", target_os = "freebsd")))]
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "freebsd"
+)))]
 pub(crate) fn interfaces() -> Vec<Interface> {
     Vec::new()
 }
@@ -174,11 +184,15 @@ fn on_our_subnet(ours: &[Interface], ip: IpAddr) -> bool {
     let ip = ip.to_canonical();
     ours.iter().any(|i| match (i.addr.to_canonical(), ip) {
         (IpAddr::V4(a), IpAddr::V4(b)) => {
-            let mask = u32::MAX.checked_shl(32 - u32::from(i.prefix.min(32))).unwrap_or(0);
+            let mask = u32::MAX
+                .checked_shl(32 - u32::from(i.prefix.min(32)))
+                .unwrap_or(0);
             u32::from(a) & mask == u32::from(b) & mask
         }
         (IpAddr::V6(a), IpAddr::V6(b)) => {
-            let mask = u128::MAX.checked_shl(128 - u32::from(i.prefix.min(128))).unwrap_or(0);
+            let mask = u128::MAX
+                .checked_shl(128 - u32::from(i.prefix.min(128)))
+                .unwrap_or(0);
             u128::from(a) & mask == u128::from(b) & mask
         }
         _ => false,
@@ -190,7 +204,11 @@ fn on_our_subnet(ours: &[Interface], ip: IpAddr) -> bool {
 /// addresses on one of this device's subnets, then the reflexive, advertised
 /// and mapped ones. Other host addresses (another network's private
 /// addresses) are probed but not dialled. Duplicates once.
-pub(crate) fn dial_order(theirs: &[Candidate], local: SocketAddr, ours: &[Interface]) -> Vec<SocketAddr> {
+pub(crate) fn dial_order(
+    theirs: &[Candidate],
+    local: SocketAddr,
+    ours: &[Interface],
+) -> Vec<SocketAddr> {
     let rank = |c: &Candidate| -> Option<u8> {
         if !reachable_from(local, c.addr) {
             return None;
@@ -203,7 +221,10 @@ pub(crate) fn dial_order(theirs: &[Candidate], local: SocketAddr, ours: &[Interf
             (CandidateKind::Advertised | CandidateKind::Mapped, _) => Some(3),
         }
     };
-    let mut ranked: Vec<(u8, SocketAddr)> = theirs.iter().filter_map(|c| rank(c).map(|r| (r, c.addr))).collect();
+    let mut ranked: Vec<(u8, SocketAddr)> = theirs
+        .iter()
+        .filter_map(|c| rank(c).map(|r| (r, c.addr)))
+        .collect();
     ranked.sort_by_key(|(r, _)| *r);
     let mut out: Vec<SocketAddr> = Vec::new();
     for (_, addr) in ranked {
@@ -271,7 +292,10 @@ mod tests {
         // private addresses included.
         assert_eq!(probe_targets(&theirs, v4).len(), 4);
         let dual: SocketAddr = "[::]:6367".parse().unwrap();
-        assert_eq!(dial_order(&theirs, dual, &ours)[0], "[2001:db8::5]:6367".parse().unwrap());
+        assert_eq!(
+            dial_order(&theirs, dual, &ours)[0],
+            "[2001:db8::5]:6367".parse().unwrap()
+        );
     }
 
     #[test]
@@ -279,7 +303,10 @@ mod tests {
         let bound: SocketAddr = "127.0.0.1:7000".parse().unwrap();
         assert!(HostCandidates::default().candidates(bound).is_empty());
         assert_eq!(
-            HostCandidates { include_local: true }.candidates(bound),
+            HostCandidates {
+                include_local: true
+            }
+            .candidates(bound),
             [c(CandidateKind::Host, "127.0.0.1:7000")]
         );
         let public: SocketAddr = "192.0.2.4:7000".parse().unwrap();

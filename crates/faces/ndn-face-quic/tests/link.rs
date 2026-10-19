@@ -15,9 +15,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use ndn_face_quic::{
-    Admission, Carries, CloseReason, HandshakeLimits, KeyFingerprint, Link, LinkEndpoint, LinkError,
-    LinkHello, LinkKey, LinkScope, LinkTransportConfig, LinkVerdict, Presence, PresentDevice, RateLimit,
-    Reachability,
+    Admission, Carries, CloseReason, HandshakeLimits, KeyFingerprint, Link, LinkEndpoint,
+    LinkError, LinkHello, LinkKey, LinkScope, LinkTransportConfig, LinkVerdict, Presence,
+    PresentDevice, RateLimit, Reachability,
 };
 use ndn_packet::Name;
 use ndn_packet::encode::{DataBuilder, InterestBuilder};
@@ -36,8 +36,11 @@ fn ed_key(seed: u8) -> LinkKey {
 
 fn ec_key(seed: u8) -> LinkKey {
     LinkKey::from_signer(Arc::new(
-        EcdsaP256Signer::from_seed(&[seed; 32], format!("/ns/node/r{seed}/KEY/k").parse().unwrap())
-            .unwrap(),
+        EcdsaP256Signer::from_seed(
+            &[seed; 32],
+            format!("/ns/node/r{seed}/KEY/k").parse().unwrap(),
+        )
+        .unwrap(),
     ))
     .unwrap()
 }
@@ -47,7 +50,13 @@ fn endpoint(key: LinkKey, listen: bool) -> LinkEndpoint {
 }
 
 fn endpoint_with(key: LinkKey, listen: bool, config: LinkTransportConfig) -> LinkEndpoint {
-    LinkEndpoint::bind("127.0.0.1:0".parse().unwrap(), Arc::new(key), &config, listen).unwrap()
+    LinkEndpoint::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(key),
+        &config,
+        listen,
+    )
+    .unwrap()
 }
 
 fn addr(e: &LinkEndpoint) -> SocketAddr {
@@ -126,14 +135,20 @@ async fn a_dial_expecting_another_key_fails_in_the_handshake() {
         incoming.handshake().await.err()
     });
     match dialer.connect(target, Some(wrong)).await {
-        Err(LinkError::UnexpectedKey { expected, presented }) => {
+        Err(LinkError::UnexpectedKey {
+            expected,
+            presented,
+        }) => {
             assert_eq!(expected, wrong);
             assert_eq!(presented, ed_key(2).fingerprint());
         }
         Err(other) => panic!("expected UnexpectedKey, got {other}"),
         Ok(_) => panic!("a dial expecting another key succeeded"),
     }
-    assert!(accept.await.unwrap().is_some(), "the listener saw a link come up");
+    assert!(
+        accept.await.unwrap().is_some(),
+        "the listener saw a link come up"
+    );
 }
 
 #[tokio::test]
@@ -144,7 +159,10 @@ async fn a_refusal_reaches_the_other_side_with_its_reason() {
     let refuse = async {
         let mut hs = listener.accept().await.unwrap().handshake().await.unwrap();
         hs.exchange_hello(&hello(2), T).await.unwrap();
-        hs.refuse(CloseReason::Unrecognized, "not a device of a namespace I hold");
+        hs.refuse(
+            CloseReason::Unrecognized,
+            "not a device of a namespace I hold",
+        );
     };
     // The refusal may overtake the listener's hello: either way the dialer
     // learns the reason.
@@ -177,20 +195,34 @@ async fn a_peer_that_misses_the_message_deadline_is_closed_as_a_protocol_error()
         tokio::time::sleep(Duration::from_millis(600)).await;
         match hs.exchange_hello(&hello(2), T).await {
             Err(e) => e,
-            Ok(_) => hs.admit(FaceId(2), T, Admission::default()).await.err().unwrap(),
+            Ok(_) => hs
+                .admit(FaceId(2), T, Admission::default())
+                .await
+                .err()
+                .unwrap(),
         }
     };
     let dial = async {
         let mut hs = dialer.connect(target, None).await.unwrap();
-        hs.exchange_hello(&hello(1), Duration::from_millis(200)).await.err().unwrap()
+        hs.exchange_hello(&hello(1), Duration::from_millis(200))
+            .await
+            .err()
+            .unwrap()
     };
     let (told, waited) = tokio::join!(slow, dial);
     assert!(matches!(waited, LinkError::Timeout), "{waited:?}");
     match told {
         LinkError::Refused { reason, text } => {
-            assert_eq!(reason, Some(CloseReason::Protocol), "not a shutdown: {text}");
+            assert_eq!(
+                reason,
+                Some(CloseReason::Protocol),
+                "not a shutdown: {text}"
+            );
             assert!(text.contains("no link message"), "{text}");
-            assert!(!told_is_transient(reason), "the slow side does not dial again at once");
+            assert!(
+                !told_is_transient(reason),
+                "the slow side does not dial again at once"
+            );
         }
         other => panic!("expected the dialer's Protocol close, got {other:?}"),
     }
@@ -212,9 +244,21 @@ async fn packets_ride_datagrams_both_ways_and_large_ones_are_fragmented() {
 
     let small = Bytes::from_static(&[0x05, 0x03, 0x07, 0x01, 0x41]);
     a.face.send_bytes(small.clone()).await.unwrap();
-    assert_eq!(tokio::time::timeout(T, b.face.recv_bytes()).await.unwrap().unwrap(), small);
+    assert_eq!(
+        tokio::time::timeout(T, b.face.recv_bytes())
+            .await
+            .unwrap()
+            .unwrap(),
+        small
+    );
     b.face.send_bytes(small.clone()).await.unwrap();
-    assert_eq!(tokio::time::timeout(T, a.face.recv_bytes()).await.unwrap().unwrap(), small);
+    assert_eq!(
+        tokio::time::timeout(T, a.face.recv_bytes())
+            .await
+            .unwrap()
+            .unwrap(),
+        small
+    );
 
     // A 20 KB packet through the face's link service: one NDNLPv2 frame per
     // datagram, each within the link's datagram size, reassembled whole.
@@ -231,10 +275,20 @@ async fn packets_ride_datagrams_both_ways_and_large_ones_are_fragmented() {
 
     let mut reassembly = ndn_packet::fragment::ReassemblyBuffer::new(T);
     let whole = loop {
-        let frame = tokio::time::timeout(T, b.face.recv_bytes()).await.unwrap().unwrap();
-        assert!(frame.len() <= mtu, "a {} B frame over the {mtu} B datagram size", frame.len());
+        let frame = tokio::time::timeout(T, b.face.recv_bytes())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            frame.len() <= mtu,
+            "a {} B frame over the {mtu} B datagram size",
+            frame.len()
+        );
         let lp = ndn_packet::lp::LpPacket::decode(frame).unwrap();
-        assert!(lp.frag_count.unwrap_or(1) > 1, "the large packet was not fragmented");
+        assert!(
+            lp.frag_count.unwrap_or(1) > 1,
+            "the large packet was not fragmented"
+        );
         let (seq, index) = (lp.sequence.unwrap(), lp.frag_index.unwrap());
         if let Some(whole) = reassembly.process(
             0,
@@ -251,7 +305,10 @@ async fn packets_ride_datagrams_both_ways_and_large_ones_are_fragmented() {
 
 /// The next frame `face` delivers.
 async fn recv(face: &ndn_face_quic::LinkFace) -> Bytes {
-    tokio::time::timeout(T, face.recv_bytes()).await.unwrap().unwrap()
+    tokio::time::timeout(T, face.recv_bytes())
+        .await
+        .unwrap()
+        .unwrap()
 }
 
 /// The listener admits the dialer on an enrollment link: Interests under
@@ -269,7 +326,10 @@ async fn an_enrollment_link_carries_only_its_scope_and_says_so() {
             receives: Carries::Interests,
             sends: Carries::Answers,
             names: Box::new(move |n: &Name| n.has_prefix(&ca)),
-            rate: RateLimit { burst: 16, per_sec: 4 },
+            rate: RateLimit {
+                burst: 16,
+                per_sec: 4,
+            },
             shared: None,
             explain: "enrollment only".into(),
         };
@@ -302,31 +362,50 @@ async fn an_enrollment_link_carries_only_its_scope_and_says_so() {
     device.face.send_bytes(lp(outside.clone())).await.unwrap();
     device.face.send_bytes(lp(inside.clone())).await.unwrap();
     let got = ndn_packet::lp::LpPacket::decode(recv(&relay.face).await).unwrap();
-    assert_eq!(got.fragment.unwrap(), inside, "the first packet the relay sees is the one in scope");
+    assert_eq!(
+        got.fragment.unwrap(),
+        inside,
+        "the first packet the relay sees is the one in scope"
+    );
     // The relay's face keeps reading (and Nacking) while the device waits.
     let nack = tokio::select! {
         nack = recv(&device.face) => nack,
         other = relay.face.recv_bytes() => panic!("the relay's forwarder got {other:?}"),
     };
     let nack = ndn_packet::lp::LpPacket::decode(nack).unwrap();
-    assert!(nack.nack.is_some(), "the device got a Nack for the Interest outside the scope");
+    assert!(
+        nack.nack.is_some(),
+        "the device got a Nack for the Interest outside the scope"
+    );
     assert_eq!(nack.fragment.unwrap(), outside);
 
     // The relay answers within the scope; it sends no Interest and no Data
     // outside it (each kept back is Nacked to the relay's own side).
     let interest_out = InterestBuilder::new("/home/CA/x".parse::<Name>().unwrap()).build();
-    relay.face.send_bytes(lp(interest_out.clone())).await.unwrap();
+    relay
+        .face
+        .send_bytes(lp(interest_out.clone()))
+        .await
+        .unwrap();
     let own_nack = ndn_packet::lp::LpPacket::decode(recv(&relay.face).await).unwrap();
     assert_eq!(own_nack.fragment.unwrap(), interest_out);
     relay
         .face
-        .send_bytes(lp(DataBuilder::new("/home/member/tab/note".parse::<Name>().unwrap(), b"x").build()))
+        .send_bytes(lp(DataBuilder::new(
+            "/home/member/tab/note".parse::<Name>().unwrap(),
+            b"x",
+        )
+        .build()))
         .await
         .unwrap();
     let answer = DataBuilder::new("/home/CA/NEW".parse::<Name>().unwrap(), b"ok").build();
     relay.face.send_bytes(lp(answer.clone())).await.unwrap();
     let got = ndn_packet::lp::LpPacket::decode(recv(&device.face).await).unwrap();
-    assert_eq!(got.fragment.unwrap(), answer, "only the answer in scope reached the device");
+    assert_eq!(
+        got.fragment.unwrap(),
+        answer,
+        "only the answer in scope reached the device"
+    );
 }
 
 #[tokio::test]
@@ -350,10 +429,17 @@ async fn attempts_over_the_per_source_limit_are_refused_before_their_handshake()
     let _held = (held.unwrap(), accepted);
 
     let accepting = async {
-        tokio::time::timeout(Duration::from_secs(2), listener.accept()).await.ok().flatten().is_some()
+        tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .ok()
+            .flatten()
+            .is_some()
     };
     let (second_dial, accepted_second) = tokio::join!(second.connect(target, None), accepting);
-    assert!(!accepted_second, "the second attempt from the same address was accepted");
+    assert!(
+        !accepted_second,
+        "the second attempt from the same address was accepted"
+    );
     match second_dial {
         Err(LinkError::Refused { reason, .. }) => assert_eq!(reason, Some(CloseReason::Busy)),
         Err(other) => panic!("expected a refusal, got {other}"),
@@ -373,9 +459,21 @@ async fn a_link_survives_its_dialers_address_change() {
     assert_ne!(before, addr(&dialer));
     let pkt = Bytes::from_static(&[0x05, 0x03, 0x07, 0x01, 0x42]);
     a.face.send_bytes(pkt.clone()).await.unwrap();
-    assert_eq!(tokio::time::timeout(T, b.face.recv_bytes()).await.unwrap().unwrap(), pkt);
+    assert_eq!(
+        tokio::time::timeout(T, b.face.recv_bytes())
+            .await
+            .unwrap()
+            .unwrap(),
+        pkt
+    );
     b.face.send_bytes(pkt.clone()).await.unwrap();
-    assert_eq!(tokio::time::timeout(T, a.face.recv_bytes()).await.unwrap().unwrap(), pkt);
+    assert_eq!(
+        tokio::time::timeout(T, a.face.recv_bytes())
+            .await
+            .unwrap()
+            .unwrap(),
+        pkt
+    );
 }
 
 #[tokio::test]
@@ -393,7 +491,13 @@ async fn a_migrated_links_face_names_the_new_address() {
     assert_ne!(before, after);
     let pkt = Bytes::from_static(&[0x05, 0x03, 0x07, 0x01, 0x42]);
     a.face.send_bytes(pkt.clone()).await.unwrap();
-    assert_eq!(tokio::time::timeout(T, b.face.recv_bytes()).await.unwrap().unwrap(), pkt);
+    assert_eq!(
+        tokio::time::timeout(T, b.face.recv_bytes())
+            .await
+            .unwrap()
+            .unwrap(),
+        pkt
+    );
     until("the listener's face still names the old address", || {
         b.face.remote_uri() == uri(after)
     })
@@ -434,7 +538,10 @@ async fn a_closed_link_tells_why() {
         }
         other => panic!("expected the close reason, got {other}"),
     }
-    assert!(a.face.recv_bytes().await.is_err(), "the face outlived its link");
+    assert!(
+        a.face.recv_bytes().await.is_err(),
+        "the face outlived its link"
+    );
 }
 
 /// Wait until `handle` says the other side sees this one at `want`.
@@ -463,7 +570,13 @@ async fn each_side_tells_the_other_the_address_it_sees_and_again_when_it_changes
         .unwrap();
     let pkt = Bytes::from_static(&[0x05, 0x03, 0x07, 0x01, 0x42]);
     a.face.send_bytes(pkt.clone()).await.unwrap();
-    assert_eq!(tokio::time::timeout(T, b.face.recv_bytes()).await.unwrap().unwrap(), pkt);
+    assert_eq!(
+        tokio::time::timeout(T, b.face.recv_bytes())
+            .await
+            .unwrap()
+            .unwrap(),
+        pkt
+    );
     observed(&a, addr(&dialer), Duration::from_secs(10)).await;
 }
 
@@ -478,14 +591,22 @@ async fn probes_reach_the_punch_that_watches_them_and_never_quic() {
     let from = tokio::time::timeout(T, watch.next()).await.unwrap();
     assert_eq!(from, Some(addr(&a)));
     assert!(
-        tokio::time::timeout(Duration::from_millis(200), unwatched.next()).await.is_err(),
+        tokio::time::timeout(Duration::from_millis(200), unwatched.next())
+            .await
+            .is_err(),
         "a probe of another session was delivered"
     );
     // The same sockets still carry links.
     let (x, y) = link(&a, &b).await;
     let pkt = Bytes::from_static(&[0x05, 0x03, 0x07, 0x01, 0x42]);
     x.face.send_bytes(pkt.clone()).await.unwrap();
-    assert_eq!(tokio::time::timeout(T, y.face.recv_bytes()).await.unwrap().unwrap(), pkt);
+    assert_eq!(
+        tokio::time::timeout(T, y.face.recv_bytes())
+            .await
+            .unwrap()
+            .unwrap(),
+        pkt
+    );
 }
 
 #[tokio::test]
@@ -513,17 +634,29 @@ async fn a_socket_that_does_not_listen_takes_only_the_direct_path_its_punch_expe
         }
     });
     // No punch: nothing answers, not even a refusal.
-    assert!(matches!(peer.connect_direct(target, key).await, Err(LinkError::Connect(_))));
+    assert!(matches!(
+        peer.connect_direct(target, key).await,
+        Err(LinkError::Connect(_))
+    ));
     let window = punched.allow_inbound(&[addr(&peer)]);
     let dialed = peer.connect_direct(target, key).await.unwrap();
     assert_eq!(dialed.peer_key().fingerprint(), key);
     let from = tokio::time::timeout(T, accepted.recv()).await.unwrap();
     assert_eq!(from, Some(ed_key(1).fingerprint()));
     // Another address, while the window is open: nothing answers.
-    assert!(matches!(stranger.connect_direct(target, key).await, Err(LinkError::Connect(_))));
+    assert!(matches!(
+        stranger.connect_direct(target, key).await,
+        Err(LinkError::Connect(_))
+    ));
     drop(window);
-    assert!(matches!(peer.connect_direct(target, key).await, Err(LinkError::Connect(_))));
-    assert!(accepted.try_recv().is_err(), "the socket took a connection no punch expected");
+    assert!(matches!(
+        peer.connect_direct(target, key).await,
+        Err(LinkError::Connect(_))
+    ));
+    assert!(
+        accepted.try_recv().is_err(),
+        "the socket took a connection no punch expected"
+    );
 }
 
 #[tokio::test]
@@ -560,14 +693,24 @@ async fn the_peers_latest_reachability_replaces_the_earlier() {
         wake_token: Some(Bytes::from_static(b"push-token-1")),
     };
     device.handle.send_reachability(&first);
-    until("the relay heard the reachability", || relay.handle.peer_reachability() == Some(first.clone())).await;
+    until("the relay heard the reachability", || {
+        relay.handle.peer_reachability() == Some(first.clone())
+    })
+    .await;
     let newer = Reachability {
         hold: false,
         wake_token: None,
     };
     device.handle.send_reachability(&newer);
-    until("the newer reachability replaced it", || relay.handle.peer_reachability() == Some(newer.clone())).await;
-    assert_eq!(device.handle.peer_reachability(), None, "only the device told");
+    until("the newer reachability replaced it", || {
+        relay.handle.peer_reachability() == Some(newer.clone())
+    })
+    .await;
+    assert_eq!(
+        device.handle.peer_reachability(),
+        None,
+        "only the device told"
+    );
 }
 
 #[tokio::test]
@@ -591,18 +734,30 @@ async fn presence_reaches_the_peer_and_replaces_per_namespace() {
     let wait = |want: Vec<Presence>| {
         let mut seen = seen.clone();
         async move {
-            tokio::time::timeout(T, seen.wait_for(|p| *p == want)).await.unwrap().unwrap();
+            tokio::time::timeout(T, seen.wait_for(|p| *p == want))
+                .await
+                .unwrap()
+                .unwrap();
         }
     };
     wait(vec![home.clone(), work.clone()]).await;
     // A newer list for /home replaces it; /work stays.
-    let home2 = presence("/home", vec![present("/home/member/phone", 1), present("/home/member/tab", 3)]);
+    let home2 = presence(
+        "/home",
+        vec![
+            present("/home/member/phone", 1),
+            present("/home/member/tab", 3),
+        ],
+    );
     relay.handle.send_presence(&home2);
     wait(vec![home2, work.clone()]).await;
     // An empty list: no device of /home is there any more.
     relay.handle.send_presence(&presence("/home", Vec::new()));
     wait(vec![work]).await;
-    assert!(relay.handle.presence().borrow().is_empty(), "only the relay told");
+    assert!(
+        relay.handle.presence().borrow().is_empty(),
+        "only the relay told"
+    );
 }
 
 #[tokio::test]
@@ -618,7 +773,11 @@ async fn datagrams_count_ndn_traffic_and_not_keep_alives() {
     let (a0, b0) = (a.handle.datagrams(), b.handle.datagrams());
     // Several keep-alive intervals with no NDN traffic.
     tokio::time::sleep(Duration::from_millis(600)).await;
-    assert_eq!((a.handle.datagrams(), b.handle.datagrams()), (a0, b0), "keep-alives are not counted");
+    assert_eq!(
+        (a.handle.datagrams(), b.handle.datagrams()),
+        (a0, b0),
+        "keep-alives are not counted"
+    );
     let pkt = Bytes::from_static(&[0x05, 0x03, 0x07, 0x01, 0x44]);
     a.face.send_bytes(pkt.clone()).await.unwrap();
     assert_eq!(recv(&b.face).await, pkt);
