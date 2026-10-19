@@ -489,10 +489,9 @@ impl Links {
                 Vec::new(),
             )
         } else {
-            let memberships = match self.key.current() {
-                Ok(key) => own_memberships(self.trust.as_ref(), &key, &channel, None).await,
-                Err(_) => Vec::new(),
-            };
+            // Bound to the key this connection's handshake presented, not
+            // one the device switched to since.
+            let memberships = own_memberships(self.trust.as_ref(), hs.local_key(), &channel, None).await;
             (
                 LinkHello {
                     certificates: hello_chain(self.trust.as_ref()),

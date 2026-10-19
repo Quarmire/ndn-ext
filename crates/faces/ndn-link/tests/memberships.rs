@@ -120,13 +120,21 @@ async fn namespace(name: &str, seed: u8) -> Namespace {
 impl Namespace {
     /// Its trust context, as a device holding it has it.
     fn context(&self) -> Arc<SignedTrustContext> {
+        self.context_revoking(1, None)
+    }
+
+    /// Its trust context at `version`, revoking `revoked` when given.
+    fn context_revoking(&self, version: u64, revoked: Option<&str>) -> Arc<SignedTrustContext> {
         let schema = ndn_cert::namespace_schema(&self.name).unwrap();
-        let ctx = SignedTrustContext::hierarchical(self.name.clone())
+        let mut ctx = SignedTrustContext::hierarchical(self.name.clone())
             .with_schema_blobs(schema.blobs())
             .unwrap()
             .schema_authoritative()
             .with_ca_endpoint(self.name.clone().append("CA"))
-            .with_version(1);
+            .with_version(version);
+        if let Some(name) = revoked {
+            ctx = ctx.with_revocation(n(name));
+        }
         let root = Certificate::decode(&Data::decode(self.root.clone()).unwrap()).unwrap();
         assert!(ctx.add_anchor(root));
         Arc::new(ctx)
@@ -614,5 +622,40 @@ async fn hellos_without_memberships_and_listeners_without_them_still_link() {
         at_phone.live.lock().len() == 1
     })
     .await;
+    cancel.cancel();
+}
+
+/// A relay of A and C admits the device by both its A link key and its C
+/// membership. Revoking its C key while it is linked takes C from the link
+/// (its C route goes) and keeps the link up by A; revoking its A key then
+/// leaves it no identity, and the link is closed.
+#[tokio::test]
+async fn revoking_one_membership_keeps_the_link_by_another_and_the_last_closes_it() {
+    let cancel = CancellationToken::new();
+    let (a, c) = (namespace("/a", 10).await, namespace("/c", 30).await);
+    let relay_c = c.device("node", "relay", 90).await;
+    let relay_a = a.device("node", "relay", 91).await;
+    let trust = Trust::new(&[&a, &c], relay_c.chain.clone(), vec![relay_a.membership(&a)]);
+    let keyring = Arc::clone(&trust.keyring);
+    let (_relay, at_relay, addr) = start(relay_c.link_key(), trust, Vec::new(), true, &cancel);
+    let phone = phone(&a, &c).await;
+    let (_phone, at_phone, _) = start(
+        phone.a.link_key(),
+        Trust::new(&[&a, &c], phone.a.chain.clone(), vec![phone.c.membership(&c)]),
+        vec![relay_peer("/c/node/relay", addr)],
+        false,
+        &cancel,
+    );
+    until("the relay routes both of the phone's names", || at_relay.routed().len() == 2).await;
+    let mut routed = at_relay.routed();
+    routed.sort();
+    assert_eq!(routed, [n("/a/member/phone"), n("/c/member/phone")]);
+
+    assert!(keyring.adopt(c.context_revoking(2, Some("/c/member/phone/KEY/k"))));
+    until("the C route goes", || at_relay.routed() == [n("/a/member/phone")]).await;
+    assert_eq!(at_relay.live.lock().len(), 1, "the link stays, admitted by A");
+
+    assert!(keyring.adopt(a.context_revoking(2, Some("/a/member/phone/KEY/k"))));
+    until("the link closes", || at_relay.live.lock().is_empty() && at_phone.live.lock().is_empty()).await;
     cancel.cancel();
 }
