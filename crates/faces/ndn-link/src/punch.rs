@@ -23,13 +23,15 @@
 //! An unrecognized TLV-TYPE that is even and above 31 is skipped; any other
 //! is malformed.
 
+use std::sync::Arc;
+
 use bytes::Bytes;
 use ndn_face_quic::{
     ChannelBinding, LinkKey, MEMBERSHIP, Membership, PathSession, PeerKey, decode_udp_address, encode_udp_address,
 };
 use ndn_packet::encode::{DataBuilder, InterestBuilder};
 use ndn_packet::{Data, Interest, Name, NameComponent};
-use ndn_security::{VerifyOutcome, verify_by_sig_type};
+use ndn_security::{Certificate, Signer, VerifyOutcome, verify_by_sig_type};
 use ndn_tlv::{TlvWriter, read_varu64};
 use sha2::{Digest, Sha256};
 
@@ -225,41 +227,82 @@ pub(crate) fn session_of(device: &Name, name: &Name) -> Option<PathSession> {
     }
 }
 
-/// The key locator a device signs punch messages with: its certificate's
-/// name, else its key's.
-pub(crate) fn locator(key: &LinkKey, own_chain: &[Bytes]) -> Name {
-    own_chain
-        .first()
-        .and_then(|wire| Data::decode(wire.clone()).ok())
-        .map(|data| (*data.name).clone())
-        .unwrap_or_else(|| key.key_name().clone())
+/// The key a punch message is signed with and the KeyLocator it names:
+/// the key of the membership it shows (its certificate's name), when it
+/// shows one — the punch is named under the namespace of that membership,
+/// whose forwarders validate it there — else the link key, with its
+/// certificate's name (else its key's).
+pub(crate) fn punch_signer(
+    key: &LinkKey,
+    own_chain: &[Bytes],
+    membership: Option<(&Arc<dyn Signer>, &Membership)>,
+) -> (Arc<dyn Signer>, Name) {
+    let name_of = |certificates: &[Bytes]| {
+        certificates
+            .first()
+            .and_then(|wire| Data::decode(wire.clone()).ok())
+            .map(|data| (*data.name).clone())
+    };
+    if let Some((signer, m)) = membership
+        && let Some(locator) = name_of(&m.certificates)
+    {
+        return (Arc::clone(signer), locator);
+    }
+    let locator = name_of(own_chain).unwrap_or_else(|| key.key_name().clone());
+    (Arc::clone(key.signer()), locator)
 }
 
 /// The signed punch Interest to `device`.
-pub(crate) fn request(device: &Name, session: &PathSession, msg: &PunchMessage, key: &LinkKey, locator: &Name) -> Bytes {
-    let signer = key.signer().clone();
+pub(crate) async fn request(
+    device: &Name,
+    session: &PathSession,
+    msg: &PunchMessage,
+    signer: &dyn Signer,
+    locator: &Name,
+) -> Bytes {
     InterestBuilder::new(
         punch_prefix(device).append_component(NameComponent::generic(Bytes::copy_from_slice(session))),
     )
     .lifetime(PUNCH_ANSWER_TIMEOUT)
     .must_be_fresh()
     .app_parameters(msg.encode())
-    .sign_sync(signer.sig_type(), Some(locator), |region| {
-        signer.sign_sync(region).unwrap_or_default()
+    .sign(signer.sig_type(), Some(locator), |region| {
+        let region = region.to_vec();
+        async move { signer.sign(&region).await.unwrap_or_default() }
     })
+    .await
 }
 
 /// The signed answer to the punch Interest named `name`.
-pub(crate) fn answer(name: &Name, msg: &PunchMessage, key: &LinkKey, locator: &Name) -> Bytes {
-    let signer = key.signer().clone();
-    DataBuilder::new(name.clone(), &msg.encode()).sign_sync(signer.sig_type(), Some(locator), |region| {
-        signer.sign_sync(region).unwrap_or_default()
-    })
+pub(crate) async fn answer(name: &Name, msg: &PunchMessage, signer: &dyn Signer, locator: &Name) -> Bytes {
+    DataBuilder::new(name.clone(), &msg.encode())
+        .sign(signer.sig_type(), Some(locator), |region| {
+            let region = region.to_vec();
+            async move { signer.sign(&region).await.unwrap_or_default() }
+        })
+        .await
 }
 
-/// Whether `interest` is signed by `key`, with SignatureNonce and
+/// The key a punch message `msg` must be signed by: its membership's
+/// certificate key when it shows one (its binding ties that key to the
+/// link key `key`, checked at admission), else the link key.
+fn signing_key(msg: &PunchMessage, key: &PeerKey) -> Result<Bytes, String> {
+    match msg.memberships.first() {
+        Some(m) => m
+            .certificates
+            .first()
+            .and_then(|wire| Data::decode(wire.clone()).ok())
+            .and_then(|data| Certificate::decode(&data).ok())
+            .map(|cert| cert.public_key)
+            .ok_or_else(|| "its membership certificate does not decode".to_string()),
+        None => Ok(key.ndn_public_key()),
+    }
+}
+
+/// Whether `interest` (carrying `msg`) is signed by the key `msg` names —
+/// its membership's, else the link key `key` — with SignatureNonce and
 /// SignatureTime.
-pub(crate) async fn verify_request(interest: &Interest, key: &PeerKey) -> Result<(), String> {
+pub(crate) async fn verify_request(interest: &Interest, msg: &PunchMessage, key: &PeerKey) -> Result<(), String> {
     let (Some(info), Some(region), Some(value)) = (interest.sig_info(), interest.signed_region(), interest.sig_value())
     else {
         return Err("the punch Interest is not signed".into());
@@ -267,22 +310,22 @@ pub(crate) async fn verify_request(interest: &Interest, key: &PeerKey) -> Result
     if info.sig_nonce.is_none() || info.sig_time.is_none() {
         return Err("the punch Interest lacks SignatureNonce or SignatureTime".into());
     }
-    verified(verify_by_sig_type(info.sig_type, &region, value, &key.ndn_public_key()).await)
+    verified(verify_by_sig_type(info.sig_type, &region, value, &signing_key(msg, key)?).await)
 }
 
-/// Whether `data` is signed by `key`.
-pub(crate) async fn verify_answer(data: &Data, key: &PeerKey) -> Result<(), String> {
+/// Whether `data` (carrying `msg`) is signed by the key `msg` names.
+pub(crate) async fn verify_answer(data: &Data, msg: &PunchMessage, key: &PeerKey) -> Result<(), String> {
     let Some(info) = data.sig_info() else {
         return Err("the punch answer is not signed".into());
     };
-    verified(verify_by_sig_type(info.sig_type, data.signed_region(), data.sig_value(), &key.ndn_public_key()).await)
+    verified(verify_by_sig_type(info.sig_type, data.signed_region(), data.sig_value(), &signing_key(msg, key)?).await)
 }
 
 fn verified(outcome: Result<VerifyOutcome, ndn_security::TrustError>) -> Result<(), String> {
     match outcome {
         Ok(VerifyOutcome::Valid) => Ok(()),
-        Ok(VerifyOutcome::Invalid) => Err("its signature does not verify under the link key it names".into()),
-        Err(e) => Err(format!("its signature cannot be verified under the link key it names: {e}")),
+        Ok(VerifyOutcome::Invalid) => Err("its signature does not verify under the key it names".into()),
+        Err(e) => Err(format!("its signature cannot be verified under the key it names: {e}")),
     }
 }
 
@@ -295,6 +338,40 @@ mod tests {
             kind,
             addr: addr.parse().unwrap(),
         }
+    }
+
+    /// A punch message that shows a membership (the sender's link key is not
+    /// certified in the punch's namespace) is signed by that membership's
+    /// key and names its certificate, so forwarders validating the
+    /// namespace accept it; the receiver verifies it under that key, and one
+    /// signed by the link key instead does not verify.
+    #[tokio::test]
+    async fn a_punch_showing_a_membership_is_signed_by_its_key() {
+        use ndn_security::{Ed25519Signer, encode_cert_data};
+        let link = Arc::new(Ed25519Signer::from_seed(&[1; 32], "/a/member/phone/KEY/k".parse().unwrap()));
+        let link_key = LinkKey::from_signer(Arc::clone(&link) as Arc<dyn Signer>).unwrap();
+        let c_key: Arc<dyn Signer> = Arc::new(Ed25519Signer::from_seed(&[2; 32], "/c/member/phone/KEY/k".parse().unwrap()));
+        let ca = Ed25519Signer::from_seed(&[3; 32], "/c/CA/KEY/ca".parse().unwrap());
+        let cert_name: Name = "/c/member/phone/KEY/k/NDNCERT/v=1".parse().unwrap();
+        let pk: [u8; 32] = c_key.public_key().unwrap().as_ref().try_into().unwrap();
+        let cert = encode_cert_data(&cert_name, &pk, &ca, 0, u64::MAX / 2).await.unwrap();
+        let session = [1; 8];
+        let shown = Membership::sign(c_key.as_ref(), &link_key.fingerprint(), &punch_binding(&session), vec![cert])
+            .await
+            .unwrap();
+        let msg = PunchMessage {
+            key: link_key.spki().clone(),
+            memberships: vec![shown.clone()],
+            ..PunchMessage::default()
+        };
+        let (signer, locator) = punch_signer(&link_key, &[], Some((&c_key, &shown)));
+        assert_eq!(locator, cert_name);
+        let name: Name = "/c/member/phone/32=link/32=punch/x".parse().unwrap();
+        let data = Data::decode(answer(&name, &msg, signer.as_ref(), &locator).await).unwrap();
+        let peer = PeerKey::from_spki(link_key.spki()).unwrap();
+        verify_answer(&data, &msg, &peer).await.unwrap();
+        let by_link = Data::decode(answer(&name, &msg, link.as_ref(), &locator).await).unwrap();
+        assert!(verify_answer(&by_link, &msg, &peer).await.is_err());
     }
 
     #[test]

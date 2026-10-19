@@ -24,9 +24,10 @@ use parking_lot::Mutex;
 use tokio::sync::{Notify, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
-use ndn_face_quic::{CloseReason, KeyFingerprint, LinkEndpoint, LinkHandle, LinkHello, PathSession, PeerKey};
+use bytes::Bytes;
+use ndn_face_quic::{CloseReason, KeyFingerprint, LinkEndpoint, LinkHandle, LinkHello, LinkKey, PathSession, PeerKey};
 use ndn_packet::{Data, Interest, Name};
-use ndn_security::{ReplayCheck, ReplayGuard};
+use ndn_security::{ReplayCheck, ReplayGuard, Signer};
 
 use crate::admission::{Admitted, own_memberships};
 use crate::candidates::{Candidate, CandidateKind, dial_order, interfaces, probe_targets};
@@ -636,7 +637,8 @@ impl Links {
             candidates = ?ours.iter().map(|c| format!("{} {}", c.kind.as_str(), c.addr)).collect::<Vec<_>>(),
             "punching a direct path to {label} ({device})"
         );
-        let wire = punch::request(&device, &session, &request, &key, &punch::locator(&key, &chain));
+        let (signer, locator) = self.punch_signer(&key, &chain, &request, &namespace);
+        let wire = punch::request(&device, &session, &request, signer.as_ref(), &locator).await;
         let data = match self.signal().express(wire, PUNCH_ANSWER_TIMEOUT).await {
             Ok(Answer::Data(data)) => *data,
             Ok(Answer::Nack { why, refused: true }) => {
@@ -687,7 +689,7 @@ impl Links {
         let content = data.content().ok_or_else(|| bad("it carries no content".into()))?;
         let theirs = PunchMessage::decode(content).map_err(bad)?;
         let key = PeerKey::from_spki(&theirs.key).map_err(|e| bad(e.to_string()))?;
-        punch::verify_answer(data, &key).await.map_err(bad)?;
+        punch::verify_answer(data, &theirs, &key).await.map_err(bad)?;
         if target.key.is_some_and(|expected| expected != key.fingerprint()) {
             return Err(bad(format!(
                 "it is signed by key {}, not the key {} its relay listed",
@@ -754,7 +756,7 @@ impl Links {
         };
         // An Interest whose signature does not verify under the key it names
         // could be anyone's: no answer.
-        if punch::verify_request(&interest, &key).await.is_err() {
+        if punch::verify_request(&interest, &theirs, &key).await.is_err() {
             return;
         }
         let fingerprint = key.fingerprint();
@@ -871,8 +873,9 @@ impl Links {
                  its new punch takes this one's place",
             );
         }
+        let (signer, locator) = self.punch_signer(&own_key, &chain, &answer, &to.namespace);
         self.signal()
-            .send(punch::answer(&to.name, &answer, &own_key, &punch::locator(&own_key, &chain)))
+            .send(punch::answer(&to.name, &answer, signer.as_ref(), &locator).await)
             .await;
         // The device as known in the namespace it punched this one in.
         let device = admitted
@@ -1081,9 +1084,26 @@ impl Links {
             )
             .await,
         };
+        let (signer, locator) = self.punch_signer(&key, &chain, &msg, &to.namespace);
         self.signal()
-            .send(punch::answer(&to.name, &msg, &key, &punch::locator(&key, &chain)))
+            .send(punch::answer(&to.name, &msg, signer.as_ref(), &locator).await)
             .await;
+    }
+
+    /// The key a punch message `msg` in `namespace` is signed with, and its
+    /// KeyLocator: when it shows this device's membership of the namespace
+    /// (its link key is not certified there), that membership's key —
+    /// forwarders on the way validate the punch, named under the
+    /// namespace, there — else the link key `key`.
+    fn punch_signer(&self, key: &LinkKey, chain: &[Bytes], msg: &PunchMessage, namespace: &Name) -> (Arc<dyn Signer>, Name) {
+        let own = msg.memberships.first().and_then(|shown| {
+            self.trust
+                .own_memberships()
+                .into_iter()
+                .find(|m| &m.namespace == namespace)
+                .map(|m| (m.signer, shown))
+        });
+        punch::punch_signer(key, chain, own.as_ref().map(|(s, m)| (s, *m)))
     }
 
     /// Probe the other device's candidates `theirs` from `socket`, and dial
