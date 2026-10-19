@@ -13,7 +13,7 @@ use tracing::trace;
 use ndn_transport::{FaceError, FaceId, FaceKind, Transport, ip_face_uri};
 
 use crate::endpoint::Permit;
-use crate::key::{KeyFingerprint, PeerKey};
+use crate::key::{KeyFingerprint, LinkKey, PeerKey};
 use crate::membership::{ChannelBinding, MEMBERSHIP_EXPORTER_LABEL};
 use crate::message::{
     CloseReason, LINK_HELLO, LINK_VERDICT, LinkHello, LinkVerdict, MAX_MESSAGE, OBSERVED_ADDRESS, PRESENCE,
@@ -115,6 +115,8 @@ pub struct Handshaken {
     /// side's, and changes when the endpoint is rebound.
     endpoint: quinn::Endpoint,
     control: Option<(quinn::SendStream, quinn::RecvStream)>,
+    /// The key this side presented in the handshake.
+    local: LinkKey,
 }
 
 impl Handshaken {
@@ -123,6 +125,7 @@ impl Handshaken {
         direction: Direction,
         permit: Option<Permit>,
         endpoint: quinn::Endpoint,
+        local: LinkKey,
     ) -> Result<Self, LinkError> {
         let peer = connection
             .peer_identity()
@@ -137,11 +140,19 @@ impl Handshaken {
             permit,
             endpoint,
             control: None,
+            local,
         })
     }
 
     pub fn peer_key(&self) -> &PeerKey {
         &self.peer
+    }
+
+    /// The key this side presented in the handshake: the link key the
+    /// memberships of this side's hello are bound to (a key the device
+    /// switched to since applies to its next connection).
+    pub fn local_key(&self) -> &LinkKey {
+        &self.local
     }
 
     pub fn direction(&self) -> Direction {

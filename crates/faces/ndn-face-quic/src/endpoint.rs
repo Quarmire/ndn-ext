@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use rustls::crypto::CryptoProvider;
 use sha2::{Digest, Sha256};
 
-use crate::key::{KeyFingerprint, LinkKeySource};
+use crate::key::{KeyFingerprint, LinkKey, LinkKeySource};
 use crate::link::{Direction, Handshaken, LinkError};
 use crate::message::{CloseReason, PathSession};
 use crate::probe::{ProbeSocket, ProbeTap, ProbeWatch};
@@ -397,7 +397,10 @@ impl LinkEndpoint {
         transport: Arc<quinn::TransportConfig>,
     ) -> Result<Handshaken, LinkError> {
         let presented = Arc::new(Presented::default());
-        let config = self.client_config(expected, Arc::clone(&presented), transport)?;
+        // The key this connection presents, fixed for its handshake: the
+        // memberships its hello shows are bound to it.
+        let key = self.key.current().map_err(|e| LinkError::NoLinkKey(e.to_string()))?;
+        let config = self.client_config(expected, Arc::clone(&presented), transport, &key)?;
         let connecting = self
             .endpoint
             .connect_with(config, addr, SERVER_NAME)
@@ -422,7 +425,7 @@ impl LinkEndpoint {
                 });
             }
         };
-        Handshaken::new(connection, Direction::Dialed, None, self.endpoint.clone())
+        Handshaken::new(connection, Direction::Dialed, None, self.endpoint.clone(), key)
     }
 
     /// Send the probe of a punch's `session` to `to` from this socket.
@@ -493,14 +496,31 @@ impl LinkEndpoint {
             }
             match self.gate.admit(remote.ip()) {
                 Ok(permit) => {
-                    return Some(Incoming {
-                        incoming,
-                        permit,
-                        endpoint: self.endpoint.clone(),
-                        // A punch expects it: the connection is kept alive
-                        // as a direct path.
-                        server: punched.then(|| Arc::new(self.direct_server.clone())),
-                    });
+                    // The key this connection presents, fixed for its
+                    // handshake: the memberships its hello shows are bound
+                    // to it. A punch expects it: the connection is kept
+                    // alive as a direct path.
+                    let transport = if punched { &self.direct_transport } else { &self.transport };
+                    let fixed = self
+                        .key
+                        .current()
+                        .map_err(|e| LinkError::NoLinkKey(e.to_string()))
+                        .and_then(|key| Ok((server_config(Arc::new(key.clone()), Arc::clone(transport))?, key)));
+                    match fixed {
+                        Ok((server, key)) => {
+                            return Some(Incoming {
+                                incoming,
+                                permit,
+                                endpoint: self.endpoint.clone(),
+                                server: Arc::new(server),
+                                key,
+                            });
+                        }
+                        Err(e) => {
+                            tracing::warn!(target: "face.quic", source = %remote, error = %e, "cannot take a link");
+                            incoming.refuse();
+                        }
+                    }
                 }
                 Err(why) => {
                     tracing::info!(
@@ -541,6 +561,7 @@ impl LinkEndpoint {
         expected: Option<KeyFingerprint>,
         presented: Arc<Presented>,
         transport: Arc<quinn::TransportConfig>,
+        key: &LinkKey,
     ) -> Result<quinn::ClientConfig, LinkError> {
         let provider = provider();
         let mut tls = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
@@ -552,7 +573,7 @@ impl LinkEndpoint {
                 presented,
                 provider,
             }))
-            .with_client_cert_resolver(Arc::new(KeyResolver(Arc::clone(&self.key))));
+            .with_client_cert_resolver(Arc::new(KeyResolver(Arc::new(key.clone()))));
         tls.alpn_protocols = vec![ALPN_LINK.to_vec()];
         tls.enable_sni = false;
         // Every link proves its key with a full handshake.
@@ -603,7 +624,9 @@ pub struct Incoming {
     incoming: quinn::Incoming,
     permit: Permit,
     endpoint: quinn::Endpoint,
-    server: Option<Arc<quinn::ServerConfig>>,
+    server: Arc<quinn::ServerConfig>,
+    /// The key this connection presents.
+    key: LinkKey,
 }
 
 impl Incoming {
@@ -613,14 +636,11 @@ impl Incoming {
 
     /// Complete the handshake.
     pub async fn handshake(self) -> Result<Handshaken, LinkError> {
-        let accepted = match self.server {
-            Some(server) => self.incoming.accept_with(server),
-            None => self.incoming.accept(),
-        };
+        let accepted = self.incoming.accept_with(self.server);
         let connecting = accepted.map_err(LinkError::from_connection)?;
         match connecting.await {
             Ok(connection) => {
-                Handshaken::new(connection, Direction::Accepted, Some(self.permit), self.endpoint)
+                Handshaken::new(connection, Direction::Accepted, Some(self.permit), self.endpoint, self.key)
             }
             Err(e) => {
                 self.permit.refused();
