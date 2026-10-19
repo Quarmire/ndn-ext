@@ -102,7 +102,7 @@ impl NlsrConfig {
 
 impl Default for NlsrConfig {
     fn default() -> Self {
-        let network: Name = "/ndn".parse().unwrap_or_else(|_| Name::root());
+        let network = ndn_packet::name!("/ndn");
         let lsa_prefix = Self::default_lsa_prefix(&network);
         let sync_prefix = Self::default_sync_prefix(&network);
         Self {

@@ -19,7 +19,7 @@ use ndn_app::Consumer;
 use ndn_compute::{ComputeClient, ComputeContext, ComputeError, ComputeService};
 use ndn_engine::{EngineBuilder, EngineConfig, ForwarderEngine, ShutdownHandle};
 use ndn_face_local::InProcFace;
-use ndn_packet::Name;
+use ndn_packet::{Name, name};
 
 /// Build an embedded engine with `n` in-process consumer faces. Returns the
 /// engine, its shutdown handle, and one `Consumer` per face.
@@ -357,7 +357,7 @@ async fn function_ref_pulls_parameter_by_reference() {
     // /compute/sum takes a parameter *name*, fetches it, and sums its bytes.
     let service = ComputeService::attach(&engine);
     service.function_ref(
-        "/compute/sum",
+        name!("/compute/sum"),
         |name: String, ctx: ComputeContext| async move {
             let pname: Name = name
                 .parse()
@@ -369,7 +369,7 @@ async fn function_ref_pulls_parameter_by_reference() {
 
     let mut client = ComputeClient::new(Consumer::from_handle(chandle));
     let sum: u64 = client
-        .call::<String, u64>("/compute/sum", "/data/blob".to_string())
+        .call::<String, u64>(name!("/compute/sum"), "/data/blob".to_string())
         .await
         .expect("function_ref call");
     assert_eq!(sum, 10);
@@ -399,14 +399,14 @@ async fn reflexive_function_end_to_end() {
 
     // Node: a reflexive function that sums the bytes it pulls from the consumer.
     let service = ComputeService::attach(&engine);
-    service.function_reflexive("/svc/sum", |params: Bytes| async move {
+    service.function_reflexive(name!("/svc/sum"), |params: Bytes| async move {
         Ok::<u64, ComputeError>(params.iter().map(|&b| b as u64).sum())
     });
 
     // Consumer C sends I1 = /svc/sum/<unique> with a reflexive name R, no params
     // in the name.
     let r = random_reflexive_name();
-    let i1 = InterestBuilder::new("/svc/sum/req-1")
+    let i1 = InterestBuilder::new(name!("/svc/sum/req-1"))
         .reflexive_name(r)
         .lifetime(Duration::from_secs(4))
         .build();
@@ -490,14 +490,14 @@ async fn reflexive_authenticated_validates_and_computes() {
     validator.cert_cache().insert(d2_cert);
     let validator = Arc::new(validator);
     service.function_reflexive_authenticated(
-        "/svc/auth",
+        name!("/svc/auth"),
         validator,
         |params: Bytes, _signer| async move {
             Ok::<u64, ComputeError>(params.iter().map(|&b| b as u64).sum())
         },
     );
 
-    let i1 = InterestBuilder::new("/svc/auth/req-1")
+    let i1 = InterestBuilder::new(name!("/svc/auth/req-1"))
         .reflexive_name(random_reflexive_name())
         .lifetime(Duration::from_secs(4))
         .build();
@@ -555,14 +555,14 @@ async fn reflexive_authenticated_rejects_unsigned() {
     let service = ComputeService::attach(&engine);
     let validator = Arc::new(Validator::new(TrustSchema::accept_all()));
     service.function_reflexive_authenticated(
-        "/svc/auth",
+        name!("/svc/auth"),
         validator,
         |params: Bytes, _signer| async move {
             Ok::<u64, ComputeError>(params.iter().map(|&b| b as u64).sum())
         },
     );
 
-    let i1 = InterestBuilder::new("/svc/auth/req-2")
+    let i1 = InterestBuilder::new(name!("/svc/auth/req-2"))
         .reflexive_name(random_reflexive_name())
         .lifetime(Duration::from_secs(2))
         .build();
@@ -616,11 +616,11 @@ async fn reflexive_sealed_end_to_end() {
     let (engine, shutdown) = builder.build().await.expect("engine build");
 
     let service = ComputeService::attach(&engine);
-    service.function_reflexive_sealed("/svc/sealed", |params: Bytes| async move {
+    service.function_reflexive_sealed(name!("/svc/sealed"), |params: Bytes| async move {
         Ok::<u64, ComputeError>(params.iter().map(|&b| b as u64).sum())
     });
 
-    let i1 = InterestBuilder::new("/svc/sealed/req-1")
+    let i1 = InterestBuilder::new(name!("/svc/sealed/req-1"))
         .reflexive_name(random_reflexive_name())
         .lifetime(Duration::from_secs(4))
         .build();
@@ -694,14 +694,14 @@ async fn reflexive_secure_validates_decrypts_and_computes() {
     let service = ComputeService::attach(&engine);
     let validator = Arc::new(Validator::new(TrustSchema::accept_all()));
     service.function_reflexive_secure(
-        "/svc/secure",
+        name!("/svc/secure"),
         validator,
         |params: Bytes, _signer| async move {
             Ok::<u64, ComputeError>(params.iter().map(|&b| b as u64).sum())
         },
     );
 
-    let i1 = InterestBuilder::new("/svc/secure/req-1")
+    let i1 = InterestBuilder::new(name!("/svc/secure/req-1"))
         .reflexive_name(random_reflexive_name())
         .lifetime(Duration::from_secs(4))
         .build();
@@ -764,14 +764,14 @@ async fn reflexive_secure_rejects_unsigned_sealed() {
     let service = ComputeService::attach(&engine);
     let validator = Arc::new(Validator::new(TrustSchema::accept_all()));
     service.function_reflexive_secure(
-        "/svc/secure",
+        name!("/svc/secure"),
         validator,
         |params: Bytes, _signer| async move {
             Ok::<u64, ComputeError>(params.iter().map(|&b| b as u64).sum())
         },
     );
 
-    let i1 = InterestBuilder::new("/svc/secure/req-2")
+    let i1 = InterestBuilder::new(name!("/svc/secure/req-2"))
         .reflexive_name(random_reflexive_name())
         .lifetime(Duration::from_secs(2))
         .build();
@@ -888,12 +888,12 @@ async fn reflexive_multi_hop_traverses_intermediate_forwarder() {
 
     // B runs the compute node.
     let service = ComputeService::attach(&engine_b);
-    service.function_reflexive("/svc/compute", |params: Bytes| async move {
+    service.function_reflexive(name!("/svc/compute"), |params: Bytes| async move {
         Ok::<u64, ComputeError>(params.iter().map(|&b| b as u64).sum())
     });
 
     // Consumer (on A) sends I1 with a reflexive name and no in-name params.
-    let i1 = InterestBuilder::new("/svc/compute/req-1")
+    let i1 = InterestBuilder::new(name!("/svc/compute/req-1"))
         .reflexive_name(random_reflexive_name())
         .lifetime(Duration::from_secs(4))
         .build();

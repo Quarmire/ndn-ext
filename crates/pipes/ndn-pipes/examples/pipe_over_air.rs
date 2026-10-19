@@ -102,16 +102,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await?;
             engine.fib().add_nexthop(&root, FaceId(10), 0);
 
+            let namespace_name: Name = namespace.parse()?;
+            let object_name: Name = object.parse()?;
             let mut pc = PipeConsumer::new(Consumer::from_handle(app_handle));
             println!("opening pipe to {namespace} over {iface} (k={k} n={n} mcs={mcs}) …");
             let pipe = pc
                 .open(
-                    namespace.as_str(),
+                    namespace_name,
                     PipeParams::default().with_fec(k, n).with_aead_key(KEY),
                 )
                 .await?;
             println!("pipe up (len={}); fetching {object} …", pipe.pipe_len);
-            let got = pc.fetch(&pipe, object.as_str()).await?;
+            let got = pc.fetch(&pipe, object_name).await?;
             let sum: u64 = got.iter().map(|&b| b as u64).sum();
             println!(
                 "recovered {} bytes (checksum {sum}); tearing down",

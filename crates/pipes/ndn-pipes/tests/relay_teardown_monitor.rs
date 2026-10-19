@@ -13,7 +13,7 @@ use std::time::Duration;
 use ndn_app::{Consumer, EngineBuilder, Producer};
 use ndn_engine::EngineConfig;
 use ndn_face::local::InProcFace;
-use ndn_packet::Name;
+use ndn_packet::{Name, name};
 use ndn_transport::FaceId;
 
 use ndn_pipes::{
@@ -47,7 +47,7 @@ async fn relay_monitor_pathcontrol_teardown_reaps_producer_and_relay() {
             &Confidentiality::None,
         );
     let registry = producer.registry();
-    let relay = PipeRelay::new(Producer::from_handle(r_h, Name::from("/COMMON")));
+    let relay = PipeRelay::new(Producer::from_handle(r_h, name!("/COMMON")));
     let store = relay.store();
 
     let prod_adapter = Arc::new(PipeTeardownControl::new(registry));

@@ -15,7 +15,7 @@ use ndn_engine::{EngineConfig, ForwarderEngine};
 use ndn_face::local::InProcFace;
 use ndn_mgmt::MgmtResponse;
 use ndn_mgmt::module::{MgmtContext, MgmtModule};
-use ndn_packet::Name;
+use ndn_packet::{Name, name};
 use ndn_transport::FaceId;
 use tokio_util::sync::CancellationToken;
 
@@ -116,7 +116,7 @@ async fn pipes_list_reports_live_pipes() {
     // Open a pipe, then list: it appears with a hex id and a remaining PUI.
     let mut pc = PipeConsumer::new(Consumer::from_handle(consumer_handle));
     let pipe = pc
-        .open("/sensors/temp", PipeParams::default())
+        .open(name!("/sensors/temp"), PipeParams::default())
         .await
         .expect("pipe");
     let listed = module

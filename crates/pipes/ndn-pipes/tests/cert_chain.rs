@@ -11,7 +11,7 @@ use ndn_app::{Consumer, EngineBuilder, Producer};
 use ndn_coding::FecPolicy;
 use ndn_engine::EngineConfig;
 use ndn_face::local::InProcFace;
-use ndn_packet::Name;
+use ndn_packet::{Name, name};
 use ndn_security::{KeyChain, Validator};
 use ndn_transport::FaceId;
 
@@ -46,7 +46,7 @@ async fn open_with(producer_kc: &KeyChain, validator: Arc<Validator>) -> Result<
     let mut pc =
         PipeConsumer::new(Consumer::from_handle(consumer_handle)).with_validator(validator);
     let result = pc
-        .open("/sensors/temp", PipeParams::default())
+        .open(name!("/sensors/temp"), PipeParams::default())
         .await
         .map(|_| ());
 

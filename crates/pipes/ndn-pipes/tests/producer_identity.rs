@@ -7,7 +7,7 @@
 use ndn_app::{Consumer, EngineBuilder, Producer};
 use ndn_engine::EngineConfig;
 use ndn_face::local::InProcFace;
-use ndn_packet::Name;
+use ndn_packet::{Name, name};
 use ndn_transport::FaceId;
 
 use ndn_pipes::{
@@ -29,7 +29,7 @@ async fn open_with(producer_sk: [u8; 32], anchor: [u8; 32]) -> Result<(), PipeEr
     engine.fib().add_nexthop(&root, FaceId(2), 0);
 
     let producer = PipeProducer::new(Producer::from_handle(producer_handle, root))
-        .with_identity(producer_sk, "/pipes/producer/KEY")
+        .with_identity(producer_sk, name!("/pipes/producer/KEY"))
         .serve_object(
             &"/sensors/temp/v=42".parse().unwrap(),
             b"unused",
@@ -43,7 +43,7 @@ async fn open_with(producer_sk: [u8; 32], anchor: [u8; 32]) -> Result<(), PipeEr
     let mut pc =
         PipeConsumer::new(Consumer::from_handle(consumer_handle)).with_trust_anchor(anchor);
     let result = pc
-        .open("/sensors/temp", PipeParams::default())
+        .open(name!("/sensors/temp"), PipeParams::default())
         .await
         .map(|_| ());
 

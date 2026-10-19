@@ -7,7 +7,7 @@ use ndn_app::{Consumer, EngineBuilder, Producer};
 use ndn_coding::FecPolicy;
 use ndn_engine::EngineConfig;
 use ndn_face::local::InProcFace;
-use ndn_packet::Name;
+use ndn_packet::{Name, name};
 use ndn_transport::FaceId;
 
 use ndn_pipes::{Confidentiality, PipeConsumer, PipeError, PipeParams, PipeProducer};
@@ -44,10 +44,10 @@ async fn run(consumer_params: PipeParams) -> (Vec<u8>, Result<Vec<u8>, PipeError
 
     let mut pc = PipeConsumer::new(Consumer::from_handle(consumer_handle));
     let pipe = pc
-        .open("/sensors/temp", consumer_params)
+        .open(name!("/sensors/temp"), consumer_params)
         .await
         .expect("pipe");
-    let got = pc.fetch(&pipe, "/v=42").await.map(|b| b.to_vec());
+    let got = pc.fetch(&pipe, name!("/v=42")).await.map(|b| b.to_vec());
 
     drop(pc);
     drop(engine);

@@ -15,7 +15,7 @@ use std::time::Duration;
 use ndn_app::{Consumer, EngineBuilder, Producer};
 use ndn_engine::EngineConfig;
 use ndn_face::local::InProcFace;
-use ndn_packet::Name;
+use ndn_packet::{Name, name};
 use ndn_transport::FaceId;
 
 use ndn_pipes::{
@@ -34,7 +34,7 @@ async fn pathcontrol_teardown_reaps_relay_state_membership_authed() {
 
     // The relay (holds the per-hop pipe state). Its store backs the PathControl adapter
     // we register on the engine as the teardown authorizer + observer.
-    let relay = PipeRelay::new(Producer::from_handle(r_h, Name::from("/COMMON")));
+    let relay = PipeRelay::new(Producer::from_handle(r_h, name!("/COMMON")));
     let store = relay.store();
     let adapter = Arc::new(PipeTeardownControl::new(store.clone()));
 

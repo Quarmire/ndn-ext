@@ -67,6 +67,7 @@ async fn main() -> Result<()> {
     builder.add_face_composed(radio);
     let (engine, shutdown) = builder.build().await?;
     let cancel = CancellationToken::new();
+    let prefix: Name = PREFIX.parse()?;
 
     match role {
         "producer" => {
@@ -78,7 +79,7 @@ async fn main() -> Result<()> {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(18);
             let payload: bytes::Bytes = (0..size).map(|i| (i & 0xff) as u8).collect();
-            let producer = engine.register_producer(PREFIX, cancel.child_token());
+            let producer = engine.register_producer(prefix, cancel.child_token());
             println!("producer serving {PREFIX}/* — {size}-byte pattern payload");
             producer
                 .serve(move |interest, responder| {
@@ -93,7 +94,7 @@ async fn main() -> Result<()> {
         }
         "consumer" => {
             // Route the prefix out the radio face, then express Interests.
-            engine.fib().add_nexthop(&Name::from(PREFIX), RADIO_FACE, 0);
+            engine.fib().add_nexthop(&prefix, RADIO_FACE, 0);
             let mut consumer = engine.app_consumer(cancel.child_token());
             // Broadcast injection is unacknowledged and lossy, so retry across
             // distinct names (the producer serves the whole prefix) until one
@@ -102,7 +103,7 @@ async fn main() -> Result<()> {
             println!("consumer fetching {PREFIX}/ping/<n> over the radio ({tries} tries)…");
             let mut got = false;
             for i in 0..tries {
-                let name = Name::from(format!("{PREFIX}/ping/{i}").as_str());
+                let name = prefix.clone().append("ping").append(i.to_string());
                 // Short lifetime so a lost Interest fails fast and we retry.
                 let builder = ndn_packet::encode::InterestBuilder::new(name)
                     .lifetime(std::time::Duration::from_millis(700));

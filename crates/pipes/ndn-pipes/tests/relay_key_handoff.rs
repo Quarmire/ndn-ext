@@ -9,7 +9,7 @@ use std::time::Duration;
 use ndn_app::{Consumer, EngineBuilder, Producer};
 use ndn_engine::EngineConfig;
 use ndn_face::local::InProcFace;
-use ndn_packet::Name;
+use ndn_packet::{Name, name};
 use ndn_transport::FaceId;
 
 use ndn_pipes::{
@@ -55,7 +55,7 @@ async fn pipe_exchange_hands_the_key_to_on_path_nodes() {
     // Consumer opens the pipe; it holds the pipe key as `teardown_secret`.
     let mut pc = PipeConsumer::new(Consumer::from_handle(c_h));
     let pipe = pc
-        .open("/sensors/temp", PipeParams::default())
+        .open(name!("/sensors/temp"), PipeParams::default())
         .await
         .expect("pipe opens");
     let pipe_id = pipe.id.as_bytes().to_vec();
@@ -76,7 +76,7 @@ async fn pipe_exchange_hands_the_key_to_on_path_nodes() {
     // (2) A PipeRelay learns + holds the key (membership), so it can authorize a
     // teardown of its own state later (slices 2–3). Its producer face (4) is unused
     // here; learn drives over the `fetcher` consumer.
-    let relay = PipeRelay::new(Producer::from_handle(r_h, Name::from("/COMMON")));
+    let relay = PipeRelay::new(Producer::from_handle(r_h, name!("/COMMON")));
     let learned = relay
         .learn_pipe_key(
             &mut fetcher,

@@ -12,7 +12,7 @@ use std::time::Duration;
 use ndn_app::{Consumer, EngineBuilder, Producer};
 use ndn_engine::EngineConfig;
 use ndn_face::local::InProcFace;
-use ndn_packet::Name;
+use ndn_packet::{Name, name};
 use ndn_transport::FaceId;
 
 use ndn_pipes::{
@@ -41,7 +41,7 @@ async fn active_fetch_renews_a_pipe_then_idle_tears_it_down() {
             &[],
             &Confidentiality::None,
         );
-    let relay = PipeRelay::new(Producer::from_handle(r_h, Name::from("/COMMON")));
+    let relay = PipeRelay::new(Producer::from_handle(r_h, name!("/COMMON")));
     let store = relay.store();
 
     // The relay's teardown adapter (reaps on a membership teardown) + its data-plane
@@ -94,7 +94,10 @@ async fn active_fetch_renews_a_pipe_then_idle_tears_it_down() {
     // past the PUI. Each fetch's interests cross the engine → RelayActivity renews the
     // pipe, so the monitor never finds it idle.
     for _ in 0..6 {
-        let got = pc.fetch(&pipe, "/v=1").await.expect("object fetches");
+        let got = pc
+            .fetch(&pipe, name!("/v=1"))
+            .await
+            .expect("object fetches");
         assert_eq!(got.as_ref(), b"the-bulk-payload");
         tokio::time::sleep(Duration::from_millis(60)).await;
     }

@@ -26,7 +26,7 @@ use ndn_face::l2::get_interface_mac;
 use ndn_face::{NamedEtherFace, RadioFaceMetadata};
 use ndn_face_afxdp::AfXdpFace;
 use ndn_packet::encode::{DataBuilder, InterestBuilder};
-use ndn_packet::{Data, Interest, Name};
+use ndn_packet::{Data, Interest, Name, name};
 use ndn_transport::{FaceId, Transport};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -58,7 +58,7 @@ async fn af_xdp_ether_roundtrip() {
 
     // Consumer on if0: send an Interest (retry — early veth frames can drop),
     // await the Data back over the AF_XDP RX path.
-    let interest = InterestBuilder::new("/afxdp/witness")
+    let interest = InterestBuilder::new(name!("/afxdp/witness"))
         .lifetime(Duration::from_secs(2))
         .build();
     for _ in 0..20 {
@@ -107,7 +107,7 @@ async fn af_packet_tx_reaches_af_xdp_without_gap() {
     )
     .expect("af_packet ether face");
 
-    let interest = InterestBuilder::new("/afpkt/txfix")
+    let interest = InterestBuilder::new(name!("/afpkt/txfix"))
         .lifetime(Duration::from_secs(2))
         .build();
     let sender = tokio::spawn(async move {

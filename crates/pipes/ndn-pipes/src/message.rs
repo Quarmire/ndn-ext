@@ -51,20 +51,27 @@ fn extend(mut n: Name, suffix: &Name) -> Name {
     n
 }
 
+/// One of the prefix constants above as a [`Name`]. They are literals, so a parse
+/// failure is a bug in this file and panics.
+fn prefix(p: &'static str) -> Name {
+    p.parse()
+        .unwrap_or_else(|e| panic!("invalid message prefix {p}: {e}"))
+}
+
 /// `/NPD/SEEK/{namespace}` — the multicast producer search.
 pub fn seek_name(namespace: &Name) -> Name {
-    extend(Name::from(SEEK_PREFIX), namespace)
+    extend(prefix(SEEK_PREFIX), namespace)
 }
 
 /// `/NPD/JOIN/{namespace}/{pipe_id}` — only the consumer (who decrypted the
 /// pipe id) can form this, so only it can JOIN.
 pub fn join_name(namespace: &Name, pipe_id: &[u8]) -> Name {
-    extend(Name::from(JOIN_PREFIX), namespace).append(pipe_id)
+    extend(prefix(JOIN_PREFIX), namespace).append(pipe_id)
 }
 
 /// `/COMMON/{pipe_id}/{hop}/CONTEXT`.
 pub fn context_name(pipe_id: &[u8], hop: u32) -> Name {
-    Name::from(COMMON_PREFIX)
+    prefix(COMMON_PREFIX)
         .append(pipe_id)
         .append(hop.to_string())
         .append("CONTEXT")
@@ -72,7 +79,7 @@ pub fn context_name(pipe_id: &[u8], hop: u32) -> Name {
 
 /// `/COMMON/{pipe_id}/{hop}/LINK`.
 pub fn link_name(pipe_id: &[u8], hop: u32) -> Name {
-    Name::from(COMMON_PREFIX)
+    prefix(COMMON_PREFIX)
         .append(pipe_id)
         .append(hop.to_string())
         .append("LINK")
@@ -80,7 +87,7 @@ pub fn link_name(pipe_id: &[u8], hop: u32) -> Name {
 
 /// `/COMMON/{pipe_id}/{hop}/PIPE`.
 pub fn pipe_name(pipe_id: &[u8], hop: u32) -> Name {
-    Name::from(COMMON_PREFIX)
+    prefix(COMMON_PREFIX)
         .append(pipe_id)
         .append(hop.to_string())
         .append("PIPE")
@@ -184,10 +191,11 @@ pub fn hop_index(global_hop_limit: u8, remaining_hop_limit: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ndn_packet::name;
 
     #[test]
     fn message_names_match_the_thesis_tables() {
-        let ns = Name::from("/sensors/temp");
+        let ns = name!("/sensors/temp");
         let pid = b"\x9a\x12\xff\x03"; // a producer-generated pipe id
 
         assert_eq!(seek_name(&ns).to_string(), "/NPD/SEEK/sensors/temp");
@@ -206,19 +214,16 @@ mod tests {
 
     #[test]
     fn classify_dispatches_each_message() {
+        assert_eq!(classify(&seek_name(&name!("/a"))), Some(MessageKind::Seek));
         assert_eq!(
-            classify(&seek_name(&Name::from("/a"))),
-            Some(MessageKind::Seek)
-        );
-        assert_eq!(
-            classify(&join_name(&Name::from("/a"), b"p")),
+            classify(&join_name(&name!("/a"), b"p")),
             Some(MessageKind::Join)
         );
         assert_eq!(classify(&context_name(b"p", 1)), Some(MessageKind::Context));
         assert_eq!(classify(&link_name(b"p", 1)), Some(MessageKind::Link));
         assert_eq!(classify(&pipe_name(b"p", 1)), Some(MessageKind::Pipe));
         assert_eq!(classify(&check_name(b"p", 3)), Some(MessageKind::Check));
-        assert_eq!(classify(&Name::from("/random/data")), None);
+        assert_eq!(classify(&name!("/random/data")), None);
     }
 
     #[test]

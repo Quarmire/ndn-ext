@@ -14,7 +14,7 @@ use ndn_app::{Consumer, EngineBuilder, Producer};
 use ndn_coding::FecPolicy;
 use ndn_engine::EngineConfig;
 use ndn_face::local::InProcFace;
-use ndn_packet::Name;
+use ndn_packet::{Name, name};
 use ndn_transport::FaceId;
 
 use ndn_pipes::{Confidentiality, PipeConsumer, PipeParams, PipeProducer};
@@ -53,7 +53,10 @@ async fn producer_pushes_coded_bulk_over_the_reflexive_route() {
     // Consumer receives the pushed, sealed, coded bulk and decrypts it.
     let mut pc = PipeConsumer::new(Consumer::from_handle(consumer_handle));
     let got = pc
-        .receive("/sensors/temp", PipeParams::default().with_aead_key(key))
+        .receive(
+            name!("/sensors/temp"),
+            PipeParams::default().with_aead_key(key),
+        )
         .await
         .expect("pushed bulk received");
 

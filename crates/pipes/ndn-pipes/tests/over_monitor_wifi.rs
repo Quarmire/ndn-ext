@@ -16,7 +16,7 @@ use ndn_app::{Consumer, EngineBuilder, Producer};
 use ndn_coding::FecPolicy;
 use ndn_engine::EngineConfig;
 use ndn_face::local::InProcFace;
-use ndn_packet::Name;
+use ndn_packet::{Name, name};
 use ndn_phy_wifi::{LoopbackMonitorBus, WifiPhy};
 use ndn_transport::FaceId;
 
@@ -78,11 +78,14 @@ async fn run(name_group: Option<&'static str>, skip: &'static [u16]) -> (Vec<u8>
 
     let mut pc = PipeConsumer::new(Consumer::from_handle(consumer_handle));
     let pipe = pc
-        .open("/sensors/temp", PipeParams::default().with_aead_key(key))
+        .open(
+            name!("/sensors/temp"),
+            PipeParams::default().with_aead_key(key),
+        )
         .await
         .expect("pipe establishes over the radio");
     let got = pc
-        .fetch(&pipe, "/v=42")
+        .fetch(&pipe, name!("/v=42"))
         .await
         .expect("coded confidential bulk arrives over the radio");
 

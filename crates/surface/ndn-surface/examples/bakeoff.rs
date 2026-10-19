@@ -15,6 +15,7 @@
 use std::time::{Duration, Instant};
 
 use iceoryx2::prelude::*;
+use ndn_packet::Name;
 use ndn_surface::{NamedPublisher, NamedSubscriber};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -91,8 +92,9 @@ async fn bench_socket(frame: usize, n: usize) -> Duration {
 /// SHM ring; the consumer reads it back zero-copy (borrowed). Ring sized for the
 /// frame so the pipeline is deep.
 async fn bench_surface_stream(name: &str, frame: usize, n: usize) -> Duration {
+    let name: Name = name.parse().expect("bench surface name");
     let slot = (frame + 256).max(2048);
-    let mut pubr = NamedPublisher::open_with_max_frame(name, slot)
+    let mut pubr = NamedPublisher::open_with_max_frame(name.clone(), slot)
         .await
         .unwrap();
     let mut sub = NamedSubscriber::connect(name).await.unwrap();
@@ -117,7 +119,8 @@ async fn bench_surface_stream(name: &str, frame: usize, n: usize) -> Duration {
 /// Surface, local (sealed) path: hash-free frames over the sealed ring (data mapped
 /// read-only — forge-proof). Uniform `publish`; for in-host same-trust-domain IPC.
 async fn bench_surface_local(name: &str, frame: usize, n: usize) -> Duration {
-    let mut pubr = NamedPublisher::open_local_with_max_frame(name, frame)
+    let name: Name = name.parse().expect("bench surface name");
+    let mut pubr = NamedPublisher::open_local_with_max_frame(name.clone(), frame)
         .await
         .unwrap();
     let mut sub = NamedSubscriber::connect_local(name).await.unwrap();
@@ -143,7 +146,8 @@ async fn bench_surface_local(name: &str, frame: usize, n: usize) -> Duration {
 /// passed over the side channel; the consumer maps and reads it in place. The
 /// payload never traverses the kernel socket buffer.
 async fn bench_surface_large(name: &str, frame: usize, n: usize) -> Duration {
-    let mut pubr = NamedPublisher::open_large(name).await.unwrap();
+    let name: Name = name.parse().expect("bench surface name");
+    let mut pubr = NamedPublisher::open_large(name.clone()).await.unwrap();
     let mut sub = NamedSubscriber::connect_large(name).await.unwrap();
     let start = Instant::now();
     let prod = tokio::spawn(async move {

@@ -15,7 +15,7 @@ use std::time::Duration;
 use ndn_app::{Consumer, EngineBuilder, Producer};
 use ndn_engine::EngineConfig;
 use ndn_face::local::InProcFace;
-use ndn_packet::Name;
+use ndn_packet::{Name, name};
 use ndn_transport::FaceId;
 
 use ndn_pipes::{Confidentiality, PipeConsumer, PipeParams, PipeProducer, PipeTeardownControl};
@@ -62,7 +62,7 @@ async fn open_pipe(
 
     let mut pc = PipeConsumer::new(Consumer::from_handle(consumer_handle));
     let pipe = pc
-        .open("/sensors/temp", PipeParams::default())
+        .open(name!("/sensors/temp"), PipeParams::default())
         .await
         .expect("pipe establishes");
     (pc, pipe, engine, shutdown, serve)

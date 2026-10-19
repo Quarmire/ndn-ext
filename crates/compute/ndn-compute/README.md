@@ -37,15 +37,16 @@ cross-implementation wire spec (`docs/notes/compute-wire-spec-2026-05-21.md`).
 
 ```rust,ignore
 use ndn_compute::{ComputeService, ComputeClient};
+use ndn_packet::name;
 
 // Attach to a running engine; this allocates the synthetic compute face.
 let compute = ComputeService::attach(&engine);
 
 // A transparent function: result cached, repeat calls coalesce.
-compute.function("/calc/add", |(a, b): (i64, i64)| async move { Ok(a + b) });
+compute.function(name!("/calc/add"), |(a, b): (i64, i64)| async move { Ok(a + b) });
 
 // Consumer side:
-let sum: i64 = ComputeClient::new(consumer).call("/calc/add", (2, 3)).await?;
+let sum: i64 = ComputeClient::new(consumer).call(name!("/calc/add"), (2, 3)).await?;
 assert_eq!(sum, 5);
 ```
 

@@ -317,5 +317,5 @@ fn extend(prefix: &Name, suffix: &Name) -> Name {
 /// namespace) — otherwise the reverse route `/rfx… → consumer` would shadow the
 /// FIB and bounce the consumer's own forward Interests back to itself.
 fn reflexive_name(pipe_id: &PipeId) -> Name {
-    Name::from("/rfx").append(pipe_id.as_bytes())
+    Name::root().append("rfx").append(pipe_id.as_bytes())
 }
