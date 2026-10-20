@@ -120,7 +120,8 @@ impl TrustCtx {
 
 /// Bridge an `ndn_security` signer into an `ndn-sync` [`PublisherSigner`], so a
 /// `SvsPubSub` built with `join_secured` signs every publication with the node's
-/// key (substrate-level publisher authentication). CPU-only signing.
+/// key (substrate-level publisher authentication). Signs asynchronously, so a
+/// remote or enclave-held key works too.
 ///
 /// Note: four-phase **message** trust is enforced in the flow via [`TrustCtx`]
 /// (the faithful NSF `MessageValidator` placement). This substrate signer is the
@@ -132,7 +133,10 @@ pub fn publisher_signer(signer: Arc<dyn Signer>) -> PublisherSigner {
     PublisherSigner {
         sig_type,
         key_locator,
-        sign: Arc::new(move |region| signer.sign_sync(region).expect("CPU-only signer")),
+        sign: Arc::new(move |region| {
+            let signer = Arc::clone(&signer);
+            Box::pin(async move { signer.sign(&region).await.map_err(|e| e.to_string()) })
+        }),
     }
 }
 
