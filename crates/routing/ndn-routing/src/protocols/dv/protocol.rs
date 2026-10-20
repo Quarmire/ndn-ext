@@ -119,8 +119,9 @@ pub struct DvProtocol {
     /// tick emits active and passive Sync instead of waiting out
     /// `adv_sync_interval`.
     adv_changed: Arc<AtomicBool>,
-    /// Set when our own prefix announcements changed: the next tick emits a
-    /// Pfx Sync Interest instead of waiting out `pfx_sync_interval`.
+    /// Set when our own prefix announcements changed, or a Pfx Sync
+    /// Interest brought a newer state to relay: the next tick emits a Pfx
+    /// Sync Interest instead of waiting out `pfx_sync_interval`.
     pfx_changed: Arc<AtomicBool>,
     /// Faces from which we recently received a passive Sync Interest;
     /// our passive Sync is sent back on these. Entries older than
@@ -658,6 +659,8 @@ impl RoutingProtocol for DvProtocol {
         let rib = Arc::clone(&self.rib);
         let prefix_table = Arc::clone(&self.prefix_table);
         let pfx_advance_tx_for_producer = self.pfx_advance_tx.clone();
+        let pfx_advance_tx_for_recompute = self.pfx_advance_tx.clone();
+        let pfx_changed = Arc::clone(&self.pfx_changed);
         let notify_recompute = Arc::clone(&self.notify_recompute);
         let adv_changed = Arc::clone(&self.adv_changed);
         let network = self.config.network.clone();
@@ -722,6 +725,7 @@ impl RoutingProtocol for DvProtocol {
                     pfx_sync,
                     prefix_table,
                     pfx_advance_tx_for_producer,
+                    pfx_changed,
                     cancel,
                 ))
             });
@@ -733,11 +737,13 @@ impl RoutingProtocol for DvProtocol {
             let recompute_task = {
                 let cancel = cancel.child_token();
                 let sync = Arc::clone(&sync);
+                let pfx_sync = Arc::clone(&pfx_sync);
                 let rib = Arc::clone(&rib);
                 let prefix_table = Arc::clone(&prefix_table);
                 let notify_recompute = Arc::clone(&notify_recompute);
                 tokio::spawn(recompute_loop(
                     sync,
+                    pfx_sync,
                     rib,
                     prefix_table,
                     engine_rib,
@@ -745,6 +751,7 @@ impl RoutingProtocol for DvProtocol {
                     network,
                     notify_recompute,
                     adv_changed,
+                    pfx_advance_tx_for_recompute,
                     cancel,
                 ))
             };
@@ -1074,10 +1081,13 @@ async fn dead_neighbor_loop(
 /// ([`DvSync::publish`] advances the seq; `adv_changed` has the next tick
 /// announce it to every neighbour), and recomputes routes via
 /// [`compute_fib_updates`], diffs them against in-task state and applies
-/// the deltas to the engine RIB.
+/// the deltas to the engine RIB. New routes queue again the Prefix Data
+/// fetches not yet applied: a fetch that raced its router's route (it
+/// failed for want of one) is retried once the route exists.
 #[allow(clippy::too_many_arguments)]
 async fn recompute_loop(
     sync: Arc<DvSync>,
+    pfx_sync: Arc<DvPfxSync>,
     rib: Arc<DvRib>,
     prefix_table: Arc<PrefixTable>,
     engine_rib: Arc<ndn_engine::Rib>,
@@ -1085,6 +1095,7 @@ async fn recompute_loop(
     network: Name,
     notify_recompute: Arc<tokio::sync::Notify>,
     adv_changed: Arc<AtomicBool>,
+    pfx_advance_tx: mpsc::UnboundedSender<NeighborAdvance>,
     cancel: CancellationToken,
 ) {
     let mut installed: HashMap<Name, Vec<NextHop>> = HashMap::new();
@@ -1122,6 +1133,11 @@ async fn recompute_loop(
                 );
                 apply_plan(&plan, &engine_rib, &engine_fib);
                 installed = new_installed;
+                if !plan.adds.is_empty() {
+                    for adv in pfx_sync.queue_unfetched() {
+                        let _ = pfx_advance_tx.send(adv);
+                    }
+                }
             }
         }
     }
@@ -1179,7 +1195,7 @@ async fn fetch_and_apply_pfx(
         Err(e) => debug!(
             target: t::ROUTING_DV,
             peer = %adv.name, boot = adv.boot, seq = adv.seq, err = %e,
-            "Pfx Data fetch failed (retried on the next Pfx Sync Interest)",
+            "Pfx Data fetch failed (retried on the next Pfx Sync Interest or new route)",
         ),
     }
 }
@@ -1190,7 +1206,10 @@ async fn fetch_and_apply_pfx(
 /// 1. Adv Data fetch → respond with the published advertisement.
 /// 2. Pfx Data fetch → respond from `PrefixTable`'s snap.
 /// 3. Pfx Sync Interest → decode peer state vector, enqueue advances
-///    for the pfx-fetcher task; no Data response.
+///    for the pfx-fetcher task; no Data response. A state newer than
+///    ours is relayed: `pfx_changed` has the next tick send our Pfx
+///    Sync, carrying it, to every neighbour (Pfx Sync Interests travel
+///    one hop).
 /// 4. Anything else → Nack so the requester fails fast.
 async fn producer_loop(
     handle: InProcHandle,
@@ -1198,6 +1217,7 @@ async fn producer_loop(
     pfx_sync: Arc<DvPfxSync>,
     prefix_table: Arc<PrefixTable>,
     pfx_advance_tx: mpsc::UnboundedSender<NeighborAdvance>,
+    pfx_changed: Arc<AtomicBool>,
     cancel: CancellationToken,
 ) {
     // Producer's prefix is metadata only — the producer answers
@@ -1211,6 +1231,7 @@ async fn producer_loop(
         let pfx_sync = Arc::clone(&pfx_sync);
         let prefix_table = Arc::clone(&prefix_table);
         let pfx_advance_tx = pfx_advance_tx.clone();
+        let pfx_changed = Arc::clone(&pfx_changed);
         let pfx_sync_group = pfx_sync_group.clone();
         async move {
             if let Some(data) = build_adv_data_response(&sync, &interest.name) {
@@ -1231,7 +1252,10 @@ async fn producer_loop(
                     match pfx_sync.process_sync_app_param(app_param) {
                         // Fetch every router whose newest state is not
                         // applied: the advances, and earlier failed fetches.
-                        Ok(_) => {
+                        Ok(advances) => {
+                            if !advances.is_empty() {
+                                pfx_changed.store(true, Ordering::Release);
+                            }
                             for adv in pfx_sync.queue_unfetched() {
                                 let _ = pfx_advance_tx.send(adv);
                             }
@@ -2108,15 +2132,6 @@ mod tests {
         assert!(plan.adds.is_empty());
     }
 
-    #[test]
-    fn notify_is_arc_clonable_into_tasks() {
-        let proto = DvProtocol::new(DvConfig::new(name("/ndn"), name("/r"), 100));
-        let n1 = Arc::clone(&proto.notify_recompute);
-        let n2 = Arc::clone(&proto.notify_recompute);
-        n1.notify_one(); // doesn't panic; multiple clones share the same Notify
-        assert!(Arc::ptr_eq(&n1, &n2));
-    }
-
     /// Liveness is checked every quarter of the dead interval, so a silent
     /// neighbour is dropped within 1.25 × it, however short it is set.
     #[test]
@@ -2130,6 +2145,15 @@ mod tests {
             MAX_DEAD_NEIGHBOR_TICK
         );
         assert_eq!(dead_neighbor_tick(Duration::ZERO), MIN_DEAD_NEIGHBOR_TICK);
+    }
+
+    #[test]
+    fn notify_is_arc_clonable_into_tasks() {
+        let proto = DvProtocol::new(DvConfig::new(name("/ndn"), name("/r"), 100));
+        let n1 = Arc::clone(&proto.notify_recompute);
+        let n2 = Arc::clone(&proto.notify_recompute);
+        n1.notify_one(); // doesn't panic; multiple clones share the same Notify
+        assert!(Arc::ptr_eq(&n1, &n2));
     }
 
     #[test]

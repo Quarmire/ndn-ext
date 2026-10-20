@@ -114,7 +114,6 @@ async fn build_dv_engine(
     produce_face_id: FaceId,
     trust: Option<ndn_routing::protocols::dv::signing::DvTrustHandle>,
 ) -> DvEngine {
-    // Keep dead-interval long so neighbours aren't killed mid-test.
     build_router(
         router_name,
         boot,
@@ -122,13 +121,13 @@ async fn build_dv_engine(
         fetch_face_id,
         produce_face_id,
         trust,
-        Duration::from_secs(60),
+        |_| {},
     )
     .await
 }
 
-/// [`build_dv_engine`] for a router owning every end in `links`, whose
-/// neighbours are dropped after `router_dead_interval` of silence.
+/// [`build_dv_engine`] for a router owning every end in `links`, its
+/// config adjusted by `configure`.
 async fn build_router(
     router_name: &str,
     boot: u64,
@@ -136,7 +135,7 @@ async fn build_router(
     fetch_face_id: FaceId,
     produce_face_id: FaceId,
     trust: Option<ndn_routing::protocols::dv::signing::DvTrustHandle>,
-    router_dead_interval: Duration,
+    configure: impl FnOnce(&mut DvConfig),
 ) -> DvEngine {
     let (fetch_face, fetch_handle) = InProcFace::new(fetch_face_id, 256);
     let (produce_face, produce_handle) = InProcFace::new(produce_face_id, 256);
@@ -145,7 +144,9 @@ async fn build_router(
     // Short intervals so the test converges quickly.
     cfg.adv_sync_interval = Duration::from_millis(100);
     cfg.pfx_sync_interval = Duration::from_millis(100);
-    cfg.router_dead_interval = router_dead_interval;
+    // Keep dead-interval long so neighbours aren't killed mid-test.
+    cfg.router_dead_interval = Duration::from_secs(60);
+    configure(&mut cfg);
 
     let dv = match trust {
         None => DvProtocol::with_io(cfg, fetch_handle, produce_handle, produce_face_id),
@@ -508,10 +509,11 @@ async fn forged_signed_peer_is_rejected_by_static_trust() {
     victim.shutdown.shutdown().await;
 }
 
-/// A line r1 – r2 – r3. r1 learns r3 through r2, two hops away, and routes
-/// r3's registered prefix via r2 at cost 2: r2 re-advertises once it has
-/// learned r3. When the r2–r3 link fails, r2 drops r3 and re-advertises,
-/// and r1 forgets r3 and the prefix's route.
+/// A line r1 – r2 – r3. r1 learns r3 through r2, two hops away: r2
+/// re-advertises once it has learned r3. A prefix r3 then registers, and
+/// its withdrawal, reach r1 within a few ticks although Pfx Sync's period
+/// is a minute: r2 relays a newer Pfx Sync state at once. When the r2–r3
+/// link fails, r2 drops r3 and re-advertises, and r1 forgets r3.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn routes_beyond_a_neighbour_follow_its_advertisements() {
     use ndn_engine::rib::RibRoute;
@@ -520,8 +522,11 @@ async fn routes_beyond_a_neighbour_follow_its_advertisements() {
     let (l12, l21) = MemoryLink::pair(FaceId(1100), FaceId(1200), 256);
     let (l23, l32) = MemoryLink::pair(FaceId(1201), FaceId(1300), 256);
     let cut_23 = Arc::clone(&l23.cut);
-    // Sync goes out at every 1 s tick, so a neighbour silent for 3 s is gone.
-    let dead = Duration::from_secs(3);
+    let configure = |cfg: &mut DvConfig| {
+        cfg.pfx_sync_interval = Duration::from_secs(60);
+        // Sync goes out at every 1 s tick, so a neighbour silent for 3 s is gone.
+        cfg.router_dead_interval = Duration::from_secs(3);
+    };
     let r1 = build_router(
         "/r1",
         1000,
@@ -529,7 +534,7 @@ async fn routes_beyond_a_neighbour_follow_its_advertisements() {
         FaceId(1101),
         FaceId(1102),
         None,
-        dead,
+        configure,
     )
     .await;
     let r2 = build_router(
@@ -539,7 +544,7 @@ async fn routes_beyond_a_neighbour_follow_its_advertisements() {
         FaceId(1202),
         FaceId(1203),
         None,
-        dead,
+        configure,
     )
     .await;
     let r3 = build_router(
@@ -549,7 +554,7 @@ async fn routes_beyond_a_neighbour_follow_its_advertisements() {
         FaceId(1301),
         FaceId(1302),
         None,
-        dead,
+        configure,
     )
     .await;
     seed_neighbor_on(&r1, "/r2", FaceId(1100));
@@ -557,7 +562,19 @@ async fn routes_beyond_a_neighbour_follow_its_advertisements() {
     seed_neighbor_on(&r2, "/r3", FaceId(1201));
     seed_neighbor_on(&r3, "/r2", FaceId(1300));
 
-    // What rib/register does for an app on r3's face 1309.
+    let to_r3 = || r1.dv.rib().best_route(&name("/r3"));
+    let via_r2 = Some(BestRoute {
+        neighbor: name("/r2"),
+        cost: 2,
+    });
+    assert!(
+        eventually(Duration::from_secs(10), || to_r3() == via_r2).await,
+        "r1 should reach r3 via r2 at cost 2, got {:?}",
+        to_r3(),
+    );
+
+    // What rib/register does for an app on r3's face 1309; every router has
+    // sent its first Pfx Sync by now, the next is a minute away.
     let shop = name("/shop");
     let r3_rib = r3.engine.rib();
     r3_rib.add(
@@ -571,28 +588,100 @@ async fn routes_beyond_a_neighbour_follow_its_advertisements() {
         },
     );
     r3_rib.readvertise_announce(&shop, 0);
-
-    let to_r3 = || r1.dv.rib().best_route(&name("/r3"));
-    let via_r2 = Some(BestRoute {
-        neighbor: name("/r2"),
-        cost: 2,
-    });
     assert!(
-        eventually(Duration::from_secs(15), || to_r3() == via_r2
-            && fib_hops(&r1, &shop) == vec![(FaceId(1100), 2)])
+        eventually(Duration::from_secs(10), || fib_hops(&r1, &shop)
+            == vec![(FaceId(1100), 2)])
         .await,
-        "r1 should reach r3 and /shop via r2 at cost 2, got {:?} and {:?}",
-        to_r3(),
+        "r1 should route /shop via r2 at cost 2, got {:?}",
+        fib_hops(&r1, &shop),
+    );
+
+    // The app's face goes down: r3 withdraws /shop, and so does r1.
+    r3_rib.handle_face_down(FaceId(1309), &r3.engine.fib());
+    assert!(
+        eventually(Duration::from_secs(10), || fib_hops(&r1, &shop).is_empty()).await,
+        "r1 should drop /shop once r3 withdraws it, got {:?}",
         fib_hops(&r1, &shop),
     );
 
     cut_23.store(true, Ordering::Relaxed);
     assert!(
-        eventually(Duration::from_secs(30), || to_r3().is_none()
-            && fib_hops(&r1, &shop).is_empty())
-        .await,
-        "r1 should forget r3 and /shop once r2 loses r3, got {:?} and {:?}",
+        eventually(Duration::from_secs(15), || to_r3().is_none()).await,
+        "r1 should forget r3 once r2 loses r3, got {:?}",
         to_r3(),
+    );
+
+    for r in [r1, r2, r3] {
+        r.shutdown.shutdown().await;
+    }
+}
+
+/// A prefix r3 registers while the line r1 – r2 – r3 comes up reaches r1:
+/// r1 hears of r3's Prefix Data (relayed by r2) about when it learns the
+/// route to r3, so its first fetch can go out before that route exists;
+/// it is retried once the route is installed, not at the next Pfx Sync a
+/// minute later.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prefix_fetch_that_raced_its_route_is_retried() {
+    use ndn_engine::rib::RibRoute;
+
+    let (l12, l21) = MemoryLink::pair(FaceId(1400), FaceId(1500), 256);
+    let (l23, l32) = MemoryLink::pair(FaceId(1501), FaceId(1600), 256);
+    let configure = |cfg: &mut DvConfig| cfg.pfx_sync_interval = Duration::from_secs(60);
+    let r1 = build_router(
+        "/r1",
+        1000,
+        vec![l12],
+        FaceId(1401),
+        FaceId(1402),
+        None,
+        configure,
+    )
+    .await;
+    let r2 = build_router(
+        "/r2",
+        2000,
+        vec![l21, l23],
+        FaceId(1502),
+        FaceId(1503),
+        None,
+        configure,
+    )
+    .await;
+    let r3 = build_router(
+        "/r3",
+        3000,
+        vec![l32],
+        FaceId(1601),
+        FaceId(1602),
+        None,
+        configure,
+    )
+    .await;
+
+    let shop = name("/shop");
+    let r3_rib = r3.engine.rib();
+    r3_rib.add(
+        &shop,
+        RibRoute {
+            face_id: FaceId(1609),
+            origin: 0,
+            cost: 0,
+            flags: 0,
+            expires_at: None,
+        },
+    );
+    r3_rib.readvertise_announce(&shop, 0);
+    seed_neighbor_on(&r1, "/r2", FaceId(1400));
+    seed_neighbor_on(&r2, "/r1", FaceId(1500));
+    seed_neighbor_on(&r2, "/r3", FaceId(1501));
+    seed_neighbor_on(&r3, "/r2", FaceId(1600));
+
+    assert!(
+        eventually(Duration::from_secs(10), || fib_hops(&r1, &shop)
+            == vec![(FaceId(1400), 2)])
+        .await,
+        "r1 should route /shop via r2 at cost 2, got {:?}",
         fib_hops(&r1, &shop),
     );
 
