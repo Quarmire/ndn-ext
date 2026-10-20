@@ -9,8 +9,8 @@
 //! for named-Data Adv / Pfx fetch+serve.
 
 use portable_atomic::AtomicU64;
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::Ordering;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -22,7 +22,8 @@ use ndn_discovery::{
 use ndn_engine::observability::targets as t;
 use ndn_engine::rib::RibRoute;
 use ndn_engine::{
-    ConfigError, ConfigUpdate, RoutingHandle, RoutingProtocol, RoutingProtocolStatus,
+    ConfigError, ConfigUpdate, ReadvertiseDestination, ReadvertisedPrefixes, RoutingHandle,
+    RoutingProtocol, RoutingProtocolStatus,
 };
 use ndn_face::local::InProcHandle;
 use ndn_mgmt_wire::control_parameters::origin;
@@ -114,6 +115,9 @@ pub struct DvProtocol {
     last_active_emit: Mutex<Option<Instant>>,
     last_passive_emit: Mutex<Option<Instant>>,
     last_pfx_emit: Mutex<Option<Instant>>,
+    /// Set when our own prefix announcements changed: the next tick emits a
+    /// Pfx Sync Interest instead of waiting out `pfx_sync_interval`.
+    pfx_changed: Arc<AtomicBool>,
     /// Faces from which we recently received a passive Sync Interest;
     /// our passive Sync is sent back on these. Entries older than
     /// `PASSIVE_FACE_TTL` are pruned at emit time. Mirrors ndnd's
@@ -242,6 +246,7 @@ impl DvProtocol {
             last_active_emit: Mutex::new(None),
             last_passive_emit: Mutex::new(None),
             last_pfx_emit: Mutex::new(None),
+            pfx_changed: Arc::new(AtomicBool::new(false)),
             passive_faces: RwLock::new(HashMap::new()),
             advance_tx,
             advance_rx: Mutex::new(Some(advance_rx)),
@@ -480,11 +485,12 @@ impl DiscoveryProtocol for DvProtocol {
         }
 
         let pfx_interval = Duration::from_millis(self.pfx_sync_interval_ms.load(Ordering::Relaxed));
-        let should_send_pfx = self
-            .last_pfx_emit
-            .lock()
-            .expect("DvProtocol::last_pfx_emit poisoned")
-            .is_none_or(|t| now.duration_since(t) >= pfx_interval);
+        let should_send_pfx = self.pfx_changed.swap(false, Ordering::AcqRel)
+            || self
+                .last_pfx_emit
+                .lock()
+                .expect("DvProtocol::last_pfx_emit poisoned")
+                .is_none_or(|t| now.duration_since(t) >= pfx_interval);
         if should_send_pfx {
             self.emit_pfx_sync(&neighbors, ctx);
             *self.last_pfx_emit.lock().unwrap() = Some(now);
@@ -641,6 +647,22 @@ impl RoutingProtocol for DvProtocol {
         let engine_fib = Arc::clone(&handle.fib);
         let dead_interval_ms = Arc::clone(&self.router_dead_interval_ms);
 
+        // Readvertise: prefixes registered locally (rib/register, per the
+        // RIB's readvertise policy) are announced in our prefix table, and
+        // withdrawn when the RIB withdraws them.
+        let readvertised = Arc::new(ReadvertisedPrefixes::new());
+        handle.rib.set_readvertise_destination(
+            self.origin(),
+            Arc::clone(&readvertised) as Arc<dyn ReadvertiseDestination>,
+        );
+        let readvertise_task = tokio::spawn(readvertise_loop(
+            readvertised,
+            Arc::clone(&self.prefix_table),
+            Arc::clone(&self.pfx_sync),
+            Arc::clone(&self.pfx_changed),
+            cancel.child_token(),
+        ));
+
         tokio::spawn(async move {
             info!(target: t::ROUTING_DV, router = %router, "ndn-dv starting");
 
@@ -737,6 +759,7 @@ impl RoutingProtocol for DvProtocol {
             if let Some(t) = dead_neighbor_task {
                 let _ = t.await;
             }
+            let _ = readvertise_task.await;
             info!(target: t::ROUTING_DV, router = %router, "ndn-dv stopped");
         })
         .into()
@@ -814,7 +837,6 @@ async fn fetcher_loop(
     cancel: CancellationToken,
 ) {
     let mut consumer = Consumer::from_handle(handle);
-    let network = pfx_sync.network().clone();
     loop {
         tokio::select! {
             biased;
@@ -823,9 +845,12 @@ async fn fetcher_loop(
                 let Some(adv) = adv else { break };
                 fetch_and_apply_adv(&mut consumer, &adv, &rib, pfx_sync.trust().as_ref(), &notify_recompute).await;
             }
-            adv = pfx_advance_rx.recv() => {
-                let Some(adv) = adv else { break };
-                fetch_and_apply_pfx(&mut consumer, &adv, &network, &prefix_table, pfx_sync.trust().as_ref(), &notify_recompute).await;
+            queued = pfx_advance_rx.recv() => {
+                let Some(queued) = queued else { break };
+                // The router's newest state, unless already applied.
+                if let Some(adv) = pfx_sync.start_fetch(&queued.name) {
+                    fetch_and_apply_pfx(&mut consumer, &adv, &pfx_sync, &prefix_table, &notify_recompute).await;
+                }
             }
         }
     }
@@ -1069,13 +1094,12 @@ async fn fib_updater_loop(
 async fn fetch_and_apply_pfx(
     consumer: &mut Consumer,
     adv: &NeighborAdvance,
-    network: &Name,
+    pfx_sync: &DvPfxSync,
     prefix_table: &PrefixTable,
-    trust: &dyn crate::protocols::dv::signing::DvTrust,
     notify_recompute: &tokio::sync::Notify,
 ) {
-    let target =
-        DvPfxSync::peer_prefix_data_name(network, &adv.name, adv.boot, adv.seq).append_segment(0);
+    let target = DvPfxSync::peer_prefix_data_name(pfx_sync.network(), &adv.name, adv.boot, adv.seq)
+        .append_segment(0);
     trace!(
         target: t::ROUTING_DV,
         peer = %adv.name, boot = adv.boot, seq = adv.seq,
@@ -1083,7 +1107,8 @@ async fn fetch_and_apply_pfx(
     );
     match consumer.fetch(target).await {
         Ok(data) => {
-            if !crate::protocols::dv::signing::validate_inner_data(&data, trust) {
+            if !crate::protocols::dv::signing::validate_inner_data(&data, pfx_sync.trust().as_ref())
+            {
                 warn!(
                     target: t::ROUTING_DV,
                     peer = %adv.name, boot = adv.boot, seq = adv.seq,
@@ -1098,6 +1123,7 @@ async fn fetch_and_apply_pfx(
             match PrefixOpList::decode_content(&content_bytes) {
                 Ok(ops) => {
                     let changes = prefix_table.apply_op_list(&ops);
+                    pfx_sync.mark_fetched(adv);
                     if !changes.is_empty() {
                         notify_recompute.notify_waiters();
                     }
@@ -1117,7 +1143,7 @@ async fn fetch_and_apply_pfx(
         Err(e) => debug!(
             target: t::ROUTING_DV,
             peer = %adv.name, boot = adv.boot, seq = adv.seq, err = %e,
-            "Pfx Data fetch failed (will retry on next advance)",
+            "Pfx Data fetch failed (retried on the next Pfx Sync Interest)",
         ),
     }
 }
@@ -1169,8 +1195,10 @@ async fn producer_loop(
             if interest.name.has_prefix(&pfx_sync_group) {
                 if let Some(app_param) = interest.app_parameters() {
                     match pfx_sync.process_sync_app_param(app_param) {
-                        Ok(advances) => {
-                            for adv in advances {
+                        // Fetch every router whose newest state is not
+                        // applied: the advances, and earlier failed fetches.
+                        Ok(_) => {
+                            for adv in pfx_sync.queue_unfetched() {
                                 let _ = pfx_advance_tx.send(adv);
                             }
                         }
@@ -1200,6 +1228,66 @@ async fn producer_loop(
     }
 }
 
+/// The cost a readvertised prefix is announced with: the app is local, so
+/// reaching it costs nothing beyond the path to this router.
+const READVERTISE_COST: u32 = 0;
+
+/// Keeps the prefix table's local announcements equal to the RIB's
+/// readvertised set: announces each prefix the RIB readvertises, withdraws
+/// each it stopped readvertising. A change advances the Pfx Sync sequence
+/// (peers fetch the new snapshot) and has the next tick emit Pfx Sync.
+async fn readvertise_loop(
+    readvertised: Arc<ReadvertisedPrefixes>,
+    prefix_table: Arc<PrefixTable>,
+    pfx_sync: Arc<DvPfxSync>,
+    pfx_changed: Arc<AtomicBool>,
+    cancel: CancellationToken,
+) {
+    // Only what this loop announced is withdrawn by it.
+    let mut announced = BTreeSet::new();
+    loop {
+        if reconcile_readvertised(&readvertised.snapshot(), &mut announced, &prefix_table) {
+            let seq = pfx_sync.advance_seq();
+            pfx_changed.store(true, Ordering::Release);
+            debug!(
+                target: t::ROUTING_DV,
+                prefixes = announced.len(), pfx_seq = seq,
+                "readvertised prefixes announced",
+            );
+        }
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            _ = readvertised.changed() => {}
+        }
+    }
+}
+
+/// Bring `prefix_table`'s local announcements made by readvertise
+/// (`announced`) to `wanted`. `true` if the table changed.
+fn reconcile_readvertised(
+    wanted: &[Name],
+    announced: &mut BTreeSet<Name>,
+    prefix_table: &PrefixTable,
+) -> bool {
+    let mut changed = false;
+    announced.retain(|prefix| {
+        let keep = wanted.contains(prefix);
+        if !keep {
+            changed |= prefix_table.withdraw_local(prefix).is_some();
+        }
+        keep
+    });
+    for prefix in wanted {
+        if announced.insert(prefix.clone()) {
+            changed |= prefix_table
+                .announce_local(prefix.clone(), READVERTISE_COST)
+                .is_some();
+        }
+    }
+    changed
+}
+
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
@@ -1213,6 +1301,35 @@ mod tests {
 
     fn name(s: &str) -> Name {
         Name::from_str(s).expect("valid name")
+    }
+
+    /// Readvertise owns only what it announced: a prefix the RIB stops
+    /// readvertising is withdrawn, one announced by another source is not.
+    #[test]
+    fn reconcile_readvertised_withdraws_only_its_own_announcements() {
+        let table = PrefixTable::new(name("/r1"));
+        table.announce_local(name("/configured"), 5);
+        let mut announced = BTreeSet::new();
+
+        assert!(reconcile_readvertised(
+            &[name("/app/a"), name("/app/b")],
+            &mut announced,
+            &table
+        ));
+        assert!(!reconcile_readvertised(
+            &[name("/app/a"), name("/app/b")],
+            &mut announced,
+            &table
+        ));
+        assert!(reconcile_readvertised(
+            &[name("/app/b")],
+            &mut announced,
+            &table
+        ));
+        assert_eq!(
+            table.prefixes_for_router(&name("/r1")),
+            vec![(name("/app/b"), READVERTISE_COST), (name("/configured"), 5)]
+        );
     }
 
     /// Captures every `send_on` call so tests can assert what

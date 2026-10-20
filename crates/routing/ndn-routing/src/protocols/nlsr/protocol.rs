@@ -356,7 +356,8 @@ impl RoutingProtocol for NlsrProtocol {
         // announced in our NameLSA so peers learn them without manual config.
         let readvertised = Arc::new(ndn_engine::ReadvertisedPrefixes::new());
         rib.set_readvertise_destination(
-            Arc::clone(&readvertised) as Arc<dyn ndn_engine::ReadvertiseDestination>
+            self.origin(),
+            Arc::clone(&readvertised) as Arc<dyn ndn_engine::ReadvertiseDestination>,
         );
         let lsa_fetch_rx = self
             .lsa_fetch_rx

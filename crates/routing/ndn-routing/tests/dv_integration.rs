@@ -281,6 +281,88 @@ async fn pfx_sync_propagates_local_announcement() {
     r2.shutdown.shutdown().await;
 }
 
+/// Poll `cond` until it holds or `within` elapses; whether it held.
+async fn eventually(within: Duration, cond: impl Fn() -> bool) -> bool {
+    let deadline = tokio::time::Instant::now() + within;
+    while tokio::time::Instant::now() < deadline {
+        if cond() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    cond()
+}
+
+/// A prefix an app registers on r1 (`rib/register`, origin app) is
+/// readvertised: DV announces it, so r2 learns r1 serves it. When the app's
+/// face goes down, the RIB withdraws it and r2 forgets it — no manual
+/// `announce_local`, the production path end to end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn registered_prefix_is_advertised_and_withdrawn_with_its_face() {
+    use ndn_engine::rib::RibRoute;
+
+    let (link_a, link_b) = MemoryLink::pair(FaceId(500), FaceId(600), 256);
+    let r1 = build_dv_engine(
+        "/r1",
+        1000,
+        link_a,
+        FaceId(500),
+        FaceId(501),
+        FaceId(502),
+        None,
+    )
+    .await;
+    let r2 = build_dv_engine(
+        "/r2",
+        2000,
+        link_b,
+        FaceId(600),
+        FaceId(601),
+        FaceId(602),
+        None,
+    )
+    .await;
+    seed_neighbor(&r1, "/r2");
+    seed_neighbor(&r2, "/r1");
+
+    // What rib/register does for an app on face 509.
+    let app_face = FaceId(509);
+    let shop = name("/shop");
+    let rib = r1.engine.rib();
+    rib.add(
+        &shop,
+        RibRoute {
+            face_id: app_face,
+            origin: 0,
+            cost: 0,
+            flags: 0,
+            expires_at: None,
+        },
+    );
+    rib.readvertise_announce(&shop, 0);
+
+    let learned = || r2.dv.prefix_table().routers_for_prefix(&shop);
+    assert!(
+        eventually(Duration::from_secs(10), || learned()
+            == vec![(name("/r1"), 0)])
+        .await,
+        "r2 should learn that /r1 announces /shop, got {:?}",
+        learned()
+    );
+
+    // The app's face goes down (it crashed): the RIB drops its routes and
+    // withdraws the prefix from DV.
+    rib.handle_face_down(app_face, &r1.engine.fib());
+    assert!(
+        eventually(Duration::from_secs(10), || learned().is_empty()).await,
+        "r2 should forget /shop once r1 withdraws it, got {:?}",
+        learned()
+    );
+
+    r1.shutdown.shutdown().await;
+    r2.shutdown.shutdown().await;
+}
+
 /// Stage 5a + 5b witness — both engines sign with Ed25519 *and*
 /// verify the peer's signature against a pre-shared
 /// [`DvStaticKeys`] public-key registry. End-to-end convergence

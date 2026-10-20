@@ -17,6 +17,8 @@
 //! Pure wire layer. I/O lives in [`super::protocol`]; PrefixOpList
 //! codec in [`super::tlv`]; table state in [`super::prefix`].
 
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -72,6 +74,16 @@ pub struct DvPfxSync {
     router: Name,
     svs: SvsLocal,
     trust: crate::protocols::dv::signing::DvTrustHandle,
+    fetches: Mutex<FetchState>,
+}
+
+/// Which peers' Prefix Data this router holds or is about to fetch.
+#[derive(Default)]
+struct FetchState {
+    /// Per router, the `(boot, seq)` whose Prefix Data was applied.
+    applied: HashMap<Name, (u64, u64)>,
+    /// Routers with a fetch queued.
+    queued: HashSet<Name>,
 }
 
 impl DvPfxSync {
@@ -97,7 +109,54 @@ impl DvPfxSync {
             router: router.clone(),
             svs: SvsLocal::new(router, boot),
             trust,
+            fetches: Mutex::new(FetchState::default()),
         }
+    }
+
+    fn fetch_state(&self) -> std::sync::MutexGuard<'_, FetchState> {
+        self.fetches.lock().expect("DvPfxSync::fetches poisoned")
+    }
+
+    /// Queue a fetch for every router whose newest known `(boot, seq)` has
+    /// no applied Prefix Data and none queued: newly advanced routers, and
+    /// routers whose fetch failed (e.g. no route to them yet) — retried on
+    /// the next Pfx Sync Interest rather than at that router's next change.
+    /// Returns the routers to queue.
+    pub fn queue_unfetched(&self) -> Vec<NeighborAdvance> {
+        let mut state = self.fetch_state();
+        let mut queue = Vec::new();
+        for n in self.svs.neighbors() {
+            if state.applied.get(&n.name) != Some(&(n.boot, n.seq))
+                && state.queued.insert(n.name.clone())
+            {
+                queue.push(NeighborAdvance {
+                    name: n.name,
+                    boot: n.boot,
+                    seq: n.seq,
+                });
+            }
+        }
+        queue
+    }
+
+    /// Take `router`'s queued fetch: its newest known state, unless that
+    /// state's Prefix Data is already applied.
+    pub fn start_fetch(&self, router: &Name) -> Option<NeighborAdvance> {
+        let mut state = self.fetch_state();
+        state.queued.remove(router);
+        let (boot, seq) = self.neighbor_seq(router)?;
+        (state.applied.get(router) != Some(&(boot, seq))).then(|| NeighborAdvance {
+            name: router.clone(),
+            boot,
+            seq,
+        })
+    }
+
+    /// Record that `adv`'s Prefix Data was fetched and applied.
+    pub fn mark_fetched(&self, adv: &NeighborAdvance) {
+        self.fetch_state()
+            .applied
+            .insert(adv.name.clone(), (adv.boot, adv.seq));
     }
 
     /// Pluggable trust policy.
@@ -320,6 +379,36 @@ mod tests {
         // Pfx Sync has no HopLimit (network-wide propagation).
         assert_eq!(interest.hop_limit(), None);
         assert!(interest.app_parameters().is_some());
+    }
+
+    /// A failed Prefix Data fetch is not lost: the router stays unfetched and
+    /// is queued again on the next Pfx Sync Interest — once, however many
+    /// arrive — until its Prefix Data is applied.
+    #[test]
+    fn failed_fetch_is_queued_again_on_the_next_sync() {
+        let r1 = fresh("/r1", 100);
+        let r2 = fresh("/r2", 200);
+        r1.advance_seq();
+        let wire = r1.build_sync_interest();
+
+        r2.process_sync_interest(&wire).unwrap();
+        let queued = r2.queue_unfetched();
+        assert_eq!(queued.len(), 1);
+        r2.process_sync_interest(&wire).unwrap();
+        assert!(r2.queue_unfetched().is_empty(), "already queued");
+
+        // The fetch is taken and fails (nothing marks it fetched).
+        let adv = r2.start_fetch(&name("/r1")).expect("unfetched");
+        assert_eq!((adv.boot, adv.seq), (100, 1));
+        // The same, unchanged state vector arrives again → retried.
+        r2.process_sync_interest(&wire).unwrap();
+        assert_eq!(r2.queue_unfetched().len(), 1);
+
+        let adv = r2.start_fetch(&name("/r1")).expect("unfetched");
+        r2.mark_fetched(&adv);
+        r2.process_sync_interest(&wire).unwrap();
+        assert!(r2.queue_unfetched().is_empty(), "applied");
+        assert!(r2.start_fetch(&name("/r1")).is_none());
     }
 
     #[test]
