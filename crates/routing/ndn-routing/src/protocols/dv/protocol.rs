@@ -1022,9 +1022,17 @@ fn apply_plan(plan: &FibPlan, rib: &ndn_engine::Rib, fib: &ndn_engine::Fib) {
     }
 }
 
-/// Bounded above by `router_dead_interval / 4` so stale neighbours
-/// are caught within that fraction of the dead-interval.
-const DEAD_NEIGHBOR_TICK: Duration = Duration::from_secs(10);
+/// Bounds of [`dead_neighbor_tick`].
+const MAX_DEAD_NEIGHBOR_TICK: Duration = Duration::from_secs(10);
+const MIN_DEAD_NEIGHBOR_TICK: Duration = Duration::from_millis(100);
+
+/// Neighbour liveness is checked every quarter of `router_dead_interval`,
+/// so a silent neighbour is dropped within 1.25 × that interval; clamped
+/// to [`MIN_DEAD_NEIGHBOR_TICK`]..=[`MAX_DEAD_NEIGHBOR_TICK`] (no spin on
+/// a near-zero interval).
+fn dead_neighbor_tick(dead_interval: Duration) -> Duration {
+    (dead_interval / 4).clamp(MIN_DEAD_NEIGHBOR_TICK, MAX_DEAD_NEIGHBOR_TICK)
+}
 
 /// Pfx Sync peers are not tracked for liveness here — their peer
 /// set is SVS-group membership with no per-neighbour face state.
@@ -1035,16 +1043,14 @@ async fn dead_neighbor_loop(
     notify_recompute: Arc<tokio::sync::Notify>,
     cancel: CancellationToken,
 ) {
-    let mut ticker = tokio::time::interval(DEAD_NEIGHBOR_TICK);
-    ticker.tick().await; // skip first immediate tick
+    // The interval is runtime-settable (`router_dead_secs`): read it each round.
+    let dead_interval = || Duration::from_millis(dead_interval_ms.load(Ordering::Relaxed));
     loop {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => break,
-            _ = ticker.tick() => {
-                let now = Instant::now();
-                let dead_interval = Duration::from_millis(dead_interval_ms.load(Ordering::Relaxed));
-                let dead = sync.dead_neighbors(now, dead_interval);
+            _ = tokio::time::sleep(dead_neighbor_tick(dead_interval())) => {
+                let dead = sync.dead_neighbors(Instant::now(), dead_interval());
                 if dead.is_empty() {
                     continue;
                 }
@@ -2109,6 +2115,21 @@ mod tests {
         let n2 = Arc::clone(&proto.notify_recompute);
         n1.notify_one(); // doesn't panic; multiple clones share the same Notify
         assert!(Arc::ptr_eq(&n1, &n2));
+    }
+
+    /// Liveness is checked every quarter of the dead interval, so a silent
+    /// neighbour is dropped within 1.25 × it, however short it is set.
+    #[test]
+    fn dead_neighbor_tick_is_a_quarter_of_the_dead_interval() {
+        assert_eq!(
+            dead_neighbor_tick(Duration::from_secs(3)),
+            Duration::from_millis(750)
+        );
+        assert_eq!(
+            dead_neighbor_tick(Duration::from_secs(60)),
+            MAX_DEAD_NEIGHBOR_TICK
+        );
+        assert_eq!(dead_neighbor_tick(Duration::ZERO), MIN_DEAD_NEIGHBOR_TICK);
     }
 
     #[test]
