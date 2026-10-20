@@ -1,15 +1,16 @@
-//! G.05 Stage 6g — two-engine integration witness for ndn-dv.
+//! G.05 Stage 6g — multi-engine integration witness for ndn-dv.
 //!
-//! Wires two real [`ForwarderEngine`]s via an in-memory bridged
-//! face pair (a `MemoryLink`), registers a [`DvProtocol`] on each,
-//! and asserts convergence: Adv Sync teaches each router about the
-//! other; Pfx Sync propagates locally-announced prefixes.
+//! Wires real [`ForwarderEngine`]s via in-memory bridged face pairs
+//! (`MemoryLink`s), registers a [`DvProtocol`] on each, and asserts
+//! convergence: Adv Sync teaches each router about the others, also
+//! beyond its neighbours; Pfx Sync propagates locally-announced prefixes.
 //!
-//! Uses short sync intervals (100 ms) so convergence completes
-//! within a sub-second tokio::time::sleep window.
+//! Uses short sync intervals (100 ms; emitted at each 1 s tick) so
+//! convergence completes within a few seconds.
 
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -32,6 +33,8 @@ struct MemoryLink {
     id: FaceId,
     rx: tokio::sync::Mutex<mpsc::Receiver<Bytes>>,
     tx: mpsc::Sender<Bytes>,
+    /// Shared by both ends: once set, the link drops everything sent.
+    cut: Arc<AtomicBool>,
 }
 
 impl MemoryLink {
@@ -40,16 +43,19 @@ impl MemoryLink {
     fn pair(id_a: FaceId, id_b: FaceId, buffer: usize) -> (MemoryLink, MemoryLink) {
         let (a_to_b_tx, a_to_b_rx) = mpsc::channel(buffer);
         let (b_to_a_tx, b_to_a_rx) = mpsc::channel(buffer);
+        let cut = Arc::new(AtomicBool::new(false));
         (
             MemoryLink {
                 id: id_a,
                 rx: tokio::sync::Mutex::new(b_to_a_rx),
                 tx: a_to_b_tx,
+                cut: Arc::clone(&cut),
             },
             MemoryLink {
                 id: id_b,
                 rx: tokio::sync::Mutex::new(a_to_b_rx),
                 tx: b_to_a_tx,
+                cut,
             },
         )
     }
@@ -69,6 +75,9 @@ impl Transport for MemoryLink {
         self.rx.lock().await.recv().await.ok_or(FaceError::Closed)
     }
     async fn send_bytes(&self, pkt: Bytes) -> Result<(), FaceError> {
+        if self.cut.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         self.tx.send(pkt).await.map_err(|_| FaceError::Closed)
     }
 }
@@ -79,8 +88,8 @@ struct DvEngine {
     engine: Arc<ndn_engine::ForwarderEngine>,
     shutdown: ndn_engine::ShutdownHandle,
     dv: Arc<DvProtocol>,
-    /// FaceId of the MemoryLink end this engine owns; the test uses
-    /// it to seed the NeighborTable and to bind the FIB nexthop.
+    /// FaceId of the first MemoryLink end this engine owns; the test
+    /// uses it to seed the NeighborTable and to bind the FIB nexthop.
     link_face_id: FaceId,
 }
 
@@ -101,20 +110,42 @@ async fn build_dv_engine(
     router_name: &str,
     boot: u64,
     link_face: MemoryLink,
-    link_face_id: FaceId,
     fetch_face_id: FaceId,
     produce_face_id: FaceId,
     trust: Option<ndn_routing::protocols::dv::signing::DvTrustHandle>,
+) -> DvEngine {
+    // Keep dead-interval long so neighbours aren't killed mid-test.
+    build_router(
+        router_name,
+        boot,
+        vec![link_face],
+        fetch_face_id,
+        produce_face_id,
+        trust,
+        Duration::from_secs(60),
+    )
+    .await
+}
+
+/// [`build_dv_engine`] for a router owning every end in `links`, whose
+/// neighbours are dropped after `router_dead_interval` of silence.
+async fn build_router(
+    router_name: &str,
+    boot: u64,
+    links: Vec<MemoryLink>,
+    fetch_face_id: FaceId,
+    produce_face_id: FaceId,
+    trust: Option<ndn_routing::protocols::dv::signing::DvTrustHandle>,
+    router_dead_interval: Duration,
 ) -> DvEngine {
     let (fetch_face, fetch_handle) = InProcFace::new(fetch_face_id, 256);
     let (produce_face, produce_handle) = InProcFace::new(produce_face_id, 256);
 
     let mut cfg = DvConfig::new(name("/ndn"), name(router_name), boot);
-    // Short intervals so the test converges within sub-second.
+    // Short intervals so the test converges quickly.
     cfg.adv_sync_interval = Duration::from_millis(100);
     cfg.pfx_sync_interval = Duration::from_millis(100);
-    // Keep dead-interval long so neighbours aren't killed mid-test.
-    cfg.router_dead_interval = Duration::from_secs(60);
+    cfg.router_dead_interval = router_dead_interval;
 
     let dv = match trust {
         None => DvProtocol::with_io(cfg, fetch_handle, produce_handle, produce_face_id),
@@ -123,10 +154,12 @@ async fn build_dv_engine(
         }
     };
 
-    let mut builder = EngineBuilder::new(EngineConfig::default())
-        .face(link_face)
-        .face(fetch_face)
-        .face(produce_face);
+    let link_face_id = links.first().expect("a router has a link").id;
+    let mut builder = EngineBuilder::new(EngineConfig::default());
+    for link in links {
+        builder = builder.face(link);
+    }
+    let mut builder = builder.face(fetch_face).face(produce_face);
     builder.register_discovery(Arc::clone(&dv) as Arc<dyn DiscoveryProtocol>);
     builder.register_routing_protocol(Arc::clone(&dv) as Arc<dyn ndn_engine::RoutingProtocol>);
     let (engine, shutdown) = builder.build().await.expect("engine build");
@@ -146,13 +179,18 @@ async fn build_dv_engine(
 /// install the per-peer `/localhop/<peer>/DV/ADV` entry on first
 /// sync receipt.
 fn seed_neighbor(engine: &DvEngine, peer_router_name: &str) {
+    seed_neighbor_on(engine, peer_router_name, engine.link_face_id);
+}
+
+/// [`seed_neighbor`] reachable via `face`.
+fn seed_neighbor_on(engine: &DvEngine, peer_router_name: &str, face: FaceId) {
     let mut entry = NeighborEntry::new(name(peer_router_name));
     entry.state = NeighborState::Established {
         last_seen: Instant::now(),
     };
     entry
         .faces
-        .push((engine.link_face_id, MacAddr::new([0; 6]), String::new()));
+        .push((face, MacAddr::new([0; 6]), String::new()));
     engine
         .engine
         .discovery_ctx()
@@ -165,48 +203,18 @@ fn seed_neighbor(engine: &DvEngine, peer_router_name: &str) {
 async fn adv_sync_two_routers_learn_each_other() {
     let (link_a, link_b) = MemoryLink::pair(FaceId(100), FaceId(200), 256);
 
-    let r1 = build_dv_engine(
-        "/r1",
-        1000,
-        link_a,
-        FaceId(100),
-        FaceId(101),
-        FaceId(102),
-        None,
-    )
-    .await;
-    let r2 = build_dv_engine(
-        "/r2",
-        2000,
-        link_b,
-        FaceId(200),
-        FaceId(201),
-        FaceId(202),
-        None,
-    )
-    .await;
+    let r1 = build_dv_engine("/r1", 1000, link_a, FaceId(101), FaceId(102), None).await;
+    let r2 = build_dv_engine("/r2", 2000, link_b, FaceId(201), FaceId(202), None).await;
     seed_neighbor(&r1, "/r2");
     seed_neighbor(&r2, "/r1");
 
-    // Advance each router's seq so the sync state vector carries a
-    // non-trivial seq for the peer to consume.
-    r1.dv.sync().advance_seq();
-    r2.dv.sync().advance_seq();
-
-    // Wait for convergence — sync emits every 100 ms; allow several
-    // round-trips for the Adv Data fetch leg too.
-    tokio::time::sleep(Duration::from_millis(2500)).await;
-
-    // Each DvSync should now have a tracked seq for the other peer.
-    assert_eq!(
-        r1.dv.sync().neighbor_seq(&name("/r2")),
-        Some((2000, 1)),
-        "r1's view of r2's (boot, seq)",
-    );
-    assert_eq!(
-        r2.dv.sync().neighbor_seq(&name("/r1")),
-        Some((1000, 1)),
-        "r2's view of r1's (boot, seq)",
+    // Sync emits at each 1 s tick; each router publishes a new
+    // advertisement once it learns the other, which the other fetches.
+    assert!(
+        eventually(Duration::from_secs(10), || knows(&r1, &r2)
+            && knows(&r2, &r1))
+        .await,
+        "each router tracks the other's current (boot, seq)",
     );
 
     // Each DvRib should have a route to the other router (cost = 1,
@@ -232,32 +240,12 @@ async fn adv_sync_two_routers_learn_each_other() {
 async fn pfx_sync_propagates_local_announcement() {
     let (link_a, link_b) = MemoryLink::pair(FaceId(300), FaceId(400), 256);
 
-    let r1 = build_dv_engine(
-        "/r1",
-        1000,
-        link_a,
-        FaceId(300),
-        FaceId(301),
-        FaceId(302),
-        None,
-    )
-    .await;
-    let r2 = build_dv_engine(
-        "/r2",
-        2000,
-        link_b,
-        FaceId(400),
-        FaceId(401),
-        FaceId(402),
-        None,
-    )
-    .await;
+    let r1 = build_dv_engine("/r1", 1000, link_a, FaceId(301), FaceId(302), None).await;
+    let r2 = build_dv_engine("/r2", 2000, link_b, FaceId(401), FaceId(402), None).await;
     seed_neighbor(&r1, "/r2");
     seed_neighbor(&r2, "/r1");
 
     // Bring up Adv Sync first so each router learns about the other.
-    r1.dv.sync().advance_seq();
-    r2.dv.sync().advance_seq();
     tokio::time::sleep(Duration::from_millis(2500)).await;
 
     // r1 announces /shop. Manually advance pfx seq so the next
@@ -293,6 +281,31 @@ async fn eventually(within: Duration, cond: impl Fn() -> bool) -> bool {
     cond()
 }
 
+/// Whether `a` tracks `b`'s current `(boot, seq)` and has a route to it.
+fn knows(a: &DvEngine, b: &DvEngine) -> bool {
+    let b_name = &b.dv.config().router;
+    a.dv.sync().neighbor_seq(b_name) == Some((b.dv.config().boot, b.dv.sync().current_seq()))
+        && a.dv.rib().best_route(b_name).is_some()
+}
+
+/// The nexthops `engine`'s FIB holds for exactly `prefix`, as `(face, cost)`.
+fn fib_hops(engine: &DvEngine, prefix: &Name) -> Vec<(FaceId, u32)> {
+    engine
+        .engine
+        .fib()
+        .dump()
+        .into_iter()
+        .filter(|(name, _)| name == prefix)
+        .flat_map(|(_, entry)| {
+            entry
+                .nexthops
+                .iter()
+                .map(|h| (h.face_id, h.cost))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 /// A prefix an app registers on r1 (`rib/register`, origin app) is
 /// readvertised: DV announces it, so r2 learns r1 serves it. When the app's
 /// face goes down, the RIB withdraws it and r2 forgets it — no manual
@@ -302,26 +315,8 @@ async fn registered_prefix_is_advertised_and_withdrawn_with_its_face() {
     use ndn_engine::rib::RibRoute;
 
     let (link_a, link_b) = MemoryLink::pair(FaceId(500), FaceId(600), 256);
-    let r1 = build_dv_engine(
-        "/r1",
-        1000,
-        link_a,
-        FaceId(500),
-        FaceId(501),
-        FaceId(502),
-        None,
-    )
-    .await;
-    let r2 = build_dv_engine(
-        "/r2",
-        2000,
-        link_b,
-        FaceId(600),
-        FaceId(601),
-        FaceId(602),
-        None,
-    )
-    .await;
+    let r1 = build_dv_engine("/r1", 1000, link_a, FaceId(501), FaceId(502), None).await;
+    let r2 = build_dv_engine("/r2", 2000, link_b, FaceId(601), FaceId(602), None).await;
     seed_neighbor(&r1, "/r2");
     seed_neighbor(&r2, "/r1");
 
@@ -409,7 +404,6 @@ async fn ed25519_signed_routers_converge() {
         "/r1",
         1000,
         link_a,
-        FaceId(500),
         FaceId(501),
         FaceId(502),
         Some(r1_trust),
@@ -419,7 +413,6 @@ async fn ed25519_signed_routers_converge() {
         "/r2",
         2000,
         link_b,
-        FaceId(600),
         FaceId(601),
         FaceId(602),
         Some(r2_trust),
@@ -428,16 +421,12 @@ async fn ed25519_signed_routers_converge() {
     seed_neighbor(&r1, "/r2");
     seed_neighbor(&r2, "/r1");
 
-    r1.dv.sync().advance_seq();
-    r2.dv.sync().advance_seq();
-    tokio::time::sleep(Duration::from_millis(2500)).await;
-
-    assert_eq!(
-        r1.dv.sync().neighbor_seq(&name("/r2")),
-        Some((2000, 1)),
-        "r1 must track r2's seq across the Ed25519-signed sync wire",
+    assert!(
+        eventually(Duration::from_secs(10), || knows(&r1, &r2)
+            && knows(&r2, &r1))
+        .await,
+        "each router must track the other's seq across the Ed25519-signed sync wire",
     );
-    assert_eq!(r2.dv.sync().neighbor_seq(&name("/r1")), Some((1000, 1)),);
     assert!(
         r1.dv.rib().best_route(&name("/r2")).is_some(),
         "Adv Data fetch over Ed25519-signed wire must apply to the RIB",
@@ -485,7 +474,6 @@ async fn forged_signed_peer_is_rejected_by_static_trust() {
         "/r1",
         1000,
         link_a,
-        FaceId(700),
         FaceId(701),
         FaceId(702),
         Some(attacker_trust),
@@ -495,7 +483,6 @@ async fn forged_signed_peer_is_rejected_by_static_trust() {
         "/r2",
         2000,
         link_b,
-        FaceId(800),
         FaceId(801),
         FaceId(802),
         Some(victim_trust),
@@ -504,8 +491,6 @@ async fn forged_signed_peer_is_rejected_by_static_trust() {
     seed_neighbor(&attacker, "/r2");
     seed_neighbor(&victim, "/r1");
 
-    attacker.dv.sync().advance_seq();
-    victim.dv.sync().advance_seq();
     tokio::time::sleep(Duration::from_millis(2500)).await;
 
     // Victim must NOT have learned the forged sequence.
@@ -521,4 +506,97 @@ async fn forged_signed_peer_is_rejected_by_static_trust() {
 
     attacker.shutdown.shutdown().await;
     victim.shutdown.shutdown().await;
+}
+
+/// A line r1 – r2 – r3. r1 learns r3 through r2, two hops away, and routes
+/// r3's registered prefix via r2 at cost 2: r2 re-advertises once it has
+/// learned r3. When the r2–r3 link fails, r2 drops r3 and re-advertises,
+/// and r1 forgets r3 and the prefix's route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn routes_beyond_a_neighbour_follow_its_advertisements() {
+    use ndn_engine::rib::RibRoute;
+    use ndn_routing::protocols::dv::rib::BestRoute;
+
+    let (l12, l21) = MemoryLink::pair(FaceId(1100), FaceId(1200), 256);
+    let (l23, l32) = MemoryLink::pair(FaceId(1201), FaceId(1300), 256);
+    let cut_23 = Arc::clone(&l23.cut);
+    // Sync goes out at every 1 s tick, so a neighbour silent for 3 s is gone.
+    let dead = Duration::from_secs(3);
+    let r1 = build_router(
+        "/r1",
+        1000,
+        vec![l12],
+        FaceId(1101),
+        FaceId(1102),
+        None,
+        dead,
+    )
+    .await;
+    let r2 = build_router(
+        "/r2",
+        2000,
+        vec![l21, l23],
+        FaceId(1202),
+        FaceId(1203),
+        None,
+        dead,
+    )
+    .await;
+    let r3 = build_router(
+        "/r3",
+        3000,
+        vec![l32],
+        FaceId(1301),
+        FaceId(1302),
+        None,
+        dead,
+    )
+    .await;
+    seed_neighbor_on(&r1, "/r2", FaceId(1100));
+    seed_neighbor_on(&r2, "/r1", FaceId(1200));
+    seed_neighbor_on(&r2, "/r3", FaceId(1201));
+    seed_neighbor_on(&r3, "/r2", FaceId(1300));
+
+    // What rib/register does for an app on r3's face 1309.
+    let shop = name("/shop");
+    let r3_rib = r3.engine.rib();
+    r3_rib.add(
+        &shop,
+        RibRoute {
+            face_id: FaceId(1309),
+            origin: 0,
+            cost: 0,
+            flags: 0,
+            expires_at: None,
+        },
+    );
+    r3_rib.readvertise_announce(&shop, 0);
+
+    let to_r3 = || r1.dv.rib().best_route(&name("/r3"));
+    let via_r2 = Some(BestRoute {
+        neighbor: name("/r2"),
+        cost: 2,
+    });
+    assert!(
+        eventually(Duration::from_secs(15), || to_r3() == via_r2
+            && fib_hops(&r1, &shop) == vec![(FaceId(1100), 2)])
+        .await,
+        "r1 should reach r3 and /shop via r2 at cost 2, got {:?} and {:?}",
+        to_r3(),
+        fib_hops(&r1, &shop),
+    );
+
+    cut_23.store(true, Ordering::Relaxed);
+    assert!(
+        eventually(Duration::from_secs(30), || to_r3().is_none()
+            && fib_hops(&r1, &shop).is_empty())
+        .await,
+        "r1 should forget r3 and /shop once r2 loses r3, got {:?} and {:?}",
+        to_r3(),
+        fib_hops(&r1, &shop),
+    );
+
+    for r in [r1, r2, r3] {
+        r.shutdown.shutdown().await;
+    }
 }

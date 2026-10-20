@@ -115,6 +115,10 @@ pub struct DvProtocol {
     last_active_emit: Mutex<Option<Instant>>,
     last_passive_emit: Mutex<Option<Instant>>,
     last_pfx_emit: Mutex<Option<Instant>>,
+    /// Set when our own advertisement changed (its seq advanced): the next
+    /// tick emits active and passive Sync instead of waiting out
+    /// `adv_sync_interval`.
+    adv_changed: Arc<AtomicBool>,
     /// Set when our own prefix announcements changed: the next tick emits a
     /// Pfx Sync Interest instead of waiting out `pfx_sync_interval`.
     pfx_changed: Arc<AtomicBool>,
@@ -124,8 +128,8 @@ pub struct DvProtocol {
     /// `passive` neighbour-binding behaviour.
     passive_faces: RwLock<HashMap<FaceId, Instant>>,
     /// Unbounded because back-pressure on sync ingress would drop
-    /// packets and break the protocol; the fetcher dedupes by
-    /// `(name, boot, seq)`.
+    /// packets and break the protocol; [`DvSync`] queues at most one
+    /// fetch per neighbour.
     advance_tx: mpsc::UnboundedSender<NeighborAdvance>,
     advance_rx: Mutex<Option<mpsc::UnboundedReceiver<NeighborAdvance>>>,
     /// Caller supplies via [`with_io`]; consumed by `start()`. `None`
@@ -136,8 +140,10 @@ pub struct DvProtocol {
     /// Paired with `produce_handle`'s InProcFace; `start()` installs a
     /// FIB entry routing the advertisement-data prefix here.
     produce_face_id: Option<FaceId>,
-    /// Sites mutating `DvRib` or `PrefixTable` call `notify_waiters()`;
-    /// the FIB-updater task awaits `notified()` to trigger a recompute.
+    /// Sites mutating `DvRib`, `PrefixTable` or a neighbour's face
+    /// binding call `notify_one()`; the recompute task awaits
+    /// `notified()`. Its single permit keeps a change made while the
+    /// task is busy from being lost.
     notify_recompute: Arc<tokio::sync::Notify>,
     /// Independent from `advance_tx` so the two protocol legs don't
     /// share queue state.
@@ -226,6 +232,8 @@ impl DvProtocol {
             trust,
         ));
         let rib = Arc::new(DvRib::new(config.router.clone()));
+        // The first advertisement (just this router) is published at seq 1.
+        sync.publish(&rib.produce_advertisement());
         let prefix_table = Arc::new(PrefixTable::new(config.router.clone()));
         let claimed = vec![sync.active_sync_prefix(), sync.passive_sync_prefix()];
         let (advance_tx, advance_rx) = mpsc::unbounded_channel();
@@ -246,6 +254,7 @@ impl DvProtocol {
             last_active_emit: Mutex::new(None),
             last_passive_emit: Mutex::new(None),
             last_pfx_emit: Mutex::new(None),
+            adv_changed: Arc::new(AtomicBool::new(false)),
             pfx_changed: Arc::new(AtomicBool::new(false)),
             passive_faces: RwLock::new(HashMap::new()),
             advance_tx,
@@ -316,7 +325,7 @@ impl DvProtocol {
 
     #[cfg(test)]
     pub(crate) fn build_adv_data_response(&self, requested: &Name) -> Option<Bytes> {
-        build_adv_data_response(&self.sync, &self.rib, requested)
+        build_adv_data_response(&self.sync, requested)
     }
 
     /// Pfx Sync emission lives here in `on_tick` rather than in a
@@ -411,17 +420,17 @@ impl DiscoveryProtocol for DvProtocol {
             }
         };
 
-        for advance in &receipt.advances {
+        for fetch in &receipt.fetches {
             debug!(
                 target: t::ROUTING_DV,
-                neighbor = %advance.name,
-                boot = advance.boot,
-                seq = advance.seq,
-                "neighbour seq advanced — enqueuing Adv Data fetch",
+                neighbor = %fetch.name,
+                boot = fetch.boot,
+                seq = fetch.seq,
+                "neighbour advertisement not applied — enqueuing Adv Data fetch",
             );
             // Best-effort: at shutdown the fetcher is gone and the
-            // advance is dropped, which is correct.
-            let _ = self.advance_tx.send(advance.clone());
+            // fetch is dropped, which is correct.
+            let _ = self.advance_tx.send(fetch.clone());
         }
         for change in &receipt.face_changes {
             debug!(
@@ -447,6 +456,10 @@ impl DiscoveryProtocol for DvProtocol {
             }
             ctx.add_fib_entry(&adv_prefix, change.new_face, 0, DV_PROTOCOL_ID);
         }
+        // Routes through a neighbour follow its face binding.
+        if !receipt.face_changes.is_empty() {
+            self.notify_recompute.notify_one();
+        }
 
         // Remember passive-incoming faces so subsequent ticks fan
         // our own passive syncs back on them.
@@ -463,22 +476,26 @@ impl DiscoveryProtocol for DvProtocol {
     fn on_tick(&self, now: Instant, ctx: &dyn DiscoveryContext) {
         let interval = Duration::from_millis(self.adv_sync_interval_ms.load(Ordering::Relaxed));
         let neighbors = ctx.neighbors();
+        // A new advertisement is announced at once, actively and passively.
+        let adv_changed = self.adv_changed.swap(false, Ordering::AcqRel);
 
-        let should_send_active = self
-            .last_active_emit
-            .lock()
-            .expect("DvProtocol::last_active_emit poisoned")
-            .is_none_or(|t| now.duration_since(t) >= interval);
+        let should_send_active = adv_changed
+            || self
+                .last_active_emit
+                .lock()
+                .expect("DvProtocol::last_active_emit poisoned")
+                .is_none_or(|t| now.duration_since(t) >= interval);
         if should_send_active {
             self.emit_active_sync(&neighbors, ctx);
             *self.last_active_emit.lock().unwrap() = Some(now);
         }
 
-        let should_send_passive = self
-            .last_passive_emit
-            .lock()
-            .expect("DvProtocol::last_passive_emit poisoned")
-            .is_none_or(|t| now.duration_since(t) >= interval);
+        let should_send_passive = adv_changed
+            || self
+                .last_passive_emit
+                .lock()
+                .expect("DvProtocol::last_passive_emit poisoned")
+                .is_none_or(|t| now.duration_since(t) >= interval);
         if should_send_passive {
             self.emit_passive_sync(ctx);
             *self.last_passive_emit.lock().unwrap() = Some(now);
@@ -498,7 +515,8 @@ impl DiscoveryProtocol for DvProtocol {
     }
 
     fn tick_interval(&self) -> Duration {
-        // Poll at 1 s; emissions are gated above by `adv_sync_interval`.
+        // Poll at 1 s; emissions are gated above by the sync intervals,
+        // or sent at the next tick after our advertisement or prefixes change.
         Duration::from_secs(1)
     }
 }
@@ -641,6 +659,7 @@ impl RoutingProtocol for DvProtocol {
         let prefix_table = Arc::clone(&self.prefix_table);
         let pfx_advance_tx_for_producer = self.pfx_advance_tx.clone();
         let notify_recompute = Arc::clone(&self.notify_recompute);
+        let adv_changed = Arc::clone(&self.adv_changed);
         let network = self.config.network.clone();
 
         let engine_rib = Arc::clone(&handle.rib);
@@ -672,6 +691,7 @@ impl RoutingProtocol for DvProtocol {
             // PIT tokens (ndn-app limitation).
             let fetcher_task = fetch_handle.map(|h| {
                 let cancel = cancel.child_token();
+                let sync = Arc::clone(&sync);
                 let pfx_sync = Arc::clone(&pfx_sync);
                 let rib = Arc::clone(&rib);
                 let prefix_table = Arc::clone(&prefix_table);
@@ -680,6 +700,7 @@ impl RoutingProtocol for DvProtocol {
                     h,
                     advance_rx,
                     pfx_advance_rx,
+                    sync,
                     pfx_sync,
                     rib,
                     prefix_table,
@@ -694,30 +715,28 @@ impl RoutingProtocol for DvProtocol {
                 let cancel = cancel.child_token();
                 let sync = Arc::clone(&sync);
                 let pfx_sync = Arc::clone(&pfx_sync);
-                let rib = Arc::clone(&rib);
                 let prefix_table = Arc::clone(&prefix_table);
                 tokio::spawn(producer_loop(
                     h,
                     sync,
                     pfx_sync,
-                    rib,
                     prefix_table,
                     pfx_advance_tx_for_producer,
                     cancel,
                 ))
             });
 
-            // FIB-updater is always spawned — the engine RIB is the
-            // authoritative target for our routes regardless of
-            // whether fetcher/producer are wired. Idles on
-            // `notify_recompute` when nothing is changing.
-            let fib_updater_task = {
+            // Recompute is always spawned — our advertisement and the
+            // engine RIB follow the DV RIB regardless of whether
+            // fetcher/producer are wired. Idles on `notify_recompute`
+            // when nothing is changing.
+            let recompute_task = {
                 let cancel = cancel.child_token();
                 let sync = Arc::clone(&sync);
                 let rib = Arc::clone(&rib);
                 let prefix_table = Arc::clone(&prefix_table);
                 let notify_recompute = Arc::clone(&notify_recompute);
-                tokio::spawn(fib_updater_loop(
+                tokio::spawn(recompute_loop(
                     sync,
                     rib,
                     prefix_table,
@@ -725,6 +744,7 @@ impl RoutingProtocol for DvProtocol {
                     engine_fib,
                     network,
                     notify_recompute,
+                    adv_changed,
                     cancel,
                 ))
             };
@@ -755,7 +775,7 @@ impl RoutingProtocol for DvProtocol {
             if let Some(t) = producer_task {
                 let _ = t.await;
             }
-            let _ = fib_updater_task.await;
+            let _ = recompute_task.await;
             if let Some(t) = dead_neighbor_task {
                 let _ = t.await;
             }
@@ -770,7 +790,9 @@ impl RoutingProtocol for DvProtocol {
 /// or `None` if the requested name doesn't match our current
 /// `(boot, seq)`. Only the current advertisement is served; older
 /// versions are not retained (ndnd's `MemoryFifoDir` replay isn't
-/// mirrored). Signing flows through [`DvSync::trust`].
+/// mirrored). The content is the advertisement published at that
+/// seq ([`DvSync::publish`]), so a name's Data never changes.
+/// Signing flows through [`DvSync::trust`].
 ///
 /// ndnd's consumer expresses Interest at the segmented path
 /// `/.../t=<boot>/v=<seq>/seg=0`; we reply with a single-segment
@@ -778,15 +800,13 @@ impl RoutingProtocol for DvProtocol {
 /// sequence (no outer 0xC9 wrapper), matching
 /// `AdvertisementEncoder::EncodeInto` in
 /// `ndnd/dv/tlv/zz_generated.go:244`.
-fn build_adv_data_response(sync: &DvSync, rib: &DvRib, requested: &Name) -> Option<Bytes> {
-    let boot = sync.boot();
-    let seq = sync.current_seq();
-    let object_prefix = sync.advertisement_data_name(boot, seq);
+fn build_adv_data_response(sync: &DvSync, requested: &Name) -> Option<Bytes> {
+    let (seq, content) = sync.published();
+    let object_prefix = sync.advertisement_data_name(sync.boot(), seq);
     let expected = object_prefix.append_segment(0);
     if requested != &expected {
         return None;
     }
-    let content = rib.produce_advertisement().encode_content();
     Some(crate::protocols::dv::signing::encode_inner_segmented_data(
         &expected,
         &content,
@@ -830,6 +850,7 @@ async fn fetcher_loop(
     handle: InProcHandle,
     mut advance_rx: mpsc::UnboundedReceiver<NeighborAdvance>,
     mut pfx_advance_rx: mpsc::UnboundedReceiver<NeighborAdvance>,
+    sync: Arc<DvSync>,
     pfx_sync: Arc<DvPfxSync>,
     rib: Arc<DvRib>,
     prefix_table: Arc<PrefixTable>,
@@ -841,9 +862,12 @@ async fn fetcher_loop(
         tokio::select! {
             biased;
             _ = cancel.cancelled() => break,
-            adv = advance_rx.recv() => {
-                let Some(adv) = adv else { break };
-                fetch_and_apply_adv(&mut consumer, &adv, &rib, pfx_sync.trust().as_ref(), &notify_recompute).await;
+            queued = advance_rx.recv() => {
+                let Some(queued) = queued else { break };
+                // The neighbour's newest advertisement, unless already applied.
+                if let Some(adv) = sync.start_fetch(&queued.name) {
+                    fetch_and_apply_adv(&mut consumer, &adv, &sync, &rib, &notify_recompute).await;
+                }
             }
             queued = pfx_advance_rx.recv() => {
                 let Some(queued) = queued else { break };
@@ -859,8 +883,8 @@ async fn fetcher_loop(
 async fn fetch_and_apply_adv(
     consumer: &mut Consumer,
     adv: &NeighborAdvance,
+    sync: &DvSync,
     rib: &DvRib,
-    trust: &dyn crate::protocols::dv::signing::DvTrust,
     notify_recompute: &tokio::sync::Notify,
 ) {
     // ndnd's `client.Consume` always segments; single-segment fetch
@@ -877,7 +901,7 @@ async fn fetch_and_apply_adv(
             // Refuse to apply Adv Data we can't trust. Insecure
             // deployments still pass since `DvInsecure::validate`
             // returns `true`.
-            if !crate::protocols::dv::signing::validate_inner_data(&data, trust) {
+            if !crate::protocols::dv::signing::validate_inner_data(&data, sync.trust().as_ref()) {
                 warn!(
                     target: t::ROUTING_DV,
                     peer = %adv.name, boot = adv.boot, seq = adv.seq,
@@ -892,9 +916,11 @@ async fn fetch_and_apply_adv(
             match Advertisement::decode_content(&content_bytes) {
                 Ok(advertisement) => {
                     let changes = rib.apply_advertisement(&adv.name, &advertisement);
-                    if !changes.is_empty() {
-                        notify_recompute.notify_waiters();
-                    }
+                    sync.mark_fetched(adv);
+                    // Any cost may have moved, not only a best route: our
+                    // advertisement carries second-best costs and the FIB
+                    // every path.
+                    notify_recompute.notify_one();
                     debug!(
                         target: t::ROUTING_DV,
                         peer = %adv.name, changes = changes.len(),
@@ -911,7 +937,7 @@ async fn fetch_and_apply_adv(
         Err(e) => debug!(
             target: t::ROUTING_DV,
             peer = %adv.name, boot = adv.boot, seq = adv.seq, err = %e,
-            "Adv Data fetch failed (will retry on next advance)",
+            "Adv Data fetch failed (retried on the neighbour's next Sync Interest)",
         ),
     }
 }
@@ -1022,7 +1048,6 @@ async fn dead_neighbor_loop(
                 if dead.is_empty() {
                     continue;
                 }
-                let mut any_change = false;
                 for neighbor in &dead {
                     debug!(
                         target: t::ROUTING_DV,
@@ -1030,23 +1055,22 @@ async fn dead_neighbor_loop(
                         "neighbour timed out; clearing face binding and RIB routes",
                     );
                     sync.forget_neighbor(neighbor);
-                    let changes = rib.remove_neighbor(neighbor);
-                    if !changes.is_empty() {
-                        any_change = true;
-                    }
+                    rib.remove_neighbor(neighbor);
                 }
-                if any_change {
-                    notify_recompute.notify_waiters();
-                }
+                notify_recompute.notify_one();
             }
         }
     }
 }
 
-/// Debounces notifications, recomputes via [`compute_fib_updates`],
-/// diffs against in-task state, applies deltas to the engine RIB.
+/// Debounces change notifications, then brings what derives from the DV
+/// RIB up to date: publishes our advertisement if it changed
+/// ([`DvSync::publish`] advances the seq; `adv_changed` has the next tick
+/// announce it to every neighbour), and recomputes routes via
+/// [`compute_fib_updates`], diffs them against in-task state and applies
+/// the deltas to the engine RIB.
 #[allow(clippy::too_many_arguments)]
-async fn fib_updater_loop(
+async fn recompute_loop(
     sync: Arc<DvSync>,
     rib: Arc<DvRib>,
     prefix_table: Arc<PrefixTable>,
@@ -1054,6 +1078,7 @@ async fn fib_updater_loop(
     engine_fib: Arc<ndn_engine::Fib>,
     network: Name,
     notify_recompute: Arc<tokio::sync::Notify>,
+    adv_changed: Arc<AtomicBool>,
     cancel: CancellationToken,
 ) {
     let mut installed: HashMap<Name, Vec<NextHop>> = HashMap::new();
@@ -1065,6 +1090,11 @@ async fn fib_updater_loop(
                 // Coalesce notify bursts (one advertisement applies
                 // many entries; recompute once per burst).
                 tokio::time::sleep(Duration::from_millis(50)).await;
+
+                if let Some(seq) = sync.publish(&rib.produce_advertisement()) {
+                    adv_changed.store(true, Ordering::Release);
+                    debug!(target: t::ROUTING_DV, adv_seq = seq, "advertisement changed");
+                }
 
                 let updates = compute_fib_updates(
                     &rib,
@@ -1082,7 +1112,7 @@ async fn fib_updater_loop(
                     adds = plan.adds.len(),
                     removes = plan.removes.len(),
                     affected = plan.affected.len(),
-                    "FIB updater applying diff to engine RIB",
+                    "applying route diff to engine RIB",
                 );
                 apply_plan(&plan, &engine_rib, &engine_fib);
                 installed = new_installed;
@@ -1125,7 +1155,7 @@ async fn fetch_and_apply_pfx(
                     let changes = prefix_table.apply_op_list(&ops);
                     pfx_sync.mark_fetched(adv);
                     if !changes.is_empty() {
-                        notify_recompute.notify_waiters();
+                        notify_recompute.notify_one();
                     }
                     debug!(
                         target: t::ROUTING_DV,
@@ -1151,7 +1181,7 @@ async fn fetch_and_apply_pfx(
 /// Serves four kinds of Interest delivered to our InProcFace via
 /// the engine's FIB:
 ///
-/// 1. Adv Data fetch → respond from `DvRib`.
+/// 1. Adv Data fetch → respond with the published advertisement.
 /// 2. Pfx Data fetch → respond from `PrefixTable`'s snap.
 /// 3. Pfx Sync Interest → decode peer state vector, enqueue advances
 ///    for the pfx-fetcher task; no Data response.
@@ -1160,7 +1190,6 @@ async fn producer_loop(
     handle: InProcHandle,
     sync: Arc<DvSync>,
     pfx_sync: Arc<DvPfxSync>,
-    rib: Arc<DvRib>,
     prefix_table: Arc<PrefixTable>,
     pfx_advance_tx: mpsc::UnboundedSender<NeighborAdvance>,
     cancel: CancellationToken,
@@ -1174,12 +1203,11 @@ async fn producer_loop(
     let serve_fut = producer.serve(move |interest, responder| {
         let sync = Arc::clone(&sync);
         let pfx_sync = Arc::clone(&pfx_sync);
-        let rib = Arc::clone(&rib);
         let prefix_table = Arc::clone(&prefix_table);
         let pfx_advance_tx = pfx_advance_tx.clone();
         let pfx_sync_group = pfx_sync_group.clone();
         async move {
-            if let Some(data) = build_adv_data_response(&sync, &rib, &interest.name) {
+            if let Some(data) = build_adv_data_response(&sync, &interest.name) {
                 let _ = responder.respond_bytes(data).await;
                 trace!(target: t::ROUTING_DV, requested = %interest.name, "served Adv Data");
                 return;
@@ -1552,7 +1580,7 @@ mod tests {
         // and bind /r2 → face 7 in DvSync.
         let proto_r1 = DvProtocol::new(DvConfig::new(name("/ndn"), name("/r1"), 100));
         let peer_r2 = crate::protocols::dv::sync::DvSync::new(name("/ndn"), name("/r2"), 200);
-        peer_r2.advance_seq();
+        peer_r2.publish_next();
         let wire = peer_r2.build_sync_interest(SyncKind::Active);
         let ctx = TrackCtx::new();
         let consumed = proto_r1.on_inbound(&wire, FaceId(7), &InboundMeta::none(), &ctx);
@@ -1573,7 +1601,7 @@ mod tests {
     fn on_inbound_installs_bootstrap_fib_on_first_face_binding() {
         let proto_r1 = DvProtocol::new(DvConfig::new(name("/ndn"), name("/r1"), 100));
         let peer_r2 = crate::protocols::dv::sync::DvSync::new(name("/ndn"), name("/r2"), 200);
-        peer_r2.advance_seq();
+        peer_r2.publish_next();
         let wire = peer_r2.build_sync_interest(SyncKind::Active);
         let ctx = TrackCtx::new();
         proto_r1.on_inbound(&wire, FaceId(7), &InboundMeta::none(), &ctx);
@@ -1596,9 +1624,9 @@ mod tests {
     fn on_inbound_rebinds_bootstrap_fib_when_face_changes() {
         let proto_r1 = DvProtocol::new(DvConfig::new(name("/ndn"), name("/r1"), 100));
         let peer_r2 = crate::protocols::dv::sync::DvSync::new(name("/ndn"), name("/r2"), 200);
-        peer_r2.advance_seq();
+        peer_r2.publish_next();
         let wire1 = peer_r2.build_sync_interest(SyncKind::Active);
-        peer_r2.advance_seq();
+        peer_r2.publish_next();
         let wire2 = peer_r2.build_sync_interest(SyncKind::Active);
         let ctx = TrackCtx::new();
         proto_r1.on_inbound(&wire1, FaceId(7), &InboundMeta::none(), &ctx);
@@ -1620,6 +1648,31 @@ mod tests {
         );
     }
 
+    /// Routes through a neighbour follow its face binding: a binding that
+    /// moves has the recompute task run, one that stays does not.
+    #[test]
+    fn on_inbound_face_change_triggers_recompute() {
+        use futures::FutureExt;
+        let proto_r1 = DvProtocol::new(DvConfig::new(name("/ndn"), name("/r1"), 100));
+        let peer_r2 = crate::protocols::dv::sync::DvSync::new(name("/ndn"), name("/r2"), 200);
+        let wire = peer_r2.build_sync_interest(SyncKind::Active);
+        let ctx = TrackCtx::new();
+        let recompute_due = || {
+            proto_r1
+                .notify_recompute
+                .notified()
+                .now_or_never()
+                .is_some()
+        };
+
+        proto_r1.on_inbound(&wire, FaceId(7), &InboundMeta::none(), &ctx);
+        assert!(recompute_due(), "first binding");
+        proto_r1.on_inbound(&wire, FaceId(7), &InboundMeta::none(), &ctx);
+        assert!(!recompute_due(), "same face");
+        proto_r1.on_inbound(&wire, FaceId(9), &InboundMeta::none(), &ctx);
+        assert!(recompute_due(), "moved to face 9");
+    }
+
     #[test]
     fn on_inbound_passive_sync_tracks_face_for_emission() {
         // Receiving a passive sync from /r2 on face 9 should add face 9
@@ -1627,7 +1680,7 @@ mod tests {
         // sync back to face 9.
         let proto_r1 = DvProtocol::new(DvConfig::new(name("/ndn"), name("/r1"), 100));
         let peer_r2 = crate::protocols::dv::sync::DvSync::new(name("/ndn"), name("/r2"), 200);
-        peer_r2.advance_seq();
+        peer_r2.publish_next();
         let wire = peer_r2.build_sync_interest(SyncKind::Passive);
         let ctx = TrackCtx::new();
         proto_r1.on_inbound(&wire, FaceId(9), &InboundMeta::none(), &ctx);
@@ -1644,7 +1697,6 @@ mod tests {
     #[test]
     fn first_tick_emits_active_sync_to_every_neighbour_face() {
         let proto = DvProtocol::new(DvConfig::new(name("/ndn"), name("/r1"), 100));
-        proto.sync().advance_seq();
         let ctx = TrackCtx::new();
         ctx.add_neighbor(name("/r2"), FaceId(7));
         ctx.add_neighbor(name("/r3"), FaceId(8));
@@ -1684,14 +1736,42 @@ mod tests {
         assert_eq!(first_count, 2);
     }
 
+    /// A changed advertisement is announced at the next tick, actively and
+    /// passively, without waiting out the sync interval.
+    #[test]
+    fn on_tick_announces_a_changed_advertisement_at_once() {
+        let mut cfg = DvConfig::new(name("/ndn"), name("/r1"), 100);
+        cfg.adv_sync_interval = Duration::from_secs(60);
+        cfg.pfx_sync_interval = Duration::from_secs(60);
+        let proto = DvProtocol::new(cfg);
+        let peer = crate::protocols::dv::sync::DvSync::new(name("/ndn"), name("/r3"), 300);
+        let ctx = TrackCtx::new();
+        ctx.add_neighbor(name("/r2"), FaceId(7));
+        proto.on_inbound(
+            &peer.build_sync_interest(SyncKind::Passive),
+            FaceId(9),
+            &InboundMeta::none(),
+            &ctx,
+        );
+        proto.on_tick(ctx.now, &ctx);
+        let first = ctx.sent().len();
+
+        proto.adv_changed.store(true, Ordering::Release);
+        proto.on_tick(ctx.now + Duration::from_secs(1), &ctx);
+        let announced: Vec<FaceId> = ctx.sent()[first..].iter().map(|(f, _)| *f).collect();
+        assert_eq!(announced, vec![FaceId(7), FaceId(9)], "active and passive");
+
+        proto.on_tick(ctx.now + Duration::from_secs(2), &ctx);
+        assert_eq!(ctx.sent().len(), first + 2, "announced once");
+    }
+
     #[test]
     fn on_tick_emits_passive_sync_to_recorded_passive_faces() {
         // /r2 sends us a passive sync first; the on_tick after should
         // send a passive Sync back on the same face.
         let proto = DvProtocol::new(DvConfig::new(name("/ndn"), name("/r1"), 100));
-        proto.sync().advance_seq();
         let peer = crate::protocols::dv::sync::DvSync::new(name("/ndn"), name("/r2"), 200);
-        peer.advance_seq();
+        peer.publish_next();
         let passive_in = peer.build_sync_interest(SyncKind::Passive);
         let ctx = TrackCtx::new();
         proto.on_inbound(&passive_in, FaceId(9), &InboundMeta::none(), &ctx);
@@ -1715,7 +1795,7 @@ mod tests {
         // up. Use try_recv() to confirm without an actual fetcher.
         let proto_r1 = DvProtocol::new(DvConfig::new(name("/ndn"), name("/r1"), 100));
         let peer = crate::protocols::dv::sync::DvSync::new(name("/ndn"), name("/r2"), 200);
-        peer.advance_seq();
+        peer.publish_next();
         let wire = peer.build_sync_interest(SyncKind::Active);
         let ctx = TrackCtx::new();
         proto_r1.on_inbound(&wire, FaceId(7), &InboundMeta::none(), &ctx);
@@ -1732,11 +1812,11 @@ mod tests {
     #[test]
     fn duplicate_sync_does_not_double_enqueue() {
         // Same (boot, seq) arriving twice on the sync layer should
-        // only generate ONE advance signal — DvSync's `apply_entry`
-        // skip rule already filters; we just verify the wiring.
+        // only queue ONE fetch — DvSync queues at most one per
+        // neighbour; we just verify the wiring.
         let proto = DvProtocol::new(DvConfig::new(name("/ndn"), name("/r1"), 100));
         let peer = crate::protocols::dv::sync::DvSync::new(name("/ndn"), name("/r2"), 200);
-        peer.advance_seq();
+        peer.publish_next();
         let wire = peer.build_sync_interest(SyncKind::Active);
         let ctx = TrackCtx::new();
         proto.on_inbound(&wire, FaceId(7), &InboundMeta::none(), &ctx);
@@ -1752,7 +1832,9 @@ mod tests {
     #[test]
     fn build_adv_data_response_returns_some_for_current_name() {
         let proto = DvProtocol::new(DvConfig::new(name("/ndn"), name("/r1"), 100));
-        let seq = proto.sync().advance_seq();
+        // The first advertisement is published at seq 1.
+        let seq = proto.sync().current_seq();
+        assert_eq!(seq, 1);
         // Stage 7b — segmented name: `/.../t=/v=/seg=0`. ndnd consumer
         // expresses Interest at this segmented name.
         let expected_name = proto
@@ -1780,7 +1862,6 @@ mod tests {
     #[test]
     fn build_adv_data_response_returns_none_for_stale_name() {
         let proto = DvProtocol::new(DvConfig::new(name("/ndn"), name("/r1"), 100));
-        proto.sync().advance_seq(); // current = 1
         // Request seq=99 (we've never published that).
         let stale = proto.sync().advertisement_data_name(100, 99);
         assert!(
@@ -1792,13 +1873,24 @@ mod tests {
         assert!(proto.build_adv_data_response(&wrong_boot).is_none());
     }
 
+    /// The Data served for a `(boot, seq)` never changes: a RIB change is
+    /// served once published, under the next seq.
     #[test]
-    fn build_adv_data_response_reflects_current_rib_state() {
-        // After applying a peer's advertisement, our outgoing
-        // advertisement should include the new destination — proving
-        // the producer-side path reads the live RIB.
+    fn build_adv_data_response_serves_the_published_advertisement() {
         let proto = DvProtocol::new(DvConfig::new(name("/ndn"), name("/r1"), 100));
-        let seq = proto.sync().advance_seq();
+        let served = |seq: u64| {
+            let requested = proto
+                .sync()
+                .advertisement_data_name(100, seq)
+                .append_segment(0);
+            proto.build_adv_data_response(&requested).map(|resp| {
+                let data = ndn_packet::Data::decode(resp).unwrap();
+                let content = bytes::Bytes::copy_from_slice(data.content().unwrap());
+                Advertisement::decode_content(&content).unwrap()
+            })
+        };
+        let teaches_r2 =
+            |adv: &Advertisement| adv.entries.iter().any(|e| e.destination == name("/r2"));
         let peer_adv = Advertisement {
             entries: vec![crate::protocols::dv::tlv::AdvEntry {
                 destination: name("/r2"),
@@ -1808,32 +1900,28 @@ mod tests {
             }],
         };
         proto.rib().apply_advertisement(&name("/peer"), &peer_adv);
+        assert!(!teaches_r2(&served(1).unwrap()), "seq 1 keeps its content");
 
-        let expected_name = proto
-            .sync()
-            .advertisement_data_name(100, seq)
-            .append_segment(0);
-        let resp = proto.build_adv_data_response(&expected_name).unwrap();
-        let data = ndn_packet::Data::decode(resp).unwrap();
-        let content = bytes::Bytes::copy_from_slice(data.content().unwrap());
-        let adv = Advertisement::decode_content(&content).unwrap();
-        assert!(
-            adv.entries.iter().any(|e| e.destination == name("/r2")),
-            "advertisement must include /r2 after peer taught us a route",
+        assert_eq!(
+            proto.sync().publish(&proto.rib().produce_advertisement()),
+            Some(2)
         );
+        assert!(served(1).is_none(), "only the current seq is served");
+        assert!(teaches_r2(&served(2).unwrap()));
     }
 
     #[test]
     fn pfx_sync_starts_with_independent_seq() {
         let proto = DvProtocol::new(DvConfig::new(name("/ndn"), name("/r1"), 100));
         // Adv Sync and Pfx Sync each have their own seq counter.
-        assert_eq!(proto.sync().current_seq(), 0);
-        assert_eq!(proto.pfx_sync().current_seq(), 0);
-        proto.sync().advance_seq();
+        // The first advertisement is published at Adv seq 1; Pfx has none yet.
         assert_eq!(proto.sync().current_seq(), 1);
+        assert_eq!(proto.pfx_sync().current_seq(), 0);
+        proto.sync().publish_next();
+        assert_eq!(proto.sync().current_seq(), 2);
         assert_eq!(proto.pfx_sync().current_seq(), 0);
         proto.pfx_sync().advance_seq();
-        assert_eq!(proto.sync().current_seq(), 1);
+        assert_eq!(proto.sync().current_seq(), 2);
         assert_eq!(proto.pfx_sync().current_seq(), 1);
     }
 
@@ -2019,7 +2107,7 @@ mod tests {
         let proto = DvProtocol::new(DvConfig::new(name("/ndn"), name("/r"), 100));
         let n1 = Arc::clone(&proto.notify_recompute);
         let n2 = Arc::clone(&proto.notify_recompute);
-        n1.notify_waiters(); // doesn't panic; multiple clones share the same Notify
+        n1.notify_one(); // doesn't panic; multiple clones share the same Notify
         assert!(Arc::ptr_eq(&n1, &n2));
     }
 
@@ -2027,7 +2115,7 @@ mod tests {
     fn on_face_down_clears_passive_binding() {
         let proto = DvProtocol::new(DvConfig::new(name("/ndn"), name("/r1"), 100));
         let peer = crate::protocols::dv::sync::DvSync::new(name("/ndn"), name("/r2"), 200);
-        peer.advance_seq();
+        peer.publish_next();
         let wire = peer.build_sync_interest(SyncKind::Passive);
         let ctx = TrackCtx::new();
         proto.on_inbound(&wire, FaceId(9), &InboundMeta::none(), &ctx);

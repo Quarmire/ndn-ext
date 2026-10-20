@@ -9,6 +9,7 @@
 //! - Adv/Pfx Data content is bare entries (no outer 0xC9/0x12D wrapper),
 //!   matching ndnd's `client.Produce`.
 
+mod fetches;
 pub mod fib;
 pub mod pfx_sync;
 pub mod prefix;

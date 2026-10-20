@@ -18,6 +18,10 @@ use bytes::Bytes;
 use ndn_packet::{Data, Interest, Name, NameComponent, encode::InterestBuilder};
 use ndn_sync::{NeighborAdvance, SvsLocal, SvsLocalError, decode_svs_data};
 use ndn_transport::FaceId;
+use parking_lot::Mutex;
+
+use crate::protocols::dv::fetches::FetchTracker;
+use crate::protocols::dv::tlv::Advertisement;
 
 const KW_DV: &[u8] = b"DV";
 const KW_ADS: &[u8] = b"ADS";
@@ -87,9 +91,11 @@ pub struct FaceChange {
 /// Outcome of processing one incoming Sync Interest.
 #[derive(Clone, Debug, Default)]
 pub struct SyncReceipt {
-    /// Neighbours whose `(boot, seq)` advanced — caller should fetch
-    /// `/localhop/<neighbor>/32=DV/32=ADV/t=<boot>/v=<seq>`.
-    pub advances: Vec<NeighborAdvance>,
+    /// Neighbours whose newest `(boot, seq)` has no applied advertisement
+    /// and no fetch queued — caller queues a fetch of
+    /// `/localhop/<neighbor>/32=DV/32=ADV/t=<boot>/v=<seq>`, taken with
+    /// [`DvSync::start_fetch`].
+    pub fetches: Vec<NeighborAdvance>,
     /// Neighbours whose face binding changed — caller may need to
     /// update FIB.
     pub face_changes: Vec<FaceChange>,
@@ -106,12 +112,19 @@ struct FaceBinding {
 }
 
 /// Owned by a router. Combines [`SvsLocal`] (self + neighbour
-/// `(boot, seq)` tracking) with face/active state. Pure state +
-/// codec; no I/O.
+/// `(boot, seq)` tracking) with face/active state, the published
+/// advertisement, and which neighbours' advertisements are applied.
+/// Pure state + codec; no I/O.
 pub struct DvSync {
     network: Name,
     router: Name,
     svs: SvsLocal,
+    /// Content of the advertisement published at the current seq. It
+    /// changes only together with the seq, so the Data served for a
+    /// `(boot, seq)` never changes.
+    advertised: Mutex<Bytes>,
+    /// Which neighbours' advertisements are applied or queued for fetch.
+    fetches: FetchTracker,
     faces: RwLock<HashMap<Name, FaceBinding>>,
     /// Defaults to [`crate::protocols::dv::signing::DvInsecure`]
     /// (`DigestSha256` outgoing, accepts every incoming packet —
@@ -143,6 +156,8 @@ impl DvSync {
             network,
             router: router.clone(),
             svs: SvsLocal::new(router, boot),
+            advertised: Mutex::new(Advertisement::default().encode_content()),
+            fetches: FetchTracker::default(),
             faces: RwLock::new(HashMap::new()),
             trust,
         }
@@ -239,9 +254,36 @@ impl DvSync {
         self.svs.current_seq()
     }
 
-    /// Call when the router's published advertisement changes.
-    pub fn advance_seq(&self) -> u64 {
-        self.svs.advance_seq()
+    /// Publish `adv` as this router's advertisement. One that differs from
+    /// the published advertisement advances the seq, so neighbours fetch
+    /// it; returns the new seq. The published one changes nothing.
+    pub fn publish(&self, adv: &Advertisement) -> Option<u64> {
+        let content = adv.encode_content();
+        let mut advertised = self.advertised.lock();
+        if *advertised == content {
+            return None;
+        }
+        // Under the lock, so `published` never pairs a seq with other content.
+        let seq = self.svs.advance_seq();
+        *advertised = content;
+        Some(seq)
+    }
+
+    /// The published advertisement's seq and content, read together.
+    pub fn published(&self) -> (u64, Bytes) {
+        let advertised = self.advertised.lock();
+        (self.svs.current_seq(), advertised.clone())
+    }
+
+    /// Take `neighbor`'s queued fetch: its newest known `(boot, seq)`,
+    /// unless that advertisement is already applied.
+    pub fn start_fetch(&self, neighbor: &Name) -> Option<NeighborAdvance> {
+        self.fetches.start(&self.svs, neighbor)
+    }
+
+    /// Record that `adv`'s advertisement was fetched and applied.
+    pub fn mark_fetched(&self, adv: &NeighborAdvance) {
+        self.fetches.applied(adv);
     }
 
     pub fn neighbor_seq(&self, name: &Name) -> Option<(u64, u64)> {
@@ -313,8 +355,10 @@ impl DvSync {
             if let Some(change) = self.update_face(&entry.name, incoming_face, is_active) {
                 receipt.face_changes.push(change);
             }
-            if let Some(adv) = self.svs.apply_entry(entry) {
-                receipt.advances.push(adv);
+            // A newer state, or one whose fetch failed: fetch it, unless queued.
+            self.svs.apply_entry(entry);
+            if let Some(fetch) = self.fetches.queue(&self.svs, &entry.name) {
+                receipt.fetches.push(fetch);
             }
         }
         Ok(receipt)
@@ -382,13 +426,15 @@ impl DvSync {
             .collect()
     }
 
-    /// Drop the face binding for `neighbor`. The underlying SVS state
-    /// is intentionally preserved: on rejoin, the SVS skip-rule
-    /// handles a new boot timestamp, and a same-boot higher-seq
-    /// rejoin picks up where we left off.
+    /// Drop the face binding for `neighbor` and forget its applied
+    /// advertisement, whose routes the caller drops. The underlying SVS
+    /// state is intentionally preserved: on rejoin, the SVS skip-rule
+    /// handles a new boot timestamp, and its next Sync Interest queues a
+    /// fetch even at the same `(boot, seq)`.
     pub fn forget_neighbor(&self, neighbor: &Name) {
         let mut faces = self.faces.write().expect("DvSync::faces poisoned");
         faces.remove(neighbor);
+        self.fetches.forget(neighbor);
     }
 }
 
@@ -409,6 +455,23 @@ impl NameAppendExt for Name {
     }
 }
 
+/// Test-only: publish an advertisement that differs from the published one.
+#[cfg(test)]
+impl DvSync {
+    pub(crate) fn publish_next(&self) -> u64 {
+        let adv = Advertisement {
+            entries: vec![crate::protocols::dv::tlv::AdvEntry {
+                destination: self.router.clone(),
+                next_hop: self.router.clone(),
+                cost: self.current_seq() + 1,
+                other_cost: u64::from(crate::protocols::dv::rib::INFINITY),
+            }],
+        };
+        self.publish(&adv)
+            .expect("differs from the published advertisement")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,6 +483,26 @@ mod tests {
 
     fn fresh(router: &str, boot: u64) -> DvSync {
         DvSync::new(name("/ndn"), name(router), boot)
+    }
+
+    #[test]
+    fn publish_advances_the_seq_only_for_a_new_advertisement() {
+        let dv = fresh("/r1", 100);
+        assert_eq!(dv.current_seq(), 0);
+        let seq = dv.publish_next();
+        assert_eq!(seq, 1);
+        let (published_seq, content) = dv.published();
+        assert_eq!(published_seq, 1);
+
+        let same = Advertisement::decode_content(&content).unwrap();
+        assert_eq!(dv.publish(&same), None, "the published one changes nothing");
+        assert_eq!(dv.published(), (1, content));
+
+        assert_eq!(dv.publish(&Advertisement::default()), Some(2));
+        assert_eq!(
+            dv.published(),
+            (2, Advertisement::default().encode_content())
+        );
     }
 
     #[test]
@@ -476,7 +559,7 @@ mod tests {
     #[test]
     fn build_sync_interest_active_is_valid_interest() {
         let dv = fresh("/r1", 100);
-        dv.advance_seq();
+        dv.publish_next();
         let wire = dv.build_sync_interest(SyncKind::Active);
         let interest = Interest::decode(wire).expect("Sync Interest must be valid");
         // Name should be the active sync prefix (with a trailing
@@ -504,30 +587,30 @@ mod tests {
         let r2 = fresh("/r2", 200);
 
         // r1 publishes an advertisement (seq -> 1) and sends an active sync.
-        r1.advance_seq();
+        r1.publish_next();
         let wire = r1.build_sync_interest(SyncKind::Active);
 
         // r2 receives it on face 7 as an active sync.
         let receipt = r2
             .process_sync_interest(&wire, FaceId(7), SyncKind::Active)
             .unwrap();
-        assert_eq!(receipt.advances.len(), 1);
-        assert_eq!(receipt.advances[0].name, name("/r1"));
-        assert_eq!(receipt.advances[0].boot, 100);
-        assert_eq!(receipt.advances[0].seq, 1);
+        assert_eq!(receipt.fetches.len(), 1);
+        assert_eq!(receipt.fetches[0].name, name("/r1"));
+        assert_eq!(receipt.fetches[0].boot, 100);
+        assert_eq!(receipt.fetches[0].seq, 1);
         assert_eq!(receipt.face_changes.len(), 1);
         assert_eq!(receipt.face_changes[0].neighbor, name("/r1"));
         assert_eq!(receipt.face_changes[0].new_face, FaceId(7));
         assert!(receipt.face_changes[0].now_active);
 
         // Symmetric: r2 sends, r1 receives on face 8.
-        r2.advance_seq();
-        r2.advance_seq();
+        r2.publish_next();
+        r2.publish_next();
         let wire = r2.build_sync_interest(SyncKind::Active);
         let receipt = r1
             .process_sync_interest(&wire, FaceId(8), SyncKind::Active)
             .unwrap();
-        assert_eq!(receipt.advances[0].seq, 2);
+        assert_eq!(receipt.fetches[0].seq, 2);
 
         // Both routers now have the other's (boot, seq) tracked.
         assert_eq!(r1.neighbor_seq(&name("/r2")), Some((200, 2)));
@@ -535,10 +618,10 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_sync_does_not_re_advance() {
+    fn duplicate_sync_does_not_queue_a_second_fetch() {
         let r1 = fresh("/r1", 100);
         let r2 = fresh("/r2", 200);
-        r1.advance_seq();
+        r1.publish_next();
         let wire = r1.build_sync_interest(SyncKind::Active);
 
         let first = r2
@@ -548,20 +631,53 @@ mod tests {
             .process_sync_interest(&wire, FaceId(7), SyncKind::Active)
             .unwrap();
 
-        assert_eq!(first.advances.len(), 1);
-        assert!(
-            second.advances.is_empty(),
-            "same (boot, seq) must not re-advance",
-        );
+        assert_eq!(first.fetches.len(), 1);
+        assert!(second.fetches.is_empty(), "a fetch is already queued");
         // Face binding stable across identical syncs.
         assert!(second.face_changes.is_empty());
+    }
+
+    /// A fetch takes the newest seq, a failed one is queued again by the
+    /// neighbour's next sync, and an applied one is not fetched again.
+    #[test]
+    fn neighbour_advertisement_is_fetched_until_applied() {
+        let r1 = fresh("/r1", 100);
+        let r2 = fresh("/r2", 200);
+        let sync = |r1: &DvSync| {
+            r2.process_sync_interest(
+                &r1.build_sync_interest(SyncKind::Active),
+                FaceId(7),
+                SyncKind::Active,
+            )
+            .unwrap()
+            .fetches
+        };
+        assert_eq!(sync(&r1).len(), 1);
+        // r1 changes again before the fetch starts: still one fetch, of seq 2.
+        r1.publish_next();
+        r1.publish_next();
+        assert!(sync(&r1).is_empty(), "already queued");
+        let fetch = r2.start_fetch(&name("/r1")).expect("not applied");
+        assert_eq!((fetch.boot, fetch.seq), (100, 2));
+
+        // The fetch failed: the same sync queues it again.
+        assert_eq!(sync(&r1).len(), 1);
+        let fetch = r2.start_fetch(&name("/r1")).expect("not applied");
+        r2.mark_fetched(&fetch);
+        assert!(sync(&r1).is_empty(), "applied");
+        assert!(r2.start_fetch(&name("/r1")).is_none());
+
+        // A forgotten neighbour is fetched again at the same seq: its
+        // routes were dropped with it.
+        r2.forget_neighbor(&name("/r1"));
+        assert_eq!(sync(&r1).len(), 1);
     }
 
     #[test]
     fn passive_does_not_overwrite_active() {
         let r2 = fresh("/r2", 200);
         let r1 = fresh("/r1", 100);
-        r1.advance_seq();
+        r1.publish_next();
         let active_wire = r1.build_sync_interest(SyncKind::Active);
         let passive_wire = r1.build_sync_interest(SyncKind::Passive);
 
@@ -588,7 +704,7 @@ mod tests {
     fn active_overwrites_passive() {
         let r2 = fresh("/r2", 200);
         let r1 = fresh("/r1", 100);
-        r1.advance_seq();
+        r1.publish_next();
         let passive_wire = r1.build_sync_interest(SyncKind::Passive);
         let active_wire = r1.build_sync_interest(SyncKind::Active);
 
@@ -613,7 +729,7 @@ mod tests {
     fn passive_face_change_tracked() {
         let r2 = fresh("/r2", 200);
         let r1 = fresh("/r1", 100);
-        r1.advance_seq();
+        r1.publish_next();
         let passive_wire = r1.build_sync_interest(SyncKind::Passive);
 
         let _ = r2
@@ -644,7 +760,7 @@ mod tests {
         // ≈ now. With a 60s dead-interval, it should NOT be reported as dead.
         let s = fresh("/me", 100);
         let peer = fresh("/r2", 200);
-        peer.advance_seq();
+        peer.publish_next();
         let wire = peer.build_sync_interest(SyncKind::Active);
         s.process_sync_interest(&wire, FaceId(7), SyncKind::Active)
             .unwrap();
@@ -659,7 +775,7 @@ mod tests {
         // immediately considered dead.
         let s = fresh("/me", 100);
         let peer = fresh("/r2", 200);
-        peer.advance_seq();
+        peer.publish_next();
         let wire = peer.build_sync_interest(SyncKind::Active);
         s.process_sync_interest(&wire, FaceId(7), SyncKind::Active)
             .unwrap();
@@ -676,7 +792,7 @@ mod tests {
     fn forget_neighbor_drops_face_binding() {
         let s = fresh("/me", 100);
         let peer = fresh("/r2", 200);
-        peer.advance_seq();
+        peer.publish_next();
         let wire = peer.build_sync_interest(SyncKind::Active);
         s.process_sync_interest(&wire, FaceId(7), SyncKind::Active)
             .unwrap();
@@ -684,8 +800,7 @@ mod tests {
 
         s.forget_neighbor(&name("/r2"));
         assert_eq!(s.neighbor_face(&name("/r2")), None);
-        // SVS state intact — a fresh sync with same (boot, seq) is
-        // therefore stale; with a higher seq, it advances.
+        // SVS state intact: the seq of a rejoining neighbour is known.
         assert_eq!(s.neighbor_seq(&name("/r2")), Some((200, 1)));
     }
 
@@ -696,7 +811,7 @@ mod tests {
         // them, because update_face refreshes last_seen.
         let s = fresh("/me", 100);
         let peer = fresh("/r2", 200);
-        peer.advance_seq();
+        peer.publish_next();
         let wire1 = peer.build_sync_interest(SyncKind::Active);
         s.process_sync_interest(&wire1, FaceId(7), SyncKind::Active)
             .unwrap();
@@ -737,14 +852,14 @@ mod tests {
     #[test]
     fn self_reflection_is_ignored_for_face_tracking() {
         let r1 = fresh("/r1", 100);
-        r1.advance_seq();
+        r1.publish_next();
         // r1 receives its own sync (could happen with a multicast loop
         // mis-configuration). Should NOT bind a face for self.
         let wire = r1.build_sync_interest(SyncKind::Active);
         let receipt = r1
             .process_sync_interest(&wire, FaceId(5), SyncKind::Active)
             .unwrap();
-        assert!(receipt.advances.is_empty(), "self-bounce must not advance");
+        assert!(receipt.fetches.is_empty(), "self-bounce must not fetch");
         assert!(
             receipt.face_changes.is_empty(),
             "self-bounce must not bind face",

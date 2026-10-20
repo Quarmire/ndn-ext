@@ -17,14 +17,14 @@
 //! Pure wire layer. I/O lives in [`super::protocol`]; PrefixOpList
 //! codec in [`super::tlv`]; table state in [`super::prefix`].
 
-use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
 use std::time::Duration;
 
 use bytes::Bytes;
 use ndn_packet::encode::InterestBuilder;
 use ndn_packet::{Data, Interest, Name, NameComponent};
 use ndn_sync::{NeighborAdvance, SvsLocal, SvsLocalError, decode_svs_data};
+
+use crate::protocols::dv::fetches::FetchTracker;
 
 const KW_DV: &[u8] = b"DV";
 const KW_PFS: &[u8] = b"PFS";
@@ -74,16 +74,7 @@ pub struct DvPfxSync {
     router: Name,
     svs: SvsLocal,
     trust: crate::protocols::dv::signing::DvTrustHandle,
-    fetches: Mutex<FetchState>,
-}
-
-/// Which peers' Prefix Data this router holds or is about to fetch.
-#[derive(Default)]
-struct FetchState {
-    /// Per router, the `(boot, seq)` whose Prefix Data was applied.
-    applied: HashMap<Name, (u64, u64)>,
-    /// Routers with a fetch queued.
-    queued: HashSet<Name>,
+    fetches: FetchTracker,
 }
 
 impl DvPfxSync {
@@ -109,12 +100,8 @@ impl DvPfxSync {
             router: router.clone(),
             svs: SvsLocal::new(router, boot),
             trust,
-            fetches: Mutex::new(FetchState::default()),
+            fetches: FetchTracker::default(),
         }
-    }
-
-    fn fetch_state(&self) -> std::sync::MutexGuard<'_, FetchState> {
-        self.fetches.lock().expect("DvPfxSync::fetches poisoned")
     }
 
     /// Queue a fetch for every router whose newest known `(boot, seq)` has
@@ -123,40 +110,18 @@ impl DvPfxSync {
     /// the next Pfx Sync Interest rather than at that router's next change.
     /// Returns the routers to queue.
     pub fn queue_unfetched(&self) -> Vec<NeighborAdvance> {
-        let mut state = self.fetch_state();
-        let mut queue = Vec::new();
-        for n in self.svs.neighbors() {
-            if state.applied.get(&n.name) != Some(&(n.boot, n.seq))
-                && state.queued.insert(n.name.clone())
-            {
-                queue.push(NeighborAdvance {
-                    name: n.name,
-                    boot: n.boot,
-                    seq: n.seq,
-                });
-            }
-        }
-        queue
+        self.fetches.queue_all(&self.svs)
     }
 
     /// Take `router`'s queued fetch: its newest known state, unless that
     /// state's Prefix Data is already applied.
     pub fn start_fetch(&self, router: &Name) -> Option<NeighborAdvance> {
-        let mut state = self.fetch_state();
-        state.queued.remove(router);
-        let (boot, seq) = self.neighbor_seq(router)?;
-        (state.applied.get(router) != Some(&(boot, seq))).then(|| NeighborAdvance {
-            name: router.clone(),
-            boot,
-            seq,
-        })
+        self.fetches.start(&self.svs, router)
     }
 
     /// Record that `adv`'s Prefix Data was fetched and applied.
     pub fn mark_fetched(&self, adv: &NeighborAdvance) {
-        self.fetch_state()
-            .applied
-            .insert(adv.name.clone(), (adv.boot, adv.seq));
+        self.fetches.applied(adv);
     }
 
     /// Pluggable trust policy.

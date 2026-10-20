@@ -22,6 +22,7 @@ ndn-app       = { workspace = true }
 ndn-face     = { workspace = true }
 bytes         = { workspace = true, features = ["std"] }
 dashmap       = { workspace = true }
+parking_lot   = "0.12"
 tokio         = { workspace = true, features = ["rt", "time", "macros", "test-util", "sync"] }
 tokio-util    = { workspace = true, features = ["rt"] }
 tracing       = { workspace = true }

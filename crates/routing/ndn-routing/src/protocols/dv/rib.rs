@@ -35,8 +35,8 @@ pub struct BestRoute {
 }
 
 /// Best-route delta emitted by [`DvRib::apply_advertisement`] and
-/// [`DvRib::remove_neighbor`] so downstream consumers (FIB-updater,
-/// dashboards) can react.
+/// [`DvRib::remove_neighbor`] so downstream consumers (diagnostics,
+/// dashboards) can react. Second-best costs can change without one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RibChange {
     pub destination: Name,
