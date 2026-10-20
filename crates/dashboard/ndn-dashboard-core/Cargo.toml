@@ -34,6 +34,7 @@ ndn-mgmt-wire = { workspace = true }
 ndn-security  = { path = "../../../../ndn-rs/crates/security/ndn-security", features = ["custodian"] }
 ndn-packet    = { workspace = true }
 ndn-tlv       = { workspace = true }
+ndn-transport = { workspace = true }
 # Native token-join (NDNCERT enrollment). Desktop/native only — pulled by the
 # `desktop` feature so the wasm build never compiles it.
 ndn-cert      = { workspace = true, optional = true }
