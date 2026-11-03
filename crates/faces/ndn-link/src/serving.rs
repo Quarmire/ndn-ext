@@ -293,6 +293,20 @@ impl Judge<'_> {
             .collect()
     }
 
+    /// The namespaces this device follows: the held ones (non-empty) it
+    /// holds no certificate in.
+    pub(crate) fn followed_namespaces(&self) -> Vec<Name> {
+        let own = self.own_namespaces();
+        let mut followed: Vec<Name> = Vec::new();
+        for ctx in self.trust.keyring().contexts() {
+            let ns = ctx.namespace();
+            if !ns.is_empty() && !own.contains(ns) && !followed.contains(ns) {
+                followed.push(ns.clone());
+            }
+        }
+        followed
+    }
+
     /// Whether the serving policy serves `id`, a device linking unasked,
     /// and its quota slot when it is served for a namespace other than this
     /// device's own.

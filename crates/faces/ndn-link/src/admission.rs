@@ -1394,9 +1394,9 @@ fn certificate_unauthenticated(certificate: &Name, ns: &Name) -> LinkDetail {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::peer::PeerSpec;
+    use crate::peer::{PeerSpec, RelaySource, RelayUse};
     use crate::serving::Quotas;
-    use ndn_security::{Ed25519Signer, LinkPolicy, Signer, encode_cert_data};
+    use ndn_security::{AdvertisedRelay, Ed25519Signer, LinkPolicy, Signer, encode_cert_data};
 
     fn n(s: &str) -> Name {
         s.parse().unwrap()
@@ -1707,6 +1707,52 @@ mod tests {
             refusal.detail.param("root"),
             Some(c.root_fingerprint().to_string().as_str())
         );
+    }
+
+    /// A link path to a relay the person added routes the namespaces this
+    /// device holds a certificate in, then each it follows (holds the trust
+    /// context of without a certificate in it); one to a relay a namespace
+    /// advertises routes the advertising namespace only. Relays are chosen
+    /// over the certificate namespaces alone.
+    #[tokio::test]
+    async fn a_user_relay_also_routes_the_followed_namespaces() {
+        let (a, b) = (namespace("/a", 10).await, namespace("/b", 20).await);
+        let keyring = Keyring::new();
+        assert!(
+            keyring.adopt(Arc::new(a.context().with_relays(vec![AdvertisedRelay {
+                device: n("/a/node/relay"),
+                key: None,
+                endpoints: vec!["relay.example:6363".into()],
+                preference: 0,
+            }])))
+        );
+        assert!(keyring.adopt(Arc::new(b.context())));
+        let (_, chain) = a.device("member", "laptop", 12).await;
+        let world = World::new(
+            Bare(Arc::new(keyring), None, chain),
+            Vec::new(),
+            ServePolicy::Own,
+        );
+        let judge = world.judge();
+        assert_eq!(judge.own_namespaces(), [n("/a")]);
+        assert_eq!(judge.followed_namespaces(), [n("/b")]);
+
+        let relay = |source| PeerSpec {
+            label: "relay".into(),
+            device: Some(n("/a/node/relay")),
+            relay_use: Some(RelayUse {
+                source,
+                preference: 0,
+            }),
+            ..PeerSpec::default()
+        };
+        let user = relay(RelaySource::User);
+        let advertised = relay(RelaySource::Namespace(n("/a")));
+        assert_eq!(judge.relay_routed_namespaces(&user), [n("/a"), n("/b")]);
+        assert_eq!(judge.relay_routed_namespaces(&advertised), [n("/a")]);
+        let own = judge.own_namespaces();
+        assert_eq!(judge.relay_namespaces_of(&user, &own), [n("/a")]);
+        assert_eq!(judge.relay_namespaces_of(&advertised, &own), [n("/a")]);
     }
 
     /// A listed relay serves a namespace it does not hold by its root key:

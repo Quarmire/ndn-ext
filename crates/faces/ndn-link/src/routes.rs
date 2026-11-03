@@ -10,7 +10,8 @@ use crate::peer::{PeerSpec, Peers};
 use crate::policy::VIA_RELAY_COST;
 
 /// The routes a relay this device uses gets: the namespaces of this device
-/// it is used for, at the relay's rank.
+/// it is used for (and, a relay the person added, the namespaces this
+/// device follows), at the relay's rank.
 pub(crate) struct RelayRoutes {
     pub(crate) namespaces: Vec<Name>,
     pub(crate) cost: u32,
@@ -90,7 +91,7 @@ pub fn group_routes<'a>(namespaces: impl IntoIterator<Item = &'a Name>, cost: u3
 
 /// The prefixes a link to `peer` will route, known before it is up (for
 /// the waiting routes of an on-demand link): its `routes`, else, for a
-/// relay it uses, the namespaces of this device it uses it for
+/// relay it uses, the namespaces its link path routes
 /// (`relay_namespaces`), else its device name.
 pub(crate) fn predicted_routes(peer: &PeerSpec, relay_namespaces: &[Name]) -> Vec<Name> {
     if let Some(routes) = &peer.routes {

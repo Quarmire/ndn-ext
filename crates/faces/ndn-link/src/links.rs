@@ -667,8 +667,8 @@ impl Links {
         }
         // The namespace route goes to a relay this device dials, whichever
         // side's dial this link came from (when both dial, one link stays);
-        // a relay this device uses routes its namespaces at the relay's
-        // rank.
+        // a relay this device uses routes its namespaces (and, one the
+        // person added, the namespaces it follows) at the relay's rank.
         let dials = admitted
             .peer
             .zip(peer.as_ref())
@@ -676,7 +676,7 @@ impl Links {
         let relay_routes = match (admitted.peer, &peer) {
             (Some(i), Some(p)) if p.relay_use.is_some() && kind == PathKind::Link => {
                 Some(RelayRoutes {
-                    namespaces: self.relay_namespaces(p),
+                    namespaces: self.judge().relay_routed_namespaces(p),
                     cost: self.relay_cost(i),
                 })
             }

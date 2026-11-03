@@ -261,7 +261,7 @@ impl Links {
                 if matches!(p.mode, LinkMode::OnDemand { .. })
                     && !self.paths.candidates(id, &p).is_empty() =>
             {
-                let prefixes = predicted_routes(&p, &self.relay_namespaces(&p));
+                let prefixes = predicted_routes(&p, &self.judge().relay_routed_namespaces(&p));
                 waiting.route(self, target, prefixes);
             }
             _ => waiting.unroute(self, &target),
