@@ -1709,13 +1709,14 @@ mod tests {
         );
     }
 
-    /// A link path to a relay the person added routes the namespaces this
-    /// device holds a certificate in, then each it follows (holds the trust
-    /// context of without a certificate in it); one to a relay a namespace
-    /// advertises routes the advertising namespace only. Relays are chosen
-    /// over the certificate namespaces alone.
+    /// A link path to a relay routes the namespaces it is used for — a
+    /// relay the person added: those this device holds a certificate in; a
+    /// relay a namespace advertises: the advertising namespace — then each
+    /// namespace this device follows (holds the trust context of without a
+    /// certificate in it). Relays are chosen over the certificate
+    /// namespaces alone.
     #[tokio::test]
-    async fn a_user_relay_also_routes_the_followed_namespaces() {
+    async fn a_relay_also_routes_the_followed_namespaces() {
         let (a, b) = (namespace("/a", 10).await, namespace("/b", 20).await);
         let keyring = Keyring::new();
         assert!(
@@ -1749,7 +1750,10 @@ mod tests {
         let user = relay(RelaySource::User);
         let advertised = relay(RelaySource::Namespace(n("/a")));
         assert_eq!(judge.relay_routed_namespaces(&user), [n("/a"), n("/b")]);
-        assert_eq!(judge.relay_routed_namespaces(&advertised), [n("/a")]);
+        assert_eq!(
+            judge.relay_routed_namespaces(&advertised),
+            [n("/a"), n("/b")]
+        );
         let own = judge.own_namespaces();
         assert_eq!(judge.relay_namespaces_of(&user, &own), [n("/a")]);
         assert_eq!(judge.relay_namespaces_of(&advertised, &own), [n("/a")]);

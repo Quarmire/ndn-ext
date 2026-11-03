@@ -6,9 +6,9 @@
 //!
 //! A relay is a peer with [`PeerSpec::relay_use`]. Its link routes the
 //! namespaces of this device it is used for (a relay the person added: all
-//! of them, and each namespace this device follows — holds the trust
-//! context of without a certificate in it; a relay a namespace advertises:
-//! each namespace of this device that advertises it) at a cost by rank —
+//! of them; a relay a namespace advertises: each namespace of this device
+//! that advertises it) and each namespace this device follows (holds the
+//! trust context of without a certificate in it), at a cost by rank —
 //! the most preferred relay 0, the next 1, … — so traffic takes the most
 //! preferred linked relay and moves to the next when it is lost. Choosing
 //! walks the relays by preference (of equal preference, a user's before
@@ -384,14 +384,11 @@ impl Judge<'_> {
 
     /// The namespaces a link path to the relay `peer` routes: the ones it
     /// counts for ([`Self::relay_namespaces_of`] over the namespaces this
-    /// device holds a certificate in), then, for a relay the person added,
-    /// each namespace this device follows.
+    /// device holds a certificate in), then each namespace this device
+    /// follows, whoever added the relay.
     pub(crate) fn relay_routed_namespaces(&self, peer: &PeerSpec) -> Vec<Name> {
         let mut routed = self.relay_namespaces_of(peer, &self.own_namespaces());
-        if matches!(
-            peer.relay_use.as_ref().map(|u| &u.source),
-            Some(RelaySource::User)
-        ) {
+        if peer.relay_use.is_some() {
             for ns in self.followed_namespaces() {
                 if !routed.contains(&ns) {
                     routed.push(ns);
