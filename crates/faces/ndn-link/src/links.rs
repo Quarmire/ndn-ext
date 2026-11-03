@@ -667,8 +667,8 @@ impl Links {
         }
         // The namespace route goes to a relay this device dials, whichever
         // side's dial this link came from (when both dial, one link stays);
-        // a relay this device uses routes its namespaces (and, one the
-        // person added, the namespaces it follows) at the relay's rank.
+        // a relay this device uses routes its namespaces and the ones it
+        // follows at the relay's rank.
         let dials = admitted
             .peer
             .zip(peer.as_ref())
@@ -712,7 +712,8 @@ impl Links {
         self.faces.add_face(face, self.cancel.child_token());
         self.faces.add_routes(face_id, &routes);
         // A served device of a namespace not held here: its Data crosses this
-        // forwarder unvalidated while it is linked.
+        // forwarder unvalidated while it is linked, and the namespace's group
+        // (routed over the link above) runs with multicast meanwhile.
         let transit: Vec<Name> = admitted
             .identities
             .iter()

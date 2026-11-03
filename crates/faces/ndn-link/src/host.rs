@@ -104,8 +104,12 @@ pub trait FaceSink: Send + Sync + 'static {
     /// forwarder carries the namespace's Data **in transit**: it forwards
     /// it to the Interests pending for it without validating it (it holds
     /// neither the namespace's trust context nor its certificates; the
-    /// devices that asked validate it) and caches none of it. A forwarder
-    /// that validates nothing in transit anyway does nothing here.
+    /// devices that asked validate it) and caches none of it, and it runs
+    /// the namespace's sync group (`<ns>/32=sync`, routed over each such
+    /// link: [`group_routes`](crate::group_routes)) with the multicast
+    /// strategy, as a forwarder holding the namespace does. A forwarder
+    /// that validates nothing carries no Data in transit, but still runs
+    /// the group so.
     fn transit(&self, namespace: &Name, served: bool);
 }
 

@@ -152,6 +152,7 @@ ndn-rtc-signaling-relay = { path = "crates/faces/ndn-rtc-signaling-relay" }
 ndn-strategy  = { path = "../ndn-rs/crates/forwarding/ndn-strategy" }
 ndn-security  = { path = "../ndn-rs/crates/security/ndn-security" }
 ndn-engine    = { path = "../ndn-rs/crates/forwarding/ndn-engine" }
+ndn-namespace = { path = "../ndn-rs/crates/security/ndn-namespace" }
 ndn-pathcontrol = { path = "../ndn-rs/crates/forwarding/ndn-pathcontrol" }
 ndn-app       = { path = "../ndn-rs/crates/app/ndn-app" }
 ndn-ipc       = { path = "../ndn-rs/crates/forwarding/ndn-ipc" }

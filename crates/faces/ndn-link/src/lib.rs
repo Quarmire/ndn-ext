@@ -68,12 +68,16 @@
 //! `node` device this device dials — its [`PathSource`] gives it a path —
 //! whichever side's dial the link came from) or the peer's device name, plus
 //! the routes of the peers reached through it (`relay`, at
-//! [`policy::VIA_RELAY_COST`]), plus the sync group `<ns>/32=sync` of each
-//! namespace this device holds that the peer was admitted in
-//! ([`group_routes`]; `ndn-rs/docs/specs/data-layer.md` §12), which the
-//! host's trust-context library runs with the multicast strategy. A
-//! revocation that takes a membership from a link takes its routes, the
-//! group's with them; the link's end takes them all. Persistent peers are
+//! [`policy::VIA_RELAY_COST`]), plus, for a served peer, the key names of
+//! the issuers its hello showed (consumers fetch its chain from it), plus
+//! the sync group `<ns>/32=sync` of each
+//! namespace the peer was admitted in — held here, or served by the
+//! serving policy ([`group_routes`]; `ndn-rs/docs/specs/data-layer.md`
+//! §12) — which runs with the multicast strategy: by the host's
+//! trust-context library for a held namespace, by the host's
+//! [`FaceSink::transit`] while a served one is in transit. A revocation
+//! that takes a membership from a link takes its routes, the group's with
+//! them; the link's end takes them all. Persistent peers are
 //! dialled again with [`Backoff`] whenever their link drops. Between two
 //! devices there is one link: when both dial, the link dialled by the device
 //! with the smaller key fingerprint stays ([`keeps_existing`]).
@@ -147,12 +151,15 @@
 //! advertise in their trust contexts, the ones its person added
 //! ([`PeerSpec::relay_use`]), or none; for each namespace it is a member
 //! of, the `count` most preferred reachable ones are linked, and traffic
-//! fails over to the next when one is lost.
+//! fails over to the next when one is lost. A relay's link routes the
+//! namespaces it is used for and each namespace this device follows.
 //! A relay of another namespace forwards signed packets it cannot forge, but
 //! it sees the names it forwards (and any content not encrypted end to
 //! end). It carries the Data of a namespace it serves but does not hold in
 //! transit, unvalidated and uncached ([`FaceSink::transit`]): the devices
-//! that asked for it validate it.
+//! that asked for it validate it. It needs no trust context of the people
+//! it carries: their devices' links route their namespace's sync group,
+//! which it runs with the multicast strategy while they are linked.
 //!
 //! # Link modes and reachability while asleep
 //!

@@ -12,7 +12,12 @@ use tokio_util::sync::CancellationToken;
 use crate::host::{FaceSink, Route};
 
 /// The engine: link faces as persistent faces, their routes as static RIB
-/// routes that cover the names under them.
+/// routes that cover the names under them. While a namespace is in transit
+/// it runs the namespace's sync group with the multicast strategy
+/// ([`ndn_namespace::sync_group::carry`]), so its devices linked here
+/// reach each other in it; the last transit of it ends that
+/// ([`ndn_namespace::sync_group::release`], which leaves a namespace the
+/// engine holds as the trust-context library set it).
 #[derive(Clone)]
 pub struct EngineFaces(pub ForwarderEngine);
 
@@ -61,9 +66,71 @@ impl FaceSink for EngineFaces {
     fn transit(&self, namespace: &Name, served: bool) {
         let transit = self.0.transit();
         if served {
-            transit.add(namespace);
+            transit.add(namespace, || {
+                ndn_namespace::sync_group::carry(&self.0, namespace);
+            });
         } else {
-            transit.remove(namespace);
+            transit.remove(namespace, || {
+                ndn_namespace::sync_group::release(&self.0, namespace);
+            });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use ndn_engine::{EngineBuilder, EngineConfig};
+    use ndn_security::{SecurityManager, SignedTrustContext};
+
+    use super::*;
+
+    fn n(s: &str) -> Name {
+        s.parse().unwrap()
+    }
+
+    /// The strategy set at exactly `prefix`, by name.
+    fn strategy_at(engine: &ForwarderEngine, prefix: &str) -> Option<String> {
+        engine
+            .strategy_table()
+            .dump()
+            .into_iter()
+            .find(|(p, _)| *p == n(prefix))
+            .map(|(_, s)| s.name().to_string())
+    }
+
+    /// A served namespace's group runs with multicast from its first
+    /// transit to its last; a held namespace's keeps the strategy the
+    /// trust-context library gave it.
+    #[tokio::test]
+    async fn a_namespace_in_transit_runs_its_group_with_multicast_until_the_last_transit_ends() {
+        let (engine, shutdown) = EngineBuilder::new(EngineConfig::default())
+            .security(Arc::new(SecurityManager::new()))
+            .build()
+            .await
+            .unwrap();
+        let faces = EngineFaces(engine.clone());
+        let visitor = n("/visitor");
+        faces.transit(&visitor, true);
+        faces.transit(&visitor, true);
+        let multicast = strategy_at(&engine, "/visitor/32=sync").expect("a strategy");
+        assert!(multicast.contains("multicast"), "{multicast}");
+        faces.transit(&visitor, false);
+        assert_eq!(
+            strategy_at(&engine, "/visitor/32=sync"),
+            Some(multicast.clone())
+        );
+        faces.transit(&visitor, false);
+        assert_eq!(strategy_at(&engine, "/visitor/32=sync"), None);
+
+        let home = n("/home");
+        let keyring = engine.keyring().expect("the engine validates");
+        assert!(keyring.adopt(Arc::new(SignedTrustContext::hierarchical(home.clone()))));
+        ndn_namespace::sync_group::carry(&engine, &home);
+        faces.transit(&home, true);
+        faces.transit(&home, false);
+        assert_eq!(strategy_at(&engine, "/home/32=sync"), Some(multicast));
+        shutdown.shutdown().await;
     }
 }
