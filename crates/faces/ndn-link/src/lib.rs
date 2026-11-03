@@ -68,10 +68,15 @@
 //! `node` device this device dials — its [`PathSource`] gives it a path —
 //! whichever side's dial the link came from) or the peer's device name, plus
 //! the routes of the peers reached through it (`relay`, at
-//! [`policy::VIA_RELAY_COST`]). Persistent peers are dialled again with
-//! [`Backoff`] whenever their link drops. Between two devices there is one
-//! link: when both dial, the link dialled by the device with the smaller key
-//! fingerprint stays ([`keeps_existing`]).
+//! [`policy::VIA_RELAY_COST`]), plus the sync group `<ns>/32=sync` of each
+//! namespace this device holds that the peer was admitted in
+//! ([`group_routes`]; `ndn-rs/docs/specs/data-layer.md` §12), which the
+//! host's trust-context library runs with the multicast strategy. A
+//! revocation that takes a membership from a link takes its routes, the
+//! group's with them; the link's end takes them all. Persistent peers are
+//! dialled again with [`Backoff`] whenever their link drops. Between two
+//! devices there is one link: when both dial, the link dialled by the device
+//! with the smaller key fingerprint stays ([`keeps_existing`]).
 //!
 //! # What a host provides
 //!
@@ -197,6 +202,7 @@ pub use peer::{LinkMode, PeerId, PeerSpec, RelaySource, RelayUse};
 pub use policy::Backoff;
 pub use presence::{DirectOptions, PRESENCE_MAX};
 pub use relays::RelayOptions;
+pub use routes::group_routes;
 pub use serving::{Quotas, ServePolicy};
 pub use status::{
     AsleepStatus, DirectState, DirectStatus, LinkReport, LinkStatus, PathKind, PathStatus,

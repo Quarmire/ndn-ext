@@ -2,6 +2,7 @@
 
 use ndn_cert::roles::Role;
 use ndn_packet::Name;
+use ndn_security::sync_group;
 
 use crate::admission::{Admitted, Enrollment, Identity};
 use crate::host::Route;
@@ -20,9 +21,11 @@ pub(crate) struct RelayRoutes {
 /// rank), else, for each identity the peer was admitted by, its namespace
 /// for a relay this device dials (a `node` device whose peer entry has a
 /// path — whichever side's dial the link came from) or its device name;
-/// and the routes of the peers reached through it. An enrollment link:
-/// none on the relay (answers return the way their Interests came), the
-/// namespace on the enrolling device.
+/// the routes of the peers reached through it; and the sync group of each
+/// namespace this device holds that the peer was admitted in
+/// ([`group_routes`]). An enrollment link: none on the relay (answers
+/// return the way their Interests came), the namespace on the enrolling
+/// device.
 pub(crate) fn routes_for(
     peers: &Peers,
     admitted: &Admitted,
@@ -54,6 +57,32 @@ pub(crate) fn routes_for(
                     .into_iter()
                     .map(at(base + VIA_RELAY_COST)),
             );
+        }
+    }
+    let held = admitted
+        .identities
+        .iter()
+        .filter(|id| id.served.is_none())
+        .map(|id| &id.namespace);
+    routes.extend(group_routes(held, base));
+    routes
+}
+
+/// The routes a link carrying `namespaces` gets for their sync groups:
+/// `<ns>/32=sync` ([`ndn_security::sync_group`]) for each, once, at `cost`.
+/// A link carries a namespace when its peer was admitted in it and this
+/// device holds it; its forwarder runs the group with the multicast
+/// strategy, so a Sync Interest goes over every such link and to the local
+/// member, whose own registration of the group sits beside these routes.
+/// They come and go with the link's other routes: added when it is up,
+/// taken when it ends or a revocation takes the namespace's membership
+/// from it.
+pub fn group_routes<'a>(namespaces: impl IntoIterator<Item = &'a Name>, cost: u32) -> Vec<Route> {
+    let mut routes: Vec<Route> = Vec::new();
+    for ns in namespaces {
+        let prefix = sync_group(ns);
+        if !routes.iter().any(|r| r.prefix == prefix) {
+            routes.push(Route { prefix, cost });
         }
     }
     routes
@@ -163,14 +192,15 @@ mod tests {
             routes_for(&peers, &relay, true, None),
             [
                 route("/home", 0),
-                route("/home/member/laptop", VIA_RELAY_COST)
+                route("/home/member/laptop", VIA_RELAY_COST),
+                route("/home/32=sync", 0)
             ]
         );
         // A node that linked in unasked is routed by its device name.
         let unasked = admitted(None, Some(id("/home/node/relay", Role::Node)), None);
         assert_eq!(
             routes_for(&peers, &unasked, false, None),
-            [route("/home/node/relay", 0)]
+            [route("/home/node/relay", 0), route("/home/32=sync", 0)]
         );
     }
 
@@ -202,7 +232,34 @@ mod tests {
         let inbound = admitted(Some(0), Some(id("/home/node/relay", Role::Node)), None);
         assert_eq!(
             routes_for(&peers, &inbound, false, None),
-            [route("/home/node/relay", 0)]
+            [route("/home/node/relay", 0), route("/home/32=sync", 0)]
+        );
+    }
+
+    /// The group of each held namespace the peer was admitted in goes over
+    /// the link once, whatever its name's length; a namespace this device
+    /// only serves (it does not hold it) gets none.
+    #[test]
+    fn a_link_routes_the_sync_group_of_each_held_namespace_it_carries() {
+        let peers = Peers::new(Vec::new());
+        let mut link = admitted(None, Some(id("/home/member/phone", Role::Member)), None);
+        let mut bob = id("/home/bob/member/phone", Role::Member);
+        bob.namespace = n("/home/bob");
+        let mut served = id("/visitor/member/tab", Role::Member);
+        served.namespace = n("/visitor");
+        served.served = Some(KeyFingerprint([7; 32]));
+        link.identities
+            .extend([id("/home/admin/phone", Role::Admin), bob, served]);
+        assert_eq!(
+            routes_for(&peers, &link, false, None),
+            [
+                route("/home/member/phone", 0),
+                route("/home/admin/phone", 0),
+                route("/home/bob/member/phone", 0),
+                route("/visitor/member/tab", 0),
+                route("/home/32=sync", 0),
+                route("/home/bob/32=sync", 0),
+            ]
         );
     }
 

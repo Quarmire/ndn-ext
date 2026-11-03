@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 use ndn_face_quic::{CloseReason, Direction, KeyFingerprint, LinkHandle};
 use ndn_packet::Name;
-use ndn_security::SignedTrustContext;
+use ndn_security::{SignedTrustContext, sync_group};
 use ndn_transport::{Face, FaceId};
 
 use crate::admission::Identity;
@@ -512,7 +512,11 @@ impl LinkTable {
                 link.close(CloseReason::Revoked, &text);
                 continue;
             }
-            let prefixes = [id.device.clone(), id.namespace.clone()];
+            let mut prefixes = vec![id.device.clone(), id.namespace.clone()];
+            // The namespace's sync group goes with the last identity in it.
+            if !link.identities.iter().any(|i| i.namespace == id.namespace) {
+                prefixes.push(sync_group(&id.namespace));
+            }
             let mut routes = Vec::new();
             for p in &mut link.paths {
                 let gone: Vec<Name> = p

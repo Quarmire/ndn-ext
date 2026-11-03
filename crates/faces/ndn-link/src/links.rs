@@ -196,8 +196,10 @@ impl Links {
     /// close each enrollment link for a namespace it now holds a
     /// certificate in, and each full link whose hello showed other
     /// namespaces than it holds now, and dial them again (a link the other
-    /// device dialled, it dials again); take punches under each of its
-    /// names; use the relays its namespaces advertise.
+    /// device dialled, it dials again); dial again now each peer whose last
+    /// dial failed, which may have refused the device it was then; take
+    /// punches under each of its names; use the relays its namespaces
+    /// advertise.
     pub fn identities_changed(self: &Arc<Self>) {
         let certificates: Vec<Name> = self
             .judge()
@@ -210,6 +212,10 @@ impl Links {
         self.take_punches();
         self.sync_namespace_relays();
         for (id, _) in self.peers.iter() {
+            let ctl = self.ctl(id);
+            if ctl.failing() {
+                ctl.kick();
+            }
             self.route_demand(id);
         }
     }

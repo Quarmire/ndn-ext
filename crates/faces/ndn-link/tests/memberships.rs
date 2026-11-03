@@ -203,12 +203,15 @@ impl LinkTrust for Trust {
     }
 }
 
-/// The link faces and routes a device's forwarder gets.
+/// The link faces and routes a device's forwarder gets: a face's routes go
+/// with it, as a forwarder drops them when the face is removed.
 #[derive(Default)]
 struct Recorder {
     next: AtomicU64,
     live: Mutex<Vec<FaceId>>,
     routes: Mutex<Vec<(FaceId, Route)>>,
+    /// Woken on every change of the faces or routes.
+    changed: tokio::sync::Notify,
 }
 
 impl Recorder {
@@ -218,6 +221,30 @@ impl Recorder {
             .iter()
             .map(|(_, r)| r.prefix.clone())
             .collect()
+    }
+
+    fn sorted_routes(&self) -> Vec<Name> {
+        let mut routed = self.routed();
+        routed.sort();
+        routed
+    }
+
+    /// Wait until `done` holds, woken by each change rather than polling.
+    async fn settles(&self, what: &str, done: impl Fn(&Self) -> bool) {
+        let wait = async {
+            loop {
+                let change = self.changed.notified();
+                tokio::pin!(change);
+                change.as_mut().enable();
+                if done(self) {
+                    return;
+                }
+                change.await;
+            }
+        };
+        tokio::time::timeout(T, wait)
+            .await
+            .unwrap_or_else(|_| panic!("{what}: not within {} s", T.as_secs()));
     }
 }
 
@@ -229,9 +256,12 @@ impl FaceSink for Recorder {
         if face.kind() == FaceKind::Quic {
             self.live.lock().push(face.id());
         }
+        self.changed.notify_waiters();
     }
     fn remove_face(&self, face: FaceId) {
         self.live.lock().retain(|f| *f != face);
+        self.routes.lock().retain(|(f, _)| *f != face);
+        self.changed.notify_waiters();
     }
     fn add_routes(&self, face: FaceId, routes: &[Route]) {
         if self.live.lock().contains(&face) {
@@ -239,11 +269,13 @@ impl FaceSink for Recorder {
                 .lock()
                 .extend(routes.iter().map(|r| (face, r.clone())));
         }
+        self.changed.notify_waiters();
     }
     fn remove_routes(&self, face: FaceId, prefixes: &[Name]) {
         self.routes
             .lock()
             .retain(|(f, r)| *f != face || !prefixes.contains(&r.prefix));
+        self.changed.notify_waiters();
     }
     fn transit(&self, _: &Name, _: bool) {}
 }
@@ -329,8 +361,8 @@ async fn phone(a: &Namespace, c: &Namespace) -> Phone {
 
 /// A relay serving only C (it holds C alone, and is `/c/node/relay`)
 /// admits the device holding A by its link key and C by a membership — by
-/// that membership, and routes it as its C device only. The device knows
-/// the relay by its own C membership.
+/// that membership, and routes it as its C device only, with C's sync
+/// group. The device knows the relay by its own C membership.
 #[tokio::test]
 async fn a_relay_serving_only_c_admits_an_a_and_c_device_by_its_c_membership() {
     let cancel = CancellationToken::new();
@@ -363,15 +395,16 @@ async fn a_relay_serving_only_c_admits_an_a_and_c_device_by_its_c_membership() {
         !at_relay.routed().is_empty()
     })
     .await;
-    assert_eq!(at_relay.routed(), [n("/c/member/phone")]);
-    // The relay is a node of C this device dials: C goes there.
-    assert_eq!(at_phone.routed(), [n("/c")]);
+    assert_eq!(at_relay.routed(), [n("/c/member/phone"), n("/c/32=sync")]);
+    // The relay is a node of C this device dials: C goes there, and C's
+    // sync group.
+    assert_eq!(at_phone.routed(), [n("/c"), n("/c/32=sync")]);
     cancel.cancel();
 }
 
 /// A relay of A alone admits the same device by its link key's certificate,
 /// as before memberships: its C membership is of a namespace the relay
-/// neither holds nor serves, and only A is routed.
+/// neither holds nor serves, and only A is routed (with A's sync group).
 #[tokio::test]
 async fn an_a_only_relay_admits_the_device_by_its_link_key_as_before() {
     let cancel = CancellationToken::new();
@@ -404,7 +437,7 @@ async fn an_a_only_relay_admits_the_device_by_its_link_key_as_before() {
         !at_relay.routed().is_empty()
     })
     .await;
-    assert_eq!(at_relay.routed(), [n("/a/member/phone")]);
+    assert_eq!(at_relay.routed(), [n("/a/member/phone"), n("/a/32=sync")]);
     cancel.cancel();
 }
 
@@ -610,9 +643,10 @@ async fn hellos_without_memberships_and_listeners_without_them_still_link() {
 }
 
 /// A relay of A and C admits the device by both its A link key and its C
-/// membership. Revoking its C key while it is linked takes C from the link
-/// (its C route goes) and keeps the link up by A; revoking its A key then
-/// leaves it no identity, and the link is closed.
+/// membership, and routes both its names and both namespaces' sync groups.
+/// Revoking its C key while it is linked takes C from the link (its C
+/// route and C's group go) and keeps the link up by A; revoking its A key
+/// then leaves it no identity, and the link is closed with its routes.
 #[tokio::test]
 async fn revoking_one_membership_keeps_the_link_by_another_and_the_last_closes_it() {
     let cancel = CancellationToken::new();
@@ -638,19 +672,24 @@ async fn revoking_one_membership_keeps_the_link_by_another_and_the_last_closes_i
         false,
         &cancel,
     );
-    until("the relay routes both of the phone's names", || {
-        at_relay.routed().len() == 2
-    })
-    .await;
-    let mut routed = at_relay.routed();
-    routed.sort();
-    assert_eq!(routed, [n("/a/member/phone"), n("/c/member/phone")]);
+    at_relay
+        .settles("the relay routes the phone in both namespaces", |r| {
+            r.sorted_routes()
+                == sorted(&[
+                    "/a/member/phone",
+                    "/a/32=sync",
+                    "/c/member/phone",
+                    "/c/32=sync",
+                ])
+        })
+        .await;
 
     assert!(keyring.adopt(c.context_revoking(2, Some("/c/member/phone/KEY/k"))));
-    until("the C route goes", || {
-        at_relay.routed() == [n("/a/member/phone")]
-    })
-    .await;
+    at_relay
+        .settles("the C routes go", |r| {
+            r.sorted_routes() == sorted(&["/a/member/phone", "/a/32=sync"])
+        })
+        .await;
     assert_eq!(
         at_relay.live.lock().len(),
         1,
@@ -658,9 +697,77 @@ async fn revoking_one_membership_keeps_the_link_by_another_and_the_last_closes_i
     );
 
     assert!(keyring.adopt(a.context_revoking(2, Some("/a/member/phone/KEY/k"))));
-    until("the link closes", || {
-        at_relay.live.lock().is_empty() && at_phone.live.lock().is_empty()
-    })
-    .await;
+    at_relay
+        .settles("the link closes with its routes", |r| {
+            r.live.lock().is_empty() && r.routed().is_empty()
+        })
+        .await;
+    at_phone
+        .settles("the device's side closes", |r| r.live.lock().is_empty())
+        .await;
+    cancel.cancel();
+}
+
+/// The names `names`, sorted.
+fn sorted(names: &[&str]) -> Vec<Name> {
+    let mut names: Vec<Name> = names.iter().map(|s| n(s)).collect();
+    names.sort();
+    names
+}
+
+/// A namespace's sync group follows the link: two devices of `/home/bob` (a
+/// namespace of two components) route `/home/bob/32=sync` over their link
+/// as soon as it is up, beside each other's names, and lose it with the
+/// link when it goes.
+#[tokio::test]
+async fn the_sync_group_is_routed_over_a_link_while_it_is_up() {
+    let cancel = CancellationToken::new();
+    let bob = namespace("/home/bob", 50).await;
+    let relay_key = bob.device("node", "relay", 92).await;
+    let (_relay, at_relay, addr) = start(
+        relay_key.link_key(),
+        Trust::new(&[&bob], relay_key.chain.clone(), Vec::new()),
+        Vec::new(),
+        true,
+        &cancel,
+    );
+    let phone_key = bob.device("member", "phone", 52).await;
+    let (phone, at_phone, _) = start(
+        phone_key.link_key(),
+        Trust::new(&[&bob], phone_key.chain.clone(), Vec::new()),
+        vec![relay_peer("/home/bob/node/relay", addr)],
+        false,
+        &cancel,
+    );
+    at_relay
+        .settles("the relay routes the phone and the group to it", |r| {
+            r.routed() == [n("/home/bob/member/phone"), n("/home/bob/32=sync")]
+        })
+        .await;
+    at_phone
+        .settles(
+            "the phone routes the namespace and the group to the relay",
+            |r| r.routed() == [n("/home/bob"), n("/home/bob/32=sync")],
+        )
+        .await;
+    let face = at_relay.live.lock()[0];
+    assert!(
+        at_relay.routes.lock().iter().all(|(f, _)| *f == face),
+        "the group goes to the link's face"
+    );
+
+    // The phone stops using the relay: the link goes, and the group with it
+    // on both sides.
+    phone.remove_peer(ndn_link::PeerId(0));
+    at_relay
+        .settles("the relay's link and its routes go", |r| {
+            r.live.lock().is_empty() && r.routed().is_empty()
+        })
+        .await;
+    at_phone
+        .settles("the phone's link and its routes go", |r| {
+            r.live.lock().is_empty() && r.routed().is_empty()
+        })
+        .await;
     cancel.cancel();
 }
