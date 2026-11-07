@@ -165,6 +165,7 @@ impl Links {
             if let Some(links) = weak.upgrade() {
                 runtime.spawn(async move {
                     links.sync_namespace_relays();
+                    links.followed_changed();
                     links.announce_all();
                 });
             }
@@ -211,12 +212,52 @@ impl Links {
         self.table.relink_changed(&self.shown_namespaces());
         self.take_punches();
         self.sync_namespace_relays();
+        self.followed_changed();
         for (id, _) in self.peers.iter() {
             let ctl = self.ctl(id);
             if ctl.failing() {
                 ctl.kick();
             }
             self.route_demand(id);
+        }
+    }
+
+    /// The namespaces this device follows (or holds a certificate in)
+    /// changed: a trust context was adopted, a membership began or ended,
+    /// or the host forgot a context. Each link path to a relay this device
+    /// uses routes the namespaces it routes over that relay now
+    /// (`relay_routed_namespaces`): one followed later is routed at once,
+    /// one no longer followed loses its route; an on-demand relay that is
+    /// down routes them to the waiting face. Called on every adoption and
+    /// identity change; a host calls it after [`Keyring::forget`].
+    ///
+    /// [`Keyring::forget`]: ndn_security::Keyring::forget
+    pub fn followed_changed(&self) {
+        let judge = self.judge();
+        let routed: HashMap<PeerId, Vec<Name>> = self
+            .peers
+            .iter()
+            .into_iter()
+            .filter(|(_, p)| p.relay_use.is_some() && p.routes.is_none())
+            .map(|(id, p)| (id, judge.relay_routed_namespaces(&p)))
+            .collect();
+        for change in self.table.reroute_relays(|id| routed.get(&id).cloned()) {
+            if !change.removed.is_empty() {
+                self.faces.remove_routes(change.face, &change.removed);
+            }
+            if !change.added.is_empty() {
+                self.faces.add_routes(change.face, &change.added);
+            }
+            tracing::info!(
+                target: "face.quic",
+                face = change.face.0,
+                added = ?change.added.iter().map(|r| r.prefix.to_string()).collect::<Vec<_>>(),
+                removed = ?change.removed.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
+                "the namespaces routed over a relay changed"
+            );
+        }
+        for id in routed.keys() {
+            self.route_demand(*id);
         }
     }
 
@@ -682,6 +723,11 @@ impl Links {
             }
             _ => None,
         };
+        // A relay entry with `routes` of its own routes those, whatever
+        // this device follows.
+        let relay = relay_routes
+            .clone()
+            .filter(|_| peer.as_ref().is_some_and(|p| p.routes.is_none()));
         let routes = routes_for(&self.peers, &admitted, dials, relay_routes);
         let registration = Registration {
             fingerprint: admitted.fingerprint,
@@ -698,6 +744,7 @@ impl Links {
                 since: Instant::now(),
                 sender,
                 routes: routes.clone(),
+                relay,
             },
         };
         let Some(generation) = self.table.register(registration, self.my_fingerprint()) else {

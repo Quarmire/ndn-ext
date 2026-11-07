@@ -12,7 +12,11 @@ use crate::policy::VIA_RELAY_COST;
 
 /// The routes a relay this device uses gets: the namespaces of this device
 /// it is used for and the namespaces this device follows, at the relay's
-/// rank.
+/// rank. A link path keeps the ones it routed, so a namespace followed
+/// later is routed over it at once ([`Links::followed_changed`]).
+///
+/// [`Links::followed_changed`]: crate::Links::followed_changed
+#[derive(Clone, Debug)]
 pub(crate) struct RelayRoutes {
     pub(crate) namespaces: Vec<Name>,
     pub(crate) cost: u32,
@@ -20,15 +24,19 @@ pub(crate) struct RelayRoutes {
 
 /// The routes over a link to the admitted peer: the peer's `routes`, else
 /// this device's namespaces for a relay it uses (`relay`: at the relay's
-/// rank), else, for each identity the peer was admitted by, its namespace
-/// for a relay this device dials (a `node` device whose peer entry has a
-/// path — whichever side's dial the link came from) or its device name;
-/// the routes of the peers reached through it; for each served identity,
-/// its issuers' key names ([`issuer_routes`]); and the sync group of each
-/// namespace the peer was admitted in, held here or served
-/// ([`group_routes`]). An enrollment link: none on the relay (answers
-/// return the way their Interests came), the namespace on the enrolling
-/// device.
+/// rank) followed by the relay's own default routes (its device name, or
+/// the namespace of a `node` this device dials), else, for each identity
+/// the peer was admitted by, its namespace for a relay this device dials
+/// (a `node` device whose peer entry has a path — whichever side's dial
+/// the link came from) or its device name; the routes of the peers reached
+/// through it; for each served identity, its issuers' key names
+/// ([`issuer_routes`]); and the sync group of each namespace the peer was
+/// admitted in, held here or served ([`group_routes`]). An enrollment
+/// link: none on the relay (answers return the way their Interests came),
+/// the namespace on the enrolling device. A prefix may appear twice (a
+/// relay namespace that is also a default route): the forwarder keeps one
+/// route per prefix and face, and a namespace no longer routed keeps the
+/// route its other entry needs.
 pub(crate) fn routes_for(
     peers: &Peers,
     admitted: &Admitted,
@@ -49,7 +57,11 @@ pub(crate) fn routes_for(
     let at = |cost| move |prefix| Route { prefix, cost };
     let peer = admitted.peer.and_then(|i| peers.get(i));
     let own = match (&relay, peer.as_ref().and_then(|p| p.routes.clone())) {
-        (Some(r), None) if !r.namespaces.is_empty() => r.namespaces.clone(),
+        (Some(r), None) => {
+            let mut own = r.namespaces.clone();
+            own.extend(default_routes(peer.as_deref(), &admitted.identities, dials));
+            own
+        }
         _ => default_routes(peer.as_deref(), &admitted.identities, dials),
     };
     let mut routes: Vec<Route> = own.into_iter().map(at(base)).collect();
@@ -115,15 +127,21 @@ pub fn group_routes<'a>(namespaces: impl IntoIterator<Item = &'a Name>, cost: u3
 /// The prefixes a link to `peer` will route, known before it is up (for
 /// the waiting routes of an on-demand link): its `routes`, else, for a
 /// relay it uses, the namespaces its link path routes
-/// (`relay_namespaces`), else its device name.
+/// (`relay_namespaces`) and its device name, else its device name.
 pub(crate) fn predicted_routes(peer: &PeerSpec, relay_namespaces: &[Name]) -> Vec<Name> {
     if let Some(routes) = &peer.routes {
         return routes.clone();
     }
-    if peer.relay_use.is_some() && !relay_namespaces.is_empty() {
-        return relay_namespaces.to_vec();
+    let mut routes = Vec::new();
+    if peer.relay_use.is_some() {
+        routes.extend_from_slice(relay_namespaces);
     }
-    peer.device.clone().into_iter().collect()
+    if let Some(device) = &peer.device
+        && !routes.contains(device)
+    {
+        routes.push(device.clone());
+    }
+    routes
 }
 
 fn default_routes(peer: Option<&PeerSpec>, identities: &[Identity], dials: bool) -> Vec<Name> {
@@ -228,8 +246,12 @@ mod tests {
         );
     }
 
+    /// A relay in use routes this device's namespaces at its rank, and its
+    /// own device name beside them (a relay of a namespace this device does
+    /// not hold is known by its entry's `device`), so an Interest whose
+    /// forwarding hint names the relay goes over its link.
     #[test]
-    fn a_relay_in_use_routes_this_devices_namespace_at_its_rank() {
+    fn a_relay_in_use_routes_this_devices_namespace_and_its_own_name_at_its_rank() {
         let mut community = spec("/other/node/relay", None);
         community.relay_use = Some(crate::peer::RelayUse {
             source: crate::peer::RelaySource::User,
@@ -245,6 +267,7 @@ mod tests {
             routes_for(&peers, &relay, true, Some(rank)),
             [
                 route("/home", 2),
+                route("/other/node/relay", 2),
                 route("/home/member/laptop", 2 + VIA_RELAY_COST)
             ]
         );

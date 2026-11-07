@@ -19,7 +19,8 @@ use ndn_face_quic::{
     LinkKeySource, LinkTransportConfig, MEMBERSHIP, Membership, PeerKey,
 };
 use ndn_link::{
-    ConfiguredEndpoints, FaceSink, LinkSetup, LinkTrust, Links, OwnMembership, PeerSpec, Route,
+    ConfiguredEndpoints, FaceSink, LinkSetup, LinkTrust, Links, OwnMembership, PeerSpec,
+    RelaySource, RelayUse, Route,
 };
 use ndn_packet::{Data, Name};
 use ndn_security::{
@@ -769,5 +770,61 @@ async fn the_sync_group_is_routed_over_a_link_while_it_is_up() {
             r.live.lock().is_empty() && r.routed().is_empty()
         })
         .await;
+    cancel.cancel();
+}
+
+/// A device of A using a relay its person added routes A and the relay's
+/// own name over the relay's link. A namespace it follows later (B's
+/// trust context adopted while linked, no certificate in it) is routed
+/// over that link at once, at the relay's rank; one it no longer follows
+/// (the host forgot it) loses its route, and A stays routed.
+#[tokio::test]
+async fn a_namespace_followed_later_is_routed_over_the_relay_link_at_once() {
+    let cancel = CancellationToken::new();
+    let (a, b) = (namespace("/a", 10).await, namespace("/b", 20).await);
+    let relay_key = a.device("node", "relay", 93).await;
+    let (_relay, _, addr) = start(
+        relay_key.link_key(),
+        Trust::new(&[&a], relay_key.chain.clone(), Vec::new()),
+        Vec::new(),
+        true,
+        &cancel,
+    );
+    let phone_key = a.device("member", "phone", 94).await;
+    let trust = Trust::new(&[&a], phone_key.chain.clone(), Vec::new());
+    let keyring = Arc::clone(&trust.keyring);
+    let relay = PeerSpec {
+        relay_use: Some(RelayUse {
+            source: RelaySource::User,
+            preference: 0,
+        }),
+        ..relay_peer("/a/node/relay", addr)
+    };
+    let (phone, at_phone, _) = start(phone_key.link_key(), trust, vec![relay], false, &cancel);
+    let over = |r: &Recorder, prefix: &str| {
+        let face = r.live.lock().first().copied();
+        r.routes
+            .lock()
+            .iter()
+            .any(|(f, route)| Some(*f) == face && route.prefix == n(prefix))
+    };
+    at_phone
+        .settles("the phone routes A over the relay link", |r| over(r, "/a"))
+        .await;
+    assert!(!over(&at_phone, "/b"), "B is routed before it is followed");
+
+    assert!(keyring.adopt(b.context()));
+    at_phone
+        .settles("B, followed now, is routed over the relay link", |r| {
+            over(r, "/b")
+        })
+        .await;
+
+    assert!(keyring.forget(&n("/b")));
+    phone.followed_changed();
+    at_phone
+        .settles("B, no longer followed, loses its route", |r| !over(r, "/b"))
+        .await;
+    assert!(over(&at_phone, "/a"), "A stays routed over the relay link");
     cancel.cancel();
 }

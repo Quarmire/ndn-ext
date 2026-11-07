@@ -21,6 +21,7 @@ use ndn_transport::{Face, FaceId};
 use crate::admission::Identity;
 use crate::host::Route;
 use crate::peer::PeerId;
+use crate::routes::RelayRoutes;
 use crate::status::{PathKind, PathStatus};
 
 /// Which link stays when a link to a device that is already linked comes
@@ -58,6 +59,18 @@ pub(crate) struct LinkPath {
     pub(crate) sender: Arc<Face>,
     /// The routes the path's face got.
     pub(crate) routes: Vec<Route>,
+    /// On a link path to a relay this device uses (with no `routes` of its
+    /// own): the namespaces it routes as the relay's and their cost, kept
+    /// current by [`LinkTable::reroute_relays`].
+    pub(crate) relay: Option<RelayRoutes>,
+}
+
+/// What a link path's face gains and loses when the namespaces it routes
+/// over a relay change ([`LinkTable::reroute_relays`]).
+pub(crate) struct Rerouted {
+    pub(crate) face: FaceId,
+    pub(crate) added: Vec<Route>,
+    pub(crate) removed: Vec<Name>,
 }
 
 /// A path that ended, as [`LinkTable::unregister`] reports it.
@@ -550,6 +563,59 @@ impl LinkTable {
             });
         }
         dropped
+    }
+
+    /// Route over each link path to a relay the namespaces `routed` gives
+    /// for its peer now (`None`: leave it): the path's record gains the
+    /// new ones and loses the ones no longer given, a prefix another of
+    /// its routes still needs staying routed. What each face gains and
+    /// loses, for the caller to give the forwarder.
+    pub(crate) fn reroute_relays(
+        &self,
+        routed: impl Fn(PeerId) -> Option<Vec<Name>>,
+    ) -> Vec<Rerouted> {
+        let mut out = Vec::new();
+        let mut live = self.live.lock();
+        for link in live.values_mut() {
+            let Some(now) = link.peer.and_then(&routed) else {
+                continue;
+            };
+            for p in &mut link.paths {
+                let path = &mut p.path;
+                let Some(relay) = path.relay.as_mut() else {
+                    continue;
+                };
+                let mut added = Vec::new();
+                for ns in now.iter().filter(|ns| !relay.namespaces.contains(ns)) {
+                    let route = Route {
+                        prefix: ns.clone(),
+                        cost: relay.cost,
+                    };
+                    if !path.routes.iter().any(|r| r.prefix == *ns) {
+                        added.push(route.clone());
+                    }
+                    path.routes.push(route);
+                }
+                let mut removed = Vec::new();
+                for ns in relay.namespaces.iter().filter(|ns| !now.contains(ns)) {
+                    if let Some(at) = path.routes.iter().position(|r| r.prefix == *ns) {
+                        path.routes.remove(at);
+                    }
+                    if !path.routes.iter().any(|r| r.prefix == *ns) {
+                        removed.push(ns.clone());
+                    }
+                }
+                relay.namespaces.clone_from(&now);
+                if !added.is_empty() || !removed.is_empty() {
+                    out.push(Rerouted {
+                        face: path.face,
+                        added,
+                        removed,
+                    });
+                }
+            }
+        }
+        out
     }
 }
 
