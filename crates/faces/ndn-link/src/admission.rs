@@ -627,7 +627,9 @@ impl Judge<'_> {
             );
         }
         let keyring = Keyring::new();
-        keyring.adopt(Arc::new(ctx));
+        keyring
+            .adopt(Arc::new(ctx))
+            .expect("a fresh keyring adopts the context");
         let cache = Arc::new(CertCache::new());
         for cert in chain {
             cache.insert(cert.clone());
@@ -1404,7 +1406,7 @@ mod tests {
 
     fn keyring_with(ctx: SignedTrustContext) -> Keyring {
         let keyring = Keyring::new();
-        assert!(keyring.adopt(Arc::new(ctx)));
+        keyring.adopt(Arc::new(ctx)).unwrap();
         keyring
     }
 
@@ -1634,14 +1636,14 @@ mod tests {
     /// enrollment links off, so refusals are not softened into them.
     async fn relay(own: &Namespace, held: &[&Namespace], serve: ServePolicy) -> World {
         let keyring = Keyring::new();
-        assert!(
-            keyring.adopt(Arc::new(own.context().with_link_policy(LinkPolicy {
+        keyring
+            .adopt(Arc::new(own.context().with_link_policy(LinkPolicy {
                 enrollment_links: false,
                 ..LinkPolicy::default()
             })))
-        );
+            .unwrap();
         for ns in held {
-            assert!(keyring.adopt(Arc::new(ns.context())));
+            keyring.adopt(Arc::new(ns.context())).unwrap();
         }
         let (_, chain) = own.device("node", "relay", 90).await;
         World::new(Bare(Arc::new(keyring), None, chain), Vec::new(), serve)
@@ -1719,15 +1721,15 @@ mod tests {
     async fn a_relay_also_routes_the_followed_namespaces() {
         let (a, b) = (namespace("/a", 10).await, namespace("/b", 20).await);
         let keyring = Keyring::new();
-        assert!(
-            keyring.adopt(Arc::new(a.context().with_relays(vec![AdvertisedRelay {
+        keyring
+            .adopt(Arc::new(a.context().with_relays(vec![AdvertisedRelay {
                 device: n("/a/node/relay"),
                 key: None,
                 endpoints: vec!["relay.example:6363".into()],
                 preference: 0,
             }])))
-        );
-        assert!(keyring.adopt(Arc::new(b.context())));
+            .unwrap();
+        keyring.adopt(Arc::new(b.context())).unwrap();
         let (_, chain) = a.device("member", "laptop", 12).await;
         let world = World::new(
             Bare(Arc::new(keyring), None, chain),

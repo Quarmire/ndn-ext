@@ -117,7 +117,7 @@ async fn device(home: &Home, name: &str, seed: u8, listen: bool, peers: Vec<Peer
         .await
         .unwrap();
     let keyring = Arc::new(Keyring::new());
-    assert!(keyring.adopt(Arc::clone(&home.context)));
+    keyring.adopt(Arc::clone(&home.context)).unwrap();
     let transport = LinkTransportConfig::default();
     let key: Arc<dyn LinkKeySource> = Arc::new(key);
     let socket = Arc::new(

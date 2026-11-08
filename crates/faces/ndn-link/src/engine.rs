@@ -126,7 +126,9 @@ mod tests {
 
         let home = n("/home");
         let keyring = engine.keyring().expect("the engine validates");
-        assert!(keyring.adopt(Arc::new(SignedTrustContext::hierarchical(home.clone()))));
+        keyring
+            .adopt(Arc::new(SignedTrustContext::hierarchical(home.clone())))
+            .unwrap();
         ndn_namespace::sync_group::carry(&engine, &home);
         faces.transit(&home, true);
         faces.transit(&home, false);

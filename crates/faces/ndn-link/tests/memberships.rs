@@ -176,7 +176,7 @@ impl Trust {
     fn new(held: &[&Namespace], chain: Vec<Bytes>, memberships: Vec<OwnMembership>) -> Self {
         let keyring = Keyring::new();
         for ns in held {
-            assert!(keyring.adopt(ns.context()));
+            keyring.adopt(ns.context()).unwrap();
         }
         Self {
             keyring: Arc::new(keyring),
@@ -685,7 +685,9 @@ async fn revoking_one_membership_keeps_the_link_by_another_and_the_last_closes_i
         })
         .await;
 
-    assert!(keyring.adopt(c.context_revoking(2, Some("/c/member/phone/KEY/k"))));
+    keyring
+        .adopt_update(c.context_revoking(2, Some("/c/member/phone/KEY/k")))
+        .unwrap();
     at_relay
         .settles("the C routes go", |r| {
             r.sorted_routes() == sorted(&["/a/member/phone", "/a/32=sync"])
@@ -697,7 +699,9 @@ async fn revoking_one_membership_keeps_the_link_by_another_and_the_last_closes_i
         "the link stays, admitted by A"
     );
 
-    assert!(keyring.adopt(a.context_revoking(2, Some("/a/member/phone/KEY/k"))));
+    keyring
+        .adopt_update(a.context_revoking(2, Some("/a/member/phone/KEY/k")))
+        .unwrap();
     at_relay
         .settles("the link closes with its routes", |r| {
             r.live.lock().is_empty() && r.routed().is_empty()
@@ -813,7 +817,7 @@ async fn a_namespace_followed_later_is_routed_over_the_relay_link_at_once() {
         .await;
     assert!(!over(&at_phone, "/b"), "B is routed before it is followed");
 
-    assert!(keyring.adopt(b.context()));
+    keyring.adopt(b.context()).unwrap();
     at_phone
         .settles("B, followed now, is routed over the relay link", |r| {
             over(r, "/b")
