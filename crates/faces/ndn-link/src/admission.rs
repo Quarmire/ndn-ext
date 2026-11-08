@@ -17,6 +17,7 @@ use ndn_face_quic::{
 use ndn_mgmt_wire::{LinkDetail, link_code as code};
 use ndn_packet::{Data, Name};
 use ndn_security::cert_name::key_name_of;
+use ndn_security::self_certifying::{key_digest, self_certifying_digest};
 use ndn_security::{
     CertCache, Certificate, Keyring, SignedTrustContext, ValidationResult, Validator,
 };
@@ -614,6 +615,30 @@ impl Judge<'_> {
                 .with("root", &root.name),
             );
         };
+        // A self-certifying namespace not held is known here only by its
+        // name: the root its devices chain to must be the genesis root the
+        // name hashes. A recovered or moved root is known only to a device
+        // that holds the namespace (adopted by name, from its genesis).
+        if let Ok(Some(digest)) = self_certifying_digest(&ns) {
+            let genesis_root = <[u8; 32]>::try_from(root.public_key.as_ref())
+                .is_ok_and(|key| key_digest(&key) == digest);
+            if !genesis_root {
+                return unusable(
+                    LinkDetail::new(
+                        code::FOREIGN_ROOT_INVALID_NAMESPACE,
+                        format!(
+                            "its root certificate {} is not the key its self-certifying \
+                             namespace {ns} hashes: a device that does not hold {ns} knows its \
+                             devices only by that genesis root; adopt {ns} by name to follow its \
+                             current root",
+                            root.name
+                        ),
+                    )
+                    .with("root", &root.name)
+                    .with("namespace", &ns),
+                );
+            }
+        }
         if !ctx.add_anchor(root.clone()) {
             return unusable(
                 LinkDetail::new(
@@ -626,10 +651,8 @@ impl Judge<'_> {
                 .with("root", &root.name),
             );
         }
-        let keyring = Keyring::new();
-        keyring
-            .adopt(Arc::new(ctx))
-            .expect("a fresh keyring adopts the context");
+        let keyring =
+            Keyring::of_claim(Arc::new(ctx)).expect("a namespace context names a valid namespace");
         let cache = Arc::new(CertCache::new());
         for cert in chain {
             cache.insert(cert.clone());
