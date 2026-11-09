@@ -15,7 +15,7 @@ mod common;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
-use common::{Engine, Host, World, engine, link, n, no_ring};
+use common::{Engine, Host, World, engine, link, n, no_quota, no_ring};
 use ndn_app::EngineAppExt;
 use ndn_packet::Name;
 use ndn_surface::signal::wire::{self, Packet};
@@ -190,11 +190,13 @@ async fn throughput(senders: usize, over_link: bool) -> (f64, f64, f64, u64, u64
     let world = World::new("/alice", &all).await;
     let (a, b) = engines(&world, over_link, &all[..all.len() - 1], &["/alice/phone"]).await;
     let b = b.as_ref().unwrap_or(&a);
-    let sender = if over_link {
+    // Four runs per device at 60 Hz push 240 Interests/s, over the default push
+    // budget: the engines here carry no relay quota, so it is raised.
+    let sender = no_quota(if over_link {
         no_ring()
     } else {
         SignalOptions::default()
-    };
+    });
     let mut hosts = Vec::new();
     for d in &devices {
         hosts.push(world.host(&a, d, sender.clone()).await);

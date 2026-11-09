@@ -41,6 +41,7 @@ mod state;
 pub mod wire;
 
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU32;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
@@ -49,7 +50,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use ed25519_dalek::VerifyingKey;
 use ndn_app::Connection;
-use ndn_data::{DataError, Device, NextStep, SignalKey, SignalRefusal, SignalScope};
+use ndn_data::{DataError, Device, NextStep, SignalKey, SignalRefusal, SignalScope, SignalSender};
 use ndn_foundation_types::{Name, NameComponent};
 use ndn_packet::{Data, Interest};
 use tokio::task::JoinHandle;
@@ -69,20 +70,48 @@ pub const RUN_LIFETIME_MAX: Duration = Duration::from_secs(24 * 3600);
 pub const SEND_RATE: u64 = 120;
 /// A sender's burst per run (§5).
 pub const SEND_BURST: u64 = 30;
-/// A receiver's packets per second per run (§5).
+/// A receiver's verified packets per second per run (§10), charged once a
+/// packet's run signature verifies.
 pub const RECEIVE_RATE_RUN: u64 = 240;
-/// A receiver's packets per second per scope (§5).
+/// A receiver's verified packets per second per scope (§10), charged once a
+/// packet's run signature verifies.
 pub const RECEIVE_RATE_SCOPE: u64 = 2000;
-/// Runs held per sender key per scope (§5).
+/// Signature checks per second of a scope's packets not verified yet (§10):
+/// four times its verified rate, so forgeries spend their own budget, never
+/// the verified traffic's.
+pub const CHECK_RATE_SCOPE: u64 = 4 * RECEIVE_RATE_SCOPE;
+/// Signature checks per second of packets not verified yet, per process
+/// (§10): about 0.8 s of one core's Ed25519 verification.
+pub const CHECK_RATE_PROCESS: u64 = 16_000;
+/// Runs held per sender key per scope (§8.4).
 pub const RUNS_PER_SENDER: usize = 4;
-/// Runs held per scope (§5).
+/// Runs held per sender namespace per scope (§8.4).
+pub const RUNS_PER_NAMESPACE: usize = 16;
+/// Runs held per scope (§8.4).
 pub const RUNS_PER_SCOPE: usize = 64;
-/// Run headers being admitted at once per process (§5).
-pub const ADMITTING_MAX: usize = 8;
+/// A run none of whose packets verified for this long may be let go for
+/// another at a cap (§8.4).
+pub const RUN_IDLE: Duration = Duration::from_secs(60);
+/// Run headers being admitted at once per scope (§8.1).
+pub const ADMITTING_PER_SCOPE: usize = 8;
+/// Run headers being admitted at once per sender namespace (§8.1).
+pub const ADMITTING_PER_NAMESPACE: usize = 2;
 /// Packets of a run kept while its header is admitted; more are `unknown_run`.
 pub const WAITING_MAX: usize = 32;
+/// How long after this process first sees an epoch superseded it still
+/// opens packets sealed under that epoch's signal key (§4.2).
+pub const EPOCH_GRACE: Duration = Duration::from_secs(60);
 /// How often a header rides again in its run's packets.
 pub const HEADER_EVERY: Duration = Duration::from_secs(1);
+/// The default push budget of a process: push Interests per second, shared by
+/// all its runs (§5). A packet costs one push Interest per group it goes into.
+/// A relay serving under quotas counts every packet a device sends, 100/s per
+/// key by default (ndn-link §15.3); 80 leaves a fifth of it to the device's
+/// Data, sync and certificate traffic.
+pub const PUSH_RATE: NonZeroU32 = NonZeroU32::new(80).unwrap();
+/// The default push burst of a process, in push Interests: twice the rate, as a
+/// relay's quota bursts (200 for 100/s).
+pub const PUSH_BURST: NonZeroU32 = NonZeroU32::new(160).unwrap();
 
 /// Slots of a run's local ring: two seconds at the sender's full rate.
 const RING_SLOTS: u32 = 256;
@@ -90,6 +119,9 @@ const RING_SLOTS: u32 = 256;
 const RING_READERS: u32 = 32;
 /// Least time between two refreshes of the signal keys on an unknown key id.
 const KEY_REFRESH_EVERY_US: u64 = 1_000_000;
+/// How often the signal keys are asked of the device again while known ids
+/// arrive, so an epoch superseded is noticed and its grace starts (§4.2).
+const KEY_CONFIRM_EVERY_US: u64 = 5_000_000;
 
 /// A clock: µs since the Unix epoch.
 pub type SignalClock = Arc<dyn Fn() -> u64 + Send + Sync>;
@@ -110,6 +142,16 @@ pub struct SignalOptions {
     /// `NotAfter`, expiry, header re-rides, rate buckets, renewal). `None`: the
     /// system clock. A host running on a virtual clock gives its own.
     pub clock: Option<SignalClock>,
+    /// The push Interests per second this process sends, shared by all its runs:
+    /// [`PUSH_RATE`]. A packet costs one per group it goes into, so a run at
+    /// 60 Hz fits into one group, and into more only batched
+    /// ([`SignalRun::send_batch`]). Kept below a relay's quota per device
+    /// (ndn-link §15.3); a host whose links carry no quota (its own relays, a
+    /// forwarder with no serving quota) may raise it.
+    pub push_rate: NonZeroU32,
+    /// The push Interests this process may send at once: [`PUSH_BURST`]. One send
+    /// over it (a packet into more groups) is let from a full budget.
+    pub push_burst: NonZeroU32,
 }
 
 impl Default for SignalOptions {
@@ -120,6 +162,8 @@ impl Default for SignalOptions {
             local_ring: true,
             clock_skew: Duration::from_secs(30),
             clock: None,
+            push_rate: PUSH_RATE,
+            push_burst: PUSH_BURST,
         }
     }
 }
@@ -132,6 +176,8 @@ impl std::fmt::Debug for SignalOptions {
             .field("local_ring", &self.local_ring)
             .field("clock_skew", &self.clock_skew)
             .field("clock", &self.clock.as_ref().map(|_| "host"))
+            .field("push_rate", &self.push_rate)
+            .field("push_burst", &self.push_burst)
             .finish()
     }
 }
@@ -228,10 +274,14 @@ pub enum SignalError {
         /// The limit.
         max: usize,
     },
-    /// Over the sender's rate (§5). Next: send after `retry_after`, or batch.
+    /// Over the run's rate, or over the process's push budget, which counts each
+    /// packet once per group it goes into (§5). Next: send after `retry_after`,
+    /// batch with `send_batch`, or send less.
     #[error(
-        "over the run's rate of {SEND_RATE} packets/s (burst {SEND_BURST}); send after \
-         {retry_after:?}, or batch"
+        "over the run's rate of {SEND_RATE} packets/s (burst {SEND_BURST}) or this process's \
+         push budget (SignalOptions::push_rate), which counts each packet once per group of the \
+         scope; send after {retry_after:?}, batch signals into one packet with send_batch, or \
+         send less"
     )]
     RateLimited {
         /// When a send is let again.
@@ -360,12 +410,20 @@ impl Reason {
                 "nothing here: the record in force here admits no such sender; its owner shares \
                  the scope with it, or this device fetches the newer record"
             }
-            Reason::BadSignature => "nothing: forged, altered on the way, or a revoked key",
+            Reason::BadSignature => {
+                "nothing: forged, altered on the way, a revoked key, or a device certificate \
+                 expired (its device renews it)"
+            }
             Reason::UnknownRun => "nothing: the run's header rides again within a second",
             Reason::UnknownKey => {
-                "nothing: this device holds no signal key of that epoch yet and asks for it"
+                "nothing: this device holds no signal key of that epoch yet and asks for it, or \
+                 the epoch was superseded past its grace and its sender seals under the newer \
+                 one once it holds that epoch's record"
             }
-            Reason::Flood => "nothing here: the sender is over the limits of §5",
+            Reason::Flood => {
+                "nothing here: the sender, or whoever forges its packets, is over the limits of \
+                 signals.md §10"
+            }
             Reason::Malformed => {
                 "nothing here: the sender's program writes what this one doesn't read"
             }
@@ -394,18 +452,26 @@ impl Reason {
 struct ScopeState {
     queues: Vec<Weak<Queue>>,
     latest: Latest,
+    /// The scope's verified packets ([`RECEIVE_RATE_SCOPE`]).
     rate: Bucket,
+    /// Signature checks of its packets not verified yet ([`CHECK_RATE_SCOPE`]).
+    checks: Bucket,
     sealed: bool,
 }
 
 struct RunState {
     scope: Name,
     sender: Name,
+    /// The sender's namespace, which runs are capped by (§8.4).
+    namespace: Name,
     key: VerifyingKey,
     start: u64,
     not_after: u64,
     window: ReplayWindow,
+    /// The run's verified packets ([`RECEIVE_RATE_RUN`]).
     rate: Bucket,
+    /// When a packet of the run last verified, or it was admitted (µs).
+    verified_us: u64,
 }
 
 /// A packet of a run whose header is being admitted, processed once it is.
@@ -413,6 +479,16 @@ struct Waiting {
     body: Body,
     sealed: bool,
     local: bool,
+    /// Its run signature verified already (it carried a header, §8.1 step 4).
+    verified: bool,
+}
+
+/// A run header being admitted (§8.1 step 4): the slots it takes, and the
+/// run's packets waiting for it.
+struct Admitting {
+    scope: Name,
+    namespace: Name,
+    waiting: Vec<Waiting>,
 }
 
 #[derive(Default)]
@@ -420,9 +496,17 @@ struct HubState {
     scopes: HashMap<Name, ScopeState>,
     keys: HashMap<[u8; wire::KEY_ID_LEN], (Name, SignalKey)>,
     keys_refreshed_us: Option<u64>,
+    /// When this process first saw each signal key superseded by a newer
+    /// epoch's (µs, §4.2).
+    superseded: HashMap<[u8; wire::KEY_ID_LEN], u64>,
     runs: HashMap<RunId, RunState>,
-    /// Runs whose header is being admitted, with the packets that wait for it.
-    admitting: HashMap<RunId, Vec<Waiting>>,
+    /// Run headers being admitted.
+    admitting: HashMap<RunId, Admitting>,
+    /// The device's `signal_revocations` the runs held were admitted under.
+    revocations: u64,
+    /// Signature checks of packets not verified yet in this process
+    /// ([`CHECK_RATE_PROCESS`]), from the first.
+    checks: Option<Bucket>,
     /// This process's runs (never attached to), and the rings of those that opened one.
     own: HashSet<RunId>,
     rings: HashMap<RunId, NamedPublisher>,
@@ -437,13 +521,15 @@ struct Hub {
     state: Mutex<HubState>,
     closed: AtomicBool,
     tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// The process's push budget, in push Interests (`SignalOptions::push_rate`).
+    push: Mutex<Bucket>,
 }
 
-/// A header admitted: the run it starts.
-struct Admitted {
-    sender: Name,
-    key: VerifyingKey,
+/// A run header checked before its admission (§8.1 step 4).
+struct Checked {
+    data: Data,
     body: RunHeaderBody,
+    key: VerifyingKey,
 }
 
 type Dropped = (Reason, String);
@@ -497,12 +583,9 @@ impl Hub {
         let (body, sealed) = match decoded {
             Packet::Body(b) => (b, false),
             Packet::Sealed(s) => {
-                let Some((scope, key)) = self.key_for(&s.key_id) else {
-                    return self.drop_packet(
-                        Reason::UnknownKey,
-                        None,
-                        &format!("sealed under the key id {:02x?}", s.key_id),
-                    );
+                let (scope, key) = match self.key_for(&s.key_id) {
+                    Ok(k) => k,
+                    Err(why) => return self.drop_packet(Reason::UnknownKey, None, &why),
                 };
                 let Some(plain) = crypto::open(key.expose(), &s) else {
                     return self.drop_packet(
@@ -531,56 +614,66 @@ impl Hub {
                 (body, true)
             }
         };
-        self.process(body, sealed, local, false, scratch);
+        self.process(body, sealed, local, false, false, scratch);
     }
 
-    /// The signal key of `id`, among the subscribed scopes' keys; on an unknown id
-    /// the keys are asked of the device again, at most once a second.
-    fn key_for(&self, id: &[u8; wire::KEY_ID_LEN]) -> Option<(Name, SignalKey)> {
+    /// The signal key of `id`, among the subscribed scopes' keys, unless its
+    /// epoch was superseded here more than [`EPOCH_GRACE`] ago (§4.2); else
+    /// why not. The keys are asked of the device again on an unknown id at
+    /// most once a second, and while known ids arrive every
+    /// [`KEY_CONFIRM_EVERY_US`], so a superseded epoch is noticed.
+    fn key_for(&self, id: &[u8; wire::KEY_ID_LEN]) -> Result<(Name, SignalKey), String> {
         let now = self.now_us();
         let scopes: Vec<Name> = {
             let mut st = self.lock();
-            if let Some(k) = st.keys.get(id) {
-                return Some(k.clone());
-            }
+            let every = match st.keys.contains_key(id) {
+                true => KEY_CONFIRM_EVERY_US,
+                false => KEY_REFRESH_EVERY_US,
+            };
             if st
                 .keys_refreshed_us
-                .is_some_and(|t| now.saturating_sub(t) < KEY_REFRESH_EVERY_US)
+                .is_some_and(|t| now.saturating_sub(t) < every)
             {
-                return None;
+                return key_in(&st, id, now);
             }
             st.keys_refreshed_us = Some(now);
             st.scopes.keys().cloned().collect()
         };
         for scope in scopes {
             if let Ok(s) = self.device.signal_scope(&scope) {
-                set_keys(&mut self.lock(), &scope, &s);
+                set_keys(&mut self.lock(), &scope, &s, now);
             }
         }
-        self.lock().keys.get(id).cloned()
+        key_in(&self.lock(), id, now)
     }
 
-    /// The checks of a decoded body: of its run before verification, then the
-    /// run signature and the sender's membership, then per signal.
+    /// The checks of a decoded body: of its run before verification (a
+    /// signature check taken from the budgets of packets not verified yet),
+    /// then the run signature and the sender's membership, then the run's
+    /// and scope's rates of verified packets, then per signal.
     ///
     /// While a run's header is admitted, and until the packets that waited for it
     /// are processed in their order, its packets wait behind them; `drained`
-    /// marks one the admission hands back.
+    /// marks one the admission hands back, `verified` one whose run signature
+    /// verified already (it carried the header).
     fn process(
         self: &Arc<Self>,
         body: Body,
         sealed: bool,
         local: bool,
         drained: bool,
+        verified: bool,
         scratch: &mut Vec<u8>,
     ) {
         let now = self.now_us();
         let now_ms = now / 1000;
         let skew = self.skew_ms();
         let run_id = body.run;
+        let revocations = self.device.signal_revocations();
         let (key, sender) = {
             let mut guard = self.lock();
             let st = &mut *guard;
+            walk_again(st, revocations);
             let Some(scope) = st.scopes.get_mut(&body.scope) else {
                 return self.drop_packet(
                     Reason::Unsubscribed,
@@ -598,12 +691,13 @@ impl Hub {
                     &format!("unsealed, and {} is sealed", body.scope),
                 );
             }
-            if !drained && let Some(waiting) = st.admitting.get_mut(&run_id) {
-                if waiting.len() < WAITING_MAX {
-                    waiting.push(Waiting {
+            if !drained && let Some(admitting) = st.admitting.get_mut(&run_id) {
+                if admitting.waiting.len() < WAITING_MAX {
+                    admitting.waiting.push(Waiting {
                         body,
                         sealed,
                         local,
+                        verified,
                     });
                 } else {
                     self.drop_packet(
@@ -616,7 +710,10 @@ impl Hub {
             }
             let Some(run) = st.runs.get_mut(&run_id) else {
                 match body.header.clone() {
-                    Some(header) => self.admit(st, body, sealed, local, header),
+                    Some(header) => {
+                        drop(guard);
+                        self.admit(body, sealed, local, header, scratch);
+                    }
                     None => self.drop_packet(
                         Reason::UnknownRun,
                         Some(&run_id),
@@ -663,23 +760,14 @@ impl Hub {
                     "a sequence the run's window has seen, or older than it",
                 );
             }
-            if run.rate.take(1, now).is_err() {
-                return self.drop_packet(
-                    Reason::Flood,
-                    Some(&run_id),
-                    &format!("over {RECEIVE_RATE_RUN} packets/s of one run"),
-                );
-            }
-            if scope.rate.take(1, now).is_err() {
-                return self.drop_packet(
-                    Reason::Flood,
-                    Some(&run_id),
-                    &format!("over {RECEIVE_RATE_SCOPE} packets/s of {}", body.scope),
-                );
+            if !verified
+                && let Err(why) = take_check(&mut st.checks, &mut scope.checks, &body.scope, now)
+            {
+                return self.drop_packet(Reason::Flood, Some(&run_id), &why);
             }
             (run.key, run.sender.clone())
         };
-        if !crypto::verify(&key, &body.signed, &body.signature, scratch) {
+        if !verified && !crypto::verify(&key, &body.signed, &body.signature, scratch) {
             return self.drop_packet(
                 Reason::BadSignature,
                 Some(&run_id),
@@ -687,18 +775,21 @@ impl Hub {
             );
         }
         if !self.device.signal_member(&body.scope, &sender) {
+            // Its slots are free for members at once (§8.4).
+            self.lock().runs.remove(&run_id);
             return self.drop_packet(
                 Reason::NotMember,
                 Some(&run_id),
                 &format!(
-                    "{sender} is no member of {} by the record in force",
+                    "{sender} is no member of {} by the record in force; its run is let go",
                     body.scope
                 ),
             );
         }
         let mut guard = self.lock();
         let st = &mut *guard;
-        let Some(run) = st.runs.get_mut(&run_id) else {
+        let (Some(run), Some(scope)) = (st.runs.get_mut(&run_id), st.scopes.get_mut(&body.scope))
+        else {
             return;
         };
         if !run.window.all_fresh(body.signals.iter().map(|s| s.seq)) {
@@ -708,12 +799,28 @@ impl Hub {
                 "another copy was taken while this one was verified",
             );
         }
+        // The verified traffic's budgets, which forgeries never reach (§10).
+        if run.rate.take(1, now).is_err() {
+            return self.drop_packet(
+                Reason::Flood,
+                Some(&run_id),
+                &format!("over {RECEIVE_RATE_RUN} verified packets/s of one run"),
+            );
+        }
+        if scope.rate.take(1, now).is_err() {
+            return self.drop_packet(
+                Reason::Flood,
+                Some(&run_id),
+                &format!(
+                    "over {RECEIVE_RATE_SCOPE} verified packets/s of {}",
+                    body.scope
+                ),
+            );
+        }
         for s in &body.signals {
             run.window.mark(s.seq);
         }
-        let Some(scope) = st.scopes.get_mut(&body.scope) else {
-            return;
-        };
+        run.verified_us = now;
         scope.queues.retain(|q| q.strong_count() > 0);
         let ttl_max = TTL_MAX.as_millis() as u64;
         for s in body.signals {
@@ -763,46 +870,102 @@ impl Hub {
         }
     }
 
-    /// Admit the header a packet of an unknown run carries, then process the
-    /// packet and those of the run that came meanwhile.
+    /// Admit the header a packet of an unknown run carries (§8.1 step 4):
+    /// checked here first ([`Self::check_header`]: the packet's run signature
+    /// under the run key the header binds, the signer a member); then, while
+    /// fewer than [`ADMITTING_PER_SCOPE`] headers of the scope and
+    /// [`ADMITTING_PER_NAMESPACE`] of the signer's namespace are, admitted by
+    /// the device; then the packet and those of the run that came meanwhile
+    /// are processed.
     fn admit(
         self: &Arc<Self>,
-        st: &mut HubState,
         body: Body,
         sealed: bool,
         local: bool,
         header: Bytes,
+        scratch: &mut Vec<u8>,
     ) {
         let run = body.run;
-        if st.admitting.len() >= ADMITTING_MAX {
+        let (checked, sender) = match self.check_header(&body, header, scratch) {
+            Ok(c) => c,
+            Err((reason, why)) => return self.drop_packet(reason, Some(&run), &why),
+        };
+        let mut guard = self.lock();
+        let st = &mut *guard;
+        if st.runs.contains_key(&run) || st.admitting.contains_key(&run) {
+            // Held, or being admitted, meanwhile: the packet is one of the
+            // run's, its signature verified by the run's key.
+            drop(guard);
+            return self.process(body, sealed, local, false, true, scratch);
+        }
+        let of_scope = st
+            .admitting
+            .values()
+            .filter(|a| a.scope == body.scope)
+            .count();
+        if of_scope >= ADMITTING_PER_SCOPE {
             return self.drop_packet(
                 Reason::Flood,
                 Some(&run),
-                &format!("{ADMITTING_MAX} run headers are being admitted already"),
+                &format!(
+                    "{ADMITTING_PER_SCOPE} run headers of {} are being admitted already",
+                    body.scope
+                ),
             );
         }
-        st.admitting.insert(run, Vec::new());
+        let of_namespace = st
+            .admitting
+            .values()
+            .filter(|a| a.namespace == sender.namespace)
+            .count();
+        if of_namespace >= ADMITTING_PER_NAMESPACE {
+            return self.drop_packet(
+                Reason::Flood,
+                Some(&run),
+                &format!(
+                    "{ADMITTING_PER_NAMESPACE} run headers of senders of {} are being admitted \
+                     already",
+                    sender.namespace
+                ),
+            );
+        }
+        st.admitting.insert(
+            run,
+            Admitting {
+                scope: body.scope.clone(),
+                namespace: sender.namespace,
+                waiting: Vec::new(),
+            },
+        );
+        drop(guard);
+        let revocations = self.device.signal_revocations();
         let hub = Arc::clone(self);
         let task = tokio::spawn(async move {
-            let outcome = hub.check_header(&body, header).await;
-            let Some((attach, waiting)) = hub.admitted(&body, outcome) else {
+            let outcome = hub
+                .device
+                .signal_admit(&body.scope, &checked.data)
+                .await
+                .map_err(refused);
+            let Some((attach, waiting)) = hub.admitted(&body, checked, outcome, revocations) else {
                 return;
             };
             if let Some((ring, secret)) = attach {
                 hub.attach(ring, secret, run);
             }
             let mut scratch = Vec::with_capacity(PACKET_MAX + 16);
-            hub.process(body, sealed, local, true, &mut scratch);
+            hub.process(body, sealed, local, true, true, &mut scratch);
             let mut waiting = waiting;
             // Packets keep waiting behind those taken until none is left, so
             // the run's packets are processed in the order they came.
             loop {
                 for w in waiting {
-                    hub.process(w.body, w.sealed, w.local, true, &mut scratch);
+                    hub.process(w.body, w.sealed, w.local, true, w.verified, &mut scratch);
                 }
                 let mut st = hub.lock();
                 match st.admitting.get_mut(&run) {
-                    Some(more) if !more.is_empty() => waiting = std::mem::take(more),
+                    Some(more) if !more.waiting.is_empty() => {
+                        waiting = std::mem::take(&mut more.waiting)
+                    }
                     _ => {
                         st.admitting.remove(&run);
                         break;
@@ -813,7 +976,19 @@ impl Hub {
         self.spawn(task);
     }
 
-    async fn check_header(&self, body: &Body, header: Bytes) -> Result<Admitted, Dropped> {
+    /// The checks of a run header before anything is spent on admitting it
+    /// (§8.1 step 4), cheapest first: its shape, its run id the hash of its
+    /// run key, its name, its NotAfter; then one signature check from the
+    /// budgets of packets not verified yet, and the packet's run signature
+    /// under the run key the header binds — proof that whoever sent it holds
+    /// that run's secret key, so no header binding another's run key claims
+    /// that run; then the signer a member, asked of the device offline.
+    fn check_header(
+        &self,
+        body: &Body,
+        header: Bytes,
+        scratch: &mut Vec<u8>,
+    ) -> Result<(Checked, SignalSender), Dropped> {
         let malformed = |why: String| (Reason::Malformed, why);
         let data = Data::decode(header)
             .map_err(|e| malformed(format!("its run header is no Data packet: {e}")))?;
@@ -835,7 +1010,8 @@ impl Hub {
                 )));
             }
         }
-        let now_ms = self.now_us() / 1000;
+        let now = self.now_us();
+        let now_ms = now / 1000;
         let skew = self.skew_ms();
         if now_ms > hb.not_after.saturating_add(skew) {
             return Err((
@@ -852,46 +1028,81 @@ impl Hub {
         }
         let key = VerifyingKey::from_bytes(&hb.key)
             .map_err(|_| malformed("its run key is no Ed25519 public key".into()))?;
+        {
+            let mut guard = self.lock();
+            let st = &mut *guard;
+            let Some(scope) = st.scopes.get_mut(&body.scope) else {
+                return Err((
+                    Reason::Unsubscribed,
+                    format!("{} was unsubscribed meanwhile", body.scope),
+                ));
+            };
+            take_check(&mut st.checks, &mut scope.checks, &body.scope, now)
+                .map_err(|why| (Reason::Flood, why))?;
+        }
+        if !crypto::verify(&key, &body.signed, &body.signature, scratch) {
+            return Err((
+                Reason::BadSignature,
+                "the packet carrying its run header is not signed by the run key that header \
+                 binds: whoever sent it does not hold that run's secret key (a header binding \
+                 another's run key claims that run), so the header is not admitted"
+                    .into(),
+            ));
+        }
         let sender = self
             .device
-            .signal_admit(&body.scope, &data)
-            .await
-            .map_err(|r| match r {
-                SignalRefusal::Malformed { .. } => (Reason::Malformed, r.to_string()),
-                SignalRefusal::BadSignature { .. } => (Reason::BadSignature, r.to_string()),
-                SignalRefusal::NotMember { .. } => (Reason::NotMember, r.to_string()),
-                SignalRefusal::NotReady { .. } => (Reason::UnknownRun, r.to_string()),
-            })?;
-        Ok(Admitted {
+            .signal_sender(&body.scope, &data)
+            .map_err(refused)?;
+        Ok((
+            Checked {
+                data,
+                body: hb,
+                key,
+            },
             sender,
-            key,
-            body: hb,
-        })
+        ))
     }
 
-    /// Hold the run a header admitted, within the limits: the packets that
-    /// waited for it, and its ring when this host serves it and the run isn't
-    /// this process's. `None` when it is not held (each waiting packet counted).
+    /// Hold the run a header admitted, within the caps (§8.4): the packets
+    /// that waited for it, and its ring when this host serves it and the run
+    /// isn't this process's. `None` when it is not held (each waiting packet
+    /// counted).
     #[allow(clippy::type_complexity)]
     fn admitted(
         &self,
         body: &Body,
-        outcome: Result<Admitted, Dropped>,
+        checked: Checked,
+        outcome: Result<SignalSender, Dropped>,
+        revocations: u64,
     ) -> Option<(Option<(Name, [u8; 32])>, Vec<Waiting>)> {
         let run = body.run;
+        let now = self.now_us();
+        let current = self.device.signal_revocations();
         let mut guard = self.lock();
         let st = &mut *guard;
-        let waiting = st.admitting.remove(&run).unwrap_or_default();
+        let waiting = st
+            .admitting
+            .remove(&run)
+            .map(|a| a.waiting)
+            .unwrap_or_default();
         let refuse = |reason: Reason, why: &str| {
             self.drop_n(reason, 1 + waiting.len() as u64, Some(&run), why);
         };
-        let a = match outcome {
-            Ok(a) => a,
+        let sender = match outcome {
+            Ok(s) => s,
             Err((reason, why)) => {
                 refuse(reason, &why);
                 return None;
             }
         };
+        if current != revocations {
+            refuse(
+                Reason::UnknownRun,
+                "a trust context revoking keys was adopted while its header was admitted; its \
+                 next header is admitted again, its chain walked again",
+            );
+            return None;
+        }
         if !st.scopes.contains_key(&body.scope) {
             refuse(
                 Reason::Unsubscribed,
@@ -902,63 +1113,141 @@ impl Hub {
             );
             return None;
         }
-        let now = self.now_us();
+        walk_again(st, current);
         let skew = self.skew_ms();
         st.runs
             .retain(|_, r| now / 1000 <= r.not_after.saturating_add(skew));
         let of_sender: Vec<(RunId, u64)> = st
             .runs
             .iter()
-            .filter(|(_, r)| r.scope == body.scope && r.sender == a.sender)
+            .filter(|(_, r)| r.scope == body.scope && r.sender == sender.key)
             .map(|(id, r)| (*id, r.start))
             .collect();
-        if of_sender.len() >= RUNS_PER_SENDER {
-            let (oldest, start) = of_sender
-                .iter()
-                .min_by_key(|(_, s)| *s)
-                .copied()
-                .expect("a sender at its limit holds runs");
-            if a.body.start <= start {
+        if let Some((oldest, start)) = of_sender.iter().min_by_key(|(_, s)| *s).copied()
+            && of_sender.len() >= RUNS_PER_SENDER
+        {
+            if checked.body.start <= start {
                 refuse(
                     Reason::Flood,
                     &format!(
                         "{} holds {RUNS_PER_SENDER} newer runs of {} here",
-                        a.sender, body.scope
+                        sender.key, body.scope
                     ),
                 );
                 return None;
             }
             st.runs.remove(&oldest);
         }
-        if st.runs.values().filter(|r| r.scope == body.scope).count() >= RUNS_PER_SCOPE {
+        let of_namespace = st
+            .runs
+            .values()
+            .filter(|r| r.scope == body.scope && r.namespace == sender.namespace)
+            .count();
+        if of_namespace >= RUNS_PER_NAMESPACE
+            && !self.make_room(st, &body.scope, Some(&sender.namespace), now)
+        {
             refuse(
                 Reason::Flood,
-                &format!("{} holds {RUNS_PER_SCOPE} runs here", body.scope),
+                &format!(
+                    "{} holds {RUNS_PER_NAMESPACE} runs of senders of {} here, each a member's \
+                     with a packet verified within {} s",
+                    body.scope,
+                    sender.namespace,
+                    RUN_IDLE.as_secs()
+                ),
             );
             return None;
         }
-        st.runs.insert(
-            run,
-            RunState {
-                scope: body.scope.clone(),
-                sender: a.sender,
-                key: a.key,
-                start: a.body.start,
-                not_after: a.body.not_after,
-                window: ReplayWindow::default(),
-                rate: Bucket::new(RECEIVE_RATE_RUN, RECEIVE_RATE_RUN, now),
-            },
-        );
-        let ring = a
+        let of_scope = st.runs.values().filter(|r| r.scope == body.scope).count();
+        if of_scope >= RUNS_PER_SCOPE && !self.make_room(st, &body.scope, None, now) {
+            refuse(
+                Reason::Flood,
+                &format!(
+                    "{} holds {RUNS_PER_SCOPE} runs here, each a member's with a packet verified \
+                     within {} s",
+                    body.scope,
+                    RUN_IDLE.as_secs()
+                ),
+            );
+            return None;
+        }
+        let ring = checked
             .body
             .ring
             .filter(|_| !st.own.contains(&run))
             .map(|secret| (ring_name(&body.scope, &run), secret))
             .filter(|(ring, _)| crate::served_here(ring));
+        st.runs.insert(
+            run,
+            RunState {
+                scope: body.scope.clone(),
+                sender: sender.key,
+                namespace: sender.namespace.clone(),
+                key: checked.key,
+                start: checked.body.start,
+                not_after: checked.body.not_after,
+                window: ReplayWindow::default(),
+                rate: Bucket::new(RECEIVE_RATE_RUN, RECEIVE_RATE_RUN, now),
+                verified_us: now,
+            },
+        );
         // The run's later packets keep waiting behind those taken here until
         // the admission has processed them (see `admit`).
-        st.admitting.insert(run, Vec::new());
+        st.admitting.insert(
+            run,
+            Admitting {
+                scope: body.scope.clone(),
+                namespace: sender.namespace,
+                waiting: Vec::new(),
+            },
+        );
         Some((ring, waiting))
+    }
+
+    /// Make room for a run in `scope` (of the sender namespace `namespace`,
+    /// when given) at a cap (§8.4): let go every run there whose sender is no
+    /// member now — a removal frees its slots at once — else the run none of
+    /// whose packets verified for longest, if for [`RUN_IDLE`]. False when
+    /// none may go.
+    fn make_room(
+        &self,
+        st: &mut HubState,
+        scope: &Name,
+        namespace: Option<&Name>,
+        now: u64,
+    ) -> bool {
+        let idle = RUN_IDLE.as_micros() as u64;
+        let mut gone = Vec::new();
+        let mut idlest: Option<(RunId, u64)> = None;
+        for (id, r) in st
+            .runs
+            .iter()
+            .filter(|(_, r)| r.scope == *scope && namespace.is_none_or(|ns| r.namespace == *ns))
+        {
+            if !self.device.signal_member(scope, &r.sender) {
+                gone.push(*id);
+            } else if now.saturating_sub(r.verified_us) >= idle
+                && idlest.is_none_or(|(_, t)| r.verified_us < t)
+            {
+                idlest = Some((*id, r.verified_us));
+            }
+        }
+        if gone.is_empty() {
+            gone.extend(idlest.map(|(id, _)| id));
+        }
+        for id in &gone {
+            if let Some(r) = st.runs.remove(id) {
+                tracing::debug!(
+                    target: "ndn_surface::signal",
+                    run = %id,
+                    sender = %r.sender,
+                    %scope,
+                    "a run let go for another at a cap: its sender is no member now, or none of its packets verified for {} s",
+                    RUN_IDLE.as_secs()
+                );
+            }
+        }
+        !gone.is_empty()
     }
 
     /// Read a run's ring on this host: its packets enter the same pipeline, local.
@@ -1045,14 +1334,109 @@ impl Drop for Hub {
     }
 }
 
-fn set_keys(st: &mut HubState, scope: &Name, s: &SignalScope) {
+/// Take `s`, what the device answers for `scope` now: its keys, the first
+/// that of the epoch in force; each other noted superseded from `now`, if
+/// not before (§4.2).
+fn set_keys(st: &mut HubState, scope: &Name, s: &SignalScope, now: u64) {
     st.keys.retain(|_, (sc, _)| sc != scope);
-    for k in &s.keys {
+    for (i, k) in s.keys.iter().enumerate() {
         st.keys.insert(k.id, (scope.clone(), k.clone()));
+        match i {
+            0 => {
+                st.superseded.remove(&k.id);
+            }
+            _ => {
+                st.superseded.entry(k.id).or_insert(now);
+            }
+        }
     }
+    let keys = &st.keys;
+    st.superseded.retain(|id, _| keys.contains_key(id));
     if let Some(ss) = st.scopes.get_mut(scope) {
         ss.sealed = !s.keys.is_empty();
     }
+}
+
+/// The signal key of `id` held in `st`, unless its epoch was superseded here
+/// more than [`EPOCH_GRACE`] before `now` (§4.2); else why not.
+fn key_in(
+    st: &HubState,
+    id: &[u8; wire::KEY_ID_LEN],
+    now: u64,
+) -> Result<(Name, SignalKey), String> {
+    let Some((scope, key)) = st.keys.get(id) else {
+        return Err(format!(
+            "sealed under the key id {id:02x?}, of no epoch whose key this device holds"
+        ));
+    };
+    if let Some(since) = st.superseded.get(id) {
+        let ago = now.saturating_sub(*since);
+        if ago > EPOCH_GRACE.as_micros() as u64 {
+            return Err(format!(
+                "sealed under the key of an epoch of {scope} superseded here {} s ago, past the \
+                 {} s grace: its sender doesn't hold the record that started the newer epoch yet, \
+                 or reads the scope no more",
+                ago / 1_000_000,
+                EPOCH_GRACE.as_secs()
+            ));
+        }
+    }
+    Ok((scope.clone(), key.clone()))
+}
+
+/// One signature check of a packet not verified yet, from its scope's and the
+/// process's budgets (§10); else why not.
+fn take_check(
+    process: &mut Option<Bucket>,
+    of_scope: &mut Bucket,
+    scope: &Name,
+    now: u64,
+) -> Result<(), String> {
+    if of_scope.take(1, now).is_err() {
+        return Err(format!(
+            "over {CHECK_RATE_SCOPE} signature checks/s of packets of {scope} not verified yet"
+        ));
+    }
+    let process =
+        process.get_or_insert_with(|| Bucket::new(CHECK_RATE_PROCESS, CHECK_RATE_PROCESS, now));
+    if process.take(1, now).is_err() {
+        return Err(format!(
+            "over {CHECK_RATE_PROCESS} signature checks/s of packets not verified yet in this \
+             process"
+        ));
+    }
+    Ok(())
+}
+
+/// Let every run held go when the device's `signal_revocations` moved since
+/// they were admitted (§8.4): a trust context revoking keys was adopted, and
+/// each run is admitted again from its next header, its chain walked again,
+/// so a revoked issuer ends the runs of the keys it certified.
+fn walk_again(st: &mut HubState, revocations: u64) {
+    if st.revocations == revocations {
+        return;
+    }
+    st.revocations = revocations;
+    if !st.runs.is_empty() {
+        tracing::debug!(
+            target: "ndn_surface::signal",
+            runs = st.runs.len(),
+            next = "nothing: each run's header rides again within a second and is admitted again",
+            "a trust context revoking keys was adopted: every run held is let go, its chain to be walked again"
+        );
+        st.runs.clear();
+    }
+}
+
+/// The drop a data-layer refusal of a run header is counted as.
+fn refused(r: SignalRefusal) -> Dropped {
+    let reason = match r {
+        SignalRefusal::Malformed { .. } => Reason::Malformed,
+        SignalRefusal::BadSignature { .. } => Reason::BadSignature,
+        SignalRefusal::NotMember { .. } => Reason::NotMember,
+        SignalRefusal::NotReady { .. } | SignalRefusal::Unverified { .. } => Reason::UnknownRun,
+    };
+    (reason, r.to_string())
 }
 
 /// The packet a pushed wire carries, if it is a push Interest (LP-wrapped or not).
@@ -1103,6 +1487,12 @@ impl Signals {
         conn.register_prefix(&listen).await.map_err(|e| {
             SignalError::Io(format!("cannot register {listen} on the connection: {e}"))
         })?;
+        let now = options.clock.as_ref().map_or_else(system_us, |c| c());
+        let push = Bucket::new(
+            u64::from(options.push_rate.get()),
+            u64::from(options.push_burst.get()),
+            now,
+        );
         let hub = Arc::new(Hub {
             device,
             conn: Arc::clone(&conn),
@@ -1112,6 +1502,7 @@ impl Signals {
             state: Mutex::new(HubState::default()),
             closed: AtomicBool::new(false),
             tasks: Mutex::new(Vec::new()),
+            push: Mutex::new(push),
         });
         let weak = Arc::downgrade(&hub);
         let task = tokio::spawn(async move {
@@ -1161,11 +1552,12 @@ impl Signals {
                 queues: Vec::new(),
                 latest: Latest::default(),
                 rate: Bucket::new(RECEIVE_RATE_SCOPE, RECEIVE_RATE_SCOPE, now),
+                checks: Bucket::new(CHECK_RATE_SCOPE, CHECK_RATE_SCOPE, now),
                 sealed: false,
             })
             .queues
             .push(Arc::downgrade(&queue));
-        set_keys(&mut st, scope, &s);
+        set_keys(&mut st, scope, &s, now);
         Ok(SignalSubscriber {
             scope: scope.clone(),
             queue,
@@ -1399,6 +1791,18 @@ impl SignalRun {
         if signals.is_empty() {
             return Ok(first..first);
         }
+        // Receivers refuse a sequence past the last one; sequences start at the
+        // host's clock in µs, so only a clock far past now gets there.
+        // Sequences first ..= SEQ_MAX are left: SEQ_MAX + 1 - first of them.
+        let room = (wire::SEQ_MAX + 1).saturating_sub(first);
+        if signals.len() as u64 > room {
+            return Err(SignalError::TooLarge {
+                what: "a batch past the run's last sequence (signals; the host's clock is far \
+                       past now)",
+                size: signals.len(),
+                max: usize::try_from(room).unwrap_or(usize::MAX),
+            });
+        }
         // Membership, keys and groups by the record in force now: NotMember from
         // the moment this device holds a record that removes it.
         let scope = self
@@ -1473,9 +1877,21 @@ impl SignalRun {
                 max: PACKET_MAX,
             });
         }
-        self.bucket
-            .take(plan.len() as u64, now)
-            .map_err(|retry_after| SignalError::RateLimited { retry_after })?;
+        // The run's rate counts packets; the process's push budget counts push
+        // Interests, one per packet per group, as a relay's quota counts them.
+        // Both are spent, or neither.
+        let packets = plan.len() as u64;
+        let pushes = packets.saturating_mul(scope.groups.len() as u64);
+        {
+            let mut budget = self.hub.push.lock().expect("signal push budget lock");
+            let run_wait = self.bucket.ready(packets, now).err();
+            let push_wait = budget.ready(pushes, now).err();
+            if let Some(retry_after) = run_wait.max(push_wait) {
+                return Err(SignalError::RateLimited { retry_after });
+            }
+            self.bucket.spend(packets);
+            budget.spend(pushes);
+        }
         let run = keyed.key.id();
         for p in plan {
             let header = p.header.then_some(keyed.header.as_ref());

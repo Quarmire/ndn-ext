@@ -4,6 +4,7 @@
 
 #![allow(dead_code)]
 
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -52,6 +53,8 @@ pub struct World {
     issuer: Name,
     anchor: Certificate,
     devices: Vec<(Name, Arc<SecurityManager>, Certificate)>,
+    /// Other namespaces whose trust contexts its devices hold: (namespace, anchor).
+    trusted: Vec<(Name, Certificate)>,
     pub cancel: CancellationToken,
 }
 
@@ -78,6 +81,7 @@ impl World {
             issuer,
             anchor,
             devices: Vec::new(),
+            trusted: Vec::new(),
             cancel: CancellationToken::new(),
         };
         for d in devices {
@@ -102,13 +106,22 @@ impl World {
         &self.ns
     }
 
+    /// Its devices started from now on hold `other`'s trust context too, so a
+    /// record naming `other`'s namespace counts its group.
+    pub fn trust(&mut self, other: &World) {
+        self.trusted.push((other.ns.clone(), other.anchor.clone()));
+    }
+
     /// A validator as each device's host holds it: the namespace's trust context
-    /// (its anchor) and its devices' certificates.
+    /// (its anchor), those it trusts, and its devices' certificates.
     fn validator(&self) -> Arc<Validator> {
         let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
-        let ctx = SignedTrustContext::hierarchical(self.ns.clone()).with_version(1);
-        assert!(ctx.add_anchor(self.anchor.clone()));
-        validator.adopt_context(Arc::new(ctx)).unwrap();
+        let own = [(self.ns.clone(), self.anchor.clone())];
+        for (ns, anchor) in own.iter().chain(&self.trusted) {
+            let ctx = SignedTrustContext::hierarchical(ns.clone()).with_version(1);
+            assert!(ctx.add_anchor(anchor.clone()));
+            validator.adopt_context(Arc::new(ctx)).unwrap();
+        }
         for (_, _, cert) in &self.devices {
             validator.cert_cache().insert(cert.clone());
         }
@@ -240,5 +253,16 @@ pub fn no_ring() -> SignalOptions {
     SignalOptions {
         local_ring: false,
         ..SignalOptions::default()
+    }
+}
+
+/// `options` with a push budget no test reaches: an in-process engine, and a UDP
+/// face between two, carry no relay quota (the default budget keeps a device
+/// below one, ndn-link §15.3), so several runs at 60 Hz may push freely.
+pub fn no_quota(options: SignalOptions) -> SignalOptions {
+    SignalOptions {
+        push_rate: NonZeroU32::new(10_000).unwrap(),
+        push_burst: NonZeroU32::new(20_000).unwrap(),
+        ..options
     }
 }

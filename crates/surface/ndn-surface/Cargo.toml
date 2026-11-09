@@ -48,6 +48,10 @@ required-features = ["signals"]
 name = "signals"
 required-features = ["signals"]
 
+[[test]]
+name = "signal_lows"
+required-features = ["signals"]
+
 [dev-dependencies]
 tokio          = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync"] }
 ndn-engine     = { workspace = true }

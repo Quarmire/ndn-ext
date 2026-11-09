@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use common::{Engine, World, engine, link, n, no_ring};
+use common::{Engine, World, engine, link, n, no_quota, no_ring};
 use ndn_app::EngineAppExt;
 use ndn_surface::signal::wire::{self, Packet};
 use ndn_surface::signal::{Signal, SignalError, SignalOptions, SignalSubscriber};
@@ -340,7 +340,9 @@ async fn a_members_signals_arrive_over_one_link() {
 /// Four runs send at 60 Hz for 2 s, each to its own address. No signal is lost:
 /// each is delivered, or stale (a newer one of its address was delivered first —
 /// on one host, while the reader attaches to a ring, a forwarder copy can come
-/// after the ring's next); each address's last is read.
+/// after the ring's next); each address's last is read. Four runs at 60 Hz push
+/// 240 Interests/s, over the default push budget: the engines here carry no
+/// relay quota, so the sender's budget is raised ([`no_quota`]).
 async fn sixty_hertz_from_four(
     sender_engine: &Engine,
     receiver_engine: &Engine,
@@ -407,7 +409,7 @@ async fn sixty_hertz_from_four(
 async fn sixty_hertz_from_four_senders_on_one_host_loses_nothing() {
     let world = World::new("/alice", &["/alice/laptop", "/alice/phone"]).await;
     let e = engine().await;
-    sixty_hertz_from_four(&e, &e, &world, SignalOptions::default()).await;
+    sixty_hertz_from_four(&e, &e, &world, no_quota(SignalOptions::default())).await;
     world.cancel.cancel();
 }
 
@@ -424,6 +426,6 @@ async fn sixty_hertz_from_four_senders_over_a_link_loses_nothing() {
         &world.cancel,
     )
     .await;
-    sixty_hertz_from_four(&a, &b, &world, no_ring()).await;
+    sixty_hertz_from_four(&a, &b, &world, no_quota(no_ring())).await;
     world.cancel.cancel();
 }
