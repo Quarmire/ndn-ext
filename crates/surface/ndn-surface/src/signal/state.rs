@@ -28,7 +28,11 @@ impl ReplayWindow {
     }
 
     /// Whether `seq` is new: above the highest seen, or in the window and unseen.
+    /// 2^64 − 1, which the wire refuses (no sequence one above it), never is.
     pub(crate) fn fresh(&self, seq: u64) -> bool {
+        if seq == u64::MAX {
+            return false;
+        }
         if seq >= self.top {
             return true;
         }
@@ -49,11 +53,13 @@ impl ReplayWindow {
         })
     }
 
-    /// Record `seq` as seen.
+    /// Record `seq` as seen; 2^64 − 1 (never fresh) is not recorded.
     pub(crate) fn mark(&mut self, seq: u64) {
+        let Some(above) = seq.checked_add(1) else {
+            return;
+        };
         if seq >= self.top {
-            let advance = seq + 1 - self.top;
-            if advance >= WINDOW {
+            if above - self.top >= WINDOW {
                 self.bits = [0; (WINDOW / 64) as usize];
             } else {
                 for s in self.top..=seq {
@@ -61,7 +67,7 @@ impl ReplayWindow {
                     self.bits[w] &= !b;
                 }
             }
-            self.top = seq + 1;
+            self.top = above;
         } else if self.top - seq > WINDOW {
             return;
         }
@@ -70,24 +76,31 @@ impl ReplayWindow {
     }
 }
 
-/// A token bucket: `rate` per second, at most `burst` at once.
+/// A token bucket: `rate` per second, at most `burst` at once. A take over the
+/// burst (one send into more groups than the burst) is let from a full bucket
+/// and leaves it in debt, so the average stays at `rate`.
 #[derive(Debug)]
 pub(crate) struct Bucket {
     rate: u64,
     burst: u64,
-    /// Tokens, in millionths.
-    micro: u64,
+    /// Tokens, in millionths; below zero after a take over the burst.
+    micro: i128,
     at_us: u64,
 }
 
 impl Bucket {
+    /// A full bucket. A rate of 0 is taken as 1, so a wait is always finite.
     pub(crate) fn new(rate: u64, burst: u64, now_us: u64) -> Self {
         Bucket {
-            rate,
+            rate: rate.max(1),
             burst,
-            micro: burst * 1_000_000,
+            micro: Self::micro(burst),
             at_us: now_us,
         }
+    }
+
+    fn micro(n: u64) -> i128 {
+        i128::from(n) * 1_000_000
     }
 
     fn refill(&mut self, now_us: u64) {
@@ -95,20 +108,32 @@ impl Bucket {
         self.at_us = self.at_us.max(now_us);
         self.micro = self
             .micro
-            .saturating_add(elapsed.saturating_mul(self.rate))
-            .min(self.burst * 1_000_000);
+            .saturating_add(i128::from(elapsed).saturating_mul(i128::from(self.rate)))
+            .min(Self::micro(self.burst));
+    }
+
+    /// Whether `n` tokens are there now (a full bucket for more than the burst),
+    /// or how long until they are.
+    pub(crate) fn ready(&mut self, n: u64, now_us: u64) -> Result<(), Duration> {
+        self.refill(now_us);
+        let need = Self::micro(n.min(self.burst));
+        if self.micro >= need {
+            return Ok(());
+        }
+        let short = u64::try_from(need - self.micro).unwrap_or(u64::MAX);
+        Err(Duration::from_micros(short.div_ceil(self.rate)))
+    }
+
+    /// Spend `n` tokens [`ready`](Self::ready) said are there.
+    pub(crate) fn spend(&mut self, n: u64) {
+        self.micro = self.micro.saturating_sub(Self::micro(n));
     }
 
     /// Take `n` tokens, or say how long until they are there.
     pub(crate) fn take(&mut self, n: u64, now_us: u64) -> Result<(), Duration> {
-        self.refill(now_us);
-        let need = n * 1_000_000;
-        if self.micro >= need {
-            self.micro -= need;
-            return Ok(());
-        }
-        let short = need - self.micro;
-        Err(Duration::from_micros(short.div_ceil(self.rate)))
+        self.ready(n, now_us)?;
+        self.spend(n);
+        Ok(())
     }
 }
 
@@ -124,7 +149,7 @@ impl Latest {
     /// Take `seq` for `(sender, address)` if it is newer than the newest held:
     /// `false` means stale.
     pub(crate) fn advance(&mut self, sender: &Name, address: &Bytes, seq: u64) -> bool {
-        self.tick += 1;
+        self.tick = self.tick.saturating_add(1);
         let tick = self.tick;
         if let Some(held) = self.pairs.get_mut(&(sender.clone(), address.clone())) {
             if seq <= held.0 {
@@ -188,6 +213,27 @@ mod tests {
         assert!(!w.fresh(10 + WINDOW + 5));
     }
 
+    /// L1: at the top of the sequence space the window neither panics nor wraps
+    /// (a wrapped top would take every sequence as new again).
+    #[test]
+    fn the_window_at_the_last_sequence_neither_panics_nor_wraps() {
+        let mut w = ReplayWindow::default();
+        w.mark(u64::MAX - 1);
+        assert!(!w.fresh(u64::MAX - 1), "the last sequence, seen");
+        assert!(w.fresh(u64::MAX - 2), "below it, in the window, unseen");
+        assert!(!w.fresh(0), "far below the window: the top did not wrap");
+        // One past the last sequence the wire refuses; the window takes it as
+        // nothing, not as new.
+        w.mark(u64::MAX);
+        assert!(!w.fresh(u64::MAX));
+        assert!(!w.fresh(u64::MAX - 1));
+        assert!(!w.fresh(0));
+        let mut empty = ReplayWindow::default();
+        empty.mark(u64::MAX);
+        assert!(!empty.fresh(u64::MAX), "never new");
+        assert!(empty.fresh(5), "and it marked nothing");
+    }
+
     #[test]
     fn a_bucket_lets_its_burst_then_its_rate() {
         let mut b = Bucket::new(120, 30, 0);
@@ -200,6 +246,24 @@ mod tests {
         assert!(b.take(1, 8334).is_err());
         assert!(b.take(30, 10_000_000).is_ok(), "never more than the burst");
         assert!(b.take(1, 10_000_000).is_err());
+    }
+
+    /// One take over the burst (a packet into more groups than the push burst)
+    /// is let only from a full bucket, and its debt is paid at the rate before
+    /// anything more is let: the average stays at the rate.
+    #[test]
+    fn a_take_over_the_burst_is_let_from_a_full_bucket_and_paid_at_the_rate() {
+        let mut b = Bucket::new(80, 160, 0);
+        assert!(b.take(1, 0).is_ok());
+        assert_eq!(
+            b.take(400, 0),
+            Err(Duration::from_micros(12_500)),
+            "not from a bucket short of full"
+        );
+        assert!(b.take(400, 12_500).is_ok(), "from a full bucket");
+        // 240 owed, and 1 more to take: (240 + 1) / 80 s.
+        assert_eq!(b.take(1, 12_500), Err(Duration::from_micros(3_012_500)));
+        assert!(b.take(1, 12_500 + 3_012_500).is_ok());
     }
 
     #[test]

@@ -87,7 +87,7 @@ fn aad(key_id: &[u8; KEY_ID_LEN]) -> [u8; 12 + KEY_ID_LEN] {
 }
 
 /// Seal the `SignalBody` TLV `body` under the signal key `key` (id `key_id`)
-/// with `nonce`: the whole `SignalSealed` packet.
+/// with `nonce`, padded to its size bucket: the whole `SignalSealed` packet.
 pub(crate) fn seal(
     key: &[u8; 32],
     key_id: &[u8; KEY_ID_LEN],
@@ -103,8 +103,9 @@ pub(crate) fn seal(
     })
 }
 
-/// The `SignalBody` TLV `sealed` carries, if it opens under `key`; `None` when
-/// it was altered or sealed under another key or key id.
+/// The plaintext `sealed` carries (its `SignalBody` TLV, then its
+/// `SignalPadding`), if it opens under `key`; `None` when it was altered or
+/// sealed under another key or key id.
 pub(crate) fn open(key: &[u8; 32], sealed: &Sealed) -> Option<Vec<u8>> {
     let cipher = XChaCha20Poly1305::new(key.into());
     let split = sealed.ciphertext.len() - TAG_LEN;
@@ -138,7 +139,8 @@ mod tests {
     #[test]
     fn a_sealed_packet_opens_only_under_its_key_and_key_id() {
         let s = sealed(&[1; 32], &[8; 8]);
-        assert_eq!(open(&[1; 32], &s).as_deref(), Some(&b"a SignalBody"[..]));
+        let plain = open(&[1; 32], &s).expect("it opens under its key");
+        assert_eq!(&plain[..12], b"a SignalBody", "the body, then its padding");
         assert_eq!(open(&[2; 32], &s), None, "another key does not open it");
         let mut relabelled = s.clone();
         relabelled.key_id = [9; 8];

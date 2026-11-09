@@ -4,7 +4,9 @@
 //! scope), at most [`PACKET_MAX`] octets. It rides as the ApplicationParameters of
 //! a push Interest `<group>/32=signal/<ParametersSha256Digest>` and, unchanged, as
 //! a frame of a run's local ring. Every TLV-TYPE here is even: a decoder skips an
-//! unknown even element and refuses an unknown odd one.
+//! unknown even element and refuses an unknown odd one. A sealed packet's
+//! plaintext is its `SignalBody` and a `SignalPadding` that brings the packet's
+//! length to a multiple of [`PAD_BUCKET`] octets.
 //!
 //! This module needs no device: a capture tool decodes what a relay carries with
 //! [`decode_packet`] and [`decode_run_header_body`].
@@ -28,7 +30,8 @@ pub const SIGNAL_SEALED: u64 = 0x0582;
 pub const KEY_ID: u64 = 0x0584;
 /// `SealNonce`: 24 random octets.
 pub const SEAL_NONCE: u64 = 0x0586;
-/// `Ciphertext`: XChaCha20-Poly1305 of the `SignalBody` TLV, tag appended.
+/// `Ciphertext`: XChaCha20-Poly1305 of the `SignalBody` TLV and its
+/// `SignalPadding`, tag appended.
 pub const CIPHERTEXT: u64 = 0x0588;
 /// `RunId`: 16 octets, SHA-256(run public key)[0..16].
 pub const RUN_ID: u64 = 0x058A;
@@ -56,11 +59,17 @@ pub const RUN_START: u64 = 0x059E;
 pub const RUN_NOT_AFTER: u64 = 0x05A0;
 /// `LocalRing`: 32 octets, the run's ring secret.
 pub const LOCAL_RING: u64 = 0x05A2;
+/// `SignalPadding`: zero octets after the `SignalBody` inside a ciphertext, so
+/// the sealed packet's length falls on a [`PAD_BUCKET`]; a reader ignores them.
+pub const SIGNAL_PADDING: u64 = 0x05A4;
 
 /// Domain separation of the run signature and of the seal's associated data.
 pub const CONTEXT: &[u8] = b"ndn-signal/1";
 /// The most octets a packet's whole encoding may take.
 pub const PACKET_MAX: usize = 1024;
+/// A sealed packet's length is rounded up to a multiple of this many octets
+/// (never above [`PACKET_MAX`]).
+pub const PAD_BUCKET: usize = 128;
 /// The most octets of an address.
 pub const ADDRESS_MAX: usize = 64;
 /// The most octets of a payload.
@@ -75,6 +84,9 @@ pub const NONCE_LEN: usize = 24;
 pub const TAG_LEN: usize = 16;
 /// Octets of a run signature.
 pub const SIGNATURE_LEN: usize = 64;
+/// The last sequence a run may use: a run's window counts one above the highest
+/// sequence it saw, so 2^64 − 1 is no sequence (refused at decode).
+pub const SEQ_MAX: u64 = u64::MAX - 1;
 
 /// The keyword component a push name carries after its group: `32=signal`.
 pub const SIGNAL_KEYWORD: &[u8] = b"signal";
@@ -168,6 +180,15 @@ pub enum WireError {
         size: usize,
         /// The limit.
         max: usize,
+    },
+    /// A `SignalSeq` past [`SEQ_MAX`].
+    #[error(
+        "SignalSeq {seq} is past the last sequence {SEQ_MAX}: a run's window counts one above \
+         the highest sequence it saw"
+    )]
+    SeqPast {
+        /// The sequence.
+        seq: u64,
     },
     /// Neither a `SignalBody` nor a `SignalSealed`, or octets after it.
     #[error("not a signal packet: {why}")]
@@ -323,14 +344,26 @@ pub fn decode_packet(packet: Bytes) -> Result<Packet, WireError> {
     }
 }
 
-/// Decode a `SignalBody` TLV: the plaintext of a sealed packet.
-pub fn decode_body(body: Bytes) -> Result<Body, WireError> {
-    let mut r = TlvReader::new(body);
+/// Decode the plaintext of a sealed packet: a `SignalBody` TLV, then at most one
+/// `SignalPadding`, whose octets are ignored (the AEAD covers them; the run
+/// signature need not: they carry nothing).
+pub fn decode_body(plain: Bytes) -> Result<Body, WireError> {
+    let mut r = TlvReader::new(plain);
     let (typ, value) = r.read_tlv().map_err(tlv("SignalBody"))?;
-    if typ != SIGNAL_BODY || !r.is_empty() {
+    if typ != SIGNAL_BODY {
         return Err(WireError::NotPacket {
-            why: "a sealed packet's plaintext is not one SignalBody".into(),
+            why: format!("a sealed packet's plaintext starts with {typ:#x}, not a SignalBody"),
         });
+    }
+    if !r.is_empty() {
+        let (typ, _) = r.read_tlv().map_err(tlv("SignalPadding"))?;
+        if typ != SIGNAL_PADDING || !r.is_empty() {
+            return Err(WireError::NotPacket {
+                why: "a sealed packet's plaintext carries more than its SignalBody and one \
+                      SignalPadding"
+                    .into(),
+            });
+        }
     }
     decode_body_value(value)
 }
@@ -522,6 +555,9 @@ fn decode_signal(value: Bytes) -> Result<WireSignal, WireError> {
             what: "SignalSeq",
         })?,
     )?;
+    if seq > SEQ_MAX {
+        return Err(WireError::SeqPast { seq });
+    }
     let address = address.ok_or(WireError::Missing {
         inside: IN,
         what: "Address",
@@ -701,15 +737,48 @@ fn body_value_size(scope_tlv: usize, header: Option<usize>, signals: &[Outgoing<
         + tlv_size(RUN_SIGNATURE, SIGNATURE_LEN)
 }
 
-/// The encoded size of a `SignalSealed` TLV sealing a body of `body` octets.
+/// The encoded size of a `SignalSealed` TLV sealing a body of `body` octets,
+/// padded to its bucket ([`padding`]).
 pub(crate) fn sealed_size(body: usize) -> usize {
-    tlv_size(SIGNAL_SEALED, sealed_value_size(body))
+    unpadded_size(body + padding(body).map_or(0, |p| tlv_size(SIGNAL_PADDING, p)))
 }
 
-fn sealed_value_size(body: usize) -> usize {
+/// The encoded size of a `SignalSealed` TLV whose plaintext is `plain` octets.
+fn unpadded_size(plain: usize) -> usize {
+    tlv_size(SIGNAL_SEALED, sealed_value_size(plain))
+}
+
+fn sealed_value_size(plain: usize) -> usize {
     tlv_size(KEY_ID, KEY_ID_LEN)
         + tlv_size(SEAL_NONCE, NONCE_LEN)
-        + tlv_size(CIPHERTEXT, body + TAG_LEN)
+        + tlv_size(CIPHERTEXT, plain + TAG_LEN)
+}
+
+/// The octets of the `SignalPadding` that brings a sealed packet of a body of
+/// `body` octets to the next multiple of [`PAD_BUCKET`]; `None` when it is on
+/// one already, or no bucket up to [`PACKET_MAX`] can be met exactly (the
+/// packet is then within 3 octets of [`PACKET_MAX`], or over it).
+pub(crate) fn padding(body: usize) -> Option<usize> {
+    let bare = unpadded_size(body);
+    if bare.is_multiple_of(PAD_BUCKET) {
+        return None;
+    }
+    let least = unpadded_size(body + tlv_size(SIGNAL_PADDING, 0));
+    let mut bucket = bare.next_multiple_of(PAD_BUCKET);
+    while bucket <= PACKET_MAX {
+        if let Some(guess) = bucket.checked_sub(least) {
+            // Each octet of padding adds one to the length, and a TLV-LENGTH
+            // that grows past 252 two more: the exact padding is at most 6
+            // octets below the guess, or the bucket can't be met.
+            if let Some(p) = (guess.saturating_sub(6)..=guess)
+                .find(|p| unpadded_size(body + tlv_size(SIGNAL_PADDING, *p)) == bucket)
+            {
+                return Some(p);
+            }
+        }
+        bucket += PAD_BUCKET;
+    }
+    None
 }
 
 /// Encode a `SignalBody` into `out` (cleared first), signed by `sign` over
@@ -743,22 +812,29 @@ pub(crate) fn encode_body(
     put_tlv(out, RUN_SIGNATURE, &signature);
 }
 
-/// Encode a `SignalSealed` around `body`, leaving the plaintext where the
-/// ciphertext goes: `seal` encrypts that region in place and returns the tag.
+/// Encode a `SignalSealed` around `body` and its `SignalPadding` ([`padding`]),
+/// leaving the plaintext where the ciphertext goes: `seal` encrypts that region
+/// in place and returns the tag.
 pub(crate) fn encode_sealed(
     key_id: &[u8; KEY_ID_LEN],
     nonce: &[u8; NONCE_LEN],
     body: &[u8],
     seal: impl FnOnce(&mut [u8]) -> [u8; TAG_LEN],
 ) -> Vec<u8> {
-    let value = sealed_value_size(body.len());
+    let pad = padding(body.len());
+    let plain = body.len() + pad.map_or(0, |p| tlv_size(SIGNAL_PADDING, p));
+    let value = sealed_value_size(plain);
     let mut out = Vec::with_capacity(tlv_size(SIGNAL_SEALED, value));
     put_header(&mut out, SIGNAL_SEALED, value);
     put_tlv(&mut out, KEY_ID, key_id);
     put_tlv(&mut out, SEAL_NONCE, nonce);
-    put_header(&mut out, CIPHERTEXT, body.len() + TAG_LEN);
+    put_header(&mut out, CIPHERTEXT, plain + TAG_LEN);
     let at = out.len();
     out.extend_from_slice(body);
+    if let Some(p) = pad {
+        put_header(&mut out, SIGNAL_PADDING, p);
+        out.resize(out.len() + p, 0);
+    }
     let tag = seal(&mut out[at..]);
     out.extend_from_slice(&tag);
     out
@@ -934,20 +1010,63 @@ mod tests {
         assert_eq!(decode_body(Bytes::from(wire)).unwrap(), b);
     }
 
+    /// L3: a sealed packet's length falls on a multiple of [`PAD_BUCKET`] (unless
+    /// within 3 octets of [`PACKET_MAX`], where no bucket can be met), never over
+    /// [`PACKET_MAX`]; its plaintext is its body and a padding the reader skips.
     #[test]
-    fn a_sealed_packet_round_trips() {
-        let wire = encode_sealed(&[1; 8], &[2; 24], b"plaintext", |region| {
-            region.reverse();
-            [3; TAG_LEN]
-        });
-        assert_eq!(wire.len(), sealed_size(9));
-        let Packet::Sealed(s) = decode_packet(Bytes::from(wire)).unwrap() else {
-            panic!("a sealed packet decodes as sealed");
-        };
-        assert_eq!(s.key_id, [1; 8]);
-        assert_eq!(s.nonce, [2; 24]);
-        assert_eq!(&s.ciphertext[..9], b"txetnialp");
-        assert_eq!(&s.ciphertext[9..], &[3; TAG_LEN]);
+    fn a_sealed_packet_is_padded_to_its_bucket_and_round_trips() {
+        let mut sealed = 0;
+        for size in 0..=PAYLOAD_MAX {
+            let payload = vec![0x5A; size];
+            let signals: [Outgoing<'_>; 1] = [(
+                1_700_000_000_000_000,
+                b"cursor",
+                1_700_000_002_000,
+                &payload,
+            )];
+            let plain = body(None, &signals);
+            let bare = unpadded_size(plain.len());
+            if bare > PACKET_MAX {
+                break;
+            }
+            let wire = encode_sealed(&[1; 8], &[2; 24], &plain, |region| {
+                region.iter_mut().for_each(|b| *b ^= 0xFF);
+                [3; TAG_LEN]
+            });
+            assert_eq!(wire.len(), sealed_size(plain.len()));
+            assert!(wire.len() <= PACKET_MAX);
+            assert!(
+                wire.len().is_multiple_of(PAD_BUCKET)
+                    || (wire.len() == bare && bare > PACKET_MAX - 4),
+                "a body of {} octets sealed to {} octets",
+                plain.len(),
+                wire.len()
+            );
+            let Packet::Sealed(s) = decode_packet(Bytes::from(wire)).unwrap() else {
+                panic!("a sealed packet decodes as sealed");
+            };
+            assert_eq!((s.key_id, s.nonce), ([1; 8], [2; 24]));
+            let (ciphertext, tag) = s.ciphertext.split_at(s.ciphertext.len() - TAG_LEN);
+            assert_eq!(tag, &[3; TAG_LEN]);
+            let opened: Vec<u8> = ciphertext.iter().map(|b| b ^ 0xFF).collect();
+            assert_eq!(&opened[..plain.len()], &plain[..]);
+            assert_eq!(
+                decode_body(Bytes::from(opened)).unwrap(),
+                decode_body(Bytes::from(plain.clone())).unwrap()
+            );
+            let mut twice = plain.clone();
+            put_tlv(&mut twice, SIGNAL_PADDING, &[0; 4]);
+            put_tlv(&mut twice, SIGNAL_PADDING, &[0; 4]);
+            assert!(
+                matches!(
+                    decode_body(Bytes::from(twice)),
+                    Err(WireError::NotPacket { .. })
+                ),
+                "one padding at most"
+            );
+            sealed += 1;
+        }
+        assert!(sealed > PAYLOAD_MAX / 2, "the sizes swept");
     }
 
     #[test]
@@ -1053,6 +1172,22 @@ mod tests {
             decode_packet(Bytes::from(body(Some(b"h"), &[]))).is_ok(),
             "a header-only packet"
         );
+    }
+
+    /// L1: a window counts one above the highest sequence it saw, so the last
+    /// sequence is 2^64 − 2; 2^64 − 1 is refused at decode, saying why.
+    #[test]
+    fn the_last_signal_seq_decodes_and_the_one_past_it_is_refused() {
+        let last: [Outgoing<'_>; 1] = [(u64::MAX - 1, b"a", 2, b"p")];
+        let Packet::Body(b) = decode_packet(Bytes::from(body(None, &last))).unwrap() else {
+            panic!("a body");
+        };
+        assert_eq!(b.signals[0].seq, u64::MAX - 1);
+        let past: [Outgoing<'_>; 1] = [(u64::MAX, b"a", 2, b"p")];
+        match decode_packet(Bytes::from(body(None, &past))) {
+            Err(e) => assert!(e.to_string().contains("SignalSeq"), "{e}"),
+            Ok(p) => panic!("SignalSeq 2^64 − 1 is refused, not decoded as {p:?}"),
+        }
     }
 
     #[test]
