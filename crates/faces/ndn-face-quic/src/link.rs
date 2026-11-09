@@ -255,7 +255,9 @@ impl Handshaken {
             Ok(Err(e)) => return Err(self.fail(e, deadline)),
             Err(_) => return Err(self.fail(LinkError::Timeout, deadline)),
         };
-        drop(self.permit.take());
+        if let Some(permit) = self.permit.take() {
+            permit.admitted(self.connection.clone());
+        }
         let remote = self.connection.remote_address();
         trace!(target: "face.quic", face = %id, peer = %remote, scoped = admission.scope.is_some(), "link admitted");
         let scope = admission.scope.map(|s| Arc::new(ScopeState::new(s)));

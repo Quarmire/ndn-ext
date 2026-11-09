@@ -447,6 +447,67 @@ async fn attempts_over_the_per_source_limit_are_refused_before_their_handshake()
     }
 }
 
+/// Admitted links are capped: over `max_links` links up, an attempt is
+/// refused before its handshake (an open serving policy's keys cannot hold
+/// links without end); once one closes, a link is admitted again. Links
+/// this side dials do not count.
+#[tokio::test]
+async fn attempts_over_the_admitted_link_cap_are_refused_until_one_closes() {
+    let config = LinkTransportConfig {
+        limits: HandshakeLimits {
+            max_links: 1,
+            ..HandshakeLimits::default()
+        },
+        ..LinkTransportConfig::default()
+    };
+    let listener = endpoint_with(ec_key(2), true, config);
+    let target = addr(&listener);
+    let first = endpoint(ed_key(1), false);
+    let (a, b) = link(&first, &listener).await;
+
+    // The listener dials out: that link does not count against its cap.
+    let other = endpoint(ed_key(5), true);
+    let _dialed = link(&listener, &other).await;
+
+    let second = endpoint(ed_key(3), false);
+    let accepting = async {
+        tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+    };
+    let (second_dial, accepted_second) = tokio::join!(second.connect(target, None), accepting);
+    assert!(!accepted_second, "an attempt over the cap was accepted");
+    match second_dial {
+        Err(LinkError::Refused { reason, .. }) => assert_eq!(reason, Some(CloseReason::Busy)),
+        Err(other) => panic!("expected a refusal, got {other}"),
+        Ok(_) => panic!("an attempt over the cap got a handshake"),
+    }
+
+    a.handle.close(CloseReason::Shutdown, "done");
+    b.handle.closed().await;
+    let third = endpoint(ed_key(4), false);
+    let deadline = tokio::time::Instant::now() + T;
+    loop {
+        let (dialed, accepted) = tokio::join!(third.connect(target, None), async {
+            let incoming = tokio::time::timeout(Duration::from_millis(500), listener.accept())
+                .await
+                .ok()
+                .flatten()?;
+            incoming.handshake().await.ok()
+        });
+        if let (Ok(_), Some(_)) = (dialed, accepted) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no link admitted after the only one closed"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 #[tokio::test]
 async fn a_link_survives_its_dialers_address_change() {
     let dialer = endpoint(ed_key(1), false);

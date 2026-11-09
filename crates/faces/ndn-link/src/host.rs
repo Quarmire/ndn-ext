@@ -98,6 +98,14 @@ pub trait FaceSink: Send + Sync + 'static {
     /// added with [`add_routes`](Self::add_routes); the face stays).
     fn remove_routes(&self, face: FaceId, prefixes: &[Name]);
 
+    /// Whether any route of the forwarder points at `face` now: one this
+    /// crate added, or any other (a prefix registered over the link). A
+    /// link another device dialed here that carries no NDN packet for
+    /// [`quiet_close`](ndn_face_quic::LinkTransportConfig::quiet_close),
+    /// with no route to its face and no namespace in transit over it, is
+    /// closed.
+    fn routes_to(&self, face: FaceId) -> bool;
+
     /// A device of `namespace`, a namespace this device does not hold, is
     /// linked here and served by the serving policy (`true`), or one such
     /// link ended (`false`; calls pair up). While any is linked, the

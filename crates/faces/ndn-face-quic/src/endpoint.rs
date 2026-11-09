@@ -49,8 +49,13 @@ pub struct LinkTransportConfig {
     /// Idle timeout a dialled direct path offers; a connection takes the
     /// smaller of both sides' offers, so it applies to both sides.
     pub direct_idle_timeout: Duration,
-    /// Bounds on handshakes not yet admitted.
+    /// Bounds on inbound attempts and admitted links.
     pub limits: HandshakeLimits,
+    /// How long a link another device dialed here may carry no NDN packet
+    /// while nothing on this side routes to it and it carries no namespace
+    /// in transit, before the link layer closes it: its keep-alives would
+    /// otherwise hold it open for ever.
+    pub quiet_close: Duration,
 }
 
 impl Default for LinkTransportConfig {
@@ -62,6 +67,7 @@ impl Default for LinkTransportConfig {
             direct_keep_alive: Duration::from_secs(2),
             direct_idle_timeout: Duration::from_secs(8),
             limits: HandshakeLimits::default(),
+            quiet_close: Duration::from_secs(300),
         }
     }
 }
@@ -134,10 +140,11 @@ impl LinkTransportConfig {
     }
 }
 
-/// Bounds on inbound connections that have not been admitted as links: an
-/// unauthenticated attempt costs a handshake, so their number is capped in
-/// total and per source address, and a source refused again and again is
-/// refused outright for a while.
+/// Bounds on inbound connections: an unauthenticated attempt costs a
+/// handshake, so the attempts not yet admitted as links are capped in total
+/// and per source address, and a source refused again and again is refused
+/// outright for a while; the links admitted and still up are capped too, so
+/// keys an open serving policy admits cannot hold links without end.
 #[derive(Clone, Debug)]
 pub struct HandshakeLimits {
     /// Inbound connections in their handshake or admission at once.
@@ -152,6 +159,10 @@ pub struct HandshakeLimits {
     /// Refusals older than this are forgotten: the count starts again at
     /// the first refusal after the window of the previous first one ends.
     pub refusal_window: Duration,
+    /// Inbound links admitted and still up, with the attempts in progress:
+    /// an attempt beyond it is refused before its handshake until a link
+    /// closes. Links this device dials do not count.
+    pub max_links: usize,
 }
 
 impl Default for HandshakeLimits {
@@ -162,6 +173,7 @@ impl Default for HandshakeLimits {
             refusals_before_cooldown: 8,
             cooldown: Duration::from_secs(60),
             refusal_window: Duration::from_secs(60),
+            max_links: 1024,
         }
     }
 }
@@ -178,6 +190,8 @@ struct Source {
 pub(crate) struct Gate {
     limits: HandshakeLimits,
     in_flight: AtomicUsize,
+    /// Inbound links admitted whose connection is still up.
+    links: AtomicUsize,
     sources: Mutex<HashMap<IpAddr, Source>>,
 }
 
@@ -192,6 +206,19 @@ impl Permit {
     /// The link was refused: count it against the source.
     pub(crate) fn refused(&self) {
         self.gate.refused(self.source, Instant::now());
+    }
+
+    /// The link over `connection` was admitted: it counts against
+    /// [`HandshakeLimits::max_links`] until the connection closes.
+    pub(crate) fn admitted(self, connection: quinn::Connection) {
+        let gate = Arc::clone(&self.gate);
+        // Counted as a link before it stops counting as an attempt.
+        gate.links.fetch_add(1, Ordering::SeqCst);
+        drop(self);
+        tokio::spawn(async move {
+            connection.closed().await;
+            gate.links.fetch_sub(1, Ordering::SeqCst);
+        });
     }
 }
 
@@ -217,6 +244,7 @@ impl Gate {
         Arc::new(Self {
             limits,
             in_flight: AtomicUsize::new(0),
+            links: AtomicUsize::new(0),
             sources: Mutex::new(HashMap::new()),
         })
     }
@@ -264,8 +292,15 @@ impl Gate {
         if source.in_flight >= self.limits.max_in_flight_per_source {
             return Err("too many of its link attempts are in progress");
         }
-        if self.in_flight.load(Ordering::SeqCst) >= self.limits.max_in_flight {
+        let in_flight = self.in_flight.load(Ordering::SeqCst);
+        if in_flight >= self.limits.max_in_flight {
             return Err("this device has too many link attempts in progress");
+        }
+        if self.links.load(Ordering::SeqCst) + in_flight >= self.limits.max_links {
+            return Err(
+                "this device holds as many inbound links as it admits: attempts are refused \
+                 until one of them closes (raise the host's link cap to admit more devices)",
+            );
         }
         source.in_flight += 1;
         self.in_flight.fetch_add(1, Ordering::SeqCst);

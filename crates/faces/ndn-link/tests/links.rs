@@ -97,6 +97,9 @@ impl FaceSink for Recorder {
             .lock()
             .retain(|(f, r)| *f != face || !prefixes.contains(&r.prefix));
     }
+    fn routes_to(&self, face: FaceId) -> bool {
+        self.routes.lock().iter().any(|(f, _)| *f == face)
+    }
     fn transit(&self, _: &Name, _: bool) {}
 }
 
@@ -127,7 +130,24 @@ fn start_with(
     cancel: &CancellationToken,
     service: RelayService,
 ) -> (Arc<Links>, Arc<Recorder>, Option<String>) {
-    let transport = LinkTransportConfig::default();
+    start_full(
+        key,
+        peers,
+        listen,
+        cancel,
+        service,
+        LinkTransportConfig::default(),
+    )
+}
+
+fn start_full(
+    key: LinkKey,
+    peers: Vec<PeerSpec>,
+    listen: bool,
+    cancel: &CancellationToken,
+    service: RelayService,
+    transport: LinkTransportConfig,
+) -> (Arc<Links>, Arc<Recorder>, Option<String>) {
     let key: Arc<dyn LinkKeySource> = Arc::new(key);
     let socket = listen.then(|| {
         Arc::new(
@@ -159,6 +179,70 @@ fn start_with(
         cancel.child_token(),
     );
     (links, faces, addr)
+}
+
+/// A link another device dialed here that carries no NDN packet for
+/// `quiet_close`, with no route to its face and nothing in transit over it,
+/// is closed; one the listener routes to stays, however quiet; and a link
+/// this device dialed is never closed so, even with no route of its own.
+#[tokio::test]
+async fn a_quiet_inbound_link_with_no_route_is_closed_and_routed_or_dialed_ones_stay() {
+    let cancel = CancellationToken::new();
+    let (a, l, c) = (key(12), key(13), key(14));
+    let (fa, fl, fc) = (a.fingerprint(), l.fingerprint(), c.fingerprint());
+    let quiet = || LinkTransportConfig {
+        quiet_close: Duration::from_secs(1),
+        ..LinkTransportConfig::default()
+    };
+    let (_listener, at_l, addr) = start_full(
+        l,
+        vec![
+            peer(fa, None, None),
+            peer(fc, None, Some(vec!["/c".parse().unwrap()])),
+        ],
+        true,
+        &cancel,
+        RelayService::default(),
+        quiet(),
+    );
+    let dial = |k, routes: Vec<Name>| {
+        start_full(
+            k,
+            vec![peer(fl, addr.clone(), Some(routes))],
+            false,
+            &cancel,
+            RelayService::default(),
+            quiet(),
+        )
+    };
+    // a's link: routed on a's side only. c's link: routed on the
+    // listener's side only, and dialed by c, which routes nothing over it.
+    let (_a, at_a, _) = dial(a, vec!["/l".parse().unwrap()]);
+    let (_c, at_c, _) = dial(c, Vec::new());
+    until("both links come up", || {
+        at_a.live.lock().len() == 1 && at_c.live.lock().len() == 1 && at_l.live.lock().len() == 2
+    })
+    .await;
+    let link_faces = |r: &Recorder| {
+        r.faces
+            .lock()
+            .iter()
+            .filter(|f| f.kind() == FaceKind::Quic)
+            .count()
+    };
+    within(
+        "the quiet link nothing routes to on the listener closes",
+        Duration::from_secs(8),
+        || at_a.live.lock().is_empty() || link_faces(&at_a) > 1,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        (at_c.live.lock().len(), link_faces(&at_c)),
+        (1, 1),
+        "the link the listener routes to, dialed by a device routing nothing over it, closed"
+    );
+    cancel.cancel();
 }
 
 async fn until(what: &str, done: impl FnMut() -> bool) {

@@ -278,6 +278,9 @@ impl FaceSink for Recorder {
             .retain(|(f, r)| *f != face || !prefixes.contains(&r.prefix));
         self.changed.notify_waiters();
     }
+    fn routes_to(&self, face: FaceId) -> bool {
+        self.routes.lock().iter().any(|(f, _)| *f == face)
+    }
     fn transit(&self, _: &Name, _: bool) {}
 }
 

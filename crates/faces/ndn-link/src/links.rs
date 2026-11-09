@@ -792,38 +792,69 @@ impl Links {
         let fingerprint = admitted.fingerprint;
         let describe = admitted.describe();
         let what = kind.as_str();
+        // A link another device dialed here that carries no NDN packet for
+        // `quiet_close`, while nothing routes to its face and it carries no
+        // namespace in transit, is closed: its keep-alives would hold it
+        // open for ever. A link this device dialed is its own mode's.
+        let quiet = (kind == PathKind::Link && direction == ndn_face_quic::Direction::Accepted)
+            .then_some(self.transport.quiet_close);
         tokio::spawn(async move {
             // Cancelled once this task removed the path's face and routes.
             let _gone = gone.drop_guard();
-            let why = match slot {
-                // An enrollment link that carries nothing for its idle
-                // lifetime is closed; the device dials again if it still
-                // needs it.
-                Some(slot) => {
-                    let why = loop {
-                        tokio::select! {
-                            why = watched.closed() => break why,
-                            () = tokio::time::sleep(ENROLLMENT_IDLE / 4) => {}
-                        }
-                        if watched
+            let why = if slot.is_none() && quiet.is_none() {
+                watched.closed().await
+            } else {
+                let check = match quiet {
+                    Some(quiet) if slot.is_none() => idle_check(quiet),
+                    Some(quiet) => idle_check(quiet).min(ENROLLMENT_IDLE / 4),
+                    None => ENROLLMENT_IDLE / 4,
+                };
+                let (mut carried, mut quiet_since) = (watched.datagrams(), Instant::now());
+                loop {
+                    tokio::select! {
+                        why = watched.closed() => break why,
+                        () = tokio::time::sleep(check) => {}
+                    }
+                    // An enrollment link that carries nothing for its idle
+                    // lifetime is closed; the device dials again if it
+                    // still needs it.
+                    if slot.is_some()
+                        && watched
                             .scope_idle_for()
                             .is_some_and(|idle| idle >= ENROLLMENT_IDLE)
-                        {
-                            watched.close(
-                                CloseReason::Idle,
-                                &format!(
-                                    "this enrollment link carried nothing for {} s and is closed; \
-                                     your device dials again by itself while it enrolls",
-                                    ENROLLMENT_IDLE.as_secs()
-                                ),
-                            );
-                        }
-                    };
-                    drop(slot);
-                    why
+                    {
+                        watched.close(
+                            CloseReason::Idle,
+                            &format!(
+                                "this enrollment link carried nothing for {} s and is closed; \
+                                 your device dials again by itself while it enrolls",
+                                ENROLLMENT_IDLE.as_secs()
+                            ),
+                        );
+                        continue;
+                    }
+                    let Some(quiet) = quiet else { continue };
+                    let now = watched.datagrams();
+                    if now != carried {
+                        (carried, quiet_since) = (now, Instant::now());
+                    } else if quiet_since.elapsed() >= quiet
+                        && transit.is_empty()
+                        && !weak.upgrade().is_some_and(|l| l.faces.routes_to(face_id))
+                    {
+                        watched.close(
+                            CloseReason::Idle,
+                            &format!(
+                                "this link carried no NDN packet for {} s, and nothing on this \
+                                 device routes to it or carries a namespace in transit over it: \
+                                 it is closed; your device dials again when it has something to \
+                                 send or to serve",
+                                quiet.as_secs()
+                            ),
+                        );
+                    }
                 }
-                None => watched.closed().await,
             };
+            drop(slot);
             drop(quota);
             tracing::info!(
                 target: "face.quic",

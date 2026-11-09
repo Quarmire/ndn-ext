@@ -63,6 +63,10 @@ impl FaceSink for EngineFaces {
         }
     }
 
+    fn routes_to(&self, face: FaceId) -> bool {
+        self.0.fib().routes_to(face)
+    }
+
     fn transit(&self, namespace: &Name, served: bool) {
         let transit = self.0.transit();
         if served {

@@ -41,8 +41,8 @@
 //!   across an address change ([`LinkEndpoint::rebind`]). A host may hand
 //!   the endpoint a socket it bound itself, to a network interface or a
 //!   phone's Wi-Fi or cellular network ([`LinkEndpoint::from_socket`]).
-//!   Inbound attempts are bounded before their handshake
-//!   ([`HandshakeLimits`]).
+//!   Inbound attempts are bounded before their handshake, and so are the
+//!   inbound links admitted and still up ([`HandshakeLimits`]).
 //! - **Reachability.** After the verdict a device tells a relay whether to
 //!   hold Interests for it while it sleeps and how to wake it
 //!   ([`LinkHandle::send_reachability`], [`Reachability`]); a relay tells a
