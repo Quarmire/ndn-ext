@@ -43,6 +43,13 @@
 //! still findable) but gates the fd-handshake on a caller secret — the secret never
 //! appears on the wire or in the socket path and is bound to the name.
 //!
+//! ## Signals (feature `signals`)
+//!
+//! `ndn_surface::signal` carries ephemeral live data (presence, cursors, drags) of a data-layer
+//! folder: pushed as unsigned Interests into the members' sync groups, read off a
+//! run's broadcast ring on this host, gated by `ndn-data` (ndn-rs
+//! `docs/specs/signals.md`).
+//!
 //! Scope: the large-frame `SharedBuffer` path and 1:N fan-out remain seams for the
 //! next phase.
 
@@ -66,6 +73,9 @@ use ndn_packet::encode::DataBuilder;
 use ndn_packet::tlv_type;
 use ndn_storage::{NamedOp, NamedReadStore, NamedWriteStore};
 use ndn_transport::FaceId;
+
+#[cfg(feature = "signals")]
+pub mod signal;
 
 /// Default maximum frame size (ring slot) — 1 MiB. Override with
 /// [`NamedPublisher::open_with_max_frame`].
@@ -123,6 +133,13 @@ fn sha256_parts(parts: &[&[u8]]) -> ShmToken {
     let mut t = [0u8; 32];
     t.copy_from_slice(&h.finalize());
     t
+}
+
+/// Whether a producer may serve the surface `name` on this host: its rendezvous
+/// socket exists (a stale one, left by a crashed producer, refuses the attach).
+#[cfg(feature = "signals")]
+pub(crate) fn served_here(name: &Name) -> bool {
+    control_socket_path(&rendezvous_token(name)).exists()
 }
 
 /// How a publisher delivers frames.
@@ -422,7 +439,13 @@ impl NamedPublisher {
     pub async fn open_broadcast(name: impl Into<Name>) -> Result<Self, SurfaceError> {
         let name = name.into();
         let cap = rendezvous_token(&name);
-        Self::open_broadcast_inner(name, 64 * 1024, Self::DEFAULT_BROADCAST_CONSUMERS, cap).await
+        Self::open_broadcast_inner(
+            name,
+            sealed_geometry(64 * 1024),
+            Self::DEFAULT_BROADCAST_CONSUMERS,
+            cap,
+        )
+        .await
     }
 
     /// Broadcast surface with tuned `max_frame` and `max_consumers`.
@@ -433,7 +456,7 @@ impl NamedPublisher {
     ) -> Result<Self, SurfaceError> {
         let name = name.into();
         let cap = rendezvous_token(&name);
-        Self::open_broadcast_inner(name, max_frame, max_consumers, cap).await
+        Self::open_broadcast_inner(name, sealed_geometry(max_frame), max_consumers, cap).await
     }
 
     /// Capability-gated broadcast surface (see [`open_gated`](Self::open_gated)).
@@ -443,16 +466,39 @@ impl NamedPublisher {
     ) -> Result<Self, SurfaceError> {
         let name = name.into();
         let cap = capability_token(&name, secret);
-        Self::open_broadcast_inner(name, 64 * 1024, Self::DEFAULT_BROADCAST_CONSUMERS, cap).await
+        Self::open_broadcast_inner(
+            name,
+            sealed_geometry(64 * 1024),
+            Self::DEFAULT_BROADCAST_CONSUMERS,
+            cap,
+        )
+        .await
+    }
+
+    /// Capability-gated broadcast surface with tuned geometry: frames up to
+    /// `max_frame` bytes, a ring of `capacity` slots (a reader more than
+    /// `capacity` frames behind is lapped), up to `max_consumers` readers. A
+    /// small, fixed-size live stream (e.g. a signal run's local ring) keeps its
+    /// ring to what it needs rather than the default ~4 MiB.
+    pub async fn open_broadcast_gated_with(
+        name: impl Into<Name>,
+        secret: &[u8],
+        max_frame: usize,
+        capacity: u32,
+        max_consumers: u32,
+    ) -> Result<Self, SurfaceError> {
+        let name = name.into();
+        let cap = capability_token(&name, secret);
+        let slot_size = sealed_geometry(max_frame).1;
+        Self::open_broadcast_inner(name, (capacity, slot_size), max_consumers, cap).await
     }
 
     async fn open_broadcast_inner(
         name: Name,
-        max_frame: usize,
+        (capacity, slot_size): (u32, u32),
         max_consumers: u32,
         capability: ShmToken,
     ) -> Result<Self, SurfaceError> {
-        let (capacity, slot_size) = sealed_geometry(max_frame);
         let writer =
             std::sync::Arc::new(BroadcastWriter::create(capacity, slot_size, max_consumers)?);
         let path = control_socket_path(&rendezvous_token(&name));
@@ -1033,6 +1079,42 @@ impl NamedPublisher {
     pub fn name(&self) -> &Name {
         &self.name
     }
+
+    /// Publish one frame on a broadcast surface without waiting: the ring is lossy
+    /// and never blocks the producer. Refused when the surface is not a broadcast
+    /// one or `content` doesn't fit its slot.
+    #[cfg(feature = "signals")]
+    pub(crate) fn publish_broadcast(&mut self, content: &[u8]) -> Result<(), SurfaceError> {
+        let Sink::Broadcast(writer) = &self.sink else {
+            return Err(SurfaceError::Face(
+                "publish_broadcast is for a broadcast surface".into(),
+            ));
+        };
+        let comps = self
+            .prefix_components
+            .get_or_insert_with(|| name_components_tlv(&self.name));
+        let mut vbuf = [0u8; 10];
+        let vlen = encode_version_component(self.seq, &mut vbuf);
+        let l = fast_inline_len(comps.len(), vlen, content.len());
+        if !writer.publish_with(l, |slot| {
+            encode_fast_inline(comps, &vbuf[..vlen], content, slot)
+        }) {
+            return Err(SurfaceError::Face(
+                "broadcast frame exceeds the surface slot size".into(),
+            ));
+        }
+        self.seq += 1;
+        Ok(())
+    }
+
+    /// End a broadcast surface now: its readers are told it closed cleanly (a
+    /// lapped reader ends as an abort instead), and its rendezvous goes.
+    #[cfg(feature = "signals")]
+    pub(crate) fn end_broadcast(self) {
+        if let Sink::Broadcast(writer) = &self.sink {
+            writer.publish(&[EOS_MARKER]);
+        }
+    }
 }
 
 impl Drop for NamedPublisher {
@@ -1277,6 +1359,34 @@ impl NamedSubscriber {
             Source::Broadcast(r) => r.dropped(),
             _ => 0,
         }
+    }
+
+    /// The next frame's content of a broadcast surface, owned: the one copy out
+    /// of the lossy ring (a borrowed view could be overwritten mid-read), sliced
+    /// without another. `None` once the surface ends, or for another kind.
+    #[cfg(feature = "signals")]
+    pub(crate) async fn next_broadcast(&mut self) -> Option<Bytes> {
+        if self.complete.is_some() {
+            return None;
+        }
+        let Source::Broadcast(reader) = &self.source else {
+            return None;
+        };
+        let Some(wire) = reader.recv().await else {
+            self.complete = Some(false);
+            return None;
+        };
+        if is_eos(&wire) {
+            self.complete = Some(true);
+            return None;
+        }
+        let Ok((_, content)) = parse_frame(&wire) else {
+            self.complete = Some(false);
+            return None;
+        };
+        let start = content.as_ptr() as usize - wire.as_ptr() as usize;
+        let end = start + content.len();
+        Some(Bytes::from(wire).slice(start..end))
     }
 
     async fn connect_local_inner(
