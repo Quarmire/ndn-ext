@@ -190,6 +190,28 @@ async fn a_sender_is_held_to_its_limits() {
     world.cancel.cancel();
 }
 
+/// A scope the data layer refuses for its name (no `32=data`) is refused with
+/// that refusal and its own next step — fix the name — not as a membership one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_scope_that_is_no_data_layer_name_is_refused_with_the_data_layers_reason() {
+    let world = World::new("/alice", &["/alice/laptop"]).await;
+    let e = engine().await;
+    let laptop = world.host(&e, "/alice/laptop", no_ring()).await;
+    let bad = n("/alice/board");
+    for refused in [
+        laptop.signals.subscribe(&bad).await.map(|_| ()),
+        laptop.signals.open(&bad).await.map(|_| ()),
+    ] {
+        match refused {
+            Err(e @ SignalError::Data(ndn_data::DataError::BadName { .. })) => {
+                assert_eq!(e.next(), ndn_data::NextStep::FixName, "{e}");
+            }
+            other => panic!("refused with the data layer's BadName, not {other:?}"),
+        }
+    }
+    world.cancel.cancel();
+}
+
 /// A full-size signal sent first, whose packet has no room for the run header,
 /// arrives after a header-only packet.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

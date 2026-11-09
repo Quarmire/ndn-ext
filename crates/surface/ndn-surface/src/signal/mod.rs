@@ -243,6 +243,10 @@ pub enum SignalError {
     /// From the forwarder connection or the local ring.
     #[error("the forwarder connection or the local ring failed: {0}")]
     Io(String),
+    /// Any other refusal of the scope by the data layer (a name that is no
+    /// folder or collection, a local failure, …). Next: as the data error says.
+    #[error(transparent)]
+    Data(DataError),
 }
 
 impl SignalError {
@@ -253,21 +257,25 @@ impl SignalError {
             SignalError::NotReady { .. } | SignalError::RateLimited { .. } => NextStep::RetryLater,
             SignalError::TooLarge { .. } | SignalError::Closed => NextStep::FixRequest,
             SignalError::Io(_) => NextStep::FixLocal,
+            SignalError::Data(e) => e.next(),
         }
     }
 }
 
-/// A data-layer refusal of a scope as a signal refusal.
+/// A data-layer refusal of a scope as a signal refusal, keeping its next step:
+/// no member (or outside a sealed audience) is NotMember, anything that may
+/// succeed later NotReady, every other refusal the data error itself.
 fn scope_error(scope: &Name, e: DataError) -> SignalError {
-    match e.next() {
-        NextStep::RetryLater => SignalError::NotReady {
+    match e {
+        DataError::NotAllowed { .. } | DataError::Sealed { .. } => SignalError::NotMember {
             scope: scope.clone(),
             why: e.to_string(),
         },
-        _ => SignalError::NotMember {
+        e if e.next() == NextStep::RetryLater => SignalError::NotReady {
             scope: scope.clone(),
             why: e.to_string(),
         },
+        e => SignalError::Data(e),
     }
 }
 
