@@ -21,6 +21,12 @@ use ndn_surface::signal::{SignalError, SignalOptions, SignalSubscriber, Signals,
 use ndn_sync::MemoryStore;
 use tokio_util::sync::CancellationToken;
 
+/// The octets of `name`'s encoding as a Name TLV.
+pub fn name_octets(name: &Name) -> usize {
+    let tlv = |len: usize| 1 + if len < 253 { 1 } else { 3 } + len;
+    tlv(name.components().iter().map(|c| tlv(c.value.len())).sum())
+}
+
 const VALIDITY_MS: u64 = 365 * 24 * 3600 * 1000;
 
 pub fn n(s: &str) -> Name {

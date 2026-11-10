@@ -40,6 +40,7 @@ mod queue;
 mod state;
 pub mod wire;
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
 use std::ops::Range;
@@ -59,8 +60,8 @@ use crate::{NamedPublisher, NamedSubscriber};
 use crypto::RunKey;
 use queue::Queue;
 use state::{Bucket, Latest, ReplayWindow};
-pub use wire::RunId;
-use wire::{Body, Outgoing, PACKET_MAX, Packet, RunHeaderBody};
+use wire::{Body, Outgoing, PACKET_MAX, Packet, RunHeaderBody, ScopeDigest};
+pub use wire::{RunId, SCOPE_MAX};
 
 /// The longest `Expires` after now a signal may carry (§5).
 pub const TTL_MAX: Duration = Duration::from_secs(60);
@@ -274,6 +275,39 @@ pub enum SignalError {
         /// The limit.
         max: usize,
     },
+    /// The scope's name is too long for a run to be opened in it: a run's
+    /// header carries the scope's Name and the device's key name, and must fit a
+    /// packet of its own ([`SCOPE_MAX`] encoded octets of scope for a device
+    /// key name up to 140). Next: name the folder or collection shorter.
+    #[error(
+        "the scope {scope} is {size} encoded octets long, over the {max} that a run's header \
+         can name in one packet of {} octets (it carries the scope's name and this device's \
+         key name, and a signal packet then names the scope only by a 16-octet digest); name \
+         the folder or collection with a shorter name",
+        wire::PACKET_MAX
+    )]
+    ScopeTooLong {
+        /// The scope.
+        scope: Name,
+        /// Its encoded octets (its Name TLV).
+        size: usize,
+        /// The most this device's runs can name: at most [`SCOPE_MAX`].
+        max: usize,
+    },
+    /// Two scopes this process subscribes to have one 16-octet scope digest, so
+    /// their packets could not be told apart. Next: unsubscribe one, or name it
+    /// otherwise.
+    #[error(
+        "the scope {scope} has the same 16-octet scope digest as {other}, which this process \
+         subscribes to already, so their packets could not be told apart; drop the \
+         subscription to {other} first, or name {scope} otherwise"
+    )]
+    ScopeDigestCollision {
+        /// The scope refused.
+        scope: Name,
+        /// The scope subscribed already.
+        other: Name,
+    },
     /// Over the run's rate, or over the process's push budget, which counts each
     /// packet once per group it goes into (§5). Next: send after `retry_after`,
     /// batch with `send_batch`, or send less.
@@ -306,6 +340,9 @@ impl SignalError {
             SignalError::NotMember { .. } => NextStep::AskOwner,
             SignalError::NotReady { .. } | SignalError::RateLimited { .. } => NextStep::RetryLater,
             SignalError::TooLarge { .. } | SignalError::Closed => NextStep::FixRequest,
+            SignalError::ScopeTooLong { .. } | SignalError::ScopeDigestCollision { .. } => {
+                NextStep::FixName
+            }
             SignalError::Io(_) => NextStep::FixLocal,
             SignalError::Data(e) => e.next(),
         }
@@ -326,6 +363,42 @@ fn scope_error(scope: &Name, e: DataError) -> SignalError {
             why: e.to_string(),
         },
         e => SignalError::Data(e),
+    }
+}
+
+/// A scope a run can be opened in: its name within [`SCOPE_MAX`] encoded octets.
+fn scope_fits(scope: &Name) -> Result<(), SignalError> {
+    let size = wire::name_size(scope);
+    if size > SCOPE_MAX {
+        return Err(SignalError::ScopeTooLong {
+            scope: scope.clone(),
+            size,
+            max: SCOPE_MAX,
+        });
+    }
+    Ok(())
+}
+
+/// Record `scope` as the one subscribed under `digest`, or refuse when another
+/// scope holds that digest: unsealed packets name their scope by digest alone, so
+/// two scopes of one digest could not be told apart (a collision of a 128-bit
+/// truncated hash costs about 2^64 work to find, so only the owner of both
+/// scopes could make one).
+fn claim_digest(
+    by_digest: &mut HashMap<ScopeDigest, Name>,
+    digest: ScopeDigest,
+    scope: &Name,
+) -> Result<(), SignalError> {
+    match by_digest.entry(digest) {
+        Entry::Occupied(held) if held.get() != scope => Err(SignalError::ScopeDigestCollision {
+            scope: scope.clone(),
+            other: held.get().clone(),
+        }),
+        Entry::Occupied(_) => Ok(()),
+        Entry::Vacant(free) => {
+            free.insert(scope.clone());
+            Ok(())
+        }
     }
 }
 
@@ -450,6 +523,7 @@ impl Reason {
 // ---- the hub ----------------------------------------------------------------------------------
 
 struct ScopeState {
+    digest: ScopeDigest,
     queues: Vec<Weak<Queue>>,
     latest: Latest,
     /// The scope's verified packets ([`RECEIVE_RATE_SCOPE`]).
@@ -474,9 +548,36 @@ struct RunState {
     verified_us: u64,
 }
 
+/// A decoded body placed in its scope: the scope is the Name the subscription
+/// gave for its digest (unsealed) or the scope of the key it was sealed under;
+/// `digest` is what the packet claims, which the run signature covers.
+struct Inbound {
+    scope: Name,
+    digest: ScopeDigest,
+    run: RunId,
+    header: Option<Bytes>,
+    signals: Vec<wire::WireSignal>,
+    signature: [u8; wire::SIGNATURE_LEN],
+    signed: Bytes,
+}
+
+impl Inbound {
+    fn new(body: Body, scope: Name) -> Inbound {
+        Inbound {
+            scope,
+            digest: body.digest,
+            run: body.run,
+            header: body.header,
+            signals: body.signals,
+            signature: body.signature,
+            signed: body.signed,
+        }
+    }
+}
+
 /// A packet of a run whose header is being admitted, processed once it is.
 struct Waiting {
-    body: Body,
+    body: Inbound,
     sealed: bool,
     local: bool,
     /// Its run signature verified already (it carried a header, §8.1 step 4).
@@ -494,6 +595,9 @@ struct Admitting {
 #[derive(Default)]
 struct HubState {
     scopes: HashMap<Name, ScopeState>,
+    /// The subscribed scopes by their digest, which unsealed packets name them
+    /// by (never two scopes of one digest, [`claim_digest`]).
+    by_digest: HashMap<ScopeDigest, Name>,
     keys: HashMap<[u8; wire::KEY_ID_LEN], (Name, SignalKey)>,
     keys_refreshed_us: Option<u64>,
     /// When this process first saw each signal key superseded by a newer
@@ -580,8 +684,23 @@ impl Hub {
             Ok(p) => p,
             Err(e) => return self.drop_packet(Reason::Malformed, None, &e.to_string()),
         };
-        let (body, sealed) = match decoded {
-            Packet::Body(b) => (b, false),
+        let (body, scope, sealed) = match decoded {
+            Packet::Body(b) => {
+                // An unsealed packet names its scope by digest: the scope is the one
+                // subscribed here whose digest it is, if any (§8.1 step 3).
+                let Some(scope) = self.lock().by_digest.get(&b.digest).cloned() else {
+                    return self.drop_packet(
+                        Reason::Unsubscribed,
+                        Some(&b.run),
+                        &format!(
+                            "a packet of the scope with digest {}, which no one subscribes to \
+                             here",
+                            b.digest
+                        ),
+                    );
+                };
+                (b, scope, false)
+            }
             Packet::Sealed(s) => {
                 let (scope, key) = match self.key_for(&s.key_id) {
                     Ok(k) => k,
@@ -601,20 +720,17 @@ impl Hub {
                     Ok(b) => b,
                     Err(e) => return self.drop_packet(Reason::Malformed, None, &e.to_string()),
                 };
-                if body.scope != scope {
-                    return self.drop_packet(
-                        Reason::Malformed,
-                        Some(&body.run),
-                        &format!(
-                            "sealed under {scope}'s key but names the scope {}",
-                            body.scope
-                        ),
-                    );
-                }
-                (body, true)
+                (body, scope, true)
             }
         };
-        self.process(body, sealed, local, false, false, scratch);
+        self.process(
+            Inbound::new(body, scope),
+            sealed,
+            local,
+            false,
+            false,
+            scratch,
+        );
     }
 
     /// The signal key of `id`, among the subscribed scopes' keys, unless its
@@ -658,7 +774,7 @@ impl Hub {
     /// verified already (it carried the header).
     fn process(
         self: &Arc<Self>,
-        body: Body,
+        body: Inbound,
         sealed: bool,
         local: bool,
         drained: bool,
@@ -684,6 +800,17 @@ impl Hub {
                     ),
                 );
             };
+            if scope.digest != body.digest {
+                return self.drop_packet(
+                    Reason::Malformed,
+                    Some(&run_id),
+                    &format!(
+                        "it names the scope digest {}, which is not {}'s ({}): sealed under that \
+                         scope's key but claiming another scope",
+                        body.digest, body.scope, scope.digest
+                    ),
+                );
+            }
             if scope.sealed && !sealed {
                 return self.drop_packet(
                     Reason::Malformed,
@@ -879,7 +1006,7 @@ impl Hub {
     /// are processed.
     fn admit(
         self: &Arc<Self>,
-        body: Body,
+        body: Inbound,
         sealed: bool,
         local: bool,
         header: Bytes,
@@ -985,7 +1112,7 @@ impl Hub {
     /// that run; then the signer a member, asked of the device offline.
     fn check_header(
         &self,
-        body: &Body,
+        body: &Inbound,
         header: Bytes,
         scratch: &mut Vec<u8>,
     ) -> Result<(Checked, SignalSender), Dropped> {
@@ -1070,7 +1197,7 @@ impl Hub {
     #[allow(clippy::type_complexity)]
     fn admitted(
         &self,
-        body: &Body,
+        body: &Inbound,
         checked: Checked,
         outcome: Result<SignalSender, Dropped>,
         revocations: u64,
@@ -1525,6 +1652,27 @@ impl Signals {
         &self.hub.listen
     }
 
+    /// The octets of address plus payload that one signal always fits beside in a
+    /// packet of `scope`, sealed or not: any signal with an address of at most
+    /// [`wire::ADDRESS_MAX`] (64), a payload of at most [`wire::PAYLOAD_MAX`] (768)
+    /// and address + payload within the room fits one packet, whatever the scope
+    /// is called, because a packet names its scope by a 16-octet digest and not by
+    /// its Name (signals.md §4.1, §4.3). A batch takes [`wire::SIGNAL_OVERHEAD`]
+    /// more octets per signal, and the packet [`wire::PACKET_MAX`] in all.
+    ///
+    /// 0 when no run can be opened in `scope`: its name is over [`SCOPE_MAX`]
+    /// encoded octets, so its run header would not fit a packet of its own
+    /// ([`SignalError::ScopeTooLong`]). A device whose own key name is far longer
+    /// than the wire tests hold to (140 octets) can have less scope to spend; its
+    /// `open` says so.
+    pub fn room(scope: &Name) -> usize {
+        if wire::name_size(scope) > SCOPE_MAX {
+            0
+        } else {
+            wire::ROOM
+        }
+    }
+
     fn open_check(&self) -> Result<(), SignalError> {
         if self.hub.closed.load(Ordering::Relaxed) {
             return Err(SignalError::Closed);
@@ -1538,6 +1686,7 @@ impl Signals {
     /// isn't held yet: its ask has started; ask again).
     pub async fn subscribe(&self, scope: &Name) -> Result<SignalSubscriber, SignalError> {
         self.open_check()?;
+        scope_fits(scope)?;
         let s = self
             .hub
             .device
@@ -1545,10 +1694,13 @@ impl Signals {
             .map_err(|e| scope_error(scope, e))?;
         let queue = Arc::new(Queue::default());
         let now = self.hub.now_us();
+        let digest = ScopeDigest::of(scope);
         let mut st = self.hub.lock();
+        claim_digest(&mut st.by_digest, digest, scope)?;
         st.scopes
             .entry(scope.clone())
             .or_insert_with(|| ScopeState {
+                digest,
                 queues: Vec::new(),
                 latest: Latest::default(),
                 rate: Bucket::new(RECEIVE_RATE_SCOPE, RECEIVE_RATE_SCOPE, now),
@@ -1569,6 +1721,7 @@ impl Signals {
     /// local ring. Refused as subscribe is.
     pub async fn open(&self, scope: &Name) -> Result<SignalRun, SignalError> {
         self.open_check()?;
+        scope_fits(scope)?;
         self.hub
             .device
             .signal_scope(scope)
@@ -1578,6 +1731,7 @@ impl Signals {
         Ok(SignalRun {
             hub: Arc::clone(&self.hub),
             scope: scope.clone(),
+            digest: ScopeDigest::of(scope),
             next_seq: now,
             keyed: Some(keyed),
             bucket: Bucket::new(SEND_RATE, SEND_BURST, now),
@@ -1646,6 +1800,14 @@ impl Keyed {
             .device
             .signal_header(scope, &key.id().0, &wire::encode_run_header_body(&body))
             .map_err(|e| scope_error(scope, e))?;
+        if header.len() > wire::HEADER_MAX {
+            let size = wire::name_size(scope);
+            return Err(SignalError::ScopeTooLong {
+                scope: scope.clone(),
+                size,
+                max: size.saturating_sub(header.len() - wire::HEADER_MAX),
+            });
+        }
         let id = key.id();
         hub.lock().own.insert(id);
         if let Some(secret) = ring {
@@ -1685,6 +1847,7 @@ impl Keyed {
 pub struct SignalRun {
     hub: Arc<Hub>,
     scope: Name,
+    digest: ScopeDigest,
     next_seq: u64,
     /// `None` once closed.
     keyed: Option<Keyed>,
@@ -1826,11 +1989,7 @@ impl SignalRun {
             .collect();
         let sealed = scope.keys.first();
         let size = |header: bool, of: &[Outgoing<'_>]| {
-            let body = wire::body_size(
-                wire::name_size(&self.scope),
-                header.then_some(keyed.header.len()),
-                of,
-            );
+            let body = wire::body_size(header.then_some(keyed.header.len()), of);
             if sealed.is_some() {
                 wire::sealed_size(body)
             } else {
@@ -1851,12 +2010,6 @@ impl SignalRun {
                 header: true,
                 signals: all,
             }]
-        } else if size(true, &[]) > PACKET_MAX {
-            return Err(SignalError::TooLarge {
-                what: "the run header in a packet",
-                size: size(true, &[]),
-                max: PACKET_MAX,
-            });
         } else {
             vec![
                 Planned {
@@ -1899,7 +2052,7 @@ impl SignalRun {
             let scratch = &mut self.scratch;
             wire::encode_body(
                 &mut self.body,
-                &self.scope,
+                &self.digest,
                 &run,
                 header,
                 &outgoing[p.signals],
@@ -1989,6 +2142,7 @@ impl Drop for SignalSubscriber {
         s.queues
             .retain(|q| q.strong_count() > 0 && !q.ptr_eq(&mine));
         if s.queues.is_empty() {
+            st.by_digest.remove(&s.digest);
             st.scopes.remove(&self.scope);
             st.keys.retain(|_, (sc, _)| *sc != self.scope);
             st.runs.retain(|_, r| r.scope != self.scope);
@@ -2011,7 +2165,7 @@ mod tests {
             let mut out = Vec::new();
             encode_body(
                 &mut out,
-                &scope.parse().unwrap(),
+                &ScopeDigest::of(&scope.parse().unwrap()),
                 &key.id(),
                 None,
                 &signals,
@@ -2029,12 +2183,12 @@ mod tests {
             &b.signature,
             &mut scratch
         ));
-        // The same signature carried over a packet naming another scope.
+        // The same signature carried over a packet claiming another scope: its digest.
         let mut other = Vec::new();
         let sig = b.signature;
         encode_body(
             &mut other,
-            &"/alice/32=data/notes".parse().unwrap(),
+            &ScopeDigest::of(&"/alice/32=data/notes".parse().unwrap()),
             &key.id(),
             None,
             &signals,
@@ -2046,7 +2200,50 @@ mod tests {
         assert_eq!(o.signature, sig);
         assert!(
             !crypto::verify(&public, &o.signed, &o.signature, &mut scratch),
-            "a run signature binds its scope"
+            "a run signature binds its scope's digest"
         );
+    }
+
+    /// Two scopes with one digest can't both be subscribed: the second is refused,
+    /// saying which; the same scope again is not a collision.
+    #[test]
+    fn a_second_scope_with_a_subscribed_scopes_digest_is_refused() {
+        let (a, b): (Name, Name) = (
+            "/alice/32=data/board".parse().unwrap(),
+            "/alice/32=data/notes".parse().unwrap(),
+        );
+        let mut by_digest = HashMap::new();
+        let digest = ScopeDigest::of(&a);
+        assert!(claim_digest(&mut by_digest, digest, &a).is_ok());
+        assert!(claim_digest(&mut by_digest, digest, &a).is_ok());
+        match claim_digest(&mut by_digest, digest, &b) {
+            Err(e @ SignalError::ScopeDigestCollision { .. }) => {
+                assert_eq!(e.next(), NextStep::FixName);
+                assert!(e.to_string().contains("notes"), "{e}");
+            }
+            other => panic!("refused as a digest collision, not {other:?}"),
+        }
+        assert_eq!(by_digest.get(&digest), Some(&a));
+    }
+
+    /// A scope longer than `SCOPE_MAX` has no room, and one within it has the room
+    /// of a packet.
+    #[test]
+    fn room_is_the_packets_for_any_scope_within_scope_max_and_none_beyond() {
+        let within: Name = "/alice/32=data/board".parse().unwrap();
+        assert_eq!(Signals::room(&within), wire::ROOM);
+        let long = |octets: usize| -> Name {
+            let mut n: Name = "/alice/32=data".parse().unwrap();
+            // 2 octets of framing per component and 4 for the Name's.
+            while wire::name_size(&n) + 102 <= octets {
+                n = n.append("x".repeat(100));
+            }
+            let rest = octets - wire::name_size(&n);
+            n.append("y".repeat(rest - 2))
+        };
+        let at_max = long(SCOPE_MAX);
+        assert_eq!(wire::name_size(&at_max), SCOPE_MAX);
+        assert_eq!(Signals::room(&at_max), wire::ROOM);
+        assert_eq!(Signals::room(&long(SCOPE_MAX + 1)), 0);
     }
 }

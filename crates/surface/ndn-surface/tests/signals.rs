@@ -11,7 +11,7 @@ use bytes::Bytes;
 use common::{Engine, World, engine, link, n, no_quota, no_ring};
 use ndn_app::EngineAppExt;
 use ndn_surface::signal::wire::{self, Packet};
-use ndn_surface::signal::{Signal, SignalError, SignalOptions, SignalSubscriber};
+use ndn_surface::signal::{Signal, SignalError, SignalOptions, SignalSubscriber, Signals};
 
 const WITHIN: Duration = Duration::from_secs(20);
 
@@ -427,5 +427,281 @@ async fn sixty_hertz_from_four_senders_over_a_link_loses_nothing() {
     )
     .await;
     sixty_hertz_from_four(&a, &b, &world, no_quota(no_ring())).await;
+    world.cancel.cancel();
+}
+
+/// A folder named in words: a scope of `octets` encoded octets (a `32=data`
+/// folder under `/alice`, its name padded with long components).
+fn scope_of(octets: usize) -> ndn_foundation_types::Name {
+    let mut name = n("/alice/32=data");
+    let mut i = 0;
+    while common::name_octets(&name) < octets {
+        let left = octets - common::name_octets(&name);
+        // A component takes 2 octets of framing (3 from 253 octets of value).
+        let value = left.saturating_sub(2).clamp(1, 100);
+        let c = format!("{i:02}").repeat(value / 2 + 1);
+        name = name.append(&c[..value]);
+        i += 1;
+    }
+    assert_eq!(common::name_octets(&name), octets, "scope_of is exact");
+    name
+}
+
+/// N9: a signal of 512 octets always fits, whatever the scope is called: a long
+/// name costs only the header packet. Sealed and unsealed, a scope of `SCOPE_MAX`
+/// encoded octets (the name rode in every packet on the `/1` wire, and a 512-octet
+/// signal beside a name of 380 octets did not fit).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_signal_of_512_octets_fits_in_a_scope_with_a_very_long_name() {
+    let world = World::new("/alice", &["/alice/laptop", "/alice/phone"]).await;
+    let e = engine().await;
+    let laptop = world.host(&e, "/alice/laptop", no_ring()).await;
+    let phone = world
+        .host(&e, "/alice/phone", SignalOptions::default())
+        .await;
+    for (sealed, octets) in [(false, wire::SCOPE_MAX), (true, wire::SCOPE_MAX - 1)] {
+        let scope = scope_of(octets);
+        laptop.share(&scope, world.ns(), sealed).await;
+        let mut sub = phone.subscribe(&scope, WITHIN).await;
+        let mut run = laptop.signals.open(&scope).await.unwrap();
+        let seq = run
+            .send(&[1; 64], &[2; 448])
+            .await
+            .unwrap_or_else(|e| panic!("512 octets in a long-named scope (sealed {sealed}): {e}"));
+        let s = next(&mut sub, Duration::from_secs(5))
+            .await
+            .expect("the signal arrives");
+        assert_eq!((s.seq, s.address.len(), s.payload.len()), (seq, 64, 448));
+        assert_eq!(s.scope, scope);
+    }
+    world.cancel.cancel();
+}
+
+/// 14.1: `room` is exact on the wire, sealed: a signal of address + payload ==
+/// room is sent and arrives; one octet more is refused `TooLarge` (the packet),
+/// in a scope as long as `SCOPE_MAX` allows and in a short one alike. A scope over
+/// `SCOPE_MAX` has no room, and `open` and `subscribe` refuse it, naming the
+/// limit and what to do.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn room_is_exact_and_a_scope_over_scope_max_is_refused_with_its_limit() {
+    let world = World::new("/alice", &["/alice/laptop", "/alice/phone"]).await;
+    let e = engine().await;
+    let laptop = world.host(&e, "/alice/laptop", no_ring()).await;
+    let phone = world
+        .host(&e, "/alice/phone", SignalOptions::default())
+        .await;
+    let too_large = |r: Result<_, SignalError>| match r {
+        Err(SignalError::TooLarge { what, .. }) => what,
+        other => panic!("refused TooLarge, not {other:?}"),
+    };
+    for scope in [n("/alice/32=data/secret"), scope_of(wire::SCOPE_MAX)] {
+        let room = Signals::room(&scope);
+        assert_eq!(room, wire::ROOM);
+        assert!(room >= 512);
+        laptop.share(&scope, world.ns(), true).await;
+        let mut sub = phone.subscribe(&scope, WITHIN).await;
+        let mut run = laptop.signals.open(&scope).await.unwrap();
+        let payload = [4u8; wire::PAYLOAD_MAX];
+        // address 64 and the rest of the room as payload; then one octet more.
+        let seq = run
+            .send(
+                &[1; wire::ADDRESS_MAX],
+                &payload[..room - wire::ADDRESS_MAX],
+            )
+            .await
+            .expect("address + payload == room fits, sealed");
+        let s = next(&mut sub, Duration::from_secs(5))
+            .await
+            .expect("it arrives");
+        assert_eq!(
+            (s.seq, s.address.len() + s.payload.len()),
+            (seq, room),
+            "the signal of exactly room octets"
+        );
+        assert_eq!(
+            too_large(
+                run.send(
+                    &[1; wire::ADDRESS_MAX],
+                    &payload[..room - wire::ADDRESS_MAX + 1]
+                )
+                .await
+                .map(|_| ())
+            ),
+            "the packet",
+            "room + 1 does not fit sealed"
+        );
+    }
+    let over = scope_of(wire::SCOPE_MAX + 1);
+    assert_eq!(Signals::room(&over), 0);
+    for refused in [
+        laptop.signals.subscribe(&over).await.map(|_| ()),
+        laptop.signals.open(&over).await.map(|_| ()),
+    ] {
+        match refused {
+            Err(e @ SignalError::ScopeTooLong { size, max, .. }) => {
+                assert_eq!((size, max), (wire::SCOPE_MAX + 1, wire::SCOPE_MAX));
+                assert_eq!(e.next(), ndn_data::NextStep::FixName);
+                let why = e.to_string();
+                assert!(
+                    why.contains("384") && why.contains("shorter"),
+                    "the refusal says the limit and what to do: {why}"
+                );
+            }
+            other => panic!("refused ScopeTooLong, not {other:?}"),
+        }
+    }
+    world.cancel.cancel();
+}
+
+/// The limit holds for a device with a long key name: a device whose key name is
+/// 140 octets opens runs in a scope of `SCOPE_MAX` octets, sealed and not, and a
+/// 512-octet signal arrives. A device whose key name is longer still is refused at
+/// `open` with the scope length its header does allow.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_with_a_long_key_name_opens_runs_in_a_scope_of_scope_max_octets() {
+    // `<device>/KEY/1`, the key name of World's devices: 8 octets after the device.
+    let device = |key_octets: usize| {
+        let mut d = n("/alice");
+        let mut i = 0;
+        while common::name_octets(&d) + 8 < key_octets {
+            let left = key_octets - (common::name_octets(&d) + 8);
+            let value = left.saturating_sub(2).clamp(1, 60);
+            d = d.append(&format!("{i}").repeat(value)[..value]);
+            i += 1;
+        }
+        d
+    };
+    let long = device(140);
+    let longer = device(220);
+    let (long_s, longer_s) = (long.to_string(), longer.to_string());
+    let world = World::new("/alice", &[&long_s, &longer_s, "/alice/phone"]).await;
+    let e = engine().await;
+    let sender = world.host(&e, &long_s, no_ring()).await;
+    let phone = world
+        .host(&e, "/alice/phone", SignalOptions::default())
+        .await;
+    for (sealed, scope) in [
+        (false, scope_of(wire::SCOPE_MAX)),
+        (true, scope_of(wire::SCOPE_MAX - 1)),
+    ] {
+        sender.share(&scope, world.ns(), sealed).await;
+        let mut sub = phone.subscribe(&scope, WITHIN).await;
+        let mut run = sender.signals.open(&scope).await.unwrap();
+        let seq = run.send(&[1; 64], &[2; 448]).await.unwrap();
+        let s = next(&mut sub, Duration::from_secs(5))
+            .await
+            .expect("the signal arrives");
+        assert_eq!(s.seq, seq);
+    }
+    let wide = world.host(&e, &longer_s, no_ring()).await;
+    let scope = scope_of(wire::SCOPE_MAX - 2);
+    wide.share(&scope, world.ns(), false).await;
+    match wide.signals.open(&scope).await.map(|_| ()) {
+        Err(SignalError::ScopeTooLong { size, max, .. }) => {
+            assert_eq!(size, wire::SCOPE_MAX - 2);
+            assert!(
+                max < wire::SCOPE_MAX,
+                "this device's header leaves less: {max}"
+            );
+        }
+        other => panic!("a 220-octet key name's header does not fit: {other:?}"),
+    }
+    world.cancel.cancel();
+}
+
+/// N9: a packet of scope S1 replayed so that it claims S2 (its digest swapped) is
+/// refused wherever it lands: by a receiver that has no run of it yet (the header's
+/// device-signed name says S1) and by one that holds the run (the run is S1's).
+/// Nothing reaches S2's subscriber, and the unaltered packet still arrives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_packet_replayed_into_another_scope_is_refused() {
+    let world = World::new("/alice", &["/alice/laptop", "/alice/tablet"]).await;
+    let e = engine().await;
+    let laptop = world.host(&e, "/alice/laptop", no_ring()).await;
+    let (board, notes) = (n("/alice/32=data/board"), n("/alice/32=data/notes"));
+    laptop.share(&board, world.ns(), false).await;
+    laptop.share(&notes, world.ns(), false).await;
+    let group = wire::sync_group(world.ns());
+    let tap = e.engine.app_face(world.cancel.child_token());
+    tap.register_prefix(&group).await.unwrap();
+    let mut run = laptop.signals.open(&board).await.unwrap();
+    run.send(b"cursor", b"first").await.unwrap();
+    run.send(b"cursor", b"second").await.unwrap();
+    let mut captured = Vec::new();
+    while captured.len() < 2 {
+        let wire = tokio::time::timeout(Duration::from_secs(5), tap.recv())
+            .await
+            .expect("the tap hears both packets")
+            .unwrap();
+        if let Some(packet) = ndn_packet::Interest::decode(wire)
+            .ok()
+            .and_then(|i| wire::push_packet(&i))
+        {
+            captured.push(packet);
+        }
+    }
+    let (first, second) = (captured.remove(0), captured.remove(0));
+    let Ok(Packet::Body(b)) = wire::decode_packet(first.clone()) else {
+        panic!("an unsealed packet is a body");
+    };
+    assert!(b.header.is_some(), "the first packet carries the header");
+    let (of_board, of_notes) = (wire::ScopeDigest::of(&board), wire::ScopeDigest::of(&notes));
+    assert_eq!(b.digest, of_board);
+    let claiming_notes = |packet: &Bytes| -> Bytes {
+        let mut altered = packet.to_vec();
+        let at = altered
+            .windows(16)
+            .position(|w| w == of_board.0)
+            .expect("the packet names its scope by digest");
+        altered[at..at + 16].copy_from_slice(&of_notes.0);
+        Bytes::from(altered)
+    };
+    // A receiver that holds no run yet, subscribed to both scopes.
+    let tablet = world
+        .host(&e, "/alice/tablet", SignalOptions::default())
+        .await;
+    let mut on_board = tablet.subscribe(&board, WITHIN).await;
+    let mut on_notes = tablet.subscribe(&notes, WITHIN).await;
+    let inject = |packet: &Bytes| {
+        let face = e.engine.app_face(world.cancel.child_token());
+        let interest = wire::push_interest(&group, packet);
+        async move { face.send(interest).await.unwrap() }
+    };
+    let settle = || tokio::time::sleep(Duration::from_millis(300));
+    inject(&claiming_notes(&first)).await;
+    settle().await;
+    let stats = tablet.signals.stats();
+    assert_eq!(
+        (stats.delivered, stats.malformed),
+        (0, 1),
+        "the header names {board}, the packet claims {notes}: {stats:?}"
+    );
+    // The run's next genuine packet (its header rides again after a second; an identical
+    // copy of an earlier one is a duplicate the forwarder's loop suppression drops) is
+    // admitted and delivered, to board's subscriber only.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    run.send(b"cursor", b"third").await.unwrap();
+    let s = next(&mut on_board, Duration::from_secs(5))
+        .await
+        .expect("the genuine packet arrives");
+    assert_eq!(
+        (s.scope.clone(), s.payload.as_ref()),
+        (board.clone(), &b"third"[..])
+    );
+    // Now the run is held: its next packet claiming `notes` is refused too.
+    inject(&claiming_notes(&second)).await;
+    settle().await;
+    let stats = tablet.signals.stats();
+    assert_eq!(
+        (stats.delivered, stats.malformed),
+        (1, 2),
+        "the run is {board}'s: {stats:?}"
+    );
+    assert!(
+        next(&mut on_notes, Duration::from_millis(200))
+            .await
+            .is_none(),
+        "nothing reached the other scope's subscriber"
+    );
     world.cancel.cancel();
 }

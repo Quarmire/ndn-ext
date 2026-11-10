@@ -3,7 +3,10 @@
 //! A **packet** is a `SignalBody` (unsealed scope) or a `SignalSealed` (sealed
 //! scope), at most [`PACKET_MAX`] octets. It rides as the ApplicationParameters of
 //! a push Interest `<group>/32=signal/<ParametersSha256Digest>` and, unchanged, as
-//! a frame of a run's local ring. Every TLV-TYPE here is even: a decoder skips an
+//! a frame of a run's local ring. A packet names its run by `RunId` and its scope
+//! by a 16-octet [`ScopeDigest`], never by the scope's Name: the Name lives only in
+//! the device-signed run header, so a signal's room does not depend on how long the
+//! scope is called ([`ROOM`]). Every TLV-TYPE here is even: a decoder skips an
 //! unknown even element and refuses an unknown odd one. A sealed packet's
 //! plaintext is its `SignalBody` and a `SignalPadding` that brings the packet's
 //! length to a multiple of [`PAD_BUCKET`] octets.
@@ -21,7 +24,7 @@ use ndn_tlv::TlvReader;
 use ndn_tlv::writer::tlv_size;
 use sha2::{Digest, Sha256};
 
-/// `SignalBody`: Name (scope), RunId, \[RunHeader\], Signal* (0–32; at least one
+/// `SignalBody`: ScopeDigest, RunId, \[RunHeader\], Signal* (0–32; at least one
 /// unless RunHeader rides), RunSignature.
 pub const SIGNAL_BODY: u64 = 0x0580;
 /// `SignalSealed`: KeyId, SealNonce, Ciphertext.
@@ -62,9 +65,14 @@ pub const LOCAL_RING: u64 = 0x05A2;
 /// `SignalPadding`: zero octets after the `SignalBody` inside a ciphertext, so
 /// the sealed packet's length falls on a [`PAD_BUCKET`]; a reader ignores them.
 pub const SIGNAL_PADDING: u64 = 0x05A4;
+/// `ScopeDigest`: 16 octets, the first 16 of SHA-256 over [`SCOPE_DOMAIN`] and
+/// the scope's Name TLV.
+pub const SCOPE_DIGEST: u64 = 0x05A6;
 
 /// Domain separation of the run signature and of the seal's associated data.
-pub const CONTEXT: &[u8] = b"ndn-signal/1";
+pub const CONTEXT: &[u8] = b"ndn-signal/2";
+/// Domain separation of a [`ScopeDigest`]: hashed before the scope's Name TLV.
+pub const SCOPE_DOMAIN: &[u8] = b"ndn-signal/2 scope";
 /// The most octets a packet's whole encoding may take.
 pub const PACKET_MAX: usize = 1024;
 /// A sealed packet's length is rounded up to a multiple of this many octets
@@ -84,6 +92,36 @@ pub const NONCE_LEN: usize = 24;
 pub const TAG_LEN: usize = 16;
 /// Octets of a run signature.
 pub const SIGNATURE_LEN: usize = 64;
+/// Octets of a scope digest.
+pub const SCOPE_DIGEST_LEN: usize = 16;
+/// Octets a `SignalSealed` adds around its plaintext, with every TLV-LENGTH in
+/// its 3-octet form (a plaintext of 253 octets or more): the key id (12), the
+/// nonce (28), the ciphertext's framing (6) and tag (16), and its own framing (6).
+pub const SEAL_OVERHEAD: usize = 68;
+/// Octets of a `SignalBody` beside its signals and its run header, at most: its
+/// own framing (6), the scope digest (20), the RunId (20) and the run signature (68).
+pub const BODY_OVERHEAD: usize = 114;
+/// Octets a `Signal` takes beside its address and payload, at most: its framing
+/// (6), an 8-octet sequence (12) and `Expires` (12), the address's framing (4) and
+/// the payload's (6).
+pub const SIGNAL_OVERHEAD: usize = 40;
+/// Octets of a `RunHeader` element's own framing, at most.
+pub const HEADER_OVERHEAD: usize = 6;
+/// The octets of address plus payload that one signal always fits beside in a
+/// packet, sealed or not, by any scope within [`SCOPE_MAX`]: an address of at
+/// most [`ADDRESS_MAX`], a payload of at most [`PAYLOAD_MAX`], and address plus
+/// payload at most this.
+pub const ROOM: usize = PACKET_MAX - SEAL_OVERHEAD - BODY_OVERHEAD - SIGNAL_OVERHEAD;
+/// The most octets of a run header's Data wire that fit one sealed packet of its
+/// own (the header-only packet): the limit every scope name and device name
+/// must leave room under.
+pub const HEADER_MAX: usize = PACKET_MAX - SEAL_OVERHEAD - BODY_OVERHEAD - HEADER_OVERHEAD;
+/// The longest scope name, in encoded octets (its Name TLV), a run can be opened
+/// in: the run header, which carries the scope's Name once, must fit a packet of
+/// its own ([`HEADER_MAX`]) beside the device's own key name, which it carries
+/// twice (its name and its KeyLocator) — up to 140 octets of that name, which
+/// the wire tests hold to.
+pub const SCOPE_MAX: usize = 384;
 /// The last sequence a run may use: a run's window counts one above the highest
 /// sequence it saw, so 2^64 − 1 is no sequence (refused at decode).
 pub const SEQ_MAX: u64 = u64::MAX - 1;
@@ -109,6 +147,44 @@ impl RunId {
         let mut id = [0u8; 16];
         id.copy_from_slice(&digest[..16]);
         RunId(id)
+    }
+}
+
+/// A scope's digest: the first 16 octets of SHA-256 over [`SCOPE_DOMAIN`] and the
+/// scope's Name TLV. What a packet names its scope by after the run's header: the
+/// run signature covers it, and a receiver compares it with the digest of the
+/// scope the run's device-signed header names.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
+pub struct ScopeDigest(pub [u8; SCOPE_DIGEST_LEN]);
+
+impl ScopeDigest {
+    /// The digest of `scope`.
+    pub fn of(scope: &Name) -> ScopeDigest {
+        let mut h = Sha256::new();
+        h.update(SCOPE_DOMAIN);
+        let update_header = |h: &mut Sha256, typ: u64, len: usize| {
+            let mut head = [0u8; 18];
+            let n = ndn_tlv::write_varu64(&mut head, typ);
+            let m = ndn_tlv::write_varu64(&mut head[n..], len as u64);
+            h.update(&head[..n + m]);
+        };
+        update_header(&mut h, tlv_type::NAME, name_value_size(scope));
+        for c in scope.components() {
+            update_header(&mut h, c.typ, c.value.len());
+            h.update(&c.value);
+        }
+        let mut digest = [0u8; SCOPE_DIGEST_LEN];
+        digest.copy_from_slice(&h.finalize()[..SCOPE_DIGEST_LEN]);
+        ScopeDigest(digest)
+    }
+}
+
+impl fmt::Display for ScopeDigest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for b in self.0 {
+            write!(f, "{b:02x}")?;
+        }
+        Ok(())
     }
 }
 
@@ -221,8 +297,8 @@ pub struct Sealed {
 /// A `SignalBody`. Its slices share the packet's allocation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Body {
-    /// The scope (folder or collection).
-    pub scope: Name,
+    /// The scope, by its digest (the Name rides only in the run header).
+    pub digest: ScopeDigest,
     /// The run.
     pub run: RunId,
     /// The run header's Data wire, when it rides.
@@ -447,14 +523,11 @@ fn decode_body_value(value: Bytes) -> Result<Body, WireError> {
     let mut signals = Vec::new();
     let mut signature = None;
     let mut signed = Bytes::new();
-    let known = [tlv_type::NAME, RUN_ID, RUN_HEADER, SIGNAL, RUN_SIGNATURE];
+    let known = [SCOPE_DIGEST, RUN_ID, RUN_HEADER, SIGNAL, RUN_SIGNATURE];
     while let Some((offset, typ, v)) = els.next(&known)? {
         match typ {
-            tlv_type::NAME if at == At::Scope => {
-                scope = Some(Name::decode(v).map_err(|e| WireError::Tlv {
-                    inside: "the scope Name",
-                    why: format!("{e:?}"),
-                })?);
+            SCOPE_DIGEST if at == At::Scope => {
+                scope = Some(ScopeDigest(fixed::<SCOPE_DIGEST_LEN>("ScopeDigest", &v)?));
                 at = At::Run;
             }
             RUN_ID if at == At::Run => {
@@ -485,7 +558,7 @@ fn decode_body_value(value: Bytes) -> Result<Body, WireError> {
                 return Err(WireError::Order {
                     inside: IN,
                     what: match typ {
-                        tlv_type::NAME => "the scope Name",
+                        SCOPE_DIGEST => "the ScopeDigest",
                         RUN_ID => "RunId",
                         RUN_HEADER => "RunHeader",
                         SIGNAL => "a Signal",
@@ -497,7 +570,7 @@ fn decode_body_value(value: Bytes) -> Result<Body, WireError> {
     }
     let scope = scope.ok_or(WireError::Missing {
         inside: IN,
-        what: "scope Name",
+        what: "ScopeDigest",
     })?;
     let run = run.ok_or(WireError::Missing {
         inside: IN,
@@ -521,7 +594,7 @@ fn decode_body_value(value: Bytes) -> Result<Body, WireError> {
         });
     }
     Ok(Body {
-        scope,
+        digest: scope,
         run,
         header,
         signals,
@@ -700,13 +773,6 @@ fn name_value_size(name: &Name) -> usize {
         .sum()
 }
 
-fn put_name(out: &mut Vec<u8>, name: &Name) {
-    put_header(out, tlv_type::NAME, name_value_size(name));
-    for c in name.components() {
-        put_tlv(out, c.typ, &c.value);
-    }
-}
-
 /// One signal to encode: (seq, address, expires, payload).
 pub(crate) type Outgoing<'a> = (u64, &'a [u8], u64, &'a [u8]);
 
@@ -718,16 +784,12 @@ fn signal_value_size(s: &Outgoing<'_>) -> usize {
 }
 
 /// The encoded size of a `SignalBody` TLV carrying `header` and `signals`.
-pub(crate) fn body_size(
-    scope_tlv: usize,
-    header: Option<usize>,
-    signals: &[Outgoing<'_>],
-) -> usize {
-    tlv_size(SIGNAL_BODY, body_value_size(scope_tlv, header, signals))
+pub(crate) fn body_size(header: Option<usize>, signals: &[Outgoing<'_>]) -> usize {
+    tlv_size(SIGNAL_BODY, body_value_size(header, signals))
 }
 
-fn body_value_size(scope_tlv: usize, header: Option<usize>, signals: &[Outgoing<'_>]) -> usize {
-    scope_tlv
+fn body_value_size(header: Option<usize>, signals: &[Outgoing<'_>]) -> usize {
+    tlv_size(SCOPE_DIGEST, SCOPE_DIGEST_LEN)
         + tlv_size(RUN_ID, 16)
         + header.map_or(0, |h| tlv_size(RUN_HEADER, h))
         + signals
@@ -785,18 +847,18 @@ pub(crate) fn padding(body: usize) -> Option<usize> {
 /// [`CONTEXT`] ‖ the value octets before `RunSignature`.
 pub(crate) fn encode_body(
     out: &mut Vec<u8>,
-    scope: &Name,
+    scope: &ScopeDigest,
     run: &RunId,
     header: Option<&[u8]>,
     signals: &[Outgoing<'_>],
     sign: impl FnOnce(&[u8]) -> [u8; SIGNATURE_LEN],
 ) {
     out.clear();
-    let value = body_value_size(name_size(scope), header.map(<[u8]>::len), signals);
+    let value = body_value_size(header.map(<[u8]>::len), signals);
     out.reserve(tlv_size(SIGNAL_BODY, value));
     put_header(out, SIGNAL_BODY, value);
     let start = out.len();
-    put_name(out, scope);
+    put_tlv(out, SCOPE_DIGEST, &scope.0);
     put_tlv(out, RUN_ID, &run.0);
     if let Some(h) = header {
         put_tlv(out, RUN_HEADER, h);
@@ -963,7 +1025,7 @@ mod tests {
         let mut out = Vec::new();
         encode_body(
             &mut out,
-            &n("/alice/32=data/board"),
+            &ScopeDigest::of(&n("/alice/32=data/board")),
             &RunId([7; 16]),
             header,
             signals,
@@ -984,14 +1046,11 @@ mod tests {
             (1_700_000_000_000_001, b"", 0, &[0u8; PAYLOAD_MAX]),
         ];
         let wire = body(Some(b"header"), &signals);
-        assert_eq!(
-            wire.len(),
-            body_size(name_size(&n("/alice/32=data/board")), Some(6), &signals)
-        );
+        assert_eq!(wire.len(), body_size(Some(6), &signals));
         let Packet::Body(b) = decode_packet(Bytes::from(wire.clone())).unwrap() else {
             panic!("an unsealed packet decodes as a body");
         };
-        assert_eq!(b.scope, n("/alice/32=data/board"));
+        assert_eq!(b.digest, ScopeDigest::of(&n("/alice/32=data/board")));
         assert_eq!(b.run, RunId([7; 16]));
         assert_eq!(b.header.as_deref(), Some(&b"header"[..]));
         assert_eq!(b.signals.len(), 2);
@@ -1091,7 +1150,7 @@ mod tests {
         let wire = body(None, &signals);
         let mut r = TlvReader::new(Bytes::from(wire));
         let (_, value) = r.read_tlv().unwrap();
-        let after_run = name_size(&n("/alice/32=data/board")) + tlv_size(RUN_ID, 16);
+        let after_run = tlv_size(SCOPE_DIGEST, SCOPE_DIGEST_LEN) + tlv_size(RUN_ID, 16);
         let mut v = value[..after_run].to_vec();
         put_tlv(&mut v, typ, b"later");
         v.extend_from_slice(&value[after_run..]);
@@ -1211,5 +1270,130 @@ mod tests {
             .app_parameters(packet.clone())
             .build();
         assert_eq!(push_packet(&Interest::decode(svs).unwrap()), None);
+    }
+
+    /// N9: the framing constants are what the encoder takes, worst case; a signal
+    /// of address + payload == [`ROOM`] always fits a sealed packet and one octet
+    /// more may not.
+    #[test]
+    fn the_framing_constants_are_exact_and_room_is_the_last_octet_that_fits() {
+        assert_eq!(unpadded_size(300) - 300, SEAL_OVERHEAD);
+        assert_eq!(
+            body_size(Some(300), &[]) - tlv_size(RUN_HEADER, 300),
+            BODY_OVERHEAD
+        );
+        assert_eq!(tlv_size(RUN_HEADER, 300) - 300, HEADER_OVERHEAD);
+        let payload = [0u8; PAYLOAD_MAX];
+        let address = [0u8; ADDRESS_MAX];
+        let worst = |a: usize, p: usize| -> [Outgoing<'_>; 1] {
+            [(SEQ_MAX, &address[..a], u64::MAX, &payload[..p])]
+        };
+        let signal = worst(ADDRESS_MAX, ROOM - ADDRESS_MAX);
+        assert_eq!(
+            tlv_size(SIGNAL, signal_value_size(&signal[0])) - ROOM,
+            SIGNAL_OVERHEAD
+        );
+        let sealed = |s: &[Outgoing<'_>]| sealed_size(body_size(None, s));
+        assert!(
+            sealed(&signal) <= PACKET_MAX,
+            "address + payload == ROOM fits sealed"
+        );
+        assert!(body_size(None, &signal) <= sealed(&signal));
+        // Every split of ROOM within the field caps fits; one more may not.
+        for a in 0..=ADDRESS_MAX {
+            let p = (ROOM - a).min(PAYLOAD_MAX);
+            assert!(
+                sealed(&worst(a, p)) <= PACKET_MAX,
+                "address {a}, payload {p}"
+            );
+        }
+        let over = worst(ADDRESS_MAX, ROOM - ADDRESS_MAX + 1);
+        assert!(sealed(&over) > PACKET_MAX, "ROOM + 1 does not fit sealed");
+        const { assert!(ROOM >= 512, "a signal of 512 octets always fits") };
+        // The run header's own packet.
+        assert_eq!(sealed_size(body_size(Some(HEADER_MAX), &[])), PACKET_MAX);
+        assert!(sealed_size(body_size(Some(HEADER_MAX + 1), &[])) > PACKET_MAX);
+    }
+
+    /// N9: the digest of a scope is pinned: SHA-256 over `"ndn-signal/2 scope"` and the
+    /// scope's Name TLV, first 16 octets (a vector computed outside this crate).
+    #[test]
+    fn a_scope_digest_is_the_pinned_hash_of_the_scope_name_tlv() {
+        let d = ScopeDigest::of(&n("/alice/32=data/board"));
+        assert_eq!(d.to_string(), "98c7ac51e9d132364fc4dd4673acc4af");
+        // Same octets as hashing the Name's own encoding.
+        let name = n("/alice/32=data/board");
+        let mut h = Sha256::new();
+        h.update(SCOPE_DOMAIN);
+        h.update(name.encode_to_tlv());
+        assert_eq!(&h.finalize()[..SCOPE_DIGEST_LEN], &d.0);
+        // A long name (3-octet length) hashes the same way.
+        let long = n(&format!("/alice/32=data/{}", "x".repeat(300)));
+        let mut h = Sha256::new();
+        h.update(SCOPE_DOMAIN);
+        h.update(long.encode_to_tlv());
+        assert_eq!(&h.finalize()[..SCOPE_DIGEST_LEN], &ScopeDigest::of(&long).0);
+    }
+
+    /// N9: different scopes have different digests, also names that differ only
+    /// in where a component ends or in a component's type, and the digest is not
+    /// the hash of the Name without its domain tag.
+    #[test]
+    fn scopes_have_distinct_digests() {
+        let scopes = [
+            "/alice/32=data/board",
+            "/alice/32=data/notes",
+            "/alice/32=data/boar",
+            "/alice/32=data/board/x",
+            "/alice/32=data",
+            "/alice/32=data/bo/ard",
+            "/alice/32=data/32=board",
+            "/bob/32=data/board",
+            "/alice/32=data/board/32=data/board",
+        ];
+        let digests: std::collections::HashSet<_> =
+            scopes.iter().map(|s| ScopeDigest::of(&n(s))).collect();
+        assert_eq!(digests.len(), scopes.len());
+        let name = n("/alice/32=data/board");
+        let plain: [u8; 32] = Sha256::digest(name.encode_to_tlv()).into();
+        assert_ne!(&plain[..SCOPE_DIGEST_LEN], &ScopeDigest::of(&name).0);
+    }
+
+    /// N9: no scope Name rides in a packet: a `/1` body, which starts with the
+    /// scope's Name, is refused (an odd, critical element), and a body whose
+    /// digest is not 16 octets is refused.
+    #[test]
+    fn a_packet_in_the_old_wire_or_with_a_short_digest_is_refused() {
+        let old = {
+            let name = n("/alice/32=data/board");
+            let mut v = name.encode_to_tlv().to_vec();
+            put_tlv(&mut v, RUN_ID, &[7; 16]);
+            put_tlv(&mut v, SIGNAL, b"");
+            put_tlv(&mut v, RUN_SIGNATURE, &[9; SIGNATURE_LEN]);
+            let mut out = Vec::new();
+            put_tlv(&mut out, SIGNAL_BODY, &v);
+            Bytes::from(out)
+        };
+        assert!(matches!(
+            decode_packet(old),
+            Err(WireError::Critical { typ: 0x07, .. })
+        ));
+        let short = {
+            let mut v = Vec::new();
+            put_tlv(&mut v, SCOPE_DIGEST, &[1; 15]);
+            put_tlv(&mut v, RUN_ID, &[7; 16]);
+            put_tlv(&mut v, RUN_HEADER, b"h");
+            put_tlv(&mut v, RUN_SIGNATURE, &[9; SIGNATURE_LEN]);
+            let mut out = Vec::new();
+            put_tlv(&mut out, SIGNAL_BODY, &v);
+            Bytes::from(out)
+        };
+        assert!(matches!(
+            decode_packet(short),
+            Err(WireError::Length {
+                what: "ScopeDigest",
+                ..
+            })
+        ));
     }
 }
