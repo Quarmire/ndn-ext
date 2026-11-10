@@ -5,7 +5,7 @@ use tokio::sync::{Mutex, mpsc};
 use tracing::warn;
 
 use ndn_packet::Interest;
-use ndn_transport::{FaceError, FaceId, FaceKind, Transport};
+use ndn_transport::{FaceError, FaceId, FaceKind, FaceTrust, Transport};
 
 use crate::ComputeRegistry;
 
@@ -42,6 +42,11 @@ impl Transport for ComputeFace {
 
     fn kind(&self) -> FaceKind {
         FaceKind::Compute
+    }
+
+    /// The handlers behind a compute face are programs of this process.
+    fn trust(&self) -> FaceTrust {
+        FaceTrust::Program
     }
 
     async fn recv_bytes(&self) -> Result<Bytes, FaceError> {

@@ -66,9 +66,10 @@ impl Transport for MemoryLink {
         self.id
     }
     fn kind(&self) -> FaceKind {
-        // Treat as a local-scope face so the pipeline doesn't try
-        // to LP-encode/decode the bytes (the link carries raw NDN
-        // packets just like an InProcFace).
+        // Local scope (a local-IPC kind) so the pipeline doesn't try to
+        // LP-encode/decode the bytes: the link carries raw NDN packets just
+        // like an InProcFace. Its trust is the default, validated: this is a
+        // router-to-router link, not a program.
         FaceKind::App
     }
     async fn recv_bytes(&self) -> Result<Bytes, FaceError> {
@@ -196,6 +197,35 @@ fn seed_neighbor_on(engine: &DvEngine, peer_router_name: &str, face: FaceId) {
         .engine
         .discovery_ctx()
         .update_neighbor(NeighborUpdate::Upsert(entry));
+}
+
+/// Anchor `key`, a peer router's DV key, in `engine`'s validator. The link
+/// between two routers is a network face (`MemoryLink` stands in for a UDP
+/// face), so the forwarder validates the Data that arrives on it, and a key it
+/// holds no anchor for is refused (`untrusted-root`). It does not trust a link
+/// for being in-process. DV names (`/localhop/<router>/DV/...`) are not under
+/// the signer's identity, so the validator's schema authorises any name for an
+/// anchored key, as the DV trust of these routers does.
+fn anchor_peer_key(engine: &DvEngine, key: &Name, public: Bytes) {
+    use ndn_packet::SignatureType;
+    let validator = engine
+        .engine
+        .validator()
+        .expect("the default profile has a validator");
+    validator
+        .keyring()
+        .ambient()
+        .set_schema(ndn_security::TrustSchema::accept_all());
+    validator.add_trust_anchor(ndn_security::Certificate {
+        name: Arc::new(key.clone()),
+        public_key: public,
+        valid_from: 0,
+        valid_until: u64::MAX,
+        issuer: None,
+        signed_region: None,
+        sig_value: None,
+        sig_type: SignatureType::SignatureEd25519,
+    });
 }
 
 // ─── Convergence cases ──────────────────────────────────────────────────────
@@ -421,6 +451,10 @@ async fn ed25519_signed_routers_converge() {
     .await;
     seed_neighbor(&r1, "/r2");
     seed_neighbor(&r2, "/r1");
+    // The link is a router-to-router link: a network face, whose Data the
+    // forwarder validates. Each engine anchors the peer's DV key.
+    anchor_peer_key(&r1, &r2_key, r2_public);
+    anchor_peer_key(&r2, &r1_key, r1_public);
 
     assert!(
         eventually(Duration::from_secs(10), || knows(&r1, &r2)

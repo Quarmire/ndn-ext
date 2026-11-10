@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use bytes::Bytes;
 
-use ndn_transport::{FaceError, FaceId, FaceKind, Transport};
+use ndn_transport::{FaceError, FaceId, FaceKind, FaceTrust, Transport};
 
 use crate::ShmError;
 
@@ -1541,6 +1541,14 @@ impl Transport for SpscFace {
     }
     fn kind(&self) -> FaceKind {
         FaceKind::Shm
+    }
+
+    /// The far end of a shared-memory ring is a program of this host that
+    /// opened the segment: the region is created owner-only (`0o600`) or
+    /// anonymous and capability-scoped, so only a process of the owning user
+    /// (or one handed the capability) can attach.
+    fn trust(&self) -> FaceTrust {
+        FaceTrust::Program
     }
 
     /// MTU is baked into the slot size at create time; the ring layout

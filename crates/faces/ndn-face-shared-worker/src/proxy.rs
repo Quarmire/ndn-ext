@@ -13,7 +13,7 @@ use wasm_bindgen::closure::Closure;
 use web_sys::{MessageEvent, MessagePort, SharedWorker};
 
 use ndn_runtime::Runtime;
-use ndn_transport::{FaceError, FaceId, FaceKind, Transport};
+use ndn_transport::{FaceError, FaceId, FaceKind, FaceTrust, Transport};
 
 use crate::codec::{decode_inbound, encode_outbound};
 use crate::error::SharedWorkerFaceError;
@@ -86,6 +86,12 @@ impl Transport for SharedWorkerProxyFace {
         // Same-origin, same-host local IPC; `App` is the closest FaceKind
         // (Local scope + backpressure congestion policy).
         FaceKind::App
+    }
+
+    /// The other end of the port is this origin's own shared worker: the same
+    /// principal as the tab (a `MessagePort` carries no cross-origin peer).
+    fn trust(&self) -> FaceTrust {
+        FaceTrust::Program
     }
 
     fn remote_uri(&self) -> Option<String> {
