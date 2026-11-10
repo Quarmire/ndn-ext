@@ -138,6 +138,19 @@ impl World {
     /// of its own. The engine runs the namespace's sync group with the multicast
     /// strategy, as a host does.
     pub async fn host(&self, engine: &Engine, device: &str, options: SignalOptions) -> Host {
+        self.host_on(engine, device, options, Arc::new(MemoryStore::new()))
+            .await
+    }
+
+    /// Like [`Self::host`], on `store`: a device started again on the store a
+    /// stopped one left is that device restarted.
+    pub async fn host_on(
+        &self,
+        engine: &Engine,
+        device: &str,
+        options: SignalOptions,
+        store: Arc<MemoryStore>,
+    ) -> Host {
         let (name, keys, _) = self
             .devices
             .iter()
@@ -153,7 +166,7 @@ impl World {
             name.clone(),
             Arc::clone(keys),
             self.validator(),
-            Arc::new(MemoryStore::new()),
+            store,
             Config {
                 first_look: Duration::from_millis(50),
                 ..Config::new()

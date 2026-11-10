@@ -35,6 +35,7 @@
 //! connection's face, as it does for the Device's sync face, and runs the group
 //! with the multicast strategy (as for sync).
 
+mod clock;
 mod crypto;
 mod queue;
 mod state;
@@ -57,6 +58,7 @@ use ndn_packet::{Data, Interest};
 use tokio::task::JoinHandle;
 
 use crate::{NamedPublisher, NamedSubscriber};
+use clock::Clock;
 use crypto::RunKey;
 use queue::Queue;
 use state::{Bucket, Latest, ReplayWindow};
@@ -123,6 +125,9 @@ const KEY_REFRESH_EVERY_US: u64 = 1_000_000;
 /// How often the signal keys are asked of the device again while known ids
 /// arrive, so an epoch superseded is noticed and its grace starts (§4.2).
 const KEY_CONFIRM_EVERY_US: u64 = 5_000_000;
+/// When to ask the device for more clock floor: its reserve (ndn-data's `SIGNAL_CLOCK_RESERVE`, 5 s
+/// ahead of the time asked) is asked for again once less than half of it is left.
+const CLOCK_RESERVE_US: u64 = 5_000_000;
 
 /// A clock: µs since the Unix epoch.
 pub type SignalClock = Arc<dyn Fn() -> u64 + Send + Sync>;
@@ -627,6 +632,13 @@ struct Hub {
     tasks: Mutex<Vec<JoinHandle<()>>>,
     /// The process's push budget, in push Interests (`SignalOptions::push_rate`).
     push: Mutex<Bucket>,
+    /// The clock every date and judgement is read from ([`clock::Clock`]).
+    clock: Clock,
+    /// The clock floor the device made durable, as far as this process knows
+    /// ([`Device::signal_clock_dated`]).
+    reserved: AtomicU64,
+    /// A background extension of the floor is running.
+    extending: AtomicBool,
 }
 
 /// A run header checked before its admission (§8.1 step 4).
@@ -640,7 +652,42 @@ type Dropped = (Reason, String);
 
 impl Hub {
     fn now_us(&self) -> u64 {
-        self.options.clock.as_ref().map_or_else(system_us, |c| c())
+        self.clock.now()
+    }
+
+    /// About to date a signal by `now`: the device's clock floor is durable at or above it
+    /// (spec §3.5), asked first when `now` is past what was reserved, and, once `now`
+    /// is within half a reserve of the end of it, asked for more in the background, so a send
+    /// rarely waits. Refused with the data layer's reason when the floor can't be made durable:
+    /// a signal dated beyond it could be re-dated below it by a restart.
+    async fn dated(self: &Arc<Self>, now: u64) -> Result<(), SignalError> {
+        let reserved = self.reserved.load(Ordering::Acquire);
+        if now > reserved {
+            let floor = self
+                .device
+                .signal_clock_dated(now)
+                .await
+                .map_err(SignalError::Data)?;
+            self.reserved.fetch_max(floor, Ordering::AcqRel);
+            return Ok(());
+        }
+        if now.saturating_add(CLOCK_RESERVE_US / 2) > reserved
+            && !self.extending.swap(true, Ordering::AcqRel)
+        {
+            let hub = Arc::clone(self);
+            let task = tokio::spawn(async move {
+                if let Ok(floor) = hub
+                    .device
+                    .signal_clock_dated(reserved.saturating_add(1))
+                    .await
+                {
+                    hub.reserved.fetch_max(floor, Ordering::AcqRel);
+                }
+                hub.extending.store(false, Ordering::Release);
+            });
+            self.spawn(task);
+        }
+        Ok(())
     }
 
     fn lock(&self) -> MutexGuard<'_, HubState> {
@@ -1614,12 +1661,14 @@ impl Signals {
         conn.register_prefix(&listen).await.map_err(|e| {
             SignalError::Io(format!("cannot register {listen} on the connection: {e}"))
         })?;
-        let now = options.clock.as_ref().map_or_else(system_us, |c| c());
+        let clock = Clock::new(options.clock.clone(), device.signal_clock_floor());
+        let now = clock.now();
         let push = Bucket::new(
             u64::from(options.push_rate.get()),
             u64::from(options.push_burst.get()),
             now,
         );
+        let reserved = AtomicU64::new(device.signal_clock_floor());
         let hub = Arc::new(Hub {
             device,
             conn: Arc::clone(&conn),
@@ -1630,6 +1679,9 @@ impl Signals {
             closed: AtomicBool::new(false),
             tasks: Mutex::new(Vec::new()),
             push: Mutex::new(push),
+            clock,
+            reserved,
+            extending: AtomicBool::new(false),
         });
         let weak = Arc::downgrade(&hub);
         let task = tokio::spawn(async move {
@@ -1727,6 +1779,7 @@ impl Signals {
             .signal_scope(scope)
             .map_err(|e| scope_error(scope, e))?;
         let now = self.hub.now_us();
+        self.hub.dated(now).await?;
         let keyed = Keyed::new(&self.hub, scope, now, now).await?;
         Ok(SignalRun {
             hub: Arc::clone(&self.hub),
@@ -1974,11 +2027,13 @@ impl SignalRun {
             .signal_scope(&self.scope)
             .map_err(|e| scope_error(&self.scope, e))?;
         let mut now = self.hub.now_us();
+        self.hub.dated(now).await?;
         let lifetime = self.hub.options.run_lifetime.as_micros() as u64;
         let opened = self.keyed.as_ref().map_or(now, |k| k.opened_us);
         if now.saturating_sub(opened) >= lifetime / 10 * 9 {
             self.renew(now).await?;
             now = self.hub.now_us();
+            self.hub.dated(now).await?;
         }
         let keyed = self.keyed.as_mut().ok_or(SignalError::Closed)?;
         let expires = now / 1000 + ttl.as_millis() as u64;
