@@ -109,8 +109,10 @@ impl ComputeContext {
     }
 
     /// Fetch `name` and return it only if its signature validates against
-    /// `validator`. A validation failure is an error (the computation is gated
-    /// on it).
+    /// `validator` by the **durable** rule: a full certificate chain to a trust
+    /// anchor. Use it for Data that is kept or acted on later. A failure is an
+    /// error (the computation is gated on it). For a reflexive reply, use
+    /// [`fetch_reply_verified`](Self::fetch_reply_verified).
     pub async fn fetch_verified(
         &self,
         name: impl Into<Name>,
@@ -121,6 +123,26 @@ impl ComputeContext {
             .fetch_verified(name, validator)
             .await
             .map_err(|e| ComputeError::HandlerFailed(format!("parameter fetch/verify: {e}")))
+    }
+
+    /// Fetch a reflexive reply (`R/params`) and return it only if it validates
+    /// by the **live** rule (trust-context §6.3): a reply to a request this node
+    /// just sent, acted on at once and never kept. The signer's certificate must
+    /// be known to `validator` (cached or anchored); no chain walk to a trust
+    /// anchor is needed. Digest-only replies are refused.
+    pub async fn fetch_reply_verified(
+        &self,
+        name: impl Into<Name>,
+        validator: &Validator,
+    ) -> Result<SafeData, ComputeError> {
+        let mut consumer = self.fetcher.lock().await;
+        consumer
+            .fetch_unverified(name)
+            .await
+            .map_err(|e| ComputeError::HandlerFailed(format!("parameter fetch: {e}")))?
+            .verify_live(validator)
+            .await
+            .map_err(|e| ComputeError::HandlerFailed(format!("parameter verify: {e}")))
     }
 }
 
@@ -292,6 +314,11 @@ impl ComputeService {
     /// [`function_reflexive_sealed`](Self::function_reflexive_sealed) is open
     /// to. The closure receives the decrypted params and the verified signer.
     /// Requires the `sealed-params` feature.
+    ///
+    /// D2 is judged by the **live** rule (trust-context §6.3): it is a reply to
+    /// a request this node just sent over the reverse path, used once and never
+    /// kept, so the validator's cached or anchored certificate for the signer
+    /// is enough; no chain walk to a trust anchor is required.
     #[cfg(feature = "sealed-params")]
     pub fn function_reflexive_secure<O, F, Fut>(
         &self,
@@ -325,6 +352,13 @@ impl ComputeService {
     ///
     /// Confidentiality (an encrypted-parameter key exchange) is out of scope —
     /// params travel in cleartext over the reverse path within the trust domain.
+    ///
+    /// D2 is judged by the **live** rule (trust-context §6.3), not the durable
+    /// one: it is a reply to a request this node just sent over the reverse
+    /// path, acted on at once and never kept, so the validator's cached or
+    /// anchored certificate for the signer is enough; the validator does not
+    /// have to walk a certificate chain to a trust anchor. Digest-only params
+    /// are still refused.
     pub fn function_reflexive_authenticated<O, F, Fut>(
         &self,
         prefix: impl Into<Name>,
@@ -741,7 +775,10 @@ where
             .append_component(NameComponent::generic(Bytes::copy_from_slice(&node.public)));
         // Authorization gate: the signed D2 (whose content is the sealed blob)
         // must validate before we decrypt or compute.
-        let safe = self.ctx.fetch_verified(param_name, &self.validator).await?;
+        let safe = self
+            .ctx
+            .fetch_reply_verified(param_name, &self.validator)
+            .await?;
         let signer = safe.data().sig_info().and_then(|si| match &si.key_locator {
             Some(KeyLocator::Name(n)) => Some((**n).clone()),
             _ => None,
@@ -779,7 +816,10 @@ where
         let param_name = (**reflexive).clone().append("params");
         // Validation gate: an unauthorized / unverifiable D2 fails here and the
         // computation never runs.
-        let safe = self.ctx.fetch_verified(param_name, &self.validator).await?;
+        let safe = self
+            .ctx
+            .fetch_reply_verified(param_name, &self.validator)
+            .await?;
         let signer = safe.data().sig_info().and_then(|si| match &si.key_locator {
             Some(KeyLocator::Name(n)) => Some((**n).clone()),
             _ => None,
