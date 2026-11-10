@@ -7,10 +7,10 @@ the WebRTC API is window-scoped on every shipping browser).  A
 The practical pattern is a **bridge tab** that owns the WebRTC
 peer connection in window scope and proxies bytes into the
 per-origin SharedWorker via the existing `SharedWorkerProxyFace`.
-From the worker's perspective, the bridge tab is just another
-`WorkerPortFace` — the engine's FIB / strategy / pipeline route
-to it like any other face, and the bridge tab takes care of
-moving bytes onto the wire.
+From the worker's perspective, the bridge tab is a `WorkerPortFace`
+(a validated one, see "Trust" below) — the engine's FIB / strategy /
+pipeline route to it like any other face, and the bridge tab takes
+care of moving bytes onto the wire.
 
 ```text
    peer browser                bridge tab                     SharedWorker
@@ -86,11 +86,47 @@ out face #N, the bridge tab receives it via `Face::recv` on
 
 ## What the worker sees
 
-A standard inbound face.  No new code in the worker's face graph.
+An inbound face.  No new code in the worker's face graph.
 The bridge tab can also register prefixes via management
 (`/localhost/nfd/rib/register` Interest → mgmt mounts it against
 the bridge's `WorkerPortFace`), so the worker can route to the
 bridged peer by name.
+
+## Trust: the bridge's port is a validated face
+
+The bridge tab forwards whatever the remote peer sends, so the
+`MessagePort` between the tab and the worker does not tell the
+worker who is really on the other end: it can be a stranger on the
+network.  The worker therefore accepts the port with
+`WorkerListener::accept_one`, which gives a **validated** face
+(`FaceTrust::Validated`).  The forwarder checks the signature of
+every Data that arrives on it against the worker's trust anchors
+before caching or forwarding it, so a forged Data from the bridged
+peer is refused and never enters the content store.  Configure the
+worker's trust anchors for the names the bridged peer is allowed to
+answer.
+
+`WorkerListener::accept_program` gives a **program** face, whose
+Data is cached and forwarded without a signature check.  Use it only
+for a worker none of whose tabs bridges a remote peer.  Never use it
+for an origin that runs a bridge like the one above: if one tab of
+the origin bridges, every port of that worker must go through
+`accept_one`, because the worker cannot tell the bridge's port from
+any other.
+
+What the bridged peer can still do:
+
+- Send Interests under `/localhost`.  The face's kind is `App`,
+  which counts as local for name scope, so scope does not stop them.
+  Trust, not scope, is what the forwarder uses to judge Data.
+- Send management commands.  Because the face is validated, a
+  command is decided by its signature: it must be signed by a key the
+  worker's trust schema authorizes for that command.  An unsigned or
+  wrongly signed command is refused with a reason that says so; sign
+  it with an authorized key.
+
+The tab's own side, `SharedWorkerProxyFace`, stays a program face:
+the peer of a tab's proxy is the worker of its own origin.
 
 ## Why a `WebRtcFace` *inside* the worker would be redundant
 

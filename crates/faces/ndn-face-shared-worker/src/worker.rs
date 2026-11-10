@@ -17,10 +17,11 @@ use wasm_bindgen::closure::Closure;
 use web_sys::{MessageEvent, MessagePort, SharedWorkerGlobalScope};
 
 use ndn_runtime::Runtime;
-use ndn_transport::{FaceError, FaceId, FaceKind, FaceTrust, Transport};
+use ndn_transport::{FaceId, FaceTrust};
 
 use crate::codec::{decode_inbound, encode_outbound};
 use crate::error::SharedWorkerFaceError;
+use crate::port_face::WorkerPortFace;
 
 /// Acceptor-style listener bound to the current [`SharedWorkerGlobalScope`].
 /// Construct once per worker via [`init_worker_scope`]; inbound ports are
@@ -36,14 +37,47 @@ impl WorkerListener {
     /// Yield the next inbound tab connection as a [`WorkerPortFace`] driven
     /// on `runtime`. Caller supplies a fresh [`FaceId`] (typically via the
     /// engine's `face_table.alloc_id()`).
+    ///
+    /// The face is [`FaceTrust::Validated`]: the forwarder checks the
+    /// signature of every Data the tab sends before caching or forwarding it.
+    /// A tab can be a bridge for a remote peer (a WebRTC or WebTransport page
+    /// relaying what a peer sent), and a `MessagePort` says nothing about who
+    /// is on the far side of that page. Use [`Self::accept_program`] only when
+    /// you know no tab does that.
     pub async fn accept_one(
         &self,
         id: FaceId,
         runtime: Arc<dyn Runtime>,
     ) -> Result<WorkerPortFace, SharedWorkerFaceError> {
+        self.accept(id, FaceTrust::Validated, runtime).await
+    }
+
+    /// Like [`Self::accept_one`], but the face is [`FaceTrust::Program`]: its
+    /// Data is cached and forwarded without a signature check, and its
+    /// `/localhost` and management Interests are treated as coming from a
+    /// local program.
+    ///
+    /// Call this only for a worker none of whose tabs bridges a remote peer
+    /// (a page that forwards bytes from WebRTC, WebTransport, or any other
+    /// network source). If any tab does, a remote peer's forged Data would
+    /// pass as local, so use [`Self::accept_one`] for that worker.
+    pub async fn accept_program(
+        &self,
+        id: FaceId,
+        runtime: Arc<dyn Runtime>,
+    ) -> Result<WorkerPortFace, SharedWorkerFaceError> {
+        self.accept(id, FaceTrust::Program, runtime).await
+    }
+
+    async fn accept(
+        &self,
+        id: FaceId,
+        trust: FaceTrust,
+        runtime: Arc<dyn Runtime>,
+    ) -> Result<WorkerPortFace, SharedWorkerFaceError> {
         let mut rx = self.rx.lock().await;
         let port = rx.recv().await.ok_or(SharedWorkerFaceError::Closed)?;
-        Ok(WorkerPortFace::new(id, port, runtime))
+        Ok(port_face(id, trust, port, runtime))
     }
 
     /// Enqueue an inbound [`MessagePort`] directly — for JS-side bootstraps
@@ -57,56 +91,20 @@ impl WorkerListener {
     }
 }
 
-/// A face backed by one tab→worker [`MessagePort`]. Mirror of
-/// [`SharedWorkerProxyFace`](crate::SharedWorkerProxyFace) on the tab side.
-pub struct WorkerPortFace {
+/// Wire `port` to a [`WorkerPortFace`]: two channels, and a pump task on
+/// `runtime` that owns the `!Send` port for its lifetime.
+fn port_face(
     id: FaceId,
-    tx_out: mpsc::Sender<Bytes>,
-    rx_in: Mutex<mpsc::Receiver<Bytes>>,
-}
+    trust: FaceTrust,
+    port: MessagePort,
+    runtime: Arc<dyn Runtime>,
+) -> WorkerPortFace {
+    let (tx_out, rx_out) = mpsc::channel::<Bytes>(64);
+    let (tx_in, rx_in) = mpsc::channel::<Bytes>(64);
 
-impl WorkerPortFace {
-    fn new(id: FaceId, port: MessagePort, runtime: Arc<dyn Runtime>) -> Self {
-        let (tx_out, rx_out) = mpsc::channel::<Bytes>(64);
-        let (tx_in, rx_in) = mpsc::channel::<Bytes>(64);
+    runtime.spawn(Box::pin(port_pump(port, rx_out, tx_in)));
 
-        runtime.spawn(Box::pin(port_pump(port, rx_out, tx_in)));
-
-        Self {
-            id,
-            tx_out,
-            rx_in: Mutex::new(rx_in),
-        }
-    }
-}
-
-impl Transport for WorkerPortFace {
-    fn id(&self) -> FaceId {
-        self.id
-    }
-
-    fn kind(&self) -> FaceKind {
-        FaceKind::App
-    }
-
-    /// The other end of the port is a tab of this origin: the same principal
-    /// as the worker (a `MessagePort` carries no cross-origin peer).
-    fn trust(&self) -> FaceTrust {
-        FaceTrust::Program
-    }
-
-    fn remote_uri(&self) -> Option<String> {
-        Some(format!("shared-worker-port://tab/{}", self.id.0))
-    }
-
-    async fn recv_bytes(&self) -> Result<Bytes, FaceError> {
-        let mut rx = self.rx_in.lock().await;
-        rx.recv().await.ok_or(FaceError::Closed)
-    }
-
-    async fn send_bytes(&self, pkt: Bytes) -> Result<(), FaceError> {
-        self.tx_out.send(pkt).await.map_err(|_| FaceError::Closed)
-    }
+    WorkerPortFace::with_trust(id, trust, tx_out, rx_in)
 }
 
 /// Bind the worker-scope `onconnect` handler and return the [`WorkerListener`].

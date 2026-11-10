@@ -15,7 +15,16 @@
 //! The worker dies when the last connected tab closes; cross-session state
 //! needs a separate strategy (e.g. IndexedDB-backed PIB).
 //!
-//! Native compiles as a no-op stub (types are wasm32-only).
+//! Native builds have [`WorkerPortFace`] (a plain pair of channels) so its
+//! trust can be tested without a browser; the listener, the pump and the
+//! tab-side proxy are wasm32-only.
+//!
+//! Trust: a port the worker accepts with `WorkerListener::accept_one` is a
+//! validated face, so Data a tab sends is checked before it is cached or
+//! forwarded. `WorkerListener::accept_program` skips that check and is only
+//! for a worker none of whose tabs bridges a remote peer. The tab's own proxy
+//! (`SharedWorkerProxyFace`) is a program face: its peer is the worker of its
+//! own origin.
 //!
 //! Peer-reuse — sharing a single WebRTC peering across tabs — is deferred.
 //!
@@ -26,8 +35,10 @@
 
 mod codec;
 mod error;
+mod port_face;
 
 pub use error::SharedWorkerFaceError;
+pub use port_face::WorkerPortFace;
 
 #[cfg(target_arch = "wasm32")]
 mod proxy;
@@ -37,4 +48,4 @@ mod worker;
 #[cfg(target_arch = "wasm32")]
 pub use proxy::SharedWorkerProxyFace;
 #[cfg(target_arch = "wasm32")]
-pub use worker::{WorkerListener, WorkerPortFace, init_worker_scope};
+pub use worker::{WorkerListener, init_worker_scope};

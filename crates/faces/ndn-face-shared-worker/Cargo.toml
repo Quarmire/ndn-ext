@@ -38,5 +38,13 @@ web-sys = { version = "0.3", features = [
     "Worker",
 ] }
 
+[dev-dependencies]
+ndn-engine     = { workspace = true }
+ndn-face-local = { workspace = true }
+ndn-packet     = { workspace = true, features = ["std"] }
+ndn-security   = { workspace = true }
+tokio          = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
+tokio-util     = { workspace = true }
+
 [lints]
 workspace = true
