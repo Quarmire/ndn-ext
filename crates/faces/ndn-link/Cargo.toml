@@ -32,9 +32,13 @@ ndn-mgmt-wire = { workspace = true }
 # carries a held one's.
 ndn-engine    = { workspace = true, optional = true }
 ndn-namespace = { workspace = true, optional = true }
+# `LinkHints`: a data-layer device's link hint and dial over these links
+# (ndn-rs data-layer.md §19.2, §19.3).
+ndn-data      = { workspace = true, optional = true }
 
 [features]
 engine = ["dep:ndn-engine", "dep:ndn-namespace"]
+introductions = ["dep:ndn-data"]
 
 # Interface addresses for direct-path host candidates.
 [target.'cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple", target_os = "freebsd"))'.dependencies]
@@ -42,9 +46,15 @@ nix = { version = "0.29", default-features = false, features = ["net"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
-# tests/direct.rs: devices on real forwarders (`EngineFaces`).
-ndn-link   = { path = ".", features = ["engine"] }
+# tests/direct.rs: devices on real forwarders (`EngineFaces`); tests/introductions.rs:
+# real data-layer devices on them, joining by a code's link hint.
+ndn-link   = { path = ".", features = ["engine", "introductions"] }
 ndn-engine = { workspace = true }
+ndn-data   = { workspace = true }
+ndn-app    = { workspace = true }
+ndn-sync   = { workspace = true }
+ndn-namespace = { workspace = true }
+ndn-trust-envelope = { workspace = true }
 
 [lints]
 workspace = true

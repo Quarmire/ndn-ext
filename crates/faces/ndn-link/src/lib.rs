@@ -142,6 +142,25 @@
 //! and the device with the smaller key fingerprint punches, at most
 //! [`DirectOptions::max_paths`] at once.
 //!
+//! # Introductions
+//!
+//! A device that hands out introduction codes names the prefixes its
+//! introductions travel under ([`Links::set_introductions`]). A device it
+//! knows nothing of is then admitted on an **introduction link** rather than
+//! refused: Interests under those prefixes and their answers cross it,
+//! nothing else, within the enrollment links' slots and rates. The joiner
+//! dials the inviter by the key and addresses of its code's link hint
+//! ([`Links::dial_by_key`]): every address at once, the handshake accepting
+//! only the device holding the key; the address is where to try and is
+//! trusted for nothing. Once the joiner holds the inviter's namespace its
+//! link is made again, and the inviter admits it by its certificate: as a
+//! full link when its [`ServePolicy`] serves the joiner's namespace (a
+//! person it introduced is another person's namespace, so an inviter
+//! chooses `open` within [`Quotas`], or `listed`; the default `own` leaves
+//! the stranger on its introduction link). With the `introductions`
+//! feature, `LinkHints` gives a data layer device both halves (its hint,
+//! its dial).
+//!
 //! # Relays
 //!
 //! Any device that others can reach is a relay for the devices it serves:
@@ -179,7 +198,10 @@ mod control;
 mod direct;
 #[cfg(feature = "engine")]
 mod engine;
+#[cfg(feature = "introductions")]
+mod hints;
 mod host;
+mod introduce;
 mod links;
 mod peer;
 pub mod policy;
@@ -200,6 +222,8 @@ pub use candidates::{
 };
 #[cfg(feature = "engine")]
 pub use engine::EngineFaces;
+#[cfg(feature = "introductions")]
+pub use hints::LinkHints;
 pub use host::{
     ConfiguredEndpoints, FaceSink, LinkTrust, OwnMembership, PathCandidate, PathSource, Route,
 };

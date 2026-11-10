@@ -110,6 +110,12 @@ pub struct Links {
     pub(crate) sleepers: Sleepers,
     /// Members this device punches by presence, by key.
     pub(crate) members: Mutex<HashMap<KeyFingerprint, MemberEntry>>,
+    /// The name prefixes strangers' introduction links may carry
+    /// ([`Links::set_introductions`]); empty: this device takes none.
+    pub(crate) introductions: Mutex<Vec<Name>>,
+    /// The addresses of peers this device dialled by key from a code's link
+    /// hint ([`Links::dial_by_key`]), in the order tried: their paths.
+    pub(crate) introduced: Mutex<HashMap<PeerId, Vec<SocketAddr>>>,
     pub(crate) cancel: CancellationToken,
 }
 
@@ -145,6 +151,8 @@ impl Links {
             dismissed: Mutex::new(HashSet::new()),
             sleepers: Sleepers::default(),
             members: Mutex::new(HashMap::new()),
+            introductions: Mutex::new(Vec::new()),
+            introduced: Mutex::new(HashMap::new()),
             cancel,
         });
         let _ = links.signal.set(Signal::start(&links));
@@ -167,6 +175,7 @@ impl Links {
                     links.sync_namespace_relays();
                     links.followed_changed();
                     links.announce_all();
+                    links.relink_identified();
                 });
             }
         });
@@ -633,7 +642,10 @@ impl Links {
         let judge = self.judge();
         let mut admitted = match judge.decide(hs.peer_key(), &theirs, &channel, dialed).await {
             Ok(a) => a,
-            Err(refusal) => return Err(refuse(hs, refusal.reason, refusal.detail)),
+            Err(refusal) => match self.introduction_link(&refusal, peer_fp, origin) {
+                Some(a) => a,
+                None => return Err(refuse(hs, refusal.reason, refusal.detail)),
+            },
         };
         if let Some(session) = direct {
             if admitted.enrollment.is_some() {
@@ -657,20 +669,22 @@ impl Links {
             }
         }
         let slot = match &admitted.enrollment {
-            Some(Enrollment::Relay(_)) => match self.enrollment_slots.reserve(remote.ip()) {
-                Ok(slot) => Some(slot),
-                Err(refusal) => {
-                    tracing::warn!(
-                        target: "face.quic",
-                        %remote,
-                        key = %hs.peer_key().fingerprint(),
-                        "refused an enrollment link: {}",
-                        refusal.detail.text
-                    );
-                    hs.refuse(refusal.reason, &refusal.detail.text);
-                    return Err(NotLinked::refused_here(refusal.reason, refusal.detail));
+            Some(Enrollment::Relay(_) | Enrollment::Introduction(_)) => {
+                match self.enrollment_slots.reserve(remote.ip()) {
+                    Ok(slot) => Some(slot),
+                    Err(refusal) => {
+                        tracing::warn!(
+                            target: "face.quic",
+                            %remote,
+                            key = %hs.peer_key().fingerprint(),
+                            "refused an enrollment link: {}",
+                            refusal.detail.text
+                        );
+                        hs.refuse(refusal.reason, &refusal.detail.text);
+                        return Err(NotLinked::refused_here(refusal.reason, refusal.detail));
+                    }
                 }
-            },
+            }
             _ => None,
         };
         // What the link carries is decided before the quota slots move to
@@ -713,7 +727,7 @@ impl Links {
         let dials = admitted
             .peer
             .zip(peer.as_ref())
-            .is_some_and(|(i, p)| !self.paths.candidates(i, p).is_empty());
+            .is_some_and(|(i, p)| self.has_path(i, p));
         let relay_routes = match (admitted.peer, &peer) {
             (Some(i), Some(p)) if p.relay_use.is_some() && kind == PathKind::Link => {
                 Some(RelayRoutes {
@@ -952,6 +966,13 @@ impl Links {
                  certificate in {ns}, so it cannot confirm the device there yet. Enroll it; \
                  the link is made again as a full link then"
             ),
+            Some(Enrollment::Introduction(prefixes)) => tracing::info!(
+                target: "face.quic",
+                face = face.0,
+                "admitted {peer} on an introduction link: it carries only Interests under {} and \
+                 their answers; the device links fully once this device holds its namespace",
+                list(prefixes)
+            ),
             None => {}
         }
         if peer_enrollment.is_empty() {
@@ -993,7 +1014,7 @@ impl Links {
             "{} has no endpoint",
             peer.label
         )));
-        for candidate in self.paths.candidates(id, peer) {
+        for candidate in self.path_candidates(id, peer) {
             let addrs: Vec<SocketAddr> = match candidate {
                 PathCandidate::Address(addr) => vec![addr],
                 PathCandidate::Endpoint(endpoint) => {

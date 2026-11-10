@@ -353,7 +353,7 @@ impl Links {
     /// This device's candidate addresses for its link socket `socket`:
     /// reflexive ones (what linked devices see), then the sources' (host,
     /// advertised, mapped), at most [`CANDIDATES_MAX`].
-    fn gather(&self, socket: &LinkEndpoint) -> Vec<Candidate> {
+    pub(crate) fn gather(&self, socket: &LinkEndpoint) -> Vec<Candidate> {
         let Ok(local) = socket.local_addr() else {
             return Vec::new();
         };

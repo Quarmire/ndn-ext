@@ -462,6 +462,23 @@ impl LinkTable {
         });
     }
 
+    /// A trust context was adopted: close each full link to a device this
+    /// device dialled by its key alone (no identity of it admitted yet) whose
+    /// namespace `held` now says this device holds, and mark its peer to be
+    /// dialled again, so the device is identified in it and admitted by its
+    /// certificate (an introduction's joiner dials the inviter by key before
+    /// it trusts its namespace).
+    pub(crate) fn relink_identified(&self, held: impl Fn(PeerId) -> bool) {
+        self.relink_where(|link| {
+            let peer = link.peer?;
+            (link.identities.is_empty() && link.enrolling.is_empty() && held(peer)).then(|| {
+                "this device now holds the namespace of the device this link reaches; it links \
+                 again to identify it"
+                    .to_string()
+            })
+        });
+    }
+
     /// Close the link paths of each link `why` gives a reason for, with
     /// [`CloseReason::Enrolled`], marking their peers to be dialled again.
     fn relink_where(&self, why: impl Fn(&LiveLink) -> Option<String>) {

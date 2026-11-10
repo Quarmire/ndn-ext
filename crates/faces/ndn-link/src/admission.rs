@@ -103,6 +103,10 @@ pub(crate) enum Enrollment {
     /// This device, holding no certificate in the namespace, dialled a relay
     /// of it that it cannot confirm yet.
     Device(Name),
+    /// This device admitted a device it does not know on an introduction
+    /// link: it carries only Interests under these prefixes (the names of
+    /// the introductions this device answers) and their answers.
+    Introduction(Vec<Name>),
 }
 
 pub(crate) struct Admitted {
@@ -844,6 +848,28 @@ impl Judge<'_> {
                              answers); it links fully once it enrolls",
                             admitted.fingerprint,
                             list(namespaces)
+                        ),
+                    }),
+                }
+            }
+            Some(Enrollment::Introduction(prefixes)) => {
+                let carried = prefixes.clone();
+                Admission {
+                    verdict: LinkVerdict::default(),
+                    scope: Some(LinkScope {
+                        receives: Carries::Interests,
+                        sends: Carries::Answers,
+                        names: Box::new(move |name: &Name| {
+                            carried.iter().any(|p| name.has_prefix(p))
+                        }),
+                        rate: ENROLLMENT_INTERESTS,
+                        shared: None,
+                        explain: format!(
+                            "the introduction link of key {} carries only Interests under {} and \
+                             their answers; it links fully once this device holds the namespace \
+                             of the device it reaches",
+                            admitted.fingerprint,
+                            list(prefixes)
                         ),
                     }),
                 }
@@ -1731,6 +1757,43 @@ mod tests {
         assert_eq!(
             refusal.detail.param("root"),
             Some(c.root_fingerprint().to_string().as_str())
+        );
+    }
+
+    /// An open relay serves a device of a namespace it holds the trust
+    /// context of but no certificate in — an inviter holds the namespace of
+    /// the person it introduced, whom `own` refuses — checked as any device
+    /// of it and under the quotas, the namespace bound to one of the held
+    /// context's anchors.
+    #[tokio::test]
+    async fn open_serves_a_device_of_a_held_namespace_under_quotas() {
+        let (a, b) = (namespace("/a", 10).await, namespace("/b", 20).await);
+        let serve = ServePolicy::Open {
+            quotas: Quotas {
+                links_per_namespace: 1,
+                ..Quotas::default()
+            },
+        };
+        let world = relay(&a, &[&b], serve).await;
+        let judge = world.judge();
+
+        let (key, chain) = b.device("member", "phone", 22).await;
+        let first = judge.decide(&key, &hello(chain), &CH, None).await.unwrap();
+        let id = first.identity().unwrap();
+        assert_eq!((id.device.clone(), id.served), (n("/b/member/phone"), None));
+        assert!(first.quota.as_ref().is_some_and(|q| q.limits.is_some()));
+
+        let (key, chain) = b.device("member", "laptop", 23).await;
+        let refusal = judge
+            .decide(&key, &hello(chain), &CH, None)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(refusal.reason, CloseReason::Busy, "{}", refusal.detail.text);
+        assert!(
+            refusal.detail.is(code::QUOTA_NAMESPACE_LINKS),
+            "{:?}",
+            refusal.detail
         );
     }
 

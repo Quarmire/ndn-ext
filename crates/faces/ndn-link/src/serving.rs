@@ -343,6 +343,18 @@ impl Judge<'_> {
                         .take(&id.namespace, *root, quotas.as_ref())
                         .map(Some);
                 }
+                // A device of a namespace this device holds, under an open
+                // policy ("any namespace"): checked as any device of it and
+                // bound to the held context's first anchor (by fingerprint
+                // order, so it is the same root every time).
+                if let ServePolicy::Open { quotas } = self.serve
+                    && let Some(root) = anchors.iter().min()
+                {
+                    return self
+                        .quotas
+                        .take(&id.namespace, *root, Some(quotas))
+                        .map(Some);
+                }
                 let anchors = anchors
                     .iter()
                     .map(ToString::to_string)
