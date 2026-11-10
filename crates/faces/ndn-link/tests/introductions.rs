@@ -1016,7 +1016,21 @@ async fn a_link_dialled_by_key_routes_only_what_it_was_dialled_for_and_is_taken_
         "{:#?}",
         phone.links.report()
     );
-    // The inviter took it as a stranger: no identity.
+    // The inviter took it as a stranger: no identity. Its side of the link
+    // is registered a moment after the dial returns.
+    until(
+        "the inviter reports the link",
+        Duration::from_secs(10),
+        async || {
+            laptop
+                .links
+                .report()
+                .links
+                .iter()
+                .any(|l| l.key == Some(phone.key))
+        },
+    )
+    .await;
     let seen = laptop
         .links
         .report()
