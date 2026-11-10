@@ -125,9 +125,6 @@ const KEY_REFRESH_EVERY_US: u64 = 1_000_000;
 /// How often the signal keys are asked of the device again while known ids
 /// arrive, so an epoch superseded is noticed and its grace starts (§4.2).
 const KEY_CONFIRM_EVERY_US: u64 = 5_000_000;
-/// When to ask the device for more clock floor: its reserve (ndn-data's `SIGNAL_CLOCK_RESERVE`, 5 s
-/// ahead of the time asked) is asked for again once less than half of it is left.
-const CLOCK_RESERVE_US: u64 = 5_000_000;
 
 /// A clock: µs since the Unix epoch.
 pub type SignalClock = Arc<dyn Fn() -> u64 + Send + Sync>;
@@ -144,9 +141,10 @@ pub struct SignalOptions {
     pub local_ring: bool,
     /// How far another device's clock may run behind ours: 30 s.
     pub clock_skew: Duration,
-    /// Where every time `Signals` reads comes from (run starts, `Expires`,
-    /// `NotAfter`, expiry, header re-rides, rate buckets, renewal). `None`: the
-    /// system clock. A host running on a virtual clock gives its own.
+    /// The raw clock `Signals` reads time from: what arriving signals are judged by
+    /// (`Expires`, `NotAfter`, the limits on how far ahead they may be, letting runs
+    /// go) and what dating starts from (run starts, `Expires`, `NotAfter`). `None`:
+    /// the system clock. A host running on a virtual clock gives its own.
     pub clock: Option<SignalClock>,
     /// The push Interests per second this process sends, shared by all its runs:
     /// [`PUSH_RATE`]. A packet costs one per group it goes into, so a run at
@@ -634,10 +632,13 @@ struct Hub {
     push: Mutex<Bucket>,
     /// The clock every date and judgement is read from ([`clock::Clock`]).
     clock: Clock,
-    /// The clock floor the device made durable, as far as this process knows
-    /// ([`Device::signal_clock_dated`]).
+    /// The next sequence this process gives: one counter for all its runs, so a new run's
+    /// start is above every sequence of every run before it (spec §3.3).
+    next_seq: AtomicU64,
+    /// The sequence counter the device made durable, as far as this process knows
+    /// ([`Device::signal_sequences`]): every sequence given is below it.
     reserved: AtomicU64,
-    /// A background extension of the floor is running.
+    /// A background extension of the counter is running.
     extending: AtomicBool,
 }
 
@@ -651,34 +652,67 @@ struct Checked {
 type Dropped = (Reason, String);
 
 impl Hub {
-    fn now_us(&self) -> u64 {
-        self.clock.now()
+    /// The time this process dates what it sends by ([`Clock::now`]), noted to the device as
+    /// the hint a restart continues from (spec §3.5). It never waits.
+    fn dating_us(&self) -> u64 {
+        let now = self.clock.now();
+        self.device.note_signal_time(now);
+        now
     }
 
-    /// About to date a signal by `now`: the device's clock floor is durable at or above it
-    /// (spec §3.5), asked first when `now` is past what was reserved, and, once `now`
-    /// is within half a reserve of the end of it, asked for more in the background, so a send
-    /// rarely waits. Refused with the data layer's reason when the floor can't be made durable:
-    /// a signal dated beyond it could be re-dated below it by a restart.
-    async fn dated(self: &Arc<Self>, now: u64) -> Result<(), SignalError> {
+    /// Monotonic µs: the rate buckets and the timers read it, and only compare readings.
+    fn ticks_us(&self) -> u64 {
+        self.clock.ticks()
+    }
+
+    /// The raw clock in ms: what arrives is judged by it (spec §13.8).
+    fn raw_ms(&self) -> u64 {
+        self.clock.raw_now() / 1000
+    }
+
+    /// The reading in ms, never earlier than the raw clock: the "ahead" limits are measured from
+    /// it, so a device whose raw clock is behind real time, and whose reading holds the time it
+    /// last dated by (spec §3.5), still hears signals dated by real time (§13.8).
+    fn reading_ms(&self) -> u64 {
+        self.clock.now() / 1000
+    }
+
+    /// `n` sequences, the first of them returned: one counter for all this process's runs,
+    /// durable in the device before any is given (spec §3.3). Once less than half a block is
+    /// left, the next block is asked for in the background, so a send rarely waits. Refused
+    /// with the data layer's reason when the counter can't be made durable: a sequence given
+    /// beyond it could be given again after a restart. Refused `TooLarge` when the
+    /// sequences are spent.
+    async fn sequences(self: &Arc<Self>, n: u64) -> Result<u64, SignalError> {
+        // The sequences first ..= SEQ_MAX (u64::MAX - 1) are left from `first`: the counter is
+        // spent when `n` more would pass u64::MAX.
+        let first = self
+            .next_seq
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |s| s.checked_add(n))
+            .map_err(|left| SignalError::TooLarge {
+                what: "signals past the last sequence (the device's sequence counter is spent)",
+                size: usize::try_from(n).unwrap_or(usize::MAX),
+                max: usize::try_from(u64::MAX - left).unwrap_or(usize::MAX),
+            })?;
+        let end = first + n;
         let reserved = self.reserved.load(Ordering::Acquire);
-        if now > reserved {
+        if end > reserved {
             let floor = self
                 .device
-                .signal_clock_dated(now)
+                .signal_sequences(end)
                 .await
                 .map_err(SignalError::Data)?;
             self.reserved.fetch_max(floor, Ordering::AcqRel);
-            return Ok(());
+            return Ok(first);
         }
-        if now.saturating_add(CLOCK_RESERVE_US / 2) > reserved
+        if end.saturating_add(Device::SIGNAL_SEQ_BLOCK / 2) > reserved
             && !self.extending.swap(true, Ordering::AcqRel)
         {
             let hub = Arc::clone(self);
             let task = tokio::spawn(async move {
                 if let Ok(floor) = hub
                     .device
-                    .signal_clock_dated(reserved.saturating_add(1))
+                    .signal_sequences(reserved.saturating_add(1))
                     .await
                 {
                     hub.reserved.fetch_max(floor, Ordering::AcqRel);
@@ -687,7 +721,7 @@ impl Hub {
             });
             self.spawn(task);
         }
-        Ok(())
+        Ok(first)
     }
 
     fn lock(&self) -> MutexGuard<'_, HubState> {
@@ -786,7 +820,7 @@ impl Hub {
     /// most once a second, and while known ids arrive every
     /// [`KEY_CONFIRM_EVERY_US`], so a superseded epoch is noticed.
     fn key_for(&self, id: &[u8; wire::KEY_ID_LEN]) -> Result<(Name, SignalKey), String> {
-        let now = self.now_us();
+        let now = self.ticks_us();
         let scopes: Vec<Name> = {
             let mut st = self.lock();
             let every = match st.keys.contains_key(id) {
@@ -828,8 +862,9 @@ impl Hub {
         verified: bool,
         scratch: &mut Vec<u8>,
     ) {
-        let now = self.now_us();
-        let now_ms = now / 1000;
+        let now = self.ticks_us();
+        let now_ms = self.raw_ms();
+        let ahead_ms = self.reading_ms();
         let skew = self.skew_ms();
         let run_id = body.run;
         let revocations = self.device.signal_revocations();
@@ -1006,7 +1041,7 @@ impl Hub {
                 );
                 continue;
             }
-            if s.expires > now_ms.saturating_add(ttl_max).saturating_add(skew) {
+            if s.expires > ahead_ms.saturating_add(ttl_max).saturating_add(skew) {
                 self.drop_packet(
                     Reason::Malformed,
                     Some(&run_id),
@@ -1184,8 +1219,9 @@ impl Hub {
                 )));
             }
         }
-        let now = self.now_us();
-        let now_ms = now / 1000;
+        let now = self.ticks_us();
+        let now_ms = self.raw_ms();
+        let ahead_ms = self.reading_ms();
         let skew = self.skew_ms();
         if now_ms > hb.not_after.saturating_add(skew) {
             return Err((
@@ -1194,7 +1230,7 @@ impl Hub {
             ));
         }
         let lifetime_max = RUN_LIFETIME_MAX.as_millis() as u64;
-        if hb.not_after > now_ms.saturating_add(lifetime_max).saturating_add(skew) {
+        if hb.not_after > ahead_ms.saturating_add(lifetime_max).saturating_add(skew) {
             return Err(malformed(format!(
                 "its run's NotAfter {} is more than 24 h ahead",
                 hb.not_after
@@ -1250,7 +1286,8 @@ impl Hub {
         revocations: u64,
     ) -> Option<(Option<(Name, [u8; 32])>, Vec<Waiting>)> {
         let run = body.run;
-        let now = self.now_us();
+        let now = self.ticks_us();
+        let now_ms = self.raw_ms();
         let current = self.device.signal_revocations();
         let mut guard = self.lock();
         let st = &mut *guard;
@@ -1290,7 +1327,7 @@ impl Hub {
         walk_again(st, current);
         let skew = self.skew_ms();
         st.runs
-            .retain(|_, r| now / 1000 <= r.not_after.saturating_add(skew));
+            .retain(|_, r| now_ms <= r.not_after.saturating_add(skew));
         let of_sender: Vec<(RunId, u64)> = st
             .runs
             .iter()
@@ -1661,14 +1698,17 @@ impl Signals {
         conn.register_prefix(&listen).await.map_err(|e| {
             SignalError::Io(format!("cannot register {listen} on the connection: {e}"))
         })?;
-        let clock = Clock::new(options.clock.clone(), device.signal_clock_floor());
-        let now = clock.now();
+        let clock = Clock::new(
+            options.clock.clone(),
+            device.signal_time_hint(),
+            options.run_lifetime,
+        );
         let push = Bucket::new(
             u64::from(options.push_rate.get()),
             u64::from(options.push_burst.get()),
-            now,
+            clock.ticks(),
         );
-        let reserved = AtomicU64::new(device.signal_clock_floor());
+        let floor = device.signal_sequence_floor();
         let hub = Arc::new(Hub {
             device,
             conn: Arc::clone(&conn),
@@ -1680,7 +1720,8 @@ impl Signals {
             tasks: Mutex::new(Vec::new()),
             push: Mutex::new(push),
             clock,
-            reserved,
+            next_seq: AtomicU64::new(floor),
+            reserved: AtomicU64::new(floor),
             extending: AtomicBool::new(false),
         });
         let weak = Arc::downgrade(&hub);
@@ -1745,7 +1786,7 @@ impl Signals {
             .signal_scope(scope)
             .map_err(|e| scope_error(scope, e))?;
         let queue = Arc::new(Queue::default());
-        let now = self.hub.now_us();
+        let now = self.hub.ticks_us();
         let digest = ScopeDigest::of(scope);
         let mut st = self.hub.lock();
         claim_digest(&mut st.by_digest, digest, scope)?;
@@ -1778,16 +1819,15 @@ impl Signals {
             .device
             .signal_scope(scope)
             .map_err(|e| scope_error(scope, e))?;
-        let now = self.hub.now_us();
-        self.hub.dated(now).await?;
-        let keyed = Keyed::new(&self.hub, scope, now, now).await?;
+        let start = self.hub.sequences(1).await?;
+        let now = self.hub.dating_us();
+        let keyed = Keyed::new(&self.hub, scope, start, now).await?;
         Ok(SignalRun {
             hub: Arc::clone(&self.hub),
             scope: scope.clone(),
             digest: ScopeDigest::of(scope),
-            next_seq: now,
             keyed: Some(keyed),
-            bucket: Bucket::new(SEND_RATE, SEND_BURST, now),
+            bucket: Bucket::new(SEND_RATE, SEND_BURST, self.hub.ticks_us()),
             body: Vec::with_capacity(PACKET_MAX),
             scratch: Vec::with_capacity(PACKET_MAX + 16),
         })
@@ -1889,7 +1929,7 @@ impl Keyed {
         Ok(Keyed {
             key,
             header,
-            opened_us: now,
+            opened_us: hub.ticks_us(),
             header_rode_us: None,
         })
     }
@@ -1901,7 +1941,6 @@ pub struct SignalRun {
     hub: Arc<Hub>,
     scope: Name,
     digest: ScopeDigest,
-    next_seq: u64,
     /// `None` once closed.
     keyed: Option<Keyed>,
     bucket: Bucket,
@@ -2003,21 +2042,9 @@ impl SignalRun {
                 });
             }
         }
-        let first = self.next_seq;
         if signals.is_empty() {
-            return Ok(first..first);
-        }
-        // Receivers refuse a sequence past the last one; sequences start at the
-        // host's clock in µs, so only a clock far past now gets there.
-        // Sequences first ..= SEQ_MAX are left: SEQ_MAX + 1 - first of them.
-        let room = (wire::SEQ_MAX + 1).saturating_sub(first);
-        if signals.len() as u64 > room {
-            return Err(SignalError::TooLarge {
-                what: "a batch past the run's last sequence (signals; the host's clock is far \
-                       past now)",
-                size: signals.len(),
-                max: usize::try_from(room).unwrap_or(usize::MAX),
-            });
+            let at = self.hub.next_seq.load(Ordering::Acquire);
+            return Ok(at..at);
         }
         // Membership, keys and groups by the record in force now: NotMember from
         // the moment this device holds a record that removes it.
@@ -2026,21 +2053,23 @@ impl SignalRun {
             .device
             .signal_scope(&self.scope)
             .map_err(|e| scope_error(&self.scope, e))?;
-        let mut now = self.hub.now_us();
-        self.hub.dated(now).await?;
+        let mut now = self.hub.dating_us();
+        let mut tick = self.hub.ticks_us();
         let lifetime = self.hub.options.run_lifetime.as_micros() as u64;
-        let opened = self.keyed.as_ref().map_or(now, |k| k.opened_us);
-        if now.saturating_sub(opened) >= lifetime / 10 * 9 {
-            self.renew(now).await?;
-            now = self.hub.now_us();
-            self.hub.dated(now).await?;
+        let opened = self.keyed.as_ref().map_or(tick, |k| k.opened_us);
+        if tick.saturating_sub(opened) >= lifetime / 10 * 9 {
+            self.renew().await?;
+            now = self.hub.dating_us();
+            tick = self.hub.ticks_us();
         }
         let keyed = self.keyed.as_mut().ok_or(SignalError::Closed)?;
         let expires = now / 1000 + ttl.as_millis() as u64;
-        let outgoing: Vec<Outgoing<'_>> = signals
+        // Sized with the longest a sequence encodes (8 octets), so what fits a packet does not
+        // depend on how far the counter has run (spec §4.3); the sequences are given once the
+        // packet is sure to go.
+        let mut outgoing: Vec<Outgoing<'_>> = signals
             .iter()
-            .zip(first..)
-            .map(|((a, p), seq)| (seq, *a, expires, *p))
+            .map(|(a, p)| (wire::SEQ_MAX, *a, expires, *p))
             .collect();
         let sealed = scope.keys.first();
         let size = |header: bool, of: &[Outgoing<'_>]| {
@@ -2053,7 +2082,7 @@ impl SignalRun {
         };
         let header_due = keyed
             .header_rode_us
-            .is_none_or(|t| now.saturating_sub(t) >= HEADER_EVERY.as_micros() as u64);
+            .is_none_or(|t| tick.saturating_sub(t) >= HEADER_EVERY.as_micros() as u64);
         let all = 0..outgoing.len();
         let plan: Vec<Planned> = if !header_due {
             vec![Planned {
@@ -2092,13 +2121,17 @@ impl SignalRun {
         let pushes = packets.saturating_mul(scope.groups.len() as u64);
         {
             let mut budget = self.hub.push.lock().expect("signal push budget lock");
-            let run_wait = self.bucket.ready(packets, now).err();
-            let push_wait = budget.ready(pushes, now).err();
+            let run_wait = self.bucket.ready(packets, tick).err();
+            let push_wait = budget.ready(pushes, tick).err();
             if let Some(retry_after) = run_wait.max(push_wait) {
                 return Err(SignalError::RateLimited { retry_after });
             }
             self.bucket.spend(packets);
             budget.spend(pushes);
+        }
+        let first = self.hub.sequences(signals.len() as u64).await?;
+        for (o, seq) in outgoing.iter_mut().zip(first..) {
+            o.0 = seq;
         }
         let run = keyed.key.id();
         for p in plan {
@@ -2143,16 +2176,18 @@ impl SignalRun {
                 .sent_bytes
                 .fetch_add(bytes, Ordering::Relaxed);
             if p.header {
-                keyed.header_rode_us = Some(now);
+                keyed.header_rode_us = Some(tick);
             }
         }
-        self.next_seq = first + signals.len() as u64;
-        Ok(first..self.next_seq)
+        Ok(first..first + signals.len() as u64)
     }
 
-    /// A new run key, header and ring; sequences continue; the old ring ends.
-    async fn renew(&mut self, now: u64) -> Result<(), SignalError> {
-        let keyed = Keyed::new(&self.hub, &self.scope, self.next_seq, now).await?;
+    /// A new run key, header and ring, its start above every sequence given so far; the old
+    /// ring ends.
+    async fn renew(&mut self) -> Result<(), SignalError> {
+        let start = self.hub.sequences(1).await?;
+        let now = self.hub.dating_us();
+        let keyed = Keyed::new(&self.hub, &self.scope, start, now).await?;
         if let Some(old) = self.keyed.replace(keyed) {
             self.hub.end_run(&old.key.id());
         }
