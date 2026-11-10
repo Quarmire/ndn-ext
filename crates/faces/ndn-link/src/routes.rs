@@ -127,7 +127,9 @@ pub fn group_routes<'a>(namespaces: impl IntoIterator<Item = &'a Name>, cost: u3
 /// The prefixes a link to `peer` will route, known before it is up (for
 /// the waiting routes of an on-demand link): its `routes`, else, for a
 /// relay it uses, the namespaces its link path routes
-/// (`relay_namespaces`) and its device name, else its device name.
+/// (`relay_namespaces`) and its device name, else its device name; a peer
+/// dialled by key alone ([`PeerSpec::unidentified_routes`]) routes those
+/// until it is identified.
 pub(crate) fn predicted_routes(peer: &PeerSpec, relay_namespaces: &[Name]) -> Vec<Name> {
     if let Some(routes) = &peer.routes {
         return routes.clone();
@@ -135,6 +137,14 @@ pub(crate) fn predicted_routes(peer: &PeerSpec, relay_namespaces: &[Name]) -> Ve
     let mut routes = Vec::new();
     if peer.relay_use.is_some() {
         routes.extend_from_slice(relay_namespaces);
+    }
+    if let Some(only) = &peer.unidentified_routes {
+        for route in only {
+            if !routes.contains(route) {
+                routes.push(route.clone());
+            }
+        }
+        return routes;
     }
     if let Some(device) = &peer.device
         && !routes.contains(device)
@@ -149,7 +159,16 @@ fn default_routes(peer: Option<&PeerSpec>, identities: &[Identity], dials: bool)
         return routes;
     }
     if identities.is_empty() {
-        return peer.and_then(|p| p.device.clone()).into_iter().collect();
+        // A peer dialled by key alone proved no certificate: its device
+        // name is only what a code claimed, so it gets the routes given for
+        // that case, never a route over the names it claims.
+        return match peer {
+            Some(p) => match &p.unidentified_routes {
+                Some(only) => only.clone(),
+                None => p.device.clone().into_iter().collect(),
+            },
+            None => Vec::new(),
+        };
     }
     let mut out: Vec<Name> = Vec::new();
     for id in identities {

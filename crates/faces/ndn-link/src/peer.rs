@@ -95,6 +95,13 @@ pub struct PeerSpec {
     pub relay: Option<PeerId>,
     /// The routes over its link, instead of the default ones.
     pub routes: Option<Vec<Name>>,
+    /// The routes over its link while it has shown no certificate of a
+    /// namespace this device holds, instead of the default one (its device
+    /// name). A peer dialled from a code's link hint is `device` only by
+    /// what the code claimed; until it is identified (the link is made again
+    /// once this device holds its namespace) it gets only the prefixes of
+    /// the introduction. `None`: the default routes.
+    pub unidentified_routes: Option<Vec<Name>>,
     /// Dial it again whenever its link drops.
     pub persistent: bool,
     /// NDNLPv2 reliability on its link.
@@ -121,6 +128,7 @@ impl Default for PeerSpec {
             endpoints: Vec::new(),
             relay: None,
             routes: None,
+            unidentified_routes: None,
             persistent: true,
             reliability: false,
             direct: true,

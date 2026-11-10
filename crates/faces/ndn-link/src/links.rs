@@ -110,9 +110,9 @@ pub struct Links {
     pub(crate) sleepers: Sleepers,
     /// Members this device punches by presence, by key.
     pub(crate) members: Mutex<HashMap<KeyFingerprint, MemberEntry>>,
-    /// The name prefixes strangers' introduction links may carry
-    /// ([`Links::set_introductions`]); empty: this device takes none.
-    pub(crate) introductions: Mutex<Vec<Name>>,
+    /// What strangers' introduction links may carry
+    /// ([`Links::set_introductions`]); `None`: this device takes none.
+    pub(crate) introductions: Mutex<Option<Arc<dyn crate::introduce::Introductions>>>,
     /// The addresses of peers this device dialled by key from a code's link
     /// hint ([`Links::dial_by_key`]), in the order tried: their paths.
     pub(crate) introduced: Mutex<HashMap<PeerId, Vec<SocketAddr>>>,
@@ -151,7 +151,7 @@ impl Links {
             dismissed: Mutex::new(HashSet::new()),
             sleepers: Sleepers::default(),
             members: Mutex::new(HashMap::new()),
-            introductions: Mutex::new(Vec::new()),
+            introductions: Mutex::new(None),
             introduced: Mutex::new(HashMap::new()),
             cancel,
         });
@@ -966,12 +966,12 @@ impl Links {
                  certificate in {ns}, so it cannot confirm the device there yet. Enroll it; \
                  the link is made again as a full link then"
             ),
-            Some(Enrollment::Introduction(prefixes)) => tracing::info!(
+            Some(Enrollment::Introduction(_)) => tracing::info!(
                 target: "face.quic",
                 face = face.0,
-                "admitted {peer} on an introduction link: it carries only Interests under {} and \
-                 their answers; the device links fully once this device holds its namespace",
-                list(prefixes)
+                "admitted {peer} on an introduction link: it carries only the Interests of the \
+                 introduction an open offer needs and their answers; the device links fully \
+                 once this device holds its namespace"
             ),
             None => {}
         }

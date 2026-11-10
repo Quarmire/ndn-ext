@@ -2,20 +2,25 @@
 //! introduction, and dialling a device by its key from a code's link hint
 //! (`ndn-rs/docs/specs/ndn-link.md` §14, data-layer.md §19).
 //!
-//! An inviter's host names the prefixes its introductions travel under
-//! ([`Links::set_introductions`]); a device it knows nothing of — no
-//! certificate of a namespace it holds, no peer entry expecting its key — is
-//! then admitted on an **introduction link** instead of being refused: a link
-//! that carries Interests under those prefixes and their answers, nothing
-//! else, rate-limited and held in the same slots as enrollment links.
+//! An inviter's host gives its links what its introductions serve
+//! ([`Links::set_introductions`], an [`Introductions`]); a device it knows
+//! nothing of — no certificate of a namespace it holds, no peer entry
+//! expecting its key — is then admitted on an **introduction link** instead
+//! of being refused, but only while an offer is open: a link that carries
+//! the Interests of the one exchange (the offer's record and the ask) and
+//! their answers, nothing else, rate-limited and held in the same slots as
+//! enrollment links.
 //!
 //! A joiner dials the inviter by the key and addresses its code carries
 //! ([`Links::dial_by_key`]): every address is tried at once, the handshake
 //! succeeds only with the device holding the key, and the first that does
-//! becomes the link. Once the joiner's host holds the inviter's namespace the
-//! link is made again, so the inviter admits it by its certificate (a full
-//! link); until then it carries the introduction alone.
+//! becomes the link. Until the joiner's host holds the inviter's namespace
+//! the link carries only the routes it was dialled for (an introduction's
+//! prefixes), never the names the code claims for the device; once it does
+//! the link is made again, so the inviter admits it by its certificate (a
+//! full link) and it gets the routes of the identity it proved.
 
+use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,14 +37,48 @@ use crate::links::{Links, Origin, dial_loop};
 use crate::peer::{PeerId, PeerSpec};
 use crate::policy::CANDIDATES_MAX;
 
+/// What a device's introductions serve over a link a stranger dialled
+/// (ndn-link §8.6): the host gives it to [`Links::set_introductions`]. For a
+/// data-layer device it is ndn-data's `IntroductionSurface`.
+pub trait Introductions: Send + Sync {
+    /// Whether an offer is open: a stranger's introduction link is worth
+    /// taking now. With none, a stranger is refused as any other.
+    fn open(&self) -> bool;
+
+    /// Whether an Interest for `name` may cross an introduction link: the
+    /// names of the one exchange an open offer needs, no other name the
+    /// device serves.
+    fn carries(&self, name: &Name) -> bool;
+}
+
+/// What the introduction links of [`Enrollment::Introduction`] carry.
+#[derive(Clone)]
+pub(crate) struct Surface(pub(crate) Arc<dyn Introductions>);
+
+impl fmt::Debug for Surface {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("introductions")
+    }
+}
+
+impl PartialEq for Surface {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for Surface {}
+
 impl Links {
-    /// This device takes introduction links from devices it does not know:
-    /// links that carry Interests under `prefixes` and their answers, and
-    /// nothing else (the names of the introductions it answers — for a data
-    /// layer device `<device>/32=held` and `<device>/32=intro`). Empty
-    /// stops taking them (links already up stay until they end).
-    pub fn set_introductions(&self, prefixes: Vec<Name>) {
-        *self.introductions.lock() = prefixes;
+    /// This device takes introduction links from devices it does not know,
+    /// while `surface` says an offer is open ([`Introductions::open`]): links
+    /// that carry the Interests `surface` carries
+    /// ([`Introductions::carries`]) and their answers, nothing else. Once no
+    /// offer is open a stranger is refused as any other, with no timer of
+    /// this device's; links already up stay until they end. Call it once, on
+    /// the device that makes offers.
+    pub fn set_introductions(&self, surface: Arc<dyn Introductions>) {
+        *self.introductions.lock() = Some(surface);
     }
 
     /// The fingerprint of the key this device links with now: what a link
@@ -77,15 +116,15 @@ impl Links {
         {
             return None;
         }
-        let prefixes = self.introductions.lock().clone();
-        if prefixes.is_empty() {
+        let surface = self.introductions.lock().clone()?;
+        if !surface.open() {
             return None;
         }
         Some(Admitted {
             fingerprint,
             identities: Vec::new(),
             peer: None,
-            enrollment: Some(Enrollment::Introduction(prefixes)),
+            enrollment: Some(Enrollment::Introduction(Surface(surface))),
             quota: None,
             quotas: Vec::new(),
         })
@@ -107,7 +146,7 @@ impl Links {
 
     /// A trust context was adopted: a link to a device dialled by its key
     /// alone, whose namespace this device holds now, is made again so the
-    /// device is identified in it.
+    /// device is identified in it (and gets the routes of its identity).
     pub(crate) fn relink_identified(&self) {
         let keyring = self.trust.keyring();
         self.table.relink_identified(|peer| {
@@ -121,17 +160,26 @@ impl Links {
     /// Dial the device `device` by the key `key` at `addrs` (at most
     /// [`CANDIDATES_MAX`], in order of preference), all at once, within
     /// `within` for the handshakes. `Ok` once a link to the device holding
-    /// `key` is up and routes `device`'s names; the link is then kept like a
-    /// peer's that is not persistent: made again once when this device comes
-    /// to hold `device`'s namespace, and not otherwise. An address whose
-    /// device presents another key is no link; the error says which
-    /// addresses failed and how.
+    /// `key` is up; the link is then kept like a peer's that is not
+    /// persistent: made again once when this device comes to hold
+    /// `device`'s namespace, and not otherwise. An address whose device
+    /// presents another key is no link; the error says which addresses
+    /// failed and how.
+    ///
+    /// `device` is only what a code claimed: the device at that key has
+    /// shown no certificate. Until it does (the link made again after this
+    /// device holds its namespace) the link routes `routes` — for an
+    /// introduction, its introduction prefixes — and not `device`'s names,
+    /// so a code naming a device of a namespace this device already
+    /// holds does not steer that namespace's Interests to whoever holds the
+    /// key.
     pub async fn dial_by_key(
         self: &Arc<Self>,
         key: KeyFingerprint,
         device: Name,
         addrs: Vec<SocketAddr>,
         within: Duration,
+        routes: Vec<Name>,
     ) -> Result<(), LinkDetail> {
         let mut addrs = addrs;
         addrs.truncate(CANDIDATES_MAX);
@@ -158,6 +206,7 @@ impl Links {
             device: Some(device.clone()),
             persistent: false,
             direct: false,
+            unidentified_routes: Some(routes),
             ..PeerSpec::default()
         });
         self.introduced.lock().insert(id, addrs.clone());
@@ -185,6 +234,27 @@ impl Links {
         self.introduced.lock().remove(&id);
         self.ctls.lock().remove(&id);
         self.peers.remove(id);
+    }
+
+    /// Take down the link [`dial_by_key`](Self::dial_by_key) made to the
+    /// device with key `key`, for `why`, if it is still what that dial made:
+    /// a peer the dial added whose link has shown no certificate. A link that
+    /// was up before the dial, or that has been identified since (the join
+    /// went on and this device holds the device's namespace), is kept. The
+    /// join that dialled it failed, so what answered at that key proved
+    /// nothing and keeps no route.
+    pub fn undial_by_key(&self, key: KeyFingerprint, why: &str) {
+        let ids: Vec<PeerId> = self.introduced.lock().keys().copied().collect();
+        for id in ids {
+            if self.peers.get(id).and_then(|p| p.key) != Some(key) {
+                continue;
+            }
+            if self.table.is_linked(&key) && !self.table.is_unidentified(&key) {
+                continue;
+            }
+            self.drop_peer(id, why);
+            self.forget_dialled(id);
+        }
     }
 
     /// The handshakes to every address at once, the first to succeed

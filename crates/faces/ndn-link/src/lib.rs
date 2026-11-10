@@ -144,22 +144,28 @@
 //!
 //! # Introductions
 //!
-//! A device that hands out introduction codes names the prefixes its
-//! introductions travel under ([`Links::set_introductions`]). A device it
-//! knows nothing of is then admitted on an **introduction link** rather than
-//! refused: Interests under those prefixes and their answers cross it,
-//! nothing else, within the enrollment links' slots and rates. The joiner
-//! dials the inviter by the key and addresses of its code's link hint
+//! A device that hands out introduction codes gives its links what its
+//! introductions serve ([`Links::set_introductions`], an [`Introductions`]).
+//! While one of its offers is open, a device it knows nothing of is admitted
+//! on an **introduction link** rather than refused: Interests for the names
+//! of the one exchange (the offer's record and the ask) and their answers
+//! cross it, nothing else, within the enrollment links' slots and rates; with
+//! no offer open a stranger is refused as any other. The joiner dials the
+//! inviter by the key and addresses of its code's link hint
 //! ([`Links::dial_by_key`]): every address at once, the handshake accepting
 //! only the device holding the key; the address is where to try and is
-//! trusted for nothing. Once the joiner holds the inviter's namespace its
-//! link is made again, and the inviter admits it by its certificate: as a
+//! trusted for nothing, and the device name the code claims is no route: the
+//! link routes only the introduction's prefixes until the device proves a
+//! certificate, and is taken down when the join fails
+//! ([`Links::undial_by_key`]). Once the joiner holds the inviter's namespace
+//! its link is made again, and the inviter admits it by its certificate: as a
 //! full link when its [`ServePolicy`] serves the joiner's namespace (a
 //! person it introduced is another person's namespace, so an inviter
 //! chooses `open` within [`Quotas`], or `listed`; the default `own` leaves
 //! the stranger on its introduction link). With the `introductions`
-//! feature, `LinkHints` gives a data layer device both halves (its hint,
-//! its dial).
+//! feature, `LinkHints` gives a data layer device its three halves (its
+//! hint, its dial, its undial) and serves its
+//! `ndn_data::IntroductionSurface`.
 //!
 //! # Relays
 //!
@@ -227,6 +233,7 @@ pub use hints::LinkHints;
 pub use host::{
     ConfiguredEndpoints, FaceSink, LinkTrust, OwnMembership, PathCandidate, PathSource, Route,
 };
+pub use introduce::Introductions;
 pub use links::{LinkSetup, Links};
 pub use ndn_mgmt_wire::{LinkDetail, LinkWords, link_code};
 pub use peer::{LinkMode, PeerId, PeerSpec, RelaySource, RelayUse};

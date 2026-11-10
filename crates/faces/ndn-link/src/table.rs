@@ -270,6 +270,16 @@ impl LinkTable {
         self.live.lock().contains_key(fingerprint)
     }
 
+    /// Whether the device with key `fingerprint` is linked and has shown no
+    /// certificate of a namespace this device holds (nor is enrolling): its
+    /// link carries only what an unidentified peer gets.
+    pub(crate) fn is_unidentified(&self, fingerprint: &KeyFingerprint) -> bool {
+        self.live
+            .lock()
+            .get(fingerprint)
+            .is_some_and(|l| l.identities.is_empty() && l.enrolling.is_empty())
+    }
+
     /// The sender of the link to the device with key `fingerprint` (its
     /// link path, else its direct path).
     pub(crate) fn sender_to(&self, fingerprint: &KeyFingerprint) -> Option<Arc<Face>> {

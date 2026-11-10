@@ -104,9 +104,10 @@ pub(crate) enum Enrollment {
     /// of it that it cannot confirm yet.
     Device(Name),
     /// This device admitted a device it does not know on an introduction
-    /// link: it carries only Interests under these prefixes (the names of
-    /// the introductions this device answers) and their answers.
-    Introduction(Vec<Name>),
+    /// link, while an offer is open: it carries only the Interests the
+    /// introductions' surface carries (the one exchange of an open offer)
+    /// and their answers.
+    Introduction(crate::introduce::Surface),
 }
 
 pub(crate) struct Admitted {
@@ -852,24 +853,22 @@ impl Judge<'_> {
                     }),
                 }
             }
-            Some(Enrollment::Introduction(prefixes)) => {
-                let carried = prefixes.clone();
+            Some(Enrollment::Introduction(surface)) => {
+                let carried = surface.clone();
                 Admission {
                     verdict: LinkVerdict::default(),
                     scope: Some(LinkScope {
                         receives: Carries::Interests,
                         sends: Carries::Answers,
-                        names: Box::new(move |name: &Name| {
-                            carried.iter().any(|p| name.has_prefix(p))
-                        }),
+                        names: Box::new(move |name: &Name| carried.0.carries(name)),
                         rate: ENROLLMENT_INTERESTS,
                         shared: None,
                         explain: format!(
-                            "the introduction link of key {} carries only Interests under {} and \
-                             their answers; it links fully once this device holds the namespace \
-                             of the device it reaches",
-                            admitted.fingerprint,
-                            list(prefixes)
+                            "the introduction link of key {} carries only the Interests of the \
+                             introduction an open offer needs (the offer's record and the ask) \
+                             and their answers; it links fully once this device holds the \
+                             namespace of the device it reaches",
+                            admitted.fingerprint
                         ),
                     }),
                 }
