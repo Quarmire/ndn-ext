@@ -42,7 +42,7 @@ mod state;
 pub mod wire;
 
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZeroU32;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -101,6 +101,15 @@ pub const ADMITTING_PER_SCOPE: usize = 8;
 pub const ADMITTING_PER_NAMESPACE: usize = 2;
 /// Packets of a run kept while its header is admitted; more are `unknown_run`.
 pub const WAITING_MAX: usize = 32;
+/// How long a packet of a run whose header has not come is held for it. Nothing orders
+/// two Interests: a forwarder's parallel pipeline, or a network, may deliver a signal
+/// before the header-only packet that rode ahead of it (§8.1). After this the packet is
+/// `unknown_run`.
+pub const ORPHAN_HOLD: Duration = Duration::from_millis(500);
+/// Packets of runs whose header has not come, held at once by a process: a flood of
+/// them (unverified, so unattributed) costs this much memory and no more; the oldest
+/// is `unknown_run` for a newer.
+pub const ORPHANS_MAX: usize = 64;
 /// How long after this process first sees an epoch superseded it still
 /// opens packets sealed under that epoch's signal key (§4.2).
 pub const EPOCH_GRACE: Duration = Duration::from_secs(60);
@@ -595,6 +604,12 @@ struct Admitting {
     waiting: Vec<Waiting>,
 }
 
+/// A packet of a run whose header has not come yet, held for it ([`ORPHAN_HOLD`]).
+struct Orphan {
+    at_us: u64,
+    packet: Waiting,
+}
+
 #[derive(Default)]
 struct HubState {
     scopes: HashMap<Name, ScopeState>,
@@ -617,6 +632,9 @@ struct HubState {
     /// This process's runs (never attached to), and the rings of those that opened one.
     own: HashSet<RunId>,
     rings: HashMap<RunId, NamedPublisher>,
+    /// Packets of runs no header of which is held or being admitted, oldest first: the
+    /// header may have been overtaken ([`ORPHAN_HOLD`]).
+    orphans: VecDeque<Orphan>,
 }
 
 struct Hub {
@@ -923,10 +941,20 @@ impl Hub {
                         drop(guard);
                         self.admit(body, sealed, local, header, scratch);
                     }
-                    None => self.drop_packet(
+                    None if drained => self.drop_packet(
                         Reason::UnknownRun,
                         Some(&run_id),
                         "no header of the run is held here yet",
+                    ),
+                    None => self.hold_orphan(
+                        st,
+                        Waiting {
+                            body,
+                            sealed,
+                            local,
+                            verified,
+                        },
+                        now,
                     ),
                 }
                 return;
@@ -1079,6 +1107,67 @@ impl Hub {
         }
     }
 
+    /// Hold a packet of a run whose header is neither held, nor being admitted, nor
+    /// carried by the packet: it may have overtaken its header (§8.1), whose admission
+    /// then takes it. Bounded by [`WAITING_MAX`] per run and [`ORPHANS_MAX`] in all;
+    /// nothing is verified for it, so a flood of these costs memory and nothing else.
+    fn hold_orphan(&self, st: &mut HubState, packet: Waiting, now: u64) {
+        self.expire_orphans(st, now);
+        let run = packet.body.run;
+        if st
+            .orphans
+            .iter()
+            .filter(|o| o.packet.body.run == run)
+            .count()
+            >= WAITING_MAX
+        {
+            return self.drop_packet(
+                Reason::UnknownRun,
+                Some(&run),
+                &format!("{WAITING_MAX} packets wait for its header, which has not come"),
+            );
+        }
+        if st.orphans.len() >= ORPHANS_MAX
+            && let Some(oldest) = st.orphans.pop_front()
+        {
+            self.drop_packet(
+                Reason::UnknownRun,
+                Some(&oldest.packet.body.run),
+                &format!("{ORPHANS_MAX} packets wait for their runs' headers; a newer one came"),
+            );
+        }
+        st.orphans.push_back(Orphan { at_us: now, packet });
+    }
+
+    /// Let go the orphans held longer than [`ORPHAN_HOLD`]: each is `unknown_run`.
+    fn expire_orphans(&self, st: &mut HubState, now: u64) {
+        let hold = ORPHAN_HOLD.as_micros() as u64;
+        while st
+            .orphans
+            .front()
+            .is_some_and(|o| now.saturating_sub(o.at_us) >= hold)
+        {
+            if let Some(o) = st.orphans.pop_front() {
+                self.drop_packet(
+                    Reason::UnknownRun,
+                    Some(&o.packet.body.run),
+                    "no header of the run came while its packet was held",
+                );
+            }
+        }
+    }
+
+    /// The orphans of `run`, oldest first: its header is being admitted, so they wait
+    /// behind it as the packets that came meanwhile do.
+    fn claim_orphans(&self, st: &mut HubState, run: &RunId) -> Vec<Waiting> {
+        self.expire_orphans(st, self.ticks_us());
+        let (mine, rest): (VecDeque<Orphan>, VecDeque<Orphan>) = std::mem::take(&mut st.orphans)
+            .into_iter()
+            .partition(|o| o.packet.body.run == *run);
+        st.orphans = rest;
+        mine.into_iter().map(|o| o.packet).collect()
+    }
+
     /// Admit the header a packet of an unknown run carries (§8.1 step 4):
     /// checked here first ([`Self::check_header`]: the packet's run signature
     /// under the run key the header binds, the signer a member); then, while
@@ -1138,12 +1227,13 @@ impl Hub {
                 ),
             );
         }
+        let waiting = self.claim_orphans(st, &run);
         st.admitting.insert(
             run,
             Admitting {
                 scope: body.scope.clone(),
                 namespace: sender.namespace,
-                waiting: Vec::new(),
+                waiting,
             },
         );
         drop(guard);
@@ -1523,6 +1613,7 @@ impl Hub {
             let mut st = self.lock();
             st.runs.clear();
             st.keys.clear();
+            st.orphans.clear();
             (
                 std::mem::take(&mut st.scopes),
                 std::mem::take(&mut st.rings),
@@ -1836,6 +1927,10 @@ impl Signals {
     /// Counters since start, by reason (what was refused and dropped, and why).
     pub fn stats(&self) -> SignalStats {
         let c = &self.hub.counters;
+        {
+            let mut st = self.hub.lock();
+            self.hub.expire_orphans(&mut st, self.hub.ticks_us());
+        }
         let l = |a: &AtomicU64| a.load(Ordering::Relaxed);
         SignalStats {
             sent_packets: l(&c.sent_packets),

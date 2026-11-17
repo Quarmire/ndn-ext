@@ -67,6 +67,8 @@ ndn-sync       = { workspace = true }
 ndn-namespace  = { workspace = true }
 tokio-util     = { workspace = true }
 futures        = { workspace = true }
+# The signal tests' connection that decides the order its packets arrive in.
+async-trait    = { workspace = true }
 
 [lints]
 workspace = true

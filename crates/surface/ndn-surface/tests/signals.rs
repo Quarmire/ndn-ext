@@ -8,10 +8,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use common::{Engine, World, engine, link, n, no_quota, no_ring};
+use common::{Engine, Headers, Reordered, World, engine, link, n, no_quota, no_ring};
 use ndn_app::EngineAppExt;
 use ndn_surface::signal::wire::{self, Packet};
-use ndn_surface::signal::{Signal, SignalError, SignalOptions, SignalSubscriber, Signals};
+use ndn_surface::signal::{
+    ORPHAN_HOLD, ORPHANS_MAX, Signal, SignalError, SignalOptions, SignalSubscriber, Signals,
+};
+use ndn_sync::MemoryStore;
 
 const WITHIN: Duration = Duration::from_secs(20);
 
@@ -238,6 +241,87 @@ async fn a_full_signal_arrives_after_its_header_rode_alone() {
     );
     let stats = phone.signals.stats();
     assert_eq!((stats.delivered, stats.unknown_run), (1, 0), "{stats:?}");
+    world.cancel.cancel();
+}
+
+/// Nothing orders two Interests: a forwarder with a parallel pipeline (the default)
+/// lets the signal of a run overtake the header-only packet that rides ahead of it,
+/// and so would a network. The receiver holds the signal for its header and delivers
+/// it, as if it had come second; the sender can't do more than send the header first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_signal_that_overtakes_its_headers_packet_is_still_delivered() {
+    let world = World::new("/alice", &["/alice/laptop", "/alice/phone"]).await;
+    let e = engine().await;
+    let laptop = world.host(&e, "/alice/laptop", no_ring()).await;
+    let phone = world
+        .host_via(
+            &e,
+            "/alice/phone",
+            SignalOptions::default(),
+            Arc::new(MemoryStore::new()),
+            Reordered::wrap(Headers::Behind),
+        )
+        .await;
+    let board = n("/alice/32=data/board");
+    laptop.share(&board, world.ns(), false).await;
+    let mut sub = phone.subscribe(&board, WITHIN).await;
+    let mut run = laptop.signals.open(&board).await.unwrap();
+    let seq = run.send(&[7; 64], &[9; 768]).await.unwrap();
+    let s = next(&mut sub, Duration::from_secs(5))
+        .await
+        .expect("the signal that overtook its header arrives");
+    assert_eq!((s.seq, s.address.len(), s.payload.len()), (seq, 64, 768));
+    let stats = phone.signals.stats();
+    assert_eq!((stats.delivered, stats.unknown_run), (1, 0), "{stats:?}");
+    world.cancel.cancel();
+}
+
+/// A packet whose run's header never comes is held for [`ORPHAN_HOLD`] at most, and
+/// not more than [`ORPHANS_MAX`] of them at once: each is let go as `unknown_run`,
+/// none delivered, whatever number of runs the packets are of.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn packets_whose_headers_never_come_are_let_go_as_unknown_runs() {
+    const RUNS: usize = ORPHANS_MAX + 8;
+    let world = World::new("/alice", &["/alice/laptop", "/alice/phone"]).await;
+    let e = engine().await;
+    let laptop = world.host(&e, "/alice/laptop", no_quota(no_ring())).await;
+    let phone = world
+        .host_via(
+            &e,
+            "/alice/phone",
+            SignalOptions::default(),
+            Arc::new(MemoryStore::new()),
+            Reordered::wrap(Headers::Lost),
+        )
+        .await;
+    let board = n("/alice/32=data/board");
+    laptop.share(&board, world.ns(), false).await;
+    let mut sub = phone.subscribe(&board, WITHIN).await;
+    let mut runs = Vec::new();
+    for _ in 0..RUNS {
+        runs.push(laptop.signals.open(&board).await.unwrap());
+    }
+    for run in &mut runs {
+        // The first packet carries the header, which is lost; the second rides without.
+        run.send(b"cursor", b"first").await.unwrap();
+        run.send(b"cursor", b"second").await.unwrap();
+    }
+    let deadline = tokio::time::Instant::now() + ORPHAN_HOLD + Duration::from_secs(5);
+    while phone.signals.stats().unknown_run < RUNS as u64 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "every packet is let go: {:?}",
+            phone.signals.stats()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let stats = phone.signals.stats();
+    assert_eq!(
+        (stats.delivered, stats.unknown_run),
+        (0, RUNS as u64),
+        "{stats:?}"
+    );
+    assert!(next(&mut sub, Duration::from_millis(100)).await.is_none());
     world.cancel.cancel();
 }
 
@@ -640,7 +724,14 @@ async fn a_packet_replayed_into_another_scope_is_refused() {
             captured.push(packet);
         }
     }
-    let (first, second) = (captured.remove(0), captured.remove(0));
+    // A forwarder promises no order between two Interests: the packet that carries the
+    // header is the run's first, whichever the tap heard first.
+    let carries_header = |p: &Bytes| matches!(wire::decode_packet(p.clone()), Ok(Packet::Body(b)) if b.header.is_some());
+    let at = captured
+        .iter()
+        .position(carries_header)
+        .expect("a packet carries the header");
+    let (first, second) = (captured.remove(at), captured.remove(0));
     let Ok(Packet::Body(b)) = wire::decode_packet(first.clone()) else {
         panic!("an unsealed packet is a body");
     };

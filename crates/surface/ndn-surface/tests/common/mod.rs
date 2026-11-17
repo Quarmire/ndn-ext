@@ -4,12 +4,15 @@
 
 #![allow(dead_code)]
 
+use std::collections::VecDeque;
 use std::num::NonZeroU32;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
+use bytes::Bytes;
 use futures::StreamExt;
-use ndn_app::EngineAppExt;
+use ndn_app::{Connection, EngineAppExt};
 use ndn_data::{Audience, Config, DataLayer, Device, Frontier, Rule, Share, Sharing, Transport};
 use ndn_engine::{EngineBuilder, EngineConfig, ForwarderEngine, ShutdownHandle};
 use ndn_face::net::UdpFace;
@@ -151,6 +154,20 @@ impl World {
         options: SignalOptions,
         store: Arc<MemoryStore>,
     ) -> Host {
+        self.host_via(engine, device, options, store, |conn| conn)
+            .await
+    }
+
+    /// Like [`Self::host_on`], with the `Signals` hub reading and pushing through what
+    /// `wrap` makes of its connection: a test decides in which order its packets arrive.
+    pub async fn host_via(
+        &self,
+        engine: &Engine,
+        device: &str,
+        options: SignalOptions,
+        store: Arc<MemoryStore>,
+        wrap: impl FnOnce(Arc<dyn Connection>) -> Arc<dyn Connection>,
+    ) -> Host {
         let (name, keys, _) = self
             .devices
             .iter()
@@ -176,7 +193,7 @@ impl World {
         .expect("the device starts");
         let signals = Signals::start(
             device.clone(),
-            engine.engine.app_face(self.cancel.child_token()),
+            wrap(engine.engine.app_face(self.cancel.child_token())),
             options,
         )
         .await
@@ -283,5 +300,98 @@ pub fn no_quota(options: SignalOptions) -> SignalOptions {
         push_rate: NonZeroU32::new(10_000).unwrap(),
         push_burst: NonZeroU32::new(20_000).unwrap(),
         ..options
+    }
+}
+
+/// What a [`Reordered`] connection does to the run headers on their way to a hub.
+#[derive(Clone, Copy)]
+pub enum Headers {
+    /// A header-only packet is delivered after the packet of signals that follows it, as
+    /// when the forwarder's parallel pipeline lets that packet overtake it (a forwarder
+    /// promises no order between two Interests, nor does a network).
+    Behind,
+    /// Every packet that carries a header is lost on the way.
+    Lost,
+}
+
+/// A hub's connection that decides in which order, and whether, the run headers
+/// reach it. Unsealed packets only.
+pub struct Reordered {
+    inner: Arc<dyn Connection>,
+    headers: Headers,
+    state: Mutex<Overtaken>,
+}
+
+#[derive(Default)]
+struct Overtaken {
+    /// A packet of signals has been delivered already.
+    signalled: bool,
+    /// A header-only packet waiting for the packet of signals behind which it goes.
+    held: Option<Bytes>,
+    /// Packets to deliver before reading more.
+    ready: VecDeque<Bytes>,
+}
+
+impl Reordered {
+    pub fn wrap(headers: Headers) -> impl FnOnce(Arc<dyn Connection>) -> Arc<dyn Connection> {
+        move |inner| {
+            Arc::new(Reordered {
+                inner,
+                headers,
+                state: Mutex::new(Overtaken::default()),
+            })
+        }
+    }
+}
+
+/// The body of the unsealed signal packet `wire` pushes, if it is one.
+fn unsealed_body(wire: &Bytes) -> Option<wire::Body> {
+    let interest = ndn_packet::Interest::decode(wire.clone()).ok()?;
+    match wire::decode_packet(wire::push_packet(&interest)?) {
+        Ok(wire::Packet::Body(body)) => Some(body),
+        _ => None,
+    }
+}
+
+#[async_trait]
+impl Connection for Reordered {
+    async fn send(&self, wire: Bytes) -> Result<(), ndn_app::AppError> {
+        self.inner.send(wire).await
+    }
+
+    async fn recv(&self) -> Option<Bytes> {
+        loop {
+            if let Some(ready) = self.state.lock().unwrap().ready.pop_front() {
+                return Some(ready);
+            }
+            let wire = self.inner.recv().await?;
+            let Some(body) = unsealed_body(&wire) else {
+                return Some(wire);
+            };
+            match self.headers {
+                Headers::Lost if body.header.is_some() => continue,
+                Headers::Lost => return Some(wire),
+                Headers::Behind => {
+                    let mut st = self.state.lock().unwrap();
+                    if body.header.is_some() && body.signals.is_empty() && !st.signalled {
+                        st.held = Some(wire);
+                        continue;
+                    }
+                    st.signalled |= !body.signals.is_empty();
+                    if let Some(held) = st.held.take() {
+                        st.ready.push_back(held);
+                    }
+                    return Some(wire);
+                }
+            }
+        }
+    }
+
+    async fn register_prefix(&self, prefix: &Name) -> Result<(), ndn_app::AppError> {
+        self.inner.register_prefix(prefix).await
+    }
+
+    fn replies(&self) -> Option<ndn_app::Replies> {
+        self.inner.replies()
     }
 }
