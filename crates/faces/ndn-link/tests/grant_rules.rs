@@ -1,0 +1,661 @@
+//! What a grant admits, at the level of the admission rules, on real QUIC
+//! links over loopback (the devices-and-forwarders cases are `tests/grants.rs`;
+//! ndn-rs `ndn-link.md` §8.7).
+//!
+//! Ann's relay keeps `own`: it holds the namespaces A (its own, certified),
+//! B and C (held, no certificate in them), and a grant for one key of B.
+//! The key is served and no other is; of what the key's hello shows, only the
+//! granted namespace is admitted and routed; a grant that is replaced with
+//! other namespaces, revoked, or run out ends the link it alone admitted.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime};
+
+use bytes::Bytes;
+use parking_lot::Mutex;
+
+use ndn_face_quic::{
+    Admission, CloseReason, KeyFingerprint, LinkEndpoint, LinkError, LinkHello, LinkKey,
+    LinkKeySource, LinkTransportConfig, Membership,
+};
+use ndn_link::{
+    ConfiguredEndpoints, FaceSink, Grant, GrantRole, LinkSetup, LinkTrust, Links, OwnMembership,
+    PeerSpec, Route,
+};
+use ndn_packet::{Data, Name};
+use ndn_security::{
+    Certificate, Ed25519Signer, Keyring, SignedTrustContext, Signer, encode_cert_data,
+};
+use ndn_transport::{Face, FaceId, FaceKind};
+use tokio_util::sync::CancellationToken;
+
+const T: Duration = Duration::from_secs(10);
+
+fn n(s: &str) -> Name {
+    s.parse().unwrap()
+}
+
+fn now_ns() -> u64 {
+    let since = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap();
+    u64::try_from(since.as_nanos()).unwrap()
+}
+
+async fn certificate(
+    key: &Name,
+    public_key: [u8; 32],
+    issuer: &Ed25519Signer,
+    issuer_id: &str,
+) -> Bytes {
+    let hour = 3_600_000_000_000;
+    let name = ndn_security::cert_name::new_cert_name(key, issuer_id);
+    encode_cert_data(
+        &name,
+        &public_key,
+        issuer,
+        now_ns() - hour,
+        now_ns() + 24 * hour,
+    )
+    .await
+    .unwrap()
+}
+
+/// A namespace as `ndn-cert` makes one: a root key with its self-signed
+/// certificate, and the CA the root certified.
+struct Namespace {
+    name: Name,
+    root: Bytes,
+    ca: Ed25519Signer,
+    ca_cert: Bytes,
+}
+
+struct DeviceKey {
+    signer: Arc<Ed25519Signer>,
+    chain: Vec<Bytes>,
+}
+
+impl DeviceKey {
+    fn link_key(&self) -> LinkKey {
+        LinkKey::from_signer(Arc::clone(&self.signer) as Arc<dyn Signer>).unwrap()
+    }
+
+    fn fingerprint(&self) -> KeyFingerprint {
+        self.link_key().fingerprint()
+    }
+
+    fn membership(&self, namespace: &Namespace) -> OwnMembership {
+        OwnMembership {
+            namespace: namespace.name.clone(),
+            chain: self.chain.clone(),
+            signer: Arc::clone(&self.signer) as Arc<dyn Signer>,
+        }
+    }
+
+    /// Its chain as a hello carries it: ending in the namespace's root.
+    fn hello_chain(&self, namespace: &Namespace) -> Vec<Bytes> {
+        let mut chain = self.chain.clone();
+        chain.push(namespace.root.clone());
+        chain
+    }
+}
+
+async fn namespace(name: &str, seed: u8) -> Namespace {
+    let name = n(name);
+    let root = Ed25519Signer::from_seed(&[seed; 32], name.clone().append("KEY").append("root"));
+    let root_cert = certificate(root.key_name(), root.public_key_bytes(), &root, "self").await;
+    let ca = Ed25519Signer::from_seed(
+        &[seed + 1; 32],
+        name.clone().append("CA").append("KEY").append("ca"),
+    );
+    let ca_cert = certificate(ca.key_name(), ca.public_key_bytes(), &root, "NA").await;
+    Namespace {
+        name,
+        root: root_cert,
+        ca,
+        ca_cert,
+    }
+}
+
+impl Namespace {
+    fn context(&self) -> Arc<SignedTrustContext> {
+        let schema = ndn_cert::namespace_schema(&self.name).unwrap();
+        let ctx = SignedTrustContext::hierarchical(self.name.clone())
+            .with_schema_blobs(schema.blobs())
+            .unwrap()
+            .schema_authoritative()
+            .with_ca_endpoint(self.name.clone().append("CA"))
+            .with_version(1);
+        let root = Certificate::decode(&Data::decode(self.root.clone()).unwrap()).unwrap();
+        assert!(ctx.add_anchor(root));
+        Arc::new(ctx)
+    }
+
+    /// The key of device `/<ns>/<role>/<device>`, certified by its CA.
+    async fn device(&self, role: &str, device: &str, seed: u8) -> DeviceKey {
+        let name = self
+            .name
+            .clone()
+            .append(role)
+            .append(device)
+            .append("KEY")
+            .append("k");
+        let signer = Ed25519Signer::from_seed(&[seed; 32], name);
+        let cert = certificate(
+            signer.key_name(),
+            signer.public_key_bytes(),
+            &self.ca,
+            "NDNCERT",
+        )
+        .await;
+        DeviceKey {
+            signer: Arc::new(signer),
+            chain: vec![cert, self.ca_cert.clone()],
+        }
+    }
+}
+
+struct Trust {
+    keyring: Arc<Keyring>,
+    chain: Vec<Bytes>,
+    memberships: Vec<OwnMembership>,
+}
+
+impl Trust {
+    fn new(held: &[&Namespace], chain: Vec<Bytes>, memberships: Vec<OwnMembership>) -> Self {
+        let keyring = Keyring::new();
+        for ns in held {
+            keyring.adopt(ns.context()).unwrap();
+        }
+        Self {
+            keyring: Arc::new(keyring),
+            chain,
+            memberships,
+        }
+    }
+}
+
+impl LinkTrust for Trust {
+    fn keyring(&self) -> &Arc<Keyring> {
+        &self.keyring
+    }
+    fn own_chain(&self) -> Vec<Bytes> {
+        self.chain.clone()
+    }
+    fn own_memberships(&self) -> Vec<OwnMembership> {
+        self.memberships.clone()
+    }
+    fn known_certificate(&self, _: &Name) -> Option<Certificate> {
+        None
+    }
+    fn known_certificate_of_key(&self, _: &KeyFingerprint) -> Option<Certificate> {
+        None
+    }
+}
+
+/// The link faces and routes a device's forwarder gets.
+#[derive(Default)]
+struct Recorder {
+    next: AtomicU64,
+    live: Mutex<Vec<FaceId>>,
+    routes: Mutex<Vec<(FaceId, Route)>>,
+    changed: tokio::sync::Notify,
+}
+
+impl Recorder {
+    fn sorted_routes(&self) -> Vec<Name> {
+        let mut routed: Vec<Name> = self
+            .routes
+            .lock()
+            .iter()
+            .map(|(_, r)| r.prefix.clone())
+            .collect();
+        routed.sort();
+        routed
+    }
+
+    /// Wait until `done` holds, woken by each change rather than polling.
+    async fn settles(&self, what: &str, done: impl Fn(&Self) -> bool) {
+        let wait = async {
+            loop {
+                let change = self.changed.notified();
+                tokio::pin!(change);
+                change.as_mut().enable();
+                if done(self) {
+                    return;
+                }
+                change.await;
+            }
+        };
+        tokio::time::timeout(T, wait)
+            .await
+            .unwrap_or_else(|_| panic!("{what}: not within {} s", T.as_secs()));
+    }
+}
+
+impl FaceSink for Recorder {
+    fn alloc_face_id(&self) -> FaceId {
+        FaceId(self.next.fetch_add(1, Ordering::SeqCst) + 1)
+    }
+    fn add_face(&self, face: Face, _: CancellationToken) {
+        if face.kind() == FaceKind::Quic {
+            self.live.lock().push(face.id());
+        }
+        self.changed.notify_waiters();
+    }
+    fn remove_face(&self, face: FaceId) {
+        self.live.lock().retain(|f| *f != face);
+        self.routes.lock().retain(|(f, _)| *f != face);
+        self.changed.notify_waiters();
+    }
+    fn add_routes(&self, face: FaceId, routes: &[Route]) {
+        if self.live.lock().contains(&face) {
+            self.routes
+                .lock()
+                .extend(routes.iter().map(|r| (face, r.clone())));
+        }
+        self.changed.notify_waiters();
+    }
+    fn remove_routes(&self, face: FaceId, prefixes: &[Name]) {
+        self.routes
+            .lock()
+            .retain(|(f, r)| *f != face || !prefixes.contains(&r.prefix));
+        self.changed.notify_waiters();
+    }
+    fn routes_to(&self, face: FaceId) -> bool {
+        self.routes.lock().iter().any(|(f, _)| *f == face)
+    }
+    fn transit(&self, _: &Name, _: bool) {}
+}
+
+fn start(
+    key: LinkKey,
+    trust: Trust,
+    peers: Vec<PeerSpec>,
+    listen: bool,
+    cancel: &CancellationToken,
+) -> (Arc<Links>, Arc<Recorder>, Option<String>) {
+    let transport = LinkTransportConfig::default();
+    let key: Arc<dyn LinkKeySource> = Arc::new(key);
+    let socket = listen.then(|| {
+        Arc::new(
+            LinkEndpoint::bind(
+                "127.0.0.1:0".parse().unwrap(),
+                Arc::clone(&key),
+                &transport,
+                true,
+            )
+            .unwrap(),
+        )
+    });
+    let addr = socket.as_ref().map(|s| s.local_addr().unwrap().to_string());
+    let faces = Arc::new(Recorder::default());
+    let links = Links::start(
+        LinkSetup {
+            peers,
+            key,
+            trust: Arc::new(trust),
+            faces: Arc::clone(&faces) as Arc<dyn FaceSink>,
+            paths: Arc::new(ConfiguredEndpoints),
+            candidates: Vec::new(),
+            socket,
+            transport,
+            relays: Default::default(),
+            service: Default::default(),
+            direct: Default::default(),
+        },
+        cancel.child_token(),
+    );
+    (links, faces, addr)
+}
+
+/// Ann as a device of another namespace dials her: by her key (a device not
+/// enrolled in A has no business naming a device of A).
+fn ann_peer(ann: &Links, endpoint: &str) -> PeerSpec {
+    PeerSpec {
+        label: "ann".into(),
+        key: ann.key_fingerprint(),
+        endpoints: vec![endpoint.to_string()],
+        persistent: false,
+        ..PeerSpec::default()
+    }
+}
+
+/// Dial `addr` with link key `key` and `certificates`, no memberships, and
+/// say how the other side answered: its verdict, or the reason and text it
+/// closed with.
+async fn dial_with(
+    addr: &str,
+    key: LinkKey,
+    certificates: Vec<Bytes>,
+    memberships: impl AsyncFnOnce(&[u8; 32]) -> Vec<Membership>,
+) -> Result<(), LinkError> {
+    let endpoint = LinkEndpoint::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(key),
+        &LinkTransportConfig::default(),
+        false,
+    )
+    .unwrap();
+    let mut hs = endpoint.connect(addr.parse().unwrap(), None).await?;
+    let channel = hs.channel_binding()?;
+    let hello = LinkHello {
+        certificates,
+        memberships: memberships(&channel).await,
+        direct_path: None,
+    };
+    hs.exchange_hello(&hello, T).await?;
+    hs.admit(FaceId(1), T, Admission::default()).await.map(drop)
+}
+
+/// The refusal `result` is: its close reason and the sentence it carries.
+fn refusal(result: Result<(), LinkError>) -> (Option<CloseReason>, String) {
+    match result {
+        Err(LinkError::Refused { reason, text }) => (reason, text),
+        Err(e) => panic!("expected a refusal, got {e}"),
+        Ok(()) => panic!("expected a refusal, the link was admitted"),
+    }
+}
+
+fn an_hour_on() -> SystemTime {
+    SystemTime::now() + Duration::from_secs(3600)
+}
+
+/// Ann: a relay of A holding B and C too, serving `own`.
+async fn ann(
+    a: &Namespace,
+    b: &Namespace,
+    c: &Namespace,
+    cancel: &CancellationToken,
+) -> (Arc<Links>, Arc<Recorder>, String) {
+    let key = a.device("node", "relay", 90).await;
+    let (links, faces, addr) = start(
+        key.link_key(),
+        Trust::new(&[a, b, c], key.chain.clone(), Vec::new()),
+        Vec::new(),
+        true,
+        cancel,
+    );
+    (links, faces, addr.unwrap())
+}
+
+/// A grant of one key of B links that key — and routes B's device and B's
+/// sync group, nothing of the other namespace its hello shows (a membership
+/// of C) — and links no other key of B. Replacing the grant with one for
+/// another namespace, a later one for the same, revoking it and its running
+/// out each do what they say.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grant_links_its_key_in_its_namespace_and_routes_nothing_else_it_shows() {
+    let cancel = CancellationToken::new();
+    let (a, b, c) = (
+        namespace("/a", 10).await,
+        namespace("/b", 20).await,
+        namespace("/c", 30).await,
+    );
+    let (ann_links, at_ann, addr) = ann(&a, &b, &c, &cancel).await;
+    let phone_b = b.device("member", "phone", 22).await;
+    let phone_c = c.device("member", "phone", 32).await;
+    let other_b = b.device("member", "tablet", 23).await;
+
+    // No grant: Ann holds B and has no certificate in it; `own` refuses.
+    let (reason, text) = refusal(
+        dial_with(
+            &addr,
+            phone_b.link_key(),
+            phone_b.hello_chain(&b),
+            async |_| Vec::new(),
+        )
+        .await,
+    );
+    assert_eq!(reason, Some(CloseReason::NotServed), "{text}");
+    assert!(text.contains("inviting you"), "{text}");
+    assert!(at_ann.live.lock().is_empty());
+
+    // Granted: the phone links, shows its C membership too, and is routed as
+    // B's device only.
+    ann_links.grant(Grant {
+        key: phone_b.fingerprint(),
+        namespaces: vec![n("/b")],
+        role: GrantRole::Writer,
+        until: an_hour_on(),
+    });
+    let (_phone, at_phone, _) = start(
+        phone_b.link_key(),
+        Trust::new(
+            &[&a, &b, &c],
+            phone_b.chain.clone(),
+            vec![phone_c.membership(&c)],
+        ),
+        vec![ann_peer(&ann_links, &addr)],
+        false,
+        &cancel,
+    );
+    at_ann
+        .settles("ann routes the phone", |f| !f.sorted_routes().is_empty())
+        .await;
+    let mut expected = vec![n("/b/member/phone"), n("/b/32=sync")];
+    expected.sort();
+    assert_eq!(
+        at_ann.sorted_routes(),
+        expected,
+        "a grant for B carried C's membership, or lost B's routes"
+    );
+    assert_eq!(at_ann.live.lock().len(), 1);
+    at_phone
+        .settles("the phone has its link", |f| f.live.lock().len() == 1)
+        .await;
+    assert_eq!(at_phone.live.lock().len(), 1);
+    let report = ann_links.report();
+    let link = report.links.first().expect("a link");
+    assert!(link.granted.is_some(), "{link:#?}");
+
+    // Another key of B gets nothing from it.
+    let (reason, text) = refusal(
+        dial_with(
+            &addr,
+            other_b.link_key(),
+            other_b.hello_chain(&b),
+            async |_| Vec::new(),
+        )
+        .await,
+    );
+    assert_eq!(reason, Some(CloseReason::NotServed), "{text}");
+    assert_eq!(at_ann.live.lock().len(), 1, "another key of B was linked");
+
+    // A later `until` for the same namespaces leaves the link as it is, and
+    // the report shows the new date.
+    let face = at_ann.live.lock()[0];
+    let later = an_hour_on() + Duration::from_secs(60);
+    ann_links.grant(Grant {
+        key: phone_b.fingerprint(),
+        namespaces: vec![n("/b")],
+        role: GrantRole::Writer,
+        until: later,
+    });
+    assert_eq!(
+        ann_links.report().links[0].granted.as_ref().unwrap().until,
+        later
+    );
+    assert_eq!(
+        *at_ann.live.lock(),
+        vec![face],
+        "a later `until` made the link again"
+    );
+
+    // The same key granted for another namespace ends the link the old grant
+    // admitted: it was admitted in B.
+    ann_links.grant(Grant {
+        key: phone_b.fingerprint(),
+        namespaces: vec![n("/c")],
+        role: GrantRole::Writer,
+        until: later,
+    });
+    at_ann
+        .settles("the link of the replaced grant closes", |f| {
+            f.live.lock().is_empty()
+        })
+        .await;
+
+    // Revoked: the next dial names it.
+    assert!(ann_links.revoke_grant(&phone_b.fingerprint()));
+    let (reason, text) = refusal(
+        dial_with(
+            &addr,
+            phone_b.link_key(),
+            phone_b.hello_chain(&b),
+            async |_| Vec::new(),
+        )
+        .await,
+    );
+    assert_eq!(reason, Some(CloseReason::NotServed), "{text}");
+    assert!(
+        text.contains("the grant ended") && text.contains("revoked"),
+        "{text}"
+    );
+    assert!(ann_links.grants().is_empty());
+    cancel.cancel();
+}
+
+/// The same key presenting another namespace than the granted one is linked
+/// for the granted one only: its link key is certified in C (not granted), its
+/// membership is of B (granted), and what is routed is B's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_same_key_showing_another_namespace_is_linked_for_the_granted_one_only() {
+    let cancel = CancellationToken::new();
+    let (a, b, c) = (
+        namespace("/a", 10).await,
+        namespace("/b", 20).await,
+        namespace("/c", 30).await,
+    );
+    let (ann_links, at_ann, addr) = ann(&a, &b, &c, &cancel).await;
+    let phone_c = c.device("member", "phone", 32).await;
+    let phone_b = b.device("member", "phone", 22).await;
+    ann_links.grant(Grant {
+        key: phone_c.fingerprint(),
+        namespaces: vec![n("/b")],
+        role: GrantRole::Writer,
+        until: an_hour_on(),
+    });
+    let (_phone, _, _) = start(
+        phone_c.link_key(),
+        Trust::new(
+            &[&a, &b, &c],
+            phone_c.chain.clone(),
+            vec![phone_b.membership(&b)],
+        ),
+        vec![ann_peer(&ann_links, &addr)],
+        false,
+        &cancel,
+    );
+    at_ann
+        .settles("ann routes the phone", |f| !f.sorted_routes().is_empty())
+        .await;
+    let mut expected = vec![n("/b/member/phone"), n("/b/32=sync")];
+    expected.sort();
+    assert_eq!(
+        at_ann.sorted_routes(),
+        expected,
+        "the granted key was routed for a namespace the grant does not list"
+    );
+    cancel.cancel();
+}
+
+/// A grant of a key for a namespace this device holds no context of (so the
+/// key is served only by its own root's certificate, which `own` never trusts
+/// to serve) links nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grant_for_a_namespace_not_held_links_nothing() {
+    let cancel = CancellationToken::new();
+    let (a, b, c) = (
+        namespace("/a", 10).await,
+        namespace("/b", 20).await,
+        namespace("/c", 30).await,
+    );
+    let d = namespace("/d", 40).await;
+    let (ann_links, at_ann, addr) = ann(&a, &b, &c, &cancel).await;
+    let dan = d.device("member", "phone", 42).await;
+    ann_links.grant(Grant {
+        key: dan.fingerprint(),
+        namespaces: vec![n("/d")],
+        role: GrantRole::Writer,
+        until: an_hour_on(),
+    });
+    let (reason, text) = refusal(
+        dial_with(&addr, dan.link_key(), dan.hello_chain(&d), async |_| {
+            Vec::new()
+        })
+        .await,
+    );
+    assert_eq!(reason, Some(CloseReason::NotServed), "{text}");
+    assert!(at_ann.live.lock().is_empty());
+    cancel.cancel();
+}
+
+/// A grant that runs out closes the link it admitted at `until`, with no one
+/// asking: the task wakes at the earliest `until`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grant_that_runs_out_closes_its_link_at_until() {
+    let cancel = CancellationToken::new();
+    let (a, b, c) = (
+        namespace("/a", 10).await,
+        namespace("/b", 20).await,
+        namespace("/c", 30).await,
+    );
+    let (ann_links, at_ann, addr) = ann(&a, &b, &c, &cancel).await;
+    let phone_b = b.device("member", "phone", 22).await;
+    let tablet_b = b.device("member", "tablet", 23).await;
+    let started = std::time::Instant::now();
+    // Two grants: the later one is made first, so the task must wake for the
+    // earlier one when it is made.
+    ann_links.grant(Grant {
+        key: tablet_b.fingerprint(),
+        namespaces: vec![n("/b")],
+        role: GrantRole::Writer,
+        until: an_hour_on(),
+    });
+    ann_links.grant(Grant {
+        key: phone_b.fingerprint(),
+        namespaces: vec![n("/b")],
+        role: GrantRole::Writer,
+        until: SystemTime::now() + Duration::from_secs(3),
+    });
+    let (_phone, at_phone, _) = start(
+        phone_b.link_key(),
+        Trust::new(&[&a, &b, &c], phone_b.chain.clone(), Vec::new()),
+        vec![ann_peer(&ann_links, &addr)],
+        false,
+        &cancel,
+    );
+    at_ann
+        .settles("ann links the phone", |f| f.live.lock().len() == 1)
+        .await;
+    at_ann
+        .settles("the link closes at until", |f| f.live.lock().is_empty())
+        .await;
+    assert!(
+        started.elapsed() >= Duration::from_secs(2),
+        "the link closed {:?} after a grant of 3 s",
+        started.elapsed()
+    );
+    at_phone
+        .settles("the phone sees it closed", |f| f.live.lock().is_empty())
+        .await;
+    assert_eq!(
+        ann_links.grants().len(),
+        1,
+        "only the other grant is in force"
+    );
+    let (reason, text) = refusal(
+        dial_with(
+            &addr,
+            phone_b.link_key(),
+            phone_b.hello_chain(&b),
+            async |_| Vec::new(),
+        )
+        .await,
+    );
+    assert_eq!(reason, Some(CloseReason::NotServed), "{text}");
+    assert!(text.contains("it expired"), "{text}");
+    cancel.cancel();
+}

@@ -431,7 +431,7 @@ async fn embedded_of(person: &Person, parts: Parts, setup: Setup) -> Embedded {
     .await
     .unwrap();
     if setup.listen {
-        hints.serve(device.introductions());
+        hints.serve(&device);
     }
     Embedded {
         device,

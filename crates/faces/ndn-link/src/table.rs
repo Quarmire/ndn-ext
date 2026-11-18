@@ -19,6 +19,7 @@ use ndn_security::{SignedTrustContext, sync_group};
 use ndn_transport::{Face, FaceId};
 
 use crate::admission::Identity;
+use crate::grants::Grant;
 use crate::host::Route;
 use crate::peer::PeerId;
 use crate::routes::RelayRoutes;
@@ -125,6 +126,9 @@ struct LiveLink {
     peer: Option<PeerId>,
     /// The identities it was admitted by, the deciding one first.
     identities: Vec<Identity>,
+    /// The grant that admitted it, when no policy did: its end closes the
+    /// link.
+    grant: Option<Grant>,
     /// The namespaces this device showed in its hello on the link path
     /// (its link key's and its memberships'): when they change, the link
     /// is made again.
@@ -155,6 +159,8 @@ pub(crate) struct Registration {
     pub(crate) shown: Vec<Name>,
     pub(crate) enrolling: Vec<Name>,
     pub(crate) path: LinkPath,
+    /// The grant that admitted the link, when no policy did.
+    pub(crate) grant: Option<Grant>,
 }
 
 /// A live link as [`LinkTable::views`] reports it.
@@ -162,6 +168,8 @@ pub(crate) struct LinkView {
     pub(crate) fingerprint: KeyFingerprint,
     pub(crate) peer: Option<PeerId>,
     pub(crate) device: Option<Name>,
+    /// The grant that admitted the link, when one did.
+    pub(crate) granted: Option<Grant>,
     pub(crate) paths: Vec<PathStatus>,
 }
 
@@ -200,6 +208,7 @@ impl LinkTable {
                 LiveLink {
                     peer: link.peer,
                     identities: link.identities,
+                    grant: link.grant,
                     shown: link.shown,
                     enrolling: link.enrolling,
                     paths: vec![new],
@@ -225,6 +234,7 @@ impl LinkTable {
         }
         if !link.identities.is_empty() {
             existing.identities = link.identities;
+            existing.grant = link.grant;
         }
         if kind == PathKind::Link {
             existing.enrolling = link.enrolling;
@@ -415,6 +425,7 @@ impl LinkTable {
         let live = self.live.lock();
         live.iter()
             .map(|(fp, l)| LinkView {
+                granted: l.grant.clone(),
                 fingerprint: *fp,
                 peer: l.peer,
                 device: l.identities.first().map(|id| id.device.clone()),
@@ -432,6 +443,24 @@ impl LinkTable {
                     .collect(),
             })
             .collect()
+    }
+
+    /// Close the link to `fingerprint` when only a grant admitted it,
+    /// saying `text`; `true` when one was closed.
+    pub(crate) fn close_granted(
+        &self,
+        fingerprint: &KeyFingerprint,
+        reason: CloseReason,
+        text: &str,
+    ) -> bool {
+        let live = self.live.lock();
+        match live.get(fingerprint) {
+            Some(link) if link.grant.is_some() => {
+                link.close(reason, text);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// This device now holds the certificates `certificates`: close each

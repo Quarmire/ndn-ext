@@ -378,7 +378,8 @@ impl Judge<'_> {
                         format!(
                             "{own_text}{listed_text}; you are {} of {}, whose trust context it holds but which it \
                              holds no certificate in. Its operator can serve other namespaces by their root \
-                             key fingerprint, or use a relay that serves yours",
+                             key fingerprint, grant your key a link by inviting you (an introduction grants \
+                             the person it admits, ndn-link §8.7), or you can use a relay that serves yours",
                             id.device, id.namespace
                         ),
                     )
@@ -403,8 +404,9 @@ impl Judge<'_> {
                         code::NOT_SERVED_UNLISTED,
                         format!(
                             "{own_text} and of {} namespaces listed by root key fingerprint; you are {} of {}, \
-                             whose root key {root} is not listed. Its operator can list it, or use a relay that \
-                             serves yours",
+                             whose root key {root} is not listed. Its operator can list it, grant your key \
+                             a link by inviting you (an introduction grants the person it admits, \
+                             ndn-link §8.7), or you can use a relay that serves yours",
                             roots.len(),
                             id.device,
                             id.namespace
@@ -423,7 +425,9 @@ impl Judge<'_> {
                         code::NOT_SERVED_OWN,
                         format!(
                             "{own_text}; you are {} of {} (root key {root}). Its operator can serve other \
-                             namespaces by their root key fingerprint, or use a relay that serves yours",
+                             namespaces by their root key fingerprint, grant your key a link by inviting \
+                             you (an introduction grants the person it admits, ndn-link §8.7), or you can \
+                             use a relay that serves yours",
                             id.device, id.namespace
                         ),
                     )
@@ -436,7 +440,7 @@ impl Judge<'_> {
     }
 
     /// The fingerprints of the anchor keys of the held namespace `ns`.
-    fn held_roots(&self, ns: &Name) -> Vec<KeyFingerprint> {
+    pub(crate) fn held_roots(&self, ns: &Name) -> Vec<KeyFingerprint> {
         self.trust
             .keyring()
             .contexts()

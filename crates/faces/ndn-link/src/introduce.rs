@@ -127,6 +127,7 @@ impl Links {
             enrollment: Some(Enrollment::Introduction(Surface(surface))),
             quota: None,
             quotas: Vec::new(),
+            grant: None,
         })
     }
 
@@ -223,6 +224,7 @@ impl Links {
                 Ok(())
             }
             Err(e) => {
+                self.watch_failed(id, Some(key), &e, crate::watch::Next::Gone);
                 self.forget_dialled(id);
                 Err(e)
             }
@@ -230,10 +232,11 @@ impl Links {
     }
 
     /// Peer `id`, added by [`dial_by_key`](Self::dial_by_key), is over.
-    fn forget_dialled(&self, id: PeerId) {
+    pub(crate) fn forget_dialled(&self, id: PeerId) {
         self.introduced.lock().remove(&id);
         self.ctls.lock().remove(&id);
         self.peers.remove(id);
+        self.watch_forget(id);
     }
 
     /// Take down the link [`dial_by_key`](Self::dial_by_key) made to the
@@ -259,7 +262,7 @@ impl Links {
 
     /// The handshakes to every address at once, the first to succeed
     /// established as peer `id`'s link; the others dropped.
-    async fn dial_race(
+    pub(crate) async fn dial_race(
         self: &Arc<Self>,
         id: PeerId,
         key: KeyFingerprint,

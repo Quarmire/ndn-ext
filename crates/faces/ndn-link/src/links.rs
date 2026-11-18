@@ -26,6 +26,7 @@ use crate::asleep::{RelayService, Sleepers};
 use crate::candidates::CandidateSource;
 use crate::control::{PeerCtl, idle_check, release};
 use crate::direct::{Direct, Whom, direct_up};
+use crate::grants::Grants;
 use crate::host::{FaceSink, LinkTrust, PathCandidate, PathSource};
 use crate::peer::{LinkMode, PeerId, PeerSpec, Peers};
 use crate::policy::{Backoff, ENROLLMENT_IDLE, MESSAGE_DEADLINE};
@@ -38,6 +39,7 @@ use crate::slots::EnrollmentSlots;
 use crate::status::{DirectState, DirectStatus, LinkReport, LinkStatus, PathKind, PathStatus};
 use crate::table::{LinkPath, LinkTable, Registration};
 use crate::waiting::{WaitFor, Waiting};
+use crate::watch::{LinkStates, Next};
 
 /// What a host gives [`Links::start`].
 pub struct LinkSetup {
@@ -102,6 +104,8 @@ pub struct Links {
     pub(crate) relay_options: RelayOptions,
     pub(crate) service: RelayService,
     pub(crate) quotas: QuotaState,
+    /// The grants of links to the people this device introduced.
+    pub(crate) grants: Grants,
     pub(crate) direct_options: DirectOptions,
     pub(crate) ctls: Mutex<HashMap<PeerId, Arc<PeerCtl>>>,
     pub(crate) active: AtomicBool,
@@ -116,7 +120,15 @@ pub struct Links {
     /// The addresses of peers this device dialled by key from a code's link
     /// hint ([`Links::dial_by_key`]), in the order tried: their paths.
     pub(crate) introduced: Mutex<HashMap<PeerId, Vec<SocketAddr>>>,
+    /// Each peer's link state ([`Links::watch`]) and the observers of the
+    /// links' events.
+    pub(crate) states: LinkStates,
+    /// What this device remembers of its peers ([`Links::remember`]).
+    pub(crate) memory: OnceLock<Arc<crate::memory::Memory>>,
     pub(crate) cancel: CancellationToken,
+    /// The test-only fault layer's plan, shared by every link's face.
+    #[cfg(feature = "fault-injection")]
+    pub(crate) faults: Arc<crate::fault::FaultLayer>,
 }
 
 impl Links {
@@ -145,6 +157,7 @@ impl Links {
             relay_options: setup.relays,
             service: setup.service,
             quotas: QuotaState::default(),
+            grants: Grants::default(),
             direct_options: setup.direct,
             ctls: Mutex::new(HashMap::new()),
             active: AtomicBool::new(false),
@@ -153,11 +166,18 @@ impl Links {
             members: Mutex::new(HashMap::new()),
             introductions: Mutex::new(None),
             introduced: Mutex::new(HashMap::new()),
+            states: LinkStates::default(),
+            memory: OnceLock::new(),
             cancel,
+            #[cfg(feature = "fault-injection")]
+            faults: Arc::default(),
         });
+        #[cfg(feature = "fault-injection")]
+        crate::fault::notice();
         let _ = links.signal.set(Signal::start(&links));
         let _ = links.waiting.set(Waiting::start(&links));
         links.take_punches();
+        links.spawn_grant_expiry();
 
         let weak = Arc::downgrade(&links);
         links.trust.keyring().on_revocation(move |ctx, _| {
@@ -192,7 +212,9 @@ impl Links {
     }
 
     /// Tell every linked device that this one is shutting down.
+    /// The link memory ([`Links::remember`]) is written to its store first.
     pub async fn shutdown(&self) {
+        self.flush_memory().await;
         let text = "the device is shutting down; it links again when it is back";
         let grace = Duration::from_secs(1);
         let dialers: Vec<_> = self.dialers.lock().values().cloned().collect();
@@ -364,6 +386,9 @@ impl Links {
                 relay: self.relay_status(id, &peer),
                 down: self.why_down(id, &peer),
                 asleep: key.and_then(|k| self.asleep_status(&k)),
+                granted: at
+                    .and_then(|i| views[i].granted.as_ref())
+                    .map(|g| self.grant_of_link(g)),
             });
         }
         for (i, v) in views.iter().enumerate() {
@@ -384,6 +409,7 @@ impl Links {
                 relay: None,
                 down: None,
                 asleep: None,
+                granted: v.granted.as_ref().map(|g| self.grant_of_link(g)),
             });
         }
         for (whom, entry) in &entries {
@@ -402,6 +428,7 @@ impl Links {
                 relay: None,
                 down: None,
                 asleep: self.asleep_status(fp),
+                granted: None,
             });
         }
         for (fp, device) in self.sleepers() {
@@ -421,6 +448,7 @@ impl Links {
                 relay: None,
                 down: None,
                 asleep: self.asleep_status(&fp),
+                granted: None,
             });
         }
         LinkReport {
@@ -440,6 +468,9 @@ impl Links {
                 .wakes_sent
                 .load(std::sync::atomic::Ordering::Relaxed),
             links,
+            grants: self.grants(),
+            memory: self.memory_report(),
+            fault_injection: self.fault_report(),
         }
     }
 
@@ -486,6 +517,7 @@ impl Links {
             peers: &self.peers,
             serve: &self.service.serve,
             quotas: &self.quotas,
+            grants: &self.grants,
         }
     }
 
@@ -710,6 +742,14 @@ impl Links {
             ndn_transport::default_link_service_for_kind(ndn_transport::FaceKind::Quic)
         };
         let transport: Arc<dyn ndn_transport::ErasedTransport> = Arc::new(link.face);
+        // Test-only fault layer (feature `fault-injection`): the link's face meets the plan on arrival.
+        #[cfg(feature = "fault-injection")]
+        let transport = self.faults.wrap(
+            transport,
+            admitted.fingerprint,
+            self.my_fingerprint(),
+            direction,
+        );
         let face = Face::from_parts(Arc::clone(&transport), Arc::clone(&link_service));
         let sender = Arc::new(Face::from_parts(transport, link_service));
         let handle = link.handle;
@@ -747,6 +787,7 @@ impl Links {
             fingerprint: admitted.fingerprint,
             peer: admitted.peer,
             identities: admitted.identities.clone(),
+            grant: admitted.grant.clone(),
             shown,
             enrolling: enrolling.clone(),
             path: LinkPath {
@@ -794,6 +835,7 @@ impl Links {
             "{} up",
             if direct.is_some() { "direct path" } else { "link" }
         );
+        self.watch_up(&admitted, kind, direction, remote);
         if let Some(session) = direct {
             self.direct.path_up(&session, &handle);
         }
@@ -888,6 +930,15 @@ impl Links {
                         links.direct.carried(fingerprint);
                     }
                     links.maybe_asleep(fingerprint, &ended, watched.peer_reachability(), &why);
+                    if ended.last {
+                        links.watch_down(
+                            fingerprint,
+                            ended.identities.first().map(|i| i.device.clone()),
+                            ended.peer,
+                            direction,
+                            &why,
+                        );
+                    }
                     if ended.last {
                         for id in &ended.identities {
                             links.announce_presence(&id.namespace);
@@ -1261,6 +1312,7 @@ pub(crate) async fn dial_loop(links: Weak<Links>, id: PeerId, ctl: Arc<PeerCtl>)
                     "this device no longer uses this link (the host removed it)",
                 );
             }
+            this.watch_next(id, Next::Gone);
             return;
         };
         let one_shot = !peer.persistent && peer.mode == LinkMode::Always;
@@ -1287,13 +1339,28 @@ pub(crate) async fn dial_loop(links: Weak<Links>, id: PeerId, ctl: Arc<PeerCtl>)
                 )));
                 this.reselect_relays();
             }
+            let wanted = this.wants_link(id, &peer, &ctl);
             drop(this);
             if cancel.is_cancelled() {
                 return;
             }
             if !closed_here && !relink_once(&links, id) && one_shot {
+                decided(&links, id, Next::Gone);
                 return;
             }
+            decided(
+                &links,
+                id,
+                match (wanted, closed_here) {
+                    (false, _) => Next::WhenWanted,
+                    (true, false) => Next::Redialling {
+                        within: backoff.after_drop(),
+                    },
+                    (true, true) => Next::Redialling {
+                        within: Duration::ZERO,
+                    },
+                },
+            );
             if !closed_here {
                 // Dropped: dial again after the first backoff (the other
                 // device may be restarting).
@@ -1330,6 +1397,16 @@ pub(crate) async fn dial_loop(links: Weak<Links>, id: PeerId, ctl: Arc<PeerCtl>)
                     "link to {} failed: {}",
                     peer.label,
                     e.error
+                );
+                this.watch_failed(
+                    id,
+                    peer.key,
+                    &e.detail,
+                    if one_shot {
+                        Next::Gone
+                    } else {
+                        Next::Redialling { within: wait }
+                    },
                 );
                 let retry = format!("{:.1}", wait.as_secs_f32());
                 ctl.dialled(Some(
@@ -1376,4 +1453,11 @@ pub(crate) async fn dial_loop(links: Weak<Links>, id: PeerId, ctl: Arc<PeerCtl>)
 /// been closed because this device enrolled.
 fn relink_once(links: &Weak<Links>, id: PeerId) -> bool {
     links.upgrade().is_some_and(|l| l.table.take_relink(id))
+}
+
+/// Tell the link status what peer `id`'s loop does next.
+fn decided(links: &Weak<Links>, id: PeerId, next: Next) {
+    if let Some(links) = links.upgrade() {
+        links.watch_next(id, next);
+    }
 }

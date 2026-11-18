@@ -12,7 +12,7 @@ use ndn_cert::onboarding::rdr_prefix;
 use ndn_cert::roles::{Role, parse_device_key};
 use ndn_face_quic::{
     Admission, Carries, ChannelBinding, CloseReason, KeyFingerprint, LinkHello, LinkKey, LinkScope,
-    LinkVerdict, MEMBERSHIPS_MAX, Membership, PeerKey,
+    LinkVerdict, MEMBERSHIPS_MAX, Membership, NameFilter, PeerKey,
 };
 use ndn_mgmt_wire::{LinkDetail, link_code as code};
 use ndn_packet::{Data, Name};
@@ -22,6 +22,7 @@ use ndn_security::{
     CertCache, Certificate, Keyring, SignedTrustContext, ValidationResult, Validator,
 };
 
+use crate::grants::{Grant, GrantOutcome, GrantRole, Grants};
 use crate::host::{LinkTrust, OwnMembership};
 use crate::peer::{PeerId, Peers};
 use crate::policy::{ENROLLMENT_ANSWERS, ENROLLMENT_INTERESTS, MAX_CHAIN};
@@ -126,6 +127,9 @@ pub(crate) struct Admitted {
     /// The places of the other identities served for other namespaces:
     /// they hold their namespace's name and count against its quotas.
     pub(crate) quotas: Vec<QuotaSlot>,
+    /// The grant that admitted the link, when no policy did (it closes
+    /// when the grant ends).
+    pub(crate) grant: Option<Grant>,
 }
 
 impl Admitted {
@@ -153,6 +157,7 @@ pub(crate) struct Judge<'a> {
     pub(crate) peers: &'a Peers,
     pub(crate) serve: &'a ServePolicy,
     pub(crate) quotas: &'a QuotaState,
+    pub(crate) grants: &'a Grants,
 }
 
 impl Judge<'_> {
@@ -809,24 +814,59 @@ impl Judge<'_> {
                 .and_then(|slot| slot.limits.clone().map(|l| (slot, l)))
             {
                 None => Admission::default(),
-                Some((slot, (rate, shared))) => Admission {
-                    verdict: LinkVerdict::default(),
-                    scope: Some(LinkScope {
-                        receives: Carries::Everything,
-                        sends: Carries::Everything,
-                        names: Box::new(|_: &Name| true),
-                        rate,
-                        shared: Some(shared),
-                        explain: format!(
-                            "this relay serves {} of {} under its quotas: {}/s from that device, and \
-                             a share of the namespace's limit of all its devices here; to carry more, \
-                             its operator raises the quotas, or the namespace uses another relay",
-                            admitted.describe(),
-                            slot.namespace,
-                            rate.per_sec
-                        ),
-                    }),
-                },
+                Some((slot, (rate, shared))) => {
+                    // A reader's link: everything it asks for comes to it, and
+                    // what it sends toward this device is Interests and the
+                    // answers under its own device names (its certificates,
+                    // and the seal the owner fetches to wrap a folder's key
+                    // for it); Data it pushes under any other name is dropped.
+                    let reader = admitted
+                        .grant
+                        .as_ref()
+                        .is_some_and(|g| g.role == GrantRole::Reader);
+                    let own: Vec<Name> = admitted
+                        .identities
+                        .iter()
+                        .map(|id| id.device.clone())
+                        .collect();
+                    Admission {
+                        verdict: LinkVerdict::default(),
+                        scope: Some(LinkScope {
+                            receives: Carries::Everything,
+                            sends: Carries::Everything,
+                            names: Box::new(|_: &Name| true),
+                            rate,
+                            shared: Some(shared),
+                            answers_in: reader.then(|| -> NameFilter {
+                                Box::new(move |name: &Name| own.iter().any(|d| name.has_prefix(d)))
+                            }),
+                            explain: match &admitted.grant {
+                                Some(grant) => format!(
+                                    "this device linked {} {}: {}; the quotas bound it ({}/s from that \
+                                     device), and a grant ends at its date or when the inviter revokes it",
+                                    admitted.describe(),
+                                    grant.describe(),
+                                    if reader {
+                                        "a reader writes nothing, so what it sends here is Interests and \
+                                         the answers under its own device name (its certificates and its \
+                                         seal); other Data it pushes is dropped"
+                                    } else {
+                                        "a writer's link is a full link"
+                                    },
+                                    rate.per_sec
+                                ),
+                                None => format!(
+                                    "this relay serves {} of {} under its quotas: {}/s from that device, and \
+                                     a share of the namespace's limit of all its devices here; to carry more, \
+                                     its operator raises the quotas, or the namespace uses another relay",
+                                    admitted.describe(),
+                                    slot.namespace,
+                                    rate.per_sec
+                                ),
+                            },
+                        }),
+                    }
+                }
             },
             Some(Enrollment::Relay(namespaces)) => {
                 let keyring = Arc::clone(self.keyring());
@@ -843,6 +883,7 @@ impl Judge<'_> {
                         }),
                         rate: ENROLLMENT_INTERESTS,
                         shared: None,
+                        answers_in: None,
                         explain: format!(
                             "the enrollment link of key {} carries only that device's enrollment in \
                              {} (Interests for its CA, trust context and certificates, and their \
@@ -863,6 +904,7 @@ impl Judge<'_> {
                         names: Box::new(move |name: &Name| carried.0.carries(name)),
                         rate: ENROLLMENT_INTERESTS,
                         shared: None,
+                        answers_in: None,
                         explain: format!(
                             "the introduction link of key {} carries only the Interests of the \
                              introduction an open offer needs (the offer's record and the ask) \
@@ -887,6 +929,7 @@ impl Judge<'_> {
                         }),
                         rate: ENROLLMENT_ANSWERS,
                         shared: None,
+                        answers_in: None,
                         explain: format!(
                             "the link to {label} carries only this device's enrollment in {ns} (its \
                              CA, trust context and certificates) until this device enrolls"
@@ -917,8 +960,17 @@ fn decide_identified(
     peer: Option<PeerId>,
     dialed: Option<PeerId>,
 ) -> Result<Admitted, Refusal> {
+    // A remembered peer (ndn-link §17C) is a peer entry for the dial this
+    // device made and for no link it did not dial: a link that came in is
+    // judged as any stranger's, by the serving policy.
+    let peer =
+        peer.filter(|i| dialed == Some(*i) || !judge.peers.get(*i).is_some_and(|p| p.remembered));
     let config = peer.and_then(|i| judge.peers.get(i));
-    let key_expected = config.as_ref().is_some_and(|p| p.key == Some(fingerprint));
+    // The expected key admits a device that shows no identity, except for a
+    // remembered peer, whose key only pins the dial.
+    let key_expected = config
+        .as_ref()
+        .is_some_and(|p| p.key == Some(fingerprint) && !p.remembered);
     // Only a held namespace confirms a device a peer entry names.
     let identities = match identities {
         Ok(ids) if config.is_some() => {
@@ -949,6 +1001,7 @@ fn decide_identified(
         enrollment,
         quota,
         quotas,
+        grant: None,
     };
 
     if let Some(p) = &config {
@@ -968,6 +1021,29 @@ fn decide_identified(
                 .with("peer", &p.label)
                 .with("expected", expected)
                 .with("key", fingerprint),
+            ));
+        }
+        if p.remembered
+            && let Err(why) = &identities
+        {
+            // Rule 4: a remembered peer is admitted only as an identified
+            // device; its key alone admits no one.
+            let why = why.detail();
+            return Err(Refusal::new(
+                CloseReason::Unrecognized,
+                LinkDetail::new(
+                    code::EXPECTED_DEVICE_UNCONFIRMED,
+                    format!(
+                        "this device remembers {} by its key and links with it only as an \
+                         identified device, and it cannot confirm you are one: {}. A remembered \
+                         key admits no one on its own: it links again once this device holds \
+                         the namespace of the device and its certificate validates there, and a \
+                         device removed from that namespace is not linked",
+                        p.label, why.text
+                    ),
+                )
+                .with("key", fingerprint)
+                .caused_by(why),
             ));
         }
         if let Some(device) = &p.device {
@@ -1189,37 +1265,66 @@ fn serve(
 ) -> Result<Admitted, Refusal> {
     let mut served: Vec<(Identity, Option<QuotaSlot>)> = Vec::new();
     let mut refused: Option<(Refusal, bool)> = None;
+    // The identities the policy merely declines to serve, not the ones it
+    // refuses for quotas or a name collision: a grant may admit them.
+    let mut declined: Vec<Identity> = Vec::new();
     for id in ids {
         match judge.serves(&id) {
             Ok(quota) => served.push((id, quota)),
             Err(refusal) => {
+                if [
+                    code::NOT_SERVED_OWN,
+                    code::NOT_SERVED_UNLISTED,
+                    code::NOT_SERVED_UNCERTIFIED,
+                ]
+                .iter()
+                .any(|c| refusal.detail.is(c))
+                {
+                    declined.push(id.clone());
+                }
                 refused.get_or_insert((refusal, id.served.is_some()));
             }
         }
     }
+    // Only where the policy serves none (a grant never adds to a link the
+    // policy already serves): the grant of this key, in its namespaces.
+    let mut grant = None;
     if served.is_empty() {
         let (mut refusal, foreign) = refused.expect("an identity was judged");
-        // A device of another namespace gets no enrollment link: it proved
-        // whom it is, and this relay does not serve it.
-        if refusal.reason == CloseReason::NotServed
-            && foreign
-            && unasked
-            && let Ok(namespaces) = judge.enrollment_namespaces()
-        {
-            refusal.detail.append(
-                ". ",
-                LinkDetail::new(
-                    code::ENROLLMENT_POSSIBLE,
-                    format!(
-                        "A device enrolls in {} over this relay while its hello holds no \
-                         certificate of another namespace",
-                        list(&namespaces)
-                    ),
-                )
-                .with("namespaces", list(&namespaces)),
-            );
+        if !declined.is_empty() {
+            match judge.grant_for(fingerprint, &declined) {
+                GrantOutcome::Admitted(ids, granted) => {
+                    served = ids.into_iter().map(|(id, slot)| (id, Some(slot))).collect();
+                    grant = Some(granted);
+                }
+                GrantOutcome::Refused(why) => return Err(why),
+                GrantOutcome::No(Some(detail)) => refusal.detail.append(". ", detail),
+                GrantOutcome::No(None) => {}
+            }
         }
-        return Err(refusal);
+        if grant.is_none() {
+            // A device of another namespace gets no enrollment link: it
+            // proved whom it is, and this relay does not serve it.
+            if refusal.reason == CloseReason::NotServed
+                && foreign
+                && unasked
+                && let Ok(namespaces) = judge.enrollment_namespaces()
+            {
+                refusal.detail.append(
+                    ". ",
+                    LinkDetail::new(
+                        code::ENROLLMENT_POSSIBLE,
+                        format!(
+                            "A device enrolls in {} over this relay while its hello holds no \
+                             certificate of another namespace",
+                            list(&namespaces)
+                        ),
+                    )
+                    .with("namespaces", list(&namespaces)),
+                );
+            }
+            return Err(refusal);
+        }
     }
     served.sort_by_key(|(_, quota)| match quota {
         None => 0,
@@ -1233,6 +1338,7 @@ fn serve(
         enrollment: None,
         quota: None,
         quotas: Vec::new(),
+        grant,
     };
     for (i, (id, quota)) in served.into_iter().enumerate() {
         admitted.identities.push(id);
@@ -1525,6 +1631,7 @@ mod tests {
         peers: Peers,
         serve: ServePolicy,
         quotas: QuotaState,
+        grants: Grants,
     }
 
     impl World {
@@ -1534,6 +1641,7 @@ mod tests {
                 peers: Peers::new(peers),
                 serve,
                 quotas: QuotaState::default(),
+                grants: Grants::default(),
             }
         }
 
@@ -1543,6 +1651,7 @@ mod tests {
                 peers: &self.peers,
                 serve: &self.serve,
                 quotas: &self.quotas,
+                grants: &self.grants,
             }
         }
     }
@@ -1757,6 +1866,208 @@ mod tests {
             refusal.detail.param("root"),
             Some(c.root_fingerprint().to_string().as_str())
         );
+    }
+
+    /// A grant in force for `key`, for `namespaces`, for an hour.
+    fn granted(key: &PeerKey, namespaces: &[&str], role: GrantRole) -> Grant {
+        Grant {
+            key: key.fingerprint(),
+            namespaces: namespaces.iter().map(|s| n(s)).collect(),
+            role,
+            until: std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
+        }
+    }
+
+    /// Where `own` refuses a device of a held namespace it has no certificate
+    /// in, a grant of the device's key serves it in the namespaces the grant
+    /// lists — by key and namespace both: another key of the namespace, the
+    /// same key presenting another namespace, and a device of a namespace
+    /// this device does not hold (served by its own root's certificate) are
+    /// refused, whatever the grant lists. Only the granted identities are
+    /// admitted, under the default quotas.
+    #[tokio::test]
+    async fn a_grant_serves_its_key_in_its_namespaces_where_own_refuses_and_no_other() {
+        let (a, b, c, d) = (
+            namespace("/a", 10).await,
+            namespace("/b", 20).await,
+            namespace("/c", 30).await,
+            namespace("/d", 40).await,
+        );
+        let world = relay(&a, &[&b, &c], ServePolicy::Own).await;
+        let judge = world.judge();
+        let (bob, bob_chain) = b.device("member", "phone", 22).await;
+        let (carol, carol_chain) = b.device("member", "tablet", 23).await;
+
+        // No grant: refused, and told that an invitation grants a link.
+        let refusal = judge
+            .decide(&bob, &hello(bob_chain.clone()), &CH, None)
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            refusal.detail.is(code::NOT_SERVED_UNCERTIFIED),
+            "{:?}",
+            refusal.detail
+        );
+        assert!(
+            refusal.detail.text.contains("inviting you"),
+            "{}",
+            refusal.detail.text
+        );
+
+        // Granted: served, as the granted namespace's person only, within quotas.
+        world.grants.put(granted(&bob, &["/b"], GrantRole::Writer));
+        let admitted = judge
+            .decide(&bob, &hello(bob_chain.clone()), &CH, None)
+            .await
+            .unwrap();
+        assert_eq!(admitted.identities.len(), 1);
+        assert_eq!(admitted.identity().unwrap().device, n("/b/member/phone"));
+        assert_eq!(
+            admitted.grant.as_ref().map(|g| g.key),
+            Some(bob.fingerprint())
+        );
+        assert!(
+            admitted.quota.as_ref().is_some_and(|q| q.limits.is_some()),
+            "a grant link is under the default quotas"
+        );
+        assert!(judge.admission_for(&admitted).scope.is_some());
+
+        // Another key of the same namespace gets nothing from Bob's grant.
+        let refusal = judge
+            .decide(&carol, &hello(carol_chain), &CH, None)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(
+            refusal.reason,
+            CloseReason::NotServed,
+            "{}",
+            refusal.detail.text
+        );
+        assert!(refusal.detail.is(code::NOT_SERVED_UNCERTIFIED));
+
+        // The grant lists another namespace than the one Bob's certificate is
+        // of: refused, and the refusal names the grant.
+        world.grants.put(granted(&bob, &["/c"], GrantRole::Writer));
+        let refusal = judge
+            .decide(&bob, &hello(bob_chain), &CH, None)
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            refusal
+                .detail
+                .causes
+                .iter()
+                .any(|c| c.is(code::GRANT_UNMATCHED)),
+            "{:?}",
+            refusal.detail
+        );
+
+        // A device of a namespace this device does not hold is served by its
+        // own root's certificate only; a grant listing the namespace does not
+        // serve it.
+        let (dan, mut dan_chain) = d.device("member", "phone", 42).await;
+        dan_chain.push(d.root.clone());
+        world.grants.put(granted(&dan, &["/d"], GrantRole::Writer));
+        let refusal = judge
+            .decide(&dan, &hello(dan_chain), &CH, None)
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            refusal.detail.is(code::NOT_SERVED_OWN),
+            "{:?}",
+            refusal.detail
+        );
+    }
+
+    /// A grant that ended is named in the refusal of the key's next link,
+    /// and serves nothing.
+    #[tokio::test]
+    async fn an_ended_grant_serves_nothing_and_is_named_in_the_refusal() {
+        let (a, b) = (namespace("/a", 10).await, namespace("/b", 20).await);
+        let world = relay(&a, &[&b], ServePolicy::Own).await;
+        let judge = world.judge();
+        let (bob, chain) = b.device("member", "phone", 22).await;
+        let mut grant = granted(&bob, &["/b"], GrantRole::Writer);
+        grant.until = std::time::SystemTime::now() - std::time::Duration::from_secs(1);
+        world.grants.put(grant);
+        let refusal = judge
+            .decide(&bob, &hello(chain), &CH, None)
+            .await
+            .err()
+            .unwrap();
+        let ended = refusal
+            .detail
+            .causes
+            .iter()
+            .find(|c| c.is(code::GRANT_ENDED))
+            .unwrap_or_else(|| panic!("{:?}", refusal.detail));
+        assert_eq!(ended.param("ended"), Some("expired"));
+        assert!(
+            refusal.detail.text.contains("it expired"),
+            "{}",
+            refusal.detail.text
+        );
+    }
+
+    /// Under `open` a grant adds nothing: the policy serves the device (under
+    /// its quotas) and the link is not the grant's. Under `listed` with
+    /// quotas a grant is bound by them: it never serves what they refuse.
+    #[tokio::test]
+    async fn a_grant_adds_nothing_under_open_and_never_beats_the_quotas() {
+        let (a, b) = (namespace("/a", 10).await, namespace("/b", 20).await);
+        let open = relay(
+            &a,
+            &[&b],
+            ServePolicy::Open {
+                quotas: Quotas::default(),
+            },
+        )
+        .await;
+        let (bob, chain) = b.device("member", "phone", 22).await;
+        open.grants.put(granted(&bob, &["/b"], GrantRole::Reader));
+        let admitted = open
+            .judge()
+            .decide(&bob, &hello(chain), &CH, None)
+            .await
+            .unwrap();
+        assert!(admitted.grant.is_none(), "open served the device itself");
+
+        let listed = relay(
+            &a,
+            &[&b],
+            ServePolicy::Listed {
+                roots: Vec::new(),
+                quotas: Some(Quotas {
+                    links_per_namespace: 1,
+                    ..Quotas::default()
+                }),
+            },
+        )
+        .await;
+        let judge = listed.judge();
+        let (carol, carol_chain) = b.device("member", "tablet", 23).await;
+        let (bob, bob_chain) = b.device("member", "phone", 22).await;
+        listed.grants.put(granted(&bob, &["/b"], GrantRole::Writer));
+        listed
+            .grants
+            .put(granted(&carol, &["/b"], GrantRole::Writer));
+        let first = judge
+            .decide(&bob, &hello(bob_chain), &CH, None)
+            .await
+            .unwrap();
+        assert!(first.grant.is_some());
+        let refusal = judge
+            .decide(&carol, &hello(carol_chain), &CH, None)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(refusal.reason, CloseReason::Busy, "{}", refusal.detail.text);
+        assert!(refusal.detail.is(code::QUOTA_NAMESPACE_LINKS));
+        drop(first);
     }
 
     /// An open relay serves a device of a namespace it holds the trust
@@ -2080,6 +2391,219 @@ mod tests {
         assert!(
             refusal.detail.is(code::NOT_EXPECTED_KEY),
             "{:?}",
+            refusal.detail
+        );
+    }
+
+    /// A remembered peer's entry: its key pins the dial, its device is the
+    /// one it proved when it was remembered.
+    fn remembered(device: &str) -> PeerSpec {
+        PeerSpec {
+            remembered: true,
+            ..spec(Some(THEIRS), Some(device))
+        }
+    }
+
+    /// An identity of `/b`, a namespace this device holds.
+    fn held_in_b(device: &str) -> Identity {
+        Identity {
+            served: None,
+            version: 1,
+            ..served("/b", device, THEIRS)
+        }
+    }
+
+    fn holding_b(peers: Vec<PeerSpec>) -> World {
+        World::new(
+            Bare(
+                Arc::new(keyring_with(
+                    SignedTrustContext::hierarchical(n("/b")).with_version(1),
+                )),
+                None,
+                Vec::new(),
+            ),
+            peers,
+            ServePolicy::Own,
+        )
+    }
+
+    /// Rule 4 (§17C.2): a remembered peer is never admitted by its expected key
+    /// alone. The same entry listed by a host is admitted by it (what a
+    /// permissive seam would do), so the refusal is the rule's and nothing
+    /// else's.
+    #[test]
+    fn a_remembered_peer_is_never_admitted_by_its_key_alone() {
+        let listed = holding_b(vec![PeerSpec {
+            remembered: false,
+            ..remembered("/b/member/phone")
+        }]);
+        let by_key = decide_identified(
+            &listed.judge(),
+            THEIRS,
+            Err(Unidentified::NoCertificate),
+            Some(PeerId(0)),
+            Some(PeerId(0)),
+        );
+        assert!(
+            by_key.is_ok_and(|a| a.identity().is_none()),
+            "a host-listed entry is admitted by its expected key: the seam the rule closes"
+        );
+
+        let world = holding_b(vec![remembered("/b/member/phone")]);
+        for why in [
+            Unidentified::NoCertificate,
+            Unidentified::Unusable(LinkDetail::new(code::NO_CERTIFICATE, "its chain is broken")),
+        ] {
+            let refusal = decide_identified(
+                &world.judge(),
+                THEIRS,
+                Err(why),
+                Some(PeerId(0)),
+                Some(PeerId(0)),
+            )
+            .err()
+            .expect("a remembered peer that shows no identity is refused, not admitted by its key");
+            assert_eq!(refusal.reason, CloseReason::Unrecognized);
+            assert!(
+                refusal.detail.is(code::EXPECTED_DEVICE_UNCONFIRMED),
+                "{:?}",
+                refusal.detail
+            );
+            assert!(
+                refusal.detail.text.contains("identified device"),
+                "{}",
+                refusal.detail.text
+            );
+        }
+    }
+
+    #[test]
+    fn a_remembered_peer_is_admitted_as_the_identified_device_it_was() {
+        let world = holding_b(vec![remembered("/b/member/phone")]);
+        let admitted = decide_identified(
+            &world.judge(),
+            THEIRS,
+            Ok(vec![held_in_b("/b/member/phone")]),
+            Some(PeerId(0)),
+            Some(PeerId(0)),
+        )
+        .unwrap();
+        assert_eq!(admitted.peer, Some(PeerId(0)));
+        assert_eq!(admitted.identity().unwrap().device, n("/b/member/phone"));
+        assert!(admitted.enrollment.is_none());
+    }
+
+    #[test]
+    fn a_remembered_peer_proving_another_device_or_another_key_is_refused() {
+        let world = holding_b(vec![remembered("/b/member/phone")]);
+        let refusal = decide_identified(
+            &world.judge(),
+            THEIRS,
+            Ok(vec![held_in_b("/b/member/laptop")]),
+            Some(PeerId(0)),
+            Some(PeerId(0)),
+        )
+        .err()
+        .unwrap();
+        assert!(
+            refusal.detail.is(code::NOT_EXPECTED_DEVICE),
+            "{:?}",
+            refusal.detail
+        );
+        let refusal = decide_identified(
+            &world.judge(),
+            KeyFingerprint([9; 32]),
+            Ok(vec![held_in_b("/b/member/phone")]),
+            Some(PeerId(0)),
+            Some(PeerId(0)),
+        )
+        .err()
+        .unwrap();
+        assert!(
+            refusal.detail.is(code::NOT_EXPECTED_KEY),
+            "{:?}",
+            refusal.detail
+        );
+    }
+
+    /// Rule 3 (§17C.2): an identity only a root this device does not hold
+    /// vouches for confirms no remembered peer.
+    #[test]
+    fn a_remembered_peer_of_a_namespace_no_longer_held_is_refused() {
+        let world = holding_b(vec![remembered("/b/member/phone")]);
+        let refusal = decide_identified(
+            &world.judge(),
+            THEIRS,
+            Ok(vec![served("/b", "/b/member/phone", THEIRS)]),
+            Some(PeerId(0)),
+            Some(PeerId(0)),
+        )
+        .err()
+        .expect("served by a root this device does not hold: not a held identity");
+        assert!(
+            refusal.detail.is(code::EXPECTED_DEVICE_UNCONFIRMED),
+            "{:?}",
+            refusal.detail
+        );
+        assert!(
+            refusal.detail.text.contains("does not hold"),
+            "{}",
+            refusal.detail.text
+        );
+    }
+
+    /// A link that came in is not the dial the remembered entry stands for:
+    /// it is judged by the serving policy as any stranger's. Under `own` a
+    /// device of a namespace this device holds but is not in is refused,
+    /// where a host-listed entry (admitted whoever dials) would take it.
+    #[test]
+    fn a_remembered_entry_does_not_admit_a_link_that_came_in() {
+        let listed = holding_b(vec![PeerSpec {
+            remembered: false,
+            ..remembered("/b/member/phone")
+        }]);
+        assert!(
+            decide_identified(
+                &listed.judge(),
+                THEIRS,
+                Ok(vec![held_in_b("/b/member/phone")]),
+                Some(PeerId(0)),
+                None,
+            )
+            .is_ok(),
+            "a host-listed entry admits the device whoever dialled"
+        );
+        let world = holding_b(vec![remembered("/b/member/phone")]);
+        let refusal = decide_identified(
+            &world.judge(),
+            THEIRS,
+            Ok(vec![held_in_b("/b/member/phone")]),
+            Some(PeerId(0)),
+            None,
+        )
+        .err()
+        .expect("a remembered entry is no reason to serve a link that dialled in");
+        assert_eq!(
+            refusal.reason,
+            CloseReason::NotServed,
+            "{}",
+            refusal.detail.text
+        );
+        // And a remembered key that shows no identity is not admitted by it
+        // either way.
+        let refusal = decide_identified(
+            &world.judge(),
+            THEIRS,
+            Err(Unidentified::NoCertificate),
+            Some(PeerId(0)),
+            None,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(refusal.reason, CloseReason::Unrecognized);
+        assert!(
+            refusal.detail.is(code::UNRECOGNIZED_KEY),
+            "refused as any stranger: {:?}",
             refusal.detail
         );
     }

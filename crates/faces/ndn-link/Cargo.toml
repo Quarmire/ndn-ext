@@ -35,10 +35,16 @@ ndn-namespace = { workspace = true, optional = true }
 # `LinkHints`: a data-layer device's link hint and dial over these links
 # (ndn-rs data-layer.md §19.2, §19.3).
 ndn-data      = { workspace = true, optional = true }
+# The one definition of the fault profile, shared with ndn-sim (feature `fault-injection`).
+ndn-faults    = { workspace = true, optional = true }
 
 [features]
 engine = ["dep:ndn-engine", "dep:ndn-namespace"]
 introductions = ["dep:ndn-data"]
+# The test-only fault layer (ndn-rs ndn-link.md §17B): the seeded profile of the
+# conformance's `--faulty` runs on a real link's face. NEVER enable in a shipped
+# binary; `tools/check-shipped-features.sh` fails when one does.
+fault-injection = ["dep:ndn-faults"]
 
 # Interface addresses for direct-path host candidates.
 [target.'cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple", target_os = "freebsd"))'.dependencies]

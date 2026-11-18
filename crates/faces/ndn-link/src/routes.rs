@@ -221,6 +221,7 @@ mod tests {
             enrollment,
             quota: None,
             quotas: Vec::new(),
+            grant: None,
         }
     }
 

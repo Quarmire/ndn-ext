@@ -12,6 +12,7 @@ use ndn_mgmt_wire::LinkDetail;
 use ndn_packet::Name;
 use ndn_transport::FaceId;
 
+use crate::grants::Grant;
 use crate::peer::{LinkMode, PeerId, RelaySource};
 
 /// This device's links, as [`Links::report`](crate::Links::report) gives
@@ -32,6 +33,16 @@ pub struct LinkReport {
     /// Times this device invoked its wake notifier, in total.
     pub wakes_sent: u64,
     pub links: Vec<LinkStatus>,
+    /// The grants in force now ([`Links::grants`](crate::Links::grants)),
+    /// linked or not.
+    pub grants: Vec<Grant>,
+    /// What the link memory holds and does ([`Links::remember`]
+    /// (crate::Links::remember)); `None` when it was not asked for.
+    pub memory: Option<crate::memory::MemoryReport>,
+    /// The fault layer, when this build has it: `Some` exactly when ndn-link was
+    /// built with the cargo feature `fault-injection` (**tests only**), else `None`.
+    /// The field is in every build so a host's code does not change.
+    pub fault_injection: Option<crate::fault_report::FaultReport>,
 }
 
 /// One device this device links with (or is configured to, or punched
@@ -62,6 +73,9 @@ pub struct LinkStatus {
     /// On a relay: the device is asleep here (its link ended, and it asked
     /// for its Interests to be held or for a wake).
     pub asleep: Option<AsleepStatus>,
+    /// When a grant, not the serving policy, admitted its link: the grant
+    /// as it stands (`granted until … as a writer in …`, [`Grant::describe`]).
+    pub granted: Option<Grant>,
 }
 
 /// A relay this device uses.

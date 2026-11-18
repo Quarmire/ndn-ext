@@ -159,13 +159,36 @@
 //! certificate, and is taken down when the join fails
 //! ([`Links::undial_by_key`]). Once the joiner holds the inviter's namespace
 //! its link is made again, and the inviter admits it by its certificate: as a
-//! full link when its [`ServePolicy`] serves the joiner's namespace (a
-//! person it introduced is another person's namespace, so an inviter
-//! chooses `open` within [`Quotas`], or `listed`; the default `own` leaves
-//! the stranger on its introduction link). With the `introductions`
-//! feature, `LinkHints` gives a data layer device its three halves (its
-//! hint, its dial, its undial) and serves its
-//! `ndn_data::IntroductionSurface`.
+//! full link when its [`ServePolicy`] serves the joiner's namespace or a
+//! **grant** ([`Grant`], [`Links::grant`]) does. A person it introduced is
+//! another person's namespace, which the default `own` refuses; the grant
+//! says *the device holding this link key may link here, as a person of these
+//! namespaces, until then*, and `own` plus the grant is tighter and enough
+//! (an inviter no longer has to choose `open` or `listed`; `open` is as it
+//! was, and a grant adds nothing to it). A grant admits that key in those
+//! namespaces only, under the quotas, in its role's scope (a reader's link
+//! carries Interests toward this device, and answers only under its own
+//! device names), and ends at its date, when it is revoked
+//! ([`Links::revoke_grant`]) or when a held record leaves the person out,
+//! closing the links it alone admitted and naming what ended in the refusal
+//! of the key's next link. With the `introductions` feature, `LinkHints`
+//! gives a data layer device its three halves (its hint, its dial, its
+//! undial), serves its `ndn_data::IntroductionSurface` and installs the
+//! device's grants (`LinkHints::serve`, `grant`, `revoke_grant`).
+//!
+//! # Link memory
+//!
+//! A device that restarts keeps what it learned of its peers, and links with
+//! them again with no peer entry, relay or list of the host's:
+//! [`Links::remember`] takes a [`LinkMemory`] (with the feature
+//! `introductions`, `DeviceMemory` keeps it in a data-layer device's local
+//! notes). It records, for each peer a link was admitted for by an identity in
+//! a held namespace, its key, its device and the addresses that worked, and
+//! dials them again in the background. The key is what a redial trusts and an
+//! address is a hint; a remembered peer is never admitted by its key alone, is
+//! not dialled when no held context (a namespace this device holds, a live
+//! grant) admits it, and is forgotten by [`Links::forget`]
+//! (`ndn-rs/docs/specs/ndn-link.md` §17C).
 //!
 //! # Relays
 //!
@@ -194,6 +217,15 @@
 //! it is asleep and to wake it ([`PeerSpec::hold`],
 //! [`Links::set_wake_token`]); a relay offers that per its
 //! [`RelayService`], waking through the host's [`WakeNotifier`].
+//!
+//! # The fault layer (cargo feature `fault-injection`, **for tests only**)
+//!
+//! Off by default and never to be enabled by a shipped binary
+//! (`tools/check-shipped-features.sh` fails when one does): a wrapper on each link's
+//! face applies the conformance's seeded fault profile (drop, duplicate, forge, delay,
+//! reorder, block loss) to the packets arriving on it, chosen by an optional host
+//! predicate (`Links::inject_faults`). A build that has it logs a warning at start and
+//! says so in [`LinkReport::fault_injection`]. ndn-rs `docs/specs/ndn-link.md` §17B.
 
 #![cfg(not(target_arch = "wasm32"))]
 
@@ -201,14 +233,21 @@ mod admission;
 mod asleep;
 mod candidates;
 mod control;
+#[cfg(feature = "introductions")]
+mod device_memory;
 mod direct;
 #[cfg(feature = "engine")]
 mod engine;
+#[cfg(feature = "fault-injection")]
+mod fault;
+mod fault_report;
+mod grants;
 #[cfg(feature = "introductions")]
 mod hints;
 mod host;
 mod introduce;
 mod links;
+mod memory;
 mod peer;
 pub mod policy;
 mod presence;
@@ -221,13 +260,20 @@ mod slots;
 mod status;
 mod table;
 mod waiting;
+mod watch;
 
 pub use asleep::{HoldLimits, RelayService, WAKE_INTERVAL, WakeNotifier, WakeRequest};
 pub use candidates::{
     AdvertisedCandidates, Candidate, CandidateKind, CandidateSource, HostCandidates,
 };
+#[cfg(feature = "introductions")]
+pub use device_memory::DeviceMemory;
 #[cfg(feature = "engine")]
 pub use engine::EngineFaces;
+#[cfg(feature = "fault-injection")]
+pub use fault::{FaultFrame, FaultKind, FaultPass, FaultPlan};
+pub use fault_report::FaultReport;
+pub use grants::{Grant, GrantRole};
 #[cfg(feature = "introductions")]
 pub use hints::LinkHints;
 pub use host::{
@@ -235,6 +281,14 @@ pub use host::{
 };
 pub use introduce::Introductions;
 pub use links::{LinkSetup, Links};
+pub use memory::{
+    LinkMemory, MemoryFuture, MemoryOptions, MemoryReport, PeerRecord, RememberedPeer,
+    RememberedState,
+};
+/// The fault profile a [`FaultPlan`] carries, and the conformance's `--faulty` one
+/// (ndn-rs `ndn-link.md` §17B); **for tests only**.
+#[cfg(feature = "fault-injection")]
+pub use ndn_faults::{FAULTY, Faults};
 pub use ndn_mgmt_wire::{LinkDetail, LinkWords, link_code};
 pub use peer::{LinkMode, PeerId, PeerSpec, RelaySource, RelayUse};
 pub use policy::Backoff;
@@ -248,3 +302,4 @@ pub use status::{
 };
 pub use table::keeps_existing;
 pub use waiting::{DEMAND_PER_PEER, DEMAND_TOTAL, WAITING_COST};
+pub use watch::{Direction, LINK_STATES_MAX, LinkState, LinkWatch, Next, PeerLink};

@@ -117,6 +117,14 @@ pub struct PeerSpec {
     /// Ask the peer (a relay) to hold Interests for this device while it is
     /// asleep, and deliver them when it links again.
     pub hold: bool,
+    /// This entry was made from the link memory ([`Links::remember`]
+    /// (crate::Links::remember)): its `key` pins the dial (the handshake
+    /// accepts only the holder of the key) and admits no one. A remembered
+    /// peer is admitted only as an identified device, by a certificate that
+    /// validates in a namespace this device holds and proves the `device`;
+    /// never by its key alone, and never when it dials in (the serving
+    /// policy judges that link). Leave it `false` in a host's entries.
+    pub remembered: bool,
 }
 
 impl Default for PeerSpec {
@@ -135,6 +143,7 @@ impl Default for PeerSpec {
             mode: LinkMode::Always,
             relay_use: None,
             hold: false,
+            remembered: false,
         }
     }
 }

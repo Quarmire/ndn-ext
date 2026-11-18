@@ -130,6 +130,7 @@ ndn-time      = { path = "../ndn-rs/crates/core/ndn-time", default-features = fa
 ndn-time-sources = { path = "crates/time/ndn-time-sources" }
 ndn-timekeeper = { path = "crates/time/ndn-timekeeper" }
 ndn-ble-framing = { path = "../ndn-rs/crates/core/ndn-ble-framing" }
+ndn-faults   = { path = "../ndn-rs/crates/core/ndn-faults" }
 ndn-mgmt-wire = { path = "../ndn-rs/crates/core/ndn-mgmt-wire" }
 ndn-transport = { path = "../ndn-rs/crates/core/ndn-transport" }
 ndn-store     = { path = "../ndn-rs/crates/forwarding/ndn-store" }
