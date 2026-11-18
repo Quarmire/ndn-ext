@@ -82,6 +82,9 @@ impl SharedRate {
     }
 }
 
+/// Whether a packet of a name is within a scope's names.
+pub type NameFilter = Box<dyn Fn(&Name) -> bool + Send + Sync>;
+
 /// What a scoped link carries.
 pub struct LinkScope {
     /// What the peer may send over the link.
@@ -98,6 +101,11 @@ pub struct LinkScope {
     /// For the log, when a packet is dropped: what the link carries and
     /// what to do to carry more.
     pub explain: String,
+    /// When set, an answer (Data or Nack) the peer sends is carried only
+    /// within it, besides being within `names`: a peer whose Interests go
+    /// everywhere may answer for some names only. The peer's Interests, and
+    /// what this side sends, are judged by `names` alone.
+    pub answers_in: Option<NameFilter>,
 }
 
 /// What a scope did with a frame.
@@ -211,12 +219,17 @@ impl ScopeState {
                 return Judged::Drop(None);
             }
         }
-        self.judge(packet, self.scope.receives, &self.inbound)
+        self.judge(
+            packet,
+            self.scope.receives,
+            &self.inbound,
+            self.scope.answers_in.as_deref(),
+        )
     }
 
     /// Judge a frame this side would send.
     pub(crate) fn sending(&self, frame: &Bytes) -> Judged {
-        self.judge(Packet::of(frame), self.scope.sends, &self.outbound)
+        self.judge(Packet::of(frame), self.scope.sends, &self.outbound, None)
     }
 
     fn take_token(&self) -> bool {
@@ -231,6 +244,7 @@ impl ScopeState {
         packet: Option<Packet>,
         carries: Carries,
         fragmented: &Mutex<Fragmented>,
+        answers: Option<&(dyn Fn(&Name) -> bool + Send + Sync)>,
     ) -> Judged {
         let Some(packet) = packet else {
             self.note_drop("not a packet a link carries", None);
@@ -261,7 +275,9 @@ impl ScopeState {
                     Carries::Answers => kind != Kind::Interest,
                     Carries::Everything => true,
                 };
-                if carried && (self.scope.names)(&name) {
+                let answer_named =
+                    kind == Kind::Interest || answers.is_none_or(|named| named(&name));
+                if carried && answer_named && (self.scope.names)(&name) {
                     if let Some(base) = first_of {
                         fragmented
                             .lock()
@@ -415,6 +431,7 @@ mod tests {
             },
             shared: None,
             explain: "test".into(),
+            answers_in: None,
         })
     }
 
@@ -457,6 +474,47 @@ mod tests {
                 10
             ))),
             Judged::Drop(None)
+        );
+    }
+
+    /// A scope with `answers_in` carries the peer's Interests anywhere in the
+    /// names, but its answers only within it; what this side sends is judged
+    /// by the names alone.
+    #[test]
+    fn answers_the_peer_sends_are_judged_by_answers_in() {
+        let own: Name = "/bob/member/phone".parse().unwrap();
+        let s = ScopeState::new(LinkScope {
+            receives: Carries::Everything,
+            sends: Carries::Everything,
+            names: Box::new(|_: &Name| true),
+            rate: RateLimit {
+                burst: 100,
+                per_sec: 100,
+            },
+            shared: None,
+            explain: "test".into(),
+            answers_in: Some(Box::new(move |n: &Name| n.has_prefix(&own))),
+        });
+        let lp = |p: &Bytes| ndn_packet::lp::encode_lp_packet(p);
+        assert_eq!(
+            s.received(&lp(&interest("/alice/32=sync/probe"))),
+            Judged::Pass,
+            "the peer's Interests go everywhere"
+        );
+        assert_eq!(
+            s.received(&lp(&data("/bob/member/phone/seal/1", 10))),
+            Judged::Pass,
+            "an answer under the peer's own name passes"
+        );
+        assert_eq!(
+            s.received(&lp(&data("/bob/32=sync/probe/1", 10))),
+            Judged::Drop(None),
+            "an answer under another name is dropped"
+        );
+        assert_eq!(
+            s.sending(&lp(&data("/alice/32=sync/probe/1", 10))),
+            Judged::Pass,
+            "what this side sends is not held to answers_in"
         );
     }
 
@@ -532,6 +590,7 @@ mod tests {
                 },
                 shared: Some(Arc::clone(&shared)),
                 explain: "test".into(),
+                answers_in: None,
             })
         };
         let (a, b) = (link(), link());

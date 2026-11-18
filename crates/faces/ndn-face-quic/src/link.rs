@@ -297,6 +297,7 @@ impl Handshaken {
                 outbox,
                 reachability,
                 presence,
+                local_close: Arc::default(),
             },
             peer_verdict,
         })
@@ -640,17 +641,31 @@ pub struct LinkHandle {
     outbox: Arc<Outbox>,
     reachability: tokio::sync::watch::Receiver<Option<Reachability>>,
     presence: tokio::sync::watch::Receiver<Vec<Presence>>,
+    /// What this side said when it closed the link (the first close wins, as
+    /// in QUIC): the connection itself keeps no text of a close made here.
+    local_close: Arc<std::sync::OnceLock<(CloseReason, String)>>,
 }
 
 impl LinkHandle {
     pub fn close(&self, reason: CloseReason, text: &str) {
+        let _ = self.local_close.set((reason, text.to_string()));
         self.connection
             .close(quinn::VarInt::from_u32(reason.code()), text.as_bytes());
     }
 
-    /// Resolves when the link has ended, with why.
+    /// Resolves when the link has ended, with why. A link this side closed
+    /// ends with the reason and the words it closed with.
     pub async fn closed(&self) -> LinkError {
-        LinkError::from_connection(self.connection.closed().await)
+        match self.connection.closed().await {
+            ConnectionError::LocallyClosed => match self.local_close.get() {
+                Some((reason, text)) => LinkError::RefusedHere {
+                    reason: *reason,
+                    text: text.clone(),
+                },
+                None => LinkError::Connect("this device closed the link".into()),
+            },
+            other => LinkError::from_connection(other),
+        }
     }
 
     /// Whether the link ended (or this side closed it), though its end may

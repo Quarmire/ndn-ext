@@ -89,4 +89,4 @@ pub use message::{
     PresentDevice, Reachability, WAKE_TOKEN_MAX, decode_udp_address, encode_udp_address,
 };
 pub use probe::{PROBE_LEN, ProbeWatch, decode_probe, encode_probe};
-pub use scope::{Carries, LinkScope, RateLimit, SharedRate};
+pub use scope::{Carries, LinkScope, NameFilter, RateLimit, SharedRate};

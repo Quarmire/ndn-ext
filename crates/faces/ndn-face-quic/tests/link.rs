@@ -332,6 +332,7 @@ async fn an_enrollment_link_carries_only_its_scope_and_says_so() {
             },
             shared: None,
             explain: "enrollment only".into(),
+            answers_in: None,
         };
         let admission = Admission {
             verdict: LinkVerdict {
