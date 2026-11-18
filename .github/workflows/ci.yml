@@ -62,6 +62,11 @@ jobs:
           cargo fmt $PKGS -- --check
       - name: clippy (default-members, all targets)
         run: cargo clippy --all-targets
+      # A feature that exists for tests only must not be on in a shipped build
+      # (the file is the same in ndn-ext, ndn-fwd and ndn-mobile; it needs no
+      # build and nothing outside this repo).
+      - name: forbidden test-only features
+        run: tools/check-forbidden-features.sh
 
   test:
     name: tests (nextest + doctests)
@@ -94,6 +99,10 @@ jobs:
       # feature (they need the PathControl adapter); the default run skips them.
       - name: nextest (engine-gated pipe teardown tests)
         run: cargo nextest run --profile ci -p ndn-pipes --features engine
+      # ndn-link's fault layer is off by default and compiled only for its own
+      # tests: they run here, with the feature.
+      - name: nextest (ndn-link fault layer)
+        run: cargo nextest run --profile ci -p ndn-link --features fault-injection
       - name: doctests (nextest does not run these)
         run: cargo test --doc
 
