@@ -45,9 +45,9 @@ pub const VIA_RELAY_COST: u32 = 10;
 /// one, always wins; this route is the way through the inviter only when
 /// there is no other.
 pub const JOINED_ROUTE_COST: u32 = VIA_RELAY_COST + 1000;
-/// Distinct prefixes in all that [`Links::set_joined_routes`](crate::Links::set_joined_routes)
-/// takes; a prefix in two folders counts once. The rest are dropped, with a
-/// warning.
+/// Distinct namespaces in all that [`Links::set_joined_routes`](crate::Links::set_joined_routes)
+/// takes (each is routed with its sync group); a namespace in two folders
+/// counts once. The rest are dropped, with a warning.
 pub const JOINED_ROUTES_MAX: usize = 64;
 /// Folders (entries of the set) that `set_joined_routes` takes; the rest are
 /// dropped, with a warning.

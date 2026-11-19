@@ -28,6 +28,7 @@ use common::{
     Embedded, LONG, Person, Setup, dials, embedded, invited, invited_in, linked, n, puts, reads,
     reshare, routed_over, text, until,
 };
+use ndn_cert::onboarding::rdr_prefix;
 use ndn_data::Role;
 use ndn_face_quic::{KeyFingerprint, LinkEndpoint, LinkKey, LinkKeySource, LinkTransportConfig};
 use ndn_link::policy::{JOINED_FOLDERS_MAX, JOINED_ROUTE_COST, JOINED_ROUTES_MAX, VIA_RELAY_COST};
@@ -37,7 +38,7 @@ use ndn_link::{
 };
 use ndn_packet::{Data, Name};
 use ndn_security::{
-    Certificate, Ed25519Signer, Keyring, SignedTrustContext, Signer, encode_cert_data,
+    Certificate, Ed25519Signer, Keyring, SignedTrustContext, Signer, encode_cert_data, sync_group,
 };
 use ndn_transport::{Face, FaceId, FaceKind};
 use tokio_util::sync::CancellationToken;
@@ -501,6 +502,16 @@ async fn the_route_is_installed_over_the_inviters_identified_link_and_over_no_ot
         vec![VIA_RELAY_COST + 1000],
         "the route does not cost the relay's cost and a thousand"
     );
+    // Each writer's sync group is routed beside the namespace: a data layer
+    // registers the groups of the other writers with its own forwarder, and
+    // that entry would shadow the namespace's route for every name of the group.
+    for ns in ["/c", "/d"] {
+        assert_eq!(
+            bob.at.joined_additions(&sync_group(&n(ns))),
+            1,
+            "{ns}'s sync group was not routed over the inviter's link"
+        );
+    }
     for stray in ["/x", "/y"] {
         assert_eq!(
             bob.at.joined_additions(&n(stray)),
@@ -543,6 +554,13 @@ async fn a_route_the_set_drops_is_removed_and_the_same_set_again_changes_nothing
     assert!(
         bob.at.removed.lock().contains(&(ann_face, n("/c"))),
         "the route the set dropped was not removed with remove_routes"
+    );
+    assert!(
+        bob.at
+            .removed
+            .lock()
+            .contains(&(ann_face, sync_group(&n("/c")))),
+        "the sync group of the dropped namespace was not removed with remove_routes"
     );
     assert_eq!(
         bob.at.joined_additions(&n("/d")),
@@ -913,14 +931,25 @@ fn fib_cost(on: &Embedded, prefix: &Name, face: FaceId) -> Option<u32> {
 /// record, and toward nothing else: not his own namespace, not Ann's, not a
 /// name no record lists; Carol's, symmetrically, toward Bob's; Ann's none (no
 /// folder was joined by her). Carol writes and Bob reads it. A record without
-/// Carol takes the route at the next notification.
-async fn g11(faulty: bool) {
+/// Carol takes the route at the next notification. With `by_name`, Bob's and
+/// Carol's hosts serve their own namespace's context on their engines and
+/// adopt each other's self-certifying namespace **by name through their own
+/// engines** (`adopt_scoped_via_engine`: the trust context is an Interest
+/// that crosses Bob's forwarder, the link to Ann, Ann's forwarder and her
+/// link to Carol): the test hands them no context and makes no FIB entry, so
+/// each hop has the route the links installed or the Interest dies there
+/// ("no route for …").
+async fn g11(faulty: bool, by_name: bool) {
     let alice = Person::new("/alice").await;
     let bobs = Person::self_certifying([0xb2; 32]).await;
     let carols = Person::self_certifying([0xc2; 32]).await;
+    let named = Setup {
+        scoped_by_name: by_name,
+        ..Setup::dialer()
+    };
     let ann = embedded(&alice, common::ANN, Setup::inviter()).await;
-    let bob = embedded(&bobs, &bobs.device("phone"), Setup::dialer()).await;
-    let carol = embedded(&carols, &carols.device("phone"), Setup::dialer()).await;
+    let bob = embedded(&bobs, &bobs.device("phone"), named.clone()).await;
+    let carol = embedded(&carols, &carols.device("phone"), named).await;
     let folder = n(common::FOLDER);
     if faulty {
         inject(&[&ann, &bob, &carol]);
@@ -952,6 +981,26 @@ async fn g11(faulty: bool) {
         "bob's FIB: {:?}",
         routed_over(&bob, ann.key)
     );
+    // (Without the test host's own group routes, which are cost 0 on the same
+    // entry, the sync group has the joiner's route.)
+    if by_name {
+        assert_eq!(
+            fib_cost(&bob, &sync_group(&carols.ns), face_of(&bob, ann.key)),
+            Some(JOINED_ROUTE_COST),
+            "bob's FIB does not route Carol's sync group over his link to Ann"
+        );
+    }
+    // Ann's grant link to Carol routes Carol's public names outside her
+    // devices (the trust context), so Ann's forwarder can relay Bob's fetch.
+    until(
+        "ann routes carol's trust context toward carol",
+        LONG,
+        async || {
+            ann.sink
+                .routed_at_joiner_cost(face_of(&ann, carol.key), &rdr_prefix(&carols.ns))
+        },
+    )
+    .await;
     // Nothing else, ever: not his own namespace, not Ann's, not a stranger's.
     assert_eq!(
         bob.sink.ever_joined(),
@@ -1006,7 +1055,7 @@ fn inject(devices: &[&Embedded]) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn g11_bob_is_routed_carols_namespace_and_reads_carol_through_ann() {
-    g11(false).await;
+    g11(false, false).await;
 }
 
 /// G11 with the conformance's FAULTY profile on every link (drops,
@@ -1014,7 +1063,23 @@ async fn g11_bob_is_routed_carols_namespace_and_reads_carol_through_ann() {
 #[cfg(feature = "fault-injection")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn g11_faulty_bob_is_routed_carols_namespace_and_reads_carol_through_ann() {
-    g11(true).await;
+    g11(true, false).await;
+}
+
+/// G11 as ndf's host does it: Bob adopts Carol's namespace by name through his
+/// own engine, over the route his links installed toward her namespace and
+/// the one Ann's link to Carol gives her forwarder for the namespace's trust
+/// context.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn g11_bob_fetches_carols_context_by_name_through_the_joiners_route_and_anns() {
+    g11(false, true).await;
+}
+
+/// The same under the conformance's FAULTY profile.
+#[cfg(feature = "fault-injection")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn g11_faulty_bob_fetches_carols_context_by_name_through_the_joiners_route_and_anns() {
+    g11(true, true).await;
 }
 
 /// A link that goes down loses the route with its face, and the link made

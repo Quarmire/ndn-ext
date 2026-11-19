@@ -19,12 +19,24 @@ pub enum Call {
     RemoveFace(FaceId),
 }
 
-/// A route of a grant link's public names (a trust context, a key or
-/// certificate name outside the devices): it costs what a joiner's route
-/// costs, and is not one.
+/// A route at the joiner's cost that is not a writer's namespace: a grant
+/// link's public names (a trust context, a key or certificate name outside
+/// the devices), and a writer's sync group, which the joiner's link routes
+/// beside the namespace.
 pub fn is_public_name(prefix: &Name) -> bool {
     let text = prefix.to_string();
-    text.ends_with("trust-context") || text.ends_with("/KEY")
+    text.ends_with("trust-context") || text.ends_with("/KEY") || text.ends_with("sync")
+}
+
+impl Recording {
+    /// Whether the links ever gave `face` a route to `prefix` at the joiner's
+    /// cost.
+    pub fn routed_at_joiner_cost(&self, face: FaceId, prefix: &Name) -> bool {
+        self.calls.lock().iter().any(|c| {
+            matches!(c, Call::AddRoutes(f, routes)
+                if *f == face && routes.iter().any(|r| r.prefix == *prefix && r.cost == JOINED_ROUTE_COST))
+        })
+    }
 }
 
 /// [`EngineFaces`], recording its route and face removals.

@@ -318,7 +318,9 @@ impl Links {
 
     /// The folders this device joined, and the namespaces of the folder's
     /// other writers its link to each inviter routes (SHAPES-R9 §A): the set
-    /// is replaced whole. A route toward each namespace is installed over the
+    /// is replaced whole. A route toward each namespace, and one toward its
+    /// sync group (`<ns>/32=sync`: a forwarder holding a local registration of
+    /// the group would shadow the namespace's route for its names), is installed over the
     /// **full, identified link of the inviter's key** (its handshake proved
     /// that key, an identity that validates in the folder's owner namespace
     /// admitted it, and it is no enrollment, introduction or departure link)

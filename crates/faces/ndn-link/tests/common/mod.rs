@@ -40,6 +40,7 @@ use ndn_sync::MemoryStore;
 use ndn_trust_envelope::TrustEnvelope;
 use tokio_util::sync::CancellationToken;
 
+pub mod context;
 pub mod recording;
 pub use recording::Recording;
 
@@ -290,6 +291,9 @@ struct Host {
     engine: ForwarderEngine,
     hints: OnceLock<LinkHints>,
     links: OnceLock<Arc<Links>>,
+    /// `adopt_scoped` fetches the namespace's context by name through the
+    /// engine (as ndf's host does) and makes no FIB entry of its own.
+    by_name: bool,
 }
 
 impl Introducer for Host {
@@ -378,8 +382,35 @@ impl Introducer for Host {
         namespace: &'a Name,
         held: Option<&'a ndn_security::ScopedContext>,
     ) -> ndn_data::intro::Scoping<'a> {
-        let _ = held;
         Box::pin(async move {
+            if self.by_name {
+                let scoped = ndn_identity::adopt_scoped_via_engine(&self.engine, namespace, held)
+                    .await
+                    .map_err(|e| {
+                        tracing::warn!(
+                            target: "face.quic",
+                            "adopting {namespace} by name through the engine failed: {e}"
+                        );
+                        e.to_string()
+                    })?;
+                // The strategy of the namespace's group, not a route: what
+                // routes toward the namespace is the links' business.
+                ndn_namespace::sync_group::carry(&self.engine, namespace);
+                for cert in CERTIFICATES
+                    .lock()
+                    .unwrap()
+                    .get(namespace)
+                    .cloned()
+                    .unwrap_or_default()
+                {
+                    self.validator.cert_cache().insert(cert);
+                }
+                tracing::info!(
+                    target: "face.quic",
+                    "adopted {namespace} by name through the engine"
+                );
+                return Ok(scoped);
+            }
             // The fetch of the genesis by name is the host's, over the
             // network; the harness's network is the directory of the test's
             // people. What the layer adopts is checked here as a fetched one
@@ -442,6 +473,12 @@ pub struct Setup {
     /// How long a departure mark its device makes lasts: zero, no mark (a
     /// person let go is not told, as before round 7).
     pub departure_for: Duration,
+    /// Its host serves its own self-certifying namespace's trust context and
+    /// certificate by name on its engine, and adopts the namespaces of other
+    /// writers by name through its engine
+    /// (`ndn_identity::adopt_scoped_via_engine`), not from the test's
+    /// directory and with no route of its own.
+    pub scoped_by_name: bool,
 }
 
 impl Setup {
@@ -453,6 +490,7 @@ impl Setup {
             serve: ServePolicy::Own,
             grant_for: None,
             departure_for: IntroPolicy::new().departure_for,
+            scoped_by_name: false,
         }
     }
 
@@ -489,6 +527,7 @@ pub struct Embedded {
     /// recorded).
     pub sink: Arc<Recording>,
     _shutdown: ShutdownHandle,
+    _serving: Option<context::Serving>,
     pub validator: Arc<Validator>,
     kept: Kept,
     skew: Arc<AtomicU64>,
@@ -617,6 +656,7 @@ async fn boot(kept: Kept, setup: Setup) -> Embedded {
         engine: engine.clone(),
         hints: OnceLock::new(),
         links: OnceLock::new(),
+        by_name: setup.scoped_by_name,
     });
     let _ = host.hints.set(hints.clone());
     let _ = host.links.set(Arc::clone(&links));
@@ -645,6 +685,17 @@ async fn boot(kept: Kept, setup: Setup) -> Embedded {
     .await
     .unwrap();
     hints.serve(&device);
+    let serving = match directory_entry(&ns).filter(|_| setup.scoped_by_name) {
+        Some((genesis, newest)) => Some(context::serve_own_context(
+            &engine,
+            &validator,
+            &cancel,
+            genesis,
+            newest,
+            kept.trust.chain.clone(),
+        )),
+        None => None,
+    };
     Embedded {
         device,
         links,
@@ -659,6 +710,7 @@ async fn boot(kept: Kept, setup: Setup) -> Embedded {
         kept,
         skew,
         _shutdown: shutdown,
+        _serving: serving,
     }
 }
 

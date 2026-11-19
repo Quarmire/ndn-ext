@@ -61,6 +61,8 @@ ndn-app    = { workspace = true }
 ndn-sync   = { workspace = true }
 ndn-namespace = { workspace = true }
 ndn-trust-envelope = { workspace = true }
+# tests/joiner.rs: a host adopts another writer's namespace by name through its engine.
+ndn-identity = { path = "../../../../ndn-rs/crates/security/ndn-identity" }
 # tests/common: `NDN_LINK_TEST_LOG=<file> RUST_LOG=…` writes the tracing of a run to a file.
 tracing-subscriber = { workspace = true }
 

@@ -17,6 +17,7 @@ use std::collections::BTreeSet;
 
 use ndn_face_quic::KeyFingerprint;
 use ndn_packet::Name;
+use ndn_security::sync_group;
 
 use crate::admission::Identity;
 use crate::policy::{JOINED_FOLDERS_MAX, JOINED_ROUTES_MAX};
@@ -95,10 +96,16 @@ impl JoinedSet {
     }
 
     /// The prefixes to route over the link to `fingerprint`, whose identities
-    /// are `identities`: those of each folder whose inviter it is and whose
-    /// owner one of its identities validates in (an identity of a namespace
-    /// held here; a served device of a namespace not held proves nothing
-    /// about it). Sorted, once each.
+    /// are `identities`: for each folder whose inviter it is and whose owner
+    /// one of its identities validates in (an identity of a namespace held
+    /// here; a served device of a namespace not held proves nothing about
+    /// it), each writer's namespace **and its sync group** (`<W>/32=sync`).
+    /// The group needs its own route: this device's data layer registers the
+    /// other writers' groups with its own forwarder (to hear their notices),
+    /// and a forwarder's longest-prefix match returns that one entry alone, so
+    /// a route at `<W>` is shadowed for every name of the group and the
+    /// group's Interests would never leave (the by-name case of
+    /// `tests/joiner.rs` shows it). Sorted, once each.
     pub(crate) fn wanted(
         &self,
         fingerprint: &KeyFingerprint,
@@ -112,7 +119,8 @@ impl JoinedSet {
                     .iter()
                     .any(|id| id.served.is_none() && id.namespace == f.owner)
             })
-            .flat_map(|f| f.namespaces.iter().cloned())
+            .flat_map(|f| f.namespaces.iter())
+            .flat_map(|ns| [ns.clone(), sync_group(ns)])
             .collect()
     }
 }
