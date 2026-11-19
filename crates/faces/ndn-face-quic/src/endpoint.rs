@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -343,6 +343,8 @@ pub struct LinkEndpoint {
     /// accepts with it only while an [`InboundWindow`] is open.
     direct_server: quinn::ServerConfig,
     expected: Arc<Mutex<Expected>>,
+    /// Whether inbound attempts are taken at all ([`set_accepting`](Self::set_accepting)).
+    accepting: AtomicBool,
 }
 
 impl LinkEndpoint {
@@ -407,6 +409,7 @@ impl LinkEndpoint {
             listening: listen,
             direct_server,
             expected: Arc::new(Mutex::new(Expected::default())),
+            accepting: AtomicBool::new(true),
         })
     }
 
@@ -416,6 +419,15 @@ impl LinkEndpoint {
 
     pub fn is_listening(&self) -> bool {
         self.listening
+    }
+
+    /// Take inbound attempts (`true`, the default) or none (`false`): while
+    /// off, every attempt that reaches the socket is dropped unanswered
+    /// (`Incoming::ignore`, not a refusal: nothing leaves this device), links
+    /// already up are the caller's to close. A device that went offline
+    /// (ndn-link.md §17D) turns it off.
+    pub fn set_accepting(&self, accepting: bool) {
+        self.accepting.store(accepting, Ordering::SeqCst);
     }
 
     /// Dial `addr`. With `expected`, the handshake fails unless the listener
@@ -543,6 +555,10 @@ impl LinkEndpoint {
             let incoming = self.endpoint.accept().await?;
             let remote = incoming.remote_address();
             let punched = self.expects(remote);
+            if !self.accepting.load(Ordering::SeqCst) {
+                incoming.ignore();
+                continue;
+            }
             if !self.listening && !punched {
                 // Not listening: as if nothing were here.
                 incoming.ignore();

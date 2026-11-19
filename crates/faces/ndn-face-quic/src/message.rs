@@ -30,6 +30,11 @@
 //! namespace `Name` linked to the relay now (device name and key
 //! fingerprint, no address), the full list; the latest for a namespace
 //! replaces the earlier ones, and an empty list says none is.
+//! `Departure = 0x044C { Name(folder), Name(record) }` — after the verdict,
+//! inviter to the person it let go of `folder`: the log entry name of the
+//! members record that leaves the person out, a hint of which name to fetch
+//! (it carries no authority; the record is judged by its signatures). The
+//! latest for a folder replaces the earlier ones.
 //!
 //! Every message after the verdict has an even TLV-TYPE above 31, so a
 //! receiver that predates it skips it. A malformed one closes the link with
@@ -56,6 +61,11 @@ const WAKE_TOKEN: u64 = 0x0444;
 pub(crate) const PRESENCE: u64 = 0x0446;
 const PRESENT_DEVICE: u64 = 0x0448;
 const KEY_DIGEST: u64 = 0x044A;
+pub(crate) const DEPARTURE: u64 = 0x044C;
+
+/// Most distinct `Departure` messages a link takes from its peer, and queues
+/// toward it: a person is let go of a few folders at once, not hundreds.
+pub const DEPARTURES_MAX: usize = 16;
 pub(crate) const DATA: u64 = 0x06;
 const NAME: u64 = 0x07;
 
@@ -397,6 +407,65 @@ fn decode_present_device(value: &[u8]) -> Result<PresentDevice, String> {
 
 fn decode_name(value: &[u8], what: &str) -> Result<Name, String> {
     Name::decode(Bytes::copy_from_slice(value)).map_err(|e| format!("{what}: {e}"))
+}
+
+/// A `Departure` message: the inviter tells a person it let go which members
+/// record to fetch. A hint of *which name to ask for*, with no authority of
+/// its own: the record fetched is judged by its signatures, not by this.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Departure {
+    /// The folder the person was let go of.
+    pub folder: Name,
+    /// The log entry name of the members record that leaves the person out.
+    pub record: Name,
+}
+
+impl Departure {
+    pub(crate) fn encode(&self) -> Bytes {
+        let mut w = TlvWriter::new();
+        w.write_nested(DEPARTURE, |w| {
+            w.write_raw(&self.folder.encode_to_tlv());
+            w.write_raw(&self.record.encode_to_tlv());
+        });
+        w.finish()
+    }
+
+    /// Decode the value of a `Departure` TLV: exactly two names, the folder
+    /// then the record.
+    pub(crate) fn decode(value: &[u8]) -> Result<Self, String> {
+        let mut folder = None;
+        let mut record = None;
+        let mut cur = value;
+        while !cur.is_empty() {
+            let (t, start, end) = split_tlv(cur)?;
+            match t {
+                NAME if folder.is_none() => {
+                    folder = Some(decode_name(
+                        &cur[start..end],
+                        "the folder of the Departure message",
+                    )?);
+                }
+                NAME if record.is_none() => {
+                    record = Some(decode_name(
+                        &cur[start..end],
+                        "the record of the Departure message",
+                    )?);
+                }
+                NAME => return Err("a third name in the Departure message".into()),
+                t if skippable(t) => {}
+                t => {
+                    return Err(format!(
+                        "unknown critical field {t:#x} in the Departure message"
+                    ));
+                }
+            }
+            cur = &cur[end..];
+        }
+        match (folder, record) {
+            (Some(folder), Some(record)) => Ok(Self { folder, record }),
+            _ => Err("a Departure message needs a folder and a record name".into()),
+        }
+    }
 }
 
 /// A UDP address as link messages and direct-path candidates carry it: the
@@ -830,5 +899,43 @@ mod tests {
         assert!(Presence::decode(&short_key).is_err());
         let no_key = [0x07, 0x00, 0xFD, 0x04, 0x48, 0x02, 0x07, 0x00];
         assert!(Presence::decode(&no_key).is_err());
+    }
+
+    #[test]
+    fn departure_matches_the_spec_vector_round_trips_and_is_read_strictly() {
+        let departure = Departure {
+            folder: "/a/32=data/n".parse().unwrap(),
+            record: "/a/d/32=log/n/seq=3".parse().unwrap(),
+        };
+        let wire = departure.encode();
+        // The vector of the spec (ndn-link.md §19.20), 37 bytes.
+        let hex: String = wire.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            "fd044c21070c08016120046461746108016e071108016108016420036c6f6708016e3a0103"
+        );
+        // 0x044C { Name(folder), Name(record) }
+        assert_eq!(&wire[..3], [0xFD, 0x04, 0x4C]);
+        let folder = departure.folder.encode_to_tlv();
+        let record = departure.record.encode_to_tlv();
+        assert_eq!(usize::from(wire[3]), folder.len() + record.len());
+        assert_eq!(&wire[4..4 + folder.len()], folder.as_ref());
+        assert_eq!(&wire[4 + folder.len()..], record.as_ref());
+        assert_eq!(Departure::decode(&wire[4..]).unwrap(), departure);
+        // Both names are required, and no third one.
+        assert!(Departure::decode(&[]).is_err());
+        assert!(Departure::decode(&folder).is_err());
+        let mut three = wire[4..].to_vec();
+        three.extend_from_slice(&record);
+        assert!(Departure::decode(&three).is_err());
+        // An unknown even field above 31 is skipped, an odd one is critical.
+        let mut skipped = wire[4..].to_vec();
+        skipped.extend([0xFD, 0x04, 0x4E, 0x00]);
+        assert_eq!(Departure::decode(&skipped).unwrap(), departure);
+        let mut critical = wire[4..].to_vec();
+        critical.extend([0xFD, 0x04, 0x4F, 0x00]);
+        assert!(Departure::decode(&critical).is_err());
+        // A name that is not a Name.
+        assert!(Departure::decode(&[0x07, 0x01, 0xFF, 0x07, 0x00]).is_err());
     }
 }

@@ -106,6 +106,21 @@ pub struct LinkScope {
     /// everywhere may answer for some names only. The peer's Interests, and
     /// what this side sends, are judged by `names` alone.
     pub answers_in: Option<NameFilter>,
+    /// When set, the scope narrows in place while [`Narrowing::when`] holds
+    /// (asked at every packet), with no reconnect.
+    pub narrowing: Option<Narrowing>,
+}
+
+/// What a scope carries while it is narrowed: the same names and rates, other
+/// kinds of packet. A link whose reason to be broad ended (a grant's last
+/// entry, ndn-link §8.8) narrows to what the person may still be told.
+pub struct Narrowing {
+    /// Whether the scope is narrowed now.
+    pub when: Box<dyn Fn() -> bool + Send + Sync>,
+    /// What the peer may send while narrowed.
+    pub receives: Carries,
+    /// What this side may send while narrowed.
+    pub sends: Carries,
 }
 
 /// What a scope did with a frame.
@@ -221,7 +236,7 @@ impl ScopeState {
         }
         self.judge(
             packet,
-            self.scope.receives,
+            self.carries(|n| n.receives, self.scope.receives),
             &self.inbound,
             self.scope.answers_in.as_deref(),
         )
@@ -229,7 +244,21 @@ impl ScopeState {
 
     /// Judge a frame this side would send.
     pub(crate) fn sending(&self, frame: &Bytes) -> Judged {
-        self.judge(Packet::of(frame), self.scope.sends, &self.outbound, None)
+        self.judge(
+            Packet::of(frame),
+            self.carries(|n| n.sends, self.scope.sends),
+            &self.outbound,
+            None,
+        )
+    }
+
+    /// What one direction carries now: the narrowed kind while the scope is
+    /// narrowed, else `plain`.
+    fn carries(&self, narrowed: impl Fn(&Narrowing) -> Carries, plain: Carries) -> Carries {
+        match &self.scope.narrowing {
+            Some(n) if (n.when)() => narrowed(n),
+            _ => plain,
+        }
     }
 
     fn take_token(&self) -> bool {
@@ -432,6 +461,7 @@ mod tests {
             shared: None,
             explain: "test".into(),
             answers_in: None,
+            narrowing: None,
         })
     }
 
@@ -494,6 +524,7 @@ mod tests {
             shared: None,
             explain: "test".into(),
             answers_in: Some(Box::new(move |n: &Name| n.has_prefix(&own))),
+            narrowing: None,
         });
         let lp = |p: &Bytes| ndn_packet::lp::encode_lp_packet(p);
         assert_eq!(
@@ -516,6 +547,53 @@ mod tests {
             Judged::Pass,
             "what this side sends is not held to answers_in"
         );
+    }
+
+    /// A narrowing scope carries what it was admitted for until `when` holds,
+    /// then, with no reconnect, only Interests from the peer and answers to
+    /// it, within the same names; it widens again when `when` stops holding.
+    #[test]
+    fn a_narrowing_scope_narrows_in_place_and_widens_back() {
+        let narrowed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&narrowed);
+        let s = ScopeState::new(LinkScope {
+            receives: Carries::Everything,
+            sends: Carries::Everything,
+            names: Box::new(|_: &Name| true),
+            rate: RateLimit {
+                burst: 100,
+                per_sec: 100,
+            },
+            shared: None,
+            explain: "test".into(),
+            answers_in: None,
+            narrowing: Some(Narrowing {
+                when: Box::new(move || flag.load(Ordering::SeqCst)),
+                receives: Carries::Interests,
+                sends: Carries::Answers,
+            }),
+        });
+        let lp = |p: &Bytes| ndn_packet::lp::encode_lp_packet(p);
+        let pushed = lp(&data("/bob/x", 10));
+        let asked = lp(&interest("/bob/x"));
+        assert_eq!(s.received(&pushed), Judged::Pass, "a full link before");
+        assert_eq!(s.sending(&asked), Judged::Pass);
+
+        narrowed.store(true, Ordering::SeqCst);
+        assert_eq!(
+            s.received(&pushed),
+            Judged::Drop(None),
+            "no Data from the peer once narrowed"
+        );
+        assert_eq!(s.received(&asked), Judged::Pass, "its Interests still come");
+        assert!(
+            matches!(s.sending(&asked), Judged::Drop(Some(_))),
+            "this side asks the peer nothing once narrowed"
+        );
+        assert_eq!(s.sending(&pushed), Judged::Pass, "it still answers");
+
+        narrowed.store(false, Ordering::SeqCst);
+        assert_eq!(s.received(&pushed), Judged::Pass, "widened again");
     }
 
     #[test]
@@ -591,6 +669,7 @@ mod tests {
                 shared: Some(Arc::clone(&shared)),
                 explain: "test".into(),
                 answers_in: None,
+                narrowing: None,
             })
         };
         let (a, b) = (link(), link());

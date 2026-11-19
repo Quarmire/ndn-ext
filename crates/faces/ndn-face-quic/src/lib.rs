@@ -50,6 +50,9 @@
 //!   ([`LinkHandle::send_presence`], [`Presence`]). A device closing its
 //!   link to sleep says so ([`CloseReason::Asleep`]). What to do with them
 //!   is the `ndn-link` crate's.
+//! - **Departure.** An inviter that let a person go tells them which members
+//!   record to fetch ([`LinkHandle::send_departure`], [`Departure`]); a link
+//!   scope may narrow in place ([`Narrowing`]).
 //! - **Direct paths.** Each side tells the other the address it sees it at
 //!   ([`LinkHandle::observed_address`]), which is how a device behind a NAT
 //!   learns its address beyond it. The link socket sends and receives the
@@ -86,9 +89,10 @@ pub use membership::{
     Membership, binding_transcript,
 };
 pub use message::{
-    CloseReason, LINK_PROTOCOL_VERSION, LinkHello, LinkVerdict, PathSession, Presence,
-    PresentDevice, Reachability, WAKE_TOKEN_MAX, decode_udp_address, encode_udp_address,
+    CloseReason, DEPARTURES_MAX, Departure, LINK_PROTOCOL_VERSION, LinkHello, LinkVerdict,
+    PathSession, Presence, PresentDevice, Reachability, WAKE_TOKEN_MAX, decode_udp_address,
+    encode_udp_address,
 };
 pub use probe::{PROBE_LEN, ProbeWatch, decode_probe, encode_probe};
-pub use scope::{Carries, LinkScope, NameFilter, RateLimit, SharedRate};
+pub use scope::{Carries, LinkScope, NameFilter, Narrowing, RateLimit, SharedRate};
 pub use text::{PEER_TEXT_MAX, bounded_text, clean_text, sanitize_peer_text};

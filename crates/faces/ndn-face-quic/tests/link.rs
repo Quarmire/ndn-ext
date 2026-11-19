@@ -15,9 +15,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use ndn_face_quic::{
-    Admission, Carries, CloseReason, HandshakeLimits, KeyFingerprint, Link, LinkEndpoint,
-    LinkError, LinkHello, LinkKey, LinkScope, LinkTransportConfig, LinkVerdict, Presence,
-    PresentDevice, RateLimit, Reachability,
+    Admission, Carries, CloseReason, Departure, HandshakeLimits, KeyFingerprint, Link,
+    LinkEndpoint, LinkError, LinkHello, LinkKey, LinkScope, LinkTransportConfig, LinkVerdict,
+    Presence, PresentDevice, RateLimit, Reachability,
 };
 use ndn_packet::Name;
 use ndn_packet::encode::{DataBuilder, InterestBuilder};
@@ -333,6 +333,7 @@ async fn an_enrollment_link_carries_only_its_scope_and_says_so() {
             shared: None,
             explain: "enrollment only".into(),
             answers_in: None,
+            narrowing: None,
         };
         let admission = Admission {
             verdict: LinkVerdict {
@@ -901,6 +902,69 @@ async fn presence_reaches_the_peer_and_replaces_per_namespace() {
     assert!(
         relay.handle.presence().borrow().is_empty(),
         "only the relay told"
+    );
+}
+
+#[tokio::test]
+async fn a_departure_reaches_the_peer_once_and_no_more_than_a_link_takes_are_told() {
+    let dialer = endpoint(ed_key(1), false);
+    let listener = endpoint(ed_key(2), true);
+    let (person, inviter) = link(&dialer, &listener).await;
+    let departure = |folder: &str, record: &str| Departure {
+        folder: folder.parse().unwrap(),
+        record: record.parse().unwrap(),
+    };
+    let a = departure("/a/32=data/one", "/a/d/32=log/one/seq=2");
+    let b = departure("/a/32=data/two", "/a/d/32=log/two/seq=7");
+    assert!(person.handle.departures().borrow().is_empty());
+    inviter.handle.send_departure(&a);
+    inviter.handle.send_departure(&b);
+    // Told again: still one entry.
+    inviter.handle.send_departure(&a);
+    let mut heard = person.handle.departures();
+    tokio::time::timeout(
+        T,
+        heard.wait_for(|all| all.contains(&a) && all.contains(&b)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        person.handle.departures().borrow().len(),
+        2,
+        "the same message twice is one entry"
+    );
+    assert!(
+        inviter.handle.departures().borrow().is_empty(),
+        "only the inviter told"
+    );
+
+    // More distinct folders than a link takes: the receiver closes the link
+    // as a protocol error and says why.
+    for i in 0..40 {
+        inviter.handle.send_departure(&departure(
+            &format!("/a/32=data/f{i}"),
+            &format!("/a/d/32=log/f{i}/seq=1"),
+        ));
+    }
+    let mut heard = person.handle.departures();
+    tokio::time::timeout(
+        T,
+        heard.wait_for(|all| all.len() == ndn_face_quic::DEPARTURES_MAX),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        person.handle.departures().borrow().len(),
+        ndn_face_quic::DEPARTURES_MAX,
+        "a sender tells no more folders than the peer takes"
+    );
+    assert!(
+        !inviter.handle.is_closed() && !person.handle.is_closed(),
+        "telling too many is not a reason to close the link"
     );
 }
 

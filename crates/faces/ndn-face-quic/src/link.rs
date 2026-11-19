@@ -16,9 +16,9 @@ use crate::endpoint::Permit;
 use crate::key::{KeyFingerprint, LinkKey, PeerKey};
 use crate::membership::{ChannelBinding, MEMBERSHIP_EXPORTER_LABEL};
 use crate::message::{
-    CloseReason, LINK_HELLO, LINK_VERDICT, LinkHello, LinkVerdict, MAX_MESSAGE, OBSERVED_ADDRESS,
-    PRESENCE, Presence, REACHABILITY, Reachability, WAKE_TOKEN_MAX, decode_udp_address,
-    encode_observed_address, skippable, split_tlv,
+    CloseReason, DEPARTURE, DEPARTURES_MAX, Departure, LINK_HELLO, LINK_VERDICT, LinkHello,
+    LinkVerdict, MAX_MESSAGE, OBSERVED_ADDRESS, PRESENCE, Presence, REACHABILITY, Reachability,
+    WAKE_TOKEN_MAX, decode_udp_address, encode_observed_address, skippable, split_tlv,
 };
 use crate::scope::{Judged, LinkScope, ScopeState, nack_for};
 
@@ -271,11 +271,13 @@ impl Handshaken {
         let (observed_tx, observed) = tokio::sync::watch::channel(None);
         let (reachability_tx, reachability) = tokio::sync::watch::channel(None);
         let (presence_tx, presence) = tokio::sync::watch::channel(Vec::new());
+        let (departures_tx, departures) = tokio::sync::watch::channel(Vec::new());
         let outbox = Arc::new(Outbox::default());
         let heard = Heard {
             observed: observed_tx,
             reachability: reachability_tx,
             presence: presence_tx,
+            departures: departures_tx,
         };
         tokio::spawn(observe(
             self.connection.clone(),
@@ -300,6 +302,7 @@ impl Handshaken {
                 outbox,
                 reachability,
                 presence,
+                departures,
                 local_close: Arc::default(),
             },
             peer_verdict,
@@ -455,6 +458,9 @@ struct Outbox {
 struct Pending {
     reachability: Option<Bytes>,
     presence: Vec<(Name, Bytes)>,
+    departures: Vec<(Name, Bytes)>,
+    /// The folders this side told the peer of, ever, on this link.
+    told: Vec<Name>,
 }
 
 impl Outbox {
@@ -476,12 +482,32 @@ impl Outbox {
         self.ready.notify_one();
     }
 
-    fn take(&self) -> Vec<Bytes> {
+    /// Queue a `Departure` for `folder`; `false` when this link already told
+    /// [`DEPARTURES_MAX`] other folders (the peer takes no more).
+    fn put_departure(&self, folder: &Name, wire: Bytes) -> bool {
         let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        if !pending.told.contains(folder) {
+            if pending.told.len() >= DEPARTURES_MAX {
+                return false;
+            }
+            pending.told.push(folder.clone());
+        }
+        match pending.departures.iter_mut().find(|(f, _)| f == folder) {
+            Some((_, queued)) => *queued = wire,
+            None => pending.departures.push((folder.clone(), wire)),
+        }
+        drop(pending);
+        self.ready.notify_one();
+        true
+    }
+
+    fn take(&self) -> Vec<Bytes> {
+        let pending = &mut *self.pending.lock().unwrap_or_else(PoisonError::into_inner);
         let reachability = pending.reachability.take();
         reachability
             .into_iter()
             .chain(pending.presence.drain(..).map(|(_, wire)| wire))
+            .chain(pending.departures.drain(..).map(|(_, wire)| wire))
             .collect()
     }
 }
@@ -491,6 +517,7 @@ struct Heard {
     observed: tokio::sync::watch::Sender<Option<SocketAddr>>,
     reachability: tokio::sync::watch::Sender<Option<Reachability>>,
     presence: tokio::sync::watch::Sender<Vec<Presence>>,
+    departures: tokio::sync::watch::Sender<Vec<Departure>>,
 }
 
 impl Heard {
@@ -532,6 +559,29 @@ impl Heard {
                     return Err(format!(
                         "presence for more than {PRESENCE_NAMESPACES_MAX} namespaces at once: a relay \
                          tells a device of the namespaces they share"
+                    ));
+                }
+            }
+            DEPARTURE => {
+                let d = Departure::decode(value)
+                    .map_err(|e| format!("malformed Departure link message: {e}"))?;
+                let mut over = false;
+                self.departures.send_if_modified(|all| {
+                    match all.iter().position(|q| q.folder == d.folder) {
+                        Some(i) if all[i] == d => return false,
+                        Some(i) => all[i] = d,
+                        None if all.len() >= DEPARTURES_MAX => {
+                            over = true;
+                            return false;
+                        }
+                        None => all.push(d),
+                    }
+                    true
+                });
+                if over {
+                    return Err(format!(
+                        "a Departure message for more than {DEPARTURES_MAX} folders at once: a \
+                         link tells a person of the few folders it let them go of"
                     ));
                 }
             }
@@ -644,6 +694,7 @@ pub struct LinkHandle {
     outbox: Arc<Outbox>,
     reachability: tokio::sync::watch::Receiver<Option<Reachability>>,
     presence: tokio::sync::watch::Receiver<Vec<Presence>>,
+    departures: tokio::sync::watch::Receiver<Vec<Departure>>,
     /// What this side said when it closed the link (the first close wins, as
     /// in QUIC): the connection itself keeps no text of a close made here.
     local_close: Arc<std::sync::OnceLock<(CloseReason, String)>>,
@@ -755,6 +806,41 @@ impl LinkHandle {
             return;
         }
         self.outbox.put_presence(&p.namespace, wire);
+    }
+
+    /// Tell the peer it was let go of `d.folder`, naming the members record
+    /// to fetch ([`Departure`]); it replaces what was told before for that
+    /// folder. A link tells at most [`DEPARTURES_MAX`] folders (the peer
+    /// closes a link that hears more): the others are not sent, and the
+    /// warning says so.
+    pub fn send_departure(&self, d: &Departure) {
+        let wire = d.encode();
+        if wire.len() > MAX_MESSAGE {
+            tracing::warn!(
+                target: "face.quic",
+                peer = %self.connection.remote_address(),
+                "not sending the departure of {}: it takes {} bytes, over the {MAX_MESSAGE}-byte \
+                 limit of a link message",
+                d.folder,
+                wire.len()
+            );
+            return;
+        }
+        if !self.outbox.put_departure(&d.folder, wire) {
+            tracing::warn!(
+                target: "face.quic",
+                peer = %self.connection.remote_address(),
+                "not telling the peer it was let go of {}: this link already told it of \
+                 {DEPARTURES_MAX} folders, which is as many as a link takes",
+                d.folder
+            );
+        }
+    }
+
+    /// What the peer last told this side of its departures, one entry per
+    /// folder (the latest for a folder replaces the earlier).
+    pub fn departures(&self) -> tokio::sync::watch::Receiver<Vec<Departure>> {
+        self.departures.clone()
     }
 
     /// The peer's latest presence, one entry per namespace with a device
@@ -882,5 +968,53 @@ impl Transport for LinkFace {
                 Judged::Drop(None) => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn heard() -> (Heard, tokio::sync::watch::Receiver<Vec<Departure>>) {
+        let (departures, rx) = tokio::sync::watch::channel(Vec::new());
+        let heard = Heard {
+            observed: tokio::sync::watch::channel(None).0,
+            reachability: tokio::sync::watch::channel(None).0,
+            presence: tokio::sync::watch::channel(Vec::new()).0,
+            departures,
+        };
+        (heard, rx)
+    }
+
+    fn departure(i: usize, seq: usize) -> Departure {
+        Departure {
+            folder: format!("/a/32=data/f{i}").parse().unwrap(),
+            record: format!("/a/d/32=log/f{i}/seq={seq}").parse().unwrap(),
+        }
+    }
+
+    /// A malformed Departure, or one for more folders than a link takes,
+    /// closes the link as a protocol error; the latest for a folder replaces
+    /// the earlier.
+    #[test]
+    fn a_peer_that_tells_too_many_folders_or_garbage_is_a_protocol_error() {
+        let (heard, rx) = heard();
+        for i in 0..DEPARTURES_MAX {
+            let wire = departure(i, 1).encode();
+            heard.take(DEPARTURE, &wire[4..]).unwrap();
+        }
+        // The same folder again with a newer record replaces its entry.
+        heard
+            .take(DEPARTURE, &departure(3, 9).encode()[4..])
+            .unwrap();
+        assert_eq!(rx.borrow().len(), DEPARTURES_MAX);
+        assert!(rx.borrow().contains(&departure(3, 9)));
+        assert!(!rx.borrow().contains(&departure(3, 1)));
+        let over = heard
+            .take(DEPARTURE, &departure(DEPARTURES_MAX, 1).encode()[4..])
+            .unwrap_err();
+        assert!(over.contains("Departure"), "{over}");
+        let garbage = heard.take(DEPARTURE, &[0x07, 0x00]).unwrap_err();
+        assert!(garbage.contains("Departure"), "{garbage}");
     }
 }
