@@ -71,7 +71,9 @@ impl LinkError {
         match e {
             ConnectionError::ApplicationClosed(close) => {
                 let reason = CloseReason::from_code(close.error_code.into_inner());
-                let text = String::from_utf8_lossy(&close.reason).into_owned();
+                // The other device chose these words: whatever it put in them,
+                // what is handed up is one bounded line of printable text.
+                let text = crate::text::sanitize_peer_text(&String::from_utf8_lossy(&close.reason));
                 Self::Refused { reason, text }
             }
             ConnectionError::ConnectionClosed(close)
@@ -88,7 +90,8 @@ impl LinkError {
                 "the other device stopped answering (it went away, or the path to it broke)".into(),
             ),
             ConnectionError::LocallyClosed => Self::Connect("this device closed the link".into()),
-            other => Self::Connect(other.to_string()),
+            // A transport close of the other device quotes its reason phrase.
+            other => Self::Connect(crate::text::sanitize_peer_text(&other.to_string())),
         }
     }
 

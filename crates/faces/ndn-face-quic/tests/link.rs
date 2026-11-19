@@ -606,6 +606,88 @@ async fn a_closed_link_tells_why() {
     );
 }
 
+/// What a hostile peer puts in a close reason: a forged log line, a terminal
+/// escape, a bidi override, a zero-width character, and a page of words.
+fn hostile_text() -> String {
+    format!(
+        "your key is revoked\n2026-01-01 INFO face.quic: trusted \x1b[2J\x1b[31m call \u{202E}now\u{200B}{}",
+        " persuade".repeat(500)
+    )
+}
+
+/// What a link hands up of the other device's close text has no control or
+/// invisible character, is on one line and is bounded, whichever way the
+/// other device closed.
+fn assert_clean(text: &str) {
+    assert!(
+        !text
+            .chars()
+            .any(|c| c.is_control()
+                || matches!(c, '\u{202E}' | '\u{200B}' | '\u{2066}'..='\u{2069}')),
+        "the peer's control characters reached the caller: {text:?}"
+    );
+    assert!(
+        text.chars().count() <= ndn_face_quic::PEER_TEXT_MAX,
+        "the peer's text is not bounded: {} characters",
+        text.chars().count()
+    );
+    assert!(
+        text.starts_with("your key is revoked 2026-01-01 INFO"),
+        "{text:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_hostile_close_text_is_cleaned_before_it_is_handed_up() {
+    let dialer = endpoint(ed_key(1), false);
+    let listener = endpoint(ed_key(2), true);
+    let (a, b) = link(&dialer, &listener).await;
+    b.handle.close(CloseReason::Revoked, &hostile_text());
+    match tokio::time::timeout(T, a.handle.closed()).await.unwrap() {
+        LinkError::Refused { reason, text } => {
+            assert_eq!(reason, Some(CloseReason::Revoked));
+            assert_clean(&text);
+            assert!(text.ends_with('…'), "{text:?}");
+        }
+        other => panic!("expected the close reason, got {other}"),
+    }
+}
+
+#[tokio::test]
+async fn a_hostile_refusal_text_is_cleaned_before_it_is_handed_up() {
+    let dialer = endpoint(ed_key(1), false);
+    let listener = endpoint(ed_key(2), true);
+    let target = addr(&listener);
+    let refuse = async {
+        let mut hs = listener.accept().await.unwrap().handshake().await.unwrap();
+        hs.exchange_hello(&hello(2), T).await.unwrap();
+        hs.refuse(CloseReason::Revoked, &hostile_text());
+    };
+    let dial = async {
+        let mut hs = dialer.connect(target, None).await.unwrap();
+        match hs.exchange_hello(&hello(1), T).await {
+            Err(e) => Some(e),
+            Ok(_) => hs.admit(FaceId(1), T, Admission::default()).await.err(),
+        }
+    };
+    let ((), refused) = tokio::join!(refuse, dial);
+    match refused {
+        Some(error @ LinkError::Refused { .. }) => {
+            let LinkError::Refused { text, .. } = &error else {
+                unreachable!()
+            };
+            assert_clean(text);
+            assert_clean(
+                error
+                    .to_string()
+                    .strip_prefix("the other device closed the link: ")
+                    .expect("the sentence quotes the text"),
+            );
+        }
+        other => panic!("expected the refusal, got {other:?}"),
+    }
+}
+
 /// Wait until `handle` says the other side sees this one at `want`.
 async fn observed(link: &Link, want: SocketAddr, within: Duration) {
     let start = std::time::Instant::now();

@@ -71,6 +71,7 @@ mod membership;
 mod message;
 mod probe;
 mod scope;
+mod text;
 mod verify;
 
 pub use endpoint::{
@@ -90,3 +91,4 @@ pub use message::{
 };
 pub use probe::{PROBE_LEN, ProbeWatch, decode_probe, encode_probe};
 pub use scope::{Carries, LinkScope, NameFilter, RateLimit, SharedRate};
+pub use text::{PEER_TEXT_MAX, bounded_text, clean_text, sanitize_peer_text};
