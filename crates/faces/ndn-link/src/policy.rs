@@ -41,9 +41,13 @@ pub const VIA_RELAY_COST: u32 = 10;
 /// Cost of a route the joiner's link gets toward a namespace of another
 /// writer of a folder it joined ([`Links::set_joined_routes`](crate::Links::set_joined_routes)):
 /// above every route the link layer makes for a real path (a relay's, a
-/// direct path's), so a path to the namespace's own devices, when there is
-/// one, always wins; this route is the way through the inviter only when
-/// there is no other.
+/// direct path's), so among routes **for the same prefix** a path to the
+/// namespace's own devices wins and this route is the way through the inviter
+/// only when there is no other. Cost decides only among routes of one prefix:
+/// a forwarder takes the longest matching prefix first. What keeps this route
+/// from taking a name away from a better route is the device's filter on the
+/// names it lists (a name that names itself, and none above or below a
+/// namespace it holds), not this cost.
 pub const JOINED_ROUTE_COST: u32 = VIA_RELAY_COST + 1000;
 /// Distinct namespaces in all that [`Links::set_joined_routes`](crate::Links::set_joined_routes)
 /// takes (each is routed with its sync group); a namespace in two folders

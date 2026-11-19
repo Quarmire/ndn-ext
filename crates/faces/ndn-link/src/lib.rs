@@ -207,11 +207,15 @@
 //! `joined_folders` with it). Each namespace, and for a writer-role joiner
 //! its sync group (a reader is routed the namespace only), is routed over the **full link of
 //! the inviter's key**, admitted by an identity of the owner's namespace, at a
-//! cost above every real path ([`policy::JOINED_ROUTE_COST`]), and over no
-//! other link; it goes with the entry, the record's writer and the link, and
-//! it is a path, not a right: the inviter's filter decides what crosses it.
-//! At most [`policy::JOINED_ROUTES_MAX`] prefixes in [`policy::JOINED_FOLDERS_MAX`]
-//! folders (`ndn-rs/docs/specs/ndn-link.md` §8.7).
+//! cost above every real path ([`policy::JOINED_ROUTE_COST`]; cost decides only
+//! among routes of the same prefix, a forwarder takes the longest prefix first,
+//! so the device lists only names that cannot take a name from a better route),
+//! and over no other link; it goes with the entry, the record's writer and the
+//! link, and it is a path, not a right: the inviter's filter decides what
+//! crosses it. At most [`policy::JOINED_ROUTES_MAX`] prefixes in
+//! [`policy::JOINED_FOLDERS_MAX`] folders, shared equally by the inviters, and
+//! none under or over `/localhost` or `/localhop`
+//! (`ndn-rs/docs/specs/ndn-link.md` §8.7).
 //!
 //! The inviter's side is routed too: a link admitted by a live grant entry (the
 //! inviter's grant of a person, and the mirror a joiner keeps of its inviter)

@@ -326,15 +326,18 @@ impl Links {
     /// **full, identified link of the inviter's key** (its handshake proved
     /// that key, an identity that validates in the folder's owner namespace
     /// admitted it, and it is no enrollment, introduction or departure link)
-    /// at [`JOINED_ROUTE_COST`](crate::policy::JOINED_ROUTE_COST), above every
-    /// route of a real path, and over no other link; a route the set no
+    /// at [`JOINED_ROUTE_COST`](crate::policy::JOINED_ROUTE_COST) (above every
+    /// route of a real path to the same prefix), and over no other link; a
+    /// route the set no
     /// longer lists is removed, and a link that ends takes its routes with its
     /// face. A link made after this call gets its routes when it is up; a link
     /// made only to introduce gets them once it is made again as a full link.
     /// Idempotent, never blocks, bounded
     /// ([`JOINED_ROUTES_MAX`](crate::policy::JOINED_ROUTES_MAX) distinct
     /// prefixes in all, [`JOINED_FOLDERS_MAX`](crate::policy::JOINED_FOLDERS_MAX)
-    /// folders: the excess is dropped with a warning that says why).
+    /// folders, each inviter key an equal share of both; a prefix over or under
+    /// `/localhost` or `/localhop`, or the root, is never routed: the excess
+    /// is dropped with a warning that says why).
     ///
     /// A route is a path, not a right: the inviter's own filter decides what
     /// crosses it. [`LinkHints::serve`](crate::LinkHints::serve) calls this

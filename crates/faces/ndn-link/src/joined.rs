@@ -13,7 +13,7 @@
 //!
 //! [`Links::set_joined_routes`]: crate::Links::set_joined_routes
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ndn_face_quic::KeyFingerprint;
 use ndn_packet::Name;
@@ -40,8 +40,9 @@ pub struct JoinedRoutes {
     /// device of no such namespace gets no route, whatever it is named.
     pub owner: Name,
     /// The prefixes to route: the other writers' namespaces, as the device
-    /// derived them from the members record in force (never this device's own
-    /// namespace, nor one above or below it).
+    /// derived them from the members record in force (each names itself: the
+    /// namespace of a context held, or a self-certifying person's; never this
+    /// device's own namespace, nor above or below it or another held one).
     pub namespaces: Vec<Name>,
     /// This device writes in the folder: the other writers' sync groups
     /// (`<W>/32=sync`) are routed beside `<W>`. The group is how a writer's
@@ -58,23 +59,64 @@ pub struct JoinedRoutes {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct JoinedSet(Vec<JoinedRoutes>);
 
+/// Whether `ns` is the root or overlaps `/localhost` or `/localhop` (equal, under
+/// or above): a route for it over a peer's link would divert this host's own
+/// scopes, or every name.
+fn overlaps_local_scope(ns: &Name) -> bool {
+    ["localhost", "localhop"].into_iter().any(|scope| {
+        let scope = Name::root().append(scope);
+        ns.has_prefix(&scope) || scope.has_prefix(ns)
+    })
+}
+
 impl JoinedSet {
     /// `routes` within [`JOINED_FOLDERS_MAX`] folders and [`JOINED_ROUTES_MAX`]
-    /// distinct prefixes in all, in the order given; what exceeds them is
-    /// dropped, with a warning that says so.
+    /// distinct prefixes in all; what exceeds them is dropped, with a warning
+    /// that says so.
+    ///
+    /// **Each inviter has an equal share of both bounds** (the bound divided by
+    /// the number of inviters, at least one; a sole inviter has all of it), taken
+    /// from its folders in the order given. Without it, one inviter whose
+    /// folders sort first and list the most writers uses up every slot, and the
+    /// folders of every other inviter get no route: a denial of service by
+    /// whoever invited this device first. The share is not lent to the others
+    /// when an inviter does not use it: that keeps the rule one line, and what
+    /// one inviter lists never changes what another gets.
+    ///
+    /// A prefix that overlaps `/localhost` or `/localhop`, or is the root, is
+    /// never routed whatever it came from: they are scopes of this host and of
+    /// its direct neighbours, which no peer's link may carry Interests for.
     pub(crate) fn bounded(routes: Vec<JoinedRoutes>) -> Self {
         let given = routes.len();
+        let inviters: BTreeSet<KeyFingerprint> = routes.iter().map(|f| f.inviter).collect();
+        let folder_share = (JOINED_FOLDERS_MAX / inviters.len().max(1)).max(1);
+        let route_share = (JOINED_ROUTES_MAX / inviters.len().max(1)).max(1);
         let mut kept = Vec::new();
         let mut prefixes: BTreeSet<Name> = BTreeSet::new();
-        let mut dropped = 0usize;
-        for mut folder in routes.into_iter().take(JOINED_FOLDERS_MAX) {
+        let mut per_inviter: BTreeMap<KeyFingerprint, (usize, BTreeSet<Name>)> = BTreeMap::new();
+        let (mut folders_dropped, mut dropped, mut local) = (0usize, 0usize, 0usize);
+        for mut folder in routes {
+            let (folders, own) = per_inviter.entry(folder.inviter).or_default();
+            if kept.len() >= JOINED_FOLDERS_MAX || *folders >= folder_share {
+                folders_dropped += 1;
+                continue;
+            }
+            *folders += 1;
             let mut taken = Vec::new();
             for ns in folder.namespaces {
                 if taken.contains(&ns) {
                     continue;
                 }
-                if prefixes.contains(&ns) || prefixes.len() < JOINED_ROUTES_MAX {
+                if overlaps_local_scope(&ns) {
+                    local += 1;
+                    continue;
+                }
+                let room = own.contains(&ns)
+                    || (own.len() < route_share
+                        && (prefixes.contains(&ns) || prefixes.len() < JOINED_ROUTES_MAX));
+                if room {
                     prefixes.insert(ns.clone());
+                    own.insert(ns.clone());
                     taken.push(ns);
                 } else {
                     dropped += 1;
@@ -83,22 +125,30 @@ impl JoinedSet {
             folder.namespaces = taken;
             kept.push(folder);
         }
-        if given > JOINED_FOLDERS_MAX {
+        if folders_dropped > 0 {
             tracing::warn!(
                 target: "face.quic",
                 given,
-                "the joined folders are more than the {JOINED_FOLDERS_MAX} this device routes: \
-                 the folders after the first {JOINED_FOLDERS_MAX} get no route; end the folders \
-                 you no longer use"
+                "the joined folders are more than this device routes ({JOINED_FOLDERS_MAX} in all, \
+                 shared equally by the inviters): {folders_dropped} folders get no route; end the \
+                 folders you no longer use"
             );
         }
         if dropped > 0 {
             tracing::warn!(
                 target: "face.quic",
                 dropped,
-                "the joined folders list more than {JOINED_ROUTES_MAX} distinct namespaces: \
-                 {dropped} get no route; a folder with fewer writers, or fewer joined folders, \
-                 routes them all"
+                "the joined folders list more than this device routes ({JOINED_ROUTES_MAX} \
+                 distinct namespaces in all, shared equally by the inviters): {dropped} get no \
+                 route; a folder with fewer writers, or fewer joined folders, routes them all"
+            );
+        }
+        if local > 0 {
+            tracing::warn!(
+                target: "face.quic",
+                local,
+                "a joined folder lists {local} names under /localhost or /localhop, or the root: \
+                 they are not routed over a peer's link"
             );
         }
         Self(kept)
@@ -136,5 +186,103 @@ impl JoinedSet {
                 })
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn n(s: &str) -> Name {
+        s.parse().unwrap()
+    }
+
+    fn folder(inviter: u8, namespaces: Vec<Name>) -> JoinedRoutes {
+        JoinedRoutes {
+            inviter: KeyFingerprint([inviter; 32]),
+            owner: n("/owner"),
+            namespaces,
+            push: true,
+        }
+    }
+
+    /// `count` writers named `/<tag>-<i>`.
+    fn writers(tag: &str, count: usize) -> Vec<Name> {
+        (0..count).map(|i| n(&format!("/{tag}-{i:02}"))).collect()
+    }
+
+    fn kept_by(set: &JoinedSet, inviter: u8) -> Vec<&JoinedRoutes> {
+        set.0
+            .iter()
+            .filter(|f| f.inviter == KeyFingerprint([inviter; 32]))
+            .collect()
+    }
+
+    /// Round-9 L1: one inviter's folders, sorted first, cannot use up the
+    /// budget of namespaces: another inviter's folder keeps its writers.
+    #[test]
+    fn one_inviter_with_four_full_folders_does_not_starve_another_inviters_folder() {
+        let per_folder = JOINED_ROUTES_MAX / 4;
+        let mut routes: Vec<JoinedRoutes> = (0..4)
+            .map(|i| folder(1, writers(&format!("a{i}"), per_folder)))
+            .collect();
+        routes.push(folder(2, writers("b", 16)));
+        let set = JoinedSet::bounded(routes);
+        let b = kept_by(&set, 2);
+        assert_eq!(b.len(), 1, "the other inviter's folder was dropped");
+        assert_eq!(
+            b[0].namespaces,
+            writers("b", 16),
+            "the other inviter's folder lost writers to a first inviter's four folders"
+        );
+        let all: BTreeSet<&Name> = set.0.iter().flat_map(|f| &f.namespaces).collect();
+        assert!(
+            all.len() <= JOINED_ROUTES_MAX,
+            "{} namespaces kept, over the bound",
+            all.len()
+        );
+    }
+
+    /// Round-9 L1, the same for the folders: sixteen of one inviter's folders
+    /// do not take every slot.
+    #[test]
+    fn one_inviter_with_sixteen_folders_does_not_starve_another_inviters_folder() {
+        let mut routes: Vec<JoinedRoutes> = (0..JOINED_FOLDERS_MAX)
+            .map(|i| folder(1, vec![n(&format!("/a{i:02}"))]))
+            .collect();
+        routes.push(folder(2, vec![n("/b")]));
+        let set = JoinedSet::bounded(routes);
+        assert_eq!(
+            kept_by(&set, 2).len(),
+            1,
+            "the other inviter's folder got no slot"
+        );
+        assert!(set.0.len() <= JOINED_FOLDERS_MAX);
+    }
+
+    /// A sole inviter has the whole budget, and the first of its prefixes are
+    /// kept.
+    #[test]
+    fn a_sole_inviter_has_the_whole_budget() {
+        let set = JoinedSet::bounded(vec![folder(1, writers("w", JOINED_ROUTES_MAX + 6))]);
+        assert_eq!(set.0[0].namespaces, writers("w", JOINED_ROUTES_MAX));
+    }
+
+    /// Defence in depth (round-9 M1): whatever the device listed, a prefix
+    /// that overlaps `/localhost` or `/localhop`, or the root, is not routed.
+    #[test]
+    fn the_local_scopes_and_the_root_are_never_routed() {
+        let set = JoinedSet::bounded(vec![folder(
+            1,
+            vec![
+                n("/localhost"),
+                n("/localhost/x"),
+                n("/localhop"),
+                n("/localhop/x"),
+                Name::root(),
+                n("/carol"),
+            ],
+        )]);
+        assert_eq!(set.0[0].namespaces, vec![n("/carol")]);
     }
 }
