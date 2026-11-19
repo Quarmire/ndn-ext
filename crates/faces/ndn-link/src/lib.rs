@@ -211,7 +211,10 @@
 //! address is a hint; a remembered peer is never admitted by its key alone, is
 //! not dialled when no held context (a namespace this device holds, a live
 //! grant) admits it, and is forgotten by [`Links::forget`]
-//! (`ndn-rs/docs/specs/ndn-link.md` §17C).
+//! (`ndn-rs/docs/specs/ndn-link.md` §17C). When an identified peer opens a link
+//! to this device, its record's address is brought up to date: the IP the link
+//! came from, with the port the record holds, goes first; the source port is
+//! the peer's own choice and is never recorded.
 //!
 //! # Relays
 //!

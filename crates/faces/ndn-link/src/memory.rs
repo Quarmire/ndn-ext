@@ -23,9 +23,12 @@
 //!    [`Links::report`].
 //! 7. The addresses are hints with a bound on what they can do: loopback
 //!    and link-local ones are not kept or dialled
-//!    ([`MemoryOptions::include_local`]), the redials are staggered
-//!    ([`MemoryOptions::dials_at_once`]), and an accepted link's source
-//!    address never replaces one this device dialled.
+//!    ([`MemoryOptions::include_local`]), and the redials are staggered
+//!    ([`MemoryOptions::dials_at_once`]).
+//! 8. A link an identified peer opens brings its record's address up to
+//!    date: the IP it came from, with the port the record holds, moves to
+//!    the front of the list ([`Book::learn`]). The source port is the peer's
+//!    own choice and is never recorded.
 //!
 //! The logic (the [`Book`], the decision of rule 3) knows nothing of
 //! QUIC; the loops that dial are at the end.
@@ -298,13 +301,24 @@ impl Book {
     /// remembered; the record's `origin` is the direction of the first
     /// contact.
     ///
-    /// The address of a link the peer opened is its source address: the
-    /// port is the peer's own choice and changes at every reconnect of a
-    /// device that dials from a socket of its own. It is kept only for a
-    /// peer that has no address yet (it is then the one to try, and what a
-    /// peer that listens and dials from its listening socket has), and never
-    /// moves or adds to a list that holds one. The addresses a peer is
-    /// reached at are those this device dialled.
+    /// A link this device dialled is at the peer's listening address: the
+    /// address and its port are kept as they are.
+    ///
+    /// A link the peer opened (`Accepted`) shows where the peer is now, and
+    /// the peer is the holder of `key` (the handshake proved it before this
+    /// is called, and an identity validated in a held namespace admitted
+    /// it): the **address it came from with the port the record holds**
+    /// (`record.port`, else the port of the record's first address) moves to
+    /// the front when its IP is usable and differs from the front address,
+    /// within `addresses_max`. The **source port is never recorded**: it is
+    /// the peer's own choice and changes at every reconnect of a device that
+    /// dials from a socket of its own, so a peer that reconnects 100 times
+    /// from new ports changes nothing. Only a record with no address and no
+    /// port takes the source address and port (the one to try, and what a
+    /// peer that listens and dials from its listening socket has). The
+    /// record is keyed by the proven key: another key's link never reaches
+    /// it. With `persist_addresses` off the new front address lives in
+    /// memory and nothing is marked to save.
     pub(crate) fn learn(
         &mut self,
         key: KeyFingerprint,
@@ -324,28 +338,34 @@ impl Book {
                 record.device = device;
                 changed = true;
             }
-            if usable(&addr, local)
-                && (direction == Direction::Dialed || record.addresses.is_empty())
-                && record.addresses.first() != Some(&addr)
-            {
-                record.addresses.retain(|a| *a != addr);
-                record.addresses.insert(0, addr);
-                record.addresses.truncate(keep);
-                // With the addresses not persisted, the store holds none to
-                // bring up to date.
-                changed |= persists;
-            }
-            // The port of a link this device dialled is the peer's listening
-            // port; the source port of one the peer opened is its own choice
-            // (it changes at every reconnect of a device that dials from a
-            // socket of its own), so it only fills a port not known yet.
-            if usable(&addr, local)
-                && (direction == Direction::Dialed || record.port.is_none())
-                && record.port != Some(addr.port())
-            {
-                record.port = Some(addr.port());
-                // Not persisted either with the addresses off.
-                changed |= persists;
+            // What the list and the port are to become: a link this device
+            // dialled says both; one the peer opened says the IP it is at,
+            // with the port already held (the source port is not it). A
+            // record with no port and no address has none held, and takes the
+            // source address and port.
+            let held_port = record
+                .port
+                .or_else(|| record.addresses.first().map(SocketAddr::port));
+            let (candidate, port) = match (direction, held_port) {
+                (Direction::Accepted, Some(held)) => (SocketAddr::new(addr.ip(), held), None),
+                _ => (addr, Some(addr.port())),
+            };
+            if usable(&candidate, local) {
+                if record.addresses.first() != Some(&candidate) {
+                    record.addresses.retain(|a| *a != candidate);
+                    record.addresses.insert(0, candidate);
+                    record.addresses.truncate(keep);
+                    // With the addresses not persisted, the store holds none
+                    // to bring up to date.
+                    changed |= persists;
+                }
+                if let Some(port) = port
+                    && record.port != Some(port)
+                {
+                    record.port = Some(port);
+                    // Not persisted either with the addresses off.
+                    changed |= persists;
+                }
             }
             record.last_contact = record.last_contact.max(now);
             let behind =
@@ -1695,7 +1715,7 @@ mod tests {
             Direction::Accepted,
             at(0),
         );
-        for bad in ["0.0.0.0:4433", "192.0.2.9:0", "224.0.0.1:4433"] {
+        for bad in ["0.0.0.0:4433", "224.0.0.1:4433"] {
             book.learn(
                 key(1),
                 device.clone(),
@@ -2381,11 +2401,12 @@ mod tests {
         assert_eq!(shelf.saves.load(Ordering::SeqCst), before);
     }
 
-    /// L7 (round 6): an accepted link's source address is the peer's own
-    /// choice (a fresh port at each reconnect); it never moves a list that
-    /// holds addresses, so a peer that reconnects 100 times changes nothing.
+    /// L7 (round 6): an accepted link's source port is the peer's own choice
+    /// (a fresh port at each reconnect); it is never recorded, so a peer that
+    /// reconnects 100 times from the same IP changes nothing (the address
+    /// held is that IP with the held port already).
     #[test]
-    fn an_accepted_link_never_changes_the_addresses_held() {
+    fn an_accepted_link_from_a_held_ip_changes_nothing_whatever_its_source_port() {
         let (mut book, _) = Book::load(options(8, 4, 1000), Vec::new(), at(0));
         let device = n("/ann/member/laptop");
         let first = book.learn(
@@ -2438,6 +2459,256 @@ mod tests {
         );
     }
 
+    /// Address freshness (round 9, §17C): an identified peer that opens a link
+    /// is at the address it opened it from, with the port the record holds.
+    /// The address moves to the front; the source port is the peer's own
+    /// choice and is never recorded.
+    #[test]
+    fn an_accepted_link_brings_the_address_up_to_date_with_the_held_port() {
+        let (mut book, _) = Book::load(options(8, 4, 1000), vec![record(1, 0)], at(0));
+        let device = n("/ann/member/d1");
+        let moved = book.learn(
+            key(1),
+            device.clone(),
+            addr("192.0.2.77:51000"),
+            Direction::Accepted,
+            at(1),
+        );
+        assert!(moved.save, "a new front address is a record to save");
+        let held = book.get(&key(1)).unwrap();
+        assert_eq!(
+            held.addresses,
+            vec![addr("192.0.2.77:4433"), addr("192.0.2.1:4433")],
+            "the new address with the held port goes first; the old one stays behind it"
+        );
+        assert_eq!(
+            held.port,
+            Some(4433),
+            "the held port is not the source port"
+        );
+        assert_eq!(
+            held.origin,
+            Direction::Dialed,
+            "the first contact's direction stays"
+        );
+        // The same peer again from another source port: nothing changes, no write.
+        for port in 52000..52100u16 {
+            let again = book.learn(
+                key(1),
+                device.clone(),
+                addr(&format!("192.0.2.77:{port}")),
+                Direction::Accepted,
+                at(1),
+            );
+            assert!(!again.save, "source port {port} asked for a write");
+        }
+        // Back at the first address: it moves to the front again, held once.
+        book.learn(
+            key(1),
+            device,
+            addr("192.0.2.1:60000"),
+            Direction::Accepted,
+            at(2),
+        );
+        assert_eq!(
+            book.get(&key(1)).unwrap().addresses,
+            vec![addr("192.0.2.1:4433"), addr("192.0.2.77:4433")]
+        );
+    }
+
+    /// The source port is never in the record: not as the port, not in an
+    /// address, wherever the peer opened its link from.
+    #[test]
+    fn the_source_port_of_an_accepted_link_is_never_recorded() {
+        let (mut book, _) = Book::load(options(8, 4, 1000), vec![record(1, 0)], at(0));
+        for (i, source) in ["192.0.2.77:51000", "192.0.2.78:51001", "192.0.2.1:51002"]
+            .into_iter()
+            .enumerate()
+        {
+            book.learn(
+                key(1),
+                n("/ann/member/d1"),
+                addr(source),
+                Direction::Accepted,
+                at(i as u64),
+            );
+        }
+        let held = book.get(&key(1)).unwrap();
+        assert_eq!(held.port, Some(4433));
+        assert!(
+            held.addresses.iter().all(|a| a.port() == 4433),
+            "a source port was recorded: {:?}",
+            held.addresses
+        );
+    }
+
+    /// A record with no port of its own (one a store wrote before ports were
+    /// kept) uses the port of its first address; it takes no port from the link.
+    #[test]
+    fn a_record_with_no_port_uses_the_port_of_its_first_address() {
+        let mut old = record(1, 0);
+        old.port = None;
+        old.addresses = vec![addr("192.0.2.1:9000"), addr("192.0.2.2:9100")];
+        let (mut book, _) = Book::load(options(8, 4, 1000), vec![old], at(0));
+        book.learn(
+            key(1),
+            n("/ann/member/d1"),
+            addr("192.0.2.77:51000"),
+            Direction::Accepted,
+            at(1),
+        );
+        let held = book.get(&key(1)).unwrap();
+        assert_eq!(
+            held.addresses,
+            vec![
+                addr("192.0.2.77:9000"),
+                addr("192.0.2.1:9000"),
+                addr("192.0.2.2:9100")
+            ]
+        );
+        assert_eq!(held.port, None, "the source port is not taken as the port");
+        // No port and no address: the source address and port fill the record,
+        // as for a peer first met on its link.
+        let mut bare = record(2, 0);
+        bare.port = None;
+        bare.addresses.clear();
+        let (mut book, _) = Book::load(options(8, 4, 1000), vec![bare], at(0));
+        book.learn(
+            key(2),
+            n("/ann/member/d2"),
+            addr("192.0.2.88:51000"),
+            Direction::Accepted,
+            at(1),
+        );
+        let held = book.get(&key(2)).unwrap();
+        assert_eq!(held.addresses, vec![addr("192.0.2.88:51000")]);
+        assert_eq!(held.port, Some(51000));
+    }
+
+    /// `addresses_max` bounds the list the accepted address is put in front of.
+    #[test]
+    fn an_accepted_address_is_held_within_the_bound() {
+        let mut full = record(1, 0);
+        full.addresses = vec![addr("192.0.2.1:4433"), addr("192.0.2.2:4433")];
+        let (mut book, _) = Book::load(options(8, 2, 1000), vec![full], at(0));
+        book.learn(
+            key(1),
+            n("/ann/member/d1"),
+            addr("192.0.2.3:51000"),
+            Direction::Accepted,
+            at(1),
+        );
+        assert_eq!(
+            book.get(&key(1)).unwrap().addresses,
+            vec![addr("192.0.2.3:4433"), addr("192.0.2.1:4433")],
+            "the oldest went when the new one came"
+        );
+    }
+
+    /// With `persist_addresses` off the new address lives in memory for the
+    /// run and nothing is marked for the store.
+    #[test]
+    fn an_accepted_address_asks_for_no_write_when_addresses_are_not_persisted() {
+        let off = MemoryOptions {
+            persist_addresses: false,
+            ..options(8, 4, 1000)
+        };
+        let (mut book, _) = Book::load(off, vec![record(1, 0)], at(0));
+        let device = n("/ann/member/d1");
+        book.learn(
+            key(1),
+            device.clone(),
+            addr("192.0.2.1:7000"),
+            Direction::Dialed,
+            at(0),
+        );
+        let moved = book.learn(
+            key(1),
+            device,
+            addr("192.0.2.77:51000"),
+            Direction::Accepted,
+            at(0),
+        );
+        assert!(
+            !moved.save,
+            "an address that is not persisted asked for a write"
+        );
+        assert_eq!(
+            book.get(&key(1)).unwrap().addresses,
+            vec![addr("192.0.2.77:7000"), addr("192.0.2.1:7000")],
+            "kept for this run"
+        );
+    }
+
+    /// A loopback source is not kept (no host on one machine said so); where
+    /// the host did say so, it is kept with the held port.
+    #[test]
+    fn a_loopback_source_is_kept_only_where_the_host_says_so() {
+        let (mut book, _) = Book::load(options(8, 4, 1000), vec![record(1, 0)], at(0));
+        for source in ["127.0.0.1:51000", "[::1]:51000", "169.254.1.1:51000"] {
+            let learned = book.learn(
+                key(1),
+                n("/ann/member/d1"),
+                addr(source),
+                Direction::Accepted,
+                at(1),
+            );
+            assert!(!learned.save, "{source} asked for a write");
+        }
+        assert_eq!(
+            book.get(&key(1)).unwrap().addresses,
+            vec![addr("192.0.2.1:4433")]
+        );
+        let on_one_machine = MemoryOptions {
+            include_local: true,
+            ..options(8, 4, 1000)
+        };
+        let (mut book, _) = Book::load(on_one_machine, vec![record(1, 0)], at(0));
+        book.learn(
+            key(1),
+            n("/ann/member/d1"),
+            addr("127.0.0.1:51000"),
+            Direction::Accepted,
+            at(1),
+        );
+        assert_eq!(
+            book.get(&key(1)).unwrap().addresses,
+            vec![addr("127.0.0.1:4433"), addr("192.0.2.1:4433")]
+        );
+    }
+
+    /// The record is keyed by the key the handshake proved: a link of another
+    /// key, from whatever address, touches only that key's record.
+    #[test]
+    fn a_link_another_key_opened_leaves_this_record_untouched() {
+        let (mut book, _) =
+            Book::load(options(8, 4, 1000), vec![record(1, 0), record(2, 0)], at(0));
+        let before = book.get(&key(1)).unwrap().clone();
+        book.learn(
+            key(2),
+            n("/ann/member/d2"),
+            addr("192.0.2.1:51000"),
+            Direction::Accepted,
+            at(5),
+        );
+        book.learn(
+            key(3),
+            n("/ann/member/d3"),
+            addr("192.0.2.1:51001"),
+            Direction::Accepted,
+            at(5),
+        );
+        let after = book.get(&key(1)).unwrap();
+        assert_eq!(after.addresses, before.addresses);
+        assert_eq!(after.port, before.port);
+        assert_eq!(after.last_contact, before.last_contact);
+        assert_eq!(
+            book.get(&key(2)).unwrap().addresses[0],
+            addr("192.0.2.1:4433"),
+            "the proven key's own record moved"
+        );
+    }
+
     /// L7 (round 6): a peer reached at one of two addresses and linking again
     /// and again, a hundred times, is a few writes of the store, not a hundred
     /// (flash wear, an fsync each).
@@ -2468,9 +2739,9 @@ mod tests {
     }
 
     /// §17D.2: the port a record keeps is the one of the last contact this
-    /// device dialled; a peer's own source ports (accepted links) only fill
-    /// a port not known yet, so a peer that reconnects from a new port at
-    /// every link is not a write at every link.
+    /// device dialled; a peer's own source ports (accepted links) are never
+    /// recorded, so a peer that reconnects from a new port at every link is
+    /// not a write at every link.
     #[test]
     fn a_record_keeps_the_listening_port_of_the_contact_this_device_dialled() {
         let (mut book, _) = Book::load(options(8, 4, 1000), Vec::new(), at(0));

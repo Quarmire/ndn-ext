@@ -948,11 +948,11 @@ async fn a_kept_port_below_1024_or_zero_is_not_a_bind_target() {
     }
 }
 
-/// SHAPES-R7 D: a contact that reports a new IP for a peer that has no
-/// address that works is dialled at that IP and the port the record keeps. Ann
-/// remembers Bob at an address where he no longer is; Bob dialled her once, once
-/// only; Ann is told the one that works by that contact, and dials it when the
-/// link is lost.
+/// SHAPES-R7 D, as SHAPES-R9 B changed it: a peer that dials in again from a new
+/// IP is recorded at that IP and the port the record keeps (its source port is
+/// not recorded). Ann remembers Bob at an address where he no longer is; Bob
+/// dials her once, once only; her record now names the IP he came from, with
+/// his port, and she dials it when the link is lost.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_new_ip_a_contact_reports_is_dialled_at_the_port_the_record_keeps() {
     let home = Home::new();
@@ -978,8 +978,12 @@ async fn a_new_ip_a_contact_reports_is_dialled_at_the_port_the_record_keeps() {
     let (record, _) = remembered(&ann, bob.key).unwrap();
     assert_eq!(
         record.addresses,
-        vec![SocketAddr::new("127.0.0.1".parse().unwrap(), port)],
-        "an accepted link never changes the addresses kept"
+        vec![
+            SocketAddr::new("127.0.0.2".parse().unwrap(), port),
+            SocketAddr::new("127.0.0.1".parse().unwrap(), port)
+        ],
+        "an accepted link brings the address up to date: the IP it came from, the port the \
+         record holds (not the source port), the old address behind it"
     );
     // The link is lost; Bob does not dial again. Ann dials him: the IP the
     // contact reported, at his port.
