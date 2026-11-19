@@ -594,3 +594,362 @@ async fn a_note_changed_in_the_store_leaves_no_mark_at_the_next_start() {
         }
     }
 }
+
+// ---- who may tell a person of a departure, and what counts (round 7 L1–L4) ---------------------
+
+/// A sink that records what it is asked, who told, and answers `refuse_first`
+/// of the first asks as not ready, else as the device's own sink does.
+struct Recording {
+    inner: ndn_data::IntroductionSurface,
+    asked: std::sync::Mutex<Vec<(Name, Name, Name)>>,
+    refuse_first: AtomicUsize,
+}
+
+impl Recording {
+    fn new(of: &Embedded, refuse_first: usize) -> Arc<Recording> {
+        Arc::new(Recording {
+            inner: of.device.introductions(),
+            asked: std::sync::Mutex::new(Vec::new()),
+            refuse_first: AtomicUsize::new(refuse_first),
+        })
+    }
+
+    /// (told by, folder, record) of each ask.
+    fn asked(&self) -> Vec<(Name, Name, Name)> {
+        self.asked.lock().unwrap().clone()
+    }
+}
+
+impl ndn_link::DepartureSink for Recording {
+    fn departure<'a>(
+        &'a self,
+        from: &'a Name,
+        folder: &'a Name,
+        record: &'a Name,
+    ) -> ndn_link::DepartureTaking<'a> {
+        Box::pin(async move {
+            self.asked
+                .lock()
+                .unwrap()
+                .push((from.clone(), folder.clone(), record.clone()));
+            let refused = self
+                .refuse_first
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok();
+            if refused {
+                return Err(ndn_link::NotTaken::not_yet(
+                    "not ready (a case's own doing)",
+                ));
+            }
+            ndn_link::DepartureSink::departure(&self.inner, from, folder, record).await
+        })
+    }
+}
+
+/// A record name that no log holds: `<device>/32=log/<folder>/seq=<seq>`.
+fn bogus_record(folder: &Name, seq: u64) -> Name {
+    ndn_data::wire::log_name(&n(ANN), Some(folder), seq)
+}
+
+fn an_hour_on() -> std::time::SystemTime {
+    std::time::SystemTime::now() + Duration::from_secs(3600)
+}
+
+/// L1: a departure is taken only when told by a device under the folder's own
+/// namespace. Ann (`/alice`) names a folder of **Bob's** namespace in the same
+/// message that tells him of the notebook; the notebook is taken, the other
+/// never reaches his sink.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_departure_is_taken_only_from_a_device_of_the_folders_namespace() {
+    let alice = Person::new("/alice").await;
+    let bobs = Person::new("/bob").await;
+    let ann = embedded(&alice, ANN, Setup::inviter()).await;
+    let bob = embedded(&bobs, "/bob/member/phone", Setup::dialer()).await;
+    let folder = n(FOLDER);
+    let sink = Recording::new(&bob, 0);
+    bob.links.set_departure_sink(sink.clone());
+    invited(&ann, &bob, Role::Writer).await;
+    // A folder of Bob's own, which his device holds a members record of.
+    let mine = n("/bob/32=data/mine");
+    reshare(&bob, &mine, std::slice::from_ref(&bobs.ns)).await;
+    until("ann is linked to bob", LONG, async || {
+        linked(&ann, bob.key) && linked(&bob, ann.key)
+    })
+    .await;
+
+    // Ann's device names Bob's folder, then really lets him go of the notebook.
+    ann.links.depart(ndn_link::Departure {
+        key: bob.key,
+        namespaces: vec![bobs.ns.clone()],
+        folder: mine.clone(),
+        record: bogus_record(&mine, 7),
+        until: an_hour_on(),
+    });
+    lets_go(&ann).await;
+    until("bob's device says it was let go", LONG, async || {
+        !lists(&bob, &folder, &bob.ns).await
+    })
+    .await;
+    let asked = sink.asked();
+    assert!(
+        asked
+            .iter()
+            .any(|(from, f, _)| *f == folder && from.has_prefix(&n("/alice"))),
+        "the notebook's record was never taken, or not as told by a device of /alice: {asked:?}"
+    );
+    assert!(
+        asked.iter().all(|(_, f, _)| *f != mine),
+        "a device of /alice told Bob's sink of a folder of /bob, and it was passed on: {asked:?}"
+    );
+}
+
+/// L1: a stranger that dials an inviter's introduction link and tells it of a
+/// folder it holds is not heard: nothing reaches the sink (it would hold the
+/// folder's fetch slot and drain the window).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stranger_on_an_introduction_link_is_not_heard() {
+    use ndn_face_quic::{Admission, LinkEndpoint, LinkHello, LinkKey, LinkTransportConfig};
+    let alice = Person::new("/alice").await;
+    let ann = embedded(&alice, ANN, Setup::inviter()).await;
+    // An open offer: a stranger is given an introduction link.
+    let _code = offered(&ann, Role::Writer).await;
+    let sink = Recording::new(&ann, 0);
+    ann.links.set_departure_sink(sink.clone());
+
+    let key = LinkKey::from_signer(Arc::new(ndn_security::Ed25519Signer::from_seed(
+        &[9; 32],
+        n("/mallory/KEY/k"),
+    )))
+    .unwrap();
+    let endpoint = LinkEndpoint::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(key),
+        &LinkTransportConfig::default(),
+        false,
+    )
+    .unwrap();
+    let mut hs = endpoint
+        .connect(ann.addr.expect("ann listens"), None)
+        .await
+        .expect("the stranger reaches ann");
+    let hello = LinkHello {
+        certificates: Vec::new(),
+        memberships: Vec::new(),
+        direct_path: None,
+    };
+    hs.exchange_hello(&hello, Duration::from_secs(10))
+        .await
+        .unwrap();
+    let link = hs
+        .admit(
+            ndn_transport::FaceId(1),
+            Duration::from_secs(10),
+            Admission::default(),
+        )
+        .await
+        .expect("ann gave the stranger an introduction link");
+    let folder = n(FOLDER);
+    link.handle.send_departure(&ndn_face_quic::Departure {
+        folder: folder.clone(),
+        record: bogus_record(&folder, 900),
+    });
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        sink.asked().is_empty(),
+        "a stranger's introduction link told Ann's sink of {:?}",
+        sink.asked()
+    );
+    drop(link);
+}
+
+/// L1: a departure that is not ready (a fetch in flight for the folder, the
+/// window full, the link not up) is asked again, not dropped: the record the
+/// inviter really told is taken after the sink said "not yet" twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_departure_the_sink_is_not_ready_for_is_asked_again() {
+    let alice = Person::new("/alice").await;
+    let bobs = Person::new("/bob").await;
+    let ann = embedded(&alice, ANN, Setup::inviter()).await;
+    let bob = embedded(&bobs, "/bob/member/phone", Setup::dialer()).await;
+    let folder = n(FOLDER);
+    let sink = Recording::new(&bob, 2);
+    bob.links.set_departure_sink(sink.clone());
+    bob.links.set_departure_options(DepartureOptions {
+        retry: Duration::from_millis(300),
+        ..DepartureOptions::default()
+    });
+    invited(&ann, &bob, Role::Writer).await;
+    until("ann is linked to bob", LONG, async || {
+        linked(&ann, bob.key) && linked(&bob, ann.key)
+    })
+    .await;
+    lets_go(&ann).await;
+    until(
+        "bob's device took the record after being not ready twice",
+        Duration::from_secs(20),
+        async || !lists(&bob, &folder, &bob.ns).await,
+    )
+    .await;
+    assert!(
+        sink.asked().len() >= 3,
+        "the sink was asked {} times",
+        sink.asked().len()
+    );
+}
+
+/// L2: a person's `Down` says "let go" only for a record its sink took. A
+/// notice naming a record nobody holds (it cannot be fetched) is the
+/// inviter's say-so: the link's closing is reported, the let-go is not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_notice_that_was_not_taken_is_no_let_go_in_the_status() {
+    let alice = Person::new("/alice").await;
+    let bobs = Person::new("/bob").await;
+    let ann = embedded(&alice, ANN, Setup::inviter()).await;
+    let bob = embedded(&bobs, "/bob/member/phone", Setup::dialer()).await;
+    let folder = n(FOLDER);
+    invited(&ann, &bob, Role::Writer).await;
+    ann.links.set_departure_options(DepartureOptions {
+        settle: Duration::ZERO,
+        hold: Duration::from_secs(3),
+        ..DepartureOptions::default()
+    });
+    until("ann is linked to bob", LONG, async || {
+        linked(&ann, bob.key) && linked(&bob, ann.key)
+    })
+    .await;
+    // A mark naming a record no log holds, and the grant ended by the host's
+    // own hand: the link narrows and tells Bob of it.
+    ann.links.depart(ndn_link::Departure {
+        key: bob.key,
+        namespaces: vec![bobs.ns.clone()],
+        folder: folder.clone(),
+        record: bogus_record(&folder, 900),
+        until: an_hour_on(),
+    });
+    assert!(ann.links.revoke_grant(&bob.key, &folder));
+    until("the link closes", LONG, async || {
+        !linked(&ann, bob.key) && !linked(&bob, ann.key)
+    })
+    .await;
+    until("bob says why", LONG, async || {
+        down_says(&bob, ann.key).is_some()
+    })
+    .await;
+    let state = bob
+        .links
+        .watch()
+        .current()
+        .into_iter()
+        .find(|p| p.key == ann.key)
+        .expect("bob has a state for ann");
+    let LinkState::Down { why, .. } = state.state else {
+        panic!("the link is not down");
+    };
+    assert!(
+        !why.causes.iter().any(|c| c.is(ndn_link::link_code::LET_GO)),
+        "Bob's Down reports a let-go he did not verify: {}",
+        said(&why)
+    );
+}
+
+/// L3: a refused enrollment slot burns no attempt. Four strangers hold the
+/// slots of Ann's loopback address; Bob's dials are refused for want of a
+/// slot more often than the mark has attempts, and once the slots are free
+/// he is admitted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_departure_link_refused_for_want_of_a_slot_burns_no_attempt() {
+    let alice = Person::new("/alice").await;
+    let bobs = Person::new("/bob").await;
+    let ann = embedded(&alice, ANN, Setup::inviter()).await;
+    let bob = embedded(&bobs, "/bob/member/phone", Setup::dialer()).await;
+    invited(&ann, &bob, Role::Writer).await;
+    ann.links.set_departure_options(DepartureOptions {
+        settle: Duration::ZERO,
+        hold: Duration::from_secs(1),
+        attempts: 3,
+        ..DepartureOptions::default()
+    });
+    // Four strangers take the slots of 127.0.0.1 (introduction links).
+    let mut strangers = Vec::new();
+    for i in 0..4 {
+        let s = embedded(&bobs, &format!("/bob/member/stranger{i}"), Setup::dialer()).await;
+        dials(&s, &ann)
+            .await
+            .unwrap_or_else(|e| panic!("stranger {i} was refused: {}", said(&e)));
+        strangers.push(s);
+    }
+    // No new introduction link is worth taking: Bob's only way in is his mark.
+    ann.offers_run_out();
+    let_go_offline(&ann, &bob).await;
+    for round in 0..5 {
+        let refused = dials(&bob, &ann)
+            .await
+            .expect_err("a departure link was admitted with every slot taken");
+        assert!(
+            said(&refused).contains("enrollment links"),
+            "round {round}: {}",
+            said(&refused)
+        );
+    }
+    for s in &strangers {
+        s.links.shutdown().await;
+    }
+    let started = std::time::Instant::now();
+    loop {
+        match dials(&bob, &ann).await {
+            Ok(()) => break,
+            Err(e) => assert!(
+                started.elapsed() < LONG,
+                "Bob was never admitted once the slots were free; the last refusal: {}",
+                said(&e)
+            ),
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// L4: a person offline when one of two entries ended by a record is told of
+/// it when they return on the entry that stands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_person_offline_when_one_entry_ended_is_told_when_they_return_on_another() {
+    let alice = Person::new("/alice").await;
+    let bobs = Person::new("/bob").await;
+    let ann = embedded(&alice, ANN, Setup::inviter()).await;
+    let bob = embedded(&bobs, "/bob/member/phone", Setup::dialer()).await;
+    let (first, second) = (n(FOLDER), n(SECOND));
+    invited(&ann, &bob, Role::Writer).await;
+    shared(&ann, &second).await;
+    invited_in(&ann, &bob, &second, Role::Writer).await;
+    until("ann is linked to bob", LONG, async || {
+        linked(&ann, bob.key) && linked(&bob, ann.key)
+    })
+    .await;
+    bob.links.set_online(false);
+    until("the link to bob ends", LONG, async || {
+        !linked(&ann, bob.key)
+    })
+    .await;
+    // The first folder's record leaves Bob out; the second keeps him.
+    reshare(&ann, &first, &[n("/alice")]).await;
+    until(
+        "ann holds the departure of the first folder",
+        LONG,
+        async || ann.links.departures().iter().any(|d| d.key == bob.key),
+    )
+    .await;
+    assert!(
+        lists(&bob, &first, &bob.ns).await,
+        "bob's device heard of the record while offline"
+    );
+    bob.links.set_online(true);
+    until("bob is linked to ann again", LONG, async || {
+        linked(&ann, bob.key) && linked(&bob, ann.key)
+    })
+    .await;
+    until(
+        "bob's device was told of the first folder's record",
+        Duration::from_secs(20),
+        async || !lists(&bob, &first, &bob.ns).await,
+    )
+    .await;
+}

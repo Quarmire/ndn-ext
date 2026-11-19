@@ -10,11 +10,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ndn_data::intro::{Dialing, HintCandidate, HintKind, LinkHint, introduction_prefixes};
 use ndn_data::version::Timestamp;
-use ndn_data::{DataError, Device, IntroductionSurface, Role};
+use ndn_data::{DataError, Device, IntroductionSurface, NextStep, Role};
 use ndn_face_quic::KeyFingerprint;
 use ndn_packet::Name;
 
-use crate::departures::{Departure, DepartureSink, DepartureTaking};
+use crate::departures::{Departure, DepartureSink, DepartureTaking, NotTaken};
 use crate::grants::{Grant, GrantRole};
 use crate::introduce::Introductions;
 use crate::links::Links;
@@ -42,11 +42,23 @@ impl Introductions for IntroductionSurface {
 }
 
 impl DepartureSink for IntroductionSurface {
-    fn departure<'a>(&'a self, folder: &'a Name, record: &'a Name) -> DepartureTaking<'a> {
+    fn departure<'a>(
+        &'a self,
+        from: &'a Name,
+        folder: &'a Name,
+        record: &'a Name,
+    ) -> DepartureTaking<'a> {
         Box::pin(async move {
-            self.take_departure(folder, record)
+            self.take_departure(from, folder, record)
                 .await
-                .map_err(|e| e.to_string())
+                .map_err(|e| {
+                    // What `NotReady` and `Unavailable` say to do: ask again.
+                    if e.next() == NextStep::RetryLater {
+                        NotTaken::not_yet(e.to_string())
+                    } else {
+                        NotTaken::refused(e.to_string())
+                    }
+                })
         })
     }
 }

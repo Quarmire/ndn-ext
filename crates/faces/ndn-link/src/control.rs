@@ -20,6 +20,7 @@ use crate::direct::direct_loop;
 use crate::links::{Links, dial_loop};
 use crate::peer::{LinkMode, PeerId, PeerSpec};
 use crate::routes::predicted_routes;
+use crate::table::Gone;
 use crate::waiting::{DEMAND_PER_PEER, DEMAND_TOTAL, Verdict, WaitFor};
 
 /// One peer's controls, shared between the host's calls and its dial loop.
@@ -230,17 +231,18 @@ impl Links {
     /// every device a direct path goes to (that path is closed; the new
     /// punch's takes its place). A host with no platform callback leaves
     /// this to [`Links::watch_addresses`], which does the same on a change
-    /// of this device's addresses.
+    /// of this device's addresses, but closes only the links accepted at an
+    /// address that went.
     pub fn network_changed(self: &Arc<Self>, socket: Option<std::net::UdpSocket>) {
-        self.moved(socket, true);
+        self.moved(socket, Some(Gone::Every));
     }
 
-    /// What a change of network does (`network_changed`); with
-    /// `close_accepted` the links this device accepted are closed.
+    /// What a change of network does (`network_changed`); with `closing` the
+    /// links this device accepted that it names are closed.
     pub(crate) fn moved(
         self: &Arc<Self>,
         socket: Option<std::net::UdpSocket>,
-        close_accepted: bool,
+        closing: Option<Gone<'_>>,
     ) {
         if let (Some(socket), Some(endpoint)) = (socket, &self.socket)
             && let Err(e) = endpoint.rebind(socket)
@@ -266,12 +268,8 @@ impl Links {
                 }
             }
         }
-        if close_accepted {
-            let closed = self.table.close_accepted(
-                CloseReason::Released,
-                "this device's address changed: a link it accepted cannot follow it, and this \
-                 device links again from where it is now",
-            );
+        if let Some(gone) = closing {
+            let closed = self.table.close_accepted(gone);
             if closed > 0 {
                 tracing::info!(target: "face.quic", closed, "the network changed: links this device accepted are closed");
             }

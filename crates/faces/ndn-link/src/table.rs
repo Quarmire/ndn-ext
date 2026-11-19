@@ -4,8 +4,8 @@
 //! this device's memberships, and the links (or the memberships of links) a
 //! revocation ends.
 
-use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -174,6 +174,15 @@ pub(crate) struct LinkView {
     pub(crate) paths: Vec<PathStatus>,
 }
 
+/// Which of the links this device accepted an address change lost.
+#[derive(Clone, Copy)]
+pub(crate) enum Gone<'a> {
+    /// Every one: the host says the network changed, and not what changed.
+    Every,
+    /// Those accepted at one of these addresses of this device.
+    At(&'a BTreeSet<IpAddr>),
+}
+
 #[derive(Default)]
 pub(crate) struct LinkTable {
     live: Mutex<HashMap<KeyFingerprint, LiveLink>>,
@@ -340,6 +349,27 @@ impl LinkTable {
             .collect()
     }
 
+    /// The devices the link to `fingerprint` was admitted by now, in the
+    /// namespaces this device holds: whom a departure told over that link is
+    /// told by. Empty for a link that is none of a full link's (an enrollment
+    /// link, an introduction link, a link with no identity of a held
+    /// namespace): what such a peer says is not heard.
+    pub(crate) fn peer_devices(&self, fingerprint: &KeyFingerprint) -> Vec<Name> {
+        let live = self.live.lock();
+        live.get(fingerprint)
+            .filter(|l| {
+                l.enrolling.is_empty() && l.paths.iter().any(|p| p.path.kind == PathKind::Link)
+            })
+            .map(|l| {
+                l.identities
+                    .iter()
+                    .filter(|id| id.served.is_none())
+                    .map(|id| id.device.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Direct paths up now.
     pub(crate) fn direct_count(&self) -> usize {
         self.live
@@ -493,19 +523,42 @@ impl LinkTable {
         }
     }
 
-    /// Close the link paths (not direct paths) this device accepted, saying
-    /// `text`: a QUIC server cannot follow its address (RFC 9000 §9), so a
-    /// link accepted at an address that is gone is lost to both sides until
-    /// an idle timeout. The device dials again from where it is now. Returns
-    /// how many were closed.
-    pub(crate) fn close_accepted(&self, reason: CloseReason, text: &str) -> usize {
+    /// Close the link paths (not direct paths) this device accepted that an
+    /// address change lost (`gone`), saying why: a QUIC server cannot follow
+    /// its address (RFC 9000 §9), so a link accepted at an address that is
+    /// gone is lost to both sides until an idle timeout. The device dials
+    /// again from where it is now. A link accepted at an address that stays
+    /// is not touched; nor is one whose accepted-at address is not known
+    /// ([`LinkHandle::accepted_ip`]): which address went cannot say it is
+    /// lost, and a link that is lost ends at the idle timeout or by the other
+    /// device's dial, as any does. Returns how many were closed.
+    pub(crate) fn close_accepted(&self, gone: Gone<'_>) -> usize {
         let live = self.live.lock();
         let mut closed = 0;
         for link in live.values() {
             for p in link.paths.iter().filter(|p| {
                 p.path.kind == PathKind::Link && p.path.direction == Direction::Accepted
             }) {
-                p.path.handle.close(reason, text);
+                let text = match gone {
+                    Gone::Every => "this device's address changed: a link it accepted cannot \
+                                    follow it, and this device links again from where it is now"
+                        .to_string(),
+                    Gone::At(addresses) => {
+                        let Some(ip) = p
+                            .path
+                            .handle
+                            .accepted_ip()
+                            .filter(|ip| addresses.contains(ip))
+                        else {
+                            continue;
+                        };
+                        format!(
+                            "this device's address {ip} is gone: a link accepted at it cannot \
+                             follow it, and this device links again from where it is now"
+                        )
+                    }
+                };
+                p.path.handle.close(CloseReason::Released, &text);
                 closed += 1;
             }
         }

@@ -1,7 +1,7 @@
 //! A link after its handshake: the hello exchange, the admission verdicts,
 //! and the face it becomes.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -736,6 +736,26 @@ impl LinkHandle {
     /// moved), the new one.
     pub fn local_address(&self) -> Option<SocketAddr> {
         self.endpoint.local_addr().ok()
+    }
+
+    /// The local address this link's packets arrive at (the destination
+    /// address the peer sent to): for a link accepted on a socket bound to
+    /// every address, the one address of this device the peer reached it at.
+    /// The socket's own address when that is a specific one and the system
+    /// gives no destination address; `None` when this is neither (a socket
+    /// on every address on a system that tells no destination), where which
+    /// address a link was accepted at is not known.
+    pub fn accepted_ip(&self) -> Option<IpAddr> {
+        self.connection
+            .local_ip()
+            .or_else(|| {
+                self.endpoint
+                    .local_addr()
+                    .ok()
+                    .map(|a| a.ip())
+                    .filter(|ip| !ip.is_unspecified())
+            })
+            .map(|ip| ip.to_canonical())
     }
 
     /// The address the other device sees this one's packets come from, as

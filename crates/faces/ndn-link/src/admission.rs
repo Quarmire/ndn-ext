@@ -1582,13 +1582,30 @@ pub(crate) fn in_enrollment(
     })
 }
 
-/// `…/KEY/<key-id>`, optionally followed by `<issuer>/<version>`.
+/// `…/KEY/<key-id>`, optionally followed by `<issuer>/<version>`, where
+/// `components` is the name under a namespace (or device) and `KEY` follows
+/// the identity part at once: nothing, `CA` or `<role>/<device>` before it
+/// (the shapes of the root, the CA's and a device's key names), none of them
+/// a keyword component. A keyword before `KEY` (`32=data`, `32=log`, …)
+/// means the name belongs to a collection, whose path may spell `KEY`
+/// itself.
 pub(crate) fn is_key_or_certificate_name(components: &[ndn_packet::NameComponent]) -> bool {
-    components
+    let Some(key) = components
         .iter()
         .position(|c| c.typ == ndn_packet::tlv_type::NAME_COMPONENT && c.value.as_ref() == b"KEY")
-        .is_some_and(|key| (1..=3).contains(&(components.len() - key - 1)))
+    else {
+        return false;
+    };
+    key <= IDENTITY_PART_MAX
+        && components[..key]
+            .iter()
+            .all(|c| c.typ != ndn_packet::tlv_type::KEYWORD)
+        && (1..=3).contains(&(components.len() - key - 1))
 }
+
+/// The most components an identity (`<role>/<device>`) has before `KEY` in a
+/// key or certificate name under its namespace.
+const IDENTITY_PART_MAX: usize = 2;
 
 pub(crate) fn list(names: &[Name]) -> String {
     names
@@ -1703,6 +1720,15 @@ mod tests {
             (n("/home/node/relay/hello"), false),
             (n("/home/member/phone/KEY"), false),
             (n("/home/member/phone/files/KEY/a/b/c/d"), false),
+            (
+                n("/home/member/phone/32=log/home/32=data/diary/KEY/x/seq=3"),
+                false,
+            ),
+            (
+                n("/home/member/phone/32=log/home/32=data/diary/KEY/x"),
+                false,
+            ),
+            (n("/home/32=data/KEY/x"), false),
             (n("/elsewhere/CA/NEW"), false),
         ] {
             for relay in [true, false] {
@@ -3067,6 +3093,10 @@ mod tests {
             "/a/member/laptop/32=log/a/32=data/diary/seq=1",
             "/b/member/tablet/32=log/x",
             "/b/32=data/anything",
+            // Entries of collections whose path has a literal `KEY` component
+            // are no key or certificate names.
+            "/a/member/laptop/32=log/a/32=data/diary/KEY/x/seq=3",
+            "/b/member/tablet/32=log/b/32=data/diary/KEY/x/seq=3",
             "/somewhere/else",
         ] {
             assert!(
@@ -3220,6 +3250,8 @@ mod tests {
             panic!("not a departure link: {:?}", admitted.enrollment);
         };
         assert_eq!(told.len(), 1);
+        // Registered: that is the first attempt.
+        world.departures.count_attempt(&key, told);
         assert!(admitted.quota.is_none() && admitted.grant.is_none());
         assert!(admitted.identities.is_empty(), "no identity is recorded");
         let scope = judge.admission_for(&admitted).scope.expect("a scope");
@@ -3239,6 +3271,9 @@ mod tests {
             "/intro/ask",
             "/b/member/phone/32=log/x",
             "/a/member/laptop/32=log/a/32=data/notes/seq=5",
+            // An entry of another collection whose path has a literal `KEY`
+            // component is not a key name.
+            "/a/member/laptop/32=log/a/32=data/diary/KEY/x/seq=3",
         ] {
             assert!(!names(&n(refused)), "{refused} crossed the departure link");
         }
@@ -3263,10 +3298,15 @@ mod tests {
         // The attempts bound: three admissions in all, the fourth is refused
         // and says the grant ended.
         for _ in 0..2 {
-            judge
+            let again = judge
                 .decide(&bob, &hello(chain.clone()), &CH, None)
                 .await
                 .expect("within the attempts");
+            // The attempt is counted when the link is registered, not here.
+            let Some(Enrollment::Departure(marks)) = &again.enrollment else {
+                panic!("not a departure link");
+            };
+            world.departures.count_attempt(&key, marks);
         }
         let refusal = judge
             .decide(&bob, &hello(chain.clone()), &CH, None)

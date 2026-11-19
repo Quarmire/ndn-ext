@@ -308,7 +308,7 @@ pub use asleep::{HoldLimits, RelayService, WAKE_INTERVAL, WakeNotifier, WakeRequ
 pub use candidates::{
     AdvertisedCandidates, Candidate, CandidateKind, CandidateSource, HostCandidates,
 };
-pub use departures::{Departure, DepartureOptions, DepartureSink, DepartureTaking};
+pub use departures::{Departure, DepartureOptions, DepartureSink, DepartureTaking, NotTaken};
 #[cfg(feature = "introductions")]
 pub use device_memory::DeviceMemory;
 #[cfg(feature = "engine")]

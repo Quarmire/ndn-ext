@@ -69,10 +69,16 @@ pub struct DepartureOptions {
     /// record's cut manifests follow. Default 2 s.
     pub settle: Duration,
     /// How many departure links one mark admits (per key per mark), counted
-    /// in memory and not reset by a new link. Default 3.
+    /// when a link is registered, in memory, and not reset by a new link.
+    /// Default 3.
     pub attempts: u32,
     /// How many marks are kept: past it the oldest are forgotten. Default 256.
     pub marks_max: usize,
+    /// The person's half: how long the link layer waits before it asks its
+    /// sink again for a departure the sink was not ready for. Default 15 s (so
+    /// the six asks of [`TAKE_TRIES`] outlast the data layer's bound of a
+    /// minute).
+    pub retry: Duration,
 }
 
 impl Default for DepartureOptions {
@@ -82,27 +88,77 @@ impl Default for DepartureOptions {
             settle: Duration::from_secs(2),
             attempts: 3,
             marks_max: 256,
+            retry: Duration::from_secs(15),
         }
     }
 }
 
+/// Why a sink did not take a departure, and whether asking again may help.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NotTaken {
+    /// In words: why, and what to do.
+    pub why: String,
+    /// The sink was not ready (a fetch in flight, the bound of the minute used,
+    /// the link not up yet): the link layer asks again, a limited number of
+    /// times. `false`: the departure is no good (a name that is no members
+    /// record, a device that is no member, a peer that may not tell it): it is
+    /// asked no more.
+    pub again: bool,
+}
+
+impl NotTaken {
+    /// Not taken, and asking again would not help.
+    pub fn refused(why: impl Into<String>) -> Self {
+        Self {
+            why: why.into(),
+            again: false,
+        }
+    }
+
+    /// Not taken yet: ask again.
+    pub fn not_yet(why: impl Into<String>) -> Self {
+        Self {
+            why: why.into(),
+            again: true,
+        }
+    }
+}
+
+impl std::fmt::Display for NotTaken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.why)
+    }
+}
+
 /// What a departure sink takes: a future of the result.
-pub type DepartureTaking<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+pub type DepartureTaking<'a> = Pin<Box<dyn Future<Output = Result<(), NotTaken>> + Send + 'a>>;
 
 /// The person's half: what to do with the members record the inviter named.
 /// For a data-layer device it fetches and takes the record
 /// (`Device::take_departure`); [`LinkHints::serve`](crate::LinkHints::serve)
 /// registers the device's.
 pub trait DepartureSink: Send + Sync {
-    /// The inviter that let this device go told it that the members record
-    /// named `record` of `folder` leaves it out (a hint, with no authority:
-    /// the sink fetches the record and takes it only as it validates, for a
-    /// folder it is a member of). `Err` is why it was not taken, in words.
-    fn departure<'a>(&'a self, folder: &'a Name, record: &'a Name) -> DepartureTaking<'a>;
+    /// The peer `from` told this device that the members record named
+    /// `record` of `folder` leaves it out (a hint, with no authority: the sink
+    /// fetches the record and takes it only as it validates, for a folder it
+    /// is a member of). `from` is the peer's **authenticated device**, on a
+    /// full link, and lies under the namespace of `folder`: the link layer
+    /// does not pass a departure told by any other. `Err` is why it was not
+    /// taken, in words, and whether to ask again.
+    fn departure<'a>(
+        &'a self,
+        from: &'a Name,
+        folder: &'a Name,
+        record: &'a Name,
+    ) -> DepartureTaking<'a>;
 }
 
 /// The most departures a link's sink takes, however often the inviter tells.
 const TAKEN_PER_LINK_MAX: usize = 32;
+
+/// How many times a link layer asks its sink for one departure it was not
+/// ready for, in all.
+const TAKE_TRIES: u32 = 6;
 
 struct Mark {
     departure: Departure,
@@ -243,9 +299,12 @@ impl Departures {
     /// Admission of a departure link for `key`, whose handshake showed
     /// identities in `namespaces` (validated in held namespaces): the marks of
     /// the key in force whose namespaces include one of them and that still
-    /// have attempts left, each counted once more. `None` when there is none:
-    /// a key with no mark (it never held a grant), an expired or used-up
-    /// mark, or identities of other namespaces.
+    /// have attempts left. `None` when there is none: a key with no mark (it
+    /// never held a grant), an expired or used-up mark, or identities of other
+    /// namespaces. **Counts nothing**: a handshake can still be refused after
+    /// this (a direct path, no enrollment slot, a link that already exists), so
+    /// the attempt is counted by [`Departures::count_attempt`] once the link
+    /// is registered.
     pub(crate) fn admit(
         &self,
         key: &KeyFingerprint,
@@ -255,20 +314,34 @@ impl Departures {
         let mut state = self.inner.state.lock();
         state.forget_expired(now);
         let attempts = state.options.attempts;
-        let mut admitted = Vec::new();
+        let admitted: Vec<Departure> = state
+            .live(key, now)
+            .filter(|m| {
+                m.admissions < attempts
+                    && m.departure
+                        .namespaces
+                        .iter()
+                        .any(|ns| namespaces.contains(ns))
+            })
+            .map(|m| m.departure.clone())
+            .collect();
+        (!admitted.is_empty()).then_some(admitted)
+    }
+
+    /// A departure link of `key` was registered for `marks`: each counts one
+    /// attempt. The count is in memory (a restart of the inviter begins it
+    /// again, the mark's own expiry bounds it), and a mark replaced by a
+    /// newer record is not the one counted.
+    pub(crate) fn count_attempt(&self, key: &KeyFingerprint, marks: &[Departure]) {
+        let mut state = self.inner.state.lock();
         for mark in state.marks.iter_mut().filter(|m| {
             m.departure.key == *key
-                && m.admissions < attempts
-                && m.departure
-                    .namespaces
+                && marks
                     .iter()
-                    .any(|ns| namespaces.contains(ns))
+                    .any(|d| d.folder == m.departure.folder && d.record == m.departure.record)
         }) {
-            mark.admissions += 1;
-            mark.sightings = 0;
-            admitted.push(mark.departure.clone());
+            mark.admissions = mark.admissions.saturating_add(1);
         }
-        (!admitted.is_empty()).then_some(admitted)
     }
 
     /// A link of `key` narrows or is admitted now: what crossed it before is
@@ -506,15 +579,39 @@ impl Links {
         }
     }
 
-    /// A departure link was registered: tell the person, and see it to its end.
+    /// A departure link was registered: count the attempt (now that there is a
+    /// link: a handshake that was refused after its mark admitted it, for a
+    /// slot or a direct path, costs the person none), tell the person, and
+    /// see it to its end.
     pub(crate) fn departure_link_up(&self, admitted: &Admitted, handle: &LinkHandle) {
         let Some(Enrollment::Departure(marks)) = &admitted.enrollment else {
             return;
         };
+        self.departures.count_attempt(&admitted.fingerprint, marks);
         self.departures
             .begin(&admitted.fingerprint, SystemTime::now());
         self.tell_departures(handle, marks);
         self.spawn_finish(admitted.fingerprint, handle.clone());
+    }
+
+    /// A link admitted by a grant was registered: tell the person of each mark
+    /// of the key in force. An entry of the key may have ended by a record
+    /// while the person was away, with another entry standing (so no
+    /// departure link, no narrowing, and nobody to tell at the time): the
+    /// person is told now, on the entry that stands, and does not keep
+    /// walking the folder that no longer lists them. A mark that a grant
+    /// replaced is gone ([`Links::grant`]), so a folder the person was
+    /// invited into again is not told.
+    pub(crate) fn grant_link_up(&self, admitted: &Admitted, handle: &LinkHandle) {
+        if admitted.grant.is_none() {
+            return;
+        }
+        let marks = self
+            .departures
+            .marks_of(&admitted.fingerprint, SystemTime::now());
+        if !marks.is_empty() {
+            self.tell_departures(handle, &marks);
+        }
     }
 
     fn tell_departures(&self, handle: &LinkHandle, marks: &[Departure]) {
@@ -582,63 +679,208 @@ impl Links {
         });
     }
 
-    /// The person's half, for the link of `key` just registered: what the
-    /// inviter says on its control stream goes to the sink, one at a time (so
-    /// one fetch in flight per link, hence per folder), at most
-    /// [`TAKEN_PER_LINK_MAX`] over the link's life; and the link's `Down`
-    /// names what it was told.
-    pub(crate) fn hear_departures(&self, key: KeyFingerprint, handle: &LinkHandle) {
+    /// The person's half, for the **full** link of `key` just registered (never
+    /// an enrollment, introduction or departure link: what those peers say is
+    /// not heard): what the inviter says on its control stream goes to the
+    /// sink, one at a time (so one fetch in flight per link, hence per
+    /// folder), and only when the peer is a device **under the namespace of the
+    /// folder it names** (the link's authenticated identity, read at the time:
+    /// a peer of another namespace, whoever it is, cannot hold the folder's
+    /// fetch or spend the device's bound). A departure the sink was not ready
+    /// for is asked again ([`DepartureOptions::retry`], at most
+    /// [`TAKE_TRIES`] times of one record); at most [`TAKEN_PER_LINK_MAX`]
+    /// different ones are asked of a link in its life. The link's `Down` names
+    /// the let-go only of what the sink took.
+    pub(crate) fn hear_departures(self: &Arc<Self>, key: KeyFingerprint, handle: &LinkHandle) {
         let Some(sink) = self.departures.sink() else {
             return;
         };
+        let links = Arc::downgrade(self);
         let departures = self.departures.clone();
         let mut heard = handle.departures();
         let handle = handle.clone();
         let cancel = self.cancel_token().clone();
         tokio::spawn(async move {
-            let mut seen: Vec<Told> = Vec::new();
+            let mut taking = Taking::default();
             loop {
+                let due = taking.next_due();
                 tokio::select! {
                     () = cancel.cancelled() => return,
                     _ = handle.closed() => return,
-                    changed = heard.changed() => if changed.is_err() { return },
-                }
-                let now: Vec<Told> = heard.borrow_and_update().clone();
-                departures.note_let_go(key, told_detail(&now));
-                for told in now {
-                    if seen.contains(&told) {
-                        continue;
+                    changed = heard.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                        let said: Vec<Told> = heard.borrow_and_update().clone();
+                        for over in taking.hear(said, Instant::now()) {
+                            tracing::warn!(
+                                target: "face.quic",
+                                key = %key,
+                                "not taking the departure of {}: this link already told this \
+                                 device of {TAKEN_PER_LINK_MAX} departures",
+                                over.folder
+                            );
+                        }
                     }
-                    if seen.len() >= TAKEN_PER_LINK_MAX {
+                    () = until(due) => {}
+                }
+                while let Some(mut item) = taking.next_ready(Instant::now()) {
+                    let told = item.told.clone();
+                    let devices = links
+                        .upgrade()
+                        .map(|l| l.table.peer_devices(&key))
+                        .unwrap_or_default();
+                    let Some(from) = folder_namespace(&told.folder)
+                        .and_then(|ns| devices.into_iter().find(|d| d.has_prefix(&ns)))
+                    else {
                         tracing::warn!(
                             target: "face.quic",
                             key = %key,
-                            "not taking the departure of {}: this link already told this device of \
-                             {TAKEN_PER_LINK_MAX} departures",
+                            "not taking the departure of {}: the device that told this device is \
+                             under no namespace of that folder, so it cannot let this device go \
+                             of it",
                             told.folder
                         );
+                        taking.settle(told, false);
                         continue;
-                    }
-                    seen.push(told.clone());
-                    match sink.departure(&told.folder, &told.record).await {
-                        Ok(()) => tracing::info!(
-                            target: "face.quic",
-                            key = %key,
-                            "took the members record {} that lets this device go of {}",
-                            told.record,
-                            told.folder
-                        ),
-                        Err(why) => tracing::warn!(
-                            target: "face.quic",
-                            key = %key,
-                            "did not take the members record {} named for {}: {why}",
-                            told.record,
-                            told.folder
-                        ),
+                    };
+                    match sink.departure(&from, &told.folder, &told.record).await {
+                        Ok(()) => {
+                            tracing::info!(
+                                target: "face.quic",
+                                key = %key,
+                                "took the members record {} that lets this device go of {}",
+                                told.record,
+                                told.folder
+                            );
+                            taking.settle(told, true);
+                            // Only what the sink took is the let-go the link's
+                            // `Down` reports.
+                            departures.note_let_go(key, told_detail(&taking.taken));
+                        }
+                        Err(why) if why.again => {
+                            let retry = departures.options().retry;
+                            item.tries += 1;
+                            if item.tries < TAKE_TRIES {
+                                tracing::warn!(
+                                    target: "face.quic",
+                                    key = %key,
+                                    "did not take the members record {} named for {} yet: {}; \
+                                     this device asks again in {} s",
+                                    told.record,
+                                    told.folder,
+                                    why.why,
+                                    retry.as_secs_f32()
+                                );
+                                item.due = Instant::now() + retry;
+                                taking.wait(item);
+                            } else {
+                                tracing::warn!(
+                                    target: "face.quic",
+                                    key = %key,
+                                    "did not take the members record {} named for {} after \
+                                     {TAKE_TRIES} tries: {}",
+                                    told.record,
+                                    told.folder,
+                                    why.why
+                                );
+                                taking.settle(told, false);
+                            }
+                        }
+                        Err(why) => {
+                            tracing::warn!(
+                                target: "face.quic",
+                                key = %key,
+                                "did not take the members record {} named for {}: {}",
+                                told.record,
+                                told.folder,
+                                why.why
+                            );
+                            taking.settle(told, false);
+                        }
                     }
                 }
             }
         });
+    }
+}
+
+/// Sleep until `at`; never when there is none.
+async fn until(at: Option<Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at.into()).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// A departure told over a link, and when it is next asked of the sink.
+struct Waiting {
+    told: Told,
+    /// Asks made so far.
+    tries: u32,
+    due: Instant,
+}
+
+/// What the sink of one link has been asked and has still to be: the memory
+/// that makes a departure the sink was not ready for asked again, and one it
+/// took or refused for good asked no more.
+#[derive(Default)]
+struct Taking {
+    /// Taken, or refused for good.
+    settled: Vec<Told>,
+    /// Not taken yet.
+    waiting: Vec<Waiting>,
+    /// The ones the sink took.
+    taken: Vec<Told>,
+}
+
+impl Taking {
+    /// The peer said `said` (its latest departure for each folder): each that
+    /// is not settled or waiting already is to be asked at once, and replaces
+    /// one waiting for another record of its folder. Those past
+    /// [`TAKEN_PER_LINK_MAX`] are returned and dropped.
+    fn hear(&mut self, said: Vec<Told>, now: Instant) -> Vec<Told> {
+        let mut over = Vec::new();
+        for told in said {
+            if self.settled.contains(&told) || self.waiting.iter().any(|w| w.told == told) {
+                continue;
+            }
+            self.waiting.retain(|w| w.told.folder != told.folder);
+            if self.settled.len() + self.waiting.len() >= TAKEN_PER_LINK_MAX {
+                over.push(told);
+                continue;
+            }
+            self.waiting.push(Waiting {
+                told,
+                tries: 0,
+                due: now,
+            });
+        }
+        over
+    }
+
+    /// The next departure due at `now`, taken out of the waiting.
+    fn next_ready(&mut self, now: Instant) -> Option<Waiting> {
+        let at = self.waiting.iter().position(|w| w.due <= now)?;
+        Some(self.waiting.remove(at))
+    }
+
+    /// When the next waiting departure is due.
+    fn next_due(&self) -> Option<Instant> {
+        self.waiting.iter().map(|w| w.due).min()
+    }
+
+    /// `item` is asked again at its `due`.
+    fn wait(&mut self, item: Waiting) {
+        self.waiting.push(item);
+    }
+
+    /// `told` is done: taken, or refused for good.
+    fn settle(&mut self, told: Told, taken: bool) {
+        if taken {
+            self.taken.push(told.clone());
+        }
+        self.settled.push(told);
     }
 }
 
@@ -695,8 +937,15 @@ mod tests {
             table.admit(&key(1), &[n("/carol")], now).is_none(),
             "a namespace the mark does not list"
         );
-        for _ in 0..3 {
+        // Deciding to admit counts nothing: a handshake can still be refused
+        // (a slot, a direct path), and only a registered link is an attempt.
+        for _ in 0..10 {
             assert_eq!(table.admit(&key(1), &bob, now).unwrap().len(), 1);
+        }
+        let marks = table.admit(&key(1), &bob, now).unwrap();
+        for _ in 0..3 {
+            assert!(table.admit(&key(1), &bob, now).is_some());
+            table.count_attempt(&key(1), &marks);
         }
         assert!(
             table.admit(&key(1), &bob, now).is_none(),
@@ -708,6 +957,87 @@ mod tests {
         assert!(table.admit(&key(1), &bob, now).is_none());
         table.put(mark(1, "/alice/32=data/a", 6, hour), now);
         assert!(table.admit(&key(1), &bob, now).is_some());
+        // An attempt counted for a record that was replaced counts for no mark.
+        table.count_attempt(&key(1), &marks);
+        assert!(table.admit(&key(1), &bob, now).is_some());
+    }
+
+    fn told(folder: &str, seq: u64) -> Told {
+        Told {
+            folder: n(folder),
+            record: n(&format!("/alice/laptop/32=log{folder}/seq={seq}")),
+        }
+    }
+
+    /// What a link's sink is asked: a departure once, again while it is not
+    /// ready, never again once taken or refused for good; the newest for a
+    /// folder replaces one waiting; at most `TAKEN_PER_LINK_MAX` in all.
+    #[test]
+    fn a_departure_not_ready_waits_and_a_settled_one_is_never_asked_again() {
+        let start = Instant::now();
+        let mut taking = Taking::default();
+        assert!(
+            taking
+                .hear(
+                    vec![told("/a/32=data/x", 1), told("/a/32=data/y", 1)],
+                    start
+                )
+                .is_empty()
+        );
+        let first = taking.next_ready(start).expect("asked at once");
+        assert_eq!(first.told, told("/a/32=data/x", 1));
+        // Not ready: it waits for its time; the other is asked meanwhile.
+        let mut again = first;
+        again.tries += 1;
+        again.due = start + Duration::from_secs(15);
+        taking.wait(again);
+        let second = taking.next_ready(start).expect("the other is asked");
+        assert_eq!(second.told, told("/a/32=data/y", 1));
+        taking.settle(second.told, true);
+        assert!(taking.next_ready(start).is_none(), "nothing is due yet");
+        assert_eq!(taking.next_due(), Some(start + Duration::from_secs(15)));
+        let later = start + Duration::from_secs(15);
+        let retried = taking.next_ready(later).expect("asked again when due");
+        assert_eq!(
+            (retried.told.clone(), retried.tries),
+            (told("/a/32=data/x", 1), 1)
+        );
+        taking.settle(retried.told, true);
+        // What was settled is not asked again, whenever it is told again.
+        assert!(
+            taking
+                .hear(
+                    vec![told("/a/32=data/x", 1), told("/a/32=data/y", 1)],
+                    later
+                )
+                .is_empty()
+        );
+        assert!(taking.next_ready(later).is_none());
+        assert_eq!(taking.taken.len(), 2, "both were taken");
+        // A newer record of a folder replaces the one waiting for it.
+        taking.hear(vec![told("/a/32=data/z", 1)], later);
+        taking.hear(vec![told("/a/32=data/z", 2)], later);
+        assert_eq!(
+            taking.next_ready(later).unwrap().told,
+            told("/a/32=data/z", 2)
+        );
+        assert!(taking.next_ready(later).is_none());
+    }
+
+    #[test]
+    fn a_link_asks_its_sink_of_at_most_so_many_different_departures() {
+        let now = Instant::now();
+        let mut taking = Taking::default();
+        let said: Vec<Told> = (0..TAKEN_PER_LINK_MAX + 3)
+            .map(|i| told(&format!("/a/32=data/f{i}"), 1))
+            .collect();
+        let over = taking.hear(said, now);
+        assert_eq!(over.len(), 3, "the three past the bound are dropped");
+        let mut asked = 0;
+        while taking.next_ready(now).is_some() {
+            asked += 1;
+        }
+        assert_eq!(asked, TAKEN_PER_LINK_MAX);
     }
 
     #[test]

@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -1200,7 +1200,7 @@ async fn laptop_moves(
         alice.links.watch_addresses_from(
             AddressWatch {
                 poll: Duration::from_secs(1),
-                enabled: true,
+                ..AddressWatch::default()
             },
             Arc::clone(source) as Arc<dyn AddressSource>,
         );
@@ -1223,10 +1223,12 @@ async fn laptop_moves(
 
 /// F4 with the address source controlled: Alice's socket moves (the harness
 /// plays the system, as `tests/direct.rs` does for a direct path) and the set of
-/// addresses the watcher reads changes; the watcher does the rest.
+/// addresses the watcher reads changes the way the move does: the address the
+/// link Bob dialled was accepted at goes (for good), another comes. The watcher
+/// closes that link when the removal has persisted and Alice dials again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn words_typed_after_the_laptop_moved_cross_within_a_redial_by_a_controlled_source() {
-    let source = ManualAddresses::new(&["10.1.0.1"]);
+    let source = ManualAddresses::new(&["127.0.0.2"]);
     let seen = Arc::clone(&source);
     laptop_moves(
         "127.0.0.2:0",
@@ -1237,8 +1239,8 @@ async fn words_typed_after_the_laptop_moved_cross_within_a_redial_by_a_controlle
             // The system moves Alice's socket: the old address is gone for good.
             let socket = UdpSocket::bind("127.0.0.3:0").unwrap();
             alice.endpoint.rebind(socket).unwrap();
-            // What Alice's watcher reads changes: 10.1.0.1 went, 10.2.0.1 came.
-            seen.set(&["10.2.0.1"]);
+            // What Alice's watcher reads changes: 127.0.0.2 went, 127.0.0.3 came.
+            seen.set(&["127.0.0.3"]);
         },
     )
     .await;
@@ -1306,4 +1308,347 @@ async fn words_typed_after_the_laptop_moved_cross_within_a_redial_in_a_network_n
         ip(&["addr", "add", "10.2.0.1/32", "dev", "lo"]);
     })
     .await;
+}
+
+// ---- which accepted links an address change closes (round 7 M2) --------------------------------
+
+/// An address source that counts how often it is read, and can be made to
+/// fail (panic) at its next read.
+struct CountedAddresses {
+    inner: Arc<ManualAddresses>,
+    reads: AtomicUsize,
+    fail_next: AtomicBool,
+}
+
+impl AddressSource for CountedAddresses {
+    fn addresses(&self) -> Vec<IpAddr> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        if self.fail_next.swap(false, Ordering::SeqCst) {
+            panic!("the address source failed (a case's own doing)");
+        }
+        self.inner.addresses()
+    }
+}
+
+/// The watch these cases give Alice: read every second; a removal must hold
+/// `persists` before it is acted on.
+fn watching(persists: Duration) -> AddressWatch {
+    AddressWatch {
+        poll: Duration::from_secs(1),
+        removal_persists: persists,
+        ..AddressWatch::default()
+    }
+}
+
+/// Alice listens at 127.0.0.2 and Bob dials her there, so the link Alice holds
+/// was accepted at 127.0.0.2. Her address source says she has 127.0.0.2 and
+/// 10.9.9.9 (an address no link of hers uses); her watcher reads it.
+async fn accepted_at_a_watched_address(
+    source: Arc<dyn AddressSource>,
+    persists: Duration,
+) -> (Dev, Dev) {
+    let home = Home::new();
+    let alice = dev(&home, "alice", 1, "127.0.0.2:0", Vec::new()).await;
+    let mut to_alice = peer_to(&alice);
+    to_alice.endpoints = vec![alice.addr.to_string()];
+    let bob = dev(&home, "bob", 2, "127.0.0.4:0", vec![to_alice]).await;
+    alice.links.watch_addresses_from(watching(persists), source);
+    within("Alice and Bob link", LONG, || {
+        linked(&alice, bob.key) && linked(&bob, alice.key)
+    })
+    .await;
+    words_cross(&alice, &bob, LONG).await;
+    // Past the time in which a new link of the same device is the other half
+    // of a simultaneous dial.
+    tokio::time::sleep(ndn_link::policy::DIAL_RACE_WINDOW + Duration::from_secs(1)).await;
+    (alice, bob)
+}
+
+/// The face of Alice's first link (the faces her links added, not the others
+/// her forwarder has).
+fn first_link(alice: &Dev) -> FaceId {
+    alice
+        .faces
+        .faces
+        .lock()
+        .iter()
+        .find(|f| f.kind() == FaceKind::Quic)
+        .expect("Alice has a link")
+        .id()
+}
+
+fn is_up(alice: &Dev, face: FaceId) -> bool {
+    alice.faces.live.lock().contains(&face)
+}
+
+/// The links Alice's links made so far.
+fn links_made(alice: &Dev) -> usize {
+    alice
+        .faces
+        .faces
+        .lock()
+        .iter()
+        .filter(|f| f.kind() == FaceKind::Quic)
+        .count()
+}
+
+/// The first link is still up and no other link was made.
+fn only_link_is_up(alice: &Dev, first: FaceId) -> bool {
+    let (up, made) = (is_up(alice, first), links_made(alice));
+    if !up || made != 1 {
+        eprintln!("first link up: {up}; links made: {made}");
+    }
+    up && made == 1
+}
+
+/// M2: an address that none of the accepted links uses goes (a SLAAC prefix
+/// expiring, a VPN flapping): the links accepted at other addresses stay up,
+/// untouched, however long the watcher looks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unrelated_address_going_closes_no_accepted_link() {
+    let source = ManualAddresses::new(&["127.0.0.2", "10.9.9.9"]);
+    let (alice, _bob) = accepted_at_a_watched_address(
+        Arc::clone(&source) as Arc<dyn AddressSource>,
+        Duration::from_secs(1),
+    )
+    .await;
+    let first = first_link(&alice);
+    source.set(&["127.0.0.2"]);
+    throughout(
+        "a link accepted at 127.0.0.2 was closed when 10.9.9.9 went",
+        Duration::from_secs(6),
+        || only_link_is_up(&alice, first),
+    )
+    .await;
+}
+
+/// M2: the address a link was accepted at goes (and stays gone): that link
+/// closes, so the other device dials again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_address_a_link_was_accepted_at_going_closes_that_link() {
+    let source = ManualAddresses::new(&["127.0.0.2", "10.9.9.9"]);
+    let (alice, _bob) = accepted_at_a_watched_address(
+        Arc::clone(&source) as Arc<dyn AddressSource>,
+        Duration::from_secs(1),
+    )
+    .await;
+    let first = first_link(&alice);
+    source.set(&["10.9.9.9"]);
+    within(
+        "the link accepted at 127.0.0.2 stayed up after 127.0.0.2 went for good",
+        LONG,
+        || !is_up(&alice, first),
+    )
+    .await;
+}
+
+/// M2: an address that is gone and back within the window the watcher waits
+/// (a flap) does nothing: no link closes, and none is made again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_address_that_flaps_shorter_than_the_persistence_window_does_nothing() {
+    let source = ManualAddresses::new(&["127.0.0.2", "10.9.9.9"]);
+    let (alice, _bob) = accepted_at_a_watched_address(
+        Arc::clone(&source) as Arc<dyn AddressSource>,
+        Duration::from_secs(5),
+    )
+    .await;
+    let first = first_link(&alice);
+    source.set(&["10.9.9.9"]);
+    // Long enough for the watcher to have read it, short of its window.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    source.set(&["127.0.0.2", "10.9.9.9"]);
+    throughout(
+        "a flap shorter than the window closed the link accepted at the address",
+        Duration::from_secs(8),
+        || only_link_is_up(&alice, first),
+    )
+    .await;
+}
+
+/// Informational: a read of the addresses that fails (the source panics)
+/// does not stop the watcher: it says so and reads again at the next poll.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_read_of_the_addresses_does_not_stop_the_watcher() {
+    let manual = ManualAddresses::new(&["127.0.0.2", "10.9.9.9"]);
+    let source = Arc::new(CountedAddresses {
+        inner: Arc::clone(&manual),
+        reads: AtomicUsize::new(0),
+        fail_next: AtomicBool::new(false),
+    });
+    let (alice, _bob) = accepted_at_a_watched_address(
+        Arc::clone(&source) as Arc<dyn AddressSource>,
+        Duration::from_secs(1),
+    )
+    .await;
+    let first = first_link(&alice);
+    source.fail_next.store(true, Ordering::SeqCst);
+    let before = source.reads.load(Ordering::SeqCst);
+    within("the watcher read the failing source", LONG, || {
+        source.reads.load(Ordering::SeqCst) > before
+    })
+    .await;
+    // It goes on reading at its polls.
+    within(
+        "the watcher stopped reading after a read that failed",
+        Duration::from_secs(10),
+        || source.reads.load(Ordering::SeqCst) >= before + 3,
+    )
+    .await;
+
+    manual.set(&["10.9.9.9"]);
+    within(
+        "the watcher did not act on an address change after a failed read",
+        LONG,
+        || !is_up(&alice, first),
+    )
+    .await;
+}
+
+/// Run the case named `case` again in a user and network namespace of its
+/// own (`unshare -rn`, no root), where it may change the interfaces'
+/// addresses; `true` in that run, where the case's body goes on. In the
+/// parent it returns `false` (the case ended: it passed, or panicked here with
+/// what the namespace run said), or when no namespace can be made here, says
+/// so and returns `false`.
+fn in_a_namespace(case: &str) -> bool {
+    const IN_NAMESPACE: &str = "NDN_LINK_M2_IN_NAMESPACE";
+    if std::env::var_os(IN_NAMESPACE).is_some() {
+        return true;
+    }
+    let probe = std::process::Command::new("unshare")
+        .args(["-rn", "ip", "link", "set", "lo", "up"])
+        .output();
+    if !probe.is_ok_and(|o| o.status.success()) {
+        eprintln!(
+            "no user and network namespace can be made here (unshare -rn): {case} is not run"
+        );
+        return false;
+    }
+    let me = std::env::current_exe().unwrap();
+    let out = std::process::Command::new("unshare")
+        .args(["-rn"])
+        .arg(me)
+        .args([case, "--exact", "--nocapture", "--test-threads=1"])
+        .env(IN_NAMESPACE, "1")
+        .output()
+        .expect("the case runs in the namespace");
+    let said =
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "in the namespace:\n{said}");
+    false
+}
+
+/// `ip` with `args`, which must succeed; with `lines` on its standard input
+/// when given (`ip -batch -`).
+fn ip(args: &[&str], lines: Option<&str>) {
+    use std::io::Write;
+    let mut child = std::process::Command::new("ip")
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("ip runs");
+    if let Some(lines) = lines {
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(lines.as_bytes())
+            .unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "ip {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Informational (netlink): a burst of notices for addresses that are no part
+/// of the set the watcher reads (loopback ones) costs one read of the
+/// interfaces per coalescing window, not one per notice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_burst_of_netlink_notices_costs_one_read_per_window() {
+    if !in_a_namespace("a_burst_of_netlink_notices_costs_one_read_per_window") {
+        return;
+    }
+    ip(&["link", "set", "lo", "up"], None);
+    let source = Arc::new(CountedAddresses {
+        inner: ManualAddresses::new(&[]),
+        reads: AtomicUsize::new(0),
+        fail_next: AtomicBool::new(false),
+    });
+    // The default source, counted: the interfaces really are read.
+    struct Interfaces(Arc<CountedAddresses>);
+    impl AddressSource for Interfaces {
+        fn addresses(&self) -> Vec<IpAddr> {
+            self.0.reads.fetch_add(1, Ordering::SeqCst);
+            ndn_link::InterfaceAddresses.addresses()
+        }
+    }
+    let home = Home::new();
+    let alice = dev(&home, "alice", 1, "127.0.0.2:0", Vec::new()).await;
+    alice.links.watch_addresses_from(
+        AddressWatch {
+            // The poll is out of the way: only notices read.
+            poll: Duration::from_secs(3600),
+            enabled: true,
+            ..watching(Duration::from_secs(1))
+        },
+        Arc::new(Interfaces(Arc::clone(&source))),
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let before = source.reads.load(Ordering::SeqCst);
+    // 300 notices at once: 150 loopback addresses added and removed.
+    let mut batch = String::new();
+    for i in 1..=150 {
+        batch.push_str(&format!("addr add 127.0.1.{i}/32 dev lo\n"));
+    }
+    for i in 1..=150 {
+        batch.push_str(&format!("addr del 127.0.1.{i}/32 dev lo\n"));
+    }
+    ip(&["-batch", "-"], Some(&batch));
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let reads = source.reads.load(Ordering::SeqCst) - before;
+    assert!(
+        reads <= 8,
+        "300 notices in a burst caused {reads} reads of the interfaces in 3 s: one per notice, \
+         not one per coalescing window"
+    );
+}
+
+/// Informational (M2): deprecated IPv6 addresses (preferred lifetime 0) are
+/// no part of the set the default source reads; the preferred ones are.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_default_source_leaves_out_a_deprecated_address() {
+    if !in_a_namespace("the_default_source_leaves_out_a_deprecated_address") {
+        return;
+    }
+    ip(&["link", "set", "lo", "up"], None);
+    ip(&["addr", "add", "10.1.0.1/32", "dev", "lo"], None);
+    ip(&["-6", "addr", "add", "2001:db8::2/128", "dev", "lo"], None);
+    ip(
+        &[
+            "-6",
+            "addr",
+            "add",
+            "2001:db8::1/128",
+            "dev",
+            "lo",
+            "valid_lft",
+            "3600",
+            "preferred_lft",
+            "0",
+        ],
+        None,
+    );
+    let have = ndn_link::InterfaceAddresses.addresses();
+    let has = |a: &str| have.contains(&a.parse::<IpAddr>().unwrap());
+    assert!(has("10.1.0.1"), "an IPv4 address: {have:?}");
+    assert!(has("2001:db8::2"), "a preferred IPv6 address: {have:?}");
+    assert!(
+        !has("2001:db8::1"),
+        "a deprecated IPv6 address (preferred lifetime 0) is no address of the set: {have:?}"
+    );
 }

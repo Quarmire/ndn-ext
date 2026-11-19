@@ -1145,6 +1145,14 @@ mod tests {
                 "{name} not carried while the record lists Carol"
             );
         }
+        // Nor is an entry of a collection of hers whose path has a literal
+        // `KEY` component taken for a key or certificate name.
+        for lookalike in [
+            "/carol/member/phone/32=log/carol/32=data/diary/KEY/x/seq=3",
+            "/carol/32=data/KEY/x",
+        ] {
+            assert!(!carried(lookalike), "{lookalike} taken for a key name");
+        }
         assert!(
             !carried(diary),
             "a collection of hers outside the folder is carried"

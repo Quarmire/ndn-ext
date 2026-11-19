@@ -27,6 +27,11 @@ pub const ADDRESS_COALESCE: Duration = Duration::from_millis(500);
 /// Changes of the device's addresses the watcher acts on in a minute at
 /// most; the rest merge into the next.
 pub const ADDRESS_BURSTS_PER_MINUTE: usize = 6;
+/// How long an address of the device must stay gone before the watcher acts
+/// on its removal ([`AddressWatch::removal_persists`](crate::AddressWatch)):
+/// an address that comes back within it (a VPN flapping, a lifetime renewed,
+/// a router advertisement's short-lived prefix) changes nothing.
+pub const ADDRESS_REMOVAL_PERSISTS: Duration = Duration::from_secs(3);
 /// The lowest port a device rebinds its link socket to at `remember`: a
 /// kept port below it (a privileged one, or none) is never a bind target.
 pub const LISTEN_PORT_MIN: u16 = 1024;

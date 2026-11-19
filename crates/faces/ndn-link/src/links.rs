@@ -894,8 +894,14 @@ impl Links {
         }
         self.explain_enrollment(&admitted, &peer_enrollment, face_id);
         self.departure_link_up(&admitted, &handle);
-        if kind == PathKind::Link {
+        // A person is told of a departure by a full link only: what a peer says
+        // on an enrollment, introduction or departure link is not heard, and a
+        // grant link tells the returning person of the marks it holds (an
+        // entry that ended while they were away).
+        let full = kind == PathKind::Link && enrolling.is_empty() && admitted.enrollment.is_none();
+        if full {
             self.hear_departures(admitted.fingerprint, &handle);
+            self.grant_link_up(&admitted, &handle);
         }
         if kind == PathKind::Link
             && enrolling.is_empty()

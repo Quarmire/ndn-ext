@@ -30,12 +30,18 @@ pub(crate) fn offline_detail() -> LinkDetail {
 /// Whether the device is online: true until the host says otherwise.
 pub(crate) struct Online {
     flag: watch::Sender<bool>,
+    /// Held for a whole [`Online::switch`]: the flag and the steps that
+    /// follow it (the endpoints' accepting flag, the closes), set one after
+    /// the other, are never done by two calls at once. Interleaved, they
+    /// could leave an offline device answering handshakes.
+    transition: parking_lot::Mutex<()>,
 }
 
 impl Default for Online {
     fn default() -> Self {
         Self {
             flag: watch::channel(true).0,
+            transition: parking_lot::Mutex::new(()),
         }
     }
 }
@@ -52,6 +58,18 @@ impl Online {
             *now = online;
             changed
         })
+    }
+
+    /// Set the flag and, when it changed, run `then` (what follows from it),
+    /// with no other switch between the two: `then` of one call is over before
+    /// the next call sets the flag. Whether it changed.
+    fn switch(&self, online: bool, then: impl FnOnce()) -> bool {
+        let _one_at_a_time = self.transition.lock();
+        let changed = self.set(online);
+        if changed {
+            then();
+        }
+        changed
     }
 
     /// A receiver for [`wait_online`].
@@ -86,20 +104,19 @@ impl Links {
     /// is held here; the default is online. Calling it with the state it
     /// already has does nothing.
     pub fn set_online(self: &Arc<Self>, online: bool) {
-        if !self.online.set(online) {
-            return;
-        }
-        for endpoint in self.link_endpoints() {
-            endpoint.set_accepting(online);
-        }
-        if online {
-            tracing::info!(target: "face.quic", "this device is online: links are dialled again");
-            self.redial_all();
-        } else {
-            tracing::info!(target: "face.quic", "{WENT_OFFLINE}");
-            self.table.close_all(CloseReason::Shutdown, WENT_OFFLINE);
-            self.watch_offline();
-        }
+        self.online.switch(online, || {
+            for endpoint in self.link_endpoints() {
+                endpoint.set_accepting(online);
+            }
+            if online {
+                tracing::info!(target: "face.quic", "this device is online: links are dialled again");
+                self.redial_all();
+            } else {
+                tracing::info!(target: "face.quic", "{WENT_OFFLINE}");
+                self.table.close_all(CloseReason::Shutdown, WENT_OFFLINE);
+                self.watch_offline();
+            }
+        });
     }
 
     /// Whether this device is online ([`Links::set_online`]).
@@ -147,6 +164,48 @@ mod tests {
         assert!(!online.get());
         assert!(!online.set(false), "already offline");
         assert!(online.set(true));
+    }
+
+    /// What follows a switch is over before the next switch sets the flag: the
+    /// flag and the endpoints' accepting flag cannot end up different.
+    #[test]
+    fn what_follows_a_switch_is_over_before_the_next_switch_begins() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let online = Arc::new(Online::default());
+        online.set(false);
+        let events = Arc::new(parking_lot::Mutex::new(Vec::<&'static str>::new()));
+        let (inside_tx, inside_rx) = mpsc::channel::<()>();
+        let first = {
+            let (online, events) = (Arc::clone(&online), Arc::clone(&events));
+            std::thread::spawn(move || {
+                online.switch(true, || {
+                    events.lock().push("first begins");
+                    inside_tx.send(()).unwrap();
+                    // Long enough for the second call to reach the switch.
+                    std::thread::sleep(Duration::from_millis(300));
+                    events.lock().push("first ends");
+                });
+            })
+        };
+        inside_rx.recv().unwrap();
+        let second = {
+            let (online, events) = (Arc::clone(&online), Arc::clone(&events));
+            std::thread::spawn(move || {
+                online.switch(false, || {
+                    events.lock().push("second begins");
+                    events.lock().push("second ends");
+                });
+            })
+        };
+        first.join().unwrap();
+        second.join().unwrap();
+        assert_eq!(
+            *events.lock(),
+            ["first begins", "first ends", "second begins", "second ends"],
+            "the second switch ran inside the first"
+        );
+        assert!(!online.get(), "the second call was the last");
     }
 
     #[tokio::test]

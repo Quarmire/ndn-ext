@@ -721,6 +721,9 @@ async fn a_member_reads_another_member_let_in_by_another_invitation() {
 /// drops stops being carried: her summary root is refused at the next
 /// packet, while her entries of the folder are still carried as the
 /// collection's; and a name of hers outside the folder is refused all along.
+/// Ann's forwarder also relays Bob's Interest for Carol's entry to Carol's
+/// link while her entry stands (Bob's forwarder routing her device name
+/// over his link), and no longer once it has ended.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_removed_writers_names_stop_being_carried_and_a_name_outside_the_folder_never_was() {
     let alice = Person::new("/alice").await;
@@ -756,14 +759,13 @@ async fn a_removed_writers_names_stop_being_carried_and_a_name_outside_the_folde
     })
     .await;
     // Bob asks for what Carol wrote as the walk does: of Ann, a device that
-    // holds it, by the name `<Ann>/32=held/<name>` (spec §13.5). Ann's
-    // forwarder relays nothing between two links, so only what Ann's own
-    // device holds can be asked of her over Bob's link: her copy of Carol's
-    // entry of the folder, and (to show the answer is not "everything") her
-    // copy of nothing of Carol's diary. The names' derivation from the
-    // record at each packet — a listed writer's public names carried, a
-    // dropped one's not, her collections outside the folder never — is the
-    // unit case `grants::tests::the_public_names_of_a_listed_writer_...`.
+    // holds it, by the name `<Ann>/32=held/<name>` (spec §13.5), so what
+    // Ann's own device holds answers: her copy of Carol's entry of the
+    // folder, and (to show the answer is not "everything") her copy of
+    // nothing of Carol's diary. The names' derivation from the record at
+    // each packet — a listed writer's public names carried, a dropped one's
+    // not, her collections outside the folder never — is the unit case
+    // `grants::tests::the_public_names_of_a_listed_writer_...`.
     let held = |name: &Name| ndn_data::wire::held_name(&n(ANN), name);
     let carols_entry = held(&newest_entry(&ann, &carols.device("phone"), &written).await);
     let carols_diary = held(&newest_entry(&carol, &carols.device("phone"), &diary).await);
@@ -777,6 +779,39 @@ async fn a_removed_writers_names_stop_being_carried_and_a_name_outside_the_folde
     assert!(
         !asks(&bob, ann.key, &carols_diary, false).await,
         "{carols_diary}, outside the folder, was answered over Bob's link"
+    );
+    // Ann does relay, bounded, between two grant links: her forwarder has a
+    // route for Carol's device name over Carol's link (Carol's identity is
+    // admitted by her grant), and Bob's link carries Carol's entries of the
+    // folder (`folder_carries`, whoever wrote them). So when Bob's
+    // forwarder routes Carol's device name over his link to Ann (as a host's
+    // `[[peer]]` entry for Carol through relay Ann does), Bob's Interest
+    // for Carol's entry passes his link's filter, Ann's forwarder sends it
+    // over Carol's link, which carries it (her own device's name), and the
+    // Data returns the same way. What Bob cannot ask Ann to fetch is
+    // judged per packet at Bob's link: Carol's diary, outside the folder, is
+    // not carried.
+    let carols_entry_direct = newest_entry(&ann, &carols.device("phone"), &written).await;
+    let carols_diary_direct = newest_entry(&carol, &carols.device("phone"), &diary).await;
+    let bobs_face_to_ann = bob
+        .links
+        .report()
+        .links
+        .iter()
+        .filter(|l| l.key == Some(ann.key))
+        .flat_map(|l| l.paths.iter().map(|p| p.face))
+        .next()
+        .expect("bob's link to ann");
+    bob.engine
+        .fib()
+        .add_nexthop(&n(&carols.device("phone")), bobs_face_to_ann, 10);
+    assert!(
+        asks(&bob, ann.key, &carols_entry_direct, false).await,
+        "{carols_entry_direct}, Carol's entry of the folder, was not relayed by Ann to Carol's link"
+    );
+    assert!(
+        !asks(&bob, ann.key, &carols_diary_direct, false).await,
+        "{carols_diary_direct}, outside the folder, was relayed for Bob"
     );
 
     // A record without Carol: her entry ends; Bob's link and his reading of
@@ -796,6 +831,12 @@ async fn a_removed_writers_names_stop_being_carried_and_a_name_outside_the_folde
         "{carols_diary}, outside the folder, was answered over Bob's link"
     );
     assert!(linked(&ann, bob.key), "Bob's link closed with Carol's");
+    // Carol's link is gone, and with it Ann's route to her device name: the
+    // relay ended with her entry, whatever Bob's forwarder sends.
+    assert!(
+        !asks(&bob, ann.key, &carols_entry_direct, false).await,
+        "{carols_entry_direct} was relayed to a writer whose link had ended"
+    );
 }
 
 /// SHAPES-R7 C: a grant's role is per entry and judged at every packet. Bob
