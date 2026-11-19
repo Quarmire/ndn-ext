@@ -19,6 +19,14 @@ pub enum Call {
     RemoveFace(FaceId),
 }
 
+/// A route of a grant link's public names (a trust context, a key or
+/// certificate name outside the devices): it costs what a joiner's route
+/// costs, and is not one.
+pub fn is_public_name(prefix: &Name) -> bool {
+    let text = prefix.to_string();
+    text.ends_with("trust-context") || text.ends_with("/KEY")
+}
+
 /// [`EngineFaces`], recording its route and face removals.
 pub struct Recording {
     engine: EngineFaces,
@@ -44,7 +52,10 @@ impl Recording {
         let mut out: Vec<Name> = Vec::new();
         for call in self.calls.lock().iter() {
             if let Call::AddRoutes(_, routes) = call {
-                for r in routes.iter().filter(|r| r.cost == JOINED_ROUTE_COST) {
+                for r in routes
+                    .iter()
+                    .filter(|r| r.cost == JOINED_ROUTE_COST && !is_public_name(&r.prefix))
+                {
                     if !out.contains(&r.prefix) {
                         out.push(r.prefix.clone());
                     }
@@ -63,7 +74,10 @@ impl Recording {
         for call in self.calls.lock().iter() {
             match call {
                 Call::AddRoutes(f, routes) => {
-                    for r in routes.iter().filter(|r| r.cost == JOINED_ROUTE_COST) {
+                    for r in routes
+                        .iter()
+                        .filter(|r| r.cost == JOINED_ROUTE_COST && !is_public_name(&r.prefix))
+                    {
                         if !now.contains(&(*f, r.prefix.clone())) {
                             now.push((*f, r.prefix.clone()));
                         }

@@ -40,6 +40,21 @@ fn n(s: &str) -> Name {
     s.parse().unwrap()
 }
 
+/// What Ann routes over the link of a grant for `/b`: the person's device
+/// and sync group, and the public names of `/b` outside the devices (its
+/// trust context, the root's key and the CA's key).
+fn routes_of_a_grant_for_b() -> Vec<Name> {
+    let mut routes = vec![
+        n("/b/member/phone"),
+        n("/b/32=sync"),
+        ndn_cert::onboarding::rdr_prefix(&n("/b")),
+        n("/b/KEY"),
+        n("/b/CA/KEY"),
+    ];
+    routes.sort();
+    routes
+}
+
 fn now_ns() -> u64 {
     let since = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -460,8 +475,7 @@ async fn a_grant_links_its_key_in_its_namespace_and_routes_nothing_else_it_shows
     at_ann
         .settles("ann routes the phone", |f| !f.sorted_routes().is_empty())
         .await;
-    let mut expected = vec![n("/b/member/phone"), n("/b/32=sync")];
-    expected.sort();
+    let expected = routes_of_a_grant_for_b();
     assert_eq!(
         at_ann.sorted_routes(),
         expected,
@@ -580,8 +594,7 @@ async fn the_same_key_showing_another_namespace_is_linked_for_the_granted_one_on
     at_ann
         .settles("ann routes the phone", |f| !f.sorted_routes().is_empty())
         .await;
-    let mut expected = vec![n("/b/member/phone"), n("/b/32=sync")];
-    expected.sort();
+    let expected = routes_of_a_grant_for_b();
     assert_eq!(
         at_ann.sorted_routes(),
         expected,

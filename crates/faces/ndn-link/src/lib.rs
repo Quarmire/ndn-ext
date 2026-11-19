@@ -212,6 +212,17 @@
 //! At most [`policy::JOINED_ROUTES_MAX`] prefixes in [`policy::JOINED_FOLDERS_MAX`]
 //! folders (`ndn-rs/docs/specs/ndn-link.md` §8.7).
 //!
+//! The inviter's side is routed too: a link admitted by a live grant entry (the
+//! inviter's grant of a person, and the mirror a joiner keeps of its inviter)
+//! routes, beside the person's devices and sync group, the public names of
+//! each namespace the grant lists that lie outside the devices — the trust
+//! context (`<ns>/32=trust-context`), the root's key names (`<ns>/KEY`) and
+//! the CA's (`<ns>/CA/KEY`), the names its filter already carries — at
+//! [`policy::JOINED_ROUTE_COST`], so the inviter's forwarder relays a
+//! joiner's Interest for another writer's trust context toward that writer.
+//! Never for a link a policy admitted, nor an enrollment, introduction or
+//! departure link; they go with the link's face like its other routes.
+//!
 //! # Link memory
 //!
 //! A device that restarts keeps what it learned of its peers, and links with

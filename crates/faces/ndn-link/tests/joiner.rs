@@ -23,6 +23,7 @@ use std::time::{Duration, SystemTime};
 use bytes::Bytes;
 use parking_lot::Mutex;
 
+use common::recording::is_public_name;
 use common::{
     Embedded, LONG, Person, Setup, dials, embedded, invited, invited_in, linked, n, puts, reads,
     reshare, routed_over, text, until,
@@ -204,7 +205,7 @@ impl Faces {
             .routes
             .lock()
             .iter()
-            .filter(|(_, r)| r.cost == JOINED_ROUTE_COST)
+            .filter(|(_, r)| r.cost == JOINED_ROUTE_COST && !is_public_name(&r.prefix))
             .map(|(f, r)| (*f, r.prefix.clone()))
             .collect();
         out.sort_by(|a, b| (a.0.0, &a.1).cmp(&(b.0.0, &b.1)));
@@ -1111,7 +1112,7 @@ async fn a_link_of_another_key_gets_no_route() {
             .calls()
             .iter()
             .all(|c| !matches!(c, common::recording::Call::AddRoutes(f, r)
-                if *f == tablets_face && r.iter().any(|r| r.cost == JOINED_ROUTE_COST))),
+                if *f == tablets_face && r.iter().any(|r| r.cost == JOINED_ROUTE_COST && !is_public_name(&r.prefix)))),
         "the tablet's link to Bob was given the joiner's routes"
     );
 }

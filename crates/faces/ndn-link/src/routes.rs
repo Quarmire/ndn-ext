@@ -1,14 +1,16 @@
 //! The routes an admitted link gets.
 
+use ndn_cert::onboarding::rdr_prefix;
 use ndn_cert::roles::Role;
 use ndn_packet::Name;
 use ndn_security::cert_name::key_name_of;
 use ndn_security::sync_group;
 
 use crate::admission::{Admitted, Enrollment, Identity};
+use crate::grants::Grant;
 use crate::host::Route;
 use crate::peer::{PeerSpec, Peers};
-use crate::policy::VIA_RELAY_COST;
+use crate::policy::{JOINED_ROUTE_COST, VIA_RELAY_COST};
 
 /// The routes a relay this device uses gets: the namespaces of this device
 /// it is used for and the namespaces this device follows, at the relay's
@@ -36,7 +38,9 @@ pub(crate) struct RelayRoutes {
 /// the namespace on the enrolling device. A prefix may appear twice (a
 /// relay namespace that is also a default route): the forwarder keeps one
 /// route per prefix and face, and a namespace no longer routed keeps the
-/// route its other entry needs.
+/// route its other entry needs. A link admitted by a live grant entry also
+/// gets, for each held namespace the grant lists, that namespace's public
+/// names outside its devices ([`grant_public_routes`]).
 pub(crate) fn routes_for(
     peers: &Peers,
     admitted: &Admitted,
@@ -79,6 +83,46 @@ pub(crate) fn routes_for(
     routes.extend(issuer_routes(&admitted.identities, base));
     let carried = admitted.identities.iter().map(|id| &id.namespace);
     routes.extend(group_routes(carried, base));
+    if let Some(grant) = &admitted.grant {
+        routes.extend(grant_public_routes(grant, &admitted.identities));
+    }
+    routes
+}
+
+/// The routes a link admitted by a live grant entry gets for the public
+/// names of the namespaces the grant lists, outside every device name (a
+/// device's names are routed already): the trust context and its RDR
+/// metadata ([`rdr_prefix`], `<ns>/keyword=trust-context`), the root's key
+/// and certificates (`<ns>/KEY`) and the CA's (`<ns>/CA/KEY`) — exactly the
+/// public names the entry's filter carries (`grants::public_name`), so a
+/// forwarder relays a joiner's Interest for a writer's trust context toward
+/// the writer's own link (SHAPES-R9 §A, the inviter's side: the grant link of
+/// the writer carried these names and routed none of them). One route each,
+/// once per namespace, at [`JOINED_ROUTE_COST`], above every real path's.
+/// Only **held** identities in a namespace the grant lists count: a served
+/// identity, or one in a namespace the grant does not list, gets none, and a
+/// policy-admitted link (no grant) none. The sync group is routed by
+/// [`group_routes`].
+fn grant_public_routes(grant: &Grant, identities: &[Identity]) -> Vec<Route> {
+    let mut routes: Vec<Route> = Vec::new();
+    for id in identities
+        .iter()
+        .filter(|id| id.served.is_none() && grant.namespaces.contains(&id.namespace))
+    {
+        let ns = &id.namespace;
+        for prefix in [
+            rdr_prefix(ns),
+            ns.clone().append("KEY"),
+            ns.clone().append("CA").append("KEY"),
+        ] {
+            if !routes.iter().any(|r| r.prefix == prefix) {
+                routes.push(Route {
+                    prefix,
+                    cost: JOINED_ROUTE_COST,
+                });
+            }
+        }
+    }
     routes
 }
 
@@ -396,5 +440,93 @@ mod tests {
             ),
             [route("/home", 0)]
         );
+    }
+
+    fn grant(namespaces: &[&str]) -> Grant {
+        Grant {
+            key: KeyFingerprint([0; 32]),
+            namespaces: namespaces.iter().map(|s| n(s)).collect(),
+            folder: n("/home/32=data/notes"),
+            role: crate::grants::GrantRole::Writer,
+            until: None,
+        }
+    }
+
+    fn id_in(namespace: &str, device: &str) -> Identity {
+        Identity {
+            namespace: n(namespace),
+            ..id(device, Role::Member)
+        }
+    }
+
+    /// A link admitted by a grant entry routes, beside the person's device
+    /// and sync group, the public names of each namespace the grant lists
+    /// that lie outside the devices: the trust context, the root's key and
+    /// the CA's key (so a forwarder that relays a joiner's Interest for a
+    /// writer's trust context has a route toward the writer): each at the
+    /// joiner's cost, never before the person's own routes.
+    #[test]
+    fn a_grant_link_routes_the_public_names_of_its_namespaces_outside_the_devices() {
+        let peers = Peers::new(Vec::new());
+        let mut link = admitted(None, Some(id_in("/bob", "/bob/member/phone")), None);
+        link.grant = Some(grant(&["/bob"]));
+        assert_eq!(
+            routes_for(&peers, &link, false, None),
+            [
+                route("/bob/member/phone", 0),
+                route("/bob/32=sync", 0),
+                Route {
+                    prefix: rdr_prefix(&n("/bob")),
+                    cost: JOINED_ROUTE_COST
+                },
+                route("/bob/KEY", JOINED_ROUTE_COST),
+                route("/bob/CA/KEY", JOINED_ROUTE_COST),
+            ]
+        );
+    }
+
+    /// A namespace the grant does not list, a served identity and a link no
+    /// grant admitted get no public-name route: it follows the entry, not
+    /// the identity.
+    #[test]
+    fn only_the_granted_namespaces_of_a_grant_link_are_routed_by_public_names() {
+        let peers = Peers::new(Vec::new());
+        let mut link = admitted(None, Some(id_in("/bob", "/bob/member/phone")), None);
+        let mut other = id_in("/carol", "/carol/member/tab");
+        other.certificates = vec![n("/carol/member/tab/KEY/t/NA/v=1")];
+        let mut served = id_in("/visitor", "/visitor/member/tab");
+        served.served = Some(KeyFingerprint([7; 32]));
+        link.identities.extend([other, served]);
+        link.grant = Some(grant(&["/bob", "/visitor"]));
+        let routed: Vec<Name> = routes_for(&peers, &link, false, None)
+            .into_iter()
+            .filter(|r| r.cost == JOINED_ROUTE_COST)
+            .map(|r| r.prefix)
+            .collect();
+        assert_eq!(
+            routed,
+            [rdr_prefix(&n("/bob")), n("/bob/KEY"), n("/bob/CA/KEY")],
+            "a namespace the grant does not list, or a served one, was routed"
+        );
+        link.grant = None;
+        assert!(
+            routes_for(&peers, &link, false, None)
+                .iter()
+                .all(|r| r.cost != JOINED_ROUTE_COST),
+            "a link no grant admitted got public-name routes"
+        );
+        // An enrollment or departure link gets none, whatever its entry.
+        for enrollment in [
+            Enrollment::Relay(vec![n("/bob")]),
+            Enrollment::Departure(Vec::new()),
+        ] {
+            let mut narrow = admitted(
+                None,
+                Some(id_in("/bob", "/bob/member/phone")),
+                Some(enrollment),
+            );
+            narrow.grant = Some(grant(&["/bob"]));
+            assert!(routes_for(&peers, &narrow, false, None).is_empty());
+        }
     }
 }
