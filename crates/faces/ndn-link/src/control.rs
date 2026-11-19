@@ -36,6 +36,9 @@ pub(crate) struct PeerCtl {
     /// Skip the rest of the current backoff: the host asked, or the network
     /// changed.
     kick: AtomicBool,
+    /// The next dial takes its turn at the link memory's `dials_at_once`:
+    /// every loop woke at once (online again, an address change).
+    staggered: AtomicBool,
     last_error: Mutex<Option<LinkDetail>>,
     wake_token: Mutex<Option<Bytes>>,
 }
@@ -53,6 +56,15 @@ impl PeerCtl {
 
     pub(crate) fn take_kick(&self) -> bool {
         self.kick.swap(false, Ordering::SeqCst)
+    }
+
+    /// The next dial of this peer waits for its turn (see `Links::dial_turn`).
+    pub(crate) fn stagger(&self) {
+        self.staggered.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn take_staggered(&self) -> bool {
+        self.staggered.swap(false, Ordering::SeqCst)
     }
 
     pub(crate) async fn changed(&self) {
@@ -210,11 +222,26 @@ impl Links {
 
     /// The network changed (Wi-Fi to cellular, a new address): move the
     /// host's link socket to `socket` when given (its links migrate), the
-    /// dial-only sockets to new ones, dial again now, and punch again now:
-    /// the devices whose punch waits out its backoff, and every device a
-    /// direct path goes to (that path is closed; the new punch's takes its
-    /// place).
+    /// dial-only sockets to new ones, close the links this device accepted
+    /// (a QUIC server cannot follow its address, RFC 9000 §9: the other
+    /// device dials again, and so does this one), dial again now (each peer
+    /// and each remembered device, staggered), tell the linked devices, and
+    /// punch again now: the devices whose punch waits out its backoff, and
+    /// every device a direct path goes to (that path is closed; the new
+    /// punch's takes its place). A host with no platform callback leaves
+    /// this to [`Links::watch_addresses`], which does the same on a change
+    /// of this device's addresses.
     pub fn network_changed(self: &Arc<Self>, socket: Option<std::net::UdpSocket>) {
+        self.moved(socket, true);
+    }
+
+    /// What a change of network does (`network_changed`); with
+    /// `close_accepted` the links this device accepted are closed.
+    pub(crate) fn moved(
+        self: &Arc<Self>,
+        socket: Option<std::net::UdpSocket>,
+        close_accepted: bool,
+    ) {
         if let (Some(socket), Some(endpoint)) = (socket, &self.socket)
             && let Err(e) = endpoint.rebind(socket)
         {
@@ -239,13 +266,22 @@ impl Links {
                 }
             }
         }
-        for (id, _) in self.peers.iter() {
-            let ctl = self.ctl(id);
-            ctl.failing.store(false, Ordering::SeqCst);
-            ctl.kick();
+        if close_accepted {
+            let closed = self.table.close_accepted(
+                CloseReason::Released,
+                "this device's address changed: a link it accepted cannot follow it, and this \
+                 device links again from where it is now",
+            );
+            if closed > 0 {
+                tracing::info!(target: "face.quic", closed, "the network changed: links this device accepted are closed");
+            }
         }
-        self.direct.kick();
+        for (id, _) in self.peers.iter() {
+            self.ctl(id).failing.store(false, Ordering::SeqCst);
+        }
+        self.redial_all();
         self.punch_again_all();
+        self.announce_all();
         tracing::info!(target: "face.quic", "the network changed: links are dialled and punched again now");
     }
 

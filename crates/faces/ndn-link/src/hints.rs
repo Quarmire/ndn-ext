@@ -14,6 +14,7 @@ use ndn_data::{DataError, Device, IntroductionSurface, Role};
 use ndn_face_quic::KeyFingerprint;
 use ndn_packet::Name;
 
+use crate::departures::{Departure, DepartureSink, DepartureTaking};
 use crate::grants::{Grant, GrantRole};
 use crate::introduce::Introductions;
 use crate::links::Links;
@@ -28,7 +29,25 @@ impl Introductions for IntroductionSurface {
     }
 
     fn grant_carries(&self, folder: &Name, name: &Name) -> bool {
-        ndn_data::folder_carries(folder, name)
+        IntroductionSurface::grant_carries(self, folder, name)
+    }
+
+    fn departure_carries(&self, record: &Name, name: &Name) -> bool {
+        IntroductionSurface::departure_carries(self, record, name)
+    }
+
+    fn writer_namespaces(&self, folder: &Name) -> Vec<Name> {
+        IntroductionSurface::writer_namespaces(self, folder)
+    }
+}
+
+impl DepartureSink for IntroductionSurface {
+    fn departure<'a>(&'a self, folder: &'a Name, record: &'a Name) -> DepartureTaking<'a> {
+        Box::pin(async move {
+            self.take_departure(folder, record)
+                .await
+                .map_err(|e| e.to_string())
+        })
     }
 }
 
@@ -60,6 +79,11 @@ impl LinkHints {
     pub fn serve(&self, device: &Device) {
         self.links
             .set_introductions(Arc::new(device.introductions()));
+        self.links
+            .set_departure_sink(Arc::new(device.introductions()));
+        for departure in device.departures() {
+            self.depart(&departure);
+        }
         for grant in device.grants() {
             self.grant(&grant);
         }
@@ -68,30 +92,45 @@ impl LinkHints {
     /// An offer of the device admitted a person (or a held record changed
     /// the role it admits them in): this device links with its key as a
     /// person of the grant's namespaces, in the folder's scope and the
-    /// role's, until it ends ([`Links::grant`]). Forward
+    /// role's, until it ends ([`Links::grant`]); the grant is one entry of
+    /// the key's set, the entry of its folder. Forward
     /// [`Introducer::grant`](ndn_data::intro::Introducer::grant) here.
     pub fn grant(&self, grant: &ndn_data::intro::Grant) {
         self.links.grant(link_grant(grant));
     }
 
-    /// The grant of `key` ended before its time (a held members record
-    /// leaves the person out): the links it alone admitted are closed
-    /// ([`Links::revoke_grant`]). Forward
+    /// The grant of `key` for `folder` ended before its time (a held members
+    /// record leaves the person out of that folder): the links the key's
+    /// entries admitted close when this was the last entry
+    /// ([`Links::revoke_grant`]), or narrow to the departure when
+    /// [`LinkHints::depart`] was told of this folder first. Forward
     /// [`Introducer::revoke_grant`](ndn_data::intro::Introducer::revoke_grant)
     /// here. It is **in memory only**: the device calls it before it records
     /// the end durably, itself. A host that ends a grant of its own accord
-    /// (a person who stays a member) calls [`LinkHints::end_grant`], which
-    /// also makes it durable, so that a restart does not bring it back.
-    pub fn revoke_grant(&self, key: &[u8; 32]) {
-        self.links.revoke_grant(&KeyFingerprint(*key));
+    /// (a person who stays a member) calls [`LinkHints::end_grant_in`] or
+    /// [`LinkHints::end_grant`], which also make it durable, so that a
+    /// restart does not bring it back.
+    pub fn revoke_grant(&self, key: &[u8; 32], folder: &Name) {
+        self.links.revoke_grant(&KeyFingerprint(*key), folder);
     }
 
-    /// The host ends the grant of `key` for good: the links it alone
-    /// admitted close now ([`Links::revoke_grant`], in memory, first), then
+    /// A held members record left the person out of a folder: the departure
+    /// mark ([`Links::depart`]) that makes the link narrow to the record, or
+    /// admit a returning device on a narrow link for it. Forward
+    /// [`Introducer::departure`](ndn_data::intro::Introducer::departure)
+    /// here; the device calls it before
+    /// [`revoke_grant`](LinkHints::revoke_grant) for the same end.
+    pub fn depart(&self, departure: &ndn_data::intro::Departure) {
+        self.links.depart(link_departure(departure));
+    }
+
+    /// The host ends every grant of `key` for good: the links they alone
+    /// admitted close now ([`Links::revoke_grants`], in memory, first), then
     /// the device records the end ([`Device::end_grant`]) behind its store
-    /// barrier. The person stays a member of the folder, which a members
-    /// record changes, not this. `Ok(true)` when a grant was in force in
-    /// either layer.
+    /// barrier. No departure is told: the person was not let go by a record.
+    /// The person stays a member of the folders, which a members record
+    /// changes, not this. `Ok(true)` when a grant was in force in either
+    /// layer.
     ///
     /// `device` is the one given to [`LinkHints::serve`]; it is a parameter
     /// and not kept here because the device's introducer holds these hints.
@@ -101,8 +140,26 @@ impl LinkHints {
     /// durable: the links are closed already, call it again once the device
     /// runs.
     pub async fn end_grant(&self, device: &Device, key: &[u8; 32]) -> Result<bool, DataError> {
-        let linked = self.links.revoke_grant(&KeyFingerprint(*key));
+        let linked = self.links.revoke_grants(&KeyFingerprint(*key));
         let recorded = device.end_grant(key).await?;
+        Ok(linked || recorded)
+    }
+
+    /// The host ends the grant of `key` for `folder` only, for good
+    /// ([`Links::revoke_grant`], then [`Device::end_grant_in`]): the key's
+    /// other entries stand, and the links close only when this was the last.
+    /// `Ok(true)` when an entry was in force in either layer.
+    ///
+    /// # Errors
+    /// As [`LinkHints::end_grant`].
+    pub async fn end_grant_in(
+        &self,
+        device: &Device,
+        key: &[u8; 32],
+        folder: &Name,
+    ) -> Result<bool, DataError> {
+        let linked = self.links.revoke_grant(&KeyFingerprint(*key), folder);
+        let recorded = device.end_grant_in(key, folder).await?;
         Ok(linked || recorded)
     }
 
@@ -215,6 +272,19 @@ fn link_grant(grant: &ndn_data::intro::Grant) -> Grant {
             Role::Writer => GrantRole::Writer,
         },
         until,
+    }
+}
+
+/// The data layer's departure mark as ndn-link holds it. A date no platform
+/// clock can count to is a date long past: the mark is already over.
+fn link_departure(departure: &ndn_data::intro::Departure) -> Departure {
+    let Timestamp(until) = departure.until;
+    Departure {
+        key: KeyFingerprint(departure.key),
+        namespaces: departure.namespaces.clone(),
+        folder: departure.folder.clone(),
+        record: departure.record.clone(),
+        until: epoch_plus(until).unwrap_or(UNIX_EPOCH),
     }
 }
 

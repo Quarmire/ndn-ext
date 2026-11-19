@@ -8,6 +8,28 @@ use ndn_face_quic::RateLimit;
 
 /// How long each side has for its hello, and again for its verdict.
 pub const MESSAGE_DEADLINE: Duration = Duration::from_secs(10);
+/// A link already registered for a device is the other half of a
+/// simultaneous dial for this long, and no longer: the link dialled by the
+/// device with the smaller fingerprint stays (§6.3). An older link that the
+/// same device dials past is one it lost (it moved: §17D.3), and the newer
+/// link replaces it. A handshake takes at most [`MESSAGE_DEADLINE`] for each of
+/// its two messages, so two dials that began together are registered within it.
+pub const DIAL_RACE_WINDOW: Duration = MESSAGE_DEADLINE;
+/// How often the address watcher reads the interface addresses when the
+/// host does not say (§17D.3); on Linux a netlink subscription tells at once
+/// and the poll is the backstop.
+pub const ADDRESS_POLL: Duration = Duration::from_secs(5);
+/// The shortest poll interval the address watcher takes.
+pub const ADDRESS_POLL_MIN: Duration = Duration::from_secs(1);
+/// A change of the device's addresses is acted on this long after the
+/// first notice of it: changes that follow within it are one change.
+pub const ADDRESS_COALESCE: Duration = Duration::from_millis(500);
+/// Changes of the device's addresses the watcher acts on in a minute at
+/// most; the rest merge into the next.
+pub const ADDRESS_BURSTS_PER_MINUTE: usize = 6;
+/// The lowest port a device rebinds its link socket to at `remember`: a
+/// kept port below it (a privileged one, or none) is never a bind target.
+pub const LISTEN_PORT_MIN: u16 = 1024;
 /// Cost of a route to a peer reached through its relay; a direct link to it
 /// costs 0, so it wins when it is up.
 pub const VIA_RELAY_COST: u32 = 10;

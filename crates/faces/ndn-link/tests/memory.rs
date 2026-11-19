@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -225,9 +225,9 @@ impl Introducer for Host {
         }
     }
 
-    fn revoke_grant(&self, key: &[u8; 32]) {
+    fn revoke_grant(&self, key: &[u8; 32], folder: &Name) {
         if let Some(hints) = self.hints.get() {
-            hints.revoke_grant(key);
+            hints.revoke_grant(key, folder);
         }
     }
 }
@@ -239,6 +239,10 @@ struct Setup {
     listen: bool,
     /// Whom it serves.
     serve: ServePolicy,
+    /// How long a departure mark its device makes lasts. Zero: no mark, so a
+    /// member let go is refused as a stranger is (these cases are about what
+    /// a device remembers; what a mark admits is `tests/departures.rs`).
+    departure_for: Duration,
 }
 
 impl Setup {
@@ -248,6 +252,7 @@ impl Setup {
         Setup {
             listen: true,
             serve: ServePolicy::Own,
+            departure_for: Duration::ZERO,
         }
     }
 
@@ -256,6 +261,7 @@ impl Setup {
         Setup {
             listen: false,
             serve: ServePolicy::Own,
+            departure_for: Duration::ZERO,
         }
     }
 }
@@ -270,6 +276,9 @@ struct Durable {
     trust: Arc<Trust>,
     store: Arc<MemoryStore>,
     port: Mutex<u16>,
+    /// The host keeps no port: its socket is bound on a port the system picks at
+    /// every start (the link memory keeps the port, ndn-link §17D.2).
+    fresh_port: AtomicBool,
 }
 
 impl Durable {
@@ -292,13 +301,18 @@ impl Durable {
             trust,
             store: Arc::new(MemoryStore::new()),
             port: Mutex::new(0),
+            fresh_port: AtomicBool::new(false),
         })
     }
 
     /// The listening socket: on a port the system picks the first time, on
     /// the same one at a restart (the old socket may take a moment to go).
     async fn bind(&self) -> Arc<LinkEndpoint> {
-        let port = *self.port.lock();
+        let port = if self.fresh_port.load(Ordering::SeqCst) {
+            0
+        } else {
+            *self.port.lock()
+        };
         for _ in 0..100 {
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
             match LinkEndpoint::bind(
@@ -329,6 +343,7 @@ struct Embedded {
     links: Arc<Links>,
     key: KeyFingerprint,
     addr: Option<SocketAddr>,
+    endpoint: Option<Arc<LinkEndpoint>>,
     cancel: CancellationToken,
     _shutdown: ShutdownHandle,
     validator: Arc<Validator>,
@@ -370,6 +385,12 @@ impl Embedded {
         self.links
             .remember(DeviceMemory::new(&self.device), on_this_machine());
     }
+
+    /// The same with `options`.
+    fn remembers_in_the_device_with(&self, options: MemoryOptions) {
+        self.links
+            .remember(DeviceMemory::new(&self.device), options);
+    }
 }
 
 async fn embedded(person: &Person, device: &str, setup: Setup) -> Embedded {
@@ -394,6 +415,7 @@ async fn boot(durable: &Arc<Durable>, setup: Setup) -> Embedded {
         None
     };
     let addr = socket.as_ref().map(|s| s.local_addr().unwrap());
+    let endpoint = socket.clone();
     let cancel = CancellationToken::new();
     let skew = Arc::new(AtomicU64::new(0));
     let clock: Clock = {
@@ -449,6 +471,7 @@ async fn boot(durable: &Arc<Durable>, setup: Setup) -> Embedded {
             introducer: Some(host),
             intro: IntroPolicy {
                 local_candidates: true,
+                departure_for: setup.departure_for,
                 ..IntroPolicy::new()
             },
             ..Config::new()
@@ -464,6 +487,7 @@ async fn boot(durable: &Arc<Durable>, setup: Setup) -> Embedded {
         links,
         key: durable.parts.fingerprint,
         addr,
+        endpoint,
         cancel,
         validator: Arc::clone(&durable.validator),
         skew,
@@ -655,6 +679,7 @@ fn grant_of(bob: &Embedded) -> Grant {
 #[derive(Default)]
 struct Shelf {
     records: Mutex<HashMap<KeyFingerprint, PeerRecord>>,
+    port: Mutex<Option<u16>>,
 }
 
 impl Shelf {
@@ -688,6 +713,15 @@ impl LinkMemory for Shelf {
             Ok(())
         })
     }
+    fn load_listen_port(&self) -> Result<Option<u16>, String> {
+        Ok(*self.port.lock())
+    }
+    fn save_listen_port<'a>(&'a self, port: Option<u16>) -> MemoryFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            *self.port.lock() = port;
+            Ok(())
+        })
+    }
 }
 
 /// What Bob's memory holds of Ann: where he reached her, `age` ago.
@@ -698,6 +732,7 @@ fn of_ann(ann: &Embedded, addresses: Vec<SocketAddr>, age: Duration) -> PeerReco
         addresses,
         last_contact: SystemTime::now() - age,
         origin: Direction::Dialed,
+        port: None,
     }
 }
 
@@ -908,7 +943,7 @@ async fn forget_removes_the_record_and_ends_the_redial() {
 
     // The link ends (Ann ends the grant, then grants again, so she would take
     // a redial): it is not made again.
-    assert!(ann.links.revoke_grant(&bob.key));
+    assert!(ann.links.revoke_grants(&bob.key));
     until("the link ends", LONG, async || {
         !linked(&bob, ann.key) && !linked(&ann, bob.key)
     })
@@ -1003,10 +1038,15 @@ async fn an_address_another_key_answers_at_costs_a_failed_dial_and_no_link() {
     let hostile = mallory.addr.unwrap();
     let shelf = Shelf::with(vec![of_ann(&ann, vec![hostile], DAY)]);
     bob.links.remember(shelf, on_this_machine());
+    // The failed dial is reported: as a redial that comes, or (Bob and Ann
+    // share no relay, §17D.2) as no path at all; either way no link.
     until("bob's dial fails", LONG, async || {
         matches!(
             remembered(&bob, ann.key),
-            Some((_, RememberedState::Redialling { .. }))
+            Some((
+                _,
+                RememberedState::Redialling { .. } | RememberedState::NoPath { .. }
+            ))
         )
     })
     .await;
@@ -1055,6 +1095,7 @@ async fn a_peer_with_no_address_waits_and_learns_one_when_the_peer_dials_in() {
         addresses: Vec::new(),
         last_contact: SystemTime::now() - DAY,
         origin: Direction::Accepted,
+        port: None,
     }]);
     ann.links.remember(shelf.clone(), on_this_machine());
     until("ann waits for an address", LONG, async || {
@@ -1083,11 +1124,12 @@ async fn a_peer_with_no_address_waits_and_learns_one_when_the_peer_dials_in() {
     .await;
     let record = shelf.get(&bob.key).unwrap();
     assert_eq!(record.origin, Direction::Accepted);
-    assert!(
-        remembered(&ann, bob.key).is_some_and(|(_, s)| s == RememberedState::Linked),
-        "{:?}",
-        remembered(&ann, bob.key)
-    );
+    // The record is saved on the contact and the report's state follows it
+    // (two writers, one lock each): the state is read once it has caught up.
+    until("ann reports bob linked", LONG, async || {
+        remembered(&ann, bob.key).is_some_and(|(_, s)| s == RememberedState::Linked)
+    })
+    .await;
 }
 
 /// A remembered peer whose grant ended is refused, and the inviter does not
@@ -1111,7 +1153,7 @@ async fn a_remembered_peer_whose_grant_ended_is_refused_and_not_dialled_by_the_i
     .await;
     assert_eq!(ann_shelf.get(&bob.key).unwrap().origin, Direction::Accepted);
 
-    assert!(ann.links.revoke_grant(&bob.key));
+    assert!(ann.links.revoke_grants(&bob.key));
     until("the link ends", LONG, async || {
         !linked(&bob, ann.key) && !linked(&ann, bob.key)
     })
@@ -1289,6 +1331,7 @@ impl Planted {
                     .collect(),
                 last_contact: SystemTime::now() - Duration::from_secs(60),
                 origin: Direction::Dialed,
+                port: None,
             })
             .collect()
     }
@@ -1349,4 +1392,78 @@ async fn a_store_cannot_make_this_device_dial_loopback_or_link_local_addresses()
         "the peers wait for an address they can use: {:?}",
         report.peers.first()
     );
+}
+
+/// The device stops and its port is free again (the old socket may take a
+/// moment to go).
+async fn stopped(ann: Embedded, port: u16) {
+    ann.links.shutdown().await;
+    ann.device.shutdown();
+    ann.cancel.cancel();
+    drop(ann);
+    for _ in 0..100 {
+        if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("port {port} is not free ten seconds after the device stopped");
+}
+
+fn kept_port(ann: &Embedded) -> Option<u16> {
+    ann.device
+        .local_notes("link-memory")
+        .get("listen-port")
+        .unwrap()
+        .map(|v| u16::from_be_bytes(<[u8; 2]>::try_from(v.as_ref()).expect("2 octets")))
+}
+
+/// SHAPES-R7 D, through a real device restarted over the same store: the
+/// host keeps no port (its socket is bound on a port the system picks); the
+/// device's notes keep the listening port (`link-memory/listen-port`, 2
+/// octets), the next start's `remember` binds it again when it is free, and a
+/// start with `persist_addresses = false` removes the note and moves nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_listening_port_survives_a_restart_in_the_devices_notes_and_goes_when_addresses_are_not_kept()
+ {
+    let alice = Person::new("/alice").await;
+    let durable = Durable::new(&alice, ANN).await;
+    durable.fresh_port.store(true, Ordering::SeqCst);
+
+    // First run: the port the system picked is kept.
+    let ann = boot(&durable, Setup::inviter()).await;
+    let first = ann.addr.unwrap().port();
+    ann.remembers_in_the_device();
+    ann.links.shutdown().await;
+    assert_eq!(kept_port(&ann), Some(first), "the note holds the port");
+    stopped(ann, first).await;
+
+    // Second run: the host binds another port; remember() binds the kept one.
+    let ann = boot(&durable, Setup::inviter()).await;
+    let picked = ann.addr.unwrap().port();
+    assert_ne!(picked, first, "the system picked another port");
+    ann.remembers_in_the_device();
+    assert_eq!(
+        ann.endpoint.as_ref().unwrap().local_addr().unwrap().port(),
+        first,
+        "the kept port is bound again"
+    );
+    ann.links.shutdown().await;
+    assert_eq!(kept_port(&ann), Some(first), "and still kept");
+    stopped(ann, first).await;
+
+    // Third run, addresses not persisted: the note goes, the socket stays.
+    let ann = boot(&durable, Setup::inviter()).await;
+    let picked = ann.addr.unwrap().port();
+    ann.remembers_in_the_device_with(MemoryOptions {
+        persist_addresses: false,
+        ..on_this_machine()
+    });
+    ann.links.shutdown().await;
+    assert_eq!(
+        ann.endpoint.as_ref().unwrap().local_addr().unwrap().port(),
+        picked,
+        "the kept port is not used when addresses are not kept"
+    );
+    assert_eq!(kept_port(&ann), None, "the note is removed");
 }

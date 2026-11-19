@@ -53,13 +53,34 @@ pub trait Introductions: Send + Sync {
     /// Whether a packet named `name` may cross the link of a person a grant
     /// admitted to `folder` ([`Grant::folder`](crate::Grant::folder)): the
     /// names of the folder's collections, as the layer above names them, and
-    /// the few of its own that reach them. The link layer adds the person's
-    /// own devices, the namespaces' certificates and sync groups, and this
-    /// surface's [`carries`](Introductions::carries); it carries no other
-    /// name this device serves, so an unsealed collection outside the folder
-    /// is not answered over a grant link. For a data-layer device it is
-    /// ndn-data's `folder_carries`.
+    /// the few of its own that reach them, among them the roots of the other
+    /// writers the folder's members record lists. It is asked **at every
+    /// packet** and answers from the record in force then: a writer the
+    /// record dropped is not carried from the next packet. The link layer
+    /// adds the person's own devices, the namespaces' certificates and sync
+    /// groups, and this surface's [`carries`](Introductions::carries); it
+    /// carries no other name this device serves, so an unsealed collection
+    /// outside the folder is not answered over a grant link. For a
+    /// data-layer device it is ndn-data's `IntroductionSurface::grant_carries`.
     fn grant_carries(&self, folder: &Name, name: &Name) -> bool;
+
+    /// Whether a packet named `name` may cross the departure link of a
+    /// person let go by the members record whose log entry is `record`
+    /// (ndn-link §8.8): the entry, its pieces and its cut manifests and
+    /// nothing else. For a data-layer device it is ndn-data's
+    /// `departure_carries`.
+    fn departure_carries(&self, record: &Name, name: &Name) -> bool;
+
+    /// The namespaces of the other writers the members record in force for
+    /// `folder` lists (the folder's own excluded): whose sync groups a grant
+    /// link to a person admitted to `folder` routes (§8.7), so the person's
+    /// device hears them through this one. Read live, at every look. A
+    /// device with no data layer lists none. For a data-layer device it is
+    /// ndn-data's `IntroductionSurface::writer_namespaces`.
+    fn writer_namespaces(&self, folder: &Name) -> Vec<Name> {
+        let _ = folder;
+        Vec::new()
+    }
 }
 
 /// What the introduction links of [`Enrollment::Introduction`] carry.
@@ -280,6 +301,9 @@ impl Links {
         addrs: &[SocketAddr],
         within: Duration,
     ) -> Result<LinkHandle, LinkDetail> {
+        if !self.is_online() {
+            return Err(crate::online::offline_detail());
+        }
         let mut failed: Vec<String> = Vec::new();
         let mut attempts = JoinSet::new();
         for &addr in addrs {

@@ -27,6 +27,13 @@
 //! - the key is the expected fingerprint of a [`PeerSpec`] (`key`), for a
 //!   device of another namespace or one not enrolled yet.
 //!
+//! A device is named `/<namespace>/<role>/<device>` (one component for the
+//! role, what the device does there, such as `member`; one for the device)
+//! and its certificate `/<namespace>/<role>/<device>/KEY/<key-id>/<issuer>/<version>`.
+//! A certificate of another shape identifies no device, and the refusal says
+//! the shape expected, the name it had and what to do (ndn-rs
+//! `docs/specs/ndn-link.md` §7.1).
+//!
 //! Validation is offline: the chain the peer sent, then certificates the
 //! host already has ([`LinkTrust::known_certificate`]), never a fetch — the
 //! link is not up yet. A membership whose binding does not verify (a
@@ -166,22 +173,31 @@
 //! namespaces, in the scope of this folder, until then* (or with no date: it
 //! follows the folder's members record), and `own` plus the grant is tighter
 //! and enough (an inviter no longer has to choose `open` or `listed`; `open`
-//! is as it was, and a grant adds nothing to it). A grant admits that key in
-//! those namespaces only, under the quotas, in its role's scope (a reader's
-//! link carries Interests toward this device, and answers only under its own
-//! device names), and its link carries only the names of the folder, of the
-//! person's own devices, of the introduction and the namespaces' public ones
-//! (certificates, trust contexts, sync groups): an unsealed collection of this
-//! device outside the folder is not answered over it
-//! ([`Introductions::grant_carries`]). It ends at its date, when it is
-//! revoked ([`Links::revoke_grant`]) or when a held record leaves the person
-//! out, closing the links it alone admitted (a link whose handshake straddled
-//! the end included) and naming what ended in the refusal of the key's next
-//! link. With the `introductions` feature, `LinkHints` gives a data layer
-//! device its three halves (its hint, its dial, its undial), serves its
-//! `ndn_data::IntroductionSurface` and installs the device's grants
-//! (`LinkHints::serve`, `grant`, `revoke_grant`; `end_grant` and
-//! `renew_grant` make a host's own end or renewal durable).
+//! is as it was, and a grant adds nothing to it). A person invited into
+//! several folders holds one entry per folder ([`Grant::folder`]); the link
+//! stands while any entry does. A grant admits that key in those namespaces
+//! only, under the quotas; what its link carries and what the person may push
+//! are judged at every packet against the entries live then: the names of
+//! the folders, of the person's own devices, of the introduction and the
+//! namespaces' public ones (certificates, trust contexts, sync groups) cross,
+//! an unsealed collection of this device outside the folders is not answered
+//! over it ([`Introductions::grant_carries`]), and Data the person pushes
+//! passes only under its own device names or under the names of a folder it
+//! writes in. It ends at its date, when it is revoked
+//! ([`Links::revoke_grant`], [`Links::revoke_grants`]) or when a held record
+//! leaves the person out. An entry ending closes nothing while another
+//! stands; the last closes the links it alone admitted (a link whose
+//! handshake straddled the end included) and names what ended in the refusal
+//! of the key's next link, or, when a held record left the person out and a
+//! departure mark is held ([`Links::depart`]), narrows them in place to that
+//! record, which the person is told of ([`DepartureSink`]), and closes them
+//! once it is carried (`ndn-rs/docs/specs/ndn-link.md` §8.8). With the
+//! `introductions` feature, `LinkHints` gives a data layer device its three
+//! halves (its hint, its dial, its undial), serves its
+//! `ndn_data::IntroductionSurface`, installs the device's grants and
+//! departure marks and registers its departure sink (`LinkHints::serve`,
+//! `grant`, `revoke_grant`; `end_grant`, `end_grant_in` and `renew_grant` make
+//! a host's own end or renewal durable).
 //!
 //! # Link memory
 //!
@@ -225,13 +241,29 @@
 //! [`Links::set_wake_token`]); a relay offers that per its
 //! [`RelayService`], waking through the host's [`WakeNotifier`].
 //!
+//! # Offline, online, the listening port, and the address
+//!
+//! [`Links::set_online`] says the device is offline: every link and direct path
+//! closes, no inbound attempt is answered and none is made, and
+//! [`Links::watch`] shows each peer down with [`Next::WhenOnline`]; online again,
+//! the remembered and configured peers are dialled at once (staggered by
+//! [`MemoryOptions::dials_at_once`]). [`Links::remember`] keeps the port the
+//! host's link socket listens on with the memory ([`LinkMemory::load_listen_port`],
+//! [`LinkMemory::save_listen_port`]) and binds it again after a restart when it
+//! is free; a peer that cannot be reached at all is [`RememberedState::NoPath`].
+//! [`Links::watch_addresses`] watches the device's own addresses (netlink on
+//! Linux, a bounded poll everywhere, or an [`AddressSource`] of the host's) and
+//! does what [`Links::network_changed`] does when they change. ndn-rs
+//! `docs/specs/ndn-link.md` §17D.
+//!
 //! # The fault layer (cargo feature `fault-injection`, **for tests only**)
 //!
 //! Off by default and never to be enabled by a shipped binary
 //! (`tools/check-shipped-features.sh` fails when one does): a wrapper on each link's
 //! face applies the conformance's seeded fault profile (drop, duplicate, forge, delay,
-//! reorder, block loss) to the packets arriving on it, chosen by an optional host
-//! predicate (`Links::inject_faults`). A build that has it logs a warning at start and
+//! reorder, block loss) to the packets arriving on it, or drops or passes them, as an
+//! optional host verdict says per packet (`Links::inject_faults`). A build that has it
+//! logs a warning at start and
 //! says so in [`LinkReport::fault_injection`]. ndn-rs `docs/specs/ndn-link.md` §17B.
 
 #![cfg(not(target_arch = "wasm32"))]
@@ -240,6 +272,7 @@ mod admission;
 mod asleep;
 mod candidates;
 mod control;
+mod departures;
 #[cfg(feature = "introductions")]
 mod device_memory;
 mod direct;
@@ -255,6 +288,8 @@ mod host;
 mod introduce;
 mod links;
 mod memory;
+mod netwatch;
+mod online;
 mod peer;
 pub mod policy;
 mod presence;
@@ -273,12 +308,13 @@ pub use asleep::{HoldLimits, RelayService, WAKE_INTERVAL, WakeNotifier, WakeRequ
 pub use candidates::{
     AdvertisedCandidates, Candidate, CandidateKind, CandidateSource, HostCandidates,
 };
+pub use departures::{Departure, DepartureOptions, DepartureSink, DepartureTaking};
 #[cfg(feature = "introductions")]
 pub use device_memory::DeviceMemory;
 #[cfg(feature = "engine")]
 pub use engine::EngineFaces;
 #[cfg(feature = "fault-injection")]
-pub use fault::{FaultFrame, FaultKind, FaultPass, FaultPlan};
+pub use fault::{FaultFrame, FaultJudge, FaultKind, FaultPlan, FaultVerdict};
 pub use fault_report::FaultReport;
 pub use grants::{Grant, GrantRole};
 #[cfg(feature = "introductions")]
@@ -297,6 +333,7 @@ pub use memory::{
 #[cfg(feature = "fault-injection")]
 pub use ndn_faults::{FAULTY, Faults};
 pub use ndn_mgmt_wire::{LinkDetail, LinkWords, link_code};
+pub use netwatch::{AddressSource, AddressWatch, InterfaceAddresses};
 pub use peer::{LinkMode, PeerId, PeerSpec, RelaySource, RelayUse};
 pub use policy::Backoff;
 pub use presence::{DirectOptions, PRESENCE_MAX};

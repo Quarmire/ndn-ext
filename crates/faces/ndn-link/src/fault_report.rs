@@ -18,10 +18,12 @@ pub struct FaultReport {
     /// the conformance's `--faulty` reads); `None` while no plan is installed (the
     /// layer is compiled in and touches nothing).
     pub profile: Option<String>,
-    /// Packets that arrived on a link and met the profile: the plan had no predicate,
-    /// or its predicate chose them.
+    /// Packets that arrived on a link and met the profile: the plan had no verdict
+    /// function, or its verdict was `FaultVerdict::Profile`.
     pub met: u64,
-    /// Of those, packets the profile dropped.
+    /// Of those, packets the profile dropped. Beside them, `dropped` counts the packets
+    /// the plan's verdict dropped (they never met the profile and draw nothing), so it can
+    /// exceed `met`.
     pub dropped: u64,
     /// Of those, packets the profile delivered twice.
     pub duplicated: u64,
@@ -29,9 +31,9 @@ pub struct FaultReport {
     pub forged: u64,
     /// Of those, packets the profile held back (delivered later than they arrived).
     pub delayed: u64,
-    /// Packets the plan's predicate left alone: delivered at once and untouched.
+    /// Packets the plan's verdict let pass: delivered at once and untouched.
     pub passed: u64,
-    /// Times the plan's predicate panicked; the packet it was asked about was
+    /// Times the plan's verdict function panicked; the packet it was asked about was
     /// delivered untouched (the layer fails open, and says so here).
     pub predicate_panics: u64,
 }

@@ -203,11 +203,30 @@ impl LinkTrust for Trust {
 struct Recorder {
     next: AtomicU64,
     live: Mutex<Vec<FaceId>>,
+    faces: Mutex<Vec<(FaceId, Arc<Face>)>>,
     routes: Mutex<Vec<(FaceId, Route)>>,
     changed: tokio::sync::Notify,
 }
 
 impl Recorder {
+    /// Send `packet` over the one link face this side has.
+    async fn send(&self, packet: &Bytes) {
+        let face = self.faces.lock().last().map(|(_, f)| Arc::clone(f));
+        face.expect("a link face")
+            .send_bytes(packet.clone())
+            .await
+            .expect("the link carries a send");
+    }
+
+    /// The next packet the link face delivers (what its scope let through).
+    async fn receive(&self) -> Bytes {
+        let face = self.faces.lock().last().map(|(_, f)| Arc::clone(f));
+        face.expect("a link face")
+            .recv_bytes()
+            .await
+            .expect("the link delivers")
+    }
+
     fn sorted_routes(&self) -> Vec<Name> {
         let mut routed: Vec<Name> = self
             .routes
@@ -245,11 +264,13 @@ impl FaceSink for Recorder {
     fn add_face(&self, face: Face, _: CancellationToken) {
         if face.kind() == FaceKind::Quic {
             self.live.lock().push(face.id());
+            self.faces.lock().push((face.id(), Arc::new(face)));
         }
         self.changed.notify_waiters();
     }
     fn remove_face(&self, face: FaceId) {
         self.live.lock().retain(|f| *f != face);
+        self.faces.lock().retain(|(f, _)| *f != face);
         self.routes.lock().retain(|(f, _)| *f != face);
         self.changed.notify_waiters();
     }
@@ -505,7 +526,7 @@ async fn a_grant_links_its_key_in_its_namespace_and_routes_nothing_else_it_shows
         .await;
 
     // Revoked: the next dial names it.
-    assert!(ann_links.revoke_grant(&phone_b.fingerprint()));
+    assert!(ann_links.revoke_grants(&phone_b.fingerprint()));
     let (reason, text) = refusal(
         dial_with(
             &addr,
@@ -730,7 +751,7 @@ async fn a_handshake_in_flight_when_its_grant_is_revoked_does_not_keep_its_link(
     let revoke = async {
         tokio::time::sleep(STALL / 3).await;
         assert!(
-            ann_links.revoke_grant(&phone_b.fingerprint()),
+            ann_links.revoke_grants(&phone_b.fingerprint()),
             "no grant was in force to revoke"
         );
     };
@@ -845,6 +866,12 @@ impl LinkMemory for Shelf {
             Ok(())
         })
     }
+    fn load_listen_port(&self) -> Result<Option<u16>, String> {
+        Ok(None)
+    }
+    fn save_listen_port<'a>(&'a self, _: Option<u16>) -> MemoryFuture<'a, Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// Ann remembers Bob, who dialled in first and whom her grant links, and Bob
@@ -895,6 +922,7 @@ async fn the_redial_of_a_remembered_peer_that_linked_in_is_the_grants_and_its_en
             addresses: vec![bob_addr.expect("bob listens").parse().unwrap()],
             last_contact: SystemTime::now(),
             origin: Direction::Accepted,
+            port: None,
         }]
         .into_iter()
         .map(|r| (r.key, r))
@@ -919,7 +947,7 @@ async fn the_redial_of_a_remembered_peer_that_linked_in_is_the_grants_and_its_en
     );
 
     // Bob is removed: the grant ends, and the redial's link closes with it.
-    assert!(ann_links.revoke_grant(&phone_b.fingerprint()));
+    assert!(ann_links.revoke_grants(&phone_b.fingerprint()));
     at_ann
         .settles("the redial's link closes with the grant", |f| {
             f.live.lock().is_empty()
@@ -930,11 +958,12 @@ async fn the_redial_of_a_remembered_peer_that_linked_in_is_the_grants_and_its_en
 
 /// The role of a grant is the one the members record in force gives now (the
 /// data layer derives it again and calls `grant` again): a writer demoted to a
-/// reader no longer holds the writer's link. The link the old role admitted
-/// is closed, saying it was replaced, and the person's redial is judged by the
-/// grant as it now stands.
+/// reader no longer pushes what a writer pushes, **at the next packet, on the
+/// same link** — the link is not closed (round 7: it was, in round 6, saying
+/// it was replaced; the invariant is now no weaker: what the old role pushed
+/// is dropped at once, and a promotion widens it again at once).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_grant_whose_role_changed_closes_the_link_of_the_old_role() {
+async fn a_grant_whose_role_changed_narrows_the_pushes_at_the_next_packet() {
     let cancel = CancellationToken::new();
     let (a, b, c) = (
         namespace("/a", 10).await,
@@ -951,7 +980,7 @@ async fn a_grant_whose_role_changed_closes_the_link_of_the_old_role() {
         until: None,
     };
     ann_links.grant(grant(GrantRole::Writer));
-    let (_phone, _, _) = start(
+    let (_phone, at_phone, _) = start(
         phone_b.link_key(),
         Trust::new(&[&a, &b, &c], phone_b.chain.clone(), Vec::new()),
         vec![ann_peer(&ann_links, &addr)],
@@ -963,15 +992,151 @@ async fn a_grant_whose_role_changed_closes_the_link_of_the_old_role() {
             f.live.lock().len() == 1
         })
         .await;
-
-    ann_links.grant(grant(GrantRole::Reader));
-    at_ann
-        .settles("the link of the writer's role closes", |f| {
-            f.live.lock().is_empty()
-        })
+    at_phone
+        .settles("the phone has its link", |f| f.live.lock().len() == 1)
         .await;
+    let face = at_ann.live.lock()[0];
+
+    // What the phone pushes: Data under the folder namespace's sync group (a
+    // public name a writer's entry carries, a reader's does not) and Data
+    // under its own device name (which either role carries).
+    let pushed = |name: &str| ndn_packet::encode::DataBuilder::new(n(name), b"x").build();
+    let public = "/a/32=sync/probe";
+    let own = "/b/member/phone/seal/1";
+    let push = async |name: &str| at_phone.send(&pushed(name)).await;
+    let arrives = async |name: &str| {
+        let got = tokio::time::timeout(Duration::from_secs(5), at_ann.receive())
+            .await
+            .unwrap_or_else(|_| panic!("{name} did not arrive within 5 s"));
+        // The link face delivers the packet in its link-protocol frame.
+        let got = match ndn_packet::lp::LpPacket::decode(got.clone()) {
+            Ok(lp) => lp.fragment.unwrap_or(got),
+            Err(_) => got,
+        };
+        let seen = ndn_packet::Data::decode(got)
+            .map(|d| d.name.to_string())
+            .unwrap_or_else(|e| format!("something undecodable ({e:?})"));
+        assert_eq!(seen, n(name).to_string(), "the next packet to arrive");
+        true
+    };
+
+    push(public).await;
+    assert!(
+        arrives(public).await,
+        "a writer's push under a public name crossed"
+    );
+
+    // Demoted: the same link, the next packet narrower.
+    ann_links.grant(grant(GrantRole::Reader));
+    push(public).await;
+    push(own).await;
+    assert!(
+        arrives(own).await,
+        "the first packet to arrive after the demotion is the one under its own name: the \
+         public one was dropped (a reader pushes only under its own device names)"
+    );
+    assert_eq!(
+        at_ann.live.lock().as_slice(),
+        [face],
+        "the demotion closed or replaced the link"
+    );
     let grants = ann_links.grants();
     assert_eq!(grants.len(), 1);
     assert_eq!(grants[0].role, GrantRole::Reader);
+
+    // Promoted again: widened at the next packet, still the same link.
+    ann_links.grant(grant(GrantRole::Writer));
+    push(public).await;
+    assert!(
+        arrives(public).await,
+        "a promotion shows at the next packet"
+    );
+    assert_eq!(at_ann.live.lock().as_slice(), [face]);
+    cancel.cancel();
+}
+
+/// A person who writes in one folder and reads in another pushes under the
+/// first folder's names only, judged per entry at every packet (round 7 A):
+/// the writer's entry of a folder of `/a` carries `/a`'s public names, the
+/// reader's entry of a folder of `/c` carries `/c`'s but widens no push
+/// scope. Swapping the roles swaps what is dropped, on the same link.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_writer_of_one_folder_and_a_reader_of_another_push_under_the_writers_names_only() {
+    let cancel = CancellationToken::new();
+    let (a, b, c) = (
+        namespace("/a", 10).await,
+        namespace("/b", 20).await,
+        namespace("/c", 30).await,
+    );
+    let (ann_links, at_ann, addr) = ann(&a, &b, &c, &cancel).await;
+    let phone_b = b.device("member", "phone", 22).await;
+    let (first, second) = (n(FOLDER), n("/c/32=data/other"));
+    let entry = |folder: &Name, role| Grant {
+        key: phone_b.fingerprint(),
+        namespaces: vec![n("/b")],
+        role,
+        folder: folder.clone(),
+        until: None,
+    };
+    ann_links.grant(entry(&first, GrantRole::Writer));
+    ann_links.grant(entry(&second, GrantRole::Reader));
+    let (_phone, at_phone, _) = start(
+        phone_b.link_key(),
+        Trust::new(&[&a, &b, &c], phone_b.chain.clone(), Vec::new()),
+        vec![ann_peer(&ann_links, &addr)],
+        false,
+        &cancel,
+    );
+    at_ann
+        .settles("ann links the phone", |f| f.live.lock().len() == 1)
+        .await;
+    at_phone
+        .settles("the phone has its link", |f| f.live.lock().len() == 1)
+        .await;
+    let face = at_ann.live.lock()[0];
+
+    let (in_a, in_c) = ("/a/32=sync/probe", "/c/32=sync/probe");
+    let push = async |name: &str| {
+        at_phone
+            .send(&ndn_packet::encode::DataBuilder::new(n(name), b"x").build())
+            .await
+    };
+    // What arrived next at Ann, by its name.
+    let next = async || {
+        let got = tokio::time::timeout(Duration::from_secs(5), at_ann.receive())
+            .await
+            .expect("nothing arrived within 5 s");
+        let got = match ndn_packet::lp::LpPacket::decode(got.clone()) {
+            Ok(lp) => lp.fragment.unwrap_or(got),
+            Err(_) => got,
+        };
+        Data::decode(got).expect("a Data").name.to_string()
+    };
+
+    // The reader's folder's name is pushed first and dropped: the first to
+    // arrive is the writer's.
+    push(in_c).await;
+    push(in_a).await;
+    assert_eq!(
+        next().await,
+        n(in_a).to_string(),
+        "a Data under the names of a folder the person only reads crossed"
+    );
+
+    // Swapped: the same link, the next packets judged by the new roles.
+    ann_links.grant(entry(&first, GrantRole::Reader));
+    ann_links.grant(entry(&second, GrantRole::Writer));
+    push(in_a).await;
+    push(in_c).await;
+    assert_eq!(
+        next().await,
+        n(in_c).to_string(),
+        "a Data under the names of a folder the person now only reads crossed"
+    );
+    assert_eq!(
+        at_ann.live.lock().as_slice(),
+        [face],
+        "a role change closed the link"
+    );
     cancel.cancel();
 }

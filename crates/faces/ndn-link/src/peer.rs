@@ -230,6 +230,28 @@ impl Peers {
         self.find_any(fingerprint, device.as_slice())
     }
 
+    /// The entry the host listed that expects key `fingerprint`, or names
+    /// `device`: not a redial's entry (the link memory's, [`PeerSpec::remembered`]),
+    /// which keeps no direct-path loop and so hides no device from the punches
+    /// by membership.
+    pub(crate) fn find_listed(
+        &self,
+        fingerprint: KeyFingerprint,
+        device: Option<&Name>,
+    ) -> Option<PeerId> {
+        self.slots
+            .read()
+            .iter()
+            .position(|p| {
+                p.as_ref().is_some_and(|p| {
+                    !p.remembered
+                        && (p.key == Some(fingerprint)
+                            || p.device.as_ref().is_some_and(|d| device == Some(d)))
+                })
+            })
+            .map(PeerId)
+    }
+
     /// The first peer expecting key `fingerprint`, or naming one of
     /// `devices` (the names a device proved, in each of its namespaces). An
     /// entry the host listed is found before a remembered one

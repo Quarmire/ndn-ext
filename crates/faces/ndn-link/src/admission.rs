@@ -6,13 +6,14 @@
 //! [`Identity`], and the link is admitted by any the local policy accepts.
 
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use bytes::Bytes;
 use ndn_cert::onboarding::rdr_prefix;
 use ndn_cert::roles::{Role, parse_device_key};
 use ndn_face_quic::{
     Admission, Carries, ChannelBinding, CloseReason, KeyFingerprint, LinkHello, LinkKey, LinkScope,
-    LinkVerdict, MEMBERSHIPS_MAX, Membership, NameFilter, PeerKey,
+    LinkVerdict, MEMBERSHIPS_MAX, Membership, Narrowing, PeerKey, bounded_text, clean_text,
 };
 use ndn_mgmt_wire::{LinkDetail, link_code as code};
 use ndn_packet::{Data, Name};
@@ -22,7 +23,8 @@ use ndn_security::{
     CertCache, Certificate, Keyring, SignedTrustContext, ValidationResult, Validator,
 };
 
-use crate::grants::{Grant, GrantOutcome, GrantRole, Grants};
+use crate::departures::Departures;
+use crate::grants::{Grant, GrantOutcome, Grants};
 use crate::host::{LinkTrust, OwnMembership};
 use crate::introduce::Introductions;
 use crate::peer::{PeerId, Peers};
@@ -110,6 +112,12 @@ pub(crate) enum Enrollment {
     /// introductions' surface carries (the one exchange of an open offer)
     /// and their answers.
     Introduction(crate::introduce::Surface),
+    /// This device admitted a device it let go of a folder on a departure
+    /// link (§8.8): it carries only the members records that leave the
+    /// person out and the names that validate them, Interests toward this
+    /// device and answers toward the peer. Holds the marks the person was
+    /// told of.
+    Departure(Vec<crate::departures::Departure>),
 }
 
 pub(crate) struct Admitted {
@@ -159,6 +167,7 @@ pub(crate) struct Judge<'a> {
     pub(crate) serve: &'a ServePolicy,
     pub(crate) quotas: &'a QuotaState,
     pub(crate) grants: &'a Grants,
+    pub(crate) departures: &'a Departures,
     /// What this device's introductions serve: the names a grant link may
     /// carry besides the person's own ([`Introductions::grant_carries`]).
     /// `None`: this device has no data layer to name a folder's collections.
@@ -466,17 +475,12 @@ impl Judge<'_> {
             ));
         }
         let Some(device) = parse_device_key(&ns, &leaf.name) else {
-            return unusable(
-                LinkDetail::new(
-                    code::NOT_DEVICE_CERTIFICATE,
-                    format!(
-                        "{} is not a device certificate of {ns} (/<namespace>/<role>/<device>/KEY/…)",
-                        leaf.name
-                    ),
-                )
-                .with("certificate", &leaf.name)
-                .with("namespace", &ns),
-            );
+            return unusable(not_a_device_certificate(
+                code::NOT_DEVICE_CERTIFICATE,
+                &leaf.name,
+                &ns,
+                None,
+            ));
         };
         if !leaf.is_valid_now() {
             return unusable(certificate_expired(&leaf.name));
@@ -601,19 +605,12 @@ impl Judge<'_> {
             );
         };
         let Some(device) = parse_device_key(&ns, &leaf.name) else {
-            return unusable(
-                LinkDetail::new(
-                    code::FOREIGN_NOT_DEVICE_CERTIFICATE,
-                    format!(
-                        "{} is not a device certificate of {ns}, the namespace of its root {} \
-                         (/<namespace>/<role>/<device>/KEY/…)",
-                        leaf.name, root.name
-                    ),
-                )
-                .with("certificate", &leaf.name)
-                .with("namespace", &ns)
-                .with("root", &root.name),
-            );
+            return unusable(not_a_device_certificate(
+                code::FOREIGN_NOT_DEVICE_CERTIFICATE,
+                &leaf.name,
+                &ns,
+                Some(&root.name),
+            ));
         };
         if !leaf.is_valid_now() {
             return unusable(certificate_expired(&leaf.name));
@@ -820,52 +817,60 @@ impl Judge<'_> {
             {
                 None => Admission::default(),
                 Some((slot, (rate, shared))) => {
-                    // A reader's link: everything it asks for comes to it, and
-                    // what it sends toward this device is Interests and the
-                    // answers under its own device names (its certificates,
-                    // and the seal the owner fetches to wrap a folder's key
-                    // for it); Data it pushes under any other name is dropped.
-                    let reader = admitted
-                        .grant
-                        .as_ref()
-                        .is_some_and(|g| g.role == GrantRole::Reader);
                     let own: Vec<Name> = admitted
                         .identities
                         .iter()
                         .map(|id| id.device.clone())
                         .collect();
+                    // A grant link's scope is not fixed at admission: the
+                    // names it carries, what the peer may push and whether it
+                    // has narrowed to a departure are judged at every packet
+                    // against the entries live then (§8.7, §8.8). What the
+                    // peer pushes toward this device is Interests and the
+                    // answers under its own device names (its certificates,
+                    // and the seal the owner fetches to wrap a folder's key
+                    // for it), and Data under the names of a folder it
+                    // *writes* in; Data it pushes under any other name is
+                    // dropped.
                     Admission {
                         verdict: LinkVerdict::default(),
                         scope: Some(LinkScope {
                             receives: Carries::Everything,
                             sends: Carries::Everything,
                             names: match &admitted.grant {
-                                Some(grant) => self.grant_names(grant, own.clone()),
+                                Some(grant) => self.grant_names(grant.key, own.clone()),
                                 None => Box::new(|_: &Name| true),
                             },
                             rate,
                             shared: Some(shared),
-                            answers_in: reader.then(|| -> NameFilter {
-                                Box::new(move |name: &Name| own.iter().any(|d| name.has_prefix(d)))
+                            answers_in: admitted
+                                .grant
+                                .as_ref()
+                                .map(|grant| self.grant_pushes(grant.key, own)),
+                            narrowing: admitted.grant.as_ref().map(|grant| {
+                                let table = self.grants.clone();
+                                let key = grant.key;
+                                Narrowing {
+                                    when: Box::new(move || {
+                                        !table.has_live(&key, SystemTime::now())
+                                    }),
+                                    receives: Carries::Interests,
+                                    sends: Carries::Answers,
+                                }
                             }),
                             explain: match &admitted.grant {
                                 Some(grant) => format!(
-                                    "this device linked {} {}: {}, and only the names of the folder {} \
-                                     (its collections), of the person's own devices, of the namespaces' \
-                                     certificates and sync groups and of the introduction cross it; the \
-                                     quotas bound it ({}/s from that device), and a grant ends at its date \
-                                     or when the inviter revokes it or the folder's members record leaves \
+                                    "this device linked {} {}: the names of the folders the person \
+                                     is granted (their collections), of the person's own devices, of \
+                                     the namespaces' certificates and sync groups and of the \
+                                     introduction cross it, and what it pushes is judged at every \
+                                     packet by its role in each folder (a reader's entry widens \
+                                     nothing; other Data it pushes is dropped); the quotas bound it \
+                                     ({}/s from that device), and an entry ends at its date or when \
+                                     the inviter revokes it or the folder's members record leaves \
                                      the person out",
                                     admitted.describe(),
                                     grant.describe(),
-                                    if reader {
-                                        "a reader writes nothing, so what it sends here is Interests and \
-                                         the answers under its own device name (its certificates and its \
-                                         seal); other Data it pushes is dropped"
-                                    } else {
-                                        "a writer's link is a full link of those names"
-                                    },
-                                    grant.folder,
                                     rate.per_sec
                                 ),
                                 None => format!(
@@ -897,6 +902,7 @@ impl Judge<'_> {
                         rate: ENROLLMENT_INTERESTS,
                         shared: None,
                         answers_in: None,
+                        narrowing: None,
                         explain: format!(
                             "the enrollment link of key {} carries only that device's enrollment in \
                              {} (Interests for its CA, trust context and certificates, and their \
@@ -918,12 +924,37 @@ impl Judge<'_> {
                         rate: ENROLLMENT_INTERESTS,
                         shared: None,
                         answers_in: None,
+                        narrowing: None,
                         explain: format!(
                             "the introduction link of key {} carries only the Interests of the \
                              introduction an open offer needs (the offer's record and the ask) \
                              and their answers; it links fully once this device holds the \
                              namespace of the device it reaches",
                             admitted.fingerprint
+                        ),
+                    }),
+                }
+            }
+            Some(Enrollment::Departure(marks)) => {
+                let key = admitted.fingerprint;
+                let record = marks.first().map(|d| d.record.clone());
+                Admission {
+                    verdict: LinkVerdict::default(),
+                    scope: Some(LinkScope {
+                        receives: Carries::Interests,
+                        sends: Carries::Answers,
+                        names: self.departure_names(key),
+                        rate: ENROLLMENT_INTERESTS,
+                        shared: None,
+                        answers_in: None,
+                        narrowing: None,
+                        explain: format!(
+                            "the departure link of key {key} carries only the Interests for the \
+                             members record {} that lets that person go (its pieces and its cut) \
+                             and the key and certificate names that validate it, and their \
+                             answers; it closes once the record was carried, or after a short \
+                             hold",
+                            record.map_or_else(|| "none".to_string(), |r| r.to_string())
                         ),
                     }),
                 }
@@ -943,6 +974,7 @@ impl Judge<'_> {
                         rate: ENROLLMENT_ANSWERS,
                         shared: None,
                         answers_in: None,
+                        narrowing: None,
                         explain: format!(
                             "the link to {label} carries only this device's enrollment in {ns} (its \
                              CA, trust context and certificates) until this device enrolls"
@@ -1319,6 +1351,20 @@ fn serve(
                     grant = Some(granted);
                 }
                 GrantOutcome::Refused(why) => return Err(why),
+                GrantOutcome::Departing(marks) => {
+                    // No entry stands but a mark of the key does: the narrow
+                    // link of §8.7/§8.8, in the enrollment slots, with no
+                    // identity recorded, no route and no quota.
+                    return Ok(Admitted {
+                        fingerprint,
+                        identities: Vec::new(),
+                        peer,
+                        enrollment: Some(Enrollment::Departure(marks)),
+                        quota: None,
+                        quotas: Vec::new(),
+                        grant: None,
+                    });
+                }
                 GrantOutcome::No(Some(detail)) => {
                     // What the key's holder most needs to read — its grant
                     // ended, or is of other namespaces — comes first: a peer's
@@ -1552,6 +1598,50 @@ pub(crate) fn list(names: &[Name]) -> String {
         .join(", ")
 }
 
+/// The most characters of a name a peer sent that a refusal shows.
+const RECEIVED_NAME_MAX: usize = 200;
+
+/// A name a peer sent, as a refusal shows it: without control or invisible characters
+/// (the peer chose it) and, when long, shortened with `…`.
+fn received_name(name: &Name) -> String {
+    bounded_text(&clean_text(&name.to_string()), RECEIVED_NAME_MAX)
+}
+
+/// A certificate of `ns` that is not named `<ns>/<role>/<device>/KEY/<key-id>/…`
+/// identifies no device (`which` is [`code::NOT_DEVICE_CERTIFICATE`], or
+/// [`code::FOREIGN_NOT_DEVICE_CERTIFICATE`] with `root`, the root certificate of a
+/// namespace this device does not hold). It says the shape expected, the name the
+/// certificate had, and what to do (ndn-link.md §7.1).
+fn not_a_device_certificate(
+    which: &str,
+    certificate: &Name,
+    ns: &Name,
+    root: Option<&Name>,
+) -> LinkDetail {
+    let received = received_name(certificate);
+    let expected = format!("{ns}/<role>/<device>");
+    let whose = root.map_or_else(String::new, |root| {
+        format!(", the namespace of its root {}", received_name(root))
+    });
+    let detail = LinkDetail::new(
+        which,
+        format!(
+            "{received} is not a device certificate of {ns}{whose}. The shape expected is \
+             /<namespace>/<role>/<device>, here {expected}: a device certificate is named \
+             {expected}/KEY/<key-id>/<issuer>/<version>, the role being one component naming \
+             what the device does there, such as member. Issue this device's certificate under \
+             that shape, for example {ns}/member/<device>"
+        ),
+    )
+    .with("certificate", &received)
+    .with("namespace", ns)
+    .with("expected", &expected);
+    match root {
+        Some(root) => detail.with("root", received_name(root)),
+        None => detail,
+    }
+}
+
 /// A peer's certificate `certificate` is outside its validity period: it
 /// renews it.
 fn certificate_expired(certificate: &Name) -> LinkDetail {
@@ -1578,6 +1668,7 @@ fn certificate_unauthenticated(certificate: &Name, ns: &Name) -> LinkDetail {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::grants::GrantRole;
     use crate::peer::{PeerSpec, RelaySource, RelayUse};
     use crate::serving::Quotas;
     use ndn_security::{AdvertisedRelay, Ed25519Signer, LinkPolicy, Signer, encode_cert_data};
@@ -1660,6 +1751,7 @@ mod tests {
         serve: ServePolicy,
         quotas: QuotaState,
         grants: Grants,
+        departures: Departures,
         introductions: Option<Arc<dyn Introductions>>,
     }
 
@@ -1671,6 +1763,7 @@ mod tests {
                 serve,
                 quotas: QuotaState::default(),
                 grants: Grants::default(),
+                departures: Departures::default(),
                 introductions: None,
             }
         }
@@ -1682,6 +1775,7 @@ mod tests {
                 serve: &self.serve,
                 quotas: &self.quotas,
                 grants: &self.grants,
+                departures: &self.departures,
                 introductions: self.introductions.clone(),
             }
         }
@@ -2922,6 +3016,10 @@ mod tests {
         fn grant_carries(&self, folder: &Name, name: &Name) -> bool {
             name.has_prefix(folder)
         }
+
+        fn departure_carries(&self, record: &Name, name: &Name) -> bool {
+            name.has_prefix(record)
+        }
     }
 
     /// A grant link carries the folder's names, the person's own devices, the
@@ -2991,5 +3089,358 @@ mod tests {
                 "{was_carried} crossed after the grant ended"
             );
         }
+    }
+
+    /// A grant in force for `key` in `namespaces`, in `folder`, for an hour.
+    fn granted_in(key: &PeerKey, folder: &str, role: GrantRole) -> Grant {
+        Grant {
+            folder: n(folder),
+            ..granted(key, &["/b"], role)
+        }
+    }
+
+    /// A key's second entry is added beside its first, not in its place; the
+    /// link both admitted carries the names of each folder and what the person
+    /// may push is judged at every packet by its role in each: a writer in one
+    /// folder and a reader in the other pushes under the first's names only, a
+    /// promotion or a demotion shows at the next packet with no new link, and
+    /// an entry that ended carries nothing while the other still carries.
+    #[tokio::test]
+    async fn entries_are_added_not_replaced_and_names_and_pushes_are_judged_per_entry() {
+        let (a, b) = (namespace("/a", 10).await, namespace("/b", 20).await);
+        let mut world = relay(&a, &[&b], ServePolicy::Own).await;
+        world.introductions = Some(Arc::new(Surface));
+        let (bob, chain) = b.device("member", "phone", 22).await;
+        let key = bob.fingerprint();
+        let (notes, diary) = ("/a/32=data/notes", "/a/32=data/diary");
+        world.grants.put(granted_in(&bob, notes, GrantRole::Writer));
+        world.grants.put(granted_in(&bob, diary, GrantRole::Reader));
+        assert_eq!(
+            world.grants.live_entries(&key, SystemTime::now()).len(),
+            2,
+            "the second entry did not replace the first"
+        );
+
+        let judge = world.judge();
+        let admitted = judge
+            .decide(&bob, &hello(chain), &CH, None)
+            .await
+            .expect("the entries serve bob");
+        let scope = judge.admission_for(&admitted).scope.expect("a scope");
+        let (names, pushes) = (scope.names, scope.answers_in.expect("pushes are judged"));
+        let narrowing = scope.narrowing.expect("a grant link narrows in place");
+        assert!(!(narrowing.when)(), "entries stand");
+
+        for carried in [format!("{notes}/page"), format!("{diary}/page")] {
+            assert!(names(&n(&carried)), "{carried} did not cross");
+        }
+        assert!(!names(&n("/a/32=data/other")));
+        let mine = "/b/member/phone/32=log/x";
+        assert!(pushes(&n(&format!("{notes}/page/32=log/x"))));
+        assert!(
+            !pushes(&n(&format!("{diary}/page/32=log/x"))),
+            "a reader entry widens no push"
+        );
+        assert!(pushes(&n(mine)), "its own devices' answers pass");
+        assert!(
+            pushes(&n("/a/32=sync/probe")),
+            "a writer entry carries the folder's public names"
+        );
+
+        // A promotion shows at the next packet: no new decision, no new link.
+        world.grants.put(granted_in(&bob, diary, GrantRole::Writer));
+        assert!(pushes(&n(&format!("{diary}/page/32=log/x"))));
+        // And a demotion.
+        world.grants.put(granted_in(&bob, notes, GrantRole::Reader));
+        assert!(!pushes(&n(&format!("{notes}/page/32=log/x"))));
+        assert!(pushes(&n(&format!("{diary}/page/32=log/x"))));
+        // Both readers: nothing is pushed but under the person's own devices.
+        world.grants.put(granted_in(&bob, diary, GrantRole::Reader));
+        assert!(!pushes(&n("/a/32=sync/probe")), "no writer entry stands");
+        assert!(!pushes(&n(&format!("{diary}/page/32=log/x"))));
+        assert!(pushes(&n(mine)));
+
+        // The notes entry ends: it carries nothing, the diary still does.
+        assert!(world.grants.take(&key, &n(notes)).is_some());
+        assert!(
+            !names(&n(&format!("{notes}/page"))),
+            "an ended entry carries nothing"
+        );
+        assert!(names(&n(&format!("{diary}/page"))));
+        assert!(!(narrowing.when)(), "one entry stands: not narrowed");
+        // The last ends: nothing of the folders, and the link is narrowed.
+        assert!(world.grants.take(&key, &n(diary)).is_some());
+        assert!(!names(&n(&format!("{diary}/page"))));
+        assert!(
+            !names(&n(mine)),
+            "nothing crosses with no entry and no mark"
+        );
+        assert!((narrowing.when)(), "no entry stands: narrowed");
+        assert_eq!(
+            (narrowing.receives, narrowing.sends),
+            (Carries::Interests, Carries::Answers)
+        );
+    }
+
+    /// A key whose last entry ended and that holds a mark of the folder is
+    /// admitted on a departure link: Interests toward this device, answers
+    /// toward the peer, the record and the keys that validate it and nothing
+    /// else, in no quota; only for a key with a mark, in the namespaces the
+    /// mark lists, for as many times as the options say, until the mark's
+    /// date; and otherwise the refusal says the grant ended.
+    #[tokio::test]
+    async fn a_mark_admits_a_departure_link_within_its_bounds_and_nothing_else_does() {
+        let (a, b) = (namespace("/a", 10).await, namespace("/b", 20).await);
+        let mut world = relay(&a, &[&b], ServePolicy::Own).await;
+        world.introductions = Some(Arc::new(Surface));
+        let (bob, chain) = b.device("member", "phone", 22).await;
+        let (carol, carol_chain) = b.device("member", "tablet", 23).await;
+        let key = bob.fingerprint();
+        let notes = "/a/32=data/notes";
+        let record = "/a/member/laptop/32=log/a/32=data/notes/seq=4";
+        let hour = SystemTime::now() + std::time::Duration::from_secs(3600);
+        let mark = |key: &PeerKey, until| crate::departures::Departure {
+            key: key.fingerprint(),
+            namespaces: vec![n("/b")],
+            folder: n(notes),
+            record: n(record),
+            until,
+        };
+        // The entry ended (by a record, said so), and the mark is held.
+        world.grants.put(granted_in(&bob, notes, GrantRole::Writer));
+        world.grants.take(&key, &n(notes));
+        world.departures.put(mark(&bob, hour), SystemTime::now());
+
+        let judge = world.judge();
+        let admitted = judge
+            .decide(&bob, &hello(chain.clone()), &CH, None)
+            .await
+            .expect("the mark admits bob on a departure link");
+        let Some(Enrollment::Departure(told)) = &admitted.enrollment else {
+            panic!("not a departure link: {:?}", admitted.enrollment);
+        };
+        assert_eq!(told.len(), 1);
+        assert!(admitted.quota.is_none() && admitted.grant.is_none());
+        assert!(admitted.identities.is_empty(), "no identity is recorded");
+        let scope = judge.admission_for(&admitted).scope.expect("a scope");
+        assert_eq!(
+            (scope.receives, scope.sends),
+            (Carries::Interests, Carries::Answers)
+        );
+        assert!(scope.answers_in.is_none() && scope.narrowing.is_none());
+        let names = scope.names;
+        assert!(names(&n(record)), "the record");
+        assert!(names(&n(&format!("{record}/seg=0"))), "its pieces");
+        assert!(names(&n("/a/KEY/k1")), "the key that validates it");
+        for refused in [
+            notes,
+            "/a/32=data/notes/page/32=log/x",
+            "/a/32=sync/probe",
+            "/intro/ask",
+            "/b/member/phone/32=log/x",
+            "/a/member/laptop/32=log/a/32=data/notes/seq=5",
+        ] {
+            assert!(!names(&n(refused)), "{refused} crossed the departure link");
+        }
+
+        // Another key of the namespace has no mark: the refusal of any other.
+        let refusal = judge
+            .decide(&carol, &hello(carol_chain), &CH, None)
+            .await
+            .err()
+            .expect("a key with no mark is refused");
+        assert!(
+            refusal.detail.is(code::NOT_SERVED_UNCERTIFIED)
+                && !refusal
+                    .detail
+                    .causes
+                    .iter()
+                    .any(|c| c.is(code::GRANT_ENDED)),
+            "{:?}",
+            refusal.detail
+        );
+
+        // The attempts bound: three admissions in all, the fourth is refused
+        // and says the grant ended.
+        for _ in 0..2 {
+            judge
+                .decide(&bob, &hello(chain.clone()), &CH, None)
+                .await
+                .expect("within the attempts");
+        }
+        let refusal = judge
+            .decide(&bob, &hello(chain.clone()), &CH, None)
+            .await
+            .err()
+            .expect("a fourth admission is refused");
+        assert!(
+            refusal
+                .detail
+                .causes
+                .iter()
+                .any(|c| c.is(code::GRANT_ENDED)),
+            "{:?}",
+            refusal.detail
+        );
+
+        // A new record is a new mark with its own attempts; a mark past its
+        // date admits no one, with the same refusal.
+        world.departures.put(
+            crate::departures::Departure {
+                record: n("/a/member/laptop/32=log/a/32=data/notes/seq=9"),
+                ..mark(&bob, hour)
+            },
+            SystemTime::now(),
+        );
+        judge
+            .decide(&bob, &hello(chain.clone()), &CH, None)
+            .await
+            .expect("a new record is a new mark with its own attempts");
+        world.departures.put(
+            mark(
+                &bob,
+                SystemTime::now() + std::time::Duration::from_millis(50),
+            ),
+            SystemTime::now(),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        let refusal = judge
+            .decide(&bob, &hello(chain), &CH, None)
+            .await
+            .err()
+            .expect("the mark expired");
+        assert!(
+            refusal
+                .detail
+                .causes
+                .iter()
+                .any(|c| c.is(code::GRANT_ENDED))
+        );
+    }
+
+    /// A device certificate whose key is named `key_name` (not necessarily under the device
+    /// shape), issued by the CA of `ns`, with the chain a hello carries.
+    async fn misnamed(ns: &Namespace, key_name: &str, seed: u8) -> (PeerKey, Vec<Bytes>) {
+        let key = Ed25519Signer::from_seed(&[seed; 32], n(key_name));
+        let cert = certificate(key.key_name(), key.public_key_bytes(), &ns.ca, "NDNCERT").await;
+        let peer =
+            PeerKey::from_spki(&ndn_security::spki::wrap_ed25519(&key.public_key_bytes())).unwrap();
+        (peer, vec![cert, ns.ca_cert.clone()])
+    }
+
+    /// What every refusal "not a device certificate" says: the shape expected, what the
+    /// certificate's name was, and what to do.
+    fn assert_says_the_shape(why: &LinkDetail, ns: &str, received: &str) {
+        for part in [
+            "/<namespace>/<role>/<device>".to_owned(),
+            format!("{ns}/<role>/<device>/KEY/<key-id>/<issuer>/<version>"),
+            "one component naming what the device does there, such as member".to_owned(),
+            received.to_owned(),
+            format!(
+                "Issue this device's certificate under that shape, for example {ns}/member/<device>"
+            ),
+        ] {
+            assert!(
+                why.text.contains(&part),
+                "{part:?} is not in {:?}",
+                why.text
+            );
+        }
+        assert_eq!(
+            why.param("expected"),
+            Some(format!("{ns}/<role>/<device>").as_str())
+        );
+        assert_eq!(why.param("namespace"), Some(ns));
+        assert!(
+            why.param("certificate")
+                .is_some_and(|c| c.starts_with(received)),
+            "{:?}",
+            why.params
+        );
+    }
+
+    /// A certificate of a held namespace that is not named `<ns>/<role>/<device>/KEY/…`
+    /// (here a device named with no role) identifies nobody, and the refusal says the
+    /// shape, what the name was and what to do (ndn-link.md §7.1).
+    #[tokio::test]
+    async fn a_certificate_not_of_the_device_shape_is_refused_with_the_shape_and_what_to_do() {
+        let home = namespace("/home", 1).await;
+        let (peer, chain) = misnamed(&home, "/home/phone/KEY/k", 20).await;
+        let world = World::new(
+            Bare(Arc::new(keyring_with(home.context())), None, Vec::new()),
+            Vec::new(),
+            ServePolicy::Own,
+        );
+        let proven = world
+            .judge()
+            .identify(&peer, &hello(chain), &CH)
+            .await
+            .expect("a certificate of the wrong shape identifies nobody; it does not refuse");
+        assert!(proven.identities.is_empty());
+        let why = proven.why.detail();
+        assert!(why.is(code::NOT_DEVICE_CERTIFICATE), "{why:?}");
+        assert_says_the_shape(&why, "/home", "/home/phone/KEY/k");
+    }
+
+    /// The same for a device of a namespace this device does not hold, checked against the
+    /// root its hello carries.
+    #[tokio::test]
+    async fn a_foreign_certificate_not_of_the_device_shape_is_refused_with_the_shape_and_what_to_do()
+     {
+        let mine = namespace("/a", 1).await;
+        let theirs = namespace("/b", 5).await;
+        let (peer, mut chain) = misnamed(&theirs, "/b/phone/KEY/k", 21).await;
+        chain.push(theirs.root.clone());
+        let world = World::new(
+            Bare(Arc::new(keyring_with(mine.context())), None, Vec::new()),
+            Vec::new(),
+            ServePolicy::Own,
+        );
+        let proven = world
+            .judge()
+            .identify(&peer, &hello(chain), &CH)
+            .await
+            .expect("a certificate of the wrong shape identifies nobody; it does not refuse");
+        assert!(proven.identities.is_empty());
+        let why = proven.why.detail();
+        assert!(why.is(code::FOREIGN_NOT_DEVICE_CERTIFICATE), "{why:?}");
+        assert_says_the_shape(&why, "/b", "/b/phone/KEY/k");
+        assert!(why.param("root").is_some(), "{:?}", why.params);
+    }
+
+    /// The name of a certificate a hostile peer sent is shown cleaned of control and invisible
+    /// characters and shortened, in the text and in the fact.
+    #[tokio::test]
+    async fn the_received_certificate_name_is_cleaned_and_shortened() {
+        let hostile = n("/home/x").append("a\u{202e}b\u{7}c\nd");
+        let shown = received_name(&hostile);
+        assert!(
+            !shown.chars().any(|c| c.is_control() || c == '\u{202e}'),
+            "{shown:?}"
+        );
+        assert_eq!(received_name(&n("/home/x/y")), "/home/x/y");
+
+        let long = "y".repeat(400);
+        let home = namespace("/home", 1).await;
+        let (peer, chain) = misnamed(&home, &format!("/home/phone/{long}/KEY/k"), 22).await;
+        let world = World::new(
+            Bare(Arc::new(keyring_with(home.context())), None, Vec::new()),
+            Vec::new(),
+            ServePolicy::Own,
+        );
+        let proven = world
+            .judge()
+            .identify(&peer, &hello(chain), &CH)
+            .await
+            .unwrap();
+        let why = proven.why.detail();
+        let fact = why.param("certificate").unwrap();
+        assert!(why.is(code::NOT_DEVICE_CERTIFICATE), "{why:?}");
+        assert!(
+            fact.chars().count() <= RECEIVED_NAME_MAX && fact.ends_with('…'),
+            "{fact:?}"
+        );
+        assert!(!why.text.contains(&long), "{:?}", why.text);
+        assert!(why.text.contains(fact));
     }
 }

@@ -38,7 +38,7 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 use ndn_face_quic::{Direction, KeyFingerprint};
-use ndn_mgmt_wire::LinkDetail;
+use ndn_mgmt_wire::{LinkDetail, link_code as code};
 use ndn_packet::Name;
 use parking_lot::Mutex;
 use tokio::sync::Notify;
@@ -71,6 +71,17 @@ pub trait LinkMemory: Send + Sync {
     /// Remove the record of `key`, if any; returns once the store made the
     /// removal durable.
     fn remove<'a>(&'a self, key: &'a KeyFingerprint) -> MemoryFuture<'a, Result<(), String>>;
+    /// The port this device listened on when it last stopped, if the store
+    /// kept one (§17D.2): `None` when none was kept. The error is for a store
+    /// that cannot be read at all. **Required**: a store that cannot keep a
+    /// port says so here, by an error, and its host knows the port is not
+    /// remembered.
+    fn load_listen_port(&self) -> Result<Option<u16>, String>;
+    /// Keep `port` as the port this device listens on (`None`: keep none,
+    /// and remove the one kept); returns once the store made it durable. Not
+    /// called with a port when [`MemoryOptions::persist_addresses`] is off:
+    /// then only `None`, which removes one a run before it wrote.
+    fn save_listen_port<'a>(&'a self, port: Option<u16>) -> MemoryFuture<'a, Result<(), String>>;
 }
 
 /// What is remembered of a peer.
@@ -88,6 +99,12 @@ pub struct PeerRecord {
     /// Who first made the link: this device dialled the peer, or the peer
     /// dialled in. Kept as it was at the first contact.
     pub origin: Direction,
+    /// The listening port the peer last linked from or was dialled at (a
+    /// device that listens dials from its link socket, §13.1), the last
+    /// contact's: where to try an address a contact reports without a port
+    /// that works (§17D.2). A hint, trusted for nothing; not kept (like the
+    /// addresses) under [`MemoryOptions::persist_addresses`] off.
+    pub port: Option<u16>,
 }
 
 /// What [`Links::remember`] keeps, and for how long.
@@ -226,6 +243,9 @@ impl Book {
                 })
                 .take(options.addresses())
                 .collect();
+            if !options.persist_addresses {
+                record.port = None;
+            }
             match newest.get(&record.key) {
                 Some(other) if other.last_contact >= record.last_contact => {}
                 _ => {
@@ -315,6 +335,18 @@ impl Book {
                 // bring up to date.
                 changed |= persists;
             }
+            // The port of a link this device dialled is the peer's listening
+            // port; the source port of one the peer opened is its own choice
+            // (it changes at every reconnect of a device that dials from a
+            // socket of its own), so it only fills a port not known yet.
+            if usable(&addr, local)
+                && (direction == Direction::Dialed || record.port.is_none())
+                && record.port != Some(addr.port())
+            {
+                record.port = Some(addr.port());
+                // Not persisted either with the addresses off.
+                changed |= persists;
+            }
             record.last_contact = record.last_contact.max(now);
             let behind =
                 now.duration_since(slot.persisted).unwrap_or_default() >= self.options.expires / 4;
@@ -355,6 +387,7 @@ impl Book {
                     },
                     last_contact: now,
                     origin: direction,
+                    port: usable(&addr, local).then_some(addr.port()),
                 },
                 persisted: now,
             },
@@ -378,6 +411,25 @@ impl Book {
             slot.persisted = slot.record.last_contact;
         }
         behind
+    }
+
+    /// The peer `key` was reached over a direct path whose far end is the
+    /// port `port` (its link socket's, §14): that is its listening port.
+    /// Whether the record is to be saved again (the port changed, and the
+    /// store keeps it).
+    pub(crate) fn set_port(&mut self, key: &KeyFingerprint, port: u16) -> bool {
+        let persists = self.options.persist_addresses;
+        let Some(slot) = self.slots.get_mut(key) else {
+            return false;
+        };
+        if port == 0 || slot.record.port == Some(port) {
+            return false;
+        }
+        slot.record.port = Some(port);
+        if persists {
+            slot.persisted = slot.record.last_contact;
+        }
+        persists
     }
 
     /// Mark the record of `key` as saved as it is now.
@@ -479,6 +531,14 @@ pub enum RememberedState {
     WaitingForAddress,
     /// No held context admits it: not dialled, and `why`.
     NotDialled { why: String },
+    /// Every address kept for it failed (it may have restarted on another
+    /// port), and no relay both devices use is linked: this device cannot
+    /// reach it now, and it reaches this device when it dials this device's
+    /// current address, or when both link to a relay. A statement, not a
+    /// retry loop: the redial backoff is unchanged.
+    NoPath { why: String },
+    /// This device is offline ([`Links::set_online`]): no dial is made.
+    Offline,
 }
 
 // ---- the memory ------------------------------------------------------------------------------
@@ -491,9 +551,17 @@ const DIAL_WITHIN: Duration = MESSAGE_DEADLINE;
 /// for what has no hook.
 const RECHECK: Duration = Duration::from_secs(30);
 
+/// IP addresses a contact reported for a peer that a redial tries at the
+/// peer's last-known port, besides the addresses that worked: the bound on
+/// what a stranger's source address can make this device dial.
+const REPORTED_MAX: usize = 2;
+
 /// A redial loop's handle.
 struct Redial {
     wake: Arc<Notify>,
+    /// Skip the rest of the current wait: this device is back online, or its
+    /// addresses changed (§17D).
+    kick: Arc<Notify>,
     stop: CancellationToken,
     state: Arc<Mutex<RememberedState>>,
 }
@@ -508,6 +576,38 @@ struct Inner {
     /// When each record was last written: a record is written again only
     /// once `save_interval` has passed.
     saved_at: HashMap<KeyFingerprint, Instant>,
+    /// The listening port the writer owes the store: `Some(None)` removes
+    /// the one it holds.
+    port_owed: Option<Option<u16>>,
+    /// IP addresses contacts reported for peers that this run has not
+    /// dialled at yet, newest first, at most [`REPORTED_MAX`] each: dialled
+    /// at the peer's last-known port beside its kept addresses (§17D.2). Not
+    /// kept in the store.
+    reported: HashMap<KeyFingerprint, Vec<std::net::IpAddr>>,
+}
+
+impl Inner {
+    /// A contact reported `ip` for the peer `key` (it linked in from there,
+    /// or a direct path reached it there): kept, newest first and bounded,
+    /// when no address kept for the peer is at that IP already, and when a
+    /// dial would use it ([`usable`]).
+    fn report(&mut self, key: KeyFingerprint, ip: std::net::IpAddr, include_local: bool) {
+        let ip = ip.to_canonical();
+        if !usable(&SocketAddr::new(ip, 1), include_local) {
+            return;
+        }
+        if self
+            .book
+            .get(&key)
+            .is_some_and(|r| r.addresses.iter().any(|a| a.ip().to_canonical() == ip))
+        {
+            return;
+        }
+        let ips = self.reported.entry(key).or_default();
+        ips.retain(|known| *known != ip);
+        ips.insert(0, ip);
+        ips.truncate(REPORTED_MAX);
+    }
 }
 
 /// The link memory of one [`Links`].
@@ -523,7 +623,7 @@ pub(crate) struct Memory {
     failure: Mutex<Option<String>>,
     cancel: CancellationToken,
     /// How many peers are dialled at once (`MemoryOptions::dials_at_once`).
-    dials: tokio::sync::Semaphore,
+    dials: Arc<tokio::sync::Semaphore>,
 }
 
 impl Memory {
@@ -533,11 +633,13 @@ impl Memory {
         store: Arc<dyn LinkMemory>,
         options: MemoryOptions,
     ) -> Arc<Memory> {
+        let on = Arc::clone(links);
         Memory::open(
             Arc::downgrade(links),
             links.cancel_token().child_token(),
             store,
             options,
+            move |kept| on.settle_listen_port(kept),
         )
     }
 
@@ -550,6 +652,7 @@ impl Memory {
         cancel: CancellationToken,
         store: Arc<dyn LinkMemory>,
         options: MemoryOptions,
+        bind: impl FnOnce(Option<u16>) -> Option<u16>,
     ) -> Arc<Memory> {
         let now = SystemTime::now();
         let (records, failure) = match store.load() {
@@ -565,12 +668,39 @@ impl Memory {
         };
         // The addresses a store holds that this run will not keep (it does not
         // persist them) are written out of it.
+        let mut failure = failure;
+        let (kept_port, scrub_port) = match store.load_listen_port() {
+            Ok(port) => (
+                port.filter(|_| options.persist_addresses),
+                port.is_some() && !options.persist_addresses,
+            ),
+            Err(e) => {
+                let words = format!(
+                    "the link memory could not read the listening port ({e}): this device keeps \
+                     the port its host gave it, and writes it again once the store works"
+                );
+                tracing::warn!(target: "face.quic", "{words}");
+                failure.get_or_insert(words);
+                (None, false)
+            }
+        };
+        // The listening socket takes the kept port again before any loop dials
+        // from it; the port it listens on now is owed the store when it is
+        // not the one kept.
+        let listening = bind(kept_port);
+        let port_owed = if scrub_port {
+            Some(None)
+        } else if options.persist_addresses && listening.is_some() && listening != kept_port {
+            Some(listening)
+        } else {
+            None
+        };
         let scrub: Vec<KeyFingerprint> = if options.persist_addresses {
             Vec::new()
         } else {
             records
                 .iter()
-                .filter(|r| !r.addresses.is_empty())
+                .filter(|r| !r.addresses.is_empty() || r.port.is_some())
                 .map(|r| r.key)
                 .collect()
         };
@@ -590,12 +720,14 @@ impl Memory {
                 dirty,
                 doomed: dropped.into_iter().collect(),
                 saved_at: HashMap::new(),
+                port_owed,
+                reported: HashMap::new(),
             }),
             io: tokio::sync::Mutex::new(()),
             write_wake: Notify::new(),
             failure: Mutex::new(failure),
             cancel,
-            dials: tokio::sync::Semaphore::new(dials),
+            dials: Arc::new(tokio::sync::Semaphore::new(dials)),
         });
         let keys: Vec<KeyFingerprint> = memory
             .inner
@@ -621,6 +753,7 @@ impl Memory {
         }
         let redial = Redial {
             wake: Arc::new(Notify::new()),
+            kick: Arc::new(Notify::new()),
             stop: self.cancel.child_token(),
             state: Arc::new(Mutex::new(RememberedState::Dialling)),
         };
@@ -629,6 +762,7 @@ impl Memory {
             key,
             redial.stop.clone(),
             Arc::clone(&redial.wake),
+            Arc::clone(&redial.kick),
             Arc::clone(&redial.state),
         ));
         inner.redials.insert(key, redial);
@@ -644,6 +778,57 @@ impl Memory {
     pub(crate) fn wake_all(&self) {
         for r in self.inner.lock().redials.values() {
             r.wake.notify_one();
+        }
+    }
+
+    /// Every loop dials now, whatever its backoff was: this device is back
+    /// online, or its addresses changed. The dials ride the turns of
+    /// `dials_at_once`.
+    pub(crate) fn kick_all(&self) {
+        for r in self.inner.lock().redials.values() {
+            r.kick.notify_one();
+        }
+    }
+
+    /// A turn at the dials the memory staggers (`dials_at_once`), for a
+    /// dial that every loop of these links makes at once.
+    pub(crate) async fn turn(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.dials).acquire_owned().await.ok()
+    }
+
+    /// The addresses to dial the peer of `record` at: the IP addresses
+    /// contacts reported for it at its last-known port (newest first), then
+    /// the addresses that worked.
+    fn dial_list(&self, record: &PeerRecord) -> Vec<SocketAddr> {
+        let mut list: Vec<SocketAddr> = Vec::new();
+        let inner = self.inner.lock();
+        if let (Some(port), Some(ips)) = (record.port, inner.reported.get(&record.key)) {
+            list.extend(ips.iter().map(|ip| SocketAddr::new(*ip, port)));
+        }
+        drop(inner);
+        for addr in &record.addresses {
+            if !list.contains(addr) {
+                list.push(*addr);
+            }
+        }
+        list
+    }
+
+    /// A direct path to the peer `key` is up, its far end `remote`: that is
+    /// the peer's link socket, so its listening port, and its IP address is
+    /// one to try at that port (§17D.2).
+    fn direct_contact(&self, key: &KeyFingerprint, remote: SocketAddr) {
+        let remote = canonical(remote);
+        let mut inner = self.inner.lock();
+        if inner.book.get(key).is_none() {
+            return;
+        }
+        let save = inner.book.set_port(key, remote.port());
+        inner.report(*key, remote.ip(), self.options.include_local);
+        if save {
+            inner.dirty.insert(*key);
+            drop(inner);
+            self.write_wake.notify_one();
         }
     }
 
@@ -674,6 +859,9 @@ impl Memory {
                 }
                 inner.dirty.remove(&victim);
                 inner.doomed.insert(victim);
+            }
+            if direction == Direction::Accepted {
+                inner.report(key, addr.ip(), self.options.include_local);
             }
             (learned, inner.book.get(&key).map(|r| r.addresses.clone()))
         };
@@ -817,7 +1005,8 @@ impl Memory {
                 }
                 (std::mem::take(&mut inner.doomed), due)
             };
-            if removals.is_empty() && saves.is_empty() {
+            let port_owed = self.inner.lock().port_owed.take();
+            if removals.is_empty() && saves.is_empty() && port_owed.is_none() {
                 return later;
             }
             for key in removals {
@@ -839,6 +1028,7 @@ impl Memory {
                 };
                 if !self.options.persist_addresses {
                     record.addresses.clear();
+                    record.port = None;
                 }
                 let result = self.store.save(&record).await;
                 {
@@ -849,6 +1039,18 @@ impl Memory {
                     inner.saved_at.insert(key, Instant::now());
                 }
                 self.note(result, "save a peer in");
+            }
+            if let Some(port) = port_owed {
+                let _io = self.io.lock().await;
+                let result = self.store.save_listen_port(port).await;
+                let failed = result.is_err();
+                self.note(result, "save the listening port in");
+                if failed {
+                    // Owed still, unless a newer port came meanwhile; tried
+                    // again later rather than in a loop.
+                    self.inner.lock().port_owed.get_or_insert(port);
+                    return Some(RECHECK);
+                }
             }
         }
     }
@@ -911,7 +1113,7 @@ impl Standing for Links {
     }
 
     fn granted(&self, key: &KeyFingerprint) -> bool {
-        self.grants.live(key).is_some()
+        self.grants.has_live(key, std::time::SystemTime::now())
     }
 }
 
@@ -952,6 +1154,72 @@ impl Links {
                 memory.wake_all();
             }
         });
+    }
+
+    /// The host's link socket listens, and the store kept `kept` as the port
+    /// this device listened on (§17D.2): bind the kept port again when it is
+    /// not the one in use, free, and a port a device may be reached at (not
+    /// 0, not below [`LISTEN_PORT_MIN`](crate::policy::LISTEN_PORT_MIN)),
+    /// else keep listening where it does. Returns the port the socket listens
+    /// on now (`None` when the host's socket does not listen); the peers are
+    /// told (presence refreshed, direct paths punched again with the
+    /// candidates of the port in use) when it is not the one they knew.
+    pub(crate) fn settle_listen_port(self: &Arc<Self>, kept: Option<u16>) -> Option<u16> {
+        let socket = self.socket.as_ref().filter(|s| s.is_listening())?;
+        let local = socket.local_addr().ok()?;
+        let mut now = local.port();
+        if let Some(port) = kept.filter(|port| *port != now) {
+            if port < crate::policy::LISTEN_PORT_MIN {
+                tracing::warn!(
+                    target: "face.quic",
+                    "the port kept for this device, {port}, is below {}: it is not a port this device \
+                     rebinds to; it keeps listening on {now}",
+                    crate::policy::LISTEN_PORT_MIN
+                );
+            } else {
+                match std::net::UdpSocket::bind(SocketAddr::new(local.ip(), port))
+                    .and_then(|bound| socket.rebind(bound))
+                {
+                    Ok(()) => {
+                        tracing::info!(
+                            target: "face.quic",
+                            "this device listens on its kept port {port} again (it was bound to {now})"
+                        );
+                        now = port;
+                    }
+                    Err(e) => tracing::warn!(
+                        target: "face.quic",
+                        "the port kept for this device, {port}, cannot be bound again ({e}): it keeps \
+                         listening on {now}, and keeps that"
+                    ),
+                }
+            }
+        }
+        if kept.is_some_and(|port| port != now) {
+            self.announce_all();
+            self.direct.kick();
+        }
+        Some(now)
+    }
+
+    /// Whether a relay this device is linked to lists the peer `key` as
+    /// linked to it too: a path both devices use, whatever their own
+    /// addresses are.
+    pub(crate) fn shares_relay_with(&self, key: &KeyFingerprint) -> bool {
+        self.present
+            .lock()
+            .iter()
+            .any(|(relay, keys)| keys.contains(key) && self.table.link_to(*relay).is_some())
+    }
+
+    /// A turn at the dials the link memory staggers, when there is one: the
+    /// dials every loop makes at once (online again, an address change) take
+    /// turns at `dials_at_once`.
+    pub(crate) async fn dial_turn(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        match self.memory.get() {
+            Some(memory) => memory.turn().await,
+            None => None,
+        }
     }
 
     /// Forget the peer with `key`: its record is removed (durably, before
@@ -1053,6 +1321,10 @@ impl Memory {
                 identified,
             } => {
                 self.wake(key);
+                if *identified && *kind == PathKind::Direct {
+                    self.direct_contact(key, *remote);
+                    return;
+                }
                 if *kind != PathKind::Link || !identified {
                     return;
                 }
@@ -1095,6 +1367,7 @@ async fn redial_loop(
     key: KeyFingerprint,
     stop: CancellationToken,
     wake: Arc<Notify>,
+    kick: Arc<Notify>,
     state: Arc<Mutex<RememberedState>>,
 ) {
     let mut backoff = memory.options.redial.clone();
@@ -1116,6 +1389,19 @@ async fn redial_loop(
             }
         }
     };
+    // Wait out a backoff of `within`, or until this device is kicked (back
+    // online, its addresses changed); `false` when the loop is to end.
+    let rest = |within: Duration| {
+        let stop = stop.clone();
+        let kick = Arc::clone(&kick);
+        async move {
+            tokio::select! {
+                () = stop.cancelled() => false,
+                () = kick.notified() => true,
+                () = tokio::time::sleep(within) => true,
+            }
+        }
+    };
     loop {
         let (Some(links), Some(record)) = (memory.links.upgrade(), memory.record(&key)) else {
             break;
@@ -1132,6 +1418,25 @@ async fn redial_loop(
             }
             continue;
         }
+        if !links.is_online() {
+            // Offline: no dial, and the status says so; online again, the
+            // peer is dialled at once.
+            *state.lock() = RememberedState::Offline;
+            let id = links.remembered_peer(&record);
+            links.watch_failed_remembered(
+                id,
+                &key,
+                &crate::online::offline_detail(),
+                Next::WhenOnline,
+            );
+            let online = links.online.subscribe();
+            drop(links);
+            if !crate::online::wait_online(online, &stop).await {
+                break;
+            }
+            backoff.reset();
+            continue;
+        }
         if links.table.is_linked(&key) {
             *state.lock() = RememberedState::Linked;
             backoff.reset();
@@ -1144,13 +1449,13 @@ async fn redial_loop(
             memory.touch_if_linked(&key);
             if !memory.is_linked(&key) {
                 // It dropped: the other device may be restarting.
-                if !pause_only(&stop, backoff.after_drop()).await {
+                if !rest(backoff.after_drop()).await {
                     break;
                 }
             }
             continue;
         }
-        if record.addresses.is_empty() {
+        if memory.dial_list(&record).is_empty() {
             *state.lock() = RememberedState::WaitingForAddress;
             links.watch_next_remembered(&key, Next::WaitingForAddress);
             drop(links);
@@ -1173,17 +1478,20 @@ async fn redial_loop(
         let (Some(links), Some(record)) = (memory.links.upgrade(), memory.record(&key)) else {
             break;
         };
+        let addresses = memory.dial_list(&record);
         if stop.is_cancelled()
-            || record.addresses.is_empty()
+            || addresses.is_empty()
+            || !links.is_online()
             || links.table.is_linked(&key)
             || not_redialled(links.as_ref(), &key, &record.device, record.origin).is_some()
         {
             continue;
         }
-        let id = links.remembered_peer(&record);
-        let outcome = links
-            .dial_race(id, key, &record.addresses, DIAL_WITHIN)
-            .await;
+        let id = links.remembered_peer(&PeerRecord {
+            addresses: addresses.clone(),
+            ..record.clone()
+        });
+        let outcome = links.dial_race(id, key, &addresses, DIAL_WITHIN).await;
         drop(turn);
         match outcome {
             Ok(_) if memory.is_linked(&key) => {
@@ -1195,9 +1503,13 @@ async fn redial_loop(
                 let wait = backoff.after_failure(false);
                 *state.lock() = RememberedState::Redialling { within: wait };
                 drop(links);
-                if !pause_only(&stop, wait).await {
+                if !rest(wait).await {
                     break;
                 }
+            }
+            Err(_) if !links.is_online() => {
+                // Went offline during the dial: the top of the loop waits.
+                drop(links);
             }
             Err(detail) => {
                 let wait = backoff.after_failure(false);
@@ -1208,10 +1520,24 @@ async fn redial_loop(
                     "redial of a remembered peer failed: {}",
                     detail.text
                 );
-                links.watch_failed_remembered(id, &key, &detail, wait);
-                *state.lock() = RememberedState::Redialling { within: wait };
+                if links.shares_relay_with(&key) {
+                    links.watch_failed_remembered(
+                        id,
+                        &key,
+                        &detail,
+                        Next::Redialling { within: wait },
+                    );
+                    *state.lock() = RememberedState::Redialling { within: wait };
+                } else {
+                    let why = no_path_words(&record.device);
+                    let mut no_path = LinkDetail::new(code::NO_PATH, why.clone())
+                        .with("device", record.device.to_string());
+                    no_path.append("; the last attempt: ", detail);
+                    links.watch_failed_remembered(id, &key, &no_path, Next::WaitingForAddress);
+                    *state.lock() = RememberedState::NoPath { why };
+                }
                 drop(links);
-                if !pause_only(&stop, wait).await {
+                if !rest(wait).await {
                     break;
                 }
             }
@@ -1222,12 +1548,13 @@ async fn redial_loop(
     }
 }
 
-/// Wait `within`, or until `stop`; `false` when stopped.
-async fn pause_only(stop: &CancellationToken, within: Duration) -> bool {
-    tokio::select! {
-        () = stop.cancelled() => false,
-        () = tokio::time::sleep(within) => true,
-    }
+/// What a device says when it cannot reach a remembered peer at all (§17D.2).
+fn no_path_words(device: &Name) -> String {
+    format!(
+        "every address this device kept for {device} failed, {device}'s port may have changed, and \
+         no relay both of you use is linked; {device} reaches this device when it dials this \
+         device's current address, or when you both link to a relay"
+    )
 }
 
 impl Memory {
@@ -1261,9 +1588,9 @@ impl Links {
         id: PeerId,
         key: &KeyFingerprint,
         why: &LinkDetail,
-        within: Duration,
+        next: Next,
     ) {
-        self.watch_failed(id, Some(*key), why, Next::Redialling { within });
+        self.watch_failed(id, Some(*key), why, next);
     }
 }
 
@@ -1295,6 +1622,7 @@ mod tests {
             addresses: vec![addr(&format!("192.0.2.{b}:4433"))],
             last_contact: at(last),
             origin: Direction::Dialed,
+            port: Some(4433),
         }
     }
 
@@ -1622,6 +1950,9 @@ mod tests {
         failing: parking_lot::Mutex<bool>,
         saves: AtomicUsize,
         removes: AtomicUsize,
+        /// The listening port the store holds, and the writes it took.
+        port: parking_lot::Mutex<Option<u16>>,
+        port_writes: parking_lot::Mutex<Vec<Option<u16>>>,
     }
 
     impl Shelf {
@@ -1666,16 +1997,46 @@ mod tests {
                 Ok(())
             })
         }
+        fn load_listen_port(&self) -> Result<Option<u16>, String> {
+            if *self.failing.lock() {
+                return Err("the disk is gone".into());
+            }
+            Ok(*self.port.lock())
+        }
+        fn save_listen_port<'a>(
+            &'a self,
+            port: Option<u16>,
+        ) -> MemoryFuture<'a, Result<(), String>> {
+            Box::pin(async move {
+                if *self.failing.lock() {
+                    return Err("the disk is full".into());
+                }
+                self.port_writes.lock().push(port);
+                *self.port.lock() = port;
+                Ok(())
+            })
+        }
     }
 
     /// A memory over `shelf` with no links behind it: the records, the
     /// writer and the bounds, nothing that dials.
     fn memory_over(shelf: &Arc<Shelf>, options: MemoryOptions) -> Arc<Memory> {
+        memory_binding(shelf, options, |_| None)
+    }
+
+    /// The same, with `bind` as the listening socket: it is told the port the
+    /// store kept and answers the port it listens on.
+    fn memory_binding(
+        shelf: &Arc<Shelf>,
+        options: MemoryOptions,
+        bind: impl FnOnce(Option<u16>) -> Option<u16>,
+    ) -> Arc<Memory> {
         Memory::open(
             Weak::new(),
             CancellationToken::new(),
             Arc::clone(shelf) as Arc<dyn LinkMemory>,
             options,
+            bind,
         )
     }
 
@@ -2103,6 +2464,220 @@ mod tests {
         assert!(
             writes <= 3,
             "a peer that linked 100 times was written {writes} times"
+        );
+    }
+
+    /// §17D.2: the port a record keeps is the one of the last contact this
+    /// device dialled; a peer's own source ports (accepted links) only fill
+    /// a port not known yet, so a peer that reconnects from a new port at
+    /// every link is not a write at every link.
+    #[test]
+    fn a_record_keeps_the_listening_port_of_the_contact_this_device_dialled() {
+        let (mut book, _) = Book::load(options(8, 4, 1000), Vec::new(), at(0));
+        let device = n("/ann/member/laptop");
+        let first = book.learn(
+            key(1),
+            device.clone(),
+            addr("192.0.2.1:4433"),
+            Direction::Dialed,
+            at(0),
+        );
+        assert!(first.save);
+        assert_eq!(book.get(&key(1)).unwrap().port, Some(4433));
+        for port in 1000..1100u16 {
+            let learned = book.learn(
+                key(1),
+                device.clone(),
+                addr(&format!("192.0.2.1:{port}")),
+                Direction::Accepted,
+                at(1),
+            );
+            assert!(
+                !learned.save,
+                "an accepted link from port {port} asked for a write"
+            );
+        }
+        assert_eq!(book.get(&key(1)).unwrap().port, Some(4433));
+        // Dialled at a new port (the peer restarted on it): the port moves,
+        // and the record is to be saved.
+        let moved = book.learn(
+            key(1),
+            device.clone(),
+            addr("192.0.2.1:5000"),
+            Direction::Dialed,
+            at(2),
+        );
+        assert!(moved.save);
+        assert_eq!(book.get(&key(1)).unwrap().port, Some(5000));
+        // A direct path whose far end is at a port says the same, and an
+        // unusable port says nothing.
+        assert!(book.set_port(&key(1), 6000));
+        assert!(!book.set_port(&key(1), 6000), "nothing changed");
+        assert!(!book.set_port(&key(1), 0));
+        assert!(!book.set_port(&key(9), 6000), "no record, no port");
+        assert_eq!(book.get(&key(1)).unwrap().port, Some(6000));
+    }
+
+    /// §17D.2 under `persist_addresses = false`: no port is read from the
+    /// store, and a change of it asks for no write; what a run learns lives
+    /// in memory for that run, as the addresses do.
+    #[test]
+    fn the_record_port_is_not_kept_when_the_addresses_are_not() {
+        let off = MemoryOptions {
+            persist_addresses: false,
+            ..options(8, 4, 1000)
+        };
+        let (mut book, _) = Book::load(off, vec![record(1, 10)], at(20));
+        assert_eq!(book.get(&key(1)).unwrap().port, None, "dropped at load");
+        let device = n("/ann/member/d1");
+        let learned = book.learn(
+            key(1),
+            device,
+            addr("192.0.2.1:7000"),
+            Direction::Dialed,
+            at(21),
+        );
+        assert!(
+            !learned.save,
+            "a port that is not persisted is no reason to write"
+        );
+        assert_eq!(
+            book.get(&key(1)).unwrap().port,
+            Some(7000),
+            "kept for this run"
+        );
+        assert!(
+            !book.set_port(&key(1), 7001),
+            "and no write for a direct path's either"
+        );
+    }
+
+    /// §17D.2: the contacts' reports are bounded, newest first, never at an
+    /// address already kept or one a dial would not use, and dialled at the
+    /// peer's port before the addresses that worked.
+    #[tokio::test]
+    async fn reported_addresses_are_dialled_at_the_last_known_port_before_the_kept_ones() {
+        let shelf = Shelf::with(vec![record(1, now_secs())]);
+        let memory = memory_over(&shelf, options(8, 4, 1_000_000));
+        let device = n("/ann/member/d1");
+        {
+            let mut inner = memory.inner.lock();
+            inner.report(key(1), "192.0.2.1".parse().unwrap(), false); // already kept
+            inner.report(key(1), "127.0.0.1".parse().unwrap(), false); // local
+            inner.report(key(1), "198.51.100.1".parse().unwrap(), false);
+            inner.report(key(1), "198.51.100.2".parse().unwrap(), false);
+            inner.report(key(1), "198.51.100.3".parse().unwrap(), false);
+            inner.report(key(1), "198.51.100.2".parse().unwrap(), false);
+        }
+        let kept = memory.record(&key(1)).unwrap();
+        assert_eq!(kept.device, device);
+        assert_eq!(
+            memory.dial_list(&kept),
+            vec![
+                addr("198.51.100.2:4433"),
+                addr("198.51.100.3:4433"),
+                addr("192.0.2.1:4433")
+            ],
+            "two reports at most (newest first), then what worked"
+        );
+        // With no port known, a reported IP has nowhere to be tried.
+        let no_port = PeerRecord { port: None, ..kept };
+        assert_eq!(memory.dial_list(&no_port), vec![addr("192.0.2.1:4433")]);
+    }
+
+    /// §17D.2: the listening port is kept with the memory and written behind.
+    /// The socket takes the kept port again; what it listens on after that is
+    /// owed the store when it is not the kept one, and nothing is written when
+    /// it is.
+    #[tokio::test]
+    async fn the_listening_port_is_kept_when_it_changed_and_not_written_when_it_did_not() {
+        // Nothing kept yet: the port in use is written.
+        let shelf = Shelf::with(Vec::new());
+        let memory = memory_binding(&shelf, options(8, 4, 1_000_000), |kept| {
+            assert_eq!(kept, None);
+            Some(5000)
+        });
+        memory.drain().await;
+        assert_eq!(*shelf.port.lock(), Some(5000));
+        // The same port at the next start: told what was kept, and no write.
+        let again = memory_binding(&shelf, options(8, 4, 1_000_000), |kept| {
+            assert_eq!(kept, Some(5000));
+            Some(5000)
+        });
+        again.drain().await;
+        assert_eq!(
+            *shelf.port_writes.lock(),
+            vec![Some(5000)],
+            "no second write"
+        );
+        // The kept port was taken: the one in use is the one kept now.
+        let moved = memory_binding(&shelf, options(8, 4, 1_000_000), |kept| {
+            assert_eq!(kept, Some(5000));
+            Some(6000)
+        });
+        moved.drain().await;
+        assert_eq!(*shelf.port.lock(), Some(6000));
+        // A host whose socket does not listen has no port to keep.
+        let dial_only = memory_binding(&shelf, options(8, 4, 1_000_000), |_| None);
+        dial_only.drain().await;
+        assert_eq!(*shelf.port.lock(), Some(6000), "a dial-only host leaves it");
+    }
+
+    /// §17D.2: under `persist_addresses = false` no port is kept, the memory
+    /// does not hand the kept one to the socket, and one written before is
+    /// removed.
+    #[tokio::test]
+    async fn no_port_is_written_when_the_host_says_not_to_and_one_written_before_goes() {
+        let shelf = Shelf::with(Vec::new());
+        *shelf.port.lock() = Some(5000);
+        let off = MemoryOptions {
+            persist_addresses: false,
+            ..options(8, 4, 1_000_000)
+        };
+        let memory = memory_binding(&shelf, off, |kept| {
+            assert_eq!(
+                kept, None,
+                "a port kept before is not used when nothing is kept"
+            );
+            Some(7000)
+        });
+        memory.drain().await;
+        assert_eq!(
+            *shelf.port.lock(),
+            None,
+            "the one written earlier is removed"
+        );
+        assert_eq!(
+            *shelf.port_writes.lock(),
+            vec![None],
+            "and no port was ever written: {:?}",
+            shelf.port_writes.lock()
+        );
+    }
+
+    /// §17D.2: a store that cannot say what port it kept is said in the report
+    /// and the port in use is kept for when it works again.
+    #[tokio::test]
+    async fn a_store_that_cannot_be_read_is_reported_and_the_port_is_written_when_it_works() {
+        let shelf = Shelf::with(Vec::new());
+        *shelf.failing.lock() = true;
+        let memory = memory_binding(&shelf, options(8, 4, 1_000_000), |kept| {
+            assert_eq!(kept, None);
+            Some(5000)
+        });
+        memory.drain().await;
+        let said = memory
+            .report()
+            .store_error
+            .expect("the failure is reported");
+        assert!(said.contains("could not"), "{said}");
+        assert_eq!(*shelf.port.lock(), None);
+        *shelf.failing.lock() = false;
+        memory.drain().await;
+        assert_eq!(
+            *shelf.port.lock(),
+            Some(5000),
+            "owed until the store worked"
         );
     }
 }

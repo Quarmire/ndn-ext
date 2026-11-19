@@ -722,6 +722,9 @@ impl Links {
         target: &Target,
         socket: Arc<LinkEndpoint>,
     ) -> Result<LinkHandle, Failure> {
+        if !self.is_online() {
+            return Err(Failure::new(crate::online::offline_detail()));
+        }
         let label = target.label.clone();
         let device = target.device.clone();
         let key = self.key.current().map_err(|e| {
@@ -918,6 +921,10 @@ impl Links {
     /// names): refuse it, or answer with this device's candidates and punch
     /// back.
     pub(crate) async fn answer_punch(self: Arc<Self>, interest: Interest) {
+        if !self.is_online() {
+            // Offline: nothing leaves this device, not even a refusal.
+            return;
+        }
         let Some((own, session)) = self
             .own_devices()
             .into_iter()
@@ -1651,6 +1658,19 @@ async fn punch_loop(
     loop {
         let Some(this) = links.upgrade() else { return };
         let cancel = this.cancel.clone();
+        if !this.is_online() {
+            let online = this.online.subscribe();
+            drop(this);
+            let reached = tokio::select! {
+                () = stop.cancelled() => return,
+                reached = crate::online::wait_online(online, &cancel) => reached,
+            };
+            if !reached {
+                return;
+            }
+            backoff.reset();
+            continue;
+        }
         let wait = tokio::select! {
             () = stop.cancelled() => return,
             wait = this.direct_round(&target, relay, &mut backoff) => wait,

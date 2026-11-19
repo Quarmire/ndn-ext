@@ -44,7 +44,9 @@ pub(crate) fn routes_for(
     relay: Option<RelayRoutes>,
 ) -> Vec<Route> {
     match &admitted.enrollment {
-        Some(Enrollment::Relay(_) | Enrollment::Introduction(_)) => return Vec::new(),
+        Some(Enrollment::Relay(_) | Enrollment::Introduction(_) | Enrollment::Departure(_)) => {
+            return Vec::new();
+        }
         Some(Enrollment::Device(ns)) => {
             return vec![Route {
                 prefix: ns.clone(),

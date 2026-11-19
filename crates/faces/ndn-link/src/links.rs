@@ -25,6 +25,7 @@ use crate::admission::{
 use crate::asleep::{RelayService, Sleepers};
 use crate::candidates::CandidateSource;
 use crate::control::{PeerCtl, idle_check, release};
+use crate::departures::Departures;
 use crate::direct::{Direct, Whom, direct_up};
 use crate::grants::Grants;
 use crate::host::{FaceSink, LinkTrust, PathCandidate, PathSource};
@@ -106,6 +107,9 @@ pub struct Links {
     pub(crate) quotas: QuotaState,
     /// The grants of links to the people this device introduced.
     pub(crate) grants: Grants,
+    /// The departure marks, and what a person let go is told
+    /// ([`Links::depart`]).
+    pub(crate) departures: Departures,
     pub(crate) direct_options: DirectOptions,
     pub(crate) ctls: Mutex<HashMap<PeerId, Arc<PeerCtl>>>,
     pub(crate) active: AtomicBool,
@@ -114,6 +118,10 @@ pub struct Links {
     pub(crate) sleepers: Sleepers,
     /// Members this device punches by presence, by key.
     pub(crate) members: Mutex<HashMap<KeyFingerprint, MemberEntry>>,
+    /// The devices each relay this device is linked to lists as linked to it
+    /// too (its presence), by relay: what says a relay both devices use
+    /// exists ([`Links::shares_relay_with`]).
+    pub(crate) present: Mutex<HashMap<PeerId, HashSet<KeyFingerprint>>>,
     /// What strangers' introduction links may carry
     /// ([`Links::set_introductions`]); `None`: this device takes none.
     pub(crate) introductions: Mutex<Option<Arc<dyn crate::introduce::Introductions>>>,
@@ -125,6 +133,10 @@ pub struct Links {
     pub(crate) states: LinkStates,
     /// What this device remembers of its peers ([`Links::remember`]).
     pub(crate) memory: OnceLock<Arc<crate::memory::Memory>>,
+    /// Whether this device is online ([`Links::set_online`]).
+    pub(crate) online: crate::online::Online,
+    /// What stops the running address watcher ([`Links::watch_addresses`]).
+    pub(crate) address_watch: Mutex<Option<CancellationToken>>,
     pub(crate) cancel: CancellationToken,
     /// The test-only fault layer's plan, shared by every link's face.
     #[cfg(feature = "fault-injection")]
@@ -158,16 +170,20 @@ impl Links {
             service: setup.service,
             quotas: QuotaState::default(),
             grants: Grants::default(),
+            departures: Departures::default(),
             direct_options: setup.direct,
             ctls: Mutex::new(HashMap::new()),
             active: AtomicBool::new(false),
             dismissed: Mutex::new(HashSet::new()),
             sleepers: Sleepers::default(),
             members: Mutex::new(HashMap::new()),
+            present: Mutex::new(HashMap::new()),
             introductions: Mutex::new(None),
             introduced: Mutex::new(HashMap::new()),
             states: LinkStates::default(),
             memory: OnceLock::new(),
+            online: crate::online::Online::default(),
+            address_watch: Mutex::new(None),
             cancel,
             #[cfg(feature = "fault-injection")]
             faults: Arc::default(),
@@ -178,6 +194,7 @@ impl Links {
         let _ = links.waiting.set(Waiting::start(&links));
         links.take_punches();
         links.spawn_grant_expiry();
+        links.watch_addresses(crate::netwatch::AddressWatch::default());
 
         let weak = Arc::downgrade(&links);
         links.trust.keyring().on_revocation(move |ctx, _| {
@@ -518,6 +535,7 @@ impl Links {
             serve: &self.service.serve,
             quotas: &self.quotas,
             grants: &self.grants,
+            departures: &self.departures,
             introductions: self.introductions.lock().clone(),
         }
     }
@@ -555,6 +573,7 @@ impl Links {
             false,
         )?);
         dialers.insert(v4, Arc::clone(&endpoint));
+        endpoint.set_accepting(self.is_online());
         tokio::spawn(accept_loop(Arc::downgrade(self), Arc::clone(&endpoint)));
         Ok(endpoint)
     }
@@ -572,6 +591,14 @@ impl Links {
         origin: Origin,
     ) -> Result<LinkHandle, NotLinked> {
         let remote = hs.remote_address();
+        if !self.is_online() {
+            // Closed on its way in: the handshake began before this device
+            // went offline.
+            let detail = crate::online::offline_detail();
+            tracing::info!(target: "face.quic", %remote, "refused a link: {}", detail.text);
+            hs.refuse(CloseReason::Shutdown, &detail.text);
+            return Err(NotLinked::refused_here(CloseReason::Shutdown, detail));
+        }
         let peer_fp = hs.peer_key().fingerprint();
         // A direct path is named by both hellos: the dialer's punch session,
         // and the session the listener punches with that key.
@@ -702,7 +729,7 @@ impl Links {
             }
         }
         let slot = match &admitted.enrollment {
-            Some(Enrollment::Relay(_) | Enrollment::Introduction(_)) => {
+            Some(Enrollment::Relay(_) | Enrollment::Introduction(_) | Enrollment::Departure(_)) => {
                 match self.enrollment_slots.reserve(remote.ip()) {
                     Ok(slot) => Some(slot),
                     Err(refusal) => {
@@ -814,6 +841,11 @@ impl Links {
         };
         self.faces.add_face(face, self.cancel.child_token());
         self.faces.add_routes(face_id, &routes);
+        // Offline began while this link's handshake ran: the links closed
+        // then did not include this one.
+        if !self.is_online() {
+            handle.close(CloseReason::Shutdown, crate::online::WENT_OFFLINE);
+        }
         // The grant that admitted this link was read in `decide`, before the
         // handshake's verdicts (up to MESSAGE_DEADLINE) and before the link
         // was in the table: a revoke, a replacement or an expiry in between
@@ -824,7 +856,7 @@ impl Links {
         // lookup sees the grant gone. The same scope, still in force, or
         // the link closes saying what ended.
         if let Some(by) = &admitted.grant
-            && let Some(ended) = self.grants.ended_since(by)
+            && let Some(ended) = self.grants.ended_since(by, &admitted.identities)
         {
             tracing::warn!(
                 target: "face.quic",
@@ -861,7 +893,14 @@ impl Links {
             self.direct.path_up(&session, &handle);
         }
         self.explain_enrollment(&admitted, &peer_enrollment, face_id);
-        if kind == PathKind::Link && enrolling.is_empty() {
+        self.departure_link_up(&admitted, &handle);
+        if kind == PathKind::Link {
+            self.hear_departures(admitted.fingerprint, &handle);
+        }
+        if kind == PathKind::Link
+            && enrolling.is_empty()
+            && !matches!(admitted.enrollment, Some(Enrollment::Departure(_)))
+        {
             self.link_up(&admitted, peer.as_deref(), &handle).await;
         }
         let weak = Arc::downgrade(self);
@@ -1045,6 +1084,14 @@ impl Links {
                  introduction an open offer needs and their answers; the device links fully \
                  once this device holds its namespace"
             ),
+            Some(Enrollment::Departure(marks)) => tracing::info!(
+                target: "face.quic",
+                face = face.0,
+                "admitted {peer} on a departure link: it was let go of {}, and the link carries \
+                 only the members record that says so and the names that validate it, then \
+                 closes",
+                crate::admission::list(&marks.iter().map(|d| d.folder.clone()).collect::<Vec<_>>())
+            ),
             None => {}
         }
         if peer_enrollment.is_empty() {
@@ -1082,6 +1129,9 @@ impl Links {
         id: PeerId,
         peer: &PeerSpec,
     ) -> Result<LinkHandle, NotLinked> {
+        if !self.is_online() {
+            return Err(NotLinked::offline());
+        }
         let mut last = NotLinked::from(LinkError::Connect(format!(
             "{} has no endpoint",
             peer.label
@@ -1293,6 +1343,14 @@ pub(crate) struct NotLinked {
 }
 
 impl NotLinked {
+    /// No attempt was made: this device is offline.
+    pub(crate) fn offline() -> Self {
+        Self {
+            error: LinkError::Connect(crate::online::WENT_OFFLINE.into()),
+            detail: crate::online::offline_detail(),
+        }
+    }
+
     /// This device refused the link with `reason`, saying `why` (already
     /// told to the other device).
     pub(crate) fn refused_here(reason: CloseReason, why: LinkDetail) -> Self {
@@ -1338,6 +1396,20 @@ pub(crate) async fn dial_loop(links: Weak<Links>, id: PeerId, ctl: Arc<PeerCtl>)
         };
         let one_shot = !peer.persistent && peer.mode == LinkMode::Always;
 
+        // Offline: no link, no attempt; the loop waits for the device to be
+        // online again and then dials at once.
+        if !this.is_online() {
+            this.watch_next(id, Next::WhenOnline);
+            let online = this.online.subscribe();
+            drop(this);
+            if !crate::online::wait_online(online, &cancel).await {
+                return;
+            }
+            backoff.reset();
+            ctl.take_kick();
+            continue;
+        }
+
         // Linked (dialled, or the other device dialled this one): keep it
         // while it is wanted.
         if let Some(handle) = this.table.link_to(id) {
@@ -1361,9 +1433,14 @@ pub(crate) async fn dial_loop(links: Weak<Links>, id: PeerId, ctl: Arc<PeerCtl>)
                 this.reselect_relays();
             }
             let wanted = this.wants_link(id, &peer, &ctl);
+            let offline = !this.is_online();
             drop(this);
             if cancel.is_cancelled() {
                 return;
+            }
+            if offline {
+                // Closed for going offline: the top of the loop waits.
+                continue;
             }
             if !closed_here && !relink_once(&links, id) && one_shot {
                 decided(&links, id, Next::Gone);
@@ -1402,7 +1479,13 @@ pub(crate) async fn dial_loop(links: Weak<Links>, id: PeerId, ctl: Arc<PeerCtl>)
             continue;
         }
 
+        let turn = if ctl.take_staggered() {
+            this.dial_turn().await
+        } else {
+            None
+        };
         let attempt = this.dial_once(id, &peer).await;
+        drop(turn);
         let wait = match attempt {
             Ok(_) => {
                 ctl.dialled(None);

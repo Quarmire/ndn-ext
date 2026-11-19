@@ -1,4 +1,4 @@
-//! Grants: the one person an introduction admitted links here, under the
+//! Grants: the people an introduction admitted links here, under the
 //! default serving policy (`ndn-rs/docs/specs/ndn-link.md` §8.7).
 //!
 //! A [`Grant`] says: the device holding link key `key` may link here, as a
@@ -12,6 +12,15 @@
 //! under a grant carries only the names of the folder, of the person's own
 //! devices and of the introduction (`Introductions::grant_carries`): not
 //! everything this device serves by name.
+//!
+//! A key holds a **set of entries**, one per folder (a person invited into
+//! two folders has two). The link a grant admits is tagged with the key and
+//! stands while any entry of the key is live; what it carries and what the
+//! peer may push are judged at every packet against the entries live then,
+//! so a role change or an entry's end takes effect at the next packet, with
+//! no close. When the last entry ends by a members record that left the
+//! person out, the link narrows in place to the departure
+//! (`departures.rs`, §8.8); otherwise it closes.
 //!
 //! The grants are a live table in memory by key; the host owns them (the
 //! data layer's device re-derives them at start from signed, durable data
@@ -36,6 +45,8 @@ use parking_lot::Mutex;
 use tokio::sync::Notify;
 
 use crate::admission::{Identity, Judge, Refusal, is_key_or_certificate_name, list as list_of};
+use crate::departures::Departure;
+use crate::introduce::Introductions;
 use crate::links::Links;
 use crate::serving::{QuotaSlot, Quotas, ServePolicy};
 
@@ -60,7 +71,9 @@ impl GrantRole {
 }
 
 /// The device holding link key `key` may link here as a person of
-/// `namespaces`, in the scope of `folder`, until `until`.
+/// `namespaces`, in the scope of `folder`, until `until`. One entry of the
+/// key's set: it is identified by `(key, folder)`, and granting the same key
+/// and folder again replaces it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Grant {
     /// The link key the person's device proves in the handshake.
@@ -74,6 +87,8 @@ pub struct Grant {
     /// device serves by name besides the person's own devices and the
     /// introduction ([`Introductions::grant_carries`]).
     pub folder: Name,
+    /// The role in this folder: what the person may push toward this device
+    /// under this folder's names, judged at every packet.
     pub role: GrantRole,
     /// `Some`: the grant ends then. `None`: it has no date of its own; it
     /// follows the members record of the folder, and its host ends it
@@ -97,17 +112,16 @@ impl Grant {
         )
     }
 
-    /// Whether `other` admits the same links: the same namespaces, folder
-    /// and role (its `until` may differ).
-    fn same_scope(&self, other: &Grant) -> bool {
-        self.role == other.role
-            && self.namespaces == other.namespaces
-            && self.folder == other.folder
-    }
-
     /// Whether the grant has run out by `now`.
     fn over(&self, now: SystemTime) -> bool {
         self.until.is_some_and(|until| until <= now)
+    }
+
+    /// Whether this entry's namespaces include one of `identities`'.
+    fn admits_any(&self, identities: &[Identity]) -> bool {
+        identities
+            .iter()
+            .any(|id| self.namespaces.contains(&id.namespace))
     }
 }
 
@@ -116,7 +130,7 @@ impl Grant {
 enum How {
     Expired,
     Revoked,
-    /// Replaced by a grant of other namespaces or another role.
+    /// Replaced by a grant of other namespaces.
     Replaced,
 }
 
@@ -137,22 +151,33 @@ impl How {
                 "it was revoked: this device withdrew it, as it does when the members record of the \
                  folder no longer lists you"
             }
-            Self::Replaced => "it was replaced by a grant of other namespaces or another role",
+            Self::Replaced => "it was replaced by a grant of other namespaces",
+        }
+    }
+
+    fn ended(self, grant: &Grant) -> EndedGrant {
+        EndedGrant {
+            key: grant.key,
+            namespaces: grant.namespaces.clone(),
+            folder: grant.folder.clone(),
+            until: grant.until,
+            how: self,
         }
     }
 }
 
-/// A grant that ended: what is left of it to name in a refusal.
+/// A grant entry that ended: what is left of it to name in a refusal.
 #[derive(Clone, Debug)]
-struct EndedGrant {
+pub(crate) struct EndedGrant {
     key: KeyFingerprint,
     namespaces: Vec<Name>,
+    folder: Name,
     until: Option<SystemTime>,
     how: How,
 }
 
 impl EndedGrant {
-    fn detail(&self) -> LinkDetail {
+    pub(crate) fn detail(&self) -> LinkDetail {
         let until = match self.until {
             Some(until) => format!("until {}", utc(until)),
             None => "with no end date".to_string(),
@@ -160,22 +185,24 @@ impl EndedGrant {
         LinkDetail::new(
             code::GRANT_ENDED,
             format!(
-                "your key {} was granted a link here as a person of {}, {until}, and the grant ended: \
-                 {}. Ask the person who invited you to invite you again",
+                "your key {} was granted a link here as a person of {}, {until}, in the folder {}, \
+                 and the grant ended: {}. Ask the person who invited you to invite you again",
                 self.key,
                 list_of(&self.namespaces),
+                self.folder,
                 self.how.words()
             ),
         )
         .with("key", self.key)
         .with("namespaces", list_of(&self.namespaces))
+        .with("folder", &self.folder)
         .with("until", self.until.map_or_else(|| "none".to_string(), utc))
         .with("ended", self.how.as_str())
     }
 }
 
-/// How many ended grants are remembered to name in refusals: the oldest are
-/// forgotten.
+/// How many ended grant entries are remembered to name in refusals: the
+/// oldest are forgotten.
 const ENDED_MAX: usize = 64;
 
 /// The longest the expiry task sleeps at once. The sleep runs on the monotonic
@@ -187,22 +214,59 @@ const SLEEP_MAX: Duration = Duration::from_secs(60);
 
 #[derive(Default)]
 struct State {
-    live: HashMap<KeyFingerprint, Grant>,
+    /// Each key's entries, sorted by folder. A key with none has no entry
+    /// here. Replaced whole on every change, so a reader holds a snapshot
+    /// with no lock.
+    live: HashMap<KeyFingerprint, Arc<[Grant]>>,
+    /// The entries that ended, oldest first.
     ended: VecDeque<EndedGrant>,
 }
 
 impl State {
     fn end(&mut self, grant: &Grant, how: How) {
-        self.ended.retain(|e| e.key != grant.key);
+        self.ended
+            .retain(|e| !(e.key == grant.key && e.folder == grant.folder));
         if self.ended.len() == ENDED_MAX {
             self.ended.pop_front();
         }
-        self.ended.push_back(EndedGrant {
-            key: grant.key,
-            namespaces: grant.namespaces.clone(),
-            until: grant.until,
-            how,
-        });
+        self.ended.push_back(how.ended(grant));
+    }
+
+    /// Adds `grant` or replaces the entry of its key and folder; the entry
+    /// it replaced.
+    fn put(&mut self, grant: Grant) -> Option<Grant> {
+        self.ended
+            .retain(|e| !(e.key == grant.key && e.folder == grant.folder));
+        let mut entries: Vec<Grant> = self
+            .live
+            .remove(&grant.key)
+            .map(|e| e.to_vec())
+            .unwrap_or_default();
+        let previous = match entries.iter().position(|g| g.folder == grant.folder) {
+            Some(at) => Some(std::mem::replace(&mut entries[at], grant.clone())),
+            None => {
+                entries.push(grant.clone());
+                None
+            }
+        };
+        entries.sort_by(|a, b| a.folder.cmp(&b.folder));
+        self.live.insert(grant.key, entries.into());
+        previous
+    }
+
+    /// Removes the entry of `key` for `folder`; the entry removed.
+    fn remove(&mut self, key: &KeyFingerprint, folder: &Name) -> Option<Grant> {
+        let entries = self.live.remove(key)?;
+        let removed = entries.iter().find(|g| g.folder == *folder).cloned();
+        let kept: Vec<Grant> = entries
+            .iter()
+            .filter(|g| g.folder != *folder)
+            .cloned()
+            .collect();
+        if !kept.is_empty() {
+            self.live.insert(*key, kept.into());
+        }
+        removed
     }
 }
 
@@ -221,110 +285,132 @@ pub(crate) struct Grants {
 
 /// What the table says of a key.
 pub(crate) enum Lookup {
-    Live(Grant),
+    /// The entries in force, never empty, sorted by folder.
+    Live(Arc<[Grant]>),
     Ended(LinkDetail),
     None,
 }
 
 impl Grants {
-    /// A grant in force, for the judge's tests (the table without a `Links`).
+    /// An entry in force, for the judge's tests (the table without a
+    /// `Links`).
     #[cfg(test)]
     pub(crate) fn put(&self, grant: Grant) {
-        self.inner.state.lock().live.insert(grant.key, grant);
+        self.inner.state.lock().put(grant);
     }
 
-    /// The grant of `key` now: live while it has not run out (the expiry
-    /// task may not have swept it yet), else what is known of its end.
+    /// Ends the entry of `key` for `folder` as a revoke does, for the judge's
+    /// tests; the entry ended.
+    #[cfg(test)]
+    pub(crate) fn take(&self, key: &KeyFingerprint, folder: &Name) -> Option<Grant> {
+        let mut state = self.inner.state.lock();
+        let grant = state.remove(key, folder)?;
+        state.end(&grant, How::Revoked);
+        Some(grant)
+    }
+
+    /// The entries of `key` now: live while they have not run out (the expiry
+    /// task may not have swept them yet), else what is known of the end of
+    /// the one that ended last.
     pub(crate) fn lookup(&self, key: &KeyFingerprint, now: SystemTime) -> Lookup {
         let state = self.inner.state.lock();
-        if let Some(grant) = state.live.get(key) {
-            if !grant.over(now) {
-                return Lookup::Live(grant.clone());
+        if let Some(entries) = state.live.get(key) {
+            let live = entries.iter().filter(|g| !g.over(now)).count();
+            if live == entries.len() {
+                return Lookup::Live(Arc::clone(entries));
             }
-            return Lookup::Ended(How::Expired.ended(grant).detail());
+            if live > 0 {
+                let kept: Vec<Grant> = entries.iter().filter(|g| !g.over(now)).cloned().collect();
+                return Lookup::Live(kept.into());
+            }
+            let last = entries.iter().max_by_key(|g| g.until).expect("entries");
+            return Lookup::Ended(How::Expired.ended(last).detail());
         }
-        match state.ended.iter().find(|e| e.key == *key) {
+        match state.ended.iter().rev().find(|e| e.key == *key) {
             Some(e) => Lookup::Ended(e.detail()),
             None => Lookup::None,
         }
     }
 
-    /// The live grant of `key`, if it has not run out.
-    pub(crate) fn live(&self, key: &KeyFingerprint) -> Option<Grant> {
-        match self.lookup(key, SystemTime::now()) {
-            Lookup::Live(g) => Some(g),
-            _ => None,
+    /// The entries of `key` in force at `now`: a snapshot, empty when there
+    /// are none. It takes no copy of the entries when none ran out, so the
+    /// names a grant link carries can be judged with it at every packet.
+    pub(crate) fn live_entries(&self, key: &KeyFingerprint, now: SystemTime) -> Arc<[Grant]> {
+        match self.lookup(key, now) {
+            Lookup::Live(entries) => entries,
+            _ => Arc::from([]),
         }
     }
 
-    /// Whether the table still holds `admitted` as it was when a link was
-    /// admitted by it: live now, with the same namespaces, folder and role.
-    /// Judged on the wall clock at each call, so it never lags the expiry
-    /// task. It copies nothing: the names a grant link carries are judged
-    /// with it at every packet.
-    pub(crate) fn stands(&self, admitted: &Grant) -> bool {
-        let now = SystemTime::now();
-        self.inner
-            .state
-            .lock()
-            .live
-            .get(&admitted.key)
-            .is_some_and(|g| !g.over(now) && g.same_scope(admitted))
+    /// Whether `key` has an entry in force now.
+    pub(crate) fn has_live(&self, key: &KeyFingerprint, now: SystemTime) -> bool {
+        matches!(self.lookup(key, now), Lookup::Live(_))
     }
 
-    /// `None` while the table still holds `admitted` ([`Self::stands`]);
-    /// else what ended it, to say to the person whose link it was.
-    pub(crate) fn ended_since(&self, admitted: &Grant) -> Option<LinkDetail> {
+    /// `None` while the table still holds an entry of `admitted`'s key that
+    /// admits one of the link's `identities`; else what ended it, to say to
+    /// the person whose link it was.
+    pub(crate) fn ended_since(
+        &self,
+        admitted: &Grant,
+        identities: &[Identity],
+    ) -> Option<LinkDetail> {
         let now = SystemTime::now();
         match self.lookup(&admitted.key, now) {
-            Lookup::Live(g) if g.same_scope(admitted) => None,
+            Lookup::Live(entries) if entries.iter().any(|g| g.admits_any(identities)) => None,
             Lookup::Live(_) => Some(How::Replaced.ended(admitted).detail()),
             Lookup::Ended(detail) => Some(detail),
             Lookup::None => Some(How::Revoked.ended(admitted).detail()),
         }
     }
 
-    /// The grants in force now.
+    /// The entries in force now, sorted by key then folder.
     fn list(&self) -> Vec<Grant> {
         let now = SystemTime::now();
         let state = self.inner.state.lock();
         let mut grants: Vec<Grant> = state
             .live
             .values()
+            .flat_map(|entries| entries.iter())
             .filter(|g| !g.over(now))
             .cloned()
             .collect();
-        grants.sort_by_key(|g| g.key);
+        grants.sort_by(|a, b| (a.key, &a.folder).cmp(&(b.key, &b.folder)));
         grants
     }
 
-    /// The earliest `until` of the live grants that have one.
+    /// The earliest `until` of the live entries that have one.
     fn next_until(&self) -> Option<SystemTime> {
         self.inner
             .state
             .lock()
             .live
             .values()
+            .flat_map(|entries| entries.iter())
             .filter_map(|g| g.until)
             .min()
     }
 
-    /// The grants that ran out by `now`, ended.
-    fn take_due(&self, now: SystemTime) -> Vec<Grant> {
+    /// The entries that ran out by `now`, ended: each with whether it was
+    /// the last entry of its key (the key has none left).
+    fn take_due(&self, now: SystemTime) -> Vec<(Grant, bool)> {
         let mut state = self.inner.state.lock();
-        let due: Vec<KeyFingerprint> = state
+        let due: Vec<Grant> = state
             .live
             .values()
+            .flat_map(|entries| entries.iter())
             .filter(|g| g.over(now))
-            .map(|g| g.key)
+            .cloned()
             .collect();
-        due.into_iter()
-            .filter_map(|key| {
-                let grant = state.live.remove(&key)?;
+        let mut taken = Vec::with_capacity(due.len());
+        for grant in due {
+            if state.remove(&grant.key, &grant.folder).is_some() {
                 state.end(&grant, How::Expired);
-                Some(grant)
-            })
-            .collect()
+                let last = !state.live.contains_key(&grant.key);
+                taken.push((grant, last));
+            }
+        }
+        taken
     }
 }
 
@@ -360,81 +446,160 @@ impl Links {
                     () = sleep => {}
                 }
                 let Some(links) = weak.upgrade() else { return };
-                for grant in links.grants.take_due(SystemTime::now()) {
-                    links.close_granted(&grant.key, How::Expired.ended(&grant));
+                for (grant, last) in links.grants.take_due(SystemTime::now()) {
+                    if last {
+                        links.grant_ended_last(&grant.key, How::Expired.ended(&grant), false);
+                    }
                 }
             }
         });
     }
 
-    /// Grants the device holding `grant.key` a link here as a person of
-    /// `grant.namespaces`, in the scope of `grant.folder`, until
-    /// `grant.until` (replacing an earlier grant of the same key). A grant
-    /// never serves what the serving policy's quotas, the namespace's link
-    /// policy or a revocation refuse, and under `serve = open` it adds
-    /// nothing. A link the earlier grant admitted stays when only `until`
-    /// changed; with other namespaces, folder or role it is closed (the
-    /// device dials again and is judged by the new one).
+    /// Adds the entry for `grant.folder` to the grants of `grant.key`, or
+    /// replaces the entry of the same key and folder: the device holding the
+    /// key may link here as a person of `grant.namespaces`, in the scope of
+    /// `grant.folder`, in `grant.role`, until `grant.until`. A grant never
+    /// serves what the serving policy's quotas, the namespace's link policy
+    /// or a revocation refuse, and under `serve = open` it adds nothing. It
+    /// closes no link while another entry of the key stands: a link the key's
+    /// entries admitted stays, whatever the entry replaced listed, until no
+    /// entry admits any identity it was admitted by (the device dials again
+    /// and is judged by the entries then).
     pub fn grant(&self, grant: Grant) {
         let key = grant.key;
         let now = SystemTime::now();
-        let previous = {
+        let replaced = {
             let mut state = self.grants.inner.state.lock();
-            state.ended.retain(|e| e.key != key);
+            state
+                .ended
+                .retain(|e| !(e.key == key && e.folder == grant.folder));
             if grant.over(now) {
                 // Granted already over: it ends what it replaces.
-                let previous = state.live.remove(&key);
+                let previous = state.remove(&key, &grant.folder);
                 state.end(&grant, How::Expired);
-                previous.map(|p| (p, How::Expired))
+                previous.map(|p| (p, How::Expired, !state.live.contains_key(&key)))
             } else {
-                let previous = state.live.insert(key, grant.clone());
+                let previous = state.put(grant.clone());
                 previous
-                    .filter(|p| !p.same_scope(&grant))
-                    .map(|p| (p, How::Replaced))
+                    .filter(|p| p.namespaces != grant.namespaces)
+                    .map(|p| (p, How::Replaced, false))
             }
         };
         self.grants.inner.wake.notify_one();
-        if let Some((previous, how)) = previous {
-            self.close_granted(&key, how.ended(&previous));
+        if !grant.over(now) {
+            // The person is invited into the folder again: the departure of
+            // an earlier record no longer describes them.
+            self.departures.remove(&key, &grant.folder);
+        }
+        match replaced {
+            Some((previous, How::Expired, true)) => {
+                self.grant_ended_last(&key, How::Expired.ended(&previous), false);
+            }
+            Some((previous, How::Replaced, _)) => {
+                let entries = self.grants.live_entries(&key, now);
+                self.close_granted_where(&key, &How::Replaced.ended(&previous), |ids| {
+                    !entries.iter().any(|e| e.admits_any(ids))
+                });
+            }
+            _ => {}
         }
     }
 
-    /// Ends the grant of `key` now, and closes the links it alone admitted
-    /// ([`CloseReason::NotServed`], saying what ended and what to do).
-    /// `true` when one was in force.
-    pub fn revoke_grant(&self, key: &KeyFingerprint) -> bool {
-        let grant = {
+    /// Ends the entry of `key` for `folder` now. The links the key's entries
+    /// admitted close when this was its last entry
+    /// ([`CloseReason::NotServed`], saying what ended and what to do), or
+    /// narrow in place to the departure when a mark of this folder is held
+    /// ([`Links::depart`], §8.8). `true` when an entry was in force.
+    pub fn revoke_grant(&self, key: &KeyFingerprint, folder: &Name) -> bool {
+        let (grant, last) = {
             let mut state = self.grants.inner.state.lock();
-            let Some(grant) = state.live.remove(key) else {
+            let Some(grant) = state.remove(key, folder) else {
                 return false;
             };
             state.end(&grant, How::Revoked);
-            grant
+            let last = !state.live.contains_key(key);
+            (grant, last)
         };
         self.grants.inner.wake.notify_one();
-        self.close_granted(key, How::Revoked.ended(&grant));
+        let departing = self
+            .departures
+            .has_mark(key, &grant.folder, SystemTime::now());
+        if last {
+            self.grant_ended_last(key, How::Revoked.ended(&grant), departing);
+        } else if departing {
+            // Other entries keep the link: it does not narrow, but the person
+            // is told which record lets them go of this folder, which the
+            // link carries beside what the other entries do (§8.8).
+            self.tell_ended_entry(key, &grant.folder);
+        }
         true
     }
 
-    /// The grants in force now.
+    /// Ends every entry of `key` now (the host ends the person: no departure
+    /// is told, the person was not let go by a record). The links the entries
+    /// admitted close. `true` when an entry was in force.
+    pub fn revoke_grants(&self, key: &KeyFingerprint) -> bool {
+        let ended = {
+            let mut state = self.grants.inner.state.lock();
+            let Some(entries) = state.live.remove(key) else {
+                return false;
+            };
+            for grant in entries.iter() {
+                state.end(grant, How::Revoked);
+            }
+            entries.last().map(|g| How::Revoked.ended(g))
+        };
+        self.grants.inner.wake.notify_one();
+        if let Some(ended) = ended {
+            self.grant_ended_last(key, ended, false);
+        }
+        true
+    }
+
+    /// The grant entries in force now, sorted by key then folder.
     pub fn grants(&self) -> Vec<Grant> {
         self.grants.list()
     }
 
-    /// The grant that admitted the link of `key`, as it stands now (the live
-    /// grant, else the one the link was admitted by), for the report.
+    /// The first entry of the grants that admitted the link of `key`, as it
+    /// stands now (the live entry, else the one the link was admitted by),
+    /// for the report.
     pub(crate) fn grant_of_link(&self, admitted_by: &Grant) -> Grant {
         self.grants
-            .live(&admitted_by.key)
+            .live_entries(&admitted_by.key, SystemTime::now())
+            .first()
+            .cloned()
             .unwrap_or_else(|| admitted_by.clone())
     }
 
-    /// Closes the links of `key` that only a grant admitted.
-    fn close_granted(&self, key: &KeyFingerprint, ended: EndedGrant) {
+    /// The last entry of `key` ended (`ended` is the one ended last): the
+    /// links it admitted narrow to the departure when `departing` (a held
+    /// record left the person out and a mark of the folder is held) and
+    /// there is one to tell, else they close.
+    pub(crate) fn grant_ended_last(
+        &self,
+        key: &KeyFingerprint,
+        ended: EndedGrant,
+        departing: bool,
+    ) {
+        if departing && self.narrow_granted(key) {
+            return;
+        }
+        self.close_granted_where(key, &ended, |_| true);
+    }
+
+    /// Closes the links of `key` that only a grant admitted and `closes`
+    /// says no entry admits any more.
+    fn close_granted_where(
+        &self,
+        key: &KeyFingerprint,
+        ended: &EndedGrant,
+        closes: impl Fn(&[Identity]) -> bool,
+    ) {
         let detail = ended.detail();
         let closed = self
             .table
-            .close_granted(key, CloseReason::NotServed, &detail.text);
+            .close_granted(key, CloseReason::NotServed, &detail.text, closes);
         if closed {
             tracing::warn!(
                 target: "face.quic",
@@ -446,22 +611,14 @@ impl Links {
     }
 }
 
-impl How {
-    fn ended(self, grant: &Grant) -> EndedGrant {
-        EndedGrant {
-            key: grant.key,
-            namespaces: grant.namespaces.clone(),
-            until: grant.until,
-            how: self,
-        }
-    }
-}
-
 /// What the grants make of a link the serving policy declined.
 pub(crate) enum GrantOutcome {
-    /// Admitted: the identities the grant admits, each with its quota slot,
-    /// and the grant.
+    /// Admitted: the identities the entries admit, each with its quota slot,
+    /// and the first entry that admits one.
     Admitted(Vec<(Identity, QuotaSlot)>, Grant),
+    /// No entry stands, but marks of the key do: admitted as a departure
+    /// link, telling the person of these.
+    Departing(Vec<Departure>),
     /// The grant matched and the quotas (or a name collision) refuse.
     Refused(Refusal),
     /// No grant admits it; what is worth telling the refused device about
@@ -472,10 +629,11 @@ pub(crate) enum GrantOutcome {
 impl Judge<'_> {
     /// Consulted where the serving policy served none of the identities of
     /// `fingerprint` (`declined`: those its policy declined — not the ones
-    /// refused for quotas or a name collision): a live grant of the key
-    /// admits the identities in the namespaces it lists, if they validate in
+    /// refused for quotas or a name collision): the live entries of the key
+    /// admit the identities in the namespaces they list, if they validate in
     /// a namespace this device holds (never one served by a root it does not
-    /// hold). Under `open` it adds nothing.
+    /// hold). With no live entry the marks of the key (§8.8) may admit it on
+    /// a departure link. Under `open` it adds nothing.
     pub(crate) fn grant_for(
         &self,
         fingerprint: KeyFingerprint,
@@ -484,17 +642,41 @@ impl Judge<'_> {
         if matches!(self.serve, ServePolicy::Open { .. }) {
             return GrantOutcome::No(None);
         }
-        let grant = match self.grants.lookup(&fingerprint, SystemTime::now()) {
-            Lookup::None => return GrantOutcome::No(None),
-            Lookup::Ended(detail) => return GrantOutcome::No(Some(detail)),
-            Lookup::Live(grant) => grant,
+        let now = SystemTime::now();
+        let entries = match self.grants.lookup(&fingerprint, now) {
+            Lookup::Live(entries) => entries,
+            other => {
+                // Not live. A mark of the key may admit its held identities
+                // on the narrow link; failing that the refusal is the one a
+                // key whose grant ended with no mark gets.
+                let namespaces: Vec<Name> = declined
+                    .iter()
+                    .filter(|id| id.served.is_none())
+                    .map(|id| id.namespace.clone())
+                    .collect();
+                if let Some(marks) = self.departures.admit(&fingerprint, &namespaces, now) {
+                    return GrantOutcome::Departing(marks);
+                }
+                return match other {
+                    Lookup::Ended(detail) => GrantOutcome::No(Some(detail)),
+                    _ => GrantOutcome::No(None),
+                };
+            }
         };
         let matching: Vec<&Identity> = declined
             .iter()
-            .filter(|id| id.served.is_none() && grant.namespaces.contains(&id.namespace))
+            .filter(|id| {
+                id.served.is_none() && entries.iter().any(|e| e.namespaces.contains(&id.namespace))
+            })
             .collect();
         if matching.is_empty() {
             let shown: Vec<Name> = declined.iter().map(|id| id.namespace.clone()).collect();
+            let mut listed: Vec<Name> = entries
+                .iter()
+                .flat_map(|e| e.namespaces.iter().cloned())
+                .collect();
+            listed.sort();
+            listed.dedup();
             return GrantOutcome::No(Some(
                 LinkDetail::new(
                     code::GRANT_UNMATCHED,
@@ -502,7 +684,7 @@ impl Judge<'_> {
                         "your key {fingerprint} is granted a link here as a person of {}, and the \
                          certificates you showed are of {}: link with the certificate of one the \
                          grant lists",
-                        list_of(&grant.namespaces),
+                        list_of(&listed),
                         if shown.is_empty() {
                             "no namespace this device holds".to_string()
                         } else {
@@ -511,7 +693,7 @@ impl Judge<'_> {
                     ),
                 )
                 .with("key", fingerprint)
-                .with("namespaces", list_of(&grant.namespaces))
+                .with("namespaces", list_of(&listed))
                 .with("shown", list_of(&shown)),
             ));
         }
@@ -522,6 +704,11 @@ impl Judge<'_> {
             } => *quotas,
             _ => Quotas::default(),
         };
+        let tag = entries
+            .iter()
+            .find(|e| e.admits_any(std::slice::from_ref(matching[0])))
+            .expect("an entry admits the first matching identity")
+            .clone();
         let mut admitted = Vec::with_capacity(matching.len());
         for id in matching {
             // The held context's first anchor (by fingerprint order), as an
@@ -537,47 +724,90 @@ impl Judge<'_> {
         if admitted.is_empty() {
             return GrantOutcome::No(None);
         }
-        GrantOutcome::Admitted(admitted, grant)
+        GrantOutcome::Admitted(admitted, tag)
     }
 }
 
+/// Whether `entry` carries `name` (§8.7 rule 5): the sync groups, trust
+/// contexts and key and certificate names of its namespaces and of its
+/// folder's (public by design: a hello already carries the chain, and the
+/// group carries no data) and of the other writers' namespaces its folder's
+/// record lists; what this device's introductions serve
+/// ([`Introductions::carries`]: a person may ask again); and the names of the
+/// folder's collections as the data layer names them
+/// ([`Introductions::grant_carries`]). A device with no data layer carries
+/// the first kind only.
+fn entry_carries(surface: Option<&Arc<dyn Introductions>>, entry: &Grant, name: &Name) -> bool {
+    entry
+        .namespaces
+        .iter()
+        .any(|ns| public_name(ns, name))
+        || folder_namespace(&entry.folder)
+            .is_some_and(|ns| !entry.namespaces.contains(&ns) && public_name(&ns, name))
+        || surface.is_some_and(|s| s.carries(name) || s.grant_carries(&entry.folder, name))
+        // The sync groups, trust contexts and key and certificate names of
+        // the other writers' namespaces the record in force lists, so the
+        // person's device can validate what those writers wrote (live, per
+        // packet: a writer the record drops is out at the next).
+        || surface.is_some_and(|s| {
+            s.writer_namespaces(&entry.folder)
+                .iter()
+                .any(|w| public_name(w, name))
+        })
+}
+
 impl Judge<'_> {
-    /// The names the link of `grant` carries, judged at every packet in both
-    /// directions (§8.7 rule 5): only
+    /// The names the link of the person holding `key` carries, judged at
+    /// every packet in both directions (§8.7 rule 5) against the entries
+    /// live then: only
     ///
     /// - the names under the person's own devices (`own`);
-    /// - the sync groups, trust contexts and key and certificate names of
-    ///   the grant's namespaces and of the folder's (public by design: a
-    ///   hello already carries the chain, and the group carries no data);
-    /// - what this device's introductions serve
-    ///   ([`Introductions::carries`](crate::Introductions::carries): a
-    ///   person may ask again); and
-    /// - the names of the folder's collections as the data layer names them
-    ///   ([`Introductions::grant_carries`](crate::Introductions::grant_carries)).
+    /// - what any live entry carries ([`entry_carries`]): the public names of
+    ///   its namespaces and its folder's, the introduction, and its folder's
+    ///   collections.
     ///
     /// Nothing else this device serves by name crosses, so an unsealed
-    /// collection outside the folder is not answered. Judged against the
-    /// live table at each packet, a grant that ended carries nothing from
-    /// that instant, whether or not its link has been closed yet. A device
-    /// with no data layer (no [`Introductions`](crate::Introductions) given)
-    /// carries the first three kinds and no folder.
-    pub(crate) fn grant_names(&self, grant: &Grant, own: Vec<Name>) -> NameFilter {
+    /// collection outside the folders is not answered. The record of a mark
+    /// of the key (a folder the person was let go of while other entries
+    /// stand) is carried beside them; with **no** entry live a link the
+    /// key's entries admitted carries the departure only
+    /// (`Departures::carried_by`, §8.8) whether or not it has been narrowed
+    /// or closed yet: a grant that ended carries nothing else from that
+    /// instant.
+    pub(crate) fn grant_names(&self, key: KeyFingerprint, own: Vec<Name>) -> NameFilter {
         let table = self.grants.clone();
-        let admitted = grant.clone();
+        let departures = self.departures.clone();
         let surface = self.introductions.clone();
-        let mut namespaces = grant.namespaces.clone();
-        if let Some(ns) = folder_namespace(&grant.folder)
-            && !namespaces.contains(&ns)
-        {
-            namespaces.push(ns);
-        }
         Box::new(move |name: &Name| {
-            table.stands(&admitted)
-                && (own.iter().any(|d| name.has_prefix(d))
-                    || namespaces.iter().any(|ns| public_name(ns, name))
-                    || surface.as_ref().is_some_and(|s| {
-                        s.carries(name) || s.grant_carries(&admitted.folder, name)
-                    }))
+            let now = SystemTime::now();
+            let entries = table.live_entries(&key, now);
+            if entries.is_empty() {
+                return departures.carried_by(&key, name, surface.as_ref(), now);
+            }
+            own.iter().any(|d| name.has_prefix(d))
+                || entries
+                    .iter()
+                    .any(|e| entry_carries(surface.as_ref(), e, name))
+                // The record that lets the person go of a folder whose entry
+                // ended while another stands (§8.8): the person is told which
+                // to fetch.
+                || departures.carried_by(&key, name, surface.as_ref(), now)
+        })
+    }
+
+    /// What the person holding `key` may push toward this device: Data under
+    /// its own devices, or under the carried names of a live entry whose
+    /// role is [`GrantRole::Writer`], judged at every packet. A reader entry
+    /// widens nothing; a person who writes in one folder and reads in
+    /// another pushes under the first folder's names only.
+    pub(crate) fn grant_pushes(&self, key: KeyFingerprint, own: Vec<Name>) -> NameFilter {
+        let table = self.grants.clone();
+        let surface = self.introductions.clone();
+        Box::new(move |name: &Name| {
+            own.iter().any(|d| name.has_prefix(d))
+                || table.live_entries(&key, SystemTime::now()).iter().any(|e| {
+                    e.role == GrantRole::Writer && entry_carries(surface.as_ref(), e, name)
+                })
         })
     }
 }
@@ -585,7 +815,7 @@ impl Judge<'_> {
 /// The namespace of a folder name `<O>/32=data[/<path>]`: the components
 /// before its `32=data` marker (data-layer.md §3); `None` for a name with
 /// none or nothing before it.
-fn folder_namespace(folder: &Name) -> Option<Name> {
+pub(crate) fn folder_namespace(folder: &Name) -> Option<Name> {
     let at = folder
         .components()
         .iter()
@@ -684,34 +914,160 @@ mod tests {
         assert!(table.take_due(at).is_empty(), "a grant ended twice");
     }
 
-    /// A link is checked against the grant that admitted it: still the same
-    /// scope, or what ended it.
+    /// The table holds entries per (key, folder): adding another folder keeps
+    /// the first, and the same folder again replaces its entry only.
     #[test]
-    fn a_link_stands_while_its_grant_does_and_says_what_ended_it() {
+    fn a_key_holds_one_entry_per_folder() {
         let table = Grants::default();
+        table.put(grant(None));
+        let mut other = grant(None);
+        other.folder = "/alice/32=data/diary".parse().unwrap();
+        other.role = GrantRole::Reader;
+        table.put(other.clone());
+        assert_eq!(table.list().len(), 2);
+        let mut changed = grant(None);
+        changed.role = GrantRole::Reader;
+        table.put(changed.clone());
+        let listed = table.list();
+        assert_eq!(listed.len(), 2, "replaced in place, not added");
+        assert!(listed.contains(&changed) && listed.contains(&other));
+        // Sorted by key then folder.
+        assert!(listed[0].folder < listed[1].folder);
+    }
+
+    /// The identity of a device of `ns`, as a link a grant admitted holds it.
+    fn identity(ns: &str) -> Identity {
+        Identity {
+            namespace: ns.parse().unwrap(),
+            version: 1,
+            device: format!("{ns}/member/phone").parse().unwrap(),
+            role: ndn_cert::roles::Role::Member,
+            certificates: Vec::new(),
+            served: None,
+        }
+    }
+
+    /// A link is checked against the entries of its key: it stands while one
+    /// of them admits an identity it was admitted by, and says what ended
+    /// it when none does.
+    #[test]
+    fn a_link_stands_while_an_entry_of_its_key_does_and_says_what_ended_it() {
+        let table = Grants::default();
+        let ids = [identity("/bob")];
         let admitted = grant(Some(SystemTime::now() + Duration::from_secs(3600)));
         table.put(admitted.clone());
-        assert!(table.stands(&admitted));
-        assert!(table.ended_since(&admitted).is_none());
+        assert!(table.has_live(&admitted.key, SystemTime::now()));
+        assert!(table.ended_since(&admitted, &ids).is_none());
 
-        // Replaced by another folder: not the grant the link was admitted by.
+        // Another folder is another entry: the first still stands, and the
+        // link it admitted stays.
         let mut other = admitted.clone();
         other.folder = "/alice/32=data/diary".parse().unwrap();
-        table.put(other);
-        assert!(!table.stands(&admitted));
-        let why = table.ended_since(&admitted).expect("replaced");
+        table.put(other.clone());
+        assert_eq!(
+            table.live_entries(&admitted.key, SystemTime::now()).len(),
+            2
+        );
+        assert!(table.ended_since(&admitted, &ids).is_none());
+
+        // The same folder with namespaces the link was not admitted in: no
+        // entry admits it any more.
+        let mut elsewhere = other.clone();
+        elsewhere.namespaces = vec!["/carol".parse().unwrap()];
+        assert!(table.take(&admitted.key, &admitted.folder).is_some());
+        table.put(elsewhere);
+        let why = table.ended_since(&admitted, &ids).expect("replaced");
         assert!(why.text.contains("replaced"), "{}", why.text);
 
         // Past its date: expired, whether or not the task has swept it.
+        let table = Grants::default();
         table.put(grant(Some(SystemTime::now() - Duration::from_secs(1))));
-        assert!(!table.stands(&admitted));
-        let why = table.ended_since(&admitted).expect("expired");
+        assert!(!table.has_live(&admitted.key, SystemTime::now()));
+        let why = table.ended_since(&admitted, &ids).expect("expired");
         assert!(why.text.contains("it expired"), "{}", why.text);
 
         // Gone from the table with nothing remembered: revoked.
         let empty = Grants::default();
-        let why = empty.ended_since(&admitted).expect("revoked");
+        let why = empty.ended_since(&admitted, &ids).expect("revoked");
         assert!(why.text.contains("revoked"), "{}", why.text);
+    }
+
+    /// Entries of one key end one by one: the refusal of the key names the
+    /// entry that ended last, the table remembers the last 64, and an entry
+    /// ending while another stands leaves the key live.
+    #[test]
+    fn entries_end_one_by_one_and_the_refusal_names_the_one_ended_last() {
+        let table = Grants::default();
+        let key = KeyFingerprint([5; 32]);
+        let notes: Name = "/alice/32=data/notes".parse().unwrap();
+        let diary: Name = "/alice/32=data/diary".parse().unwrap();
+        let hour = Some(SystemTime::now() + Duration::from_secs(3600));
+        table.put(grant(hour));
+        let mut second = grant(hour);
+        second.folder = diary.clone();
+        table.put(second);
+
+        assert!(table.take(&key, &notes).is_some());
+        assert!(
+            table.has_live(&key, SystemTime::now()),
+            "the diary entry stands"
+        );
+        assert!(table.take(&key, &diary).is_some());
+        let Lookup::Ended(detail) = table.lookup(&key, SystemTime::now()) else {
+            panic!("no entry stands")
+        };
+        assert_eq!(
+            detail.param("folder"),
+            Some(diary.to_string().as_str()),
+            "the entry ended last is named: {detail:?}"
+        );
+        assert_eq!(detail.param("ended"), Some("revoked"));
+        assert!(table.take(&key, &diary).is_none(), "ended twice");
+
+        // Granting a folder again drops its memory; the other stays.
+        table.put(grant(hour));
+        assert_eq!(table.list().len(), 1);
+
+        // The last 64 ended entries are remembered, per (key, folder).
+        let table = Grants::default();
+        for i in 0..70u8 {
+            let mut g = grant(hour);
+            g.key = KeyFingerprint([i; 32]);
+            table.put(g.clone());
+            table.take(&g.key, &g.folder);
+        }
+        let ended = table.inner.state.lock().ended.len();
+        assert_eq!(ended, ENDED_MAX);
+        assert!(matches!(
+            table.lookup(&KeyFingerprint([0; 32]), SystemTime::now()),
+            Lookup::None
+        ));
+        assert!(matches!(
+            table.lookup(&KeyFingerprint([69; 32]), SystemTime::now()),
+            Lookup::Ended(_)
+        ));
+    }
+
+    /// Entries run out one by one at their own dates, and the expiry task
+    /// treats the key's last as the end of the person.
+    #[test]
+    fn due_entries_are_taken_each_and_the_last_of_a_key_is_marked() {
+        let table = Grants::default();
+        let now = SystemTime::now();
+        let soon = now + Duration::from_secs(10);
+        let later = now + Duration::from_secs(20);
+        table.put(grant(Some(soon)));
+        let mut second = grant(Some(later));
+        second.folder = "/alice/32=data/diary".parse().unwrap();
+        table.put(second);
+        assert_eq!(table.next_until(), Some(soon));
+        let first = table.take_due(soon);
+        assert_eq!(first.len(), 1);
+        assert!(!first[0].1, "an entry of the key still stands");
+        assert_eq!(table.next_until(), Some(later));
+        let last = table.take_due(later);
+        assert_eq!(last.len(), 1);
+        assert!(last[0].1, "the key's last entry ran out");
     }
 
     /// The wall clock is read again within a minute whatever the next date
@@ -735,5 +1091,71 @@ mod tests {
             None,
             "no dated grant: wait to be woken"
         );
+    }
+
+    /// What a data layer lists as writers, changing under the link.
+    struct Writers(parking_lot::Mutex<Vec<Name>>);
+
+    impl Introductions for Writers {
+        fn open(&self) -> bool {
+            false
+        }
+        fn carries(&self, _: &Name) -> bool {
+            false
+        }
+        fn grant_carries(&self, _: &Name, _: &Name) -> bool {
+            false
+        }
+        fn departure_carries(&self, _: &Name, _: &Name) -> bool {
+            false
+        }
+        fn writer_namespaces(&self, _: &Name) -> Vec<Name> {
+            self.0.lock().clone()
+        }
+    }
+
+    /// The sync group, trust context and key and certificate names of a
+    /// namespace the record lists as a writer's are carried by the entry, at
+    /// the next packet after the record lists it and not after it stops;
+    /// nothing else of that namespace is (a collection of the writer's own
+    /// outside the folder), whether it is listed or not.
+    #[test]
+    fn the_public_names_of_a_listed_writer_are_carried_live_and_nothing_else_of_hers() {
+        let n = |s: &str| -> Name { s.parse().unwrap() };
+        let writers = Arc::new(Writers(parking_lot::Mutex::new(Vec::new())));
+        let surface: Arc<dyn Introductions> = writers.clone();
+        let entry = grant(None);
+        let carried = |name: &str| entry_carries(Some(&surface), &entry, &n(name));
+        let public = [
+            "/carol/32=sync/x",
+            "/carol/KEY/k1",
+            "/carol/member/phone/KEY/k1/self/v=1",
+        ];
+        let diary = "/carol/member/phone/32=log/carol/32=data/diary/seq=1";
+        for name in public {
+            assert!(
+                !carried(name),
+                "{name} carried before the record lists Carol"
+            );
+        }
+        *writers.0.lock() = vec![n("/carol")];
+        for name in public {
+            assert!(
+                carried(name),
+                "{name} not carried while the record lists Carol"
+            );
+        }
+        assert!(
+            !carried(diary),
+            "a collection of hers outside the folder is carried"
+        );
+        writers.0.lock().clear();
+        for name in public {
+            assert!(
+                !carried(name),
+                "{name} still carried after the record dropped Carol"
+            );
+        }
+        assert!(!carried(diary));
     }
 }

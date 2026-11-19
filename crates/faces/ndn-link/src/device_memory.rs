@@ -12,7 +12,8 @@
 //! store are the host's to set, and `MemoryOptions::persist_addresses` keeps
 //! the addresses out of it.
 //!
-//! The value, version 1, all integers big-endian:
+//! The value, version 2 (version 1, the same without the last field, is still
+//! read), all integers big-endian:
 //!
 //! | octets | |
 //! |---|---|
@@ -22,6 +23,13 @@
 //! | 32 | the peer's key fingerprint |
 //! | 2 + n | the device's name, as a Name TLV, `n` octets |
 //! | 1 + … | the address count (at most 255), then for each: `4` or `6`, the address (4 or 16 octets), the port (2) |
+//! | 2 | the peer's last-known listening port, `0` for none (version 2 only; ndn-link.md §17D.2) |
+//!
+//! The port this device listens on is one more local note of the same area,
+//! `listen-port`: 2 octets, big-endian, never served, written and removed
+//! under the same durability and the same
+//! [`MemoryOptions::persist_addresses`](crate::MemoryOptions::persist_addresses)
+//! option as the addresses.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -38,7 +46,13 @@ use crate::memory::{LinkMemory, MemoryFuture, PeerRecord};
 /// The area of the device's notes the link memory keeps its records in.
 pub const AREA: &str = "link-memory";
 
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
+/// The records of the first version have no port.
+const VERSION_1: u8 = 1;
+
+/// The key of the note that holds the port this device listens on: not a peer
+/// key (those are 64 hexadecimal digits), so no record is named by it.
+pub const LISTEN_PORT_KEY: &str = "listen-port";
 
 /// The link memory kept in a [`Device`]'s local notes: one record per peer
 /// key, written behind the device's store barrier. Give it to
@@ -62,6 +76,11 @@ impl LinkMemory for DeviceMemory {
         let mut records = Vec::with_capacity(listed.len());
         let mut dropped = Vec::new();
         for (name, value) in listed {
+            // The port this device listens on is no record: it is read by
+            // `load_listen_port`, and not dropped here.
+            if name == LISTEN_PORT_KEY {
+                continue;
+            }
             match decode(&value) {
                 Ok(record) if record.key.to_string() == name => records.push(record),
                 Ok(record) => {
@@ -120,6 +139,41 @@ impl LinkMemory for DeviceMemory {
                 .map_err(|e| e.to_string())
         })
     }
+
+    fn load_listen_port(&self) -> Result<Option<u16>, String> {
+        let Some(value) = self.notes.get(LISTEN_PORT_KEY).map_err(|e| e.to_string())? else {
+            return Ok(None);
+        };
+        match <[u8; 2]>::try_from(value.as_ref()) {
+            Ok(octets) => Ok(Some(u16::from_be_bytes(octets)).filter(|port| *port != 0)),
+            Err(_) => {
+                // A hint that decides nothing: dropped as an unreadable record is.
+                tracing::warn!(
+                    target: "face.quic",
+                    "the link memory's listen-port note holds {} octets, not 2: dropped",
+                    value.len()
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    fn save_listen_port<'a>(&'a self, port: Option<u16>) -> MemoryFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            match port {
+                Some(port) => self
+                    .notes
+                    .put(LISTEN_PORT_KEY, &port.to_be_bytes())
+                    .await
+                    .map_err(|e| e.to_string()),
+                None => self
+                    .notes
+                    .remove(LISTEN_PORT_KEY)
+                    .await
+                    .map_err(|e| e.to_string()),
+            }
+        })
+    }
 }
 
 /// `record` as a note's value.
@@ -159,6 +213,7 @@ pub(crate) fn encode(record: &PeerRecord) -> Vec<u8> {
         }
         out.extend_from_slice(&addr.port().to_be_bytes());
     }
+    out.extend_from_slice(&record.port.unwrap_or(0).to_be_bytes());
     out
 }
 
@@ -190,9 +245,9 @@ impl<'a> Reader<'a> {
 pub(crate) fn decode(value: &[u8]) -> Result<PeerRecord, String> {
     let mut r = Reader(value);
     let [version, origin] = r.array::<2>()?;
-    if version != VERSION {
+    if version != VERSION && version != VERSION_1 {
         return Err(format!(
-            "it is version {version}, and this reads version {VERSION}"
+            "it is version {version}, and this reads versions {VERSION_1} and {VERSION}"
         ));
     }
     let origin = match origin {
@@ -219,6 +274,11 @@ pub(crate) fn decode(value: &[u8]) -> Result<PeerRecord, String> {
         };
         addresses.push(SocketAddr::new(ip, u16::from_be_bytes(r.array()?)));
     }
+    let port = if version == VERSION {
+        Some(u16::from_be_bytes(r.array()?)).filter(|port| *port != 0)
+    } else {
+        None
+    };
     if !r.0.is_empty() {
         return Err(format!("{} octets follow the last address", r.0.len()));
     }
@@ -226,6 +286,7 @@ pub(crate) fn decode(value: &[u8]) -> Result<PeerRecord, String> {
         key,
         device,
         addresses,
+        port,
         last_contact,
         origin,
     })
@@ -245,6 +306,7 @@ mod tests {
             ],
             last_contact: UNIX_EPOCH + Duration::from_secs(1_700_000_000),
             origin: Direction::Accepted,
+            port: Some(4433),
         }
     }
 
@@ -258,6 +320,33 @@ mod tests {
             ..record()
         };
         assert_eq!(decode(&encode(&none)).unwrap(), none);
+    }
+
+    /// A record written before the port was kept (version 1: the value ends
+    /// with the addresses) is still read, with no port; one written now has
+    /// the port, and a record with none reads back with none.
+    #[test]
+    fn a_version_1_record_is_read_with_no_port_and_the_port_round_trips() {
+        let r = record();
+        let mut v1 = encode(&r);
+        v1.truncate(v1.len() - 2);
+        v1[0] = 1;
+        assert_eq!(
+            decode(&v1).unwrap(),
+            PeerRecord {
+                port: None,
+                ..r.clone()
+            },
+            "version 1 has no port"
+        );
+        assert_eq!(encode(&r)[0], 2, "records are written as version 2");
+        assert_eq!(decode(&encode(&r)).unwrap().port, Some(4433));
+        let none = PeerRecord { port: None, ..r };
+        assert_eq!(decode(&encode(&none)).unwrap().port, None);
+        // A version-1 value that carries the version 2 field is not version 1.
+        let mut padded = v1.clone();
+        padded.extend_from_slice(&[0x11, 0x51]);
+        assert!(decode(&padded).unwrap_err().contains("follow"));
     }
 
     #[test]
@@ -279,8 +368,8 @@ mod tests {
         long.push(0);
         assert!(decode(&long).unwrap_err().contains("follow"));
         let mut other_version = good.clone();
-        other_version[0] = 2;
-        assert!(decode(&other_version).unwrap_err().contains("version 2"));
+        other_version[0] = 3;
+        assert!(decode(&other_version).unwrap_err().contains("version 3"));
         // Octets from a generator, of every length up to 300.
         let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
         for len in 0..300 {

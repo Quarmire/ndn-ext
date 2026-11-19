@@ -151,6 +151,22 @@ impl Links {
     /// stop punching the ones it no longer does. Each namespace listed is
     /// judged by this device's membership in it.
     fn take_presence(self: &Arc<Self>, relay: PeerId, list: &[Presence]) {
+        {
+            // Who this relay says is linked to it too, in a namespace this
+            // device is in: a path both devices use (`shares_relay_with`).
+            let judge = self.judge();
+            let keys: std::collections::HashSet<KeyFingerprint> = list
+                .iter()
+                .filter(|p| judge.own_role_in(&p.namespace).is_some())
+                .flat_map(|p| p.devices.iter().map(|d| d.key))
+                .collect();
+            let mut present = self.present.lock();
+            if keys.is_empty() {
+                present.remove(&relay);
+            } else {
+                present.insert(relay, keys);
+            }
+        }
         let mine = self.my_fingerprint();
         let own_devices = self.own_devices();
         let judge = self.judge();
@@ -167,7 +183,7 @@ impl Links {
                         || own_devices.contains(&d.device)
                         || mine > d.key
                         || !d.device.has_prefix(&p.namespace)
-                        || self.peers.find(d.key, Some(&d.device)).is_some()
+                        || self.peers.find_listed(d.key, Some(&d.device)).is_some()
                         || self.pair_off(&d.device).is_some()
                         || wanted.iter().any(|(k, _)| *k == d.key)
                     {

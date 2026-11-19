@@ -20,7 +20,9 @@
 //!   a Data; the consumer's validation refuses it.
 //! - **Deterministic.** Each link's arrivals draw from the profile's stream for the
 //!   direction `peer key → this device's key`, so the same seed, the same devices
-//!   and the same packets give the same fates.
+//!   and the same packets give the same fates. A packet the verdict drops or passes
+//!   draws nothing, so the fates of the packets that meet the profile do not depend on
+//!   how many others were dropped or passed.
 //! - **Links already up.** A plan installed by [`Links::inject_faults`] applies to
 //!   every link, those already up included, from the next packet that arrives.
 
@@ -52,7 +54,7 @@ const INTEREST: u64 = 0x05;
 const DATA: u64 = 0x06;
 const NAME: u64 = 0x07;
 
-/// What a packet that arrived on a link is, as far as a plan's predicate cares.
+/// What a packet that arrived on a link is, as far as a plan's verdict cares.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FaultKind {
     /// An Interest.
@@ -66,7 +68,7 @@ pub enum FaultKind {
     Other,
 }
 
-/// What a plan's predicate is asked about: one packet that has just arrived on a
+/// What a plan's verdict is asked about: one packet that has just arrived on a
 /// link.
 #[derive(Clone, Debug)]
 pub struct FaultFrame {
@@ -83,18 +85,35 @@ pub struct FaultFrame {
     pub len: usize,
 }
 
-/// What a plan's predicate looks like: it says whether the profile applies to the
-/// packet. It runs on the link's receive path: keep it short; it must not block.
-pub type FaultPass = Arc<dyn Fn(&FaultFrame) -> bool + Send + Sync>;
+/// What a plan says of one packet that arrived on a link.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FaultVerdict {
+    /// The profile applies to the packet: it meets the seeded draws and may be dropped,
+    /// duplicated, forged or delayed ([`FaultReport::met`]).
+    Profile,
+    /// The packet is discarded, as a lossy network would. It draws nothing from the
+    /// profile's stream and is counted in [`FaultReport::dropped`], the counter the
+    /// profile's own drops share.
+    Drop,
+    /// The packet is delivered at once and untouched ([`FaultReport::passed`]). It draws
+    /// nothing from the profile's stream.
+    Pass,
+}
 
-/// A profile, and which packets it applies to.
+/// What a plan's verdict function looks like: it says what becomes of the packet. It
+/// runs on the link's receive path: keep it short; it must not block.
+pub type FaultJudge = Arc<dyn Fn(&FaultFrame) -> FaultVerdict + Send + Sync>;
+
+/// A profile, and a verdict per packet.
 #[derive(Clone)]
 pub struct FaultPlan {
-    /// What becomes of the packets the plan applies to.
+    /// What becomes of the packets the verdict hands to the profile.
     pub profile: Faults,
-    /// The packets the profile applies to: `None` is all of them. A packet it
-    /// refuses is delivered at once and untouched ([`FaultReport::passed`]).
-    pub pass: Option<FaultPass>,
+    /// The verdict per packet: `None` is [`FaultVerdict::Profile`] for every packet. A
+    /// `Drop` or a `Pass` draws nothing from the profile's stream, so the fates of the
+    /// packets that meet the profile do not depend on how many others were dropped or
+    /// passed.
+    pub verdict: Option<FaultJudge>,
 }
 
 impl FaultPlan {
@@ -102,13 +121,17 @@ impl FaultPlan {
     pub fn new(profile: Faults) -> FaultPlan {
         FaultPlan {
             profile,
-            pass: None,
+            verdict: None,
         }
     }
 
-    /// The profile on the packets `pass` says yes to.
-    pub fn only(mut self, pass: impl Fn(&FaultFrame) -> bool + Send + Sync + 'static) -> FaultPlan {
-        self.pass = Some(Arc::new(pass));
+    /// The verdict `f` gives on each packet: the profile on it, discard it, or let it
+    /// pass.
+    pub fn verdict(
+        mut self,
+        f: impl Fn(&FaultFrame) -> FaultVerdict + Send + Sync + 'static,
+    ) -> FaultPlan {
+        self.verdict = Some(Arc::new(f));
         self
     }
 }
@@ -117,7 +140,7 @@ impl fmt::Debug for FaultPlan {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FaultPlan")
             .field("profile", &self.profile.to_string())
-            .field("pass", &self.pass.as_ref().map(|_| "<predicate>"))
+            .field("verdict", &self.verdict.as_ref().map(|_| "<verdict>"))
             .finish()
     }
 }
@@ -152,7 +175,7 @@ impl Counts {
 /// An installed plan, with its own counters.
 struct Plan {
     profile: Faults,
-    pass: Option<FaultPass>,
+    verdict: Option<FaultJudge>,
     counts: Counts,
 }
 
@@ -167,13 +190,13 @@ impl FaultLayer {
         tracing::warn!(
             target: "ndn_link::fault",
             profile = %plan.profile,
-            filtered = plan.pass.is_some(),
+            filtered = plan.verdict.is_some(),
             "fault injection is ON: packets arriving on links will be dropped, duplicated, \
              forged and delayed (tests only)"
         );
         *self.plan.write() = Some(Arc::new(Plan {
             profile: plan.profile,
-            pass: plan.pass,
+            verdict: plan.verdict,
             counts: Counts::default(),
         }));
     }
@@ -330,7 +353,7 @@ impl Faulted {
             return;
         };
         let counts = &plan.counts;
-        if let Some(pass) = &plan.pass {
+        if let Some(judge) = &plan.verdict {
             let (kind, name) = frame_info(&frame);
             let seen = FaultFrame {
                 direction: self.direction,
@@ -339,20 +362,25 @@ impl Faulted {
                 name,
                 len: frame.len(),
             };
-            match catch_unwind(AssertUnwindSafe(|| pass(&seen))) {
-                Ok(true) => {}
-                Ok(false) => {
+            match catch_unwind(AssertUnwindSafe(|| judge(&seen))) {
+                Ok(FaultVerdict::Profile) => {}
+                Ok(FaultVerdict::Pass) => {
                     Counts::bump(&counts.passed);
                     rx.hold(now, frame);
                     return;
                 }
+                Ok(FaultVerdict::Drop) => {
+                    // What the network already does; the profile's stream is not asked.
+                    Counts::bump(&counts.dropped);
+                    return;
+                }
                 Err(_) => {
-                    // A predicate that panics must not end the link's receive
-                    // task: the packet is left alone, and the report says so.
+                    // A verdict that panics must not end the link's receive task: the
+                    // packet is left alone, and the report says so.
                     Counts::bump(&counts.predicate_panics);
                     tracing::warn!(
                         target: "ndn_link::fault",
-                        "the fault plan's predicate panicked; the packet was delivered untouched"
+                        "the fault plan's verdict panicked; the packet was delivered untouched"
                     );
                     rx.hold(now, frame);
                     return;
@@ -476,7 +504,7 @@ impl Transport for Faulted {
     }
 }
 
-/// What a frame is, and the name it carries, as far as a predicate cares.
+/// What a frame is, and the name it carries, as far as a verdict cares.
 fn frame_info(frame: &Bytes) -> (FaultKind, Option<Name>) {
     let Ok((t, _)) = ndn_tlv::read_varu64(frame) else {
         return (FaultKind::Other, None);
@@ -682,16 +710,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_predicate_picks_the_packets_and_is_told_what_they_are() {
+    async fn a_verdict_picks_the_packets_and_is_told_what_they_are() {
         let layer = Arc::new(FaultLayer::default());
         let (tx, face) = link(&layer);
         let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let log = Arc::clone(&seen);
-        layer.install(plan("drop=1").only(move |f| {
+        layer.install(plan("drop=1").verdict(move |f| {
             log.lock()
                 .push((f.kind, f.name.clone(), f.len, f.direction));
-            f.kind == FaultKind::Data
+            if f.kind == FaultKind::Data
                 && f.name.as_ref().is_some_and(|nm| nm.has_prefix(&n("/keep")))
+            {
+                FaultVerdict::Profile
+            } else {
+                FaultVerdict::Pass
+            }
         }));
         let frames = [
             interest("/keep/i"),
@@ -746,16 +779,128 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_predicate_that_panics_leaves_the_packet_alone_and_is_counted() {
+    async fn a_verdict_that_panics_leaves_the_packet_alone_and_is_counted() {
         let layer = Arc::new(FaultLayer::default());
         let (tx, face) = link(&layer);
-        layer.install(plan("drop=1").only(|_| panic!("a host bug")));
+        layer.install(plan("drop=1").verdict(|_| panic!("a host bug")));
         let f = data("/p");
         tx.send(f.clone()).unwrap();
         drop(tx);
         assert_eq!(all(&face).await, vec![f]);
         let r = layer.report();
         assert_eq!((r.predicate_panics, r.met, r.dropped), (1, 0, 0));
+    }
+
+    /// The verdict of the tests below: `/drop` is discarded, `/pass` delivered
+    /// untouched, everything else meets the profile.
+    fn by_prefix(f: &FaultFrame) -> FaultVerdict {
+        match &f.name {
+            Some(nm) if nm.has_prefix(&n("/drop")) => FaultVerdict::Drop,
+            Some(nm) if nm.has_prefix(&n("/pass")) => FaultVerdict::Pass,
+            _ => FaultVerdict::Profile,
+        }
+    }
+
+    /// `Drop` discards, `Pass` delivers untouched, `Profile` applies the profile, and each is
+    /// counted where the spec says: the verdict's drops share `dropped` with the profile's,
+    /// and a frame the verdict dropped or passed never met the profile.
+    #[tokio::test]
+    async fn a_verdict_drops_passes_or_hands_to_the_profile() {
+        let layer = Arc::new(FaultLayer::default());
+        let (tx, face) = link(&layer);
+        layer.install(plan("dup=1").verdict(by_prefix));
+        let dropped = [data("/drop/1"), interest("/drop/2"), data("/drop/3")];
+        let passed = [data("/pass/1"), interest("/pass/2")];
+        let profiled = [data("/x/1"), data("/x/2"), data("/x/3"), data("/x/4")];
+        for f in dropped.iter().chain(&passed).chain(&profiled) {
+            tx.send(f.clone()).unwrap();
+        }
+        drop(tx);
+        let got = all(&face).await;
+        for f in &dropped {
+            assert!(!got.contains(f), "a dropped frame was delivered");
+        }
+        for f in &passed {
+            assert_eq!(
+                got.iter().filter(|g| *g == f).count(),
+                1,
+                "pass: once, untouched"
+            );
+        }
+        for f in &profiled {
+            assert_eq!(got.iter().filter(|g| *g == f).count(), 2, "dup=1: twice");
+        }
+        let r = layer.report();
+        assert_eq!(
+            (r.met, r.dropped, r.duplicated, r.passed),
+            (4, 3, 4, 2),
+            "{r:?}"
+        );
+    }
+
+    /// Same seed, same fates: a frame that is dropped or passed draws nothing from the
+    /// stream, so what the profile does to the frames that meet it does not depend on how
+    /// many others were dropped or passed between them.
+    #[tokio::test]
+    async fn dropped_and_passed_frames_draw_nothing() {
+        let profile = Faults::parse("drop=0.3,dup=0.2,forge=0.3")
+            .unwrap()
+            .with_seed(77);
+        let profiled: Vec<Bytes> = (0..120).map(|i| data(&format!("/x/{i}"))).collect();
+        async fn run(profile: Faults, frames: Vec<Bytes>) -> (Vec<Bytes>, FaultReport) {
+            let layer = Arc::new(FaultLayer::default());
+            let (tx, face) = link(&layer);
+            layer.install(FaultPlan::new(profile).verdict(by_prefix));
+            for f in frames {
+                tx.send(f).unwrap();
+            }
+            drop(tx);
+            (all(&face).await, layer.report())
+        }
+        let (alone, alone_report) = run(profile, profiled.clone()).await;
+        // The same profiled frames, with a run of dropped and passed ones before each.
+        let mut between = Vec::new();
+        let mut extra_dropped = 0u64;
+        let mut extra_passed = 0u64;
+        for (i, f) in profiled.iter().enumerate() {
+            for j in 0..(i % 4) {
+                between.push(data(&format!("/drop/{i}/{j}")));
+                extra_dropped += 1;
+            }
+            if i % 3 == 0 {
+                between.push(interest(&format!("/pass/{i}")));
+                extra_passed += 1;
+            }
+            between.push(f.clone());
+        }
+        let (mixed, mixed_report) = run(profile, between).await;
+        let passed: Vec<Bytes> = mixed
+            .iter()
+            .filter(|g| frame_info(g).1.is_some_and(|nm| nm.has_prefix(&n("/pass"))))
+            .cloned()
+            .collect();
+        assert_eq!(passed.len() as u64, extra_passed);
+        let at_profile: Vec<Bytes> = mixed
+            .iter()
+            .filter(|g| frame_info(g).1.is_some_and(|nm| nm.has_prefix(&n("/x"))))
+            .cloned()
+            .collect();
+        assert_eq!(
+            at_profile, alone,
+            "the profile's fates, in order, are the same"
+        );
+        assert!(alone_report.dropped > 0 && alone_report.forged > 0 && alone_report.duplicated > 0);
+        assert_eq!(
+            FaultReport {
+                dropped: mixed_report.dropped - extra_dropped,
+                passed: mixed_report.passed - extra_passed,
+                ..mixed_report.clone()
+            },
+            alone_report,
+            "the same counters but for the frames dropped and passed"
+        );
+        assert_eq!(mixed_report.dropped, alone_report.dropped + extra_dropped);
+        assert_eq!(mixed_report.passed, extra_passed);
     }
 
     /// A plan installed after a link is up applies to its next packets; clearing it

@@ -2,7 +2,7 @@
 //! The test-only fault layer on real QUIC links between two embedded forwarders
 //! (ndn-rs `ndn-link.md` §17B): the conformance's `FAULTY` profile on a real link, the
 //! same seed and the same faults, a forged Data still refused by the consumer, and a
-//! predicate choosing what is touched.
+//! verdict per packet (the profile on it, drop it or let it pass).
 //!
 //! Two devices of one namespace, each with a forwarder of its own and its links on a
 //! loopback socket; `a` produces signed notes under its device name, `b` fetches them
@@ -12,6 +12,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -22,7 +23,7 @@ use ndn_face_quic::{
 };
 use ndn_link::{
     ConfiguredEndpoints, EngineFaces, FAULTY, FaultFrame, FaultKind, FaultPlan, FaultReport,
-    Faults, HostCandidates, LinkSetup, LinkTrust, Links, PathKind, PeerSpec,
+    FaultVerdict, Faults, HostCandidates, LinkSetup, LinkTrust, Links, PathKind, PeerSpec,
 };
 use ndn_packet::encode::{DataBuilder, InterestBuilder};
 use ndn_packet::{Data, Name};
@@ -318,7 +319,7 @@ async fn join(home: &Home, a: &Member) -> (Member, Consumer, Validator) {
     (b, consumer, validator)
 }
 
-/// What a recording predicate saw: the packets that met the profile.
+/// What a recording verdict saw: the packets that met the profile.
 #[derive(Clone, Default)]
 struct Seen(Arc<Mutex<Vec<FaultFrame>>>);
 
@@ -339,12 +340,14 @@ fn plan(
     matching: impl Fn(&FaultFrame) -> bool + Send + Sync + 'static,
 ) -> FaultPlan {
     let seen = seen.clone();
-    FaultPlan::new(profile).only(move |f| {
+    FaultPlan::new(profile).verdict(move |f| {
         let chosen = in_notes(f) && matching(f);
         if chosen {
             seen.0.lock().push(f.clone());
+            FaultVerdict::Profile
+        } else {
+            FaultVerdict::Pass
         }
-        chosen
     })
 }
 
@@ -385,7 +388,7 @@ fn replay(
     report
 }
 
-/// The layer's report of `links` and what its predicate saw, read together once nothing is
+/// The layer's report of `links` and what its verdict saw, read together once nothing is
 /// arriving between the two reads.
 fn settled(links: &Links, seen: &Seen) -> (FaultReport, Vec<FaultFrame>) {
     for _ in 0..200 {
@@ -411,7 +414,7 @@ fn assert_fates_are_the_streams(
     me: &KeyFingerprint,
 ) -> FaultReport {
     let (report, recorded) = settled(links, seen);
-    // `passed` counts the packets the predicate refused (the probe, link traffic): they
+    // `passed` counts the packets the verdict let pass (the probe, link traffic): they
     // draw nothing, so the stream says nothing of them.
     let want = FaultReport {
         passed: report.passed,
@@ -510,7 +513,7 @@ async fn interests_under(profile: Faults, interests: usize) -> FaultReport {
         seen.all()
             .iter()
             .all(|f| f.direction == Direction::Accepted && f.peer == b.key),
-        "the predicate is told which link, and that `a` accepted it"
+        "the verdict is told which link, and that `a` accepted it"
     );
     report
 }
@@ -593,10 +596,10 @@ async fn a_forged_data_is_still_refused_by_validation() {
     ));
 }
 
-/// With a predicate only the packets it chooses are touched, and it is told what each is:
-/// its kind, its name, which side opened the link and whose key it came from.
+/// With a verdict only the packets it hands to the profile are touched, and it is told what
+/// each is: its kind, its name, which side opened the link and whose key it came from.
 #[tokio::test(flavor = "multi_thread")]
-async fn only_the_packets_the_predicate_chooses_are_touched() {
+async fn only_the_packets_the_verdict_hands_to_the_profile_are_touched() {
     let home = Home::new();
     let a = member(&home, "a", 1, Vec::new()).await;
     let _guard = produce(&a).await;
@@ -605,20 +608,23 @@ async fn only_the_packets_the_predicate_chooses_are_touched() {
     let asked: Arc<Mutex<Vec<FaultFrame>>> = Arc::default();
     let log = Arc::clone(&asked);
     let target = lost.clone();
-    let mut plan = FaultPlan::new(Faults::parse("drop=1").unwrap());
-    plan.pass = Some(Arc::new(move |f: &FaultFrame| {
+    let plan = FaultPlan::new(Faults::parse("drop=1").unwrap()).verdict(move |f: &FaultFrame| {
         log.lock().push(f.clone());
-        f.kind == FaultKind::Interest && f.name.as_ref() == Some(&target)
-    }));
+        if f.kind == FaultKind::Interest && f.name.as_ref() == Some(&target) {
+            FaultVerdict::Profile
+        } else {
+            FaultVerdict::Pass
+        }
+    });
     a.links.inject_faults(plan);
     let (b, mut consumer, validator) = join(&home, &a).await;
-    // And `b` only looks: its predicate refuses every packet.
+    // And `b` only looks: its verdict lets every packet pass.
     let at_b: Arc<Mutex<Vec<FaultFrame>>> = Arc::default();
     let log = Arc::clone(&at_b);
     b.links.inject_faults(
-        FaultPlan::new(Faults::parse("drop=1").unwrap()).only(move |f| {
+        FaultPlan::new(Faults::parse("drop=1").unwrap()).verdict(move |f| {
             log.lock().push(f.clone());
-            false
+            FaultVerdict::Pass
         }),
     );
 
@@ -650,13 +656,12 @@ async fn only_the_packets_the_predicate_chooses_are_touched() {
             .cloned()
     };
     for name in [&kept, &lost] {
-        let f =
-            interest_for(name).unwrap_or_else(|| panic!("the predicate was not asked of {name}"));
+        let f = interest_for(name).unwrap_or_else(|| panic!("the verdict was not asked of {name}"));
         assert_eq!(f.direction, Direction::Accepted, "a accepted the link");
         assert_eq!(f.peer, b.key);
         assert!(f.len > 0);
     }
-    // At `b` the predicate saw the Data that answered, and touched nothing.
+    // At `b` the verdict saw the Data that answered, and touched nothing.
     let report_b = b.links.report().fault_injection.unwrap();
     assert_eq!(report_b.met, 0);
     assert_eq!(report_b.passed as usize, at_b.lock().len());
@@ -664,7 +669,176 @@ async fn only_the_packets_the_predicate_chooses_are_touched() {
     let answer = at_b
         .iter()
         .find(|f| f.kind == FaultKind::Data && f.name.as_ref() == Some(&kept))
-        .expect("the predicate at b saw the Data of the kept note");
+        .expect("the verdict at b saw the Data of the kept note");
     assert_eq!(answer.direction, Direction::Dialed, "b dialled the link");
     assert_eq!(answer.peer, a.key);
+}
+
+/// The versions of another collection: `/home/member/a/other/<n>` (ndf's scenario K1 drops
+/// a version of the other collection and keeps the faulty network for the rest).
+fn other_collection() -> Name {
+    n(&format!("{NS}/member/a/other"))
+}
+
+fn in_other(f: &FaultFrame) -> bool {
+    f.name
+        .as_ref()
+        .is_some_and(|nm| nm.has_prefix(&other_collection()))
+}
+
+/// What one run of K1 came to.
+struct K1 {
+    report: FaultReport,
+    /// Whether each note's fetch got its Data (one entry per note, in order).
+    arrived: Vec<bool>,
+    /// The packets that met the profile, in order.
+    met: Vec<FaultFrame>,
+    /// How many frames the verdict dropped.
+    vetoed: usize,
+    /// Whether every fetch of the other collection came to nothing.
+    others_lost: bool,
+}
+
+/// `notes_n` serial fetches of notes, each preceded by `others` fetches of the other
+/// collection's versions, at `a`, whose verdict drops the other collection's frames, hands
+/// the notes' Interests to `profile`, and passes the rest.
+async fn k1_run(profile: Faults, notes_n: usize, others: usize) -> K1 {
+    let home = Home::new();
+    let a = member(&home, "a", 1, Vec::new()).await;
+    let _guard = produce(&a).await;
+    let seen = Seen::default();
+    let vetoed = Arc::new(AtomicUsize::new(0));
+    let (log, count) = (seen.clone(), Arc::clone(&vetoed));
+    a.links
+        .inject_faults(FaultPlan::new(profile).verdict(move |f| {
+            if in_other(f) {
+                count.fetch_add(1, AtomicOrdering::SeqCst);
+                FaultVerdict::Drop
+            } else if in_notes(f) && f.kind == FaultKind::Interest {
+                log.0.lock().push(f.clone());
+                FaultVerdict::Profile
+            } else {
+                FaultVerdict::Pass
+            }
+        }));
+    let (b, mut consumer, validator) = join(&home, &a).await;
+    let mut arrived = Vec::new();
+    let mut others_lost = true;
+    for i in 0..notes_n {
+        for j in 0..others {
+            let name = other_collection().append((i * others + j).to_string());
+            let got = attempt(&mut consumer, &validator, &name, Duration::from_millis(200)).await;
+            others_lost &= matches!(got, Got::Lost);
+        }
+        let got = attempt(
+            &mut consumer,
+            &validator,
+            &note(i),
+            Duration::from_millis(600),
+        )
+        .await;
+        arrived.push(matches!(got, Got::Verified));
+    }
+    until(
+        "the notes' Interests have arrived at a",
+        Duration::from_secs(20),
+        || a.links.report().fault_injection.unwrap().met as usize >= notes_n,
+    )
+    .await;
+    let (report, met) = settled(&a.links, &seen);
+    // What the profile did to the frames that met it is the shared stream's draws for those
+    // frames alone: the verdict's drops and passes drew nothing.
+    let vetoed = vetoed.load(AtomicOrdering::SeqCst);
+    let replayed = replay(&profile, &b.key, &a.key, &met);
+    assert_eq!(
+        report,
+        FaultReport {
+            passed: report.passed,
+            dropped: replayed.dropped + vetoed as u64,
+            ..replayed
+        },
+        "the counters are the stream's fates for the packets that met the profile, plus the \
+         verdict's drops in `dropped`"
+    );
+    K1 {
+        report,
+        arrived,
+        met,
+        vetoed,
+        others_lost,
+    }
+}
+
+/// Case K1: the verdict drops a version of another collection, the faulty profile stays on
+/// for the rest. Both are visible in the counters and in what arrives, and the same seed gives
+/// the same fates twice, with or without the dropped frames between the others.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_verdict_drops_one_collection_and_the_profile_stays_on_for_the_rest() {
+    let profile = Faults {
+        // Shortened so the delays fit the fetches' lifetimes; the draws are the same.
+        delay_ms: 40,
+        blocks_ms: 40,
+        ..Faults::parse(FAULTY).unwrap().with_seed(5)
+    };
+    let notes_n = 20;
+    let first = k1_run(profile, notes_n, 1).await;
+    let again = k1_run(profile, notes_n, 1).await;
+    let without = k1_run(profile, notes_n, 0).await;
+
+    // The verdict's effect: every version of the other collection is lost, and counted.
+    assert!(
+        first.others_lost,
+        "a dropped version of another collection arrived"
+    );
+    assert_eq!(
+        first.vetoed, notes_n,
+        "one Interest per fetch of the other collection"
+    );
+    assert_eq!(without.vetoed, 0);
+    assert_eq!(
+        first.report.dropped - without.report.dropped,
+        notes_n as u64,
+        "the verdict's drops are in `dropped`, beside the profile's"
+    );
+
+    // The profile's effect on the rest: some notes are lost, some are not, by its fates.
+    let lost = first.arrived.iter().filter(|got| !**got).count();
+    assert!(
+        0 < lost && lost < notes_n,
+        "the profile stayed on for the notes: {lost} of {notes_n} lost, {:?}",
+        first.report
+    );
+    let by_profile = first.report.dropped - first.vetoed as u64;
+    assert_eq!(
+        lost as u64, by_profile,
+        "a note is lost exactly when the profile dropped it"
+    );
+    assert_eq!(
+        first.report.met as usize, notes_n,
+        "only the notes met the profile"
+    );
+
+    // Same seed, same fates: twice, and with no frames dropped between the notes.
+    let at_profile = |k: &K1| {
+        let by_profile = k.report.dropped - k.vetoed as u64;
+        (
+            FaultReport {
+                passed: 0,
+                dropped: by_profile,
+                ..k.report.clone()
+            },
+            k.arrived.clone(),
+            k.met.len(),
+        )
+    };
+    assert_eq!(
+        at_profile(&first),
+        at_profile(&again),
+        "the same seed, the same fates"
+    );
+    assert_eq!(
+        at_profile(&first),
+        at_profile(&without),
+        "what the profile does to the notes does not depend on the frames dropped between them"
+    );
 }

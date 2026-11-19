@@ -22,6 +22,7 @@ use crate::admission::Identity;
 use crate::grants::Grant;
 use crate::host::Route;
 use crate::peer::PeerId;
+use crate::policy::DIAL_RACE_WINDOW;
 use crate::routes::RelayRoutes;
 use crate::status::{PathKind, PathStatus};
 
@@ -216,10 +217,15 @@ impl LinkTable {
             );
             return Some(generation);
         };
+        // Only a link registered within `DIAL_RACE_WINDOW` can be the other
+        // half of a simultaneous dial; an older one that the same device
+        // dials past has been lost on its side (it moved, §17D.3), and the
+        // newer link, proven by the same key, replaces it.
         if existing
             .paths
             .iter()
             .filter(|p| p.path.kind == kind)
+            .filter(|p| p.path.since.elapsed() < DIAL_RACE_WINDOW)
             .any(|p| keeps_existing(p.path.direction, new.path.direction, mine, link.fingerprint))
         {
             new.path.handle.close(CloseReason::Replaced, text);
@@ -445,22 +451,65 @@ impl LinkTable {
             .collect()
     }
 
-    /// Close the link to `fingerprint` when only a grant admitted it,
-    /// saying `text`; `true` when one was closed.
+    /// Close the link to `fingerprint` when only a grant admitted it and
+    /// `closes` says so of the identities it was admitted by, saying `text`;
+    /// `true` when one was closed.
     pub(crate) fn close_granted(
         &self,
         fingerprint: &KeyFingerprint,
         reason: CloseReason,
         text: &str,
+        closes: impl Fn(&[Identity]) -> bool,
     ) -> bool {
         let live = self.live.lock();
         match live.get(fingerprint) {
-            Some(link) if link.grant.is_some() => {
+            Some(link) if link.grant.is_some() && closes(&link.identities) => {
                 link.close(reason, text);
                 true
             }
             _ => false,
         }
+    }
+
+    /// The handles of the paths of the link to `fingerprint` when only a
+    /// grant admitted it: what narrows to a departure when its last entry
+    /// ends.
+    pub(crate) fn granted_handles(&self, fingerprint: &KeyFingerprint) -> Vec<LinkHandle> {
+        let live = self.live.lock();
+        match live.get(fingerprint) {
+            Some(link) if link.grant.is_some() => {
+                link.paths.iter().map(|p| p.path.handle.clone()).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Close every path of every link (the device went offline), saying
+    /// `text`.
+    pub(crate) fn close_all(&self, reason: CloseReason, text: &str) {
+        let live = self.live.lock();
+        for link in live.values() {
+            link.close(reason, text);
+        }
+    }
+
+    /// Close the link paths (not direct paths) this device accepted, saying
+    /// `text`: a QUIC server cannot follow its address (RFC 9000 §9), so a
+    /// link accepted at an address that is gone is lost to both sides until
+    /// an idle timeout. The device dials again from where it is now. Returns
+    /// how many were closed.
+    pub(crate) fn close_accepted(&self, reason: CloseReason, text: &str) -> usize {
+        let live = self.live.lock();
+        let mut closed = 0;
+        for link in live.values() {
+            for p in link.paths.iter().filter(|p| {
+                p.path.kind == PathKind::Link && p.path.direction == Direction::Accepted
+            }) {
+                p.path.handle.close(reason, text);
+                closed += 1;
+            }
+        }
+        closed
     }
 
     /// This device now holds the certificates `certificates`: close each

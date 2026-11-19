@@ -46,6 +46,9 @@ pub enum Next {
     /// It dials the peer when the link is wanted: the host asks, traffic
     /// waits for it, the relay is needed.
     WhenWanted,
+    /// This device is offline ([`Links::set_online`]): it makes no attempt,
+    /// and dials the peer again when it is back online.
+    WhenOnline,
     /// It does not dial the peer again.
     Gone,
 }
@@ -294,6 +297,32 @@ impl StateTable {
         self.intents.remove(&peer);
     }
 
+    /// This device went offline: every peer that is down is down because of
+    /// it, and is dialled again when this device is back online. A peer's
+    /// later outcome (up, or a failed dial) replaces what is said here.
+    fn offline(&mut self, why: &LinkDetail) -> bool {
+        let mut changed = false;
+        for entry in self.entries.values_mut() {
+            if let LinkState::Down {
+                why: old,
+                next: old_next,
+                ..
+            } = &mut entry.link.state
+                && (*old != *why || *old_next != Next::WhenOnline)
+            {
+                *old = why.clone();
+                *old_next = Next::WhenOnline;
+                changed = true;
+                self.version += 1;
+                entry.changed = self.version;
+            }
+        }
+        for next in self.intents.values_mut() {
+            *next = Next::WhenOnline;
+        }
+        changed
+    }
+
     /// The entries changed after `cursor`, the longest unchanged first.
     fn since(&self, cursor: u64) -> Vec<PeerLink> {
         let mut changed: Vec<&Entry> = self
@@ -464,8 +493,31 @@ impl Links {
         direction: Direction,
         why: &LinkError,
     ) {
-        let why = plain(&link_error_detail(why));
-        let next = self.default_next(peer);
+        let offline = !self.is_online();
+        let why = if offline {
+            plain(&crate::online::offline_detail())
+        } else {
+            // A link closed by a let-go names the folder and the record
+            // (§8.8), on this side as on the other.
+            let detail = link_error_detail(why);
+            plain(&match self.departures.take_let_go(&key) {
+                Some(let_go) => detail.caused_by(let_go),
+                None => detail,
+            })
+        };
+        let next = if offline {
+            Next::WhenOnline
+        } else {
+            self.default_next(peer)
+        };
+        if offline && let Some(peer) = peer {
+            // The intent of an offline device wins over a loop's earlier word.
+            self.states
+                .shared
+                .table
+                .lock()
+                .decide(peer, Next::WhenOnline);
+        }
         let changed = {
             let mut table = self.states.shared.table.lock();
             // Looked at under the table's lock, so a link made again between
@@ -482,6 +534,13 @@ impl Links {
     /// What peer `id`'s dial loop does next, once it decided.
     pub(crate) fn watch_next(&self, id: PeerId, next: Next) {
         let changed = self.states.shared.table.lock().decide(id, next);
+        self.states.publish(changed);
+    }
+
+    /// This device went offline: say so for every peer that is down.
+    pub(crate) fn watch_offline(&self) {
+        let why = plain(&crate::online::offline_detail());
+        let changed = self.states.shared.table.lock().offline(&why);
         self.states.publish(changed);
     }
 

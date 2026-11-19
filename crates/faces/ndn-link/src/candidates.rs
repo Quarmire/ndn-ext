@@ -149,6 +149,11 @@ pub(crate) fn interfaces() -> Vec<Interface> {
     };
     let mut out = Vec::new();
     for a in addrs {
+        // An interface that is down reaches nowhere: its addresses are not
+        // candidates, and a change of them is no change of this device's.
+        if !a.flags.contains(nix::net::if_::InterfaceFlags::IFF_UP) {
+            continue;
+        }
         let (Some(addr), Some(mask)) = (a.address, a.netmask) else {
             continue;
         };

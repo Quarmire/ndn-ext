@@ -13,620 +13,17 @@
 //! `serve = open` the grant changes nothing; a reader's link carries what a
 //! reader sends as Interests only.
 
-use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+mod common;
+
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
+use common::*;
 use ndn_app::EngineAppExt;
-use ndn_data::intro::{Dialing, Grant as DataGrant, LinkHint};
-use ndn_data::{
-    Answer, Audience, Clock, Config, Content, DataLayer, Device, Got, IntroPolicy, Introducer,
-    Joined, Keep, NextStep, Offer, Payload, PutOptions, Role, Rule, Share, Sharing, Timestamp,
-    Transport, TypeId,
-};
-use ndn_engine::{EngineBuilder, EngineConfig, ForwarderEngine, ShutdownHandle};
-use ndn_face_quic::{KeyFingerprint, LinkEndpoint, LinkKey, LinkKeySource, LinkTransportConfig};
-use ndn_link::{
-    ConfiguredEndpoints, EngineFaces, Grant, GrantRole, HostCandidates, LinkDetail, LinkHints,
-    LinkSetup, LinkTrust, Links, Quotas, RelayService, ServePolicy,
-};
-use ndn_packet::{Data, Name};
-use ndn_security::sync_group;
-use ndn_security::{
-    Certificate, Keyring, SecurityManager, SecurityProfile, SignedTrustContext, TrustSchema,
-    Validator,
-};
-use ndn_sync::MemoryStore;
-use ndn_trust_envelope::TrustEnvelope;
-use tokio_util::sync::CancellationToken;
-
-const VALIDITY_MS: u64 = 365 * 24 * 3600 * 1000;
-const FOLDER: &str = "/alice/32=data/notebook";
-const ANN: &str = "/alice/member/laptop";
-
-fn n(s: &str) -> Name {
-    s.parse().unwrap()
-}
-
-/// A person: a namespace with its root key, trust context and anchor.
-struct Person {
-    ns: Name,
-    authority: SecurityManager,
-    issuer: Name,
-    ctx: Arc<SignedTrustContext>,
-    signed: Bytes,
-}
-
-impl Person {
-    async fn new(ns: &str) -> Person {
-        let ns = n(ns);
-        let authority = SecurityManager::new();
-        let issuer = authority
-            .generate_ed25519(ns.clone().append("KEY").append("ns"))
-            .unwrap();
-        let signer = authority.get_signer_sync(&issuer).unwrap();
-        let anchor = authority
-            .issue_self_signed_async(&issuer, signer.public_key().unwrap(), VALIDITY_MS)
-            .await
-            .unwrap();
-        let ctx = SignedTrustContext::hierarchical(ns.clone()).with_version(1);
-        assert!(ctx.add_anchor(anchor));
-        let signed = ctx.sign_into_data(signer.as_ref()).unwrap().raw().clone();
-        Person {
-            ns,
-            authority,
-            issuer,
-            ctx: Arc::new(ctx),
-            signed,
-        }
-    }
-}
-
-/// A device's keys, and its link socket when it listens.
-struct Parts {
-    name: Name,
-    keys: Arc<SecurityManager>,
-    key_name: Name,
-    link_key: Arc<dyn LinkKeySource>,
-    fingerprint: KeyFingerprint,
-    public: Bytes,
-    socket: Option<Arc<LinkEndpoint>>,
-    addr: Option<SocketAddr>,
-    transport: LinkTransportConfig,
-}
-
-impl Parts {
-    fn new(device: &str, listen: bool) -> Parts {
-        let name = n(device);
-        let keys = Arc::new(SecurityManager::new());
-        let key_name = keys
-            .generate_ed25519(name.clone().append("KEY").append("1"))
-            .unwrap();
-        let signer = keys.get_signer_sync(&key_name).unwrap();
-        let public = signer.public_key().unwrap();
-        let link_key = LinkKey::from_signer(signer).unwrap();
-        let fingerprint = link_key.fingerprint();
-        let transport = LinkTransportConfig::default();
-        let link_key: Arc<dyn LinkKeySource> = Arc::new(link_key);
-        let socket = listen.then(|| {
-            Arc::new(
-                LinkEndpoint::bind(
-                    "127.0.0.1:0".parse().unwrap(),
-                    Arc::clone(&link_key),
-                    &transport,
-                    true,
-                )
-                .unwrap(),
-            )
-        });
-        let addr = socket.as_ref().map(|s| s.local_addr().unwrap());
-        Parts {
-            name,
-            keys,
-            key_name,
-            link_key,
-            fingerprint,
-            public,
-            socket,
-            addr,
-            transport,
-        }
-    }
-
-    /// The certificate `person` gives this device's key.
-    async fn certified(&self, person: &Person) -> Certificate {
-        let cert = person
-            .authority
-            .certify(
-                &self.key_name,
-                self.public.clone(),
-                &person.issuer,
-                VALIDITY_MS,
-            )
-            .await
-            .unwrap();
-        self.keys.cert_cache().insert(cert.clone());
-        cert
-    }
-}
-
-/// The host's trust data for the link library.
-struct Trust {
-    keyring: Arc<Keyring>,
-    chain: Vec<Bytes>,
-    validator: Arc<Validator>,
-}
-
-impl LinkTrust for Trust {
-    fn keyring(&self) -> &Arc<Keyring> {
-        &self.keyring
-    }
-    fn own_chain(&self) -> Vec<Bytes> {
-        self.chain.clone()
-    }
-    fn known_certificate(&self, name: &Name) -> Option<Certificate> {
-        self.validator.cert_cache().get_valid(name)
-    }
-    fn known_certificate_of_key(&self, _: &KeyFingerprint) -> Option<Certificate> {
-        None
-    }
-}
-
-fn trust(person: &Person, cert: &Certificate) -> (Arc<Validator>, Arc<Trust>) {
-    let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
-    validator.adopt_context(Arc::clone(&person.ctx)).unwrap();
-    validator.cert_cache().insert(cert.clone());
-    let trust = Arc::new(Trust {
-        keyring: Arc::clone(validator.keyring()),
-        chain: vec![cert.data_wire().unwrap()],
-        validator: Arc::clone(&validator),
-    });
-    (validator, trust)
-}
-
-/// A host's introducer: its person's signed context, adoption into its
-/// validator and forwarder, a link hint and a dial through its links, and
-/// the grants its device makes and ends forwarded to them.
-struct Host {
-    anchor: Bytes,
-    validator: Arc<Validator>,
-    engine: ForwarderEngine,
-    hints: OnceLock<LinkHints>,
-}
-
-impl Introducer for Host {
-    fn anchor(&self) -> Option<Bytes> {
-        Some(self.anchor.clone())
-    }
-
-    fn adopt<'a>(&'a self, link: &'a TrustEnvelope) -> ndn_data::intro::Adopting<'a> {
-        Box::pin(async move {
-            let TrustEnvelope::Anchor {
-                namespace: Some(ns),
-                context_data: Some(data),
-                ..
-            } = link
-            else {
-                return Err("not an inline anchor link".into());
-            };
-            let ns: Name = ns.parse().map_err(|_| "no name".to_string())?;
-            let data = Data::decode(data.clone()).map_err(|e| format!("{e:?}"))?;
-            let (ctx, _) = SignedTrustContext::open_received(&data)
-                .await
-                .map_err(|e| e.to_string())?;
-            if self.validator.keyring().held(&ns).is_none() {
-                self.validator
-                    .adopt_context(Arc::new(ctx))
-                    .map_err(|refused| refused.to_string())?;
-            }
-            ndn_namespace::sync_group::carry(&self.engine, &ns);
-            Ok(())
-        })
-    }
-
-    fn link_hint(&self) -> Option<LinkHint> {
-        self.hints.get().and_then(LinkHints::hint)
-    }
-
-    fn dial<'a>(&'a self, hint: &'a LinkHint, inviter: &'a Name, within: Duration) -> Dialing<'a> {
-        match self.hints.get() {
-            Some(hints) => hints.dial(hint, inviter, within),
-            None => Box::pin(async { Err("no links".to_string()) }),
-        }
-    }
-
-    fn undial(&self, hint: &LinkHint, inviter: &Name) {
-        if let Some(hints) = self.hints.get() {
-            hints.undial(hint, inviter);
-        }
-    }
-
-    fn grant(&self, grant: &DataGrant) {
-        if let Some(hints) = self.hints.get() {
-            hints.grant(grant);
-        }
-    }
-
-    fn revoke_grant(&self, key: &[u8; 32]) {
-        if let Some(hints) = self.hints.get() {
-            hints.revoke_grant(key);
-        }
-    }
-}
-
-/// How a test's device is set up.
-#[derive(Clone)]
-struct Setup {
-    /// It listens for links on a loopback socket and takes introductions.
-    listen: bool,
-    /// Whom it serves.
-    serve: ServePolicy,
-    /// How long a grant its device makes lasts: `None`, no date (it follows
-    /// the members record).
-    grant_for: Option<Duration>,
-}
-
-impl Setup {
-    /// An inviter that keeps the default policy: `own`, and the grants its
-    /// device makes.
-    fn inviter() -> Setup {
-        Setup {
-            listen: true,
-            serve: ServePolicy::Own,
-            grant_for: None,
-        }
-    }
-
-    fn open() -> Setup {
-        Setup {
-            serve: ServePolicy::Open {
-                quotas: Quotas::default(),
-            },
-            ..Setup::inviter()
-        }
-    }
-
-    /// A joiner: dial-only.
-    fn dialer() -> Setup {
-        Setup {
-            listen: false,
-            ..Setup::inviter()
-        }
-    }
-}
-
-/// A device of a person, alone on a forwarder of its own: its data layer, its
-/// links.
-struct Embedded {
-    device: Device,
-    links: Arc<Links>,
-    hints: LinkHints,
-    key: KeyFingerprint,
-    ns: Name,
-    addr: Option<SocketAddr>,
-    cancel: CancellationToken,
-    engine: ForwarderEngine,
-    _shutdown: ShutdownHandle,
-    validator: Arc<Validator>,
-    skew: Arc<AtomicU64>,
-}
-
-impl Drop for Embedded {
-    fn drop(&mut self) {
-        self.cancel.cancel();
-    }
-}
-
-impl Embedded {
-    /// Every offer this device made has run out by its clock (moved two hours
-    /// on): no stranger's introduction link is worth taking, so a device the
-    /// policy does not serve is refused, with the reason.
-    fn offers_run_out(&self) {
-        self.skew.store(2 * 3_600_000, Ordering::SeqCst);
-        assert!(
-            !self.device.introductions().open(),
-            "an offer is still open two hours on"
-        );
-    }
-}
-
-async fn embedded(person: &Person, device: &str, setup: Setup) -> Embedded {
-    let parts = Parts::new(device, setup.listen);
-    let cert = parts.certified(person).await;
-    let (validator, trust) = trust(person, &cert);
-    let (engine, shutdown) = EngineBuilder::new(EngineConfig::default())
-        .security_profile(SecurityProfile::Disabled)
-        .build()
-        .await
-        .unwrap();
-    ndn_namespace::sync_group::carry(&engine, &person.ns);
-    let cancel = CancellationToken::new();
-    let skew = Arc::new(AtomicU64::new(0));
-    let clock: Clock = {
-        let by = Arc::clone(&skew);
-        Arc::new(move || {
-            let now = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .map_or(0, |d| d.as_millis() as u64);
-            Timestamp(now + by.load(Ordering::SeqCst))
-        })
-    };
-    let links = Links::start(
-        LinkSetup {
-            peers: Vec::new(),
-            key: Arc::clone(&parts.link_key),
-            trust,
-            faces: Arc::new(EngineFaces(engine.clone())),
-            paths: Arc::new(ConfiguredEndpoints),
-            candidates: vec![Arc::new(HostCandidates {
-                include_local: true,
-            })],
-            socket: parts.socket.clone(),
-            transport: parts.transport.clone(),
-            relays: Default::default(),
-            service: RelayService {
-                serve: setup.serve,
-                ..RelayService::default()
-            },
-            direct: Default::default(),
-        },
-        cancel.clone(),
-    );
-    let hints = LinkHints::new(Arc::clone(&links));
-    let host = Arc::new(Host {
-        anchor: person.signed.clone(),
-        validator: Arc::clone(&validator),
-        engine: engine.clone(),
-        hints: OnceLock::new(),
-    });
-    let _ = host.hints.set(hints.clone());
-    let device = Device::start(
-        Transport {
-            node: engine.app_node(cancel.child_token()),
-            sync: engine.app_face(cancel.child_token()),
-        },
-        parts.name.clone(),
-        Arc::clone(&parts.keys),
-        Arc::clone(&validator),
-        Arc::new(MemoryStore::new()),
-        Config {
-            clock,
-            first_look: Duration::from_secs(1),
-            introducer: Some(host),
-            intro: IntroPolicy {
-                local_candidates: true,
-                grant_for: setup.grant_for,
-                ..IntroPolicy::new()
-            },
-            ..Config::new()
-        },
-    )
-    .await
-    .unwrap();
-    if setup.listen {
-        hints.serve(&device);
-    }
-    Embedded {
-        device,
-        links,
-        hints,
-        key: parts.fingerprint,
-        ns: person.ns.clone(),
-        addr: parts.addr,
-        cancel,
-        engine,
-        validator,
-        skew,
-        _shutdown: shutdown,
-    }
-}
-
-fn note() -> PutOptions {
-    PutOptions {
-        type_id: TypeId {
-            name: n("/types/note"),
-            revision: 1,
-        },
-        keep: Keep::Forever,
-        batch: None,
-    }
-}
-
-fn text(s: &str) -> Content {
-    Content::new().with("text", Bytes::copy_from_slice(s.as_bytes()))
-}
-
-/// Whether `layer` reads `s` as the newest note of `collection`.
-async fn reads(layer: &Device, collection: &Name, s: &str) -> bool {
-    match layer.get(collection).await {
-        Ok(Answer {
-            got: Got::Version(v),
-            ..
-        }) => {
-            matches!(&v.payload, Payload::Entry(c) if c.get("text").is_some_and(|t| t[..] == *s.as_bytes()))
-        }
-        _ => false,
-    }
-}
-
-async fn until(what: &str, limit: Duration, mut done: impl AsyncFnMut() -> bool) {
-    let start = Instant::now();
-    while !done().await {
-        assert!(start.elapsed() < limit, "not within {limit:?}: {what}");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
-const LONG: Duration = Duration::from_secs(60);
-
-/// Ann's notebook, shared with `/alice` alone and with a cover written into
-/// it: an offer of it as `role` made by her laptop.
-async fn offered(laptop: &Embedded, role: Role) -> ndn_data::Code {
-    let folder = n(FOLDER);
-    laptop
-        .device
-        .share_folder(
-            &folder,
-            Sharing::Whole(Share {
-                rule: Rule::Log,
-                writers: vec![n("/alice")],
-                readers: vec![Audience::Person(n("/alice"))],
-            }),
-        )
-        .await
-        .unwrap();
-    laptop
-        .device
-        .put(
-            &folder.clone().append("cover"),
-            text("cover by ann"),
-            note(),
-        )
-        .await
-        .unwrap();
-    laptop
-        .device
-        .offer(
-            &folder,
-            Offer {
-                role,
-                until: Timestamp(
-                    SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .unwrap()
-                        .as_millis() as u64
-                        + 3_600_000,
-                ),
-                tries: 3,
-            },
-        )
-        .await
-        .unwrap()
-}
-
-/// Join with `link` as a host does what `NotReady` says: again with the same
-/// code until `limit` has passed.
-async fn joins(
-    phone: &Embedded,
-    link: &str,
-    limit: Duration,
-) -> Result<Joined, ndn_data::DataError> {
-    let started = Instant::now();
-    loop {
-        match phone.device.join(link).await {
-            Err(e) if e.next() == NextStep::RetryLater && started.elapsed() < limit => {}
-            other => return other,
-        }
-    }
-}
-
-/// What a refusal says: its sentence, its causes' and the other device's.
-fn said(detail: &LinkDetail) -> String {
-    let mut out = detail.text.clone();
-    for (k, v) in &detail.params {
-        out.push_str(&format!(" {k}={v}"));
-    }
-    for cause in &detail.causes {
-        out.push(' ');
-        out.push_str(&said(cause));
-    }
-    out
-}
-
-/// Ann is linked to the device with `key`.
-fn linked(on: &Embedded, key: KeyFingerprint) -> bool {
-    on.links
-        .report()
-        .links
-        .iter()
-        .any(|l| l.key == Some(key) && !l.paths.is_empty())
-}
-
-/// Dial Ann (by her key and address, as a joiner's code names them) from
-/// `from`.
-async fn dials(from: &Embedded, ann: &Embedded) -> Result<(), LinkDetail> {
-    from.links
-        .dial_by_key(
-            ann.key,
-            n(ANN),
-            vec![ann.addr.expect("ann listens")],
-            Duration::from_secs(10),
-            Vec::new(),
-        )
-        .await
-}
-
-/// Invite `bob` as `role` and have him join; returns the link Ann's laptop
-/// then has with him, up and made by the grant.
-async fn invited(ann: &Embedded, bob: &Embedded, role: Role) {
-    let code = offered(ann, role).await;
-    let joined = joins(bob, &code.link, Duration::from_secs(90))
-        .await
-        .unwrap_or_else(|e| {
-            panic!(
-                "the join failed: {e} ({:?})\nbob: {:#?}\nann: {:#?}",
-                e.next(),
-                bob.links.report(),
-                ann.links.report()
-            )
-        });
-    assert_eq!(joined.role, role);
-}
-
-/// The prefixes (sorted, as text) `on`'s forwarder routes over its links to
-/// the device with key `key`.
-fn routed_over(on: &Embedded, key: KeyFingerprint) -> Vec<String> {
-    let faces: Vec<_> = on
-        .links
-        .report()
-        .links
-        .iter()
-        .filter(|l| l.key == Some(key))
-        .flat_map(|l| l.paths.iter().map(|p| p.face))
-        .collect();
-    let mut out: Vec<String> = on
-        .engine
-        .fib()
-        .dump()
-        .into_iter()
-        .filter(|(_, e)| e.nexthops.iter().any(|h| faces.contains(&h.face_id)))
-        .map(|(prefix, _)| prefix.to_string())
-        .collect();
-    out.sort();
-    out
-}
-
-/// Where a device answers probes: under its namespace's sync group, a name
-/// the other device's forwarder routes over the link (the group's route), and
-/// not under the device's own name.
-fn probe_prefix(on: &Embedded) -> Name {
-    sync_group(&on.ns).append("probe")
-}
-
-/// `on` answers probes with a Data: a Data a device sends on its own, toward
-/// the other.
-fn answers_probes(on: &Embedded) {
-    let producer = on
-        .engine
-        .register_producer(probe_prefix(on), on.cancel.child_token());
-    tokio::spawn(async move {
-        let _ = producer
-            .serve(|interest, responder| async move {
-                let _ = responder
-                    .respond((*interest.name).clone(), Bytes::from_static(b"probe"))
-                    .await;
-            })
-            .await;
-    });
-}
-
-/// Whether `from` fetches `/<to>/probe/<tag>` from `to` (it answers probes).
-async fn probes(from: &Embedded, to: &Embedded, tag: &str) -> bool {
-    let mut consumer = from.engine.app_consumer(from.cancel.child_token());
-    consumer.fetch(probe_prefix(to).append(tag)).await.is_ok()
-}
+use ndn_data::{Audience, DataLayer, Role, Rule, Share, Sharing, Timestamp};
+use ndn_link::{Grant, GrantRole};
+use ndn_packet::{Name, NameComponent};
 
 /// Ann invites Bob, who joins and syncs a note both ways with her, under the
 /// default `own` policy: his link is the grant's, in his namespace only, and
@@ -730,31 +127,6 @@ async fn ann_invites_bob_who_syncs_both_ways_and_carol_gets_no_link() {
     );
     // Bob's link is unaffected.
     assert!(linked(&ann, bob.key));
-}
-
-/// The name of the newest entry of `collection` that `device` (the name of
-/// `on`'s device) wrote, as `on` holds it: a single version's own name, or,
-/// for a merged collection, the log entry of the writer's highest seq.
-async fn newest_entry(on: &Embedded, device: &str, collection: &Name) -> Name {
-    match on.device.get(collection).await {
-        Ok(Answer {
-            got: Got::Version(v),
-            ..
-        }) => v.name,
-        Ok(Answer {
-            got: Got::State(state),
-            ..
-        }) => {
-            let seq = state
-                .at
-                .iter()
-                .map(|(_, seq)| seq.0)
-                .max()
-                .unwrap_or_else(|| panic!("{collection} has an empty state on {}", on.ns));
-            ndn_data::wire::log_name(&n(device), Some(collection), seq)
-        }
-        other => panic!("{collection} has no entry on {}: {other:?}", on.ns),
-    }
 }
 
 /// A grant links a person; it does not hand them everything the device
@@ -989,8 +361,8 @@ async fn a_revoked_grant_closes_the_link_and_the_redial_is_refused() {
     invited(&ann, &bob, Role::Writer).await;
     until("ann is linked to bob", LONG, async || linked(&ann, bob.key)).await;
 
-    assert!(ann.links.revoke_grant(&bob.key), "no grant was in force");
-    assert!(!ann.links.revoke_grant(&bob.key), "revoked twice");
+    assert!(ann.links.revoke_grants(&bob.key), "no grant was in force");
+    assert!(!ann.links.revoke_grants(&bob.key), "revoked twice");
     until("the link closes", LONG, async || {
         !linked(&ann, bob.key) && !linked(&bob, ann.key)
     })
@@ -1007,12 +379,23 @@ async fn a_revoked_grant_closes_the_link_and_the_redial_is_refused() {
 }
 
 /// A removed member's link closes: Ann's members record drops Bob, her
-/// device revokes the grant, and the link ends.
+/// device revokes the grant, and the link ends. Ann's device keeps no
+/// departure mark here (`departure_for` zero: round 7's way to say a person
+/// let go is not told), so this is the plain close and the plain refusal;
+/// what a mark changes is `tests/departures.rs`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_removed_members_link_closes_when_the_record_drops_him() {
     let alice = Person::new("/alice").await;
     let bobs = Person::new("/bob").await;
-    let ann = embedded(&alice, ANN, Setup::inviter()).await;
+    let ann = embedded(
+        &alice,
+        ANN,
+        Setup {
+            departure_for: Duration::ZERO,
+            ..Setup::inviter()
+        },
+    )
+    .await;
     let bob = embedded(&bobs, "/bob/member/phone", Setup::dialer()).await;
     invited(&ann, &bob, Role::Writer).await;
     until("ann is linked to bob", LONG, async || linked(&ann, bob.key)).await;
@@ -1072,7 +455,7 @@ async fn under_open_a_grant_changes_nothing() {
     answers_probes(&bob);
     answers_probes(&ann);
     assert!(probes(&ann, &bob, "open").await, "open's link dropped Data");
-    assert!(ann.links.revoke_grant(&bob.key));
+    assert!(ann.links.revoke_grants(&bob.key));
     // The link is open's: it carries as it did.
     assert!(
         probes(&ann, &bob, "after").await && probes(&bob, &ann, "after").await,
@@ -1188,4 +571,287 @@ async fn own_refuses_without_a_grant_and_a_hosts_grant_links_its_key_only() {
         said(&refused)
     );
     assert!(!linked(&ann, carol.key));
+}
+
+/// SHAPES-R7 A: Ann invites Bob into two folders with two notes, and he is
+/// let into both; both sync; a members record that leaves him out of the
+/// first alone ends the first's entry and leaves the second synced, on the
+/// same link, with no close. What the ended entry carried is no longer
+/// carried, what the standing one carries still is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_notes_bob_let_into_both_both_sync_and_letting_him_go_of_one_leaves_the_other() {
+    let alice = Person::new("/alice").await;
+    let bobs = Person::new("/bob").await;
+    let ann = embedded(&alice, ANN, Setup::inviter()).await;
+    let bob = embedded(&bobs, "/bob/member/phone", Setup::dialer()).await;
+    let (first, second) = (n(FOLDER), n(SECOND));
+
+    invited(&ann, &bob, Role::Writer).await;
+    shared(&ann, &second).await;
+    invited_in(&ann, &bob, &second, Role::Writer).await;
+
+    // Two entries of one key, one link.
+    let grants = ann.links.grants();
+    assert_eq!(grants.len(), 2, "{grants:#?}");
+    assert!(grants.iter().all(|g| g.key == bob.key));
+    // Sorted by key, then folder (by the names' canonical order).
+    let mut folders = vec![first.clone(), second.clone()];
+    folders.sort();
+    assert_eq!(
+        grants.iter().map(|g| g.folder.clone()).collect::<Vec<_>>(),
+        folders
+    );
+    until("ann is linked to bob", LONG, async || {
+        linked(&ann, bob.key) && linked(&bob, ann.key)
+    })
+    .await;
+
+    // Both folders sync both ways.
+    for folder in [&first, &second] {
+        let cover = folder.clone().append("cover");
+        until("bob reads ann's cover", LONG, async || {
+            reads(&bob.device, &cover, "cover by ann").await
+        })
+        .await;
+        let from_bob = folder.clone().append("from-bob");
+        puts(&bob.device, &from_bob, text("bob was here"), LONG).await;
+        until("ann reads bob's note", LONG, async || {
+            reads(&ann.device, &from_bob, "bob was here").await
+        })
+        .await;
+    }
+
+    // A record that leaves Bob out of the first folder only.
+    reshare(&ann, &first, &[n("/alice")]).await;
+    until("the first folder's entry ends", LONG, async || {
+        let grants = ann.links.grants();
+        grants.len() == 1 && grants[0].folder == second
+    })
+    .await;
+    let grants = ann.links.grants();
+    assert_eq!(grants[0].key, bob.key);
+    assert_eq!(grants[0].role, GrantRole::Writer);
+
+    // The link stands: it was never closed, and the second folder still
+    // syncs both ways, with notes written after the first ended.
+    let after_ann = second.clone().append("after-ann");
+    ann.device
+        .put(&after_ann, text("still here"), note())
+        .await
+        .unwrap();
+    until("bob reads what ann writes after", LONG, async || {
+        reads(&bob.device, &after_ann, "still here").await
+    })
+    .await;
+    let after_bob = second.clone().append("after-bob");
+    puts(&bob.device, &after_bob, text("and me"), LONG).await;
+    until("ann reads what bob writes after", LONG, async || {
+        reads(&ann.device, &after_bob, "and me").await
+    })
+    .await;
+    assert!(
+        linked(&ann, bob.key) && linked(&bob, ann.key),
+        "letting Bob go of one folder closed the link of the other: {:#?}",
+        ann.links.report()
+    );
+
+    // What the ended entry carried is not carried now: an entry Ann writes
+    // into the first folder is not answered to Bob; the second's is.
+    let left = first.clone().append("after-ann");
+    ann.device
+        .put(&left, text("not for bob"), note())
+        .await
+        .unwrap();
+    let left_entry = newest_entry(&ann, ANN, &left).await;
+    let kept_entry = newest_entry(&ann, ANN, &after_ann).await;
+    assert!(
+        asks(&bob, ann.key, &kept_entry, false).await,
+        "{kept_entry} of the folder Bob stays in was not answered"
+    );
+    assert!(
+        !asks(&bob, ann.key, &left_entry, false).await,
+        "{left_entry} of the folder Bob was let go of was answered over his link"
+    );
+}
+
+/// Three people, each invited separately: Bob and Carol never met, and Ann's
+/// grant links to each carry the summary root of the other's namespace (the
+/// writers the members record lists), so all three read everything the
+/// others wrote (REPLY-17's G11).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_reads_another_member_let_in_by_another_invitation() {
+    let alice = Person::new("/alice").await;
+    let bobs = Person::self_certifying([0xb2; 32]).await;
+    let carols = Person::self_certifying([0xc2; 32]).await;
+    let ann = embedded(&alice, ANN, Setup::inviter()).await;
+    let bob = embedded(&bobs, &bobs.device("phone"), Setup::dialer()).await;
+    let carol = embedded(&carols, &carols.device("phone"), Setup::dialer()).await;
+    let folder = n(FOLDER);
+
+    invited(&ann, &bob, Role::Writer).await;
+    invited_in(&ann, &carol, &folder, Role::Writer).await;
+    until("ann is linked to both", LONG, async || {
+        linked(&ann, bob.key) && linked(&ann, carol.key)
+    })
+    .await;
+
+    // Each writes a note of its own.
+    let people = [
+        (&ann, "from-ann", "ann writes"),
+        (&bob, "from-bob", "bob writes"),
+        (&carol, "from-carol", "carol writes"),
+    ];
+    for (who, name, words) in people {
+        puts(&who.device, &folder.clone().append(name), text(words), LONG).await;
+    }
+    // All three read everything.
+    for (reader, who) in [(&ann, "ann"), (&bob, "bob"), (&carol, "carol")] {
+        for (_, name, words) in people {
+            let collection = folder.clone().append(name);
+            until(&format!("{who} reads {name}"), LONG, async || {
+                reads(&reader.device, &collection, words).await
+            })
+            .await;
+        }
+    }
+}
+
+/// SHAPES-R7 C: the names a grant carries for the other writers are derived
+/// from the members record in force at every packet. A writer the record
+/// drops stops being carried: her summary root is refused at the next
+/// packet, while her entries of the folder are still carried as the
+/// collection's; and a name of hers outside the folder is refused all along.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_removed_writers_names_stop_being_carried_and_a_name_outside_the_folder_never_was() {
+    let alice = Person::new("/alice").await;
+    let bobs = Person::self_certifying([0xb2; 32]).await;
+    let carols = Person::self_certifying([0xc2; 32]).await;
+    let ann = embedded(&alice, ANN, Setup::inviter()).await;
+    let bob = embedded(&bobs, &bobs.device("phone"), Setup::dialer()).await;
+    let carol = embedded(&carols, &carols.device("phone"), Setup::dialer()).await;
+    let folder = n(FOLDER);
+
+    invited(&ann, &bob, Role::Writer).await;
+    invited_in(&ann, &carol, &folder, Role::Writer).await;
+    until("ann is linked to both", LONG, async || {
+        linked(&ann, bob.key) && linked(&ann, carol.key)
+    })
+    .await;
+    // Carol writes into the folder and, beside it, into a collection of her
+    // own namespace that no record gives readers.
+    let written = folder.clone().append("from-carol");
+    puts(&carol.device, &written, text("carol writes"), LONG).await;
+    let diary = carols
+        .ns
+        .clone()
+        .append_component(NameComponent::keyword(Bytes::from_static(b"data")))
+        .append("diary");
+    puts(&carol.device, &diary, text("carol's diary"), LONG).await;
+    until("ann reads carol's note", LONG, async || {
+        reads(&ann.device, &written, "carol writes").await
+    })
+    .await;
+    until("bob reads carol's note", LONG, async || {
+        reads(&bob.device, &written, "carol writes").await
+    })
+    .await;
+    // Bob asks for what Carol wrote as the walk does: of Ann, a device that
+    // holds it, by the name `<Ann>/32=held/<name>` (spec §13.5). Ann's
+    // forwarder relays nothing between two links, so only what Ann's own
+    // device holds can be asked of her over Bob's link: her copy of Carol's
+    // entry of the folder, and (to show the answer is not "everything") her
+    // copy of nothing of Carol's diary. The names' derivation from the
+    // record at each packet — a listed writer's public names carried, a
+    // dropped one's not, her collections outside the folder never — is the
+    // unit case `grants::tests::the_public_names_of_a_listed_writer_...`.
+    let held = |name: &Name| ndn_data::wire::held_name(&n(ANN), name);
+    let carols_entry = held(&newest_entry(&ann, &carols.device("phone"), &written).await);
+    let carols_diary = held(&newest_entry(&carol, &carols.device("phone"), &diary).await);
+
+    // While the record lists Carol her entry of the folder crosses Bob's
+    // link; her diary, outside the folder, is not answered.
+    assert!(
+        asks(&bob, ann.key, &carols_entry, false).await,
+        "{carols_entry}: the record lists Carol, yet her entry was not answered"
+    );
+    assert!(
+        !asks(&bob, ann.key, &carols_diary, false).await,
+        "{carols_diary}, outside the folder, was answered over Bob's link"
+    );
+
+    // A record without Carol: her entry ends; Bob's link and his reading of
+    // what she wrote stand (the entries are the collection's, carried
+    // whoever wrote them); her diary is still not answered.
+    reshare(&ann, &folder, &[alice.ns.clone(), bobs.ns.clone()]).await;
+    until("carol's entry ends", LONG, async || {
+        ann.links.grants().iter().all(|g| g.key != carol.key)
+    })
+    .await;
+    assert!(
+        asks(&bob, ann.key, &carols_entry, false).await,
+        "{carols_entry}, an entry of the folder, stopped being carried with its writer"
+    );
+    assert!(
+        !asks(&bob, ann.key, &carols_diary, false).await,
+        "{carols_diary}, outside the folder, was answered over Bob's link"
+    );
+    assert!(linked(&ann, bob.key), "Bob's link closed with Carol's");
+}
+
+/// SHAPES-R7 C: a grant's role is per entry and judged at every packet. Bob
+/// is a reader of one folder: the Data he answers with under a name only a
+/// writer's entry carries (his namespace's sync group) is dropped at Ann's
+/// end, as a reader's push always was. By a second invitation he is a writer
+/// of another folder: the same answer then passes, on the same link. When
+/// the writer entry ends (a record without him), the reader's entry alone
+/// stands and the answer is dropped again, again with no close. (The names
+/// of one folder against another's are in `tests/grant_rules.rs`: Ann's
+/// forwarder routes only Bob's names over his link, so a real Interest for a
+/// folder's names under another device's name cannot be asked of him.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reader_role_grant_gains_no_push_scope_and_a_writer_entry_of_another_folder_passes() {
+    let alice = Person::new("/alice").await;
+    let bobs = Person::new("/bob").await;
+    let ann = embedded(&alice, ANN, Setup::inviter()).await;
+    let bob = embedded(&bobs, "/bob/member/phone", Setup::dialer()).await;
+    let second = n(SECOND);
+    answers_probes(&bob);
+
+    invited(&ann, &bob, Role::Reader).await;
+    until("ann is linked to bob", LONG, async || {
+        linked(&ann, bob.key) && linked(&bob, ann.key)
+    })
+    .await;
+    assert!(
+        !probes(&ann, &bob, "reader").await,
+        "the Data a reader pushed crossed Ann's end of the link"
+    );
+
+    // A writer of the second folder as well: what a writer's entry carries
+    // passes.
+    shared(&ann, &second).await;
+    invited_in(&ann, &bob, &second, Role::Writer).await;
+    let roles: Vec<_> = ann.links.grants().iter().map(|g| g.role).collect();
+    assert_eq!(roles.len(), 2, "{roles:?}");
+    assert!(roles.contains(&GrantRole::Reader) && roles.contains(&GrantRole::Writer));
+    assert!(
+        probes(&ann, &bob, "writer").await,
+        "the Data a writer of the second folder pushed was dropped"
+    );
+
+    // The writer entry ends: the reader's entry alone stands.
+    reshare(&ann, &second, &[n("/alice")]).await;
+    until("the second folder's entry ends", LONG, async || {
+        ann.links.grants().len() == 1
+    })
+    .await;
+    assert_eq!(ann.links.grants()[0].role, GrantRole::Reader);
+    assert!(
+        !probes(&ann, &bob, "reader-again").await,
+        "a Data crossed Ann's end of the link after the only writer entry ended"
+    );
+    assert!(
+        linked(&ann, bob.key) && linked(&bob, ann.key),
+        "an entry ending closed the link a reader's entry still holds"
+    );
 }
