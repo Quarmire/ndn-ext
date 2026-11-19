@@ -27,8 +27,9 @@ use crate::policy::{JOINED_FOLDERS_MAX, JOINED_ROUTES_MAX};
 ///
 /// A route is a path, not a right: what may be fetched over the link is
 /// decided by the inviter's per-packet filter for the entry the inviter holds
-/// for this device, so a reader-role joiner is routed the same prefixes and
-/// the inviter drops what a reader may not fetch or push.
+/// for this device, so the inviter drops what a reader may not fetch or push,
+/// whatever is routed here ([`JoinedRoutes::push`] says what a reader is not
+/// routed).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JoinedRoutes {
     /// The inviter's link key. The route is installed over the full link
