@@ -263,8 +263,9 @@ struct Setup {
     listen: bool,
     /// Whom it serves.
     serve: ServePolicy,
-    /// How long a grant its device makes lasts.
-    grant_for: Duration,
+    /// How long a grant its device makes lasts: `None`, no date (it follows
+    /// the members record).
+    grant_for: Option<Duration>,
 }
 
 impl Setup {
@@ -274,7 +275,7 @@ impl Setup {
         Setup {
             listen: true,
             serve: ServePolicy::Own,
-            grant_for: Duration::from_secs(90 * 24 * 3600),
+            grant_for: None,
         }
     }
 
@@ -301,6 +302,7 @@ impl Setup {
 struct Embedded {
     device: Device,
     links: Arc<Links>,
+    hints: LinkHints,
     key: KeyFingerprint,
     ns: Name,
     addr: Option<SocketAddr>,
@@ -409,6 +411,7 @@ async fn embedded(person: &Person, device: &str, setup: Setup) -> Embedded {
     Embedded {
         device,
         links,
+        hints,
         key: parts.fingerprint,
         ns: person.ns.clone(),
         addr: parts.addr,
@@ -685,7 +688,9 @@ async fn ann_invites_bob_who_syncs_both_ways_and_carol_gets_no_link() {
         .expect("ann is linked to bob");
     let granted = link.granted.as_ref().expect("the link says it is granted");
     assert!(
-        granted.describe().starts_with("granted until "),
+        granted
+            .describe()
+            .starts_with("granted with no end date (it follows the folder's members record) as a "),
         "{}",
         granted.describe()
     );
@@ -727,9 +732,210 @@ async fn ann_invites_bob_who_syncs_both_ways_and_carol_gets_no_link() {
     assert!(linked(&ann, bob.key));
 }
 
+/// The name of the newest entry of `collection` that `device` (the name of
+/// `on`'s device) wrote, as `on` holds it: a single version's own name, or,
+/// for a merged collection, the log entry of the writer's highest seq.
+async fn newest_entry(on: &Embedded, device: &str, collection: &Name) -> Name {
+    match on.device.get(collection).await {
+        Ok(Answer {
+            got: Got::Version(v),
+            ..
+        }) => v.name,
+        Ok(Answer {
+            got: Got::State(state),
+            ..
+        }) => {
+            let seq = state
+                .at
+                .iter()
+                .map(|(_, seq)| seq.0)
+                .max()
+                .unwrap_or_else(|| panic!("{collection} has an empty state on {}", on.ns));
+            ndn_data::wire::log_name(&n(device), Some(collection), seq)
+        }
+        other => panic!("{collection} has no entry on {}: {other:?}", on.ns),
+    }
+}
+
+/// A grant links a person; it does not hand them everything the device
+/// answers by name. Over Bob's grant link Ann answers the names of the
+/// offered folder, and Bob's own device is reachable, but an **unsealed**
+/// collection of her namespace outside the folder (the data layer answers
+/// those to anyone who asks by name) is not answered: the link does not
+/// carry its names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grant_link_answers_the_folders_names_and_not_an_unsealed_collection_outside_it() {
+    let alice = Person::new("/alice").await;
+    let bobs = Person::new("/bob").await;
+    let ann = embedded(&alice, ANN, Setup::inviter()).await;
+    let bob = embedded(&bobs, "/bob/member/phone", Setup::dialer()).await;
+    invited(&ann, &bob, Role::Writer).await;
+    until("ann is linked to bob", LONG, async || linked(&ann, bob.key)).await;
+    until("bob routes ann's device", LONG, async || {
+        routed_over(&bob, ann.key).contains(&ANN.to_string())
+    })
+    .await;
+
+    // Ann writes into a collection outside the offered folder; no members
+    // record gives it readers, so the layer answers it to whoever asks.
+    let diary = n("/alice/32=data/diary");
+    ann.device
+        .put(&diary, text("ann's diary"), note())
+        .await
+        .unwrap();
+    let diary_entry = newest_entry(&ann, ANN, &diary).await;
+    // A note in the folder, which Bob's device fetches by itself.
+    let folder = n(FOLDER);
+    let shared = folder.clone().append("later");
+    ann.device
+        .put(&shared, text("for bob"), note())
+        .await
+        .unwrap();
+    let shared_entry = newest_entry(&ann, ANN, &shared).await;
+    until("bob reads the folder's note", LONG, async || {
+        reads(&bob.device, &shared, "for bob").await
+    })
+    .await;
+
+    // The folder's entry is answered over the link; the diary's is not,
+    // however Bob asks.
+    let mut at_bob = bob.engine.app_consumer(bob.cancel.child_token());
+    assert!(
+        at_bob.fetch(shared_entry.clone()).await.is_ok(),
+        "{shared_entry} of the offered folder was not answered over the grant link"
+    );
+    assert!(
+        at_bob.fetch(diary_entry.clone()).await.is_err(),
+        "{diary_entry}, an unsealed collection outside the offered folder, was answered over \
+         the grant link"
+    );
+
+    // Bob's own device is reachable: Ann fetches what he wrote.
+    let from_bob = folder.append("from-bob");
+    bob.device
+        .put(&from_bob, text("hello from bob"), note())
+        .await
+        .unwrap();
+    let bobs_entry = newest_entry(&bob, "/bob/member/phone", &from_bob).await;
+    let mut at_ann = ann.engine.app_consumer(ann.cancel.child_token());
+    until(
+        "ann fetches bob's entry from his device",
+        LONG,
+        async || at_ann.fetch(bobs_entry.clone()).await.is_ok(),
+    )
+    .await;
+}
+
+/// A host that ends the grant of a person who stays a member (it kicks
+/// them from its links, not from the folder) ends it durably: the links
+/// close, and a restart — which installs what the device derives
+/// (`LinkHints::serve`) — does not bring the grant back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grant_the_host_ended_does_not_come_back_at_the_restart() {
+    let alice = Person::new("/alice").await;
+    let bobs = Person::new("/bob").await;
+    let ann = embedded(&alice, ANN, Setup::inviter()).await;
+    let bob = embedded(&bobs, "/bob/member/phone", Setup::dialer()).await;
+    invited(&ann, &bob, Role::Writer).await;
+    until("ann is linked to bob", LONG, async || linked(&ann, bob.key)).await;
+
+    assert!(
+        ann.hints
+            .end_grant(&ann.device, &bob.key.0)
+            .await
+            .expect("the device made the end durable"),
+        "no grant was in force"
+    );
+    until("the link closes", LONG, async || {
+        !linked(&ann, bob.key) && !linked(&bob, ann.key)
+    })
+    .await;
+    assert!(ann.links.grants().is_empty());
+
+    // The restart: the device's grants are installed again.
+    ann.hints.serve(&ann.device);
+    assert!(
+        ann.device.grants().is_empty(),
+        "the device still lists a grant the host ended: {:#?}",
+        ann.device.grants()
+    );
+    assert!(
+        ann.links.grants().is_empty(),
+        "a grant the host ended came back at the restart: {:#?}",
+        ann.links.grants()
+    );
+    ann.offers_run_out();
+    let refused = dials(&bob, &ann)
+        .await
+        .expect_err("the grant the host ended linked again");
+    assert!(
+        said(&refused).contains("the grant ended"),
+        "{}",
+        said(&refused)
+    );
+}
+
+/// A host's renewal of a grant — a later date, then none — is durable: the
+/// grant as the device now derives it is what the links hold, and what a
+/// restart installs again, not the date the offer's admission gave it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hosts_renewal_of_a_grant_survives_the_restart() {
+    let alice = Person::new("/alice").await;
+    let bobs = Person::new("/bob").await;
+    let ann = embedded(
+        &alice,
+        ANN,
+        Setup {
+            grant_for: Some(Duration::from_secs(3600)),
+            ..Setup::inviter()
+        },
+    )
+    .await;
+    let bob = embedded(&bobs, "/bob/member/phone", Setup::dialer()).await;
+    invited(&ann, &bob, Role::Writer).await;
+    until("ann is linked to bob", LONG, async || linked(&ann, bob.key)).await;
+    let first = ann.links.grants()[0].until;
+    assert!(first.is_some(), "the device made a dated grant");
+
+    let in_two_days = Timestamp(
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 2 * 24 * 3_600_000,
+    );
+    let at = SystemTime::UNIX_EPOCH + Duration::from_millis(in_two_days.0);
+    let renewed = ann
+        .hints
+        .renew_grant(&ann.device, &bob.key.0, Some(in_two_days))
+        .await
+        .expect("the device made the renewal durable")
+        .expect("a grant a held record admits was live");
+    assert_eq!(renewed.until, Some(in_two_days));
+    assert_eq!(ann.links.grants()[0].until, Some(at));
+    assert!(linked(&ann, bob.key), "a renewal closed the link");
+    ann.hints.serve(&ann.device);
+    assert_eq!(
+        ann.links.grants()[0].until,
+        Some(at),
+        "the restart installed the date the offer's admission gave, not the renewed one"
+    );
+
+    // No date at all: it follows the members record.
+    ann.hints
+        .renew_grant(&ann.device, &bob.key.0, None)
+        .await
+        .expect("the device made the renewal durable")
+        .expect("a grant a held record admits was live");
+    assert_eq!(ann.links.grants()[0].until, None);
+    ann.hints.serve(&ann.device);
+    assert_eq!(ann.links.grants()[0].until, None);
+    assert!(linked(&ann, bob.key));
+}
+
 /// A grant that ran out closes the link at `until`, and the next dial of the
-/// key is refused naming the expiry. The device's grant lasts 90 days; the
-/// host shortens it through `Links::grant`.
+/// key is refused naming the expiry. The device's grant has no date; the
+/// host dates it through `Links::grant`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_expired_grant_closes_the_link_at_until_and_the_next_dial_names_it() {
     let alice = Person::new("/alice").await;
@@ -742,7 +948,7 @@ async fn an_expired_grant_closes_the_link_at_until_and_the_next_dial_names_it() 
     let started = Instant::now();
     let until_at = SystemTime::now() + Duration::from_secs(4);
     let mut shortened = ann.links.grants().remove(0);
-    shortened.until = until_at;
+    shortened.until = Some(until_at);
     ann.links.grant(shortened);
     // The same scope: the link stays up until the grant runs out.
     assert!(linked(&ann, bob.key), "a later `until` closed the link");
@@ -957,7 +1163,8 @@ async fn own_refuses_without_a_grant_and_a_hosts_grant_links_its_key_only() {
         key: bob.key,
         namespaces: vec![n("/bob")],
         role: GrantRole::Writer,
-        until: SystemTime::now() + Duration::from_secs(3600),
+        folder: n(FOLDER),
+        until: Some(SystemTime::now() + Duration::from_secs(3600)),
     });
     dials(&bob, &ann)
         .await

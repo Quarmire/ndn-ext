@@ -17,9 +17,15 @@
 //!    (`PeerSpec::remembered`, enforced in `decide_identified`).
 //! 5. Bounds and expiry are [`MemoryOptions`]; [`Links::forget`] is how a
 //!    host says a member left.
-//! 6. A record is saved in the background once its addresses changed;
-//!    nothing waits on the store, and a store that fails is logged and
-//!    reported by [`Links::report`].
+//! 6. A record is saved in the background once its addresses changed, each
+//!    at most once in [`MemoryOptions::save_interval`]; nothing waits on the
+//!    store, and a store that fails is logged and reported by
+//!    [`Links::report`].
+//! 7. The addresses are hints with a bound on what they can do: loopback
+//!    and link-local ones are not kept or dialled
+//!    ([`MemoryOptions::include_local`]), the redials are staggered
+//!    ([`MemoryOptions::dials_at_once`]), and an accepted link's source
+//!    address never replaces one this device dialled.
 //!
 //! The logic (the [`Book`], the decision of rule 3) knows nothing of
 //! QUIC; the loops that dial are at the end.
@@ -29,7 +35,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use ndn_face_quic::{Direction, KeyFingerprint};
 use ndn_mgmt_wire::LinkDetail;
@@ -49,8 +55,12 @@ pub type MemoryFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// What a host gives [`Links::remember`] to keep what it learned of peers:
 /// read once at start, written behind the host's durability barrier. A store
-/// holds keys (public), device names and addresses: nothing secret, and
-/// nothing it holds admits anyone (§17C).
+/// holds each peer's key (public), its device name and, unless
+/// [`MemoryOptions::persist_addresses`] is off, the addresses it was last
+/// reached at, **in the clear**: none of it is a secret, and nothing it holds
+/// admits anyone (§17C), but it says who this device talks to and where, so
+/// the permissions of the file or database it lives in are the host's to set
+/// (readable by this device's user only).
 pub trait LinkMemory: Send + Sync {
     /// Every record kept. A record the store cannot read is the store's to
     /// leave out; the error is for a store that cannot be read at all.
@@ -92,6 +102,29 @@ pub struct MemoryOptions {
     pub expires: Duration,
     /// When a redial is made again. The standing dial backoff by default.
     pub redial: Backoff,
+    /// Peers redialled at the same time, each racing at most `addresses_max`
+    /// addresses: a start-up with many records dials them a few at a time,
+    /// not all at once. 4 by default (at most 16 handshakes at once).
+    pub dials_at_once: usize,
+    /// Keep and dial loopback and link-local addresses, which reach only
+    /// this machine or this link. Off by default, as for the addresses of a
+    /// code (data-layer.md §19.2): what a store or a stranger's link names
+    /// must not make this device send datagrams to services on itself or on
+    /// its link (169.254.169.254, say). A host that links devices on one
+    /// machine, or one link, turns it on.
+    pub include_local: bool,
+    /// Write the addresses to the store. On by default; off, a record is
+    /// written without them (the store then holds only each peer's key and
+    /// device name, and its last contact) and the addresses a run learns
+    /// live in memory for that run: a peer is redialled in the run that
+    /// learned its address, and after a restart waits for its next contact.
+    pub persist_addresses: bool,
+    /// A record is written to the store at most once in this long. What
+    /// changes in between is kept in memory and written when the time is
+    /// up, or at [`Links::shutdown`]: a peer that reconnects again and again
+    /// is a few writes (flash wear, an fsync each), not one per reconnect.
+    /// One minute by default; the first write of a record is not delayed.
+    pub save_interval: Duration,
 }
 
 impl Default for MemoryOptions {
@@ -101,6 +134,10 @@ impl Default for MemoryOptions {
             addresses_max: 4,
             expires: Duration::from_secs(30 * 24 * 3600),
             redial: Backoff::default(),
+            dials_at_once: 4,
+            include_local: false,
+            persist_addresses: true,
+            save_interval: Duration::from_secs(60),
         }
     }
 }
@@ -113,11 +150,22 @@ impl MemoryOptions {
     fn peers(&self) -> usize {
         self.peers_max.max(1)
     }
+
+    fn dials(&self) -> usize {
+        self.dials_at_once.max(1)
+    }
 }
 
-/// An address worth dialling: not unspecified, not multicast, with a port.
-fn usable(addr: &SocketAddr) -> bool {
-    addr.port() != 0 && !addr.ip().is_unspecified() && !addr.ip().is_multicast()
+/// An address worth dialling: not unspecified, multicast or broadcast, with a
+/// port, and, unless `include_local`, not a loopback or link-local one (the
+/// rule the hint of a code has, data-layer.md §19.2).
+fn usable(addr: &SocketAddr, include_local: bool) -> bool {
+    let ip = addr.ip().to_canonical();
+    addr.port() != 0
+        && !ip.is_unspecified()
+        && !ip.is_multicast()
+        && !matches!(ip, std::net::IpAddr::V4(v4) if v4.is_broadcast())
+        && (include_local || !crate::candidates::is_local(ip))
 }
 
 /// `addr` as a dial uses it: an IPv4 address a dual-stack socket shows
@@ -156,10 +204,11 @@ pub(crate) struct Book {
 
 impl Book {
     /// The book of `records` as the store gave them at `now`: the newest
-    /// record of each key, the addresses cleaned and cut to the bound, those
-    /// not in contact for `expires` dropped, and no more than `peers_max`
-    /// kept (the least recently in contact dropped). The second value is
-    /// the keys the store holds records of that are not kept.
+    /// record of each key, the addresses cleaned (those a dial would not use
+    /// dropped, and with `persist_addresses` off all of them) and cut to the
+    /// bound, those not in contact for `expires` dropped, and no more than
+    /// `peers_max` kept (the least recently in contact dropped). The second
+    /// value is the keys the store holds records of that are not kept.
     pub(crate) fn load(
         options: MemoryOptions,
         records: Vec<PeerRecord>,
@@ -172,7 +221,9 @@ impl Book {
                 .addresses
                 .iter()
                 .map(|a| canonical(*a))
-                .filter(|a| usable(a) && seen.insert(*a))
+                .filter(|a| {
+                    options.persist_addresses && usable(a, options.include_local) && seen.insert(*a)
+                })
                 .take(options.addresses())
                 .collect();
             match newest.get(&record.key) {
@@ -220,21 +271,32 @@ impl Book {
         records
     }
 
-    /// The peer `key`, reached at `addr` by a link `origin` made, at `now`.
-    /// An address already known moves to the front; a new peer past
-    /// `peers_max` evicts the one least recently in contact. The device the
-    /// peer proved replaces the one remembered; `origin` is that of the first
+    /// The peer `key`, reached at `addr` by a link `direction` made, at
+    /// `now`. An address a dial would use ([`usable`]) moves to the front
+    /// of the list; a new peer past `peers_max` evicts the one least
+    /// recently in contact. The device the peer proved replaces the one
+    /// remembered; the record's `origin` is the direction of the first
     /// contact.
+    ///
+    /// The address of a link the peer opened is its source address: the
+    /// port is the peer's own choice and changes at every reconnect of a
+    /// device that dials from a socket of its own. It is kept only for a
+    /// peer that has no address yet (it is then the one to try, and what a
+    /// peer that listens and dials from its listening socket has), and never
+    /// moves or adds to a list that holds one. The addresses a peer is
+    /// reached at are those this device dialled.
     pub(crate) fn learn(
         &mut self,
         key: KeyFingerprint,
         device: Name,
         addr: SocketAddr,
-        origin: Direction,
+        direction: Direction,
         now: SystemTime,
     ) -> Learned {
         let addr = canonical(addr);
         let keep = self.options.addresses();
+        let local = self.options.include_local;
+        let persists = self.options.persist_addresses;
         if let Some(slot) = self.slots.get_mut(&key) {
             let record = &mut slot.record;
             let mut changed = false;
@@ -242,11 +304,16 @@ impl Book {
                 record.device = device;
                 changed = true;
             }
-            if usable(&addr) && record.addresses.first() != Some(&addr) {
+            if usable(&addr, local)
+                && (direction == Direction::Dialed || record.addresses.is_empty())
+                && record.addresses.first() != Some(&addr)
+            {
                 record.addresses.retain(|a| *a != addr);
                 record.addresses.insert(0, addr);
                 record.addresses.truncate(keep);
-                changed = true;
+                // With the addresses not persisted, the store holds none to
+                // bring up to date.
+                changed |= persists;
             }
             record.last_contact = record.last_contact.max(now);
             let behind =
@@ -281,13 +348,13 @@ impl Book {
                 record: PeerRecord {
                     key,
                     device,
-                    addresses: if usable(&addr) {
+                    addresses: if usable(&addr, local) {
                         vec![addr]
                     } else {
                         Vec::new()
                     },
                     last_contact: now,
-                    origin,
+                    origin: direction,
                 },
                 persisted: now,
             },
@@ -438,6 +505,9 @@ struct Inner {
     dirty: HashSet<KeyFingerprint>,
     /// Keys to remove from the store.
     doomed: HashSet<KeyFingerprint>,
+    /// When each record was last written: a record is written again only
+    /// once `save_interval` has passed.
+    saved_at: HashMap<KeyFingerprint, Instant>,
 }
 
 /// The link memory of one [`Links`].
@@ -452,6 +522,8 @@ pub(crate) struct Memory {
     write_wake: Notify,
     failure: Mutex<Option<String>>,
     cancel: CancellationToken,
+    /// How many peers are dialled at once (`MemoryOptions::dials_at_once`).
+    dials: tokio::sync::Semaphore,
 }
 
 impl Memory {
@@ -491,7 +563,23 @@ impl Memory {
                 (Vec::new(), Some(words))
             }
         };
+        // The addresses a store holds that this run will not keep (it does not
+        // persist them) are written out of it.
+        let scrub: Vec<KeyFingerprint> = if options.persist_addresses {
+            Vec::new()
+        } else {
+            records
+                .iter()
+                .filter(|r| !r.addresses.is_empty())
+                .map(|r| r.key)
+                .collect()
+        };
+        let dials = options.dials();
         let (book, dropped) = Book::load(options.clone(), records, now);
+        let dirty: HashSet<KeyFingerprint> = scrub
+            .into_iter()
+            .filter(|k| book.get(k).is_some())
+            .collect();
         let memory = Arc::new(Memory {
             store,
             options,
@@ -499,13 +587,15 @@ impl Memory {
             inner: Mutex::new(Inner {
                 book,
                 redials: HashMap::new(),
-                dirty: HashSet::new(),
+                dirty,
                 doomed: dropped.into_iter().collect(),
+                saved_at: HashMap::new(),
             }),
             io: tokio::sync::Mutex::new(()),
             write_wake: Notify::new(),
             failure: Mutex::new(failure),
             cancel,
+            dials: tokio::sync::Semaphore::new(dials),
         });
         let keys: Vec<KeyFingerprint> = memory
             .inner
@@ -561,20 +651,20 @@ impl Memory {
         self.inner.lock().book.get(key).cloned()
     }
 
-    /// The peer `key` was reached at `addr`, a link `origin` made: remember
-    /// it, to be saved when that changed what is kept, and dial it when it
-    /// is new.
+    /// The peer `key` was reached at `addr`, a link `direction` made:
+    /// remember it, to be saved when that changed what is kept, and dial it
+    /// when it is new.
     pub(crate) fn learn(
         self: &Arc<Self>,
         key: KeyFingerprint,
         device: Name,
         addr: SocketAddr,
-        origin: Direction,
+        direction: Direction,
         now: SystemTime,
     ) {
         let (learned, address_list) = {
             let mut inner = self.inner.lock();
-            let learned = inner.book.learn(key, device, addr, origin, now);
+            let learned = inner.book.learn(key, device, addr, direction, now);
             if learned.save {
                 inner.dirty.insert(key);
             }
@@ -617,6 +707,7 @@ impl Memory {
             r.stop.cancel();
         }
         inner.dirty.remove(key);
+        inner.saved_at.remove(key);
         had
     }
 
@@ -669,11 +760,25 @@ impl Memory {
         }
     }
 
-    /// Prune what expired (not a peer that is linked: it is in contact),
-    /// then write and remove what is owed, until nothing is.
+    /// Everything owed the store, now: prune what expired (not a peer that
+    /// is linked: it is in contact), then write and remove what is owed,
+    /// until nothing is, whatever `save_interval` says.
     async fn drain(&self) {
+        self.write_owed(true).await;
+    }
+
+    /// What is owed the store and due: the removals, and the saves of the
+    /// records not written within `save_interval`. Those not due stay owed;
+    /// the time until the first of them is.
+    async fn write_due(&self) -> Option<Duration> {
+        self.write_owed(false).await
+    }
+
+    async fn write_owed(&self, all: bool) -> Option<Duration> {
         loop {
             let now = SystemTime::now();
+            let tick = Instant::now();
+            let mut later: Option<Duration> = None;
             let (removals, saves) = {
                 let linked =
                     |k: &KeyFingerprint| self.links.upgrade().is_some_and(|l| l.table.is_linked(k));
@@ -689,13 +794,31 @@ impl Memory {
                     inner.dirty.remove(&key);
                     inner.doomed.insert(key);
                 }
-                (
-                    std::mem::take(&mut inner.doomed),
-                    std::mem::take(&mut inner.dirty),
-                )
+                let mut due = HashSet::new();
+                for key in std::mem::take(&mut inner.dirty) {
+                    let wait = inner
+                        .saved_at
+                        .get(&key)
+                        .and_then(|at| {
+                            self.options
+                                .save_interval
+                                .checked_sub(tick.saturating_duration_since(*at))
+                        })
+                        .filter(|wait| !all && !wait.is_zero());
+                    match wait {
+                        None => {
+                            due.insert(key);
+                        }
+                        Some(wait) => {
+                            inner.dirty.insert(key);
+                            later = Some(later.map_or(wait, |l| l.min(wait)));
+                        }
+                    }
+                }
+                (std::mem::take(&mut inner.doomed), due)
             };
             if removals.is_empty() && saves.is_empty() {
-                return;
+                return later;
             }
             for key in removals {
                 let _io = self.io.lock().await;
@@ -704,18 +827,26 @@ impl Memory {
                     continue;
                 }
                 let result = self.store.remove(&key).await;
+                self.inner.lock().saved_at.remove(&key);
                 self.note(result, "remove a peer from");
             }
             for key in saves {
                 let _io = self.io.lock().await;
                 // Read once the store is ours: a forget that came first has
                 // removed it, and nothing is written back.
-                let Some(record) = self.record(&key) else {
+                let Some(mut record) = self.record(&key) else {
                     continue;
                 };
+                if !self.options.persist_addresses {
+                    record.addresses.clear();
+                }
                 let result = self.store.save(&record).await;
-                if result.is_ok() {
-                    self.inner.lock().book.persisted(&key);
+                {
+                    let mut inner = self.inner.lock();
+                    if result.is_ok() {
+                        inner.book.persisted(&key);
+                    }
+                    inner.saved_at.insert(key, Instant::now());
                 }
                 self.note(result, "save a peer in");
             }
@@ -744,16 +875,25 @@ impl Memory {
     }
 }
 
-/// The writer: what is owed the store is written behind, never waited for.
+/// The writer: what is owed the store is written behind, never waited for,
+/// each record at most once in `save_interval`; what that defers is written
+/// when its time is up, and everything at the end.
 async fn write_behind(memory: Arc<Memory>) {
     loop {
-        memory.drain().await;
+        let deferred = memory.write_due().await;
+        let timer = async {
+            match deferred {
+                Some(within) => tokio::time::sleep(within).await,
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
             () = memory.cancel.cancelled() => {
                 memory.drain().await;
                 return;
             }
             () = memory.write_wake.notified() => {}
+            () = timer => {}
         }
     }
 }
@@ -873,6 +1013,7 @@ impl Links {
                 persistent: true,
                 direct: false,
                 remembered: true,
+                linked_in: record.origin == Direction::Accepted,
                 mode: LinkMode::Always,
                 ..PeerSpec::default()
             }),
@@ -1019,11 +1160,32 @@ async fn redial_loop(
             continue;
         }
         *state.lock() = RememberedState::Dialling;
-        let id = links.remembered_peer(&record);
-        match links
-            .dial_race(id, key, &record.addresses, DIAL_WITHIN)
-            .await
+        drop(links);
+        // A few peers at a time: a store with many records is not dialled all
+        // at once (and each wait for a turn can be stopped).
+        let turn = tokio::select! {
+            () = stop.cancelled() => break,
+            turn = memory.dials.acquire() => turn,
+        };
+        let Ok(turn) = turn else { break };
+        // What held when the turn came is looked at again: the peer may have
+        // been forgotten, linked, or no longer admitted while it waited.
+        let (Some(links), Some(record)) = (memory.links.upgrade(), memory.record(&key)) else {
+            break;
+        };
+        if stop.is_cancelled()
+            || record.addresses.is_empty()
+            || links.table.is_linked(&key)
+            || not_redialled(links.as_ref(), &key, &record.device, record.origin).is_some()
         {
+            continue;
+        }
+        let id = links.remembered_peer(&record);
+        let outcome = links
+            .dial_race(id, key, &record.addresses, DIAL_WITHIN)
+            .await;
+        drop(turn);
+        match outcome {
             Ok(_) if memory.is_linked(&key) => {
                 backoff.reset();
                 continue;
@@ -1136,11 +1298,15 @@ mod tests {
         }
     }
 
+    /// Options for the cases that read the store at once after a change: no
+    /// delay between two writes of a record (the case of that delay uses the
+    /// defaults).
     fn options(peers_max: usize, addresses_max: usize, expires: u64) -> MemoryOptions {
         MemoryOptions {
             peers_max,
             addresses_max,
             expires: Duration::from_secs(expires),
+            save_interval: Duration::ZERO,
             ..MemoryOptions::default()
         }
     }
@@ -1715,5 +1881,228 @@ mod tests {
             "the least recently in contact went"
         );
         assert!(shelf.kept(&key(2)).is_some() && shelf.kept(&key(3)).is_some());
+    }
+
+    /// L6 (round 6): the filter of the round-4 hint decoder, in the book. A
+    /// store, or a link, that offers a loopback or link-local address does
+    /// not make this device send datagrams to services on itself or on its
+    /// link (169.254.169.254 among them).
+    #[test]
+    fn loopback_and_link_local_addresses_are_not_kept() {
+        let planted = [
+            "127.0.0.1:4433",
+            "169.254.169.254:80",
+            "[fe80::1]:4433",
+            "[::1]:4433",
+        ];
+        let mut record = record(1, 90);
+        record.addresses = planted
+            .iter()
+            .map(|a| addr(a))
+            .chain([addr("192.0.2.1:4433")])
+            .collect();
+        let (mut book, _) = Book::load(options(8, 8, 1000), vec![record], at(100));
+        assert_eq!(
+            book.get(&key(1)).unwrap().addresses,
+            vec![addr("192.0.2.1:4433")],
+            "loopback and link-local addresses were read from the store"
+        );
+        for bad in planted {
+            book.learn(
+                key(2),
+                n("/ann/member/laptop"),
+                addr(bad),
+                Direction::Dialed,
+                at(100),
+            );
+        }
+        assert!(
+            book.get(&key(2)).unwrap().addresses.is_empty(),
+            "loopback and link-local addresses were learned: {:?}",
+            book.get(&key(2)).unwrap().addresses
+        );
+    }
+
+    /// A host that links devices on one machine (or one link) says so, and
+    /// then the addresses of this machine and this link are kept.
+    #[test]
+    fn a_host_on_one_machine_keeps_loopback_addresses() {
+        let mut local = record(1, 90);
+        local.addresses = vec![addr("127.0.0.1:4433"), addr("169.254.7.7:4433")];
+        let on_one_machine = MemoryOptions {
+            include_local: true,
+            ..options(8, 8, 1000)
+        };
+        let (mut book, _) = Book::load(on_one_machine, vec![local], at(100));
+        assert_eq!(
+            book.get(&key(1)).unwrap().addresses,
+            vec![addr("127.0.0.1:4433"), addr("169.254.7.7:4433")]
+        );
+        book.learn(
+            key(2),
+            n("/ann/member/laptop"),
+            addr("[::1]:4433"),
+            Direction::Dialed,
+            at(100),
+        );
+        assert_eq!(
+            book.get(&key(2)).unwrap().addresses,
+            vec![addr("[::1]:4433")]
+        );
+        // The unspecified, multicast and broadcast addresses are for nobody.
+        for bad in ["0.0.0.0:1", "224.0.0.1:1", "255.255.255.255:1", "[::]:1"] {
+            book.learn(
+                key(3),
+                n("/ann/member/laptop"),
+                addr(bad),
+                Direction::Dialed,
+                at(100),
+            );
+        }
+        assert!(book.get(&key(3)).unwrap().addresses.is_empty());
+    }
+
+    /// A host that does not want addresses on disk: the store holds none (and
+    /// those it held are written out), and a run still redials the peers it
+    /// reached by the addresses it learned.
+    #[tokio::test]
+    async fn addresses_are_not_written_when_the_host_says_not_to() {
+        let shelf = Shelf::with(vec![record(1, now_secs())]);
+        assert!(!shelf.kept(&key(1)).unwrap().addresses.is_empty());
+        let memory = memory_over(
+            &shelf,
+            MemoryOptions {
+                persist_addresses: false,
+                ..options(8, 4, 1_000_000)
+            },
+        );
+        memory.drain().await;
+        assert!(
+            shelf.kept(&key(1)).unwrap().addresses.is_empty(),
+            "an address a store held was not written out of it"
+        );
+        memory.learn(
+            key(2),
+            n("/ann/member/laptop"),
+            addr("192.0.2.2:4433"),
+            Direction::Dialed,
+            SystemTime::now(),
+        );
+        memory.drain().await;
+        let kept = shelf.kept(&key(2)).expect("the peer is remembered");
+        assert!(
+            kept.addresses.is_empty(),
+            "an address was written: {:?}",
+            kept.addresses
+        );
+        assert_eq!(kept.device, n("/ann/member/laptop"));
+        let in_memory = memory
+            .report()
+            .peers
+            .into_iter()
+            .find(|p| p.record.key == key(2))
+            .unwrap();
+        assert_eq!(
+            in_memory.record.addresses,
+            vec![addr("192.0.2.2:4433")],
+            "this run keeps the address it learned"
+        );
+        // Another address is no reason to write the record again.
+        let before = shelf.saves.load(Ordering::SeqCst);
+        memory.learn(
+            key(2),
+            n("/ann/member/laptop"),
+            addr("192.0.2.3:4433"),
+            Direction::Dialed,
+            SystemTime::now(),
+        );
+        memory.drain().await;
+        assert_eq!(shelf.saves.load(Ordering::SeqCst), before);
+    }
+
+    /// L7 (round 6): an accepted link's source address is the peer's own
+    /// choice (a fresh port at each reconnect); it never moves a list that
+    /// holds addresses, so a peer that reconnects 100 times changes nothing.
+    #[test]
+    fn an_accepted_link_never_changes_the_addresses_held() {
+        let (mut book, _) = Book::load(options(8, 4, 1000), Vec::new(), at(0));
+        let device = n("/ann/member/laptop");
+        let first = book.learn(
+            key(1),
+            device.clone(),
+            addr("192.0.2.1:4433"),
+            Direction::Dialed,
+            at(0),
+        );
+        assert!(first.save);
+        for port in 1000..1100u16 {
+            let learned = book.learn(
+                key(1),
+                device.clone(),
+                addr(&format!("192.0.2.1:{port}")),
+                Direction::Accepted,
+                at(1),
+            );
+            assert!(
+                !learned.save,
+                "an accepted link from port {port} asked for a write"
+            );
+        }
+        assert_eq!(
+            book.get(&key(1)).unwrap().addresses,
+            vec![addr("192.0.2.1:4433")],
+            "the source ports of accepted links were kept"
+        );
+        // A peer first met on an accepted link, with no address yet, has the
+        // address it came from as the one to try; the next reconnect does not
+        // move it.
+        book.learn(
+            key(2),
+            device.clone(),
+            addr("192.0.2.2:4433"),
+            Direction::Accepted,
+            at(0),
+        );
+        let later = book.learn(
+            key(2),
+            device,
+            addr("192.0.2.2:5555"),
+            Direction::Accepted,
+            at(1),
+        );
+        assert!(!later.save);
+        assert_eq!(
+            book.get(&key(2)).unwrap().addresses,
+            vec![addr("192.0.2.2:4433")]
+        );
+    }
+
+    /// L7 (round 6): a peer reached at one of two addresses and linking again
+    /// and again, a hundred times, is a few writes of the store, not a hundred
+    /// (flash wear, an fsync each).
+    #[tokio::test]
+    async fn a_peer_that_links_a_hundred_times_costs_few_writes() {
+        let shelf = Shelf::with(Vec::new());
+        let memory = memory_over(&shelf, MemoryOptions::default());
+        let device = n("/ann/member/laptop");
+        for i in 0..100u16 {
+            memory.learn(
+                key(1),
+                device.clone(),
+                addr(if i % 2 == 0 {
+                    "192.0.2.1:4433"
+                } else {
+                    "192.0.2.2:4433"
+                }),
+                Direction::Dialed,
+                SystemTime::now(),
+            );
+            tokio::time::sleep(Duration::from_millis(3)).await;
+        }
+        let writes = shelf.saves.load(Ordering::SeqCst);
+        assert!(
+            writes <= 3,
+            "a peer that linked 100 times was written {writes} times"
+        );
     }
 }

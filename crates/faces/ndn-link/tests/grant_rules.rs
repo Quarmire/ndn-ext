@@ -16,12 +16,12 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 
 use ndn_face_quic::{
-    Admission, CloseReason, KeyFingerprint, LinkEndpoint, LinkError, LinkHello, LinkKey,
+    Admission, CloseReason, Direction, KeyFingerprint, LinkEndpoint, LinkError, LinkHello, LinkKey,
     LinkKeySource, LinkTransportConfig, Membership,
 };
 use ndn_link::{
-    ConfiguredEndpoints, FaceSink, Grant, GrantRole, LinkSetup, LinkTrust, Links, OwnMembership,
-    PeerSpec, Route,
+    ConfiguredEndpoints, FaceSink, Grant, GrantRole, LinkMemory, LinkSetup, LinkTrust, Links,
+    MemoryFuture, MemoryOptions, OwnMembership, PeerRecord, PeerSpec, Route,
 };
 use ndn_packet::{Data, Name};
 use ndn_security::{
@@ -29,6 +29,10 @@ use ndn_security::{
 };
 use ndn_transport::{Face, FaceId, FaceKind};
 use tokio_util::sync::CancellationToken;
+
+/// The folder of Ann's every grant here: its collections are what a grant
+/// link carries.
+const FOLDER: &str = "/a/32=data/notes";
 
 const T: Duration = Duration::from_secs(10);
 
@@ -418,7 +422,8 @@ async fn a_grant_links_its_key_in_its_namespace_and_routes_nothing_else_it_shows
         key: phone_b.fingerprint(),
         namespaces: vec![n("/b")],
         role: GrantRole::Writer,
-        until: an_hour_on(),
+        folder: n(FOLDER),
+        until: Some(an_hour_on()),
     });
     let (_phone, at_phone, _) = start(
         phone_b.link_key(),
@@ -471,11 +476,12 @@ async fn a_grant_links_its_key_in_its_namespace_and_routes_nothing_else_it_shows
         key: phone_b.fingerprint(),
         namespaces: vec![n("/b")],
         role: GrantRole::Writer,
-        until: later,
+        folder: n(FOLDER),
+        until: Some(later),
     });
     assert_eq!(
         ann_links.report().links[0].granted.as_ref().unwrap().until,
-        later
+        Some(later)
     );
     assert_eq!(
         *at_ann.live.lock(),
@@ -489,7 +495,8 @@ async fn a_grant_links_its_key_in_its_namespace_and_routes_nothing_else_it_shows
         key: phone_b.fingerprint(),
         namespaces: vec![n("/c")],
         role: GrantRole::Writer,
-        until: later,
+        folder: n(FOLDER),
+        until: Some(later),
     });
     at_ann
         .settles("the link of the replaced grant closes", |f| {
@@ -535,7 +542,8 @@ async fn the_same_key_showing_another_namespace_is_linked_for_the_granted_one_on
         key: phone_c.fingerprint(),
         namespaces: vec![n("/b")],
         role: GrantRole::Writer,
-        until: an_hour_on(),
+        folder: n(FOLDER),
+        until: Some(an_hour_on()),
     });
     let (_phone, _, _) = start(
         phone_c.link_key(),
@@ -579,7 +587,8 @@ async fn a_grant_for_a_namespace_not_held_links_nothing() {
         key: dan.fingerprint(),
         namespaces: vec![n("/d")],
         role: GrantRole::Writer,
-        until: an_hour_on(),
+        folder: n(FOLDER),
+        until: Some(an_hour_on()),
     });
     let (reason, text) = refusal(
         dial_with(&addr, dan.link_key(), dan.hello_chain(&d), async |_| {
@@ -612,13 +621,15 @@ async fn a_grant_that_runs_out_closes_its_link_at_until() {
         key: tablet_b.fingerprint(),
         namespaces: vec![n("/b")],
         role: GrantRole::Writer,
-        until: an_hour_on(),
+        folder: n(FOLDER),
+        until: Some(an_hour_on()),
     });
     ann_links.grant(Grant {
         key: phone_b.fingerprint(),
         namespaces: vec![n("/b")],
         role: GrantRole::Writer,
-        until: SystemTime::now() + Duration::from_secs(3),
+        folder: n(FOLDER),
+        until: Some(SystemTime::now() + Duration::from_secs(3)),
     });
     let (_phone, at_phone, _) = start(
         phone_b.link_key(),
@@ -657,5 +668,310 @@ async fn a_grant_that_runs_out_closes_its_link_at_until() {
     );
     assert_eq!(reason, Some(CloseReason::NotServed), "{text}");
     assert!(text.contains("it expired"), "{text}");
+    cancel.cancel();
+}
+
+/// Dial `addr` as a device that sends its hello at once and its verdict only
+/// after `stall`: the other side has judged the hello (and read the grant)
+/// long before, and waits in its handshake for the verdict. The endpoint is
+/// returned with the link, which it keeps up.
+async fn dial_stalling(
+    addr: &str,
+    key: LinkKey,
+    certificates: Vec<Bytes>,
+    stall: impl Future<Output = ()>,
+) -> Result<(LinkEndpoint, ndn_face_quic::Link), LinkError> {
+    let endpoint = LinkEndpoint::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(key),
+        &LinkTransportConfig::default(),
+        false,
+    )
+    .unwrap();
+    let mut hs = endpoint.connect(addr.parse().unwrap(), None).await?;
+    let hello = LinkHello {
+        certificates,
+        memberships: Vec::new(),
+        direct_path: None,
+    };
+    hs.exchange_hello(&hello, T).await?;
+    stall.await;
+    let link = hs.admit(FaceId(1), T, Admission::default()).await?;
+    Ok((endpoint, link))
+}
+
+/// How long a stalling dialer waits before its verdict: Ann judged its hello
+/// (a few milliseconds on loopback) well before.
+const STALL: Duration = Duration::from_millis(1500);
+
+/// A handshake in flight when its grant is revoked: Ann read the grant when
+/// the hello came, the grant ended while she waited for the verdict, and the
+/// link is registered after the close that revocation made looked for links.
+/// It must not stay: the removed person would keep a link by always having a
+/// handshake in flight.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_handshake_in_flight_when_its_grant_is_revoked_does_not_keep_its_link() {
+    let cancel = CancellationToken::new();
+    let (a, b, c) = (
+        namespace("/a", 10).await,
+        namespace("/b", 20).await,
+        namespace("/c", 30).await,
+    );
+    let (ann_links, at_ann, addr) = ann(&a, &b, &c, &cancel).await;
+    let phone_b = b.device("member", "phone", 22).await;
+    ann_links.grant(Grant {
+        key: phone_b.fingerprint(),
+        namespaces: vec![n("/b")],
+        role: GrantRole::Writer,
+        folder: n(FOLDER),
+        until: Some(an_hour_on()),
+    });
+
+    let revoke = async {
+        tokio::time::sleep(STALL / 3).await;
+        assert!(
+            ann_links.revoke_grant(&phone_b.fingerprint()),
+            "no grant was in force to revoke"
+        );
+    };
+    let dial = dial_stalling(&addr, phone_b.link_key(), phone_b.hello_chain(&b), async {
+        tokio::time::sleep(STALL).await;
+    });
+    let (dialed, ()) = tokio::join!(dial, revoke);
+    let (_endpoint, link) = dialed.unwrap_or_else(|e| {
+        panic!(
+            "the handshake did not straddle the revoke (Ann judged the hello after it, or refused \
+             it): {e}"
+        )
+    });
+
+    // Ann closes it, saying what ended, though the revoke found it unregistered.
+    let closed = tokio::time::timeout(T, link.handle.closed())
+        .await
+        .unwrap_or_else(|_| {
+            panic!("the link of a revoked grant stayed up: its handshake straddled the revoke")
+        });
+    let (reason, text) = refusal(Err::<(), _>(closed));
+    assert_eq!(reason, Some(CloseReason::NotServed), "{text}");
+    assert!(
+        text.contains("the grant ended") && text.contains("revoked"),
+        "{text}"
+    );
+    at_ann
+        .settles("ann holds no link", |f| f.live.lock().is_empty())
+        .await;
+    cancel.cancel();
+}
+
+/// The same at the grant's date: a person who knows when it runs out starts a
+/// handshake just before and stalls it past.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_handshake_in_flight_when_its_grant_expires_does_not_keep_its_link() {
+    let cancel = CancellationToken::new();
+    let (a, b, c) = (
+        namespace("/a", 10).await,
+        namespace("/b", 20).await,
+        namespace("/c", 30).await,
+    );
+    let (ann_links, at_ann, addr) = ann(&a, &b, &c, &cancel).await;
+    let phone_b = b.device("member", "phone", 22).await;
+    let until = SystemTime::now() + Duration::from_secs(3);
+    ann_links.grant(Grant {
+        key: phone_b.fingerprint(),
+        namespaces: vec![n("/b")],
+        role: GrantRole::Writer,
+        folder: n(FOLDER),
+        until: Some(until),
+    });
+
+    let (_endpoint, link) = dial_stalling(
+        &addr,
+        phone_b.link_key(),
+        phone_b.hello_chain(&b),
+        async {
+            // Past the date, by the wall clock the grant is judged on.
+            let wait = until.duration_since(SystemTime::now()).unwrap_or_default()
+                + Duration::from_millis(500);
+            tokio::time::sleep(wait).await;
+        },
+    )
+    .await
+    .unwrap_or_else(|e| {
+        panic!(
+            "the handshake did not straddle the expiry (Ann judged the hello after it, or refused \
+             it): {e}"
+        )
+    });
+    assert!(
+        SystemTime::now() > until,
+        "the verdict was sent before the grant ran out"
+    );
+
+    let closed = tokio::time::timeout(T, link.handle.closed())
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the link of a grant that had run out stayed up: its handshake straddled the date"
+            )
+        });
+    let (reason, text) = refusal(Err::<(), _>(closed));
+    assert_eq!(reason, Some(CloseReason::NotServed), "{text}");
+    assert!(
+        text.contains("the grant ended") && text.contains("it expired"),
+        "{text}"
+    );
+    at_ann
+        .settles("ann holds no link", |f| f.live.lock().is_empty())
+        .await;
+    cancel.cancel();
+}
+
+/// A link memory in a map, with one record.
+struct Shelf(Mutex<std::collections::HashMap<KeyFingerprint, PeerRecord>>);
+
+impl LinkMemory for Shelf {
+    fn load(&self) -> Result<Vec<PeerRecord>, String> {
+        Ok(self.0.lock().values().cloned().collect())
+    }
+    fn save<'a>(&'a self, record: &'a PeerRecord) -> MemoryFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            self.0.lock().insert(record.key, record.clone());
+            Ok(())
+        })
+    }
+    fn remove<'a>(&'a self, key: &'a KeyFingerprint) -> MemoryFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            self.0.lock().remove(key);
+            Ok(())
+        })
+    }
+}
+
+/// Ann remembers Bob, who dialled in first and whom her grant links, and Bob
+/// grants Ann in turn (mutual invitations): when the link drops, Ann's
+/// redial of Bob is a link Bob's grant admits on his side and hers does on
+/// Ann's. It must carry Ann's grant — in her report, and so that the grant's
+/// end closes it — as the link Bob dialled in on did, not be admitted by the
+/// remembered entry with no grant, no quota and no scope.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_redial_of_a_remembered_peer_that_linked_in_is_the_grants_and_its_end_closes_it() {
+    let cancel = CancellationToken::new();
+    let (a, b, c) = (
+        namespace("/a", 10).await,
+        namespace("/b", 20).await,
+        namespace("/c", 30).await,
+    );
+    let (ann_links, at_ann, _) = ann(&a, &b, &c, &cancel).await;
+    let phone_b = b.device("member", "phone", 22).await;
+    let (bob_links, _, bob_addr) = start(
+        phone_b.link_key(),
+        Trust::new(&[&a, &b], phone_b.chain.clone(), Vec::new()),
+        Vec::new(),
+        true,
+        &cancel,
+    );
+    let hour = Some(an_hour_on());
+    // Mutual: each grants the other's key.
+    ann_links.grant(Grant {
+        key: phone_b.fingerprint(),
+        namespaces: vec![n("/b")],
+        role: GrantRole::Writer,
+        folder: n(FOLDER),
+        until: hour,
+    });
+    bob_links.grant(Grant {
+        key: ann_links.key_fingerprint().expect("ann has a key"),
+        namespaces: vec![n("/a")],
+        role: GrantRole::Writer,
+        folder: n("/b/32=data/notes"),
+        until: hour,
+    });
+
+    // What Ann's memory holds of Bob, who first dialled in.
+    let shelf = Arc::new(Shelf(Mutex::new(
+        [PeerRecord {
+            key: phone_b.fingerprint(),
+            device: n("/b/member/phone"),
+            addresses: vec![bob_addr.expect("bob listens").parse().unwrap()],
+            last_contact: SystemTime::now(),
+            origin: Direction::Accepted,
+        }]
+        .into_iter()
+        .map(|r| (r.key, r))
+        .collect(),
+    )));
+    ann_links.remember(
+        shelf,
+        MemoryOptions {
+            include_local: true,
+            ..MemoryOptions::default()
+        },
+    );
+    at_ann
+        .settles("ann redials bob", |f| f.live.lock().len() == 1)
+        .await;
+
+    let report = ann_links.report();
+    let link = report.links.first().expect("a link");
+    assert!(
+        link.granted.is_some(),
+        "the redial of a remembered peer that dialled in carries no grant: {link:#?}"
+    );
+
+    // Bob is removed: the grant ends, and the redial's link closes with it.
+    assert!(ann_links.revoke_grant(&phone_b.fingerprint()));
+    at_ann
+        .settles("the redial's link closes with the grant", |f| {
+            f.live.lock().is_empty()
+        })
+        .await;
+    cancel.cancel();
+}
+
+/// The role of a grant is the one the members record in force gives now (the
+/// data layer derives it again and calls `grant` again): a writer demoted to a
+/// reader no longer holds the writer's link. The link the old role admitted
+/// is closed, saying it was replaced, and the person's redial is judged by the
+/// grant as it now stands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grant_whose_role_changed_closes_the_link_of_the_old_role() {
+    let cancel = CancellationToken::new();
+    let (a, b, c) = (
+        namespace("/a", 10).await,
+        namespace("/b", 20).await,
+        namespace("/c", 30).await,
+    );
+    let (ann_links, at_ann, addr) = ann(&a, &b, &c, &cancel).await;
+    let phone_b = b.device("member", "phone", 22).await;
+    let grant = |role| Grant {
+        key: phone_b.fingerprint(),
+        namespaces: vec![n("/b")],
+        role,
+        folder: n(FOLDER),
+        until: None,
+    };
+    ann_links.grant(grant(GrantRole::Writer));
+    let (_phone, _, _) = start(
+        phone_b.link_key(),
+        Trust::new(&[&a, &b, &c], phone_b.chain.clone(), Vec::new()),
+        vec![ann_peer(&ann_links, &addr)],
+        false,
+        &cancel,
+    );
+    at_ann
+        .settles("ann links the phone as a writer", |f| {
+            f.live.lock().len() == 1
+        })
+        .await;
+
+    ann_links.grant(grant(GrantRole::Reader));
+    at_ann
+        .settles("the link of the writer's role closes", |f| {
+            f.live.lock().is_empty()
+        })
+        .await;
+    let grants = ann_links.grants();
+    assert_eq!(grants.len(), 1);
+    assert_eq!(grants[0].role, GrantRole::Reader);
     cancel.cancel();
 }

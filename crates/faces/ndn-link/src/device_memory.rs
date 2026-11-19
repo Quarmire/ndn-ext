@@ -7,6 +7,11 @@
 //! is dropped, and a note whose key is not the one it is named by is dropped
 //! too (a record is only ever read as the key it names).
 //!
+//! The note holds the peer's key, its device name and its last-seen addresses
+//! in the clear (data-layer.md §19.9 rule 6): the permissions of the device's
+//! store are the host's to set, and `MemoryOptions::persist_addresses` keeps
+//! the addresses out of it.
+//!
 //! The value, version 1, all integers big-endian:
 //!
 //! | octets | |

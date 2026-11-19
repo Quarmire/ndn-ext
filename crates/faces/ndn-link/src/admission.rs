@@ -24,6 +24,7 @@ use ndn_security::{
 
 use crate::grants::{Grant, GrantOutcome, GrantRole, Grants};
 use crate::host::{LinkTrust, OwnMembership};
+use crate::introduce::Introductions;
 use crate::peer::{PeerId, Peers};
 use crate::policy::{ENROLLMENT_ANSWERS, ENROLLMENT_INTERESTS, MAX_CHAIN};
 use crate::serving::{QuotaSlot, QuotaState, ServePolicy};
@@ -158,6 +159,10 @@ pub(crate) struct Judge<'a> {
     pub(crate) serve: &'a ServePolicy,
     pub(crate) quotas: &'a QuotaState,
     pub(crate) grants: &'a Grants,
+    /// What this device's introductions serve: the names a grant link may
+    /// carry besides the person's own ([`Introductions::grant_carries`]).
+    /// `None`: this device has no data layer to name a folder's collections.
+    pub(crate) introductions: Option<Arc<dyn Introductions>>,
 }
 
 impl Judge<'_> {
@@ -834,7 +839,10 @@ impl Judge<'_> {
                         scope: Some(LinkScope {
                             receives: Carries::Everything,
                             sends: Carries::Everything,
-                            names: Box::new(|_: &Name| true),
+                            names: match &admitted.grant {
+                                Some(grant) => self.grant_names(grant, own.clone()),
+                                None => Box::new(|_: &Name| true),
+                            },
                             rate,
                             shared: Some(shared),
                             answers_in: reader.then(|| -> NameFilter {
@@ -842,8 +850,12 @@ impl Judge<'_> {
                             }),
                             explain: match &admitted.grant {
                                 Some(grant) => format!(
-                                    "this device linked {} {}: {}; the quotas bound it ({}/s from that \
-                                     device), and a grant ends at its date or when the inviter revokes it",
+                                    "this device linked {} {}: {}, and only the names of the folder {} \
+                                     (its collections), of the person's own devices, of the namespaces' \
+                                     certificates and sync groups and of the introduction cross it; the \
+                                     quotas bound it ({}/s from that device), and a grant ends at its date \
+                                     or when the inviter revokes it or the folder's members record leaves \
+                                     the person out",
                                     admitted.describe(),
                                     grant.describe(),
                                     if reader {
@@ -851,8 +863,9 @@ impl Judge<'_> {
                                          the answers under its own device name (its certificates and its \
                                          seal); other Data it pushes is dropped"
                                     } else {
-                                        "a writer's link is a full link"
+                                        "a writer's link is a full link of those names"
                                     },
+                                    grant.folder,
                                     rate.per_sec
                                 ),
                                 None => format!(
@@ -1122,7 +1135,15 @@ fn decide_identified(
                 }
             }
             let Some(first) = refused.filter(|_| allowed.is_empty()) else {
-                if config.is_some() {
+                // A remembered peer that first dialled in is judged on the
+                // dial this device makes as it was on the link it made: by
+                // the serving policy and the grants, which tag the link with
+                // its grant, quota and scope (so a grant's end closes it).
+                // Any other peer entry admits what it names.
+                if config
+                    .as_ref()
+                    .is_some_and(|p| !(p.remembered && p.linked_in))
+                {
                     return Ok(admitted(allowed, None, None, Vec::new()));
                 }
                 return serve(judge, fingerprint, peer, allowed, unasked);
@@ -1298,7 +1319,14 @@ fn serve(
                     grant = Some(granted);
                 }
                 GrantOutcome::Refused(why) => return Err(why),
-                GrantOutcome::No(Some(detail)) => refusal.detail.append(". ", detail),
+                GrantOutcome::No(Some(detail)) => {
+                    // What the key's holder most needs to read — its grant
+                    // ended, or is of other namespaces — comes first: a peer's
+                    // words are bounded where they are read, and the refusal
+                    // sentence is long.
+                    refusal.detail.text = format!("{}. {}", detail.text, refusal.detail.text);
+                    refusal.detail.causes.push(detail);
+                }
                 GrantOutcome::No(None) => {}
             }
         }
@@ -1509,7 +1537,7 @@ pub(crate) fn in_enrollment(
 }
 
 /// `…/KEY/<key-id>`, optionally followed by `<issuer>/<version>`.
-fn is_key_or_certificate_name(components: &[ndn_packet::NameComponent]) -> bool {
+pub(crate) fn is_key_or_certificate_name(components: &[ndn_packet::NameComponent]) -> bool {
     components
         .iter()
         .position(|c| c.typ == ndn_packet::tlv_type::NAME_COMPONENT && c.value.as_ref() == b"KEY")
@@ -1632,6 +1660,7 @@ mod tests {
         serve: ServePolicy,
         quotas: QuotaState,
         grants: Grants,
+        introductions: Option<Arc<dyn Introductions>>,
     }
 
     impl World {
@@ -1642,6 +1671,7 @@ mod tests {
                 serve,
                 quotas: QuotaState::default(),
                 grants: Grants::default(),
+                introductions: None,
             }
         }
 
@@ -1652,6 +1682,7 @@ mod tests {
                 serve: &self.serve,
                 quotas: &self.quotas,
                 grants: &self.grants,
+                introductions: self.introductions.clone(),
             }
         }
     }
@@ -1874,7 +1905,8 @@ mod tests {
             key: key.fingerprint(),
             namespaces: namespaces.iter().map(|s| n(s)).collect(),
             role,
-            until: std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
+            folder: n("/a/32=data/notes"),
+            until: Some(std::time::SystemTime::now() + std::time::Duration::from_secs(3600)),
         }
     }
 
@@ -1992,7 +2024,7 @@ mod tests {
         let judge = world.judge();
         let (bob, chain) = b.device("member", "phone", 22).await;
         let mut grant = granted(&bob, &["/b"], GrantRole::Writer);
-        grant.until = std::time::SystemTime::now() - std::time::Duration::from_secs(1);
+        grant.until = Some(std::time::SystemTime::now() - std::time::Duration::from_secs(1));
         world.grants.put(grant);
         let refusal = judge
             .decide(&bob, &hello(chain), &CH, None)
@@ -2809,6 +2841,155 @@ mod tests {
                 identify(Bare(Arc::clone(&keyring), known, Vec::new())).await,
                 Ok(proven) if proven.identities.is_empty()
             ));
+        }
+    }
+
+    /// A remembered peer's redial is judged on the dial this device makes as
+    /// the link it made first was: one that first dialled in is judged by the
+    /// serving policy and the grants (refused where a stranger would be, and
+    /// admitted under its grant, carrying it, so the grant's end closes the
+    /// link); one this device dialled itself is admitted by its entry as
+    /// before.
+    #[tokio::test]
+    async fn a_remembered_peer_that_first_linked_in_is_judged_by_the_grants_as_a_stranger_is() {
+        let (a, b) = (namespace("/a", 10).await, namespace("/b", 20).await);
+        let (bob, chain) = b.device("member", "phone", 22).await;
+        let entry = |linked_in| PeerSpec {
+            label: "bob".into(),
+            key: Some(bob.fingerprint()),
+            device: Some(n("/b/member/phone")),
+            remembered: true,
+            linked_in,
+            ..PeerSpec::default()
+        };
+
+        let world = relay(&a, &[&b], ServePolicy::Own).await;
+        let id = world.peers.add(entry(true));
+        let judge = world.judge();
+        let refusal = judge
+            .decide(&bob, &hello(chain.clone()), &CH, Some(id))
+            .await
+            .err()
+            .expect("a remembered peer that dialled in was admitted by its entry, with no grant");
+        assert_eq!(
+            refusal.reason,
+            CloseReason::NotServed,
+            "{}",
+            refusal.detail.text
+        );
+
+        world.grants.put(granted(&bob, &["/b"], GrantRole::Writer));
+        let admitted = judge
+            .decide(&bob, &hello(chain.clone()), &CH, Some(id))
+            .await
+            .expect("the grant of the remembered key serves the redial");
+        assert_eq!(admitted.peer, Some(id));
+        assert_eq!(
+            admitted.grant.as_ref().map(|g| g.key),
+            Some(bob.fingerprint()),
+            "the redial's link carries no grant, so the grant's end would not close it"
+        );
+        assert!(
+            admitted.quota.as_ref().is_some_and(|q| q.limits.is_some()),
+            "the redial's link is under no quota"
+        );
+        assert!(judge.admission_for(&admitted).scope.is_some());
+
+        // A peer this device dialled itself: its entry admits it, no grant.
+        let world = relay(&a, &[&b], ServePolicy::Own).await;
+        let id = world.peers.add(entry(false));
+        let admitted = world
+            .judge()
+            .decide(&bob, &hello(chain), &CH, Some(id))
+            .await
+            .expect("an entry of a peer this device dialled admits it");
+        assert!(admitted.grant.is_none() && admitted.quota.is_none());
+    }
+
+    /// What the data layer carries, as a double: the introduction under
+    /// `/intro`, the folder's names under the folder.
+    struct Surface;
+
+    impl Introductions for Surface {
+        fn open(&self) -> bool {
+            true
+        }
+
+        fn carries(&self, name: &Name) -> bool {
+            name.has_prefix(&n("/intro"))
+        }
+
+        fn grant_carries(&self, folder: &Name, name: &Name) -> bool {
+            name.has_prefix(folder)
+        }
+    }
+
+    /// A grant link carries the folder's names, the person's own devices, the
+    /// introduction and the namespaces' public names — and no other name this
+    /// device serves; a grant that is over carries nothing at all, closed or
+    /// not.
+    #[tokio::test]
+    async fn a_grant_links_names_are_the_folders_the_persons_and_the_public_ones() {
+        let (a, b) = (namespace("/a", 10).await, namespace("/b", 20).await);
+        let mut world = relay(&a, &[&b], ServePolicy::Own).await;
+        world.introductions = Some(Arc::new(Surface));
+        let (bob, chain) = b.device("member", "phone", 22).await;
+        world.grants.put(granted(&bob, &["/b"], GrantRole::Writer));
+        let judge = world.judge();
+        let admitted = judge
+            .decide(&bob, &hello(chain), &CH, None)
+            .await
+            .expect("the grant serves bob");
+        let scope = judge.admission_for(&admitted).scope.expect("a scope");
+        let names = scope.names;
+
+        for carried in [
+            // The folder's collections, and the folder itself.
+            "/a/32=data/notes",
+            "/a/32=data/notes/page/32=log/x",
+            // The person's own device.
+            "/b/member/phone/32=log/anything",
+            // The introduction, which a person may ask again.
+            "/intro/ask",
+            // Sync groups of the grant's namespace and of the folder's, the
+            // trust context, keys and certificates.
+            "/b/32=sync/probe",
+            "/a/32=sync/probe",
+            "/b/32=trust-context/32=metadata",
+            "/b/member/phone/KEY/k/issuer/v=1",
+        ] {
+            assert!(names(&n(carried)), "{carried} did not cross the grant link");
+        }
+        for refused in [
+            // Another folder, another collection of the same namespace, an
+            // entry of the inviter's own, another device of the person's
+            // namespace, the inviter's namespace's other names.
+            "/a/32=data/diary",
+            "/a/32=data/notes2",
+            "/a/member/laptop/32=log/a/32=data/diary/seq=1",
+            "/b/member/tablet/32=log/x",
+            "/b/32=data/anything",
+            "/somewhere/else",
+        ] {
+            assert!(
+                !names(&n(refused)),
+                "{refused} crossed the grant link, though the grant does not carry it"
+            );
+        }
+
+        // The grant ends: nothing crosses, the link closed yet or not.
+        let mut over = granted(&bob, &["/b"], GrantRole::Writer);
+        over.until = Some(std::time::SystemTime::now() - std::time::Duration::from_secs(1));
+        world.grants.put(over);
+        for was_carried in [
+            "/b/member/phone/32=log/anything",
+            "/a/32=data/notes",
+            "/intro/ask",
+        ] {
+            assert!(
+                !names(&n(was_carried)),
+                "{was_carried} crossed after the grant ended"
+            );
         }
     }
 }

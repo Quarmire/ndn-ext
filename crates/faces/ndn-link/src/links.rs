@@ -518,6 +518,7 @@ impl Links {
             serve: &self.service.serve,
             quotas: &self.quotas,
             grants: &self.grants,
+            introductions: self.introductions.lock().clone(),
         }
     }
 
@@ -813,6 +814,26 @@ impl Links {
         };
         self.faces.add_face(face, self.cancel.child_token());
         self.faces.add_routes(face_id, &routes);
+        // The grant that admitted this link was read in `decide`, before the
+        // handshake's verdicts (up to MESSAGE_DEADLINE) and before the link
+        // was in the table: a revoke, a replacement or an expiry in between
+        // closed the links of the grant that were registered, and this one
+        // was not. Looked up again now it is: the grant leaves the table
+        // before the close looks for links, and the link entered the table
+        // before this lookup, so either that close sees this link or this
+        // lookup sees the grant gone. The same scope, still in force, or
+        // the link closes saying what ended.
+        if let Some(by) = &admitted.grant
+            && let Some(ended) = self.grants.ended_since(by)
+        {
+            tracing::warn!(
+                target: "face.quic",
+                key = %admitted.fingerprint,
+                "closing the link of a grant that ended during its handshake: {}",
+                ended.text
+            );
+            handle.close(CloseReason::NotServed, &ended.text);
+        }
         // A served device of a namespace not held here: its Data crosses this
         // forwarder unvalidated while it is linked, and the namespace's group
         // (routed over the link above) runs with multicast meanwhile.

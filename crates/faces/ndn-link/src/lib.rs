@@ -163,18 +163,25 @@
 //! **grant** ([`Grant`], [`Links::grant`]) does. A person it introduced is
 //! another person's namespace, which the default `own` refuses; the grant
 //! says *the device holding this link key may link here, as a person of these
-//! namespaces, until then*, and `own` plus the grant is tighter and enough
-//! (an inviter no longer has to choose `open` or `listed`; `open` is as it
-//! was, and a grant adds nothing to it). A grant admits that key in those
-//! namespaces only, under the quotas, in its role's scope (a reader's link
-//! carries Interests toward this device, and answers only under its own
-//! device names), and ends at its date, when it is revoked
-//! ([`Links::revoke_grant`]) or when a held record leaves the person out,
-//! closing the links it alone admitted and naming what ended in the refusal
-//! of the key's next link. With the `introductions` feature, `LinkHints`
-//! gives a data layer device its three halves (its hint, its dial, its
-//! undial), serves its `ndn_data::IntroductionSurface` and installs the
-//! device's grants (`LinkHints::serve`, `grant`, `revoke_grant`).
+//! namespaces, in the scope of this folder, until then* (or with no date: it
+//! follows the folder's members record), and `own` plus the grant is tighter
+//! and enough (an inviter no longer has to choose `open` or `listed`; `open`
+//! is as it was, and a grant adds nothing to it). A grant admits that key in
+//! those namespaces only, under the quotas, in its role's scope (a reader's
+//! link carries Interests toward this device, and answers only under its own
+//! device names), and its link carries only the names of the folder, of the
+//! person's own devices, of the introduction and the namespaces' public ones
+//! (certificates, trust contexts, sync groups): an unsealed collection of this
+//! device outside the folder is not answered over it
+//! ([`Introductions::grant_carries`]). It ends at its date, when it is
+//! revoked ([`Links::revoke_grant`]) or when a held record leaves the person
+//! out, closing the links it alone admitted (a link whose handshake straddled
+//! the end included) and naming what ended in the refusal of the key's next
+//! link. With the `introductions` feature, `LinkHints` gives a data layer
+//! device its three halves (its hint, its dial, its undial), serves its
+//! `ndn_data::IntroductionSurface` and installs the device's grants
+//! (`LinkHints::serve`, `grant`, `revoke_grant`; `end_grant` and
+//! `renew_grant` make a host's own end or renewal durable).
 //!
 //! # Link memory
 //!

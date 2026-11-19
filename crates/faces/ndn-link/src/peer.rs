@@ -125,6 +125,12 @@ pub struct PeerSpec {
     /// never by its key alone, and never when it dials in (the serving
     /// policy judges that link). Leave it `false` in a host's entries.
     pub remembered: bool,
+    /// With `remembered`: the peer first linked in (it dialled this device),
+    /// so this device's serving policy and grants judge a redial of it as
+    /// they judge any device that dials in: a remembered key never carries
+    /// more authority than the link that first made it (§17C, §8.7). `false`
+    /// for a peer this device dialled itself.
+    pub linked_in: bool,
 }
 
 impl Default for PeerSpec {
@@ -144,6 +150,7 @@ impl Default for PeerSpec {
             relay_use: None,
             hold: false,
             remembered: false,
+            linked_in: false,
         }
     }
 }
@@ -224,22 +231,26 @@ impl Peers {
     }
 
     /// The first peer expecting key `fingerprint`, or naming one of
-    /// `devices` (the names a device proved, in each of its namespaces).
+    /// `devices` (the names a device proved, in each of its namespaces). An
+    /// entry the host listed is found before a remembered one
+    /// ([`PeerSpec::remembered`]) whatever their slots: a redial's entry, made
+    /// before the host added its own, must not hide it.
     pub(crate) fn find_any(
         &self,
         fingerprint: KeyFingerprint,
         devices: &[&Name],
     ) -> Option<PeerId> {
-        self.slots
-            .read()
-            .iter()
-            .position(|p| {
+        let slots = self.slots.read();
+        let matching = |remembered: bool| {
+            slots.iter().position(|p| {
                 p.as_ref().is_some_and(|p| {
-                    p.key == Some(fingerprint)
-                        || p.device.as_ref().is_some_and(|d| devices.contains(&d))
+                    p.remembered == remembered
+                        && (p.key == Some(fingerprint)
+                            || p.device.as_ref().is_some_and(|d| devices.contains(&d)))
                 })
             })
-            .map(PeerId)
+        };
+        matching(false).or_else(|| matching(true)).map(PeerId)
     }
 
     /// The peers reached through `relay`.
@@ -251,5 +262,62 @@ impl Peers {
             .filter(|p| p.relay == Some(relay))
             .cloned()
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn n(s: &str) -> Name {
+        s.parse().unwrap()
+    }
+
+    fn fp(b: u8) -> KeyFingerprint {
+        KeyFingerprint([b; 32])
+    }
+
+    /// A remembered entry in a lower slot (a redial's entry, kept while the
+    /// host adds its own later) does not hide the host's entry of the same
+    /// device: the entry the host listed is the one a link is judged by.
+    #[test]
+    fn a_remembered_entry_does_not_shadow_a_hosts_entry_of_the_same_device() {
+        let device = n("/ann/member/laptop");
+        let peers = Peers::new(vec![PeerSpec {
+            label: "remembered".into(),
+            key: Some(fp(1)),
+            device: Some(device.clone()),
+            remembered: true,
+            ..PeerSpec::default()
+        }]);
+        let hosts = peers.add(PeerSpec {
+            label: "listed".into(),
+            device: Some(device.clone()),
+            ..PeerSpec::default()
+        });
+        assert_eq!(
+            peers.find_any(fp(2), &[&device]),
+            Some(hosts),
+            "the remembered entry in the lower slot hid the host's entry"
+        );
+        let by_key = peers.add(PeerSpec {
+            label: "listed by key".into(),
+            key: Some(fp(1)),
+            ..PeerSpec::default()
+        });
+        assert_eq!(
+            peers.find_any(fp(1), &[]),
+            Some(by_key),
+            "the remembered entry of the same key hid the host's"
+        );
+        // With no entry of the host's, the remembered one is found.
+        let only = Peers::new(vec![PeerSpec {
+            key: Some(fp(1)),
+            device: Some(device.clone()),
+            remembered: true,
+            ..PeerSpec::default()
+        }]);
+        assert_eq!(only.find_any(fp(1), &[&device]), Some(PeerId(0)));
+        assert_eq!(only.find_any(fp(3), &[&n("/other/device")]), None);
     }
 }

@@ -2,32 +2,40 @@
 //! default serving policy (`ndn-rs/docs/specs/ndn-link.md` §8.7).
 //!
 //! A [`Grant`] says: the device holding link key `key` may link here, as a
-//! person of the `namespaces`, until `until`. The serving policy `own` serves
-//! the namespaces this device holds a certificate in and no others, so the
-//! person an inviter just admitted — of another namespace, whose context it
-//! now holds — would be refused; the grant serves exactly that key in exactly
-//! those namespaces, and nothing else. It is host-supplied authority to
-//! *link*, not to read: what the link carries is what the layer above serves
-//! it.
+//! person of the `namespaces`, in the offered `folder`'s scope, until `until`
+//! (or with no date at all, while the members record of the folder keeps
+//! admitting the person). The serving policy `own` serves the namespaces this
+//! device holds a certificate in and no others, so the person an inviter just
+//! admitted — of another namespace, whose context it now holds — would be
+//! refused; the grant serves exactly that key in exactly those namespaces,
+//! and nothing else. It is host-supplied authority to *link*, and a link
+//! under a grant carries only the names of the folder, of the person's own
+//! devices and of the introduction (`Introductions::grant_carries`): not
+//! everything this device serves by name.
 //!
 //! The grants are a live table in memory by key; the host owns them (the
 //! data layer's device re-derives them at start from signed, durable data
 //! — `LinkHints::serve`). Expiry is judged on every admission and by one
-//! task that sleeps until the earliest `until`; a grant that ended closes
-//! the links it alone admitted and is named in the refusal of the next dial
-//! of its key.
+//! task that sleeps until the earliest `until`, at most a minute at a time
+//! so that a suspend or a clock step is seen within a minute; a grant that
+//! ended closes the links it alone admitted and is named in the refusal of
+//! the next dial of its key. A link is checked against the table again once
+//! it is registered, so a grant that ended while its handshake was in flight
+//! closes it too.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ndn_face_quic::{CloseReason, KeyFingerprint};
+use ndn_cert::onboarding::rdr_prefix;
+use ndn_face_quic::{CloseReason, KeyFingerprint, NameFilter};
 use ndn_mgmt_wire::{LinkDetail, link_code as code};
 use ndn_packet::Name;
+use ndn_security::sync_group;
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 
-use crate::admission::{Identity, Judge, Refusal, list as list_of};
+use crate::admission::{Identity, Judge, Refusal, is_key_or_certificate_name, list as list_of};
 use crate::links::Links;
 use crate::serving::{QuotaSlot, Quotas, ServePolicy};
 
@@ -52,7 +60,7 @@ impl GrantRole {
 }
 
 /// The device holding link key `key` may link here as a person of
-/// `namespaces`, until `until`.
+/// `namespaces`, in the scope of `folder`, until `until`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Grant {
     /// The link key the person's device proves in the handshake.
@@ -61,26 +69,45 @@ pub struct Grant {
     /// by those of its certificates and memberships that validate in one of
     /// these, and by no other.
     pub namespaces: Vec<Name>,
+    /// The folder the offer admitted the person to (`<O>/32=data/<path>`):
+    /// the link carries the names of its collections, nothing else this
+    /// device serves by name besides the person's own devices and the
+    /// introduction ([`Introductions::grant_carries`]).
+    pub folder: Name,
     pub role: GrantRole,
-    pub until: SystemTime,
+    /// `Some`: the grant ends then. `None`: it has no date of its own; it
+    /// follows the members record of the folder, and its host ends it
+    /// ([`Links::revoke_grant`]) when a record leaves the person out.
+    pub until: Option<SystemTime>,
 }
 
 impl Grant {
     /// The grant in words: `granted until 2026-11-18 14:03:22 UTC as a
-    /// writer in /bob`.
+    /// writer in /bob`, or `granted with no end date (it follows the
+    /// folder's members record) as a writer in /bob`.
     pub fn describe(&self) -> String {
+        let when = match self.until {
+            Some(until) => format!("until {}", utc(until)),
+            None => "with no end date (it follows the folder's members record)".to_string(),
+        };
         format!(
-            "granted until {} as a {} in {}",
-            utc(self.until),
+            "granted {when} as a {} in {}",
             self.role.as_str(),
             list_of(&self.namespaces)
         )
     }
 
-    /// Whether `other` admits the same links: the same namespaces and role
-    /// (its `until` may differ).
+    /// Whether `other` admits the same links: the same namespaces, folder
+    /// and role (its `until` may differ).
     fn same_scope(&self, other: &Grant) -> bool {
-        self.role == other.role && self.namespaces == other.namespaces
+        self.role == other.role
+            && self.namespaces == other.namespaces
+            && self.folder == other.folder
+    }
+
+    /// Whether the grant has run out by `now`.
+    fn over(&self, now: SystemTime) -> bool {
+        self.until.is_some_and(|until| until <= now)
     }
 }
 
@@ -120,26 +147,29 @@ impl How {
 struct EndedGrant {
     key: KeyFingerprint,
     namespaces: Vec<Name>,
-    until: SystemTime,
+    until: Option<SystemTime>,
     how: How,
 }
 
 impl EndedGrant {
     fn detail(&self) -> LinkDetail {
+        let until = match self.until {
+            Some(until) => format!("until {}", utc(until)),
+            None => "with no end date".to_string(),
+        };
         LinkDetail::new(
             code::GRANT_ENDED,
             format!(
-                "your key {} was granted a link here as a person of {}, until {}, and the grant ended: \
+                "your key {} was granted a link here as a person of {}, {until}, and the grant ended: \
                  {}. Ask the person who invited you to invite you again",
                 self.key,
                 list_of(&self.namespaces),
-                utc(self.until),
                 self.how.words()
             ),
         )
         .with("key", self.key)
         .with("namespaces", list_of(&self.namespaces))
-        .with("until", utc(self.until))
+        .with("until", self.until.map_or_else(|| "none".to_string(), utc))
         .with("ended", self.how.as_str())
     }
 }
@@ -148,8 +178,12 @@ impl EndedGrant {
 /// forgotten.
 const ENDED_MAX: usize = 64;
 
-/// The longest the expiry task sleeps at once (a wall clock may be set).
-const SLEEP_MAX: Duration = Duration::from_secs(3600);
+/// The longest the expiry task sleeps at once. The sleep runs on the monotonic
+/// clock, which stands still while a machine is suspended, and the grants'
+/// dates are on the wall clock, which may be set: so the task looks at the
+/// wall clock again at least this often while a dated grant is in force, and a
+/// suspend or a step is seen within it.
+const SLEEP_MAX: Duration = Duration::from_secs(60);
 
 #[derive(Default)]
 struct State {
@@ -199,24 +233,15 @@ impl Grants {
         self.inner.state.lock().live.insert(grant.key, grant);
     }
 
-    /// The grant of `key` now: live while its `until` is in the future (the
-    /// expiry task may not have swept it yet), else what is known of its
-    /// end.
+    /// The grant of `key` now: live while it has not run out (the expiry
+    /// task may not have swept it yet), else what is known of its end.
     pub(crate) fn lookup(&self, key: &KeyFingerprint, now: SystemTime) -> Lookup {
         let state = self.inner.state.lock();
         if let Some(grant) = state.live.get(key) {
-            if grant.until > now {
+            if !grant.over(now) {
                 return Lookup::Live(grant.clone());
             }
-            return Lookup::Ended(
-                EndedGrant {
-                    key: grant.key,
-                    namespaces: grant.namespaces.clone(),
-                    until: grant.until,
-                    how: How::Expired,
-                }
-                .detail(),
-            );
+            return Lookup::Ended(How::Expired.ended(grant).detail());
         }
         match state.ended.iter().find(|e| e.key == *key) {
             Some(e) => Lookup::Ended(e.detail()),
@@ -232,6 +257,33 @@ impl Grants {
         }
     }
 
+    /// Whether the table still holds `admitted` as it was when a link was
+    /// admitted by it: live now, with the same namespaces, folder and role.
+    /// Judged on the wall clock at each call, so it never lags the expiry
+    /// task. It copies nothing: the names a grant link carries are judged
+    /// with it at every packet.
+    pub(crate) fn stands(&self, admitted: &Grant) -> bool {
+        let now = SystemTime::now();
+        self.inner
+            .state
+            .lock()
+            .live
+            .get(&admitted.key)
+            .is_some_and(|g| !g.over(now) && g.same_scope(admitted))
+    }
+
+    /// `None` while the table still holds `admitted` ([`Self::stands`]);
+    /// else what ended it, to say to the person whose link it was.
+    pub(crate) fn ended_since(&self, admitted: &Grant) -> Option<LinkDetail> {
+        let now = SystemTime::now();
+        match self.lookup(&admitted.key, now) {
+            Lookup::Live(g) if g.same_scope(admitted) => None,
+            Lookup::Live(_) => Some(How::Replaced.ended(admitted).detail()),
+            Lookup::Ended(detail) => Some(detail),
+            Lookup::None => Some(How::Revoked.ended(admitted).detail()),
+        }
+    }
+
     /// The grants in force now.
     fn list(&self) -> Vec<Grant> {
         let now = SystemTime::now();
@@ -239,16 +291,22 @@ impl Grants {
         let mut grants: Vec<Grant> = state
             .live
             .values()
-            .filter(|g| g.until > now)
+            .filter(|g| !g.over(now))
             .cloned()
             .collect();
         grants.sort_by_key(|g| g.key);
         grants
     }
 
-    /// The earliest `until` of the live grants.
+    /// The earliest `until` of the live grants that have one.
     fn next_until(&self) -> Option<SystemTime> {
-        self.inner.state.lock().live.values().map(|g| g.until).min()
+        self.inner
+            .state
+            .lock()
+            .live
+            .values()
+            .filter_map(|g| g.until)
+            .min()
     }
 
     /// The grants that ran out by `now`, ended.
@@ -257,7 +315,7 @@ impl Grants {
         let due: Vec<KeyFingerprint> = state
             .live
             .values()
-            .filter(|g| g.until <= now)
+            .filter(|g| g.over(now))
             .map(|g| g.key)
             .collect();
         due.into_iter()
@@ -270,9 +328,19 @@ impl Grants {
     }
 }
 
+/// How long the expiry task sleeps before it looks at the wall clock again,
+/// given the earliest `until` of the grants in force (`None`: no grant has a
+/// date, the task waits to be woken): until then, but never more than
+/// [`SLEEP_MAX`].
+fn sleep_for(next: Option<SystemTime>, now: SystemTime) -> Option<Duration> {
+    next.map(|at| at.duration_since(now).unwrap_or_default().min(SLEEP_MAX))
+}
+
 impl Links {
     /// Starts the one task that ends grants when they run out: it sleeps
-    /// until the earliest `until` and wakes when a grant is made or ended.
+    /// until the earliest `until`, a minute at most at a time (the wall clock
+    /// is read again at each wake: [`SLEEP_MAX`]), and wakes when a grant is
+    /// made or ended. A grant with no `until` needs no wake.
     pub(crate) fn spawn_grant_expiry(self: &Arc<Self>) {
         let grants = self.grants.clone();
         let weak = Arc::downgrade(self);
@@ -281,14 +349,8 @@ impl Links {
             loop {
                 let next = grants.next_until();
                 let sleep = async {
-                    match next {
-                        Some(at) => {
-                            let wait = at
-                                .duration_since(SystemTime::now())
-                                .unwrap_or_default()
-                                .min(SLEEP_MAX);
-                            tokio::time::sleep(wait).await;
-                        }
+                    match sleep_for(next, SystemTime::now()) {
+                        Some(wait) => tokio::time::sleep(wait).await,
                         None => std::future::pending::<()>().await,
                     }
                 };
@@ -306,20 +368,20 @@ impl Links {
     }
 
     /// Grants the device holding `grant.key` a link here as a person of
-    /// `grant.namespaces`, until `grant.until` (replacing an earlier grant of
-    /// the same key). A grant never serves what the serving policy's
-    /// quotas, the namespace's link policy or a revocation refuse, and under
-    /// `serve = open` it adds nothing. A link the earlier grant admitted
-    /// stays when only `until` changed; with other namespaces or another
-    /// role it is closed (the device dials again and is judged by the new
-    /// one).
+    /// `grant.namespaces`, in the scope of `grant.folder`, until
+    /// `grant.until` (replacing an earlier grant of the same key). A grant
+    /// never serves what the serving policy's quotas, the namespace's link
+    /// policy or a revocation refuse, and under `serve = open` it adds
+    /// nothing. A link the earlier grant admitted stays when only `until`
+    /// changed; with other namespaces, folder or role it is closed (the
+    /// device dials again and is judged by the new one).
     pub fn grant(&self, grant: Grant) {
         let key = grant.key;
         let now = SystemTime::now();
         let previous = {
             let mut state = self.grants.inner.state.lock();
             state.ended.retain(|e| e.key != key);
-            if grant.until <= now {
+            if grant.over(now) {
                 // Granted already over: it ends what it replaces.
                 let previous = state.live.remove(&key);
                 state.end(&grant, How::Expired);
@@ -479,6 +541,66 @@ impl Judge<'_> {
     }
 }
 
+impl Judge<'_> {
+    /// The names the link of `grant` carries, judged at every packet in both
+    /// directions (§8.7 rule 5): only
+    ///
+    /// - the names under the person's own devices (`own`);
+    /// - the sync groups, trust contexts and key and certificate names of
+    ///   the grant's namespaces and of the folder's (public by design: a
+    ///   hello already carries the chain, and the group carries no data);
+    /// - what this device's introductions serve
+    ///   ([`Introductions::carries`](crate::Introductions::carries): a
+    ///   person may ask again); and
+    /// - the names of the folder's collections as the data layer names them
+    ///   ([`Introductions::grant_carries`](crate::Introductions::grant_carries)).
+    ///
+    /// Nothing else this device serves by name crosses, so an unsealed
+    /// collection outside the folder is not answered. Judged against the
+    /// live table at each packet, a grant that ended carries nothing from
+    /// that instant, whether or not its link has been closed yet. A device
+    /// with no data layer (no [`Introductions`](crate::Introductions) given)
+    /// carries the first three kinds and no folder.
+    pub(crate) fn grant_names(&self, grant: &Grant, own: Vec<Name>) -> NameFilter {
+        let table = self.grants.clone();
+        let admitted = grant.clone();
+        let surface = self.introductions.clone();
+        let mut namespaces = grant.namespaces.clone();
+        if let Some(ns) = folder_namespace(&grant.folder)
+            && !namespaces.contains(&ns)
+        {
+            namespaces.push(ns);
+        }
+        Box::new(move |name: &Name| {
+            table.stands(&admitted)
+                && (own.iter().any(|d| name.has_prefix(d))
+                    || namespaces.iter().any(|ns| public_name(ns, name))
+                    || surface.as_ref().is_some_and(|s| {
+                        s.carries(name) || s.grant_carries(&admitted.folder, name)
+                    }))
+        })
+    }
+}
+
+/// The namespace of a folder name `<O>/32=data[/<path>]`: the components
+/// before its `32=data` marker (data-layer.md §3); `None` for a name with
+/// none or nothing before it.
+fn folder_namespace(folder: &Name) -> Option<Name> {
+    let at = folder
+        .components()
+        .iter()
+        .position(|c| c.typ == ndn_packet::tlv_type::KEYWORD && c.value.as_ref() == b"data")?;
+    (at > 0).then(|| Name::from_components(folder.components()[..at].iter().cloned()))
+}
+
+/// A name of `ns` that is public by design: its sync group, its trust
+/// context, a key or certificate name.
+fn public_name(ns: &Name, name: &Name) -> bool {
+    name.has_prefix(&sync_group(ns))
+        || name.has_prefix(&rdr_prefix(ns))
+        || (name.has_prefix(ns) && is_key_or_certificate_name(&name.components()[ns.len()..]))
+}
+
 /// `t` as `2026-11-18 14:03:22 UTC`.
 pub(crate) fn utc(t: SystemTime) -> String {
     let secs = t
@@ -519,6 +641,99 @@ mod tests {
         assert_eq!(
             utc(UNIX_EPOCH + Duration::from_secs(1_709_164_800)),
             "2024-02-29 00:00:00 UTC"
+        );
+    }
+
+    fn grant(until: Option<SystemTime>) -> Grant {
+        Grant {
+            key: KeyFingerprint([5; 32]),
+            namespaces: vec!["/bob".parse().unwrap()],
+            folder: "/alice/32=data/notes".parse().unwrap(),
+            role: GrantRole::Writer,
+            until,
+        }
+    }
+
+    /// A grant with no date follows the members record, which its host ends:
+    /// the table never finds it due and never wakes the expiry task for it,
+    /// and it is in force however long it has stood; a dated one is due at
+    /// its date.
+    #[test]
+    fn a_grant_with_no_date_is_never_due_and_one_with_a_date_is() {
+        let table = Grants::default();
+        let now = SystemTime::now();
+        table.put(grant(None));
+        assert_eq!(table.next_until(), None);
+        let far = now + Duration::from_secs(100 * 365 * 24 * 3600);
+        assert!(table.take_due(far).is_empty());
+        assert!(matches!(
+            table.lookup(&KeyFingerprint([5; 32]), far),
+            Lookup::Live(_)
+        ));
+        assert_eq!(
+            grant(None).describe(),
+            "granted with no end date (it follows the folder's members record) as a writer in /bob"
+        );
+
+        let table = Grants::default();
+        let at = now + Duration::from_secs(10);
+        table.put(grant(Some(at)));
+        assert_eq!(table.next_until(), Some(at));
+        assert!(table.take_due(now).is_empty());
+        assert_eq!(table.take_due(at).len(), 1);
+        assert!(table.take_due(at).is_empty(), "a grant ended twice");
+    }
+
+    /// A link is checked against the grant that admitted it: still the same
+    /// scope, or what ended it.
+    #[test]
+    fn a_link_stands_while_its_grant_does_and_says_what_ended_it() {
+        let table = Grants::default();
+        let admitted = grant(Some(SystemTime::now() + Duration::from_secs(3600)));
+        table.put(admitted.clone());
+        assert!(table.stands(&admitted));
+        assert!(table.ended_since(&admitted).is_none());
+
+        // Replaced by another folder: not the grant the link was admitted by.
+        let mut other = admitted.clone();
+        other.folder = "/alice/32=data/diary".parse().unwrap();
+        table.put(other);
+        assert!(!table.stands(&admitted));
+        let why = table.ended_since(&admitted).expect("replaced");
+        assert!(why.text.contains("replaced"), "{}", why.text);
+
+        // Past its date: expired, whether or not the task has swept it.
+        table.put(grant(Some(SystemTime::now() - Duration::from_secs(1))));
+        assert!(!table.stands(&admitted));
+        let why = table.ended_since(&admitted).expect("expired");
+        assert!(why.text.contains("it expired"), "{}", why.text);
+
+        // Gone from the table with nothing remembered: revoked.
+        let empty = Grants::default();
+        let why = empty.ended_since(&admitted).expect("revoked");
+        assert!(why.text.contains("revoked"), "{}", why.text);
+    }
+
+    /// The wall clock is read again within a minute whatever the next date
+    /// is: the sleep runs on the monotonic clock, which stands still while a
+    /// machine is suspended and does not follow a step of the wall clock.
+    #[test]
+    fn the_expiry_task_reads_the_wall_clock_at_least_once_a_minute() {
+        let now = SystemTime::now();
+        let hour = now + Duration::from_secs(3600);
+        assert_eq!(sleep_for(Some(hour), now), Some(Duration::from_secs(60)));
+        assert_eq!(
+            sleep_for(Some(now + Duration::from_secs(5)), now),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            sleep_for(Some(now - Duration::from_secs(5)), now),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            sleep_for(None, now),
+            None,
+            "no dated grant: wait to be woken"
         );
     }
 }

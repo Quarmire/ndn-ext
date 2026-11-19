@@ -49,6 +49,17 @@ pub trait Introductions: Send + Sync {
     /// names of the one exchange an open offer needs, no other name the
     /// device serves.
     fn carries(&self, name: &Name) -> bool;
+
+    /// Whether a packet named `name` may cross the link of a person a grant
+    /// admitted to `folder` ([`Grant::folder`](crate::Grant::folder)): the
+    /// names of the folder's collections, as the layer above names them, and
+    /// the few of its own that reach them. The link layer adds the person's
+    /// own devices, the namespaces' certificates and sync groups, and this
+    /// surface's [`carries`](Introductions::carries); it carries no other
+    /// name this device serves, so an unsealed collection outside the folder
+    /// is not answered over a grant link. For a data-layer device it is
+    /// ndn-data's `folder_carries`.
+    fn grant_carries(&self, folder: &Name, name: &Name) -> bool;
 }
 
 /// What the introduction links of [`Enrollment::Introduction`] carry.

@@ -368,7 +368,7 @@ impl Embedded {
     /// (`ndf`'s `links.remember(DeviceMemory::new(&device), …)`).
     fn remembers_in_the_device(&self) {
         self.links
-            .remember(DeviceMemory::new(&self.device), MemoryOptions::default());
+            .remember(DeviceMemory::new(&self.device), on_this_machine());
     }
 }
 
@@ -646,7 +646,8 @@ fn grant_of(bob: &Embedded) -> Grant {
         key: bob.key,
         namespaces: vec![n("/bob")],
         role: GrantRole::Writer,
-        until: SystemTime::now() + Duration::from_secs(3600),
+        folder: n(FOLDER),
+        until: Some(SystemTime::now() + Duration::from_secs(3600)),
     }
 }
 
@@ -697,6 +698,15 @@ fn of_ann(ann: &Embedded, addresses: Vec<SocketAddr>, age: Duration) -> PeerReco
         addresses,
         last_contact: SystemTime::now() - age,
         origin: Direction::Dialed,
+    }
+}
+
+/// The options of these cases: every device is on this machine, so the
+/// loopback addresses they link at are kept (off by default).
+fn on_this_machine() -> MemoryOptions {
+    MemoryOptions {
+        include_local: true,
+        ..MemoryOptions::default()
     }
 }
 
@@ -823,7 +833,7 @@ async fn a_remembered_peer_is_dialled_at_start_and_linked_as_an_identified_devic
     let (alice, bobs) = (Person::new("/alice").await, Person::new("/bob").await);
     let (ann, bob) = acquainted(&alice, &bobs).await;
     let shelf = Shelf::with(vec![of_ann(&ann, vec![ann.addr.unwrap()], DAY)]);
-    bob.links.remember(shelf.clone(), MemoryOptions::default());
+    bob.links.remember(shelf.clone(), on_this_machine());
 
     until("bob dials ann from memory", LONG, async || {
         linked(&bob, ann.key) && linked(&ann, bob.key)
@@ -852,7 +862,7 @@ async fn an_expired_record_is_not_dialled_and_is_removed_from_the_store() {
     let (alice, bobs) = (Person::new("/alice").await, Person::new("/bob").await);
     let (ann, bob) = acquainted(&alice, &bobs).await;
     let stale = Shelf::with(vec![of_ann(&ann, vec![ann.addr.unwrap()], 31 * DAY)]);
-    bob.links.remember(stale.clone(), MemoryOptions::default());
+    bob.links.remember(stale.clone(), on_this_machine());
     until("the expired record is removed", LONG, async || {
         stale.get(&ann.key).is_none()
     })
@@ -868,7 +878,7 @@ async fn an_expired_record_is_not_dialled_and_is_removed_from_the_store() {
     // The control: the same record 29 days old, in a world that dials it.
     let (ann, bob) = acquainted(&alice, &bobs).await;
     let fresh = Shelf::with(vec![of_ann(&ann, vec![ann.addr.unwrap()], 29 * DAY)]);
-    bob.links.remember(fresh, MemoryOptions::default());
+    bob.links.remember(fresh, on_this_machine());
     until("a record 29 days old is dialled", LONG, async || {
         linked(&bob, ann.key)
     })
@@ -882,7 +892,7 @@ async fn forget_removes_the_record_and_ends_the_redial() {
     let (alice, bobs) = (Person::new("/alice").await, Person::new("/bob").await);
     let (ann, bob) = acquainted(&alice, &bobs).await;
     let shelf = Shelf::with(vec![of_ann(&ann, vec![ann.addr.unwrap()], DAY)]);
-    bob.links.remember(shelf.clone(), MemoryOptions::default());
+    bob.links.remember(shelf.clone(), on_this_machine());
     until("bob dials ann from memory", LONG, async || {
         linked(&bob, ann.key) && linked(&ann, bob.key)
     })
@@ -936,7 +946,7 @@ async fn a_record_whose_namespace_is_not_held_is_not_dialled_until_it_is() {
     ann.links.grant(grant_of(&bob));
     // Bob holds `/bob` and not `/alice`.
     let shelf = Shelf::with(vec![of_ann(&ann, vec![ann.addr.unwrap()], DAY)]);
-    bob.links.remember(shelf.clone(), MemoryOptions::default());
+    bob.links.remember(shelf.clone(), on_this_machine());
 
     until("bob says why he does not dial", LONG, async || {
         matches!(
@@ -992,7 +1002,7 @@ async fn an_address_another_key_answers_at_costs_a_failed_dial_and_no_link() {
 
     let hostile = mallory.addr.unwrap();
     let shelf = Shelf::with(vec![of_ann(&ann, vec![hostile], DAY)]);
-    bob.links.remember(shelf, MemoryOptions::default());
+    bob.links.remember(shelf, on_this_machine());
     until("bob's dial fails", LONG, async || {
         matches!(
             remembered(&bob, ann.key),
@@ -1024,7 +1034,7 @@ async fn an_address_another_key_answers_at_costs_a_failed_dial_and_no_link() {
     // race, the handshake accepts only the holder of the key, Ann links.
     let (ann2, bob2) = acquainted(&alice, &bobs).await;
     let shelf = Shelf::with(vec![of_ann(&ann2, vec![hostile, ann2.addr.unwrap()], DAY)]);
-    bob2.links.remember(shelf, MemoryOptions::default());
+    bob2.links.remember(shelf, on_this_machine());
     until("the right address links", LONG, async || {
         linked(&bob2, ann2.key) && linked(&ann2, bob2.key)
     })
@@ -1046,7 +1056,7 @@ async fn a_peer_with_no_address_waits_and_learns_one_when_the_peer_dials_in() {
         last_contact: SystemTime::now() - DAY,
         origin: Direction::Accepted,
     }]);
-    ann.links.remember(shelf.clone(), MemoryOptions::default());
+    ann.links.remember(shelf.clone(), on_this_machine());
     until("ann waits for an address", LONG, async || {
         matches!(
             remembered(&ann, bob.key),
@@ -1088,10 +1098,9 @@ async fn a_remembered_peer_whose_grant_ended_is_refused_and_not_dialled_by_the_i
     let (ann, bob) = acquainted(&alice, &bobs).await;
     let ann_shelf = Shelf::default();
     let ann_shelf = Arc::new(ann_shelf);
-    ann.links
-        .remember(ann_shelf.clone(), MemoryOptions::default());
+    ann.links.remember(ann_shelf.clone(), on_this_machine());
     let bob_shelf = Shelf::with(vec![of_ann(&ann, vec![ann.addr.unwrap()], DAY)]);
-    bob.links.remember(bob_shelf, MemoryOptions::default());
+    bob.links.remember(bob_shelf, on_this_machine());
     until(
         "they link from memory, and Ann learns Bob",
         LONG,
@@ -1233,7 +1242,7 @@ async fn notes_that_are_not_records_are_dropped_and_the_good_one_is_kept() {
     notes.put(&"cd".repeat(32), &named_wrong).await.unwrap();
     assert_eq!(notes.list().unwrap().len(), 4);
 
-    bob.links.remember(memory, MemoryOptions::default());
+    bob.links.remember(memory, on_this_machine());
     until(
         "the notes that are not records are removed",
         LONG,
@@ -1245,4 +1254,99 @@ async fn notes_that_are_not_records_are_dropped_and_the_good_one_is_kept() {
         linked(&bob, ann.key) && linked(&ann, bob.key)
     })
     .await;
+}
+
+/// 64 peers of a store, each with four addresses of its own: 256 sockets on
+/// this machine that count the datagrams they are sent.
+struct Planted {
+    sockets: Vec<std::net::UdpSocket>,
+}
+
+impl Planted {
+    const PEERS: usize = 64;
+    const EACH: usize = 4;
+
+    fn new() -> Planted {
+        let sockets = (0..Self::PEERS * Self::EACH)
+            .map(|_| {
+                let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+                socket.set_nonblocking(true).unwrap();
+                socket
+            })
+            .collect();
+        Planted { sockets }
+    }
+
+    /// The records a store could hold of them, in a namespace Bob holds.
+    fn records(&self) -> Vec<PeerRecord> {
+        (0..Self::PEERS)
+            .map(|i| PeerRecord {
+                key: KeyFingerprint([i as u8 + 1; 32]),
+                device: n(&format!("/alice/member/planted{i}")),
+                addresses: self.sockets[i * Self::EACH..(i + 1) * Self::EACH]
+                    .iter()
+                    .map(|s| s.local_addr().unwrap())
+                    .collect(),
+                last_contact: SystemTime::now() - Duration::from_secs(60),
+                origin: Direction::Dialed,
+            })
+            .collect()
+    }
+
+    /// How many of the addresses were sent a datagram (a QUIC Initial).
+    fn dialled(&self) -> usize {
+        let mut buf = [0u8; 2048];
+        self.sockets
+            .iter()
+            .filter(|s| s.recv_from(&mut buf).is_ok())
+            .count()
+    }
+}
+
+/// L6 (round 6): a store holding 64 peers with four addresses each does not
+/// make a start-up send 256 QUIC Initials at once: the redials are staggered,
+/// a few peers at a time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_store_with_many_addresses_is_dialled_a_few_peers_at_a_time() {
+    // The default: four peers at a time, each racing its four addresses.
+    const AT_ONCE: usize = 4;
+    let (alice, bobs) = (Person::new("/alice").await, Person::new("/bob").await);
+    let (_ann, bob) = acquainted(&alice, &bobs).await;
+    let planted = Planted::new();
+    bob.links
+        .remember(Shelf::with(planted.records()), on_this_machine());
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let dialled = planted.dialled();
+    assert!(dialled > 0, "no remembered peer was dialled at all");
+    assert!(
+        dialled <= AT_ONCE * Planted::EACH,
+        "{dialled} of 256 addresses were dialled within 1.5 s of the start: the start-up is not \
+         staggered"
+    );
+}
+
+/// L6 (round 6): an address in the store that is a loopback or link-local
+/// one (a planted 169.254.169.254, say) is never dialled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_store_cannot_make_this_device_dial_loopback_or_link_local_addresses() {
+    let (alice, bobs) = (Person::new("/alice").await, Person::new("/bob").await);
+    let (_ann, bob) = acquainted(&alice, &bobs).await;
+    let planted = Planted::new();
+    bob.links
+        .remember(Shelf::with(planted.records()), MemoryOptions::default());
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        planted.dialled(),
+        0,
+        "addresses on this machine were dialled from a store"
+    );
+    let report = bob.links.report().memory.unwrap();
+    assert!(
+        report
+            .peers
+            .iter()
+            .all(|p| p.record.addresses.is_empty() && p.state == RememberedState::WaitingForAddress),
+        "the peers wait for an address they can use: {:?}",
+        report.peers.first()
+    );
 }
