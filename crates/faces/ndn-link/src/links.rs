@@ -29,6 +29,7 @@ use crate::departures::Departures;
 use crate::direct::{Direct, Whom, direct_up};
 use crate::grants::Grants;
 use crate::host::{FaceSink, LinkTrust, PathCandidate, PathSource};
+use crate::joined::{JoinedRoutes, JoinedSet};
 use crate::peer::{LinkMode, PeerId, PeerSpec, Peers};
 use crate::policy::{Backoff, ENROLLMENT_IDLE, MESSAGE_DEADLINE};
 use crate::presence::{DirectOptions, MemberEntry};
@@ -137,6 +138,10 @@ pub struct Links {
     pub(crate) online: crate::online::Online,
     /// What stops the running address watcher ([`Links::watch_addresses`]).
     pub(crate) address_watch: Mutex<Option<CancellationToken>>,
+    /// What stops the task that follows a device's joined folders
+    /// ([`LinkHints::serve`](crate::LinkHints::serve)): there is one at most.
+    #[cfg(feature = "introductions")]
+    pub(crate) joined_follow: Mutex<Option<CancellationToken>>,
     pub(crate) cancel: CancellationToken,
     /// The test-only fault layer's plan, shared by every link's face.
     #[cfg(feature = "fault-injection")]
@@ -184,6 +189,8 @@ impl Links {
             memory: OnceLock::new(),
             online: crate::online::Online::default(),
             address_watch: Mutex::new(None),
+            #[cfg(feature = "introductions")]
+            joined_follow: Mutex::new(None),
             cancel,
             #[cfg(feature = "fault-injection")]
             faults: Arc::default(),
@@ -307,6 +314,54 @@ impl Links {
         for id in routed.keys() {
             self.route_demand(*id);
         }
+    }
+
+    /// The folders this device joined, and the namespaces of the folder's
+    /// other writers its link to each inviter routes (SHAPES-R9 §A): the set
+    /// is replaced whole. A route toward each namespace is installed over the
+    /// **full, identified link of the inviter's key** (its handshake proved
+    /// that key, an identity that validates in the folder's owner namespace
+    /// admitted it, and it is no enrollment, introduction or departure link)
+    /// at [`JOINED_ROUTE_COST`](crate::policy::JOINED_ROUTE_COST), above every
+    /// route of a real path, and over no other link; a route the set no
+    /// longer lists is removed, and a link that ends takes its routes with its
+    /// face. A link made after this call gets its routes when it is up; a link
+    /// made only to introduce gets them once it is made again as a full link.
+    /// Idempotent, never blocks, bounded
+    /// ([`JOINED_ROUTES_MAX`](crate::policy::JOINED_ROUTES_MAX) distinct
+    /// prefixes in all, [`JOINED_FOLDERS_MAX`](crate::policy::JOINED_FOLDERS_MAX)
+    /// folders: the excess is dropped with a warning that says why).
+    ///
+    /// A route is a path, not a right: the inviter's own filter decides what
+    /// crosses it. [`LinkHints::serve`](crate::LinkHints::serve) calls this
+    /// from the device's joined folders and again at every change of them; a
+    /// host whose link key is not its device key calls it itself, with the
+    /// link key of each folder's inviter. The forwarder is told while the link
+    /// table is locked: a [`FaceSink`] must not call back into [`Links`] from
+    /// `add_routes` or `remove_routes`.
+    pub fn set_joined_routes(&self, routes: Vec<JoinedRoutes>) {
+        self.reroute_joined(Some(JoinedSet::bounded(routes)));
+    }
+
+    /// Install and remove the joiner's routes each full link path is owed now
+    /// (`set`, when given, replaces the set). The forwarder is told while the
+    /// table is locked ([`LinkTable::reroute_joined`]).
+    fn reroute_joined(&self, set: Option<JoinedSet>) {
+        self.table.reroute_joined(set, |change| {
+            if !change.removed.is_empty() {
+                self.faces.remove_routes(change.face, &change.removed);
+            }
+            if !change.added.is_empty() {
+                self.faces.add_routes(change.face, &change.added);
+            }
+            tracing::info!(
+                target: "face.quic",
+                face = change.face.0,
+                added = ?change.added.iter().map(|r| r.prefix.to_string()).collect::<Vec<_>>(),
+                removed = ?change.removed.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
+                "the namespaces routed over the link of a folder's inviter changed"
+            );
+        });
     }
 
     /// The namespaces this device shows in a hello: the one of its link
@@ -811,6 +866,12 @@ impl Links {
             .clone()
             .filter(|_| peer.as_ref().is_some_and(|p| p.routes.is_none()));
         let routes = routes_for(&self.peers, &admitted, dials, relay_routes);
+        // A person is told of a departure by a full link only: what a peer says
+        // on an enrollment, introduction or departure link is not heard, and a
+        // grant link tells the returning person of the marks it holds (an
+        // entry that ended while they were away). It is also the only link
+        // that gets the joiner's routes.
+        let full = kind == PathKind::Link && enrolling.is_empty() && admitted.enrollment.is_none();
         let registration = Registration {
             fingerprint: admitted.fingerprint,
             peer: admitted.peer,
@@ -828,6 +889,8 @@ impl Links {
                 sender,
                 routes: routes.clone(),
                 relay,
+                full,
+                joined: Vec::new(),
             },
         };
         let Some(generation) = self.table.register(registration, self.my_fingerprint()) else {
@@ -841,6 +904,12 @@ impl Links {
         };
         self.faces.add_face(face, self.cancel.child_token());
         self.faces.add_routes(face_id, &routes);
+        // The joiner's routes, after the face is in the forwarder: the routes
+        // the set owes this path now are decided and given under the table's
+        // lock, so a change of the set that came before or during the
+        // registration is the one this path gets, and none is lost or given
+        // to a face already gone.
+        self.reroute_joined(None);
         // Offline began while this link's handshake ran: the links closed
         // then did not include this one.
         if !self.is_online() {
@@ -894,11 +963,6 @@ impl Links {
         }
         self.explain_enrollment(&admitted, &peer_enrollment, face_id);
         self.departure_link_up(&admitted, &handle);
-        // A person is told of a departure by a full link only: what a peer says
-        // on an enrollment, introduction or departure link is not heard, and a
-        // grant link tells the returning person of the marks it holds (an
-        // entry that ended while they were away).
-        let full = kind == PathKind::Link && enrolling.is_empty() && admitted.enrollment.is_none();
         if full {
             self.hear_departures(admitted.fingerprint, &handle);
             self.grant_link_up(&admitted, &handle);

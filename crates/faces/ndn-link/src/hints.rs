@@ -8,7 +8,9 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ndn_data::intro::{Dialing, HintCandidate, HintKind, LinkHint, introduction_prefixes};
+use ndn_data::intro::{
+    Dialing, HintCandidate, HintKind, JoinedFolder, LinkHint, introduction_prefixes,
+};
 use ndn_data::version::Timestamp;
 use ndn_data::{DataError, Device, IntroductionSurface, NextStep, Role};
 use ndn_face_quic::KeyFingerprint;
@@ -17,6 +19,7 @@ use ndn_packet::Name;
 use crate::departures::{Departure, DepartureSink, DepartureTaking, NotTaken};
 use crate::grants::{Grant, GrantRole};
 use crate::introduce::Introductions;
+use crate::joined::JoinedRoutes;
 use crate::links::Links;
 
 impl Introductions for IntroductionSurface {
@@ -88,6 +91,15 @@ impl LinkHints {
     /// [`LinkHints::grant`] and [`LinkHints::revoke_grant`]: the device is the
     /// single source of grants, and ndn-link keeps none of its own across
     /// restarts.
+    ///
+    /// It is also the joiner's half: the folders this device joined
+    /// ([`Device::joined_folders`]) are given to the links now
+    /// ([`Links::set_joined_routes`]), and again at every change the device
+    /// signals ([`Device::joined_changes`]), by **one** task that ends when the
+    /// device is gone or the links stop. A second call stops the task the first
+    /// started and starts its own: there is never more than one for these
+    /// links, so calling it twice does not follow the device twice. The host
+    /// has no route to make.
     pub fn serve(&self, device: &Device) {
         self.links
             .set_introductions(Arc::new(device.introductions()));
@@ -99,6 +111,42 @@ impl LinkHints {
         for grant in device.grants() {
             self.grant(&grant);
         }
+        self.follow_joined(device.introductions());
+    }
+
+    /// Give the links the joined folders of `surface` now and at every change
+    /// of its `joined_changes`, by one task for these links: the one a former
+    /// call started is stopped, and the task ends when the device is gone.
+    fn follow_joined(&self, surface: IntroductionSurface) {
+        let stop = {
+            let mut running = self.links.joined_follow.lock();
+            if let Some(former) = running.take() {
+                former.cancel();
+            }
+            let stop = self.links.cancel_token().child_token();
+            *running = Some(stop.clone());
+            stop
+        };
+        // Subscribed before the first read: a change between the two is seen
+        // as one more, which changes nothing.
+        let mut changes = surface.joined_changes();
+        set_joined(&self.links, &surface);
+        let links = Arc::downgrade(&self.links);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = stop.cancelled() => break,
+                    changed = changes.changed() => {
+                        // The device dropped its end: it is gone.
+                        if changed.is_err() {
+                            break;
+                        }
+                        let Some(links) = links.upgrade() else { break };
+                        set_joined(&links, &surface);
+                    }
+                }
+            }
+        });
     }
 
     /// An offer of the device admitted a person (or a held record changed
@@ -266,6 +314,38 @@ fn epoch_plus(ms: u64) -> Option<SystemTime> {
 
 fn add_ms(base: SystemTime, ms: u64) -> Option<SystemTime> {
     base.checked_add(Duration::from_millis(ms))
+}
+
+/// The joined folders `surface` lists now, given to `links` as routes, and
+/// said at info with the folders and prefixes.
+fn set_joined(links: &Links, surface: &IntroductionSurface) {
+    let folders = surface.joined_folders();
+    tracing::info!(
+        target: "face.quic",
+        folders = ?folders.iter().map(|f| format!(
+            "{} (inviter {}): {}",
+            f.folder,
+            KeyFingerprint(f.inviter),
+            f.writers.iter().map(ToString::to_string).collect::<Vec<_>>().join(" ")
+        )).collect::<Vec<_>>(),
+        "the folders this device joined changed: the writers' namespaces are routed over each inviter's link"
+    );
+    links.set_joined_routes(joined_routes(&folders));
+}
+
+/// The data layer's joined folders as ndn-link routes them: the inviter's
+/// digest is its link key (a host whose link key is not its device key calls
+/// [`Links::set_joined_routes`] with its own mapping), the owner and the
+/// writers' namespaces as the device derived them.
+fn joined_routes(folders: &[JoinedFolder]) -> Vec<JoinedRoutes> {
+    folders
+        .iter()
+        .map(|f| JoinedRoutes {
+            inviter: KeyFingerprint(f.inviter),
+            owner: f.owner.clone(),
+            namespaces: f.writers.clone(),
+        })
+        .collect()
 }
 
 /// The data layer's grant as ndn-link holds it. A date no platform clock can

@@ -38,6 +38,20 @@ pub const LISTEN_PORT_MIN: u16 = 1024;
 /// Cost of a route to a peer reached through its relay; a direct link to it
 /// costs 0, so it wins when it is up.
 pub const VIA_RELAY_COST: u32 = 10;
+/// Cost of a route the joiner's link gets toward a namespace of another
+/// writer of a folder it joined ([`Links::set_joined_routes`](crate::Links::set_joined_routes)):
+/// above every route the link layer makes for a real path (a relay's, a
+/// direct path's), so a path to the namespace's own devices, when there is
+/// one, always wins; this route is the way through the inviter only when
+/// there is no other.
+pub const JOINED_ROUTE_COST: u32 = VIA_RELAY_COST + 1000;
+/// Distinct prefixes in all that [`Links::set_joined_routes`](crate::Links::set_joined_routes)
+/// takes; a prefix in two folders counts once. The rest are dropped, with a
+/// warning.
+pub const JOINED_ROUTES_MAX: usize = 64;
+/// Folders (entries of the set) that `set_joined_routes` takes; the rest are
+/// dropped, with a warning.
+pub const JOINED_FOLDERS_MAX: usize = 16;
 /// Redial backoff after a drop or a failure that may pass…
 pub const BACKOFF_FIRST: Duration = Duration::from_millis(500);
 pub const BACKOFF_MAX: Duration = Duration::from_secs(30);

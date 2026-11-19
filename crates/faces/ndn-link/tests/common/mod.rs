@@ -40,6 +40,9 @@ use ndn_sync::MemoryStore;
 use ndn_trust_envelope::TrustEnvelope;
 use tokio_util::sync::CancellationToken;
 
+pub mod recording;
+pub use recording::Recording;
+
 /// The people of this test who are named by their key: their genesis and
 /// their newest signed context, as the network would give them by name.
 static DIRECTORY: std::sync::LazyLock<
@@ -482,6 +485,9 @@ pub struct Embedded {
     pub addr: Option<SocketAddr>,
     pub cancel: CancellationToken,
     pub engine: ForwarderEngine,
+    /// What this device's links gave its forwarder (route and face removals,
+    /// recorded).
+    pub sink: Arc<Recording>,
     _shutdown: ShutdownHandle,
     pub validator: Arc<Validator>,
     kept: Kept,
@@ -582,12 +588,13 @@ async fn boot(kept: Kept, setup: Setup) -> Embedded {
             Timestamp(now + by.load(Ordering::SeqCst))
         })
     };
+    let sink = Arc::new(Recording::new(engine.clone()));
     let links = Links::start(
         LinkSetup {
             peers: Vec::new(),
             key: Arc::clone(&parts.link_key),
             trust,
-            faces: Arc::new(EngineFaces(engine.clone())),
+            faces: Arc::clone(&sink) as Arc<dyn FaceSink>,
             paths: Arc::new(ConfiguredEndpoints),
             candidates: vec![Arc::new(HostCandidates {
                 include_local: true,
@@ -647,6 +654,7 @@ async fn boot(kept: Kept, setup: Setup) -> Embedded {
         addr: parts.addr,
         cancel,
         engine,
+        sink,
         validator,
         kept,
         skew,
@@ -984,7 +992,7 @@ pub async fn reshare(ann: &Embedded, folder: &Name, writers: &[Name]) {
 
 /// With `NDN_LINK_TEST_LOG=<file>` (and `RUST_LOG`), the tracing of the run
 /// goes to that file, once.
-fn log_to_file() {
+pub fn log_to_file() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         if let Ok(path) = std::env::var("NDN_LINK_TEST_LOG")

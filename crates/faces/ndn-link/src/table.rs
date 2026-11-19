@@ -21,8 +21,9 @@ use ndn_transport::{Face, FaceId};
 use crate::admission::Identity;
 use crate::grants::Grant;
 use crate::host::Route;
+use crate::joined::JoinedSet;
 use crate::peer::PeerId;
-use crate::policy::DIAL_RACE_WINDOW;
+use crate::policy::{DIAL_RACE_WINDOW, JOINED_ROUTE_COST};
 use crate::routes::RelayRoutes;
 use crate::status::{PathKind, PathStatus};
 
@@ -65,6 +66,13 @@ pub(crate) struct LinkPath {
     /// own): the namespaces it routes as the relay's and their cost, kept
     /// current by [`LinkTable::reroute_relays`].
     pub(crate) relay: Option<RelayRoutes>,
+    /// A full link: a path of kind [`PathKind::Link`] that is no enrollment,
+    /// introduction or departure link. Only a full link gets the joiner's
+    /// routes.
+    pub(crate) full: bool,
+    /// The prefixes of the joiner's routes ([`LinkTable::reroute_joined`])
+    /// this path's face got, and no other route of it is among them.
+    pub(crate) joined: Vec<Name>,
 }
 
 /// What a link path's face gains and loses when the namespaces it routes
@@ -190,6 +198,10 @@ pub(crate) struct LinkTable {
     /// Peers to dial again once (even when not persistent): their
     /// enrollment link was closed because this device enrolled.
     relink: Mutex<HashSet<PeerId>>,
+    /// The joiner's routes ([`Links::set_joined_routes`](crate::Links::set_joined_routes)),
+    /// read under `live` by every registration and reroute, so what a path
+    /// is given is always of the newest set.
+    joined: Mutex<JoinedSet>,
 }
 
 const ALREADY_LINKED: &str = "a link between these two devices already exists";
@@ -774,6 +786,61 @@ impl LinkTable {
             }
         }
         out
+    }
+
+    /// Route over each full link path the prefixes of the joiner's set it
+    /// is wanted for now (`set`, when given, replaces the set first): the
+    /// path's face gains the new ones and loses the ones no longer wanted.
+    /// A prefix one of the path's own routes already has is left to that
+    /// route (never overwritten with this one's cost, never removed on its
+    /// behalf). `apply` is told each face's change **while the table is
+    /// locked**: a path that ends leaves the table before its face is
+    /// removed, so a change is never given to a face that is gone. It must
+    /// not call back into the links.
+    pub(crate) fn reroute_joined(&self, set: Option<JoinedSet>, mut apply: impl FnMut(&Rerouted)) {
+        let mut live = self.live.lock();
+        let mut joined = self.joined.lock();
+        if let Some(set) = set {
+            *joined = set;
+        }
+        for (fingerprint, link) in live.iter_mut() {
+            let wanted = joined.wanted(fingerprint, &link.identities);
+            for p in &mut link.paths {
+                let path = &mut p.path;
+                let now: Vec<Name> = if path.full && path.kind == PathKind::Link {
+                    wanted
+                        .iter()
+                        .filter(|ns| !path.routes.iter().any(|r| r.prefix == **ns))
+                        .cloned()
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let added: Vec<Route> = now
+                    .iter()
+                    .filter(|ns| !path.joined.contains(ns))
+                    .map(|ns| Route {
+                        prefix: ns.clone(),
+                        cost: JOINED_ROUTE_COST,
+                    })
+                    .collect();
+                let removed: Vec<Name> = path
+                    .joined
+                    .iter()
+                    .filter(|ns| !now.contains(ns))
+                    .filter(|ns| !path.routes.iter().any(|r| r.prefix == **ns))
+                    .cloned()
+                    .collect();
+                path.joined = now;
+                if !added.is_empty() || !removed.is_empty() {
+                    apply(&Rerouted {
+                        face: path.face,
+                        added,
+                        removed,
+                    });
+                }
+            }
+        }
     }
 }
 

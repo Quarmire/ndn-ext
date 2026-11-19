@@ -199,6 +199,19 @@
 //! `grant`, `revoke_grant`; `end_grant`, `end_grant_in` and `renew_grant` make
 //! a host's own end or renewal durable).
 //!
+//! A person who joined a folder reads the folder's other writers through the
+//! inviter's link, and its forwarder has no route toward their namespaces:
+//! [`Links::set_joined_routes`] gives the link layer the set of folders the
+//! device joined ([`JoinedRoutes`]: the inviter's key, the folder's owner, the
+//! other writers' namespaces; `LinkHints::serve` follows the device's
+//! `joined_folders` with it). Each prefix is routed over the **full link of
+//! the inviter's key**, admitted by an identity of the owner's namespace, at a
+//! cost above every real path ([`policy::JOINED_ROUTE_COST`]), and over no
+//! other link; it goes with the entry, the record's writer and the link, and
+//! it is a path, not a right: the inviter's filter decides what crosses it.
+//! At most [`policy::JOINED_ROUTES_MAX`] prefixes in [`policy::JOINED_FOLDERS_MAX`]
+//! folders (`ndn-rs/docs/specs/ndn-link.md` §8.7).
+//!
 //! # Link memory
 //!
 //! A device that restarts keeps what it learned of its peers, and links with
@@ -289,6 +302,7 @@ mod grants;
 mod hints;
 mod host;
 mod introduce;
+mod joined;
 mod links;
 mod memory;
 mod netwatch;
@@ -326,6 +340,7 @@ pub use host::{
     ConfiguredEndpoints, FaceSink, LinkTrust, OwnMembership, PathCandidate, PathSource, Route,
 };
 pub use introduce::Introductions;
+pub use joined::JoinedRoutes;
 pub use links::{LinkSetup, Links};
 pub use memory::{
     LinkMemory, MemoryFuture, MemoryOptions, MemoryReport, PeerRecord, RememberedPeer,
