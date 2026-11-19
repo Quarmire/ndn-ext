@@ -344,6 +344,7 @@ fn joined_routes(folders: &[JoinedFolder]) -> Vec<JoinedRoutes> {
             inviter: KeyFingerprint(f.inviter),
             owner: f.owner.clone(),
             namespaces: f.writers.clone(),
+            push: f.role == Role::Writer,
         })
         .collect()
 }

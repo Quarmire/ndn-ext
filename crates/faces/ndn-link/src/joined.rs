@@ -42,6 +42,14 @@ pub struct JoinedRoutes {
     /// derived them from the members record in force (never this device's own
     /// namespace, nor one above or below it).
     pub namespaces: Vec<Name>,
+    /// This device writes in the folder: the other writers' sync groups
+    /// (`<W>/32=sync`) are routed beside `<W>`. The group is how a writer's
+    /// notices and pushes travel, so it is the route a writer-role joiner has
+    /// and a reader-role joiner (`false`) has not: a reader is routed `<W>`
+    /// only (what it reads of a writer lies under `<W>`), and nothing that
+    /// lets it push is installed. The role is the record's, so a record that
+    /// promotes or demotes the device re-routes at the next notification.
+    pub push: bool,
 }
 
 /// The set as [`Links::set_joined_routes`](crate::Links::set_joined_routes)
@@ -99,7 +107,8 @@ impl JoinedSet {
     /// are `identities`: for each folder whose inviter it is and whose owner
     /// one of its identities validates in (an identity of a namespace held
     /// here; a served device of a namespace not held proves nothing about
-    /// it), each writer's namespace **and its sync group** (`<W>/32=sync`).
+    /// it), each writer's namespace **and, for a folder this device writes in
+    /// ([`JoinedRoutes::push`]), its sync group** (`<W>/32=sync`).
     /// The group needs its own route: this device's data layer registers the
     /// other writers' groups with its own forwarder (to hear their notices),
     /// and a forwarder's longest-prefix match returns that one entry alone, so
@@ -119,8 +128,12 @@ impl JoinedSet {
                     .iter()
                     .any(|id| id.served.is_none() && id.namespace == f.owner)
             })
-            .flat_map(|f| f.namespaces.iter())
-            .flat_map(|ns| [ns.clone(), sync_group(ns)])
+            .flat_map(|f| {
+                f.namespaces.iter().flat_map(move |ns| {
+                    let group = f.push.then(|| sync_group(ns));
+                    std::iter::once(ns.clone()).chain(group)
+                })
+            })
             .collect()
     }
 }

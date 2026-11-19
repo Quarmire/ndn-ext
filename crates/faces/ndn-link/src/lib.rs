@@ -204,7 +204,8 @@
 //! [`Links::set_joined_routes`] gives the link layer the set of folders the
 //! device joined ([`JoinedRoutes`]: the inviter's key, the folder's owner, the
 //! other writers' namespaces; `LinkHints::serve` follows the device's
-//! `joined_folders` with it). Each namespace, and its sync group, is routed over the **full link of
+//! `joined_folders` with it). Each namespace, and for a writer-role joiner
+//! its sync group (a reader is routed the namespace only), is routed over the **full link of
 //! the inviter's key**, admitted by an identity of the owner's namespace, at a
 //! cost above every real path ([`policy::JOINED_ROUTE_COST`]), and over no
 //! other link; it goes with the entry, the record's writer and the link, and

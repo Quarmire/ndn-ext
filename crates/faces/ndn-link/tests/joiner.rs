@@ -29,7 +29,7 @@ use common::{
     reshare, routed_over, text, until,
 };
 use ndn_cert::onboarding::rdr_prefix;
-use ndn_data::Role;
+use ndn_data::{Audience, DataLayer, Role, Rule, Share, Sharing};
 use ndn_face_quic::{KeyFingerprint, LinkEndpoint, LinkKey, LinkKeySource, LinkTransportConfig};
 use ndn_link::policy::{JOINED_FOLDERS_MAX, JOINED_ROUTE_COST, JOINED_ROUTES_MAX, VIA_RELAY_COST};
 use ndn_link::{
@@ -393,11 +393,21 @@ fn face_to(links: &Links, key: KeyFingerprint) -> FaceId {
         .unwrap_or_else(|| panic!("no link to {key}"))
 }
 
+/// The routes of a folder the joiner writes in (its writers' sync groups are routed).
 fn routes(inviter: KeyFingerprint, owner: &str, namespaces: &[&str]) -> JoinedRoutes {
     JoinedRoutes {
         inviter,
         owner: n(owner),
         namespaces: namespaces.iter().map(|s| n(s)).collect(),
+        push: true,
+    }
+}
+
+/// The same folder for a joiner that only reads in it.
+fn reader(routes: JoinedRoutes) -> JoinedRoutes {
+    JoinedRoutes {
+        push: false,
+        ..routes
     }
 }
 
@@ -575,6 +585,50 @@ async fn a_route_the_set_drops_is_removed_and_the_same_set_again_changes_nothing
         bob.at.joined()
     );
     assert!(bob.at.removed.lock().contains(&(ann_face, n("/d"))));
+    bob.cancel.cancel();
+}
+
+/// A reader entry is routed `<W>` and not `<W>/32=sync`, a writer entry both:
+/// the group is the writer-push route. The entry's role changing replaces the
+/// routes at once, whichever way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn only_a_writer_entry_is_routed_the_sync_groups() {
+    let bob = bob_linked_to_three().await;
+    let ann_face = face_to(&bob.links, bob.ann);
+    let group = sync_group(&n("/c"));
+
+    bob.links
+        .set_joined_routes(vec![reader(routes(bob.ann, "/a", &["/c"]))]);
+    assert_eq!(bob.at.joined(), vec![(ann_face, n("/c"))]);
+    assert_eq!(
+        bob.at.joined_additions(&group),
+        0,
+        "a reader entry was routed the writer's sync group"
+    );
+
+    bob.links
+        .set_joined_routes(vec![routes(bob.ann, "/a", &["/c"])]);
+    assert_eq!(
+        bob.at.joined_additions(&group),
+        1,
+        "a writer entry was not routed the sync group"
+    );
+
+    bob.links
+        .set_joined_routes(vec![reader(routes(bob.ann, "/a", &["/c"]))]);
+    assert!(
+        bob.at.removed.lock().contains(&(ann_face, group.clone())),
+        "the entry demoted to a reader kept the sync group"
+    );
+    assert_eq!(bob.at.joined(), vec![(ann_face, n("/c"))]);
+
+    // A writer entry of another folder beside a reader entry of the same
+    // namespace: the writer's group is routed (one route for the namespace).
+    bob.links.set_joined_routes(vec![
+        reader(routes(bob.ann, "/a", &["/c"])),
+        routes(bob.ann, "/a", &["/c"]),
+    ]);
+    assert_eq!(bob.at.joined_additions(&group), 2, "(added again once)");
     bob.cancel.cancel();
 }
 
@@ -1215,18 +1269,43 @@ async fn a_restarted_joiner_is_routed_from_its_device_when_the_link_is_up() {
     .await;
 }
 
-/// A reader-role joiner (Bob is a reader of the folder Carol writes in) is
-/// routed the writers' namespaces: the inviter's filter decides what he may
-/// fetch (the push half is the link-level case above).
+/// Ann's members record for `folder` with `writers` as the writers and
+/// `readers` as the readers.
+async fn share_with(ann: &Embedded, folder: &Name, writers: &[Name], readers: &[Name]) {
+    ann.device
+        .share_folder(
+            folder,
+            Sharing::Whole(Share {
+                rule: Rule::Log,
+                writers: writers.to_vec(),
+                readers: readers.iter().cloned().map(Audience::Person).collect(),
+            }),
+        )
+        .await
+        .unwrap();
+}
+
+/// A reader-role joiner (Bob reads the folder Carol writes in) is routed the
+/// writer's namespace and **not her sync group**, the writer-push route: it
+/// lets a device push and hear notices, and a reader has none. The routes
+/// follow the record's role at the next notification: a record that promotes
+/// Bob to a writer brings the group route, one that demotes him takes it away
+/// and leaves the namespace. Bob's host makes no route of its own (by name).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_reader_joiner_is_routed_the_writers_namespace() {
+async fn a_reader_joiner_is_routed_the_namespace_and_not_the_group_until_a_record_promotes_it() {
     let alice = Person::new("/alice").await;
     let bobs = Person::self_certifying([0xb2; 32]).await;
     let carols = Person::self_certifying([0xc2; 32]).await;
+    let named = Setup {
+        scoped_by_name: true,
+        ..Setup::dialer()
+    };
     let ann = embedded(&alice, common::ANN, Setup::inviter()).await;
-    let bob = embedded(&bobs, &bobs.device("phone"), Setup::dialer()).await;
-    let carol = embedded(&carols, &carols.device("phone"), Setup::dialer()).await;
+    let bob = embedded(&bobs, &bobs.device("phone"), named.clone()).await;
+    let carol = embedded(&carols, &carols.device("phone"), named).await;
     let folder = n(common::FOLDER);
+    let group = sync_group(&carols.ns);
+    let everyone = [alice.ns.clone(), bobs.ns.clone(), carols.ns.clone()];
     invited(&ann, &bob, Role::Reader).await;
     invited_in(&ann, &carol, &folder, Role::Writer).await;
     until(
@@ -1235,5 +1314,44 @@ async fn a_reader_joiner_is_routed_the_writers_namespace() {
         async || bob.sink.joined_now() == vec![(face_of(&bob, ann.key), carols.ns.clone())],
     )
     .await;
+    let face = face_of(&bob, ann.key);
+    assert_eq!(
+        fib_cost(&bob, &carols.ns, face),
+        Some(JOINED_ROUTE_COST),
+        "a reader's FIB lacks the writer's namespace"
+    );
+    assert_eq!(
+        fib_cost(&bob, &group, face),
+        None,
+        "a reader was routed the writer's sync group"
+    );
+    assert!(!bob.sink.routed_at_joiner_cost(face, &group));
+
+    // A record that makes Bob a writer: the group is routed.
+    share_with(&ann, &folder, &everyone, &everyone).await;
+    until(
+        "the promoted joiner is routed the group",
+        LONG,
+        async || fib_cost(&bob, &group, face_of(&bob, ann.key)) == Some(JOINED_ROUTE_COST),
+    )
+    .await;
+
+    // One that makes him a reader again: the group goes, the namespace stays.
+    share_with(
+        &ann,
+        &folder,
+        &[alice.ns.clone(), carols.ns.clone()],
+        &everyone,
+    )
+    .await;
+    until("the demoted joiner loses the group", LONG, async || {
+        fib_cost(&bob, &group, face_of(&bob, ann.key)).is_none()
+    })
+    .await;
+    assert!(bob.sink.removed_route(face_of(&bob, ann.key), &group));
+    assert_eq!(
+        fib_cost(&bob, &carols.ns, face_of(&bob, ann.key)),
+        Some(JOINED_ROUTE_COST)
+    );
     assert_eq!(bob.sink.ever_joined(), vec![carols.ns.clone()]);
 }
