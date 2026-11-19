@@ -36,6 +36,17 @@ pub struct FaultReport {
     pub predicate_panics: u64,
 }
 
+impl FaultReport {
+    /// Whether this build of ndn-link has the fault layer (the cargo feature
+    /// `fault-injection`). A host that ships to people asks this before it
+    /// starts anything, and refuses to run when it is true, instead of
+    /// waiting for [`LinkReport::fault_injection`](crate::LinkReport) of a
+    /// running [`Links`](crate::Links).
+    pub const fn compiled_in() -> bool {
+        cfg!(feature = "fault-injection")
+    }
+}
+
 #[cfg(not(feature = "fault-injection"))]
 impl crate::Links {
     /// Without the feature there is no fault layer to report.
