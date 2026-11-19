@@ -11,7 +11,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
-use ndn_face_quic::{KeyFingerprint, LinkEndpoint, LinkKey, LinkKeySource, LinkTransportConfig};
+use ndn_face_quic::{
+    CloseReason, KeyFingerprint, LinkEndpoint, LinkKey, LinkKeySource, LinkTransportConfig,
+};
 use ndn_link::{
     ConfiguredEndpoints, Direction, FaceSink, LinkMode, LinkSetup, LinkState, LinkTrust, LinkWatch,
     Links, Next, PeerLink, PeerSpec, RelayService, Route, link_code,
@@ -430,5 +432,70 @@ async fn a_refused_first_dial_is_a_down_state_of_the_expected_key() {
             assert_eq!(next, Next::Gone);
         }
     }
+    cancel.cancel();
+}
+
+/// What a device that refuses every link says as its reason: a forged log
+/// line, a terminal escape, a bidi override, a zero-width character, the
+/// address of a third party, and a page of words.
+fn hostile_reason() -> String {
+    format!(
+        "your key is revoked\n2026-01-01 INFO forged line \x1b[2J\x1b[31m \u{202E}now\u{200B} see 203.0.113.9:6363{}",
+        " persuade".repeat(500)
+    )
+}
+
+/// Whatever a hostile device writes in the reason it refuses with, the
+/// status of that peer shows one bounded line of printable words: no control
+/// or invisible character, no address, at most `WATCH_TEXT_MAX` characters.
+#[tokio::test]
+async fn a_hostile_refusal_text_is_one_bounded_line_in_the_status() {
+    let cancel = CancellationToken::new();
+    let (a, b) = (key(11), key(12));
+    let fb = b.fingerprint();
+    let shared: Arc<dyn LinkKeySource> = Arc::new(b);
+    let socket = bind(&shared, "127.0.0.1:0").unwrap();
+    let addr = socket.local_addr().unwrap().to_string();
+    let refuser = {
+        let socket = Arc::clone(&socket);
+        tokio::spawn(async move {
+            while let Some(incoming) = socket.accept().await {
+                if let Ok(hs) = incoming.handshake().await {
+                    hs.refuse(CloseReason::Unrecognized, &hostile_reason());
+                }
+            }
+        })
+    };
+    let once = start(a, vec![peer(fb, Some(&addr), false)], None, &cancel);
+    let mut watch = once.watch();
+    let refused = change(&mut watch, "the refusal is reported", down).await;
+    let LinkState::Down { why, .. } = &refused.state else {
+        panic!("not down: {refused:?}")
+    };
+    let mut texts = vec![why.text.clone()];
+    texts.extend(why.params.values().cloned());
+    for text in texts {
+        assert!(
+            !text.chars().any(|c| c.is_control()
+                || matches!(c, '\u{202E}' | '\u{200B}' | '\u{2066}'..='\u{2069}')),
+            "control or invisible characters reached the status: {text:?}"
+        );
+        assert!(
+            text.chars().count() <= 1024,
+            "{} characters",
+            text.chars().count()
+        );
+        assert!(
+            !text.contains("203.0.113.9"),
+            "an address in the status: {text:?}"
+        );
+    }
+    assert!(
+        why.text
+            .contains("your key is revoked 2026-01-01 INFO forged line"),
+        "{}",
+        why.text
+    );
+    refuser.abort();
     cancel.cancel();
 }

@@ -528,21 +528,39 @@ impl Links {
 /// What a reason says of an address: nothing.
 const AN_ADDRESS: &str = "an address";
 
-/// `detail` as a watcher sees it: its words and facts with each address
-/// (socket address, IP address, `host:port`) replaced by "an address". A
-/// watcher sees keys, device names and plain-words reasons, never where a
-/// device is.
+/// The most characters of any one sentence or parameter a watcher is given;
+/// longer ones end in `…`. Above the bound on a peer's own words
+/// (`ndn_face_quic::PEER_TEXT_MAX`), which a sentence quotes with a little
+/// of ours.
+const WATCH_TEXT_MAX: usize = 1024;
+
+/// `detail` as a watcher sees it: its words and facts as one line of
+/// printable text each (no control or invisible characters, whatever a peer
+/// put in its close text), with each address (socket address, IP address,
+/// `host:port`) replaced by "an address", at most [`WATCH_TEXT_MAX`]
+/// characters. A watcher sees keys, device names and plain-words reasons,
+/// never where a device is.
 fn plain(detail: &LinkDetail) -> LinkDetail {
     LinkDetail {
         code: detail.code.clone(),
         params: detail
             .params
             .iter()
-            .map(|(k, v)| (k.clone(), without_addresses(v)))
+            .map(|(k, v)| (k.clone(), watchable(v)))
             .collect(),
-        text: without_addresses(&detail.text),
+        text: watchable(&detail.text),
         causes: detail.causes.iter().map(plain).collect(),
     }
+}
+
+/// `text` for a watcher: cleaned first (an address with an invisible
+/// character in it is still an address), then its addresses scrubbed, then
+/// bounded.
+fn watchable(text: &str) -> String {
+    ndn_face_quic::bounded_text(
+        &without_addresses(&ndn_face_quic::clean_text(text)),
+        WATCH_TEXT_MAX,
+    )
 }
 
 fn without_addresses(text: &str) -> String {
@@ -916,5 +934,55 @@ mod tests {
         // Words stay words.
         let said = "the other device closed the link: it is shutting down; it links again (0.5 s)";
         assert_eq!(without_addresses(said), said);
+    }
+
+    /// A watcher shows what it is given to a person: whatever a hostile
+    /// device put in its close text, a status carries one bounded line of
+    /// printable words, with the address it quotes still scrubbed.
+    #[test]
+    fn a_peer_close_text_is_one_bounded_line_of_printable_words() {
+        let hostile = format!(
+            "pay now\n2026-01-01 INFO forged line \x1b[2J\x1b[31m\u{202E}reversed\u{200B} at 203.0.113.9\u{200B}:6363 {}",
+            "persuade ".repeat(1000)
+        );
+        let error = LinkError::Refused {
+            reason: Some(ndn_face_quic::CloseReason::Revoked),
+            text: hostile.clone(),
+        };
+        let detail = link_error_detail(&error).caused_by(LinkDetail::new(
+            code::DIAL_FAILED,
+            format!("it said: {hostile}"),
+        ));
+        let plain = plain(&detail);
+        let mut texts = vec![
+            plain.text.clone(),
+            plain.causes[0].text.clone(),
+            plain
+                .params
+                .iter()
+                .find(|(k, _)| k.as_str() == "text")
+                .expect("the peer's text is a parameter")
+                .1
+                .clone(),
+        ];
+        texts.extend(plain.params.values().cloned());
+        for text in texts {
+            assert!(
+                !text.chars().any(|c| c.is_control()
+                    || matches!(c, '\u{202E}' | '\u{200B}' | '\u{2066}'..='\u{2069}')),
+                "control or invisible characters reached the watcher: {text:?}"
+            );
+            assert!(
+                text.chars().count() <= WATCH_TEXT_MAX,
+                "{} characters",
+                text.chars().count()
+            );
+            assert!(
+                !text.contains("203.0.113.9") && !text.contains("6363"),
+                "{text:?}"
+            );
+        }
+        assert!(plain.text.contains("pay now 2026-01-01 INFO forged line"));
+        assert!(plain.text.contains("an address"), "{}", plain.text);
     }
 }
