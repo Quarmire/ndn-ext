@@ -15,9 +15,10 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use ndn_app::EngineAppExt;
+use ndn_app::{Consumer, EngineAppExt};
 use ndn_data::intro::{
-    Dialing, HintCandidate, HintKind, LINK_HINT_CANDIDATES_MAX, LinkHint, introduction_prefixes,
+    Contact, Dialing, FirstDialing, HintCandidate, HintKind, HintRecord, LINK_HINT_CANDIDATES_MAX,
+    LinkHint, ShortCode, hint_name, hint_prefix, hint_token, introduction_prefixes,
 };
 use ndn_data::{
     Answer, Audience, Config, Content, DataLayer, Device, Got, IntroPolicy, Introducer, Joined,
@@ -27,9 +28,10 @@ use ndn_data::{
 use ndn_engine::{EngineBuilder, EngineConfig, ForwarderEngine, ShutdownHandle};
 use ndn_face_quic::{KeyFingerprint, LinkEndpoint, LinkKey, LinkKeySource, LinkTransportConfig};
 use ndn_link::{
-    ConfiguredEndpoints, EngineFaces, HostCandidates, LinkHints, LinkSetup, LinkTrust, Links,
-    PathKind, PeerSpec, Quotas, RelayService, RelaySource, RelayUse, ServePolicy,
+    ConfiguredEndpoints, EngineFaces, HostCandidates, Introductions, LinkHints, LinkSetup,
+    LinkTrust, Links, PathKind, PeerSpec, Quotas, RelayService, RelaySource, RelayUse, ServePolicy,
 };
+use ndn_packet::encode::{DataBuilder, InterestBuilder};
 use ndn_packet::{Data, Name};
 use ndn_security::{
     AdvertisedRelay, Certificate, Keyring, SecurityManager, SecurityProfile, SignedTrustContext,
@@ -298,6 +300,18 @@ impl Introducer for Host {
         }
     }
 
+    fn dial_first<'a>(
+        &'a self,
+        inviter: &'a Name,
+        addr: SocketAddr,
+        within: Duration,
+    ) -> FirstDialing<'a> {
+        match self.hints.get() {
+            Some(hints) => hints.dial_first(inviter, addr, within),
+            None => Box::pin(async { Err("no links".to_string()) }),
+        }
+    }
+
     fn undial(&self, hint: &LinkHint, inviter: &Name) {
         if let Some(hints) = self.hints.get() {
             hints.undial(hint, inviter);
@@ -315,6 +329,12 @@ struct Setup {
     peers: Vec<PeerSpec>,
     /// The link hint of its codes.
     hint: HintMode,
+    /// Its policy refuses a loopback or link-local address from a code
+    /// (`IntroPolicy::local_candidates` off).
+    refuse_local: bool,
+    /// How many candidates of its hint its compact codes carry (`None`: the
+    /// policy's default).
+    code_candidates: Option<usize>,
 }
 
 impl Setup {
@@ -420,9 +440,13 @@ async fn embedded_of(person: &Person, parts: Parts, setup: Setup) -> Embedded {
         Config {
             first_look: Duration::from_secs(1),
             introducer: Some(host),
-            // Devices on one machine: hints that name loopback addresses.
+            // Devices on one machine: hints that name loopback addresses
+            // (unless the case is about a device that refuses them).
             intro: IntroPolicy {
-                local_candidates: true,
+                local_candidates: !setup.refuse_local,
+                code_candidates: setup
+                    .code_candidates
+                    .unwrap_or(IntroPolicy::new().code_candidates),
                 ..IntroPolicy::new()
             },
             ..Config::new()
@@ -742,6 +766,32 @@ async fn an_embedded_joiner_with_only_the_code_dials_the_inviter_by_key_and_join
     );
 }
 
+/// The compact link carries at most `IntroPolicy::code_candidates` candidates
+/// of a host's hint: 3 by default, however many the host has, the most
+/// promising first. (A short code names one first contact.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_code_carries_at_most_the_policys_candidates_of_a_hint() {
+    let alice = Person::new("/alice").await;
+    let laptop = embedded(
+        &alice,
+        "/alice/member/laptop",
+        Setup {
+            hint: HintMode::Full,
+            ..Setup::listening()
+        },
+    )
+    .await;
+    let code = offered(&laptop).await;
+    let hint = hint_of(&code).expect("a hint");
+    assert_eq!(
+        hint.candidates.len(),
+        IntroPolicy::new().code_candidates,
+        "{:?}",
+        hint.candidates
+    );
+    assert_eq!(hint.key, laptop.key.0);
+}
+
 /// A code with a full hint — the most candidates, IPv6 (the longest) — is
 /// still one QR, carries the hint whole, and joins: the candidates nothing
 /// answers at are tried and left, the one that does is the link.
@@ -764,11 +814,15 @@ async fn a_code_with_a_full_hint_is_one_qr_and_joins_past_the_dead_candidates() 
     let with_one = offered(&plain).await.link.len();
     drop((bare, plain));
 
+    // The compact link carries at most `IntroPolicy::code_candidates` of the
+    // hint (3 by default, SHAPES-R10 §5): this case is about a code with the
+    // most a hint can hold, so the policy lifts the cap to it.
     let laptop = embedded(
         &alice,
         "/alice/member/tablet",
         Setup {
             hint: HintMode::Full,
+            code_candidates: Some(LINK_HINT_CANDIDATES_MAX),
             ..Setup::listening()
         },
     )
@@ -1051,6 +1105,242 @@ async fn a_link_dialled_by_key_routes_only_what_it_was_dialled_for_and_is_taken_
     .await;
 }
 
+/// The prefixes (sorted, as text) a link dialled for `device`'s introduction
+/// routes.
+fn introduction_routes(device: &Name) -> Vec<String> {
+    let mut out: Vec<String> = introduction_prefixes(device)
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    out.sort();
+    out
+}
+
+/// Whether `on`'s forwarder routes `name` over a link face: some prefix of
+/// the name has a nexthop that is one of its links' faces.
+fn routes_over_a_link(on: &Embedded, name: &Name) -> bool {
+    let faces: Vec<_> = on
+        .links
+        .report()
+        .links
+        .iter()
+        .flat_map(|l| l.paths.iter().map(|p| p.face))
+        .collect();
+    on._engine.fib().dump().into_iter().any(|(prefix, e)| {
+        name.has_prefix(&prefix) && e.nexthops.iter().any(|h| faces.contains(&h.face_id))
+    })
+}
+
+/// Whether `node` fetches `name` within a few seconds.
+async fn fetches(node: &ndn_app::Node, name: Name) -> bool {
+    matches!(
+        tokio::time::timeout(Duration::from_secs(6), node.fetch(name)).await,
+        Ok(Ok(_))
+    )
+}
+
+/// A first contact has no key to expect: the party at the address is linked
+/// by whatever key its handshake proves, the key is returned, and the link
+/// routes exactly the introduction's prefixes — the offer's record crosses,
+/// a name of the device outside them has no route over it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_first_contact_dial_links_a_key_the_code_did_not_name_and_routes_only_the_introduction() {
+    let alice = Person::new("/alice").await;
+    let bob = Person::new("/bob").await;
+    let laptop = embedded(&alice, "/alice/member/laptop", Setup::listening()).await;
+    let phone = embedded(&bob, "/bob/member/phone", Setup::default()).await;
+    let code = offered(&laptop).await;
+    let device = n("/alice/member/laptop");
+
+    let proved = phone
+        .links
+        .dial_first(
+            device.clone(),
+            laptop.addr.unwrap(),
+            Duration::from_secs(10),
+            introduction_prefixes(&device).into(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!(proved, laptop.key, "the key the handshake proved");
+    assert_eq!(
+        routed_over(&phone, laptop.key),
+        introduction_routes(&device),
+        "exactly the introduction's prefixes: {:#?}",
+        phone.links.report()
+    );
+    assert_eq!(routed_over_any(&phone), introduction_routes(&device));
+    // Three: the held pieces, the ask, and the hint record's family.
+    assert_eq!(routed_over(&phone, laptop.key).len(), 3);
+    assert!(
+        routed_over(&phone, laptop.key)
+            .contains(&ndn_data::intro::hint_prefix(&device).to_string())
+    );
+
+    // What the prefixes name crosses; any other name of the device, and any
+    // name at all outside them, has no route and no answer.
+    let node = phone._engine.app_node(phone.cancel.child_token());
+    let held = ndn_data::wire::held_name(&device, &code.offer);
+    assert!(
+        fetches(&node, held).await,
+        "the offer's record crosses the first-contact link: {:#?}",
+        laptop.links.report()
+    );
+    for outside in [
+        device.clone().append("private"),
+        ndn_data::wire::log_name(&device, Some(&n(FOLDER)), 1),
+        n("/alice/32=data/notebook/cover"),
+        n("/alice"),
+    ] {
+        assert!(
+            !routes_over_a_link(&phone, &outside),
+            "{outside} is routed over the first-contact link"
+        );
+        assert!(
+            !fetches(&node, outside.clone()).await,
+            "{outside} crossed the first-contact link"
+        );
+    }
+
+    // The inviter took the joiner as a stranger.
+    until(
+        "the inviter reports the link",
+        Duration::from_secs(10),
+        async || linked_keys(&laptop.links).contains(&phone.key),
+    )
+    .await;
+    let seen = laptop
+        .links
+        .report()
+        .links
+        .into_iter()
+        .find(|l| l.key == Some(phone.key))
+        .expect("the inviter was linked");
+    assert!(seen.device.is_none(), "{seen:#?}");
+
+    // The join that made it ends it, by the key the dial returned.
+    phone
+        .links
+        .undial_by_key(proved, "the join that dialled it failed");
+    until(
+        "the link and its routes are taken down",
+        Duration::from_secs(10),
+        async || !linked_keys(&phone.links).contains(&laptop.key),
+    )
+    .await;
+    assert!(routed_over_any(&phone).is_empty());
+}
+
+/// Whoever answers at a first contact's address is a stranger: another key
+/// gets the same link, whatever device name the code claims, and it
+/// carries nothing beyond the introduction's prefixes — not the names the
+/// code claims, not the stranger's own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stranger_at_a_first_contact_address_gets_the_introduction_prefixes_and_nothing_else() {
+    let alice = Person::new("/alice").await;
+    let bob = Person::new("/bob").await;
+    let carol = Person::new("/carol").await;
+    let laptop = embedded(&alice, "/alice/member/laptop", Setup::listening()).await;
+    let impostor = embedded(&carol, "/carol/member/laptop", Setup::listening()).await;
+    // The party takes strangers while it has an offer open.
+    let _own = offered_in(&impostor, "/carol", "/carol/32=data/notebook").await;
+    let phone = embedded(&bob, "/bob/member/phone", Setup::default()).await;
+    let _code = offered(&laptop).await;
+    let device = n("/alice/member/laptop");
+
+    let proved = phone
+        .links
+        .dial_first(
+            device.clone(),
+            impostor.addr.unwrap(),
+            Duration::from_secs(10),
+            introduction_prefixes(&device).into(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!(proved, impostor.key, "the key of whoever answered");
+    assert_ne!(proved, laptop.key);
+    assert_eq!(
+        routed_over(&phone, impostor.key),
+        introduction_routes(&device),
+        "{:#?}",
+        phone.links.report()
+    );
+    assert_eq!(routed_over_any(&phone), introduction_routes(&device));
+    let node = phone._engine.app_node(phone.cancel.child_token());
+    for outside in [
+        device.clone().append("private"),
+        n("/carol/member/laptop"),
+        n("/carol/32=data/notebook/cover"),
+        n("/carol"),
+    ] {
+        assert!(
+            !routes_over_a_link(&phone, &outside),
+            "{outside} is routed over the stranger's link"
+        );
+        assert!(
+            !fetches(&node, outside.clone()).await,
+            "{outside} crossed the stranger's link"
+        );
+    }
+    // The true inviter was never reached.
+    assert!(
+        !linked_keys(&laptop.links).contains(&phone.key),
+        "{:#?}",
+        laptop.links.report()
+    );
+
+    // Taken down by the key returned: no link and no route is left.
+    phone
+        .links
+        .undial_by_key(proved, "the join that dialled it failed");
+    until(
+        "the stranger's link is taken down",
+        Duration::from_secs(10),
+        async || !linked_keys(&phone.links).contains(&impostor.key),
+    )
+    .await;
+    assert!(routed_over_any(&phone).is_empty());
+}
+
+/// A first contact claiming a device of a namespace the dialler already
+/// holds steers none of that namespace's names to whoever answers: the link
+/// routes the introduction's prefixes it was dialled for, and the held
+/// namespace's own names have no route over it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_first_contact_claiming_a_held_namespace_routes_none_of_its_names() {
+    let alice = Person::new("/alice").await;
+    let bob = Person::new("/bob").await;
+    let laptop = embedded(&alice, "/alice/member/laptop", Setup::listening()).await;
+    let phone = embedded(&bob, "/bob/member/phone", Setup::default()).await;
+    let _code = offered(&laptop).await;
+    let claimed = n("/bob/member/tablet");
+
+    let proved = phone
+        .links
+        .dial_first(
+            claimed.clone(),
+            laptop.addr.unwrap(),
+            Duration::from_secs(10),
+            introduction_prefixes(&claimed).into(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!(proved, laptop.key);
+    assert_eq!(
+        routed_over_any(&phone),
+        introduction_routes(&claimed),
+        "{:#?}",
+        phone.links.report()
+    );
+    for held in [claimed.clone(), n("/bob/member/tablet/anything"), n("/bob")] {
+        assert!(
+            !routes_over_a_link(&phone, &held),
+            "{held} of a held namespace is routed over a first-contact link"
+        );
+    }
+}
+
 /// With no offer open a stranger gets no introduction link: it is refused as
 /// any device nobody knows. With one open it does, and the link answers the
 /// offer's record and nothing else the device holds by name: another log
@@ -1218,4 +1508,498 @@ async fn a_join_whose_hint_reaches_no_one_goes_on_by_the_relay_the_code_names() 
         "bob reached alice through the relay: {:#?}",
         phone.links.report()
     );
+}
+
+/// The short code of `code`: what `Device::offer` made for a host that gives a
+/// first contact, or the reason it made none.
+fn short_of(code: &ndn_data::Code) -> String {
+    code.short.clone().unwrap_or_else(|| {
+        panic!(
+            "no short code was made: {}",
+            code.short_why.as_deref().unwrap_or("no reason given")
+        )
+    })
+}
+
+/// G4, by an address: an embedded joiner holding only the short code — no
+/// daemon, no route, no peer entry — against a daemonless inviter. The code
+/// names an address and no key; the joiner dials it with none to expect,
+/// fetches the hint record over that link, verifies it against the code, and
+/// joins; the link is made again as a full link and the folder syncs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_short_code_over_a_direct_address_joins_an_embedded_joiner_with_no_route() {
+    let alice = Person::new("/alice").await;
+    let bob = Person::new("/bob").await;
+    let laptop = embedded(&alice, "/alice/member/laptop", Setup::listening()).await;
+    let phone = embedded(&bob, "/bob/member/phone", Setup::default()).await;
+    let code = offered(&laptop).await;
+
+    let short = short_of(&code);
+    assert_eq!(code.share(), short, "a short code is what is shared");
+    assert!(short.len() < code.link.len(), "{short}");
+    assert!(
+        short.contains(&laptop.addr.unwrap().to_string()),
+        "the code names the inviter's address: {short}"
+    );
+    assert!(
+        !short.contains(&format!("{}", laptop.key)),
+        "the code names no key: {short}"
+    );
+    assert!(
+        phone.links.report().links.is_empty() && routed_over_any(&phone).is_empty(),
+        "bob starts with no link and no route"
+    );
+
+    let joined = joins(&phone, &short, Duration::from_secs(90))
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "the join failed: {e} ({:?})\nbob: {:#?}\nalice: {:#?}",
+                e.next(),
+                phone.links.report(),
+                laptop.links.report()
+            )
+        });
+    assert_eq!(
+        joined,
+        Joined {
+            folder: n(FOLDER),
+            role: Role::Writer,
+            inviter: n("/alice"),
+        }
+    );
+    let cover = n(&format!("{FOLDER}/cover"));
+    until(
+        "bob reads alice's cover",
+        Duration::from_secs(60),
+        async || reads(&phone.device, &cover, "cover by alice").await,
+    )
+    .await;
+    assert!(
+        laptop
+            .links
+            .report()
+            .links
+            .iter()
+            .any(|l| l.key == Some(phone.key) && l.device.is_some()),
+        "alice's link to bob's key is a full link, by his certificate: {:#?}",
+        laptop.links.report()
+    );
+}
+
+/// A relay of alice's namespace, which her namespace advertises, with her
+/// dial-only laptop (no link hint: its code's first contact is that relay)
+/// and bob's dial-only phone, which uses the relay: neither is linked to the
+/// other.
+struct Relayed {
+    alice: Person,
+    relay: Relay,
+    laptop: Embedded,
+    phone: Embedded,
+}
+
+async fn relayed() -> Relayed {
+    let relay_parts = Parts::new("/alice/node/relay", true);
+    let alice = Person::advertising(
+        "/alice",
+        vec![AdvertisedRelay {
+            device: relay_parts.name.clone(),
+            key: None,
+            endpoints: vec![relay_parts.addr.unwrap().to_string()],
+            preference: 0,
+        }],
+    )
+    .await;
+    let bob = Person::new("/bob").await;
+    let relay = relay(&alice, &[&bob], relay_parts).await;
+    let laptop = embedded(
+        &alice,
+        "/alice/member/laptop",
+        Setup {
+            hint: HintMode::Nothing,
+            ..Setup::default()
+        },
+    )
+    .await;
+    let phone = embedded(
+        &bob,
+        "/bob/member/phone",
+        Setup {
+            peers: vec![PeerSpec {
+                label: "relay".into(),
+                device: Some(relay.name.clone()),
+                key: Some(relay.key),
+                endpoints: vec![relay.addr.to_string()],
+                persistent: true,
+                relay_use: Some(RelayUse {
+                    source: RelaySource::User,
+                    preference: 0,
+                }),
+                ..PeerSpec::default()
+            }],
+            ..Setup::default()
+        },
+    )
+    .await;
+    Relayed {
+        alice,
+        relay,
+        laptop,
+        phone,
+    }
+}
+
+/// G4, by a relay: the inviter is dial-only and its code carries a relay of
+/// its namespace for a first contact (no address: its hint is empty). The
+/// joiner has no link to the inviter and none by an address: the hint record
+/// is fetched by name through the relay it uses, and the join goes on
+/// through it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_short_code_over_a_relay_first_contact_joins_through_the_relay() {
+    let Relayed {
+        alice: _alice,
+        relay,
+        laptop,
+        phone,
+    } = relayed().await;
+    let code = offered(&laptop).await;
+
+    let short = short_of(&code);
+    assert!(
+        short.contains(&relay.name.to_string()),
+        "the code names the relay alice's namespace advertises: {short}"
+    );
+    assert!(
+        hint_of(&code).is_none(),
+        "the inviter gives no link hint: nothing to dial"
+    );
+
+    let joined = joins(&phone, &short, Duration::from_secs(90))
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "the join failed: {e} ({:?})\nbob: {:#?}\nalice: {:#?}",
+                e.next(),
+                phone.links.report(),
+                laptop.links.report()
+            )
+        });
+    assert_eq!(joined.folder, n(FOLDER));
+    assert!(
+        !linked_keys(&phone.links).contains(&laptop.key),
+        "no link to the inviter was made: {:#?}",
+        phone.links.report()
+    );
+    assert!(
+        phone
+            .links
+            .report()
+            .links
+            .iter()
+            .any(|l| l.key == Some(relay.key) && l.paths.iter().any(|p| p.kind == PathKind::Link)),
+        "bob reached alice through the relay: {:#?}",
+        phone.links.report()
+    );
+}
+
+/// A first-contact address that names this machine or its link is an address
+/// a code must not make this device dial, unless its policy says
+/// `local_candidates`: the join is refused before any dial, says so, and
+/// nothing was dialled, adopted or sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_loopback_first_contact_is_refused_unless_the_policy_allows_local_candidates() {
+    let alice = Person::new("/alice").await;
+    let bob = Person::new("/bob").await;
+    let laptop = embedded(&alice, "/alice/member/laptop", Setup::listening()).await;
+    let refusing = embedded(
+        &bob,
+        "/bob/member/phone",
+        Setup {
+            refuse_local: true,
+            ..Setup::default()
+        },
+    )
+    .await;
+    let accepting = embedded(&bob, "/bob/member/tablet", Setup::default()).await;
+    let code = offered(&laptop).await;
+    let short = short_of(&code);
+    assert!(
+        laptop.addr.is_some_and(|a| a.ip().is_loopback()) && short.contains("127.0.0.1"),
+        "the first contact is a loopback address: {short}"
+    );
+
+    let err = refusing
+        .device
+        .join(&short)
+        .await
+        .expect_err("a loopback first contact is not dialled by this policy");
+    assert_ne!(err.next(), NextStep::RetryLater, "{err}");
+    assert!(
+        err.to_string().contains("local_candidates"),
+        "the refusal says which policy to change: {err}"
+    );
+    assert!(
+        refusing.links.report().links.is_empty(),
+        "nothing was dialled: {:#?}",
+        refusing.links.report()
+    );
+    assert!(refusing.validator.keyring().held(&alice.ns).is_none());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !linked_keys(&laptop.links).contains(&refusing.key),
+        "{:#?}",
+        laptop.links.report()
+    );
+
+    // The same code, to a device whose policy allows local candidates, joins:
+    // it was the policy, not the code.
+    let joined = joins(&accepting, &short, Duration::from_secs(90))
+        .await
+        .unwrap_or_else(|e| panic!("the join failed: {e} ({:?})", e.next()));
+    assert_eq!(joined.folder, n(FOLDER));
+}
+
+/// The short code of `code`, read: its device, its secret, and so the token
+/// of its hint record.
+fn read_short(code: &ndn_data::Code) -> ShortCode {
+    ShortCode::parse(&short_of(code), true).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// Whether `node` fetches `name` within a few seconds, with the forwarding
+/// hint `via` (none: by name).
+async fn fetches_via(node: &ndn_app::Node, name: Name, via: &[Name]) -> Option<ndn_packet::Data> {
+    let mut interest = InterestBuilder::new(name).lifetime(Duration::from_secs(4));
+    if !via.is_empty() {
+        interest = interest.forwarding_hint(via.to_vec());
+    }
+    tokio::time::timeout(
+        Duration::from_secs(6),
+        Consumer::new(node.connection()).fetch_with(interest),
+    )
+    .await
+    .ok()?
+    .ok()
+}
+
+/// The hint record's name crosses an introduction link only through the
+/// surface's `carries`: the record of a token of one of the inviter's own
+/// offers does, and answers with the record naming the inviter's key; the
+/// family's prefix, an unknown token and a name under a known one do not
+/// cross and get no answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_hint_record_crosses_an_introduction_link_only_for_a_token_of_an_own_offer() {
+    let alice = Person::new("/alice").await;
+    let bob = Person::new("/bob").await;
+    let laptop = embedded(&alice, "/alice/member/laptop", Setup::listening()).await;
+    let phone = embedded(&bob, "/bob/member/phone", Setup::default()).await;
+    let code = offered(&laptop).await;
+    let short = read_short(&code);
+    let device = short.device.clone();
+    let token = hint_token(&short.secret);
+
+    phone
+        .links
+        .dial_first(
+            device.clone(),
+            laptop.addr.unwrap(),
+            Duration::from_secs(10),
+            introduction_prefixes(&device).into(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    let node = phone._engine.app_node(phone.cancel.child_token());
+
+    let record = fetches_via(&node, hint_name(&device, &token), &[])
+        .await
+        .unwrap_or_else(|| panic!("the hint record crosses: {:#?}", laptop.links.report()));
+    let content = record.content().expect("a hint record has content").clone();
+    match HintRecord::decode(content, true).unwrap_or_else(|e| panic!("{e}")) {
+        HintRecord::Offered { key, offer, .. } => {
+            assert_eq!(key, laptop.key.0, "the record names the inviter's key");
+            assert_eq!(offer, code.offer, "and the offer it is bound to");
+        }
+        other => panic!("an open offer's record, not {other:?}"),
+    }
+
+    for (what, name) in [
+        ("an unknown token", hint_name(&device, &[7; 16])),
+        ("the family's prefix", hint_prefix(&device)),
+        (
+            "a name under a known token",
+            hint_name(&device, &token).append("more"),
+        ),
+    ] {
+        assert!(
+            fetches_via(&node, name.clone(), &[]).await.is_none(),
+            "{what} ({name}) crossed the introduction link"
+        );
+    }
+}
+
+/// The hint record crosses a relay hop as the offer fetch does: an Interest
+/// that names the relay as its forwarding hint reaches the dial-only
+/// inviter through the relay, which has no link to the joiner for it; an
+/// unknown token reaches no answer by the same way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_hint_record_crosses_a_relay_hop_as_the_offer_fetch_does() {
+    let Relayed {
+        alice: _alice,
+        relay,
+        laptop,
+        phone,
+    } = relayed().await;
+    let code = offered(&laptop).await;
+    let short = read_short(&code);
+    let device = short.device.clone();
+    let node = phone._engine.app_node(phone.cancel.child_token());
+    let via = [relay.name.clone()];
+
+    // The offer's record, by the route the relay fallback uses today.
+    let held = ndn_data::wire::held_name(&device, &code.offer);
+    let until_up = Instant::now();
+    let mut offer_record = None;
+    while offer_record.is_none() && until_up.elapsed() < Duration::from_secs(60) {
+        offer_record = fetches_via(&node, held.clone(), &via).await;
+    }
+    assert!(
+        offer_record.is_some(),
+        "the offer's record crosses the relay: {:#?}",
+        phone.links.report()
+    );
+
+    let token = hint_token(&short.secret);
+    let record = fetches_via(&node, hint_name(&device, &token), &via).await;
+    assert!(
+        record.is_some(),
+        "the hint record crosses the relay hop: {:#?}",
+        phone.links.report()
+    );
+    assert!(
+        fetches_via(&node, hint_name(&device, &[7; 16]), &via)
+            .await
+            .is_none(),
+        "an unknown token got an answer through the relay"
+    );
+}
+
+/// A surface for a party that is no data-layer device: open, and carrying
+/// every name asked of it, as a hostile program on the address would.
+struct CarriesAll;
+
+impl Introductions for CarriesAll {
+    fn open(&self) -> bool {
+        true
+    }
+    fn carries(&self, _: &Name) -> bool {
+        true
+    }
+    fn grant_carries(&self, _: &Name, _: &Name) -> bool {
+        false
+    }
+    fn departure_carries(&self, _: &Name, _: &Name) -> bool {
+        false
+    }
+}
+
+/// A short code's first contact is only a hint: a stranger at the address
+/// serves a forged hint record — well formed, bound to the real offer, naming
+/// its own key and address — and the join refuses it before any dial, ask
+/// or adoption, whichever way it is forged: signed by a key of no namespace
+/// the code names with no credentials, or with a real person's credentials
+/// of another anchor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stranger_at_the_first_contact_serving_a_forged_hint_record_is_refused_and_nothing_is_adopted()
+ {
+    let alice = Person::new("/alice").await;
+    let bob = Person::new("/bob").await;
+    let carol = Person::new("/carol").await;
+    let laptop = embedded(&alice, "/alice/member/laptop", Setup::listening()).await;
+    let code = offered(&laptop).await;
+    let real = read_short(&code);
+    let device = real.device.clone();
+    let token = hint_token(&real.secret);
+
+    for forged_with_credentials in [false, true] {
+        // The stranger: its own keys, a real device of carol's, listening.
+        let parts = Parts::new("/carol/member/laptop", true);
+        let signer = parts.keys.get_signer_sync(&parts.key_name).unwrap();
+        let cert = parts.certified(&carol).await;
+        let (key, at) = (parts.fingerprint, parts.addr.unwrap());
+        let stranger = embedded_of(&carol, parts, Setup::listening()).await;
+        stranger.links.set_introductions(Arc::new(CarriesAll));
+        let record = HintRecord::Offered {
+            offer: code.offer.clone(),
+            key: key.0,
+            candidates: vec![HintCandidate {
+                kind: HintKind::Host,
+                addr: at,
+            }],
+            relays: Vec::new(),
+            until: Timestamp(u64::MAX / 4),
+            credentials: if forged_with_credentials {
+                vec![carol.signed.clone(), cert.data_wire().unwrap()]
+            } else {
+                Vec::new()
+            },
+        }
+        .encode();
+        let node = stranger._engine.app_node(stranger.cancel.child_token());
+        let name = hint_name(&device, &token);
+        let _serving = node
+            .serve(hint_prefix(&device), move |interest, responder| {
+                let (record, signer) = (record.clone(), Arc::clone(&signer));
+                async move {
+                    let wire = DataBuilder::new((*interest.name).clone(), record.as_ref())
+                        .sign_sync(signer.sig_type(), Some(signer.key_name()), |region| {
+                            signer.sign_sync(region).unwrap()
+                        });
+                    let _ = responder.respond_bytes(wire).await;
+                }
+            })
+            .await
+            .unwrap();
+        let phone = embedded(&bob, "/bob/member/phone", Setup::default()).await;
+
+        // The code is the real one with its first contact replaced: the
+        // checksum covers the address, so it is written again.
+        let forged = ShortCode {
+            contact: Some(Contact::Address(at)),
+            ..real.clone()
+        }
+        .encode()
+        .unwrap_or_else(|e| panic!("{e}"));
+        let err = phone
+            .device
+            .join(&forged)
+            .await
+            .expect_err("a forged hint record must not be believed");
+        let said = err.to_string();
+        assert!(
+            said.contains("does not prove it is the inviter's") && said.contains("new code"),
+            "(credentials {forged_with_credentials}) the refusal says why and what to do: {said}"
+        );
+        assert!(
+            phone.validator.keyring().held(&alice.ns).is_none()
+                && phone.validator.keyring().held(&carol.ns).is_none(),
+            "nothing was adopted"
+        );
+        // The record was asked for, so the stranger's link was made; the
+        // refused join took it down and left no route.
+        until(
+            "the refused join's link is taken down",
+            Duration::from_secs(10),
+            async || !linked_keys(&phone.links).contains(&stranger.key),
+        )
+        .await;
+        assert!(
+            routed_over_any(&phone).is_empty(),
+            "{name}: no route is left over the stranger's link: {:#?}",
+            phone.links.report()
+        );
+        assert!(
+            !linked_keys(&laptop.links).contains(&phone.key),
+            "the true inviter was never reached: {:#?}",
+            laptop.links.report()
+        );
+    }
 }

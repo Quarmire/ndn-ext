@@ -2,14 +2,15 @@
 //! `introductions`; ndn-rs data-layer.md §19.2, §19.3).
 //!
 //! The data layer cannot depend on this crate, so a host gives its
-//! `ndn_data::Introducer` the three halves it asks of it —
-//! `link_hint`, `dial` and `undial` — by forwarding to a [`LinkHints`].
+//! `ndn_data::Introducer` the halves it asks of it — `link_hint`, `dial`,
+//! `dial_first` and `undial` — by forwarding to a [`LinkHints`].
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ndn_data::intro::{
-    Dialing, HintCandidate, HintKind, JoinedFolder, LinkHint, introduction_prefixes,
+    Dialing, FirstDialing, HintCandidate, HintKind, JoinedFolder, LinkHint, introduction_prefixes,
 };
 use ndn_data::version::Timestamp;
 use ndn_data::{DataError, Device, IntroductionSurface, NextStep, Role};
@@ -291,6 +292,36 @@ impl LinkHints {
                     introduction_prefixes(inviter).into(),
                 )
                 .await
+                .map_err(|detail| detail.text)
+        })
+    }
+
+    /// The joiner's half for a short code's first contact: dial `inviter` at
+    /// the one address `addr` with **no key to expect**, within `within`
+    /// ([`Links::dial_first`]). `Ok(key)` is the 32 octets of the key the
+    /// handshake proved; the link routes only `inviter`'s introduction
+    /// prefixes (the held pieces, the offer's and the hint record's names:
+    /// [`introduction_prefixes`]) until the device behind it shows a
+    /// certificate this device holds, whoever answered at `addr`. The host's
+    /// introducer forwards [`Introducer::dial_first`](ndn_data::intro::Introducer::dial_first)
+    /// here, and the join's [`undial`](Self::undial) for the key returned
+    /// when it fails.
+    pub fn dial_first<'a>(
+        &'a self,
+        inviter: &'a Name,
+        addr: SocketAddr,
+        within: Duration,
+    ) -> FirstDialing<'a> {
+        Box::pin(async move {
+            self.links
+                .dial_first(
+                    inviter.clone(),
+                    addr,
+                    within,
+                    introduction_prefixes(inviter).into(),
+                )
+                .await
+                .map(|key| key.0)
                 .map_err(|detail| detail.text)
         })
     }

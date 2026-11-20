@@ -17,7 +17,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
 use ndn_app::EngineAppExt;
-use ndn_data::intro::{Departure as DataDeparture, Dialing, Grant as DataGrant, LinkHint};
+use ndn_data::intro::{
+    Departure as DataDeparture, Dialing, FirstDialing, Grant as DataGrant, LinkHint,
+};
 use ndn_data::{
     Answer, Audience, Clock, Config, Content, DataLayer, Device, Got, IntroPolicy, Introducer,
     Joined, Keep, NextStep, Offer, Payload, PutOptions, Role, Rule, Share, Sharing, Timestamp,
@@ -349,6 +351,18 @@ impl Introducer for Host {
     fn dial<'a>(&'a self, hint: &'a LinkHint, inviter: &'a Name, within: Duration) -> Dialing<'a> {
         match self.hints.get() {
             Some(hints) => hints.dial(hint, inviter, within),
+            None => Box::pin(async { Err("no links".to_string()) }),
+        }
+    }
+
+    fn dial_first<'a>(
+        &'a self,
+        inviter: &'a Name,
+        addr: SocketAddr,
+        within: Duration,
+    ) -> FirstDialing<'a> {
+        match self.hints.get() {
+            Some(hints) => hints.dial_first(inviter, addr, within),
             None => Box::pin(async { Err("no links".to_string()) }),
         }
     }

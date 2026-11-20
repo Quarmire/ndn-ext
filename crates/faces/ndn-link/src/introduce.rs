@@ -19,6 +19,12 @@
 //! prefixes), never the names the code claims for the device; once it does
 //! the link is made again, so the inviter admits it by its certificate (a
 //! full link) and it gets the routes of the identity it proved.
+//!
+//! A short code carries no key: its first contact is one address, dialled by
+//! [`Links::dial_first`] with no key to expect. Whoever answers there is
+//! linked by the key it proves, on the same terms (only the routes it was
+//! dialled for, until it shows a certificate this device holds), and the
+//! key is returned for the join to name the link by.
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -245,14 +251,7 @@ impl Links {
         self.introduced.lock().insert(id, addrs.clone());
         match self.dial_race(id, key, &addrs, within).await {
             Ok(_handle) => {
-                let ctl = self.ctl(id);
-                let weak = Arc::downgrade(self);
-                tokio::spawn(async move {
-                    dial_loop(weak.clone(), id, ctl).await;
-                    if let Some(links) = weak.upgrade() {
-                        links.forget_dialled(id);
-                    }
-                });
+                self.keep_dialled(id);
                 Ok(())
             }
             Err(e) => {
@@ -261,6 +260,120 @@ impl Links {
                 Err(e)
             }
         }
+    }
+
+    /// Dial the device `device` at the one address `addr` with **no key to
+    /// expect**, within `within` for the handshake: the key is not in the
+    /// code, the hint record fetched over this link names it. `Ok(key)` once
+    /// a link to whoever answers is up, `key` being the fingerprint of the
+    /// key its handshake proved. The link is kept as
+    /// [`dial_by_key`](Self::dial_by_key) keeps its own: not persistent,
+    /// made again once when this device comes to hold `device`'s namespace
+    /// (and the key then shows a certificate there), not otherwise, and
+    /// taken down by [`undial_by_key`](Self::undial_by_key) with the key
+    /// returned.
+    ///
+    /// `addr` is only where to try, and whoever answers there is a stranger:
+    /// the key it proved is no more than a name for its link. Until it
+    /// shows a certificate this device holds the link routes `routes` — for
+    /// an introduction, its introduction prefixes — and nothing else, not
+    /// the names the code claims for `device`, whatever key answered. The
+    /// dial is judged as `dial_by_key`'s is once the key is proved: the
+    /// peer is added with that key, so the party is admitted as a
+    /// stranger or refused as it would be had the code named its key, and a
+    /// failure leaves no peer, route or link behind.
+    ///
+    /// One address only, so no race: [`CANDIDATES_MAX`] bounds a hint's
+    /// addresses and a short code's first contact is one. A key this device
+    /// already links with is returned, no second link made; this device's
+    /// own key is refused.
+    pub async fn dial_first(
+        self: &Arc<Self>,
+        device: Name,
+        addr: SocketAddr,
+        within: Duration,
+        routes: Vec<Name>,
+    ) -> Result<KeyFingerprint, LinkDetail> {
+        if !self.is_online() {
+            return Err(crate::online::offline_detail());
+        }
+        let socket = self.endpoint_for(addr).map_err(|e| {
+            LinkDetail::new(
+                code::DIAL_FAILED,
+                format!("{addr}: no socket to dial the first contact of {device} from ({e})"),
+            )
+        })?;
+        let hs = match tokio::time::timeout(within, socket.connect(addr, None)).await {
+            Ok(Ok(hs)) => hs,
+            Ok(Err(e)) => {
+                return Err(LinkDetail::new(
+                    code::DIAL_FAILED,
+                    format!("the first contact {addr} of {device} did not link: {e}"),
+                ));
+            }
+            Err(_) => {
+                return Err(LinkDetail::new(
+                    code::DIAL_FAILED,
+                    format!(
+                        "the first contact {addr} of {device} did not answer within {} s",
+                        within.as_secs_f32()
+                    ),
+                ));
+            }
+        };
+        let key = hs.peer_key().fingerprint();
+        if self.my_fingerprint() == Some(key) {
+            let text = format!(
+                "the first contact {addr} of {device} answered with this device's own key: \
+                 a device dials itself by no code"
+            );
+            hs.refuse(CloseReason::NotTheExpectedDevice, &text);
+            return Err(LinkDetail::new(code::DIAL_FAILED, text));
+        }
+        // Already linked to that key: this connection is the second of a
+        // pair, and the first stays.
+        if self.table.is_linked(&key) {
+            hs.refuse(
+                CloseReason::Replaced,
+                "a link between these two devices already exists",
+            );
+            return Ok(key);
+        }
+        let id = self.peers.add(PeerSpec {
+            label: device.to_string(),
+            key: Some(key),
+            device: Some(device),
+            persistent: false,
+            direct: false,
+            unidentified_routes: Some(routes),
+            ..PeerSpec::default()
+        });
+        self.introduced.lock().insert(id, vec![addr]);
+        match self.establish(hs, Origin::Dialed(id)).await {
+            Ok(_handle) => {
+                self.keep_dialled(id);
+                Ok(key)
+            }
+            Err(e) => {
+                self.watch_failed(id, Some(key), &e.detail, crate::watch::Next::Gone);
+                self.forget_dialled(id);
+                Err(e.detail)
+            }
+        }
+    }
+
+    /// Peer `id`, added by a dial by key, has its link: keep it as a peer
+    /// that is not persistent, dialled again by its key at the address it
+    /// was dialled at while the link drops, until that ends.
+    fn keep_dialled(self: &Arc<Self>, id: PeerId) {
+        let ctl = self.ctl(id);
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            dial_loop(weak.clone(), id, ctl).await;
+            if let Some(links) = weak.upgrade() {
+                links.forget_dialled(id);
+            }
+        });
     }
 
     /// Peer `id`, added by [`dial_by_key`](Self::dial_by_key), is over.
@@ -364,5 +477,371 @@ impl Links {
         self.establish(hs, Origin::Dialed(id))
             .await
             .map_err(|e| e.detail)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! [`Links::dial_first`] on real QUIC between two [`Links`] over loopback:
+    //! the party at an address is linked by whatever key its handshake
+    //! proves, and the link routes only what it was dialled for.
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+
+    use bytes::Bytes;
+    use ndn_face_quic::{LinkEndpoint, LinkKey, LinkKeySource, LinkTransportConfig};
+    use ndn_security::{Certificate, Ed25519Signer, Keyring};
+    use ndn_transport::{Face, FaceId, FaceKind};
+    use parking_lot::Mutex;
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+    use crate::{ConfiguredEndpoints, FaceSink, LinkSetup, LinkTrust, RelayService, Route};
+
+    fn key(seed: u8) -> LinkKey {
+        LinkKey::from_signer(Arc::new(Ed25519Signer::from_seed(
+            &[seed; 32],
+            format!("/ns/member/d{seed}/KEY/k").parse().unwrap(),
+        )))
+        .unwrap()
+    }
+
+    fn n(s: &str) -> Name {
+        s.parse().unwrap()
+    }
+
+    /// No namespace held and no certificate: the devices are strangers.
+    struct NoTrust(Arc<Keyring>);
+
+    impl LinkTrust for NoTrust {
+        fn keyring(&self) -> &Arc<Keyring> {
+            &self.0
+        }
+        fn own_chain(&self) -> Vec<Bytes> {
+            Vec::new()
+        }
+        fn known_certificate(&self, _: &Name) -> Option<Certificate> {
+            None
+        }
+        fn known_certificate_of_key(&self, _: &KeyFingerprint) -> Option<Certificate> {
+            None
+        }
+    }
+
+    /// A listener's introductions: an offer open or not, and no name carried
+    /// (these cases look at the dialler's side).
+    struct Offers(bool);
+
+    impl Introductions for Offers {
+        fn open(&self) -> bool {
+            self.0
+        }
+        fn carries(&self, _: &Name) -> bool {
+            false
+        }
+        fn grant_carries(&self, _: &Name, _: &Name) -> bool {
+            false
+        }
+        fn departure_carries(&self, _: &Name, _: &Name) -> bool {
+            false
+        }
+    }
+
+    /// The forwarder's side, remembering the link faces and the routes the
+    /// links gave them.
+    #[derive(Default)]
+    struct Faces {
+        next: AtomicU64,
+        live: Mutex<Vec<FaceId>>,
+        routes: Mutex<Vec<(FaceId, Route)>>,
+    }
+
+    impl Faces {
+        /// The prefixes routed over link faces now, sorted.
+        fn prefixes(&self) -> Vec<Name> {
+            let mut out: Vec<Name> = self
+                .routes
+                .lock()
+                .iter()
+                .map(|(_, r)| r.prefix.clone())
+                .collect();
+            out.sort();
+            out
+        }
+    }
+
+    impl FaceSink for Faces {
+        fn alloc_face_id(&self) -> FaceId {
+            FaceId(self.next.fetch_add(1, Ordering::SeqCst) + 1)
+        }
+        fn add_face(&self, face: Face, _: CancellationToken) {
+            if face.kind() == FaceKind::Quic {
+                self.live.lock().push(face.id());
+            }
+        }
+        fn remove_face(&self, face: FaceId) {
+            self.live.lock().retain(|f| *f != face);
+            self.routes.lock().retain(|(f, _)| *f != face);
+        }
+        fn add_routes(&self, face: FaceId, routes: &[Route]) {
+            if self.live.lock().contains(&face) {
+                self.routes
+                    .lock()
+                    .extend(routes.iter().map(|r| (face, r.clone())));
+            }
+        }
+        fn remove_routes(&self, face: FaceId, prefixes: &[Name]) {
+            self.routes
+                .lock()
+                .retain(|(f, r)| *f != face || !prefixes.contains(&r.prefix));
+        }
+        fn routes_to(&self, face: FaceId) -> bool {
+            self.routes.lock().iter().any(|(f, _)| *f == face)
+        }
+        fn transit(&self, _: &Name, _: bool) {}
+    }
+
+    /// One device: its links, what its forwarder was given, the address it
+    /// listens at (when it does) and its key.
+    struct Party {
+        links: Arc<Links>,
+        faces: Arc<Faces>,
+        addr: Option<SocketAddr>,
+        key: KeyFingerprint,
+    }
+
+    /// A device with key seed `seed`. `listen`: a loopback socket, taking an
+    /// introduction link from a stranger while `offer_open`.
+    fn party(seed: u8, listen: bool, offer_open: bool, cancel: &CancellationToken) -> Party {
+        let key = key(seed);
+        let fingerprint = key.fingerprint();
+        let key: Arc<dyn LinkKeySource> = Arc::new(key);
+        let transport = LinkTransportConfig::default();
+        let socket = listen.then(|| {
+            Arc::new(
+                LinkEndpoint::bind(
+                    "127.0.0.1:0".parse().unwrap(),
+                    Arc::clone(&key),
+                    &transport,
+                    true,
+                )
+                .unwrap(),
+            )
+        });
+        let addr = socket.as_ref().map(|s| s.local_addr().unwrap());
+        let faces = Arc::new(Faces::default());
+        let links = Links::start(
+            LinkSetup {
+                peers: Vec::new(),
+                key,
+                trust: Arc::new(NoTrust(Arc::new(Keyring::new()))),
+                faces: Arc::clone(&faces) as Arc<dyn FaceSink>,
+                paths: Arc::new(ConfiguredEndpoints),
+                candidates: Vec::new(),
+                socket,
+                transport,
+                relays: Default::default(),
+                service: RelayService::default(),
+                direct: Default::default(),
+            },
+            cancel.child_token(),
+        );
+        if listen {
+            links.set_introductions(Arc::new(Offers(offer_open)));
+        }
+        Party {
+            links,
+            faces,
+            addr,
+            key: fingerprint,
+        }
+    }
+
+    /// The routes a first contact is dialled for.
+    fn routes() -> Vec<Name> {
+        vec![
+            n("/alice/member/laptop/32=held"),
+            n("/alice/member/laptop/32=intro"),
+        ]
+    }
+
+    fn sorted(mut names: Vec<Name>) -> Vec<Name> {
+        names.sort();
+        names
+    }
+
+    async fn until(what: &str, mut done: impl FnMut() -> bool) {
+        let start = Instant::now();
+        while !done() {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "not within 10 s: {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_party_at_the_address_is_linked_by_the_key_it_proves_and_only_the_routes_are_made()
+    {
+        let cancel = CancellationToken::new();
+        let listener = party(1, true, true, &cancel);
+        let joiner = party(2, false, false, &cancel);
+        let device = n("/alice/member/laptop");
+
+        let proved = joiner
+            .links
+            .dial_first(
+                device.clone(),
+                listener.addr.unwrap(),
+                Duration::from_secs(10),
+                routes(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        assert_eq!(proved, listener.key, "the key the handshake proved");
+        assert_eq!(
+            joiner.faces.prefixes(),
+            sorted(routes()),
+            "the link routes what it was dialled for and no name of the claimed device"
+        );
+        // The link is the key's, a peer the dial added: not persistent, no
+        // certificate shown.
+        let report = joiner.links.report();
+        let link = report
+            .links
+            .iter()
+            .find(|l| l.key == Some(listener.key))
+            .unwrap_or_else(|| panic!("{report:#?}"));
+        assert!(!link.paths.is_empty(), "{link:#?}");
+
+        // The dial that made it takes it down again.
+        joiner
+            .links
+            .undial_by_key(proved, "the join that dialled it failed");
+        until("the link and its routes are gone", || {
+            joiner.links.report().links.is_empty() && joiner.faces.prefixes().is_empty()
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_key_already_linked_is_returned_and_no_second_link_is_made() {
+        let cancel = CancellationToken::new();
+        let listener = party(3, true, true, &cancel);
+        let joiner = party(4, false, false, &cancel);
+        let dial = || {
+            joiner.links.dial_first(
+                n("/alice/member/laptop"),
+                listener.addr.unwrap(),
+                Duration::from_secs(10),
+                routes(),
+            )
+        };
+        let first = dial().await.unwrap_or_else(|e| panic!("{e:?}"));
+        let second = dial().await.unwrap_or_else(|e| panic!("{e:?}"));
+        assert_eq!(first, second);
+        assert_eq!(first, listener.key);
+        assert_eq!(joiner.links.report().links.len(), 1);
+        assert_eq!(joiner.faces.live.lock().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_device_does_not_dial_itself_by_a_first_contact() {
+        let cancel = CancellationToken::new();
+        let myself = party(5, true, true, &cancel);
+        let refused = myself
+            .links
+            .dial_first(
+                n("/alice/member/laptop"),
+                myself.addr.unwrap(),
+                Duration::from_secs(10),
+                routes(),
+            )
+            .await
+            .expect_err("a device is not its own first contact");
+        assert_eq!(refused.code, code::DIAL_FAILED);
+        assert!(refused.text.contains("own"), "{}", refused.text);
+        assert!(myself.faces.prefixes().is_empty());
+        assert!(
+            !myself
+                .links
+                .report()
+                .links
+                .iter()
+                .any(|l| l.key == Some(myself.key)),
+            "{:#?}",
+            myself.links.report()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_address_nothing_answers_at_fails_within_the_time_given_and_leaves_nothing() {
+        let cancel = CancellationToken::new();
+        let joiner = party(6, false, false, &cancel);
+        let dead = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let at = dead.local_addr().unwrap();
+
+        let started = Instant::now();
+        let failed = joiner
+            .links
+            .dial_first(
+                n("/alice/member/laptop"),
+                at,
+                Duration::from_secs(2),
+                routes(),
+            )
+            .await
+            .expect_err("nothing answers");
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "the dial is bounded"
+        );
+        assert_eq!(failed.code, code::DIAL_FAILED);
+        assert!(failed.text.contains(&at.to_string()), "{}", failed.text);
+        assert!(joiner.links.report().links.is_empty());
+        assert!(joiner.faces.prefixes().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_party_that_takes_no_introduction_link_leaves_no_peer_and_no_route() {
+        let cancel = CancellationToken::new();
+        // No offer is open: the party refuses a stranger as any other.
+        let listener = party(7, true, false, &cancel);
+        let joiner = party(8, false, false, &cancel);
+        let failed = joiner
+            .links
+            .dial_first(
+                n("/alice/member/laptop"),
+                listener.addr.unwrap(),
+                Duration::from_secs(10),
+                routes(),
+            )
+            .await
+            .expect_err("a stranger is refused while no offer is open");
+        assert!(!failed.text.is_empty(), "{failed:?}");
+        assert!(joiner.links.report().links.is_empty());
+        assert!(joiner.faces.prefixes().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_offline_device_dials_nobody() {
+        let cancel = CancellationToken::new();
+        let listener = party(9, true, true, &cancel);
+        let joiner = party(10, false, false, &cancel);
+        joiner.links.set_online(false);
+        let failed = joiner
+            .links
+            .dial_first(
+                n("/alice/member/laptop"),
+                listener.addr.unwrap(),
+                Duration::from_secs(5),
+                routes(),
+            )
+            .await
+            .expect_err("offline");
+        assert_eq!(failed.code, code::OFFLINE, "{failed:?}");
+        assert!(joiner.links.report().links.is_empty());
     }
 }

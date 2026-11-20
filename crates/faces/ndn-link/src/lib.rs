@@ -164,7 +164,9 @@
 //! trusted for nothing, and the device name the code claims is no route: the
 //! link routes only the introduction's prefixes until the device proves a
 //! certificate, and is taken down when the join fails
-//! ([`Links::undial_by_key`]). Once the joiner holds the inviter's namespace
+//! ([`Links::undial_by_key`]). A short code names no key, only one address:
+//! [`Links::dial_first`] dials it with none to expect, links whoever answers
+//! on the same terms and returns the key it proved. Once the joiner holds the inviter's namespace
 //! its link is made again, and the inviter admits it by its certificate: as a
 //! full link when its [`ServePolicy`] serves the joiner's namespace or a
 //! **grant** ([`Grant`], [`Links::grant`]) does. A person it introduced is
