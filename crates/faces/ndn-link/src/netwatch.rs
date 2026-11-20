@@ -320,6 +320,7 @@ impl Reader {
             let wait = ADDRESS_COALESCE.saturating_sub(last.elapsed());
             if !wait.is_zero() {
                 tokio::select! {
+                    biased;
                     () = stop.cancelled() => return Read::Stopped,
                     () = tokio::time::sleep(wait) => {}
                 }
@@ -464,6 +465,7 @@ async fn address_loop(
             Read::Stopped => return,
             Read::Set(set) => break Tracker::new(set, persists),
             Read::Failed => tokio::select! {
+                biased;
                 () = stop.cancelled() => return,
                 () = tokio::time::sleep(poll) => {}
             },
@@ -473,6 +475,7 @@ async fn address_loop(
     let mut due_at: Option<Instant> = None;
     loop {
         let woke = tokio::select! {
+            biased;
             () = stop.cancelled() => Woke::Stop,
             notice = notices.notice() => match notice {
                 Ok(()) => Woke::Notice,
@@ -508,6 +511,7 @@ async fn address_loop(
         }
         // Changes that follow this notice are the same change.
         tokio::select! {
+            biased;
             () = stop.cancelled() => return,
             () = tokio::time::sleep(ADDRESS_COALESCE) => {}
         }
@@ -519,6 +523,7 @@ async fn address_loop(
                 break;
             }
             tokio::select! {
+                biased;
                 () = stop.cancelled() => return,
                 () = tokio::time::sleep(wait) => {}
             }

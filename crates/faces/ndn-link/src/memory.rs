@@ -1110,6 +1110,7 @@ async fn write_behind(memory: Arc<Memory>) {
             }
         };
         tokio::select! {
+            biased;
             () = memory.cancel.cancelled() => {
                 memory.drain().await;
                 return;
@@ -1403,6 +1404,7 @@ async fn redial_loop(
                 }
             };
             tokio::select! {
+                biased;
                 () = stop.cancelled() => false,
                 () = wake.notified() => true,
                 () = timer => true,
@@ -1416,6 +1418,7 @@ async fn redial_loop(
         let kick = Arc::clone(&kick);
         async move {
             tokio::select! {
+                biased;
                 () = stop.cancelled() => false,
                 () = kick.notified() => true,
                 () = tokio::time::sleep(within) => true,
@@ -1489,6 +1492,7 @@ async fn redial_loop(
         // A few peers at a time: a store with many records is not dialled all
         // at once (and each wait for a turn can be stopped).
         let turn = tokio::select! {
+            biased;
             () = stop.cancelled() => break,
             turn = memory.dials.acquire() => turn,
         };

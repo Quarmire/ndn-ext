@@ -136,6 +136,7 @@ impl LinkHints {
         tokio::spawn(async move {
             loop {
                 tokio::select! {
+                    biased;
                     () = stop.cancelled() => break,
                     changed = changes.changed() => {
                         // The device dropped its end: it is gone.

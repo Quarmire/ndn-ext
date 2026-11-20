@@ -1025,6 +1025,7 @@ impl Links {
                 let (mut carried, mut quiet_since) = (watched.datagrams(), Instant::now());
                 loop {
                     tokio::select! {
+                        biased;
                         why = watched.closed() => break why,
                         () = tokio::time::sleep(check) => {}
                     }
@@ -1308,6 +1309,7 @@ impl Links {
                 _ => Duration::from_secs(60),
             };
             tokio::select! {
+                biased;
                 () = self.cancel.cancelled() => return true,
                 _ = handle.closed() => return false,
                 () = ctl.changed() => {}
@@ -1366,6 +1368,7 @@ async fn accept_loop(links: Weak<Links>, listener: Arc<LinkEndpoint>) {
             return;
         };
         let incoming = tokio::select! {
+            biased;
             () = cancel.cancelled() => return,
             incoming = listener.accept() => incoming,
         };
@@ -1565,6 +1568,7 @@ pub(crate) async fn dial_loop(links: Weak<Links>, id: PeerId, ctl: Arc<PeerCtl>)
                 // Dropped: dial again after the first backoff (the other
                 // device may be restarting).
                 tokio::select! {
+                    biased;
                     () = cancel.cancelled() => return,
                     () = tokio::time::sleep(backoff.after_drop()) => {}
                 }
@@ -1575,6 +1579,7 @@ pub(crate) async fn dial_loop(links: Weak<Links>, id: PeerId, ctl: Arc<PeerCtl>)
         if !this.wants_link(id, &peer, &ctl) {
             drop(this);
             tokio::select! {
+                biased;
                 () = cancel.cancelled() => return,
                 () = ctl.changed() => {}
             }
@@ -1647,6 +1652,7 @@ pub(crate) async fn dial_loop(links: Weak<Links>, id: PeerId, ctl: Arc<PeerCtl>)
         let until = tokio::time::Instant::now() + wait;
         loop {
             tokio::select! {
+                biased;
                 () = cancel.cancelled() => return,
                 () = tokio::time::sleep_until(until) => break,
                 () = ctl.changed() => if ctl.take_kick() { break },

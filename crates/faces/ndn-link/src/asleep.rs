@@ -208,6 +208,7 @@ impl Links {
         let cancel = self.cancel.clone();
         tokio::spawn(async move {
             tokio::select! {
+                biased;
                 () = cancel.cancelled() => {}
                 () = tokio::time::sleep(max) => {
                     if let Some(links) = weak.upgrade() {

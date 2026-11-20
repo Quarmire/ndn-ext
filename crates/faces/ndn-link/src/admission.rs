@@ -13,7 +13,8 @@ use ndn_cert::onboarding::rdr_prefix;
 use ndn_cert::roles::{Role, parse_device_key};
 use ndn_face_quic::{
     Admission, Carries, ChannelBinding, CloseReason, KeyFingerprint, LinkHello, LinkKey, LinkScope,
-    LinkVerdict, MEMBERSHIPS_MAX, Membership, Narrowing, PeerKey, bounded_text, clean_text,
+    LinkVerdict, MEMBERSHIPS_MAX, Membership, Narrowing, PeerKey, RatedInterests, bounded_text,
+    clean_text,
 };
 use ndn_mgmt_wire::{LinkDetail, link_code as code};
 use ndn_packet::{Data, Name};
@@ -24,11 +25,11 @@ use ndn_security::{
 };
 
 use crate::departures::Departures;
-use crate::grants::{Grant, GrantOutcome, Grants};
+use crate::grants::{Grant, GrantOutcome, Grants, is_ask_answer};
 use crate::host::{LinkTrust, OwnMembership};
 use crate::introduce::Introductions;
 use crate::peer::{PeerId, Peers};
-use crate::policy::{ENROLLMENT_ANSWERS, ENROLLMENT_INTERESTS, MAX_CHAIN};
+use crate::policy::{ASK_INTERESTS, ENROLLMENT_ANSWERS, ENROLLMENT_INTERESTS, MAX_CHAIN};
 use crate::serving::{QuotaSlot, QuotaState, ServePolicy};
 
 /// Who the peer is, from its certificate validated in a held namespace —
@@ -855,6 +856,7 @@ impl Judge<'_> {
                         || named.iter().any(|d| name.has_prefix(d))
                 }),
                 rate: ENROLLMENT_ANSWERS,
+                rated: None,
                 shared: None,
                 answers_in: Some(Box::new(move |name: &Name| {
                     answered.iter().any(|r| name.has_prefix(r))
@@ -917,6 +919,13 @@ impl Judge<'_> {
                                 None => Box::new(|_: &Name| true),
                             },
                             rate,
+                            // The ask exchange is rated apart per key: an honest asker
+                            // sends nine Interests per signer per question (ndn-link.md
+                            // §8.7 rule 20), a flood does not reach the signer's Device.
+                            rated: admitted.grant.as_ref().map(|_| RatedInterests {
+                                names: Box::new(is_ask_answer),
+                                rate: ASK_INTERESTS,
+                            }),
                             shared: Some(shared),
                             answers_in: admitted
                                 .grant
@@ -944,12 +953,17 @@ impl Judge<'_> {
                                      and what it pushes is judged at every \
                                      packet by its role in each folder (a reader's entry widens \
                                      nothing; other Data it pushes is dropped); the quotas bound it \
-                                     ({}/s from that device), and an entry ends at its date or when \
+                                     ({}/s from that device, and its asks of a device \
+                                     (<device>/32=ask-answer) {} at once, then {}/s: an honest ask \
+                                     sends at most 9, so ask again a few seconds later), and an \
+                                     entry ends at its date or when \
                                      the inviter revokes it or the folder's members record leaves \
                                      the person out",
                                     admitted.describe(),
                                     grant.describe(),
-                                    rate.per_sec
+                                    rate.per_sec,
+                                    ASK_INTERESTS.burst,
+                                    ASK_INTERESTS.per_sec
                                 ),
                                 None => format!(
                                     "this relay serves {} of {} under its quotas: {}/s from that device, and \
@@ -980,6 +994,7 @@ impl Judge<'_> {
                                 || introduced.as_ref().is_some_and(|s| s.0.carries(name))
                         }),
                         rate: ENROLLMENT_INTERESTS,
+                        rated: None,
                         shared: None,
                         answers_in: None,
                         interests_in: None,
@@ -1008,6 +1023,7 @@ impl Judge<'_> {
                         sends: Carries::Answers,
                         names: Box::new(move |name: &Name| carried.0.carries(name)),
                         rate: ENROLLMENT_INTERESTS,
+                        rated: None,
                         shared: None,
                         answers_in: None,
                         interests_in: None,
@@ -1032,6 +1048,7 @@ impl Judge<'_> {
                         sends: Carries::Answers,
                         names: self.departure_names(key),
                         rate: ENROLLMENT_INTERESTS,
+                        rated: None,
                         shared: None,
                         answers_in: None,
                         interests_in: None,
@@ -1060,6 +1077,7 @@ impl Judge<'_> {
                             in_enrollment(&keyring, &scoped, name, false)
                         }),
                         rate: ENROLLMENT_ANSWERS,
+                        rated: None,
                         shared: None,
                         answers_in: None,
                         interests_in: None,

@@ -492,13 +492,20 @@ impl Transport for Faulted {
             }
             let next = rx.held.peek().map(|Reverse(h)| h.due);
             let live = rx.ended.is_none();
+            // `biased`: when a held packet falls due at the instant another arrives, the
+            // order they are handled in is the same every run (an unseeded RNG chose it,
+            // and the plan's draws and the link's packet order followed it). Due
+            // packets first, then arrivals. Neither starves the other: a due packet is
+            // returned by the next pass's `take_due`, and an arrival is only taken when
+            // none is due.
             tokio::select! {
+                biased;
+                () = tokio::time::sleep_until(next.unwrap_or_else(Instant::now)), if next.is_some() => {}
                 arrived = self.inner.recv_bytes(), if live => match arrived {
                     Ok(frame) => self.arrived(&mut rx, frame),
                     Err(ended) if rx.held.is_empty() => return Err(ended),
                     Err(ended) => rx.ended = Some(ended),
                 },
-                () = tokio::time::sleep_until(next.unwrap_or_else(Instant::now)), if next.is_some() => {}
             }
         }
     }

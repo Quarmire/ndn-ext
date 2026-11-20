@@ -85,6 +85,7 @@ pub(crate) async fn wait_online(
     cancel: &CancellationToken,
 ) -> bool {
     tokio::select! {
+        biased;
         () = cancel.cancelled() => false,
         reached = online.wait_for(|up| *up) => reached.is_ok(),
     }

@@ -428,8 +428,9 @@ impl LinkWatch {
                 return None;
             }
             tokio::select! {
-                () = &mut wake => {}
+                biased;
                 () = self.cancel.cancelled() => return None,
+                () = &mut wake => {}
             }
         }
     }

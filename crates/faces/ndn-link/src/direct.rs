@@ -540,6 +540,7 @@ impl Links {
             self.direct
                 .state(whom, DirectState::Up, direct_up(remote), None);
             let why = tokio::select! {
+                biased;
                 () = self.cancel.cancelled() => return Duration::ZERO,
                 why = path.closed() => why,
             };
@@ -550,6 +551,7 @@ impl Links {
             // loop goes on from how that ends.
             if let Some(mut repunch) = self.direct.repunch_of(key) {
                 let ended = tokio::select! {
+                    biased;
                     () = self.cancel.cancelled() => return Duration::ZERO,
                     ended = repunch.wait_for(Option::is_some) => ended.ok().and_then(|e| *e),
                 };
@@ -1182,6 +1184,7 @@ impl Links {
         self.direct
             .state(whom, DirectState::Up, direct_up(remote), None);
         let why = tokio::select! {
+            biased;
             () = self.cancel.cancelled() => return,
             why = path.closed() => why,
         };
@@ -1483,6 +1486,9 @@ impl Links {
             let mut last = None;
             loop {
                 tokio::select! {
+                    // Polled in the order written, so a punch that ends at the instant its
+                    // probe, listener and dial finish is judged the same every run.
+                    biased;
                     () = &mut probe, if probing => probing = false,
                     () = &mut listen => {}
                     up = &mut up_rx => match up {
@@ -1662,6 +1668,7 @@ async fn punch_loop(
             let online = this.online.subscribe();
             drop(this);
             let reached = tokio::select! {
+                biased;
                 () = stop.cancelled() => return,
                 reached = crate::online::wait_online(online, &cancel) => reached,
             };
@@ -1672,6 +1679,7 @@ async fn punch_loop(
             continue;
         }
         let wait = tokio::select! {
+            biased;
             () = stop.cancelled() => return,
             wait = this.direct_round(&target, relay, &mut backoff) => wait,
         };
@@ -1682,6 +1690,7 @@ async fn punch_loop(
             return;
         }
         tokio::select! {
+            biased;
             () = cancel.cancelled() => return,
             () = stop.cancelled() => return,
             () = kicked => backoff.reset(),
@@ -1707,6 +1716,7 @@ async fn repunch(
     gone.cancelled().await;
     let Some(this) = links.upgrade() else { return };
     let punched = tokio::select! {
+        biased;
         () = this.cancel.cancelled() => return,
         punched = this.punch_again(&target, owned, remote) => punched,
     };

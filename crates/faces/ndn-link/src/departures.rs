@@ -670,6 +670,7 @@ impl Links {
                     return;
                 }
                 tokio::select! {
+                    biased;
                     () = cancel.cancelled() => return,
                     _ = handle.closed() => return,
                     _ = sighted.changed() => {}
@@ -705,6 +706,7 @@ impl Links {
             loop {
                 let due = taking.next_due();
                 tokio::select! {
+                    biased;
                     () = cancel.cancelled() => return,
                     _ = handle.closed() => return,
                     changed = heard.changed() => {

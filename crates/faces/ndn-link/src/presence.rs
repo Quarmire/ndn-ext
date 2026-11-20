@@ -136,6 +136,7 @@ impl Links {
                     links.take_presence(relay, &list);
                 }
                 tokio::select! {
+                    biased;
                     () = cancel.cancelled() => return,
                     _ = handle.closed() => break,
                     changed = rx.changed() => if changed.is_err() { break },

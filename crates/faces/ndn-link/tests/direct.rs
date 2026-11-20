@@ -197,6 +197,19 @@ fn direct_to(on: &Device, to: KeyFingerprint) -> Option<SocketAddr> {
         .and_then(|p| p.remote)
 }
 
+/// The remote address of each direct path `on` holds to the device with key `to`.
+fn direct_remotes(on: &Device, to: KeyFingerprint) -> Vec<Option<SocketAddr>> {
+    on.links
+        .report()
+        .links
+        .iter()
+        .filter(|l| l.key == Some(to))
+        .flat_map(|l| l.paths.iter())
+        .filter(|p| p.kind == PathKind::Direct)
+        .map(|p| p.remote)
+        .collect()
+}
+
 async fn within(what: &str, limit: Duration, mut done: impl FnMut() -> bool) -> Duration {
     let start = Instant::now();
     while !done() {
@@ -236,17 +249,15 @@ async fn a_moved_member_gets_its_direct_path_again(larger: bool) {
         || direct_to(other, mover.key) == Some(moved) && direct_to(mover, other.key).is_some(),
     )
     .await;
-    // The old path went with the move: the other member has one direct
-    // path to the mover, at its new address.
-    let report = other.links.report();
-    let paths: Vec<_> = report
-        .links
-        .iter()
-        .filter(|l| l.key == Some(mover.key))
-        .flat_map(|l| l.paths.iter())
-        .filter(|p| p.kind == PathKind::Direct)
-        .collect();
-    assert_eq!(paths.len(), 1, "{paths:?}");
+    // The old path went with the move: the other member has one direct path to the mover, at
+    // its new address. (The old one is dropped by its own close handling a moment after the
+    // new one is made: wait for the set to be exactly that, never judge the instant between.)
+    within(
+        "the old direct path gone, one direct path left at the new address",
+        Duration::from_secs(4),
+        || direct_remotes(other, mover.key) == [Some(moved)],
+    )
+    .await;
     eprintln!("direct path again {took:?} after the move (mover has the larger key: {larger})");
 }
 
