@@ -474,6 +474,32 @@ impl Introducer for Host {
     }
 }
 
+/// A connection that is another's in everything but `routes`, which it
+/// does not tell.
+struct NoRoutes(Arc<dyn ndn_app::Connection>);
+
+#[async_trait::async_trait]
+impl ndn_app::Connection for NoRoutes {
+    async fn send(&self, wire: Bytes) -> Result<(), ndn_app::AppError> {
+        self.0.send(wire).await
+    }
+    async fn recv(&self) -> Option<Bytes> {
+        self.0.recv().await
+    }
+    async fn recv_with_meta(&self) -> Option<(Bytes, ndn_app::LpInfo)> {
+        self.0.recv_with_meta().await
+    }
+    async fn register_prefix(&self, prefix: &Name) -> Result<(), ndn_app::AppError> {
+        self.0.register_prefix(prefix).await
+    }
+    fn replies(&self) -> Option<ndn_app::Replies> {
+        self.0.replies()
+    }
+    fn routes(&self) -> Option<ndn_app::RouteEvents> {
+        None
+    }
+}
+
 /// How a test's device is set up.
 #[derive(Clone)]
 pub struct Setup {
@@ -493,6 +519,10 @@ pub struct Setup {
     /// (`ndn_identity::adopt_scoped_via_engine`), not from the test's
     /// directory and with no route of its own.
     pub scoped_by_name: bool,
+    /// Its data layer's sync connection tells no routes
+    /// (`Connection::routes` is `None`): it announces its groups only by
+    /// its period, never because a face came up.
+    pub sync_tells_no_routes: bool,
 }
 
 impl Setup {
@@ -505,6 +535,7 @@ impl Setup {
             grant_for: None,
             departure_for: IntroPolicy::new().departure_for,
             scoped_by_name: false,
+            sync_tells_no_routes: false,
         }
     }
 
@@ -677,7 +708,14 @@ async fn boot(kept: Kept, setup: Setup) -> Embedded {
     let device = Device::start(
         Transport {
             node: engine.app_node(cancel.child_token()),
-            sync: engine.app_face(cancel.child_token()),
+            sync: {
+                let sync = engine.app_face(cancel.child_token());
+                if setup.sync_tells_no_routes {
+                    Arc::new(NoRoutes(sync))
+                } else {
+                    sync
+                }
+            },
         },
         parts.name.clone(),
         Arc::clone(&parts.keys),

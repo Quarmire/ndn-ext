@@ -69,7 +69,17 @@ async fn a_commit_made_while_no_link_was_up_is_read_within_seconds_of_the_link_c
     let alice = Person::new("/alice").await;
     let bobs = Person::new("/bob").await;
     let ann = embedded(&alice, ANN, Setup::inviter()).await;
-    let bob = embedded(&bobs, "/bob/member/phone", Setup::dialer()).await;
+    // Bob's device never announces because a face came up: only Ann's
+    // announcement can bring him her version before the period.
+    let bob = embedded(
+        &bobs,
+        "/bob/member/phone",
+        Setup {
+            sync_tells_no_routes: true,
+            ..Setup::dialer()
+        },
+    )
+    .await;
     invited(&ann, &bob, Role::Writer).await;
     let folder = n(FOLDER);
     let cover = folder.clone().append("cover");
