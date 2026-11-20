@@ -103,9 +103,14 @@ pub struct LinkScope {
     pub explain: String,
     /// When set, an answer (Data or Nack) the peer sends is carried only
     /// within it, besides being within `names`: a peer whose Interests go
-    /// everywhere may answer for some names only. The peer's Interests, and
-    /// what this side sends, are judged by `names` alone.
+    /// everywhere may answer for some names only. What this side sends is
+    /// judged by `names` alone.
     pub answers_in: Option<NameFilter>,
+    /// When set, an Interest the peer sends is carried only within it,
+    /// besides being within `names`: a link whose names are wide (the names
+    /// this side's own Interests go out under) may let the peer ask for some
+    /// of them only. What this side sends is judged by `names` alone.
+    pub interests_in: Option<NameFilter>,
     /// When set, the scope narrows in place while [`Narrowing::when`] holds
     /// (asked at every packet), with no reconnect.
     pub narrowing: Option<Narrowing>,
@@ -238,6 +243,7 @@ impl ScopeState {
             packet,
             self.carries(|n| n.receives, self.scope.receives),
             &self.inbound,
+            self.scope.interests_in.as_deref(),
             self.scope.answers_in.as_deref(),
         )
     }
@@ -248,6 +254,7 @@ impl ScopeState {
             Packet::of(frame),
             self.carries(|n| n.sends, self.scope.sends),
             &self.outbound,
+            None,
             None,
         )
     }
@@ -273,6 +280,7 @@ impl ScopeState {
         packet: Option<Packet>,
         carries: Carries,
         fragmented: &Mutex<Fragmented>,
+        interests: Option<&(dyn Fn(&Name) -> bool + Send + Sync)>,
         answers: Option<&(dyn Fn(&Name) -> bool + Send + Sync)>,
     ) -> Judged {
         let Some(packet) = packet else {
@@ -304,9 +312,12 @@ impl ScopeState {
                     Carries::Answers => kind != Kind::Interest,
                     Carries::Everything => true,
                 };
-                let answer_named =
-                    kind == Kind::Interest || answers.is_none_or(|named| named(&name));
-                if carried && answer_named && (self.scope.names)(&name) {
+                let named = if kind == Kind::Interest {
+                    interests.is_none_or(|named| named(&name))
+                } else {
+                    answers.is_none_or(|named| named(&name))
+                };
+                if carried && named && (self.scope.names)(&name) {
                     if let Some(base) = first_of {
                         fragmented
                             .lock()
@@ -461,6 +472,7 @@ mod tests {
             shared: None,
             explain: "test".into(),
             answers_in: None,
+            interests_in: None,
             narrowing: None,
         })
     }
@@ -524,6 +536,7 @@ mod tests {
             shared: None,
             explain: "test".into(),
             answers_in: Some(Box::new(move |n: &Name| n.has_prefix(&own))),
+            interests_in: None,
             narrowing: None,
         });
         let lp = |p: &Bytes| ndn_packet::lp::encode_lp_packet(p);
@@ -549,6 +562,59 @@ mod tests {
         );
     }
 
+    /// A scope with `interests_in` carries the peer's Interests only within
+    /// it, and still its answers within `answers_in`; what this side sends is
+    /// judged by the names alone. An Interest dropped is Nacked back to the
+    /// peer, never handed on.
+    #[test]
+    fn interests_the_peer_sends_are_judged_by_interests_in() {
+        let own: Name = "/bob/member/phone".parse().unwrap();
+        let asked: Name = "/alice/member/laptop/32=held".parse().unwrap();
+        let (own_in, asked_in, asked_names) = (own.clone(), asked.clone(), asked.clone());
+        let s = ScopeState::new(LinkScope {
+            receives: Carries::Everything,
+            sends: Carries::Everything,
+            names: Box::new(move |n: &Name| n.has_prefix(&own) || n.has_prefix(&asked_names)),
+            rate: RateLimit {
+                burst: 100,
+                per_sec: 100,
+            },
+            shared: None,
+            explain: "test".into(),
+            answers_in: Some(Box::new(move |n: &Name| n.has_prefix(&asked_in))),
+            interests_in: Some(Box::new(move |n: &Name| n.has_prefix(&own_in))),
+            narrowing: None,
+        });
+        let lp = |p: &Bytes| ndn_packet::lp::encode_lp_packet(p);
+        assert_eq!(
+            s.received(&lp(&interest("/bob/member/phone/seal"))),
+            Judged::Pass,
+            "the peer may ask for the names under this side's own device"
+        );
+        let other = interest("/alice/member/laptop/32=held/x");
+        assert_eq!(
+            s.received(&lp(&other)),
+            Judged::Drop(Some(other)),
+            "an Interest within the names but outside interests_in is dropped, to be Nacked"
+        );
+        let elsewhere = interest("/carol/private");
+        assert_eq!(
+            s.received(&lp(&elsewhere)),
+            Judged::Drop(Some(elsewhere)),
+            "an Interest outside the names is dropped"
+        );
+        assert_eq!(
+            s.received(&lp(&data("/alice/member/laptop/32=held/x", 10))),
+            Judged::Pass,
+            "an answer within answers_in passes: interests_in judges Interests only"
+        );
+        assert_eq!(
+            s.sending(&lp(&interest("/alice/member/laptop/32=held/x"))),
+            Judged::Pass,
+            "what this side sends is not held to interests_in"
+        );
+    }
+
     /// A narrowing scope carries what it was admitted for until `when` holds,
     /// then, with no reconnect, only Interests from the peer and answers to
     /// it, within the same names; it widens again when `when` stops holding.
@@ -567,6 +633,7 @@ mod tests {
             shared: None,
             explain: "test".into(),
             answers_in: None,
+            interests_in: None,
             narrowing: Some(Narrowing {
                 when: Box::new(move || flag.load(Ordering::SeqCst)),
                 receives: Carries::Interests,
@@ -669,6 +736,7 @@ mod tests {
                 shared: Some(Arc::clone(&shared)),
                 explain: "test".into(),
                 answers_in: None,
+                interests_in: None,
                 narrowing: None,
             })
         };

@@ -102,8 +102,10 @@ impl Refusal {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Enrollment {
     /// This relay admitted a device it does not know, for its enrollment in
-    /// these namespaces.
-    Relay(Vec<Name>),
+    /// these namespaces. A device with no certificate may also be the
+    /// joiner of an open offer (a first contact's hello is empty), so while
+    /// an offer is open the link carries the introduction's surface too.
+    Relay(Vec<Name>, Option<crate::introduce::Surface>),
     /// This device, holding no certificate in the namespace, dialled a relay
     /// of it that it cannot confirm yet.
     Device(Name),
@@ -164,6 +166,10 @@ impl Admitted {
 pub(crate) struct Judge<'a> {
     pub(crate) trust: &'a dyn LinkTrust,
     pub(crate) peers: &'a Peers,
+    /// The peers a code's dial added whose link was made again because this
+    /// device came to hold their namespace: a party that answers such a dial
+    /// must show a certificate of that namespace.
+    pub(crate) relinked: &'a parking_lot::Mutex<std::collections::HashSet<PeerId>>,
     pub(crate) serve: &'a ServePolicy,
     pub(crate) quotas: &'a QuotaState,
     pub(crate) grants: &'a Grants,
@@ -307,6 +313,16 @@ impl Judge<'_> {
         let mut detail = LinkDetail::new(code::NO_ENROLLMENT_LINK, text);
         detail.causes = why_not;
         Err(detail)
+    }
+
+    /// The introduction surface of this device while an offer is open
+    /// ([`Introductions::open`]): what a link carries besides its own errand
+    /// when a joiner may be the one at the other end.
+    fn open_introductions(&self) -> Option<crate::introduce::Surface> {
+        self.introductions
+            .clone()
+            .filter(|surface| surface.open())
+            .map(crate::introduce::Surface)
     }
 
     /// What `hello` (from the link key `key`, on the connection or punch
@@ -806,6 +822,65 @@ impl Judge<'_> {
         decide_identified(self, fingerprint, identities, peer, dialed)
     }
 
+    /// What a link to a peer this device dialled from an introduction code
+    /// ([`dial_by_key`](crate::Links::dial_by_key), `dial_first`: a peer entry
+    /// with `unidentified_routes`) carries while the peer has shown no
+    /// certificate: the party at that key was named by a code, not proved by a
+    /// namespace, so what it sends toward this device is bounded. Its answers
+    /// are carried under the routes this device asked for, its Interests
+    /// only under this device's own names (the inviter fetches the joiner's
+    /// seal key there), and neither is handed on beyond what the scope
+    /// carries; this device's own Interests go out under the routes only.
+    /// `None`: not such a link, or the peer showed a certificate (a full
+    /// link).
+    fn dialled_admission(&self, admitted: &Admitted) -> Option<Admission> {
+        if !admitted.identities.is_empty() {
+            return None;
+        }
+        let routes = self
+            .peers
+            .get(admitted.peer?)?
+            .unidentified_routes
+            .clone()?;
+        let own = self.own_devices();
+        let (asked, answered) = (routes.clone(), routes.clone());
+        let (named, allowed) = (own.clone(), own.clone());
+        Some(Admission {
+            verdict: LinkVerdict::default(),
+            scope: Some(LinkScope {
+                receives: Carries::Everything,
+                sends: Carries::Everything,
+                names: Box::new(move |name: &Name| {
+                    asked.iter().any(|r| name.has_prefix(r))
+                        || named.iter().any(|d| name.has_prefix(d))
+                }),
+                rate: ENROLLMENT_ANSWERS,
+                shared: None,
+                answers_in: Some(Box::new(move |name: &Name| {
+                    answered.iter().any(|r| name.has_prefix(r))
+                })),
+                interests_in: Some(Box::new(move |name: &Name| {
+                    allowed.iter().any(|d| name.has_prefix(d))
+                })),
+                narrowing: None,
+                explain: format!(
+                    "the link to {} was dialled from an introduction code and the party shows no \
+                     certificate this device holds: it carries the answers to what this device \
+                     asks under {} and only the Interests for this device's own names ({}); it \
+                     links fully once the party shows a certificate of a namespace this device \
+                     holds",
+                    self.label(admitted),
+                    list(&routes),
+                    if own.is_empty() {
+                        "none: this device holds no certificate".to_string()
+                    } else {
+                        list(&own)
+                    }
+                ),
+            }),
+        })
+    }
+
     /// How this side admits the link: what it tells the peer, and what the
     /// link carries.
     pub(crate) fn admission_for(&self, admitted: &Admitted) -> Admission {
@@ -815,7 +890,7 @@ impl Judge<'_> {
                 .as_ref()
                 .and_then(|slot| slot.limits.clone().map(|l| (slot, l)))
             {
-                None => Admission::default(),
+                None => self.dialled_admission(admitted).unwrap_or_default(),
                 Some((slot, (rate, shared))) => {
                     let own: Vec<Name> = admitted
                         .identities
@@ -847,6 +922,7 @@ impl Judge<'_> {
                                 .grant
                                 .as_ref()
                                 .map(|grant| self.grant_pushes(grant.key, own)),
+                            interests_in: None,
                             narrowing: admitted.grant.as_ref().map(|grant| {
                                 let table = self.grants.clone();
                                 let key = grant.key;
@@ -886,9 +962,10 @@ impl Judge<'_> {
                     }
                 }
             },
-            Some(Enrollment::Relay(namespaces)) => {
+            Some(Enrollment::Relay(namespaces, introductions)) => {
                 let keyring = Arc::clone(self.keyring());
                 let scoped = namespaces.clone();
+                let introduced = introductions.clone();
                 Admission {
                     verdict: LinkVerdict {
                         enrollment_link: Some(namespaces.clone()),
@@ -898,17 +975,24 @@ impl Judge<'_> {
                         sends: Carries::Answers,
                         names: Box::new(move |name: &Name| {
                             in_enrollment(&keyring, &scoped, name, true)
+                                || introduced.as_ref().is_some_and(|s| s.0.carries(name))
                         }),
                         rate: ENROLLMENT_INTERESTS,
                         shared: None,
                         answers_in: None,
+                        interests_in: None,
                         narrowing: None,
                         explain: format!(
                             "the enrollment link of key {} carries only that device's enrollment in \
                              {} (Interests for its CA, trust context and certificates, and their \
-                             answers); it links fully once it enrolls",
+                             answers){}; it links fully once it enrolls",
                             admitted.fingerprint,
-                            list(namespaces)
+                            list(namespaces),
+                            if introductions.is_some() {
+                                " and the Interests of the introduction an open offer needs"
+                            } else {
+                                ""
+                            }
                         ),
                     }),
                 }
@@ -924,6 +1008,7 @@ impl Judge<'_> {
                         rate: ENROLLMENT_INTERESTS,
                         shared: None,
                         answers_in: None,
+                        interests_in: None,
                         narrowing: None,
                         explain: format!(
                             "the introduction link of key {} carries only the Interests of the \
@@ -947,6 +1032,7 @@ impl Judge<'_> {
                         rate: ENROLLMENT_INTERESTS,
                         shared: None,
                         answers_in: None,
+                        interests_in: None,
                         narrowing: None,
                         explain: format!(
                             "the departure link of key {key} carries only the Interests for the \
@@ -974,6 +1060,7 @@ impl Judge<'_> {
                         rate: ENROLLMENT_ANSWERS,
                         shared: None,
                         answers_in: None,
+                        interests_in: None,
                         narrowing: None,
                         explain: format!(
                             "the link to {label} carries only this device's enrollment in {ns} (its \
@@ -1189,7 +1276,7 @@ fn decide_identified(
                     Ok(namespaces) => {
                         return Ok(admitted(
                             Vec::new(),
-                            Some(Enrollment::Relay(namespaces)),
+                            Some(Enrollment::Relay(namespaces, judge.open_introductions())),
                             None,
                             Vec::new(),
                         ));
@@ -1256,7 +1343,45 @@ fn decide_identified(
             detail.causes.extend(no_enrollment_link);
             Err(Refusal::new(CloseReason::Unrecognized, detail))
         }
-        Err(_) => Ok(admitted(Vec::new(), None, None, Vec::new())),
+        Err(why) => {
+            // The peer's key is the expected one and it shows no identity. A
+            // peer this device dialled from an introduction code
+            // (`unidentified_routes`) is a device of the code's namespace only
+            // by the code's claim. Once this device holds that namespace its
+            // link is made again ([`Judge::relinked`]) so the device shows a
+            // certificate of it: a party that still shows none is not that
+            // device, and is not admitted again with the introduction's
+            // routes.
+            if let Some(p) = &config
+                && p.unidentified_routes.is_some()
+                && peer.is_some_and(|i| judge.relinked.lock().contains(&i))
+                && let Some(device) = &p.device
+                && let Some(ctx) = judge.keyring().held_for(device)
+            {
+                let why = why.detail();
+                return Err(Refusal::new(
+                    CloseReason::Unrecognized,
+                    LinkDetail::new(
+                        code::EXPECTED_DEVICE_UNCONFIRMED,
+                        format!(
+                            "this device dialled {device} from an introduction code and holds \
+                             {} now, so that device shows a certificate of it; your key \
+                             {fingerprint} shows no certificate this device holds ({}), so you \
+                             are not {device}. This link is closed and its routes removed: join \
+                             again with a new code from the inviter, and check the address and \
+                             the code you were given",
+                            ctx.namespace(),
+                            why.text
+                        ),
+                    )
+                    .with("device", device)
+                    .with("namespace", ctx.namespace())
+                    .with("key", fingerprint)
+                    .caused_by(why),
+                ));
+            }
+            Ok(admitted(Vec::new(), None, None, Vec::new()))
+        }
     }
 }
 
@@ -1779,6 +1904,7 @@ mod tests {
         grants: Grants,
         departures: Departures,
         introductions: Option<Arc<dyn Introductions>>,
+        relinked: parking_lot::Mutex<std::collections::HashSet<PeerId>>,
     }
 
     impl World {
@@ -1791,12 +1917,14 @@ mod tests {
                 grants: Grants::default(),
                 departures: Departures::default(),
                 introductions: None,
+                relinked: Default::default(),
             }
         }
 
         fn judge(&self) -> Judge<'_> {
             Judge {
                 trust: &self.trust,
+                relinked: &self.relinked,
                 peers: &self.peers,
                 serve: &self.serve,
                 quotas: &self.quotas,
@@ -2402,7 +2530,10 @@ mod tests {
             .decide(&key, &hello(Vec::new()), &CH, None)
             .await
             .unwrap();
-        assert_eq!(admitted.enrollment, Some(Enrollment::Relay(vec![n("/a")])));
+        assert_eq!(
+            admitted.enrollment,
+            Some(Enrollment::Relay(vec![n("/a")], None))
+        );
     }
 
     fn served(namespace: &str, device: &str, root: KeyFingerprint) -> Identity {
@@ -3482,5 +3613,197 @@ mod tests {
         );
         assert!(!why.text.contains(&long), "{:?}", why.text);
         assert!(why.text.contains(fact));
+    }
+
+    /// An inviter that also admits enrollment links takes a device with no
+    /// certificate (a first contact's hello is empty) as an enrollment link;
+    /// while an offer is open that link carries the offer's introduction too,
+    /// and still the enrollment's names, and no other.
+    #[tokio::test]
+    async fn an_enrollment_link_carries_an_open_offers_introduction_too() {
+        let a = namespace("/a", 10).await;
+        let (_, own) = a.device("node", "laptop", 90).await;
+        let mut world = World::new(
+            Bare(Arc::new(keyring_with(a.context())), None, own),
+            Vec::new(),
+            ServePolicy::Own,
+        );
+        let (key, _) = a.device("member", "phone", 32).await;
+        async fn decided(world: &World, key: &PeerKey) -> ndn_face_quic::LinkScope {
+            let judge = world.judge();
+            let admitted = judge
+                .decide(key, &hello(Vec::new()), &CH, None)
+                .await
+                .expect("a device with no certificate gets a link");
+            judge
+                .admission_for(&admitted)
+                .scope
+                .expect("an enrollment link is scoped")
+        }
+        let scope = decided(&world, &key).await;
+        assert!((scope.names)(&n("/a/CA/NEW")), "the enrollment is carried");
+        assert!(
+            !(scope.names)(&n("/intro/offer")),
+            "no offer is open: nothing of an introduction is carried"
+        );
+
+        world.introductions = Some(Arc::new(Surface));
+        let scope = decided(&world, &key).await;
+        assert!(
+            (scope.names)(&n("/intro/offer")),
+            "the open offer's introduction crosses the enrollment link"
+        );
+        assert!(
+            (scope.names)(&n("/a/CA/NEW")),
+            "the enrollment is still carried"
+        );
+        assert!(
+            !(scope.names)(&n("/a/member/phone/album")) && !(scope.names)(&n("/other")),
+            "nothing else is"
+        );
+    }
+
+    /// A peer this device dialled from a code (it has `unidentified_routes`)
+    /// is admitted unidentified while its device's namespace is not held
+    /// here. Once it is, the link is made again so the device shows a
+    /// certificate of it, and a party that still shows none is no device of
+    /// it — refused, with why and what to do, not admitted again with the
+    /// routes of the introduction.
+    #[tokio::test]
+    async fn a_dialled_party_still_showing_no_certificate_after_the_relink_is_refused() {
+        let a = namespace("/a", 10).await;
+        let dialled = |key: Option<KeyFingerprint>, routes: Option<Vec<Name>>| PeerSpec {
+            label: "/a/member/laptop".into(),
+            key,
+            device: Some(n("/a/member/laptop")),
+            persistent: false,
+            unidentified_routes: routes,
+            ..PeerSpec::default()
+        };
+        let introduction = Some(vec![n("/a/member/laptop/32=held")]);
+        // `held`: the namespace is held here; `relinked`: this is the link
+        // made again because of it.
+        let judged = |held: bool, relinked: bool, peer: PeerSpec| {
+            let keyring = if held {
+                keyring_with(a.context())
+            } else {
+                Keyring::new()
+            };
+            let world = World::new(
+                Bare(Arc::new(keyring), None, Vec::new()),
+                vec![peer],
+                ServePolicy::Own,
+            );
+            if relinked {
+                world.relinked.lock().insert(PeerId(0));
+            }
+            decide_identified(
+                &world.judge(),
+                THEIRS,
+                Err(Unidentified::NoCertificate),
+                Some(PeerId(0)),
+                Some(PeerId(0)),
+            )
+            .map(|admitted| admitted.enrollment)
+        };
+
+        let refusal = judged(true, true, dialled(Some(THEIRS), introduction.clone())).expect_err(
+            "a held namespace's device shows a certificate of it, or is not that device",
+        );
+        assert_eq!(refusal.reason, CloseReason::Unrecognized);
+        assert!(
+            refusal.detail.is(code::EXPECTED_DEVICE_UNCONFIRMED),
+            "{:?}",
+            refusal.detail
+        );
+        let said = &refusal.detail.text;
+        assert!(
+            said.contains("/a/member/laptop") && said.contains("no certificate"),
+            "{said}"
+        );
+        assert!(said.contains("new code"), "it says what to do: {said}");
+
+        // The first link of the dial, whatever is held: the unidentified link
+        // of the introduction, which the join judges by the record.
+        for held in [false, true] {
+            assert_eq!(
+                judged(held, false, dialled(Some(THEIRS), introduction.clone())).unwrap(),
+                None,
+                "held {held}: the first link is admitted unidentified"
+            );
+        }
+        // Made again with the namespace not held (nothing to show yet).
+        assert_eq!(
+            judged(false, true, dialled(Some(THEIRS), introduction)).unwrap(),
+            None
+        );
+        // A host's own entry for a key (no code's routes) is admitted by its
+        // key whatever the namespaces held.
+        assert_eq!(
+            judged(true, true, dialled(Some(THEIRS), None)).unwrap(),
+            None,
+            "a host-configured key admits the device"
+        );
+    }
+
+    /// What an unidentified link to a peer dialled from a code carries: the
+    /// answers to what this device asks under the routes it was dialled for,
+    /// this device's Interests there, and — of the peer's Interests — only
+    /// those under this device's own names (the inviter fetches the joiner's
+    /// seal key); the others are dropped, never handed to the forwarder.
+    #[tokio::test]
+    async fn an_unidentified_dialled_link_carries_only_the_introduction_and_asks_for_own_names() {
+        let (a, b) = (namespace("/a", 10).await, namespace("/b", 20).await);
+        let (_, own) = b.device("member", "phone", 22).await;
+        let routes = vec![
+            n("/a/member/laptop/32=held"),
+            n("/a/member/laptop/32=intro"),
+        ];
+        let world = World::new(
+            Bare(Arc::new(keyring_with(b.context())), None, own),
+            vec![PeerSpec {
+                label: "/a/member/laptop".into(),
+                key: Some(THEIRS),
+                device: Some(n("/a/member/laptop")),
+                persistent: false,
+                unidentified_routes: Some(routes.clone()),
+                ..PeerSpec::default()
+            }],
+            ServePolicy::Own,
+        );
+        let _ = &a;
+        let judge = world.judge();
+        let admitted = decide_identified(
+            &judge,
+            THEIRS,
+            Err(Unidentified::NoCertificate),
+            Some(PeerId(0)),
+            Some(PeerId(0)),
+        )
+        .expect("a stranger at a first contact's address is admitted unidentified");
+        let scope = judge
+            .admission_for(&admitted)
+            .scope
+            .expect("an unidentified dialled link is scoped");
+        let interests = scope.interests_in.expect("the peer's Interests are judged");
+        let answers = scope.answers_in.expect("the peer's answers are judged");
+        let held = n("/a/member/laptop/32=held/x");
+        let own_name = n("/b/member/phone/32=seal/x");
+        let other = n("/c/private");
+        // The peer's Interests: this device's own names only.
+        assert!((scope.names)(&own_name) && interests(&own_name));
+        assert!(
+            !((scope.names)(&held) && interests(&held)),
+            "an Interest for the introduction's names is not the peer's to send"
+        );
+        assert!(!((scope.names)(&other) && interests(&other)));
+        // Its answers: under what this device asked for.
+        assert!((scope.names)(&held) && answers(&held));
+        assert!(!((scope.names)(&own_name) && answers(&own_name)));
+        assert!(!((scope.names)(&other) && answers(&other)));
+        // This device's own Interests (names judged alone) go out under the
+        // routes, and nowhere else.
+        assert!((scope.names)(&held));
+        assert!(!(scope.names)(&other));
     }
 }

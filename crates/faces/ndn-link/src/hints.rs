@@ -302,10 +302,13 @@ impl LinkHints {
     /// handshake proved; the link routes only `inviter`'s introduction
     /// prefixes (the held pieces, the offer's and the hint record's names:
     /// [`introduction_prefixes`]) until the device behind it shows a
-    /// certificate this device holds, whoever answered at `addr`. The host's
-    /// introducer forwards [`Introducer::dial_first`](ndn_data::intro::Introducer::dial_first)
+    /// certificate this device holds, whoever answered at `addr`. The dial's
+    /// hello is empty (no certificate, no membership) and what the party may
+    /// send in is bounded to answers under those prefixes and Interests for
+    /// this device's own names. The host's introducer forwards
+    /// [`Introducer::dial_first`](ndn_data::intro::Introducer::dial_first)
     /// here, and the join's [`undial`](Self::undial) for the key returned
-    /// when it fails.
+    /// when it fails or when the verified record names another key.
     pub fn dial_first<'a>(
         &'a self,
         inviter: &'a Name,
@@ -326,13 +329,17 @@ impl LinkHints {
         })
     }
 
-    /// The join that dialled `hint` failed: take down the link it made, if
-    /// it is still one that carries only the introduction
+    /// The join that dialled `hint` failed, or the verified record names
+    /// another key than the link's: take down the link it made, if it is
+    /// still one that has shown no certificate this device holds
     /// ([`Links::undial_by_key`]).
     pub fn undial(&self, hint: &LinkHint, inviter: &Name) {
         self.links.undial_by_key(
             KeyFingerprint(hint.key),
-            &format!("the join that dialled {inviter} by its code's hint failed"),
+            &format!(
+                "the link made by dialling {inviter} from its code is taken down: the join failed, \
+                 or this party's key is not the one the code's verified hint names"
+            ),
         );
     }
 }

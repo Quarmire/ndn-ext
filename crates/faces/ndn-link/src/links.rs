@@ -129,6 +129,16 @@ pub struct Links {
     /// The addresses of peers this device dialled by key from a code's link
     /// hint ([`Links::dial_by_key`]), in the order tried: their paths.
     pub(crate) introduced: Mutex<HashMap<PeerId, Vec<SocketAddr>>>,
+    /// The peers dialled with no key to expect ([`Links::dial_first`]) that
+    /// have not been made again since this device came to hold their
+    /// namespace: their hello is empty, as an enrollment link's is (nothing
+    /// of this device is shown to a party no key vouches for).
+    pub(crate) first_contacts: Mutex<HashSet<PeerId>>,
+    /// The peers a code's dial added whose link was closed to be made again
+    /// because this device came to hold their namespace: the party that
+    /// answers the redial must show a certificate of it
+    /// ([`Judge::relinked`](crate::admission::Judge)).
+    pub(crate) relinked: Mutex<HashSet<PeerId>>,
     /// Each peer's link state ([`Links::watch`]) and the observers of the
     /// links' events.
     pub(crate) states: LinkStates,
@@ -185,6 +195,8 @@ impl Links {
             present: Mutex::new(HashMap::new()),
             introductions: Mutex::new(None),
             introduced: Mutex::new(HashMap::new()),
+            first_contacts: Mutex::new(HashSet::new()),
+            relinked: Mutex::new(HashSet::new()),
             states: LinkStates::default(),
             memory: OnceLock::new(),
             online: crate::online::Online::default(),
@@ -594,6 +606,7 @@ impl Links {
         Judge {
             trust: self.trust.as_ref(),
             peers: &self.peers,
+            relinked: &self.relinked,
             serve: &self.service.serve,
             quotas: &self.quotas,
             grants: &self.grants,
@@ -672,15 +685,22 @@ impl Links {
         // Dialling a relay of a namespace this device is not in (it names
         // the relay's device, not its key), this device links for its
         // enrollment only and sends no certificate: one of another namespace
-        // would have the relay refuse it as a device it does not serve.
+        // would have the relay refuse it as a device it does not serve. A
+        // first contact (no key to expect, `dial_first`) is a party nothing
+        // vouches for yet, whoever holds the address: it is sent no
+        // certificate and no membership either, and sees the full hello only
+        // on the link made again once this device holds its namespace.
         let enrolling = match origin {
-            Origin::Dialed(id) => self.peers.get(id).is_some_and(|p| {
-                let judge = self.judge();
-                p.key.is_none()
-                    && p.device
-                        .as_ref()
-                        .is_some_and(|d| judge.own_role_in(&judge.namespace_of(d)).is_none())
-            }),
+            Origin::Dialed(id) => {
+                self.first_contacts.lock().contains(&id)
+                    || self.peers.get(id).is_some_and(|p| {
+                        let judge = self.judge();
+                        p.key.is_none()
+                            && p.device.as_ref().is_some_and(|d| {
+                                judge.own_role_in(&judge.namespace_of(d)).is_none()
+                            })
+                    })
+            }
             _ => false,
         };
         let channel = match hs.channel_binding() {
@@ -791,22 +811,22 @@ impl Links {
             }
         }
         let slot = match &admitted.enrollment {
-            Some(Enrollment::Relay(_) | Enrollment::Introduction(_) | Enrollment::Departure(_)) => {
-                match self.enrollment_slots.reserve(remote.ip()) {
-                    Ok(slot) => Some(slot),
-                    Err(refusal) => {
-                        tracing::warn!(
-                            target: "face.quic",
-                            %remote,
-                            key = %hs.peer_key().fingerprint(),
-                            "refused an enrollment link: {}",
-                            refusal.detail.text
-                        );
-                        hs.refuse(refusal.reason, &refusal.detail.text);
-                        return Err(NotLinked::refused_here(refusal.reason, refusal.detail));
-                    }
+            Some(
+                Enrollment::Relay(..) | Enrollment::Introduction(_) | Enrollment::Departure(_),
+            ) => match self.enrollment_slots.reserve(remote.ip()) {
+                Ok(slot) => Some(slot),
+                Err(refusal) => {
+                    tracing::warn!(
+                        target: "face.quic",
+                        %remote,
+                        key = %hs.peer_key().fingerprint(),
+                        "refused an enrollment link: {}",
+                        refusal.detail.text
+                    );
+                    hs.refuse(refusal.reason, &refusal.detail.text);
+                    return Err(NotLinked::refused_here(refusal.reason, refusal.detail));
                 }
-            }
+            },
             _ => None,
         };
         // What the link carries is decided before the quota slots move to
@@ -1139,13 +1159,18 @@ impl Links {
         let judge = self.judge();
         let peer = judge.label(admitted);
         match &admitted.enrollment {
-            Some(Enrollment::Relay(namespaces)) => tracing::info!(
+            Some(Enrollment::Relay(namespaces, introductions)) => tracing::info!(
                 target: "face.quic",
                 face = face.0,
                 "admitted {peer} on an enrollment link: it carries only that device's enrollment \
-                 in {} (Interests for its CA, trust context and certificates, and their answers); \
+                 in {} (Interests for its CA, trust context and certificates, and their answers){}; \
                  the device links as an enrolled device once it holds a certificate",
-                list(namespaces)
+                list(namespaces),
+                if introductions.is_some() {
+                    " and the Interests of the introduction an open offer needs"
+                } else {
+                    ""
+                }
             ),
             Some(Enrollment::Device(ns)) => tracing::info!(
                 target: "face.quic",

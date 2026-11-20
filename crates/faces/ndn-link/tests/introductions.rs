@@ -11,6 +11,7 @@
 //! code with a full hint is still one QR.
 
 use std::net::{SocketAddr, UdpSocket};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -26,7 +27,10 @@ use ndn_data::{
     TypeId,
 };
 use ndn_engine::{EngineBuilder, EngineConfig, ForwarderEngine, ShutdownHandle};
-use ndn_face_quic::{KeyFingerprint, LinkEndpoint, LinkKey, LinkKeySource, LinkTransportConfig};
+use ndn_face_quic::{
+    Admission, CloseReason, KeyFingerprint, LinkEndpoint, LinkHello, LinkKey, LinkKeySource,
+    LinkTransportConfig,
+};
 use ndn_link::{
     ConfiguredEndpoints, EngineFaces, HostCandidates, Introductions, LinkHints, LinkSetup,
     LinkTrust, Links, PathKind, PeerSpec, Quotas, RelayService, RelaySource, RelayUse, ServePolicy,
@@ -38,6 +42,7 @@ use ndn_security::{
     TrustSchema, Validator,
 };
 use ndn_sync::MemoryStore;
+use ndn_transport::ErasedTransport;
 use ndn_trust_envelope::TrustEnvelope;
 use tokio_util::sync::CancellationToken;
 
@@ -59,11 +64,21 @@ struct Person {
 
 impl Person {
     async fn new(ns: &str) -> Person {
-        Person::advertising(ns, Vec::new()).await
+        Person::build(ns, Vec::new(), false).await
+    }
+
+    /// A person whose trust context names a CA to enroll at, so a device of
+    /// the `node` role admits enrollment links.
+    async fn enrolling(ns: &str) -> Person {
+        Person::build(ns, Vec::new(), true).await
     }
 
     /// A person whose trust context advertises `relays`.
     async fn advertising(ns: &str, relays: Vec<AdvertisedRelay>) -> Person {
+        Person::build(ns, relays, false).await
+    }
+
+    async fn build(ns: &str, relays: Vec<AdvertisedRelay>, ca: bool) -> Person {
         let ns = n(ns);
         let authority = SecurityManager::new();
         let issuer = authority
@@ -74,9 +89,12 @@ impl Person {
             .issue_self_signed_async(&issuer, signer.public_key().unwrap(), VALIDITY_MS)
             .await
             .unwrap();
-        let ctx = SignedTrustContext::hierarchical(ns.clone())
+        let mut ctx = SignedTrustContext::hierarchical(ns.clone())
             .with_version(1)
             .with_relays(relays);
+        if ca {
+            ctx = ctx.with_ca_endpoint(ns.clone().append("CA"));
+        }
         assert!(ctx.add_anchor(anchor));
         let signed = ctx.sign_into_data(signer.as_ref()).unwrap().raw().clone();
         Person {
@@ -1599,6 +1617,11 @@ struct Relayed {
 }
 
 async fn relayed() -> Relayed {
+    relayed_with(HintMode::Nothing).await
+}
+
+/// [`relayed`], the inviter's codes carrying the link hint `hint`.
+async fn relayed_with(hint: HintMode) -> Relayed {
     let relay_parts = Parts::new("/alice/node/relay", true);
     let alice = Person::advertising(
         "/alice",
@@ -1616,7 +1639,7 @@ async fn relayed() -> Relayed {
         &alice,
         "/alice/member/laptop",
         Setup {
-            hint: HintMode::Nothing,
+            hint,
             ..Setup::default()
         },
     )
@@ -1974,9 +1997,20 @@ async fn a_stranger_at_the_first_contact_serving_a_forged_hint_record_is_refused
             .await
             .expect_err("a forged hint record must not be believed");
         let said = err.to_string();
+        // No credentials: nothing proves the record, which a damaged packet
+        // looks like (retry, and ask for a new code if it keeps failing).
+        // A real person's credentials of another anchor: the record verifies
+        // as that person's, and is not the inviter's — no damage in flight,
+        // so no retry.
+        let (proof, next) = if forged_with_credentials {
+            ("not as the inviter this code names", NextStep::AskOwner)
+        } else {
+            ("does not prove it is the inviter's", NextStep::RetryLater)
+        };
         assert!(
-            said.contains("does not prove it is the inviter's") && said.contains("new code"),
-            "(credentials {forged_with_credentials}) the refusal says why and what to do: {said}"
+            said.contains(proof) && said.contains("new code") && err.next() == next,
+            "(credentials {forged_with_credentials}) the refusal says why and what to do: {said} ({:?})",
+            err.next()
         );
         assert!(
             phone.validator.keyring().held(&alice.ns).is_none()
@@ -2002,4 +2036,312 @@ async fn a_stranger_at_the_first_contact_serving_a_forged_hint_record_is_refused
             laptop.links.report()
         );
     }
+}
+
+// ---- a first contact: what it is shown, what it may send in, what outlives the join --------------
+
+/// A party at an address that records the hello it is sent, then takes no one.
+fn recording_party(parts: &Parts) -> tokio::task::JoinHandle<LinkHello> {
+    let listener = Arc::clone(parts.socket.as_ref().expect("a party listens"));
+    tokio::spawn(async move {
+        let mut hs = listener.accept().await.unwrap().handshake().await.unwrap();
+        let theirs = hs
+            .exchange_hello(&LinkHello::default(), Duration::from_secs(10))
+            .await
+            .unwrap();
+        hs.refuse(CloseReason::Unrecognized, "a test party that takes no one");
+        theirs
+    })
+}
+
+/// Whoever answers at a short code's address — a hostile code, an address
+/// that was reassigned — is shown no certificate and no membership of the
+/// joiner's: its hello is empty. A dial to a key it expected shows them (the
+/// control: the same joiner, the same kind of party).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_first_contact_sends_the_party_at_the_address_no_certificate_and_no_membership() {
+    let bob = Person::new("/bob").await;
+    let phone = embedded(&bob, "/bob/member/phone", Setup::default()).await;
+    let device = n("/alice/member/laptop");
+
+    let parts = Parts::new("/carol/member/laptop", true);
+    let party = recording_party(&parts);
+    let _ = phone
+        .links
+        .dial_first(
+            device.clone(),
+            parts.addr.unwrap(),
+            Duration::from_secs(10),
+            introduction_prefixes(&device).into(),
+        )
+        .await;
+    let theirs = party.await.unwrap();
+    assert!(
+        theirs.certificates.is_empty() && theirs.memberships.is_empty(),
+        "the party at a first contact's address was sent the joiner's certificate or memberships: \
+         {} certificates, {} memberships",
+        theirs.certificates.len(),
+        theirs.memberships.len()
+    );
+
+    let parts = Parts::new("/carol/member/tablet", true);
+    let party = recording_party(&parts);
+    let _ = phone
+        .links
+        .dial_by_key(
+            parts.fingerprint,
+            device.clone(),
+            vec![parts.addr.unwrap()],
+            Duration::from_secs(10),
+            introduction_prefixes(&device).into(),
+        )
+        .await;
+    let theirs = party.await.unwrap();
+    assert!(
+        !theirs.certificates.is_empty(),
+        "a dial of a key the code names shows the joiner's certificate: the control sees none, so \
+         the case above proves nothing"
+    );
+}
+
+/// A joiner reaches an inviter that also admits enrollment links by a short
+/// code's address: its hello is empty, which that inviter takes for an
+/// enrollment link, and the link carries the open offer's introduction too, so
+/// the join completes and the link made again is a full one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_short_code_joins_an_inviter_that_also_admits_enrollment_links() {
+    let alice = Person::enrolling("/alice").await;
+    let bob = Person::new("/bob").await;
+    let laptop = embedded(&alice, "/alice/node/laptop", Setup::listening()).await;
+    let phone = embedded(&bob, "/bob/member/phone", Setup::default()).await;
+    let code = offered(&laptop).await;
+    let short = short_of(&code);
+
+    let joined = joins(&phone, &short, Duration::from_secs(90))
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "the join failed: {e} ({:?})\nbob: {:#?}\nalice: {:#?}",
+                e.next(),
+                phone.links.report(),
+                laptop.links.report()
+            )
+        });
+    assert_eq!(joined.folder, n(FOLDER));
+    until(
+        "alice's link to bob is a full link, by his certificate",
+        Duration::from_secs(60),
+        async || {
+            laptop
+                .links
+                .report()
+                .links
+                .iter()
+                .any(|l| l.key == Some(phone.key) && l.device.is_some())
+        },
+    )
+    .await;
+}
+
+/// What the party at a first contact sends into the joiner: an Interest for a
+/// name of the joiner's forwarder (another face serves it) is dropped, not
+/// forwarded; one under the joiner's own device name is delivered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_party_at_a_first_contact_can_ask_the_joiner_for_its_own_names_only() {
+    let bob = Person::new("/bob").await;
+    let phone = embedded(&bob, "/bob/member/phone", Setup::default()).await;
+    let device = n("/alice/member/laptop");
+    let node = phone._engine.app_node(phone.cancel.child_token());
+    let counting = |hits: &Arc<AtomicUsize>| {
+        let hits = Arc::clone(hits);
+        move |_interest, _responder| {
+            let hits = Arc::clone(&hits);
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    };
+    let (elsewhere, own) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let _elsewhere = node
+        .serve(n("/carol/private"), counting(&elsewhere))
+        .await
+        .unwrap();
+    let _own = node
+        .serve(n("/bob/member/phone/32=probe"), counting(&own))
+        .await
+        .unwrap();
+
+    let parts = Parts::new("/carol/member/laptop", true);
+    let listener = Arc::clone(parts.socket.as_ref().unwrap());
+    let party = tokio::spawn(async move {
+        let mut hs = listener.accept().await.unwrap().handshake().await.unwrap();
+        hs.exchange_hello(&LinkHello::default(), Duration::from_secs(10))
+            .await
+            .unwrap();
+        hs.admit(
+            ndn_transport::FaceId(9),
+            Duration::from_secs(10),
+            Admission::default(),
+        )
+        .await
+        .unwrap()
+    });
+    phone
+        .links
+        .dial_first(
+            device.clone(),
+            parts.addr.unwrap(),
+            Duration::from_secs(10),
+            introduction_prefixes(&device).into(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    let link = party.await.unwrap();
+
+    let lp = |wire: Bytes| ndn_packet::lp::encode_lp_packet(&wire);
+    for name in ["/carol/private/x", "/bob/member/phone/32=probe/x"] {
+        link.face
+            .send_bytes(lp(InterestBuilder::new(n(name)).build()))
+            .await
+            .unwrap();
+    }
+    until(
+        "the Interest for the joiner's own name is delivered",
+        Duration::from_secs(10),
+        async || own.load(Ordering::SeqCst) == 1,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        elsewhere.load(Ordering::SeqCst),
+        0,
+        "an Interest the party sent for another name reached another face of the joiner"
+    );
+}
+
+/// A party at the address answers the first-contact dial with a key of its
+/// own and relays the genuine hint record, which names the inviter's key; that
+/// key's address is dead (blocked). The join goes on through the relay and
+/// succeeds, and the party's link does not outlive it: no link and no route
+/// to the party remain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_first_contact_of_another_key_than_the_records_leaves_no_link_and_no_route_after_the_join()
+ {
+    let (_dead, dead) = silent();
+    let Relayed {
+        alice: _alice,
+        relay,
+        laptop,
+        phone,
+    } = relayed_with(HintMode::At(vec![dead])).await;
+    let carol = Person::new("/carol").await;
+    let code = offered(&laptop).await;
+    let real = read_short(&code);
+    let device = real.device.clone();
+
+    // The genuine record, as the relay path gives it.
+    let node = phone._engine.app_node(phone.cancel.child_token());
+    let (name, via) = (
+        hint_name(&device, &hint_token(&real.secret)),
+        [relay.name.clone()],
+    );
+    let started = Instant::now();
+    let mut record = None;
+    while record.is_none() && started.elapsed() < Duration::from_secs(60) {
+        record = fetches_via(&node, name.clone(), &via).await;
+    }
+    let wire = record
+        .expect("the genuine record crosses the relay")
+        .raw()
+        .clone();
+
+    // The party at the address: it serves exactly that record.
+    let parts = Parts::new("/carol/member/laptop", true);
+    let (key, at) = (parts.fingerprint, parts.addr.unwrap());
+    let party = embedded_of(&carol, parts, Setup::listening()).await;
+    party.links.set_introductions(Arc::new(CarriesAll));
+    let party_node = party._engine.app_node(party.cancel.child_token());
+    let _serving = party_node
+        .serve(hint_prefix(&device), move |_interest, responder| {
+            let wire = wire.clone();
+            async move {
+                let _ = responder.respond_bytes(wire).await;
+            }
+        })
+        .await
+        .unwrap();
+    let dialled = ShortCode {
+        contact: Some(Contact::Address(at)),
+        ..real.clone()
+    }
+    .encode()
+    .unwrap_or_else(|e| panic!("{e}"));
+
+    let joined = joins(&phone, &dialled, Duration::from_secs(90))
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "the join failed: {e} ({:?})\nbob: {:#?}\nalice: {:#?}",
+                e.next(),
+                phone.links.report(),
+                laptop.links.report()
+            )
+        });
+    assert_eq!(joined.folder, n(FOLDER));
+    // Time for the namespace's adoption to make the links again.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        !linked_keys(&phone.links).contains(&key),
+        "a link to the party at the address outlives the join: {:#?}",
+        phone.links.report()
+    );
+    assert!(
+        routed_over(&phone, key).is_empty(),
+        "a route over the party's link outlives the join: {:?}",
+        routed_over(&phone, key)
+    );
+}
+
+/// A link made again to a party dialled from a code that still shows no
+/// certificate of the device's namespace, once this device holds it, is taken
+/// down with no route left, not admitted again as an unidentified stranger.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_link_made_again_to_a_party_that_shows_no_certificate_is_taken_down() {
+    let alice = Person::new("/alice").await;
+    let bob = Person::new("/bob").await;
+    let carol = Person::new("/carol").await;
+    let party = embedded(&carol, "/carol/member/laptop", Setup::listening()).await;
+    let _own = offered_in(&party, "/carol", "/carol/32=data/notebook").await;
+    let phone = embedded(&bob, "/bob/member/phone", Setup::default()).await;
+    let device = n("/alice/member/laptop");
+
+    let proved = phone
+        .links
+        .dial_first(
+            device.clone(),
+            party.addr.unwrap(),
+            Duration::from_secs(10),
+            introduction_prefixes(&device).into(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!(proved, party.key);
+    assert!(linked_keys(&phone.links).contains(&party.key));
+
+    // The joiner comes to hold the namespace the code claimed for the device.
+    phone
+        .validator
+        .adopt_context(Arc::clone(&alice.ctx))
+        .unwrap();
+    until(
+        "the party's link is taken down once the claimed namespace is held",
+        Duration::from_secs(15),
+        async || !linked_keys(&phone.links).contains(&party.key),
+    )
+    .await;
+    assert!(
+        routed_over_any(&phone).is_empty(),
+        "a route is left over the party's link: {:#?}",
+        phone.links.report()
+    );
 }

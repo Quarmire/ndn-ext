@@ -48,7 +48,7 @@ pub(crate) fn routes_for(
     relay: Option<RelayRoutes>,
 ) -> Vec<Route> {
     match &admitted.enrollment {
-        Some(Enrollment::Relay(_) | Enrollment::Introduction(_) | Enrollment::Departure(_)) => {
+        Some(Enrollment::Relay(..) | Enrollment::Introduction(_) | Enrollment::Departure(_)) => {
             return Vec::new();
         }
         Some(Enrollment::Device(ns)) => {
@@ -425,7 +425,7 @@ mod tests {
         assert!(
             routes_for(
                 &peers,
-                &admitted(None, None, Some(Enrollment::Relay(vec![n("/home")]))),
+                &admitted(None, None, Some(Enrollment::Relay(vec![n("/home")], None))),
                 false,
                 None
             )
@@ -517,7 +517,7 @@ mod tests {
         );
         // An enrollment or departure link gets none, whatever its entry.
         for enrollment in [
-            Enrollment::Relay(vec![n("/bob")]),
+            Enrollment::Relay(vec![n("/bob")], None),
             Enrollment::Departure(Vec::new()),
         ] {
             let mut narrow = admitted(

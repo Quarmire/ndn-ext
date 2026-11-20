@@ -307,14 +307,13 @@ impl LinkTable {
         self.live.lock().contains_key(fingerprint)
     }
 
-    /// Whether the device with key `fingerprint` is linked and has shown no
-    /// certificate of a namespace this device holds (nor is enrolling): its
-    /// link carries only what an unidentified peer gets.
-    pub(crate) fn is_unidentified(&self, fingerprint: &KeyFingerprint) -> bool {
+    /// Whether the device with key `fingerprint` is linked and has shown a
+    /// certificate of a namespace this device holds.
+    pub(crate) fn is_identified(&self, fingerprint: &KeyFingerprint) -> bool {
         self.live
             .lock()
             .get(fingerprint)
-            .is_some_and(|l| l.identities.is_empty() && l.enrolling.is_empty())
+            .is_some_and(|l| !l.identities.is_empty())
     }
 
     /// The sender of the link to the device with key `fingerprint` (its
@@ -620,11 +619,21 @@ impl LinkTable {
     /// namespace `held` now says this device holds, and mark its peer to be
     /// dialled again, so the device is identified in it and admitted by its
     /// certificate (an introduction's joiner dials the inviter by key before
-    /// it trusts its namespace).
-    pub(crate) fn relink_identified(&self, held: impl Fn(PeerId) -> bool) {
+    /// it trusts its namespace). A link to a peer `introduced` (one a code's
+    /// dial added) is made again whatever enrollment its party told this
+    /// device it is on: the party chose that verdict, and the dial was never
+    /// for an enrollment.
+    pub(crate) fn relink_identified(
+        &self,
+        held: impl Fn(PeerId) -> bool,
+        introduced: impl Fn(PeerId) -> bool,
+    ) {
         self.relink_where(|link| {
             let peer = link.peer?;
-            (link.identities.is_empty() && link.enrolling.is_empty() && held(peer)).then(|| {
+            (link.identities.is_empty()
+                && (link.enrolling.is_empty() || introduced(peer))
+                && held(peer))
+            .then(|| {
                 "this device now holds the namespace of the device this link reaches; it links \
                  again to identify it"
                     .to_string()

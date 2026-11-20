@@ -23,8 +23,16 @@
 //! A short code carries no key: its first contact is one address, dialled by
 //! [`Links::dial_first`] with no key to expect. Whoever answers there is
 //! linked by the key it proves, on the same terms (only the routes it was
-//! dialled for, until it shows a certificate this device holds), and the
-//! key is returned for the join to name the link by.
+//! dialled for, until it shows a certificate this device holds), but is sent
+//! an empty hello: no certificate and no membership. The key is returned for
+//! the join to name the link by.
+//!
+//! What a link dialled from a code carries while its party has shown no
+//! certificate is bounded in both directions ([`Links::dial_by_key`],
+//! `dial_first`): answers under the routes it was dialled for and Interests
+//! only for this device's own names come in, nothing else. A party that still
+//! shows no certificate once this device holds the namespace of the device
+//! the code claimed is refused, not admitted again.
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -185,15 +193,28 @@ impl Links {
 
     /// A trust context was adopted: a link to a device dialled by its key
     /// alone, whose namespace this device holds now, is made again so the
-    /// device is identified in it (and gets the routes of its identity).
+    /// device is identified in it (and gets the routes of its identity). The
+    /// link made again of a first contact sends this device's full hello:
+    /// the party it reaches was judged by the join (its key is the hint
+    /// record's), and the hello is what lets it identify this device.
     pub(crate) fn relink_identified(&self) {
         let keyring = self.trust.keyring();
-        self.table.relink_identified(|peer| {
-            self.peers
-                .get(peer)
-                .and_then(|p| p.device.clone())
-                .is_some_and(|device| keyring.held_for(&device).is_some())
-        });
+        self.table.relink_identified(
+            |peer| {
+                let held = self
+                    .peers
+                    .get(peer)
+                    .and_then(|p| p.device.clone())
+                    .is_some_and(|device| keyring.held_for(&device).is_some());
+                // Before the link closes, so the dial that follows sends it.
+                if held {
+                    self.first_contacts.lock().remove(&peer);
+                    self.relinked.lock().insert(peer);
+                }
+                held
+            },
+            |peer| self.introduced.lock().contains_key(&peer),
+        );
     }
 
     /// Dial the device `device` by the key `key` at `addrs` (at most
@@ -277,11 +298,15 @@ impl Links {
     /// the key it proved is no more than a name for its link. Until it
     /// shows a certificate this device holds the link routes `routes` — for
     /// an introduction, its introduction prefixes — and nothing else, not
-    /// the names the code claims for `device`, whatever key answered. The
-    /// dial is judged as `dial_by_key`'s is once the key is proved: the
-    /// peer is added with that key, so the party is admitted as a
-    /// stranger or refused as it would be had the code named its key, and a
-    /// failure leaves no peer, route or link behind.
+    /// the names the code claims for `device`, whatever key answered, and
+    /// sends this device's Interests under `routes` only. **The hello is
+    /// empty**: no certificate and no membership is shown to a party nothing
+    /// vouches for; the full hello goes on the link made again once this
+    /// device holds `device`'s namespace. The dial is judged as
+    /// `dial_by_key`'s is once the key is proved: the peer is added with that
+    /// key, so the party is admitted as a stranger or refused as it would be
+    /// had the code named its key, and a failure leaves no peer, route or
+    /// link behind.
     ///
     /// One address only, so no race: [`CANDIDATES_MAX`] bounds a hint's
     /// addresses and a short code's first contact is one. A key this device
@@ -349,6 +374,7 @@ impl Links {
             ..PeerSpec::default()
         });
         self.introduced.lock().insert(id, vec![addr]);
+        self.first_contacts.lock().insert(id);
         match self.establish(hs, Origin::Dialed(id)).await {
             Ok(_handle) => {
                 self.keep_dialled(id);
@@ -379,6 +405,8 @@ impl Links {
     /// Peer `id`, added by [`dial_by_key`](Self::dial_by_key), is over.
     pub(crate) fn forget_dialled(&self, id: PeerId) {
         self.introduced.lock().remove(&id);
+        self.first_contacts.lock().remove(&id);
+        self.relinked.lock().remove(&id);
         self.ctls.lock().remove(&id);
         self.peers.remove(id);
         self.watch_forget(id);
@@ -386,18 +414,20 @@ impl Links {
 
     /// Take down the link [`dial_by_key`](Self::dial_by_key) made to the
     /// device with key `key`, for `why`, if it is still what that dial made:
-    /// a peer the dial added whose link has shown no certificate. A link that
-    /// was up before the dial, or that has been identified since (the join
-    /// went on and this device holds the device's namespace), is kept. The
-    /// join that dialled it failed, so what answered at that key proved
-    /// nothing and keeps no route.
+    /// a peer the dial added whose link has shown no certificate this device
+    /// holds (whatever enrollment the party told this device it is on: that
+    /// is the party's word). A link that was up before the dial, or that has
+    /// been identified since (the join went on and this device holds the
+    /// device's namespace), is kept. The join that dialled it failed, or its
+    /// record named another key, so what answered at that key proved nothing
+    /// and keeps no route.
     pub fn undial_by_key(&self, key: KeyFingerprint, why: &str) {
         let ids: Vec<PeerId> = self.introduced.lock().keys().copied().collect();
         for id in ids {
             if self.peers.get(id).and_then(|p| p.key) != Some(key) {
                 continue;
             }
-            if self.table.is_linked(&key) && !self.table.is_unidentified(&key) {
+            if self.table.is_identified(&key) {
                 continue;
             }
             self.drop_peer(id, why);
