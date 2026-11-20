@@ -330,6 +330,7 @@ async fn an_enrollment_link_carries_only_its_scope_and_says_so() {
                 burst: 16,
                 per_sec: 4,
             },
+            rated: None,
             shared: None,
             explain: "enrollment only".into(),
             answers_in: None,

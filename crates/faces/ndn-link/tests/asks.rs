@@ -220,9 +220,16 @@ fn ghost(ann: &Embedded, bob: &Embedded, device: &str) {
     bob.engine.fib().add_nexthop(&n(device), face, 0);
 }
 
-/// The seal key name of a device, as its owner's data layer names it, and the
-/// prefix a fetch of it asks for.
+/// The seal key packet's name of a device, in the exact form its owner's data
+/// layer names it (`<W>/<role>/<device>/32=seal/<public key>`, the key one
+/// generic component of 32 octets); a fetch of it crosses the link or does not.
 fn seal(device: &str) -> Name {
+    seal_prefix(device).append_component(NameComponent::generic(Bytes::from_static(&[7; 32])))
+}
+
+/// What a fetch of a real device's seal key asks for by prefix, its key not
+/// being known (`<W>/<role>/<device>/32=seal`).
+fn seal_prefix(device: &str) -> Name {
     n(device).append_component(NameComponent::keyword(Bytes::from_static(b"seal")))
 }
 
@@ -375,9 +382,143 @@ async fn the_seal_key_of_another_writers_real_device_crosses_the_inviters_link()
         !bob.sink.joined_now().is_empty()
     })
     .await;
-    let carols_seal = seal(&carols.device("phone"));
+    let carols_seal = seal_prefix(&carols.device("phone"));
     until("carol's seal key crosses", LONG, async || {
         crosses(&bob, ann.key, &carols_seal).await
+    })
+    .await;
+}
+
+// ---- a third writer's device is asked ---------------------------------------------------------
+
+/// Ann's folder with Bob and Carol, both writers named by their keys, who
+/// never met: each adopts the other's namespace by name from the folder's
+/// record, and Carol's device answers the asks of the folder's members as
+/// Ann's does. Returns Ann, Bob, Carol and the name of Carol's device.
+async fn three_writers() -> (Embedded, Embedded, Embedded, Name) {
+    let alice = Person::new("/alice").await;
+    let bobs = Person::self_certifying([0xb2; 32]).await;
+    let carols = Person::self_certifying([0xc2; 32]).await;
+    let bob_setup = Setup {
+        scoped_by_name: true,
+        ..joiner_setup()
+    };
+    let carol_setup = Setup {
+        answers: AnswerConfig {
+            serve_asks: AskServing::OwnAndMembers,
+            ..AnswerConfig::default()
+        },
+        ..bob_setup.clone()
+    };
+    let ann = embedded(&alice, ANN, ann_setup()).await;
+    let bob = embedded(&bobs, &bobs.device("phone"), bob_setup).await;
+    let carol = embedded(&carols, &carols.device("phone"), carol_setup).await;
+    let folder = n(common::FOLDER);
+    invited(&ann, &bob, Role::Writer).await;
+    invited_in(&ann, &carol, &folder, Role::Writer).await;
+    until("ann is linked to both", LONG, async || {
+        linked(&ann, bob.key) && linked(&ann, carol.key)
+    })
+    .await;
+    until("bob is routed carol's namespace", LONG, async || {
+        !bob.sink.joined_now().is_empty()
+    })
+    .await;
+    let device = n(&carols.device("phone"));
+    (ann, bob, carol, device)
+}
+
+/// Bob asks Carol's device, over his grant link to Ann (Ann's forwarder and
+/// the joiner's routes carry it), for the answer to a question of Ann's
+/// folder, and is answered: the seal key packet of Carol's device, the reply
+/// and the answer are all packets of Carol's namespace, which Bob holds only
+/// adopted for the folder (data-layer §6.3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_writer_asks_another_writers_real_device_and_is_answered() {
+    let (ann, bob, carol, carols_device) = three_writers().await;
+    let folder = n(common::FOLDER);
+    let q = question(&ann, &bob, &folder).await;
+    until("carol holds the definition", LONG, async || {
+        carol
+            .device
+            .get(&folder.clone().append("definition"))
+            .await
+            .is_ok()
+    })
+    .await;
+    answered(
+        asks_ann(&bob, &carols_device, &q, Duration::from_secs(30)).await,
+        "a writer's ask of another writer's device",
+    );
+}
+
+/// Whether `got` is the `RetryLater` of a seal key the data layer does not
+/// hold: `NotReady` saying "the signer's seal key is not held yet".
+fn seal_key_not_held(got: &Result<Got, DataError>) -> bool {
+    match got {
+        Err(e @ DataError::NotReady { why, .. }) => {
+            e.next() == NextStep::RetryLater && why.contains("seal key is not held yet")
+        }
+        _ => false,
+    }
+}
+
+/// A person no record lists is not asked, though her device is linked to
+/// Ann for another folder: nothing routes her namespace to Bob, and Bob
+/// takes no seal key of a device whose writer no record in force lists, so
+/// the ask ends `RetryLater` with the seal key not held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_person_no_record_lists_is_not_asked_though_her_device_is_linked_to_ann() {
+    let (ann, bob, _carol, _) = three_writers().await;
+    let daves = Person::self_certifying([0xd2; 32]).await;
+    let dave = embedded(
+        &daves,
+        &daves.device("phone"),
+        Setup {
+            scoped_by_name: true,
+            ..joiner_setup()
+        },
+    )
+    .await;
+    let second = n(common::SECOND);
+    common::shared(&ann, &second).await;
+    invited_in(&ann, &dave, &second, Role::Writer).await;
+    until("ann is linked to dave", LONG, async || {
+        linked(&ann, dave.key)
+    })
+    .await;
+    let q = question(&ann, &bob, &n(common::FOLDER)).await;
+    let got = bob.device.ask_answer(&n(&daves.device("phone")), &q).await;
+    assert!(
+        seal_key_not_held(&got),
+        "a device of a namespace the folder's record does not list: {got:?}"
+    );
+}
+
+/// A writer's seal key is kept only while a record in force lists her: Bob
+/// asks Carol's device and is answered; Ann's next record drops Carol, and
+/// Bob, who now holds no seal key of Carol's devices, ends `RetryLater` with
+/// the seal key not held, not asking a device the record no longer lists.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_writer_the_record_drops_loses_her_seal_key_and_is_not_asked() {
+    let (ann, bob, carol, carols_device) = three_writers().await;
+    let folder = n(common::FOLDER);
+    let q = question(&ann, &bob, &folder).await;
+    until("carol holds the definition", LONG, async || {
+        carol
+            .device
+            .get(&folder.clone().append("definition"))
+            .await
+            .is_ok()
+    })
+    .await;
+    answered(
+        asks_ann(&bob, &carols_device, &q, Duration::from_secs(30)).await,
+        "while the record lists her",
+    );
+    listing(&ann, &[n("/alice"), bob.ns.clone()]).await;
+    until("bob no longer holds carol's seal key", LONG, async || {
+        seal_key_not_held(&bob.device.ask_answer(&carols_device, &q).await)
     })
     .await;
 }

@@ -445,6 +445,7 @@ impl Links {
                     }
                 };
                 tokio::select! {
+                    biased;
                     () = cancel.cancelled() => return,
                     () = grants.inner.wake.notified() => continue,
                     () = sleep => {}
@@ -819,6 +820,20 @@ fn ask_exchange_namespace(name: &Name) -> Option<&[NameComponent]> {
         _ => false,
     };
     shaped.then_some(w)
+}
+
+/// Whether `name` is an **ask** of the ask exchange of a device
+/// (`W/<role>/<device>/32=ask-answer/<ParametersSha256Digest>`, the Interest
+/// that carries the question to a signer; [`ask_exchange_namespace`] says whether
+/// the shape is a device's), as against the plain fetch of a seal key. The
+/// asks are what a link rates apart ([`crate::policy::ASK_INTERESTS`]).
+pub(crate) fn is_ask_answer(name: &Name) -> bool {
+    ask_exchange_namespace(name).is_some()
+        && name
+            .components()
+            .iter()
+            .find(|c| c.typ == ndn_packet::tlv_type::KEYWORD)
+            .is_some_and(|c| c.value.as_ref() == b"ask-answer")
 }
 
 impl Judge<'_> {
@@ -1290,6 +1305,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// What a grant link rates apart is the ask (`…/32=ask-answer/<digest>`
+    /// of a device), not the fetch of a seal key and not a look-alike.
+    #[test]
+    fn only_the_ask_of_a_device_is_rated_apart() {
+        let device = "/alice/member/laptop";
+        let ask = then(device, vec![keyword("ask-answer"), octets(PARAMETERS)]);
+        assert!(is_ask_answer(&ask));
+        assert!(is_ask_answer(
+            &ask.clone().append_component(octets(IMPLICIT))
+        ));
+        let seal = then(device, vec![keyword("seal")]);
+        assert!(!is_ask_answer(&seal), "a seal key is fetched, not asked");
+        assert!(!is_ask_answer(&seal.append_component(octets(GENERIC))));
+        // A shape that is no device's is no ask of the exchange.
+        assert!(!is_ask_answer(&then(
+            "/alice/owner/laptop",
+            vec![keyword("ask-answer"), octets(PARAMETERS)]
+        )));
+        assert!(!is_ask_answer(&then(
+            "/alice/member/laptop/x",
+            vec![keyword("ask-answer"), octets(PARAMETERS)]
+        )));
+        assert!(!is_ask_answer(&then(device, vec![keyword("ask-answer")])));
+        assert!(!is_ask_answer(&nm("/alice/member/laptop/32=log/x")));
     }
 
     /// Round 7 L5/L6, for the exchange: exactly two components between the

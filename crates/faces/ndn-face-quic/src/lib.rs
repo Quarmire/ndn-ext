@@ -94,5 +94,5 @@ pub use message::{
     encode_udp_address,
 };
 pub use probe::{PROBE_LEN, ProbeWatch, decode_probe, encode_probe};
-pub use scope::{Carries, LinkScope, NameFilter, Narrowing, RateLimit, SharedRate};
+pub use scope::{Carries, LinkScope, NameFilter, Narrowing, RateLimit, RatedInterests, SharedRate};
 pub use text::{PEER_TEXT_MAX, bounded_text, clean_text, sanitize_peer_text};

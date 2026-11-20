@@ -86,6 +86,18 @@ pub const ENROLLMENT_ANSWERS: RateLimit = RateLimit {
     per_sec: 128,
 };
 
+/// What a grant link's peer may send of the ask exchange
+/// (`<W>/<role>/<device>/32=ask-answer/<digest>`, ndn-link §8.7 rule 20), per
+/// link, beside the link's own quota (100/s): 10 at once, then 1 a second. An
+/// honest asker sends at most `ASK_ATTEMPTS` × `ASK_SENDS` = 3 × 3 = 9 Interests
+/// of one question to one signer and has one ask in flight, so it never meets
+/// this; a peer that floods a signer with asks it must open, verify and answer
+/// is held to a trickle at the link, before the signer's Device sees them.
+pub const ASK_INTERESTS: RateLimit = RateLimit {
+    burst: 10,
+    per_sec: 1,
+};
+
 /// How far the SignatureTime of a punch request may be from this device's
 /// clock: the NDN signed-Interest grace period. Beyond it the request is
 /// refused as replayed, or as signed by a device whose clock is off.

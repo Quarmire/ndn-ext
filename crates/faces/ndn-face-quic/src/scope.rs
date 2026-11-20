@@ -15,8 +15,9 @@
 //! so the requester stops waiting: one arriving from the peer is Nacked to
 //! the peer, one this side would send is Nacked back to this side. Received
 //! packets are rate-limited before they are judged — by the link's own
-//! bucket, then by a bucket it shares with other links ([`SharedRate`]);
-//! acknowledgements are not.
+//! bucket, then by the bucket of the names a scope rates apart
+//! ([`RatedInterests`]), then by a bucket it shares with other links
+//! ([`SharedRate`]); acknowledgements are not.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -59,6 +60,18 @@ pub struct RateLimit {
     pub per_sec: u32,
 }
 
+/// Some of the Interests the peer sends, held to a bucket of their own beside
+/// the link's: the names `names` take a token of `rate` each, and an Interest
+/// that finds none is dropped like one over the link's rate (silently, counted,
+/// and without taking a token of the shared bucket). What the link's own rate
+/// would allow of other names is not reduced by them.
+pub struct RatedInterests {
+    /// Whether an Interest of that name is rated apart.
+    pub names: NameFilter,
+    /// What those Interests take together over this link.
+    pub rate: RateLimit,
+}
+
 /// One rate bucket shared by several links (all the links of a namespace a
 /// relay serves, say): together they take no more than its [`RateLimit`].
 pub struct SharedRate {
@@ -95,6 +108,9 @@ pub struct LinkScope {
     pub names: Box<dyn Fn(&Name) -> bool + Send + Sync>,
     /// Bound on received packets.
     pub rate: RateLimit,
+    /// Interests of some names the peer sends, bounded by a bucket of their
+    /// own after `rate`, before `shared`.
+    pub rated: Option<RatedInterests>,
     /// A bound on received packets shared with other links, checked after
     /// `rate`.
     pub shared: Option<Arc<SharedRate>>,
@@ -191,6 +207,7 @@ pub(crate) struct ScopeState {
     inbound: Mutex<Fragmented>,
     outbound: Mutex<Fragmented>,
     bucket: Mutex<Bucket>,
+    rated_bucket: Mutex<Bucket>,
     started: Instant,
     /// Milliseconds after `started` of the last packet the scope passed.
     last_passed_ms: AtomicU64,
@@ -203,6 +220,13 @@ impl ScopeState {
         let now = Instant::now();
         Self {
             bucket: Mutex::new(Bucket::full(scope.rate)),
+            rated_bucket: Mutex::new(Bucket::full(scope.rated.as_ref().map_or(
+                RateLimit {
+                    burst: 0,
+                    per_sec: 0,
+                },
+                |rated| rated.rate,
+            ))),
             scope,
             inbound: Mutex::default(),
             outbound: Mutex::default(),
@@ -227,6 +251,24 @@ impl ScopeState {
         if !matches!(packet, Some(Packet::LinkOnly)) {
             if !self.take_token() {
                 self.note_drop("over the rate limit", None);
+                return Judged::Drop(None);
+            }
+            if let (
+                Some(rated),
+                Some(Packet::Network {
+                    kind: Kind::Interest,
+                    name,
+                    ..
+                }),
+            ) = (&self.scope.rated, &packet)
+                && (rated.names)(name)
+                && !self
+                    .rated_bucket
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take(rated.rate)
+            {
+                self.note_drop("over the rate limit of its names", Some(name));
                 return Judged::Drop(None);
             }
             if self
@@ -469,6 +511,7 @@ mod tests {
                 burst: 4,
                 per_sec: 1,
             },
+            rated: None,
             shared: None,
             explain: "test".into(),
             answers_in: None,
@@ -533,6 +576,7 @@ mod tests {
                 burst: 100,
                 per_sec: 100,
             },
+            rated: None,
             shared: None,
             explain: "test".into(),
             answers_in: Some(Box::new(move |n: &Name| n.has_prefix(&own))),
@@ -579,6 +623,7 @@ mod tests {
                 burst: 100,
                 per_sec: 100,
             },
+            rated: None,
             shared: None,
             explain: "test".into(),
             answers_in: Some(Box::new(move |n: &Name| n.has_prefix(&asked_in))),
@@ -630,6 +675,7 @@ mod tests {
                 burst: 100,
                 per_sec: 100,
             },
+            rated: None,
             shared: None,
             explain: "test".into(),
             answers_in: None,
@@ -718,6 +764,59 @@ mod tests {
         );
     }
 
+    /// The Interests of the names a scope rates apart take a bucket of their
+    /// own, are dropped without a Nack when it is empty, and leave the link's
+    /// other names and the shared bucket as they were.
+    #[test]
+    fn rated_interests_take_a_bucket_of_their_own() {
+        let shared = Arc::new(SharedRate::new(RateLimit {
+            burst: 1000,
+            per_sec: 1000,
+        }));
+        let s = ScopeState::new(LinkScope {
+            receives: Carries::Everything,
+            sends: Carries::Everything,
+            names: Box::new(|_: &Name| true),
+            rate: RateLimit {
+                burst: 1000,
+                per_sec: 1000,
+            },
+            rated: Some(RatedInterests {
+                names: Box::new(|n: &Name| n.has_prefix(&"/rated".parse::<Name>().unwrap())),
+                rate: RateLimit {
+                    burst: 3,
+                    per_sec: 1,
+                },
+            }),
+            shared: Some(Arc::clone(&shared)),
+            explain: "test".into(),
+            answers_in: None,
+            interests_in: None,
+            narrowing: None,
+        });
+        let wire = |p: Bytes| ndn_packet::lp::encode_lp_packet(&p);
+        let rated = wire(interest("/rated/x"));
+        let plain = wire(interest("/plain/x"));
+        let passed = (0..10)
+            .filter(|_| s.received(&rated) == Judged::Pass)
+            .count();
+        assert_eq!(passed, 3, "the rated names' burst, then nothing");
+        assert_eq!(
+            s.received(&rated),
+            Judged::Drop(None),
+            "an Interest over the rate is dropped without a Nack"
+        );
+        // Other names, Data of the rated name, are not held to it.
+        assert_eq!(s.received(&plain), Judged::Pass);
+        assert_eq!(s.received(&wire(data("/rated/x", 10))), Judged::Pass);
+        // The refused Interests took nothing of the shared bucket: 3 + 1 + 1.
+        let left = shared.bucket.lock().unwrap().tokens;
+        assert!(
+            (994.0..996.0).contains(&left),
+            "{left} tokens left of the shared bucket"
+        );
+    }
+
     #[test]
     fn links_sharing_a_rate_take_no_more_than_it_together() {
         let shared = Arc::new(SharedRate::new(RateLimit {
@@ -733,6 +832,7 @@ mod tests {
                     burst: 4,
                     per_sec: 1,
                 },
+                rated: None,
                 shared: Some(Arc::clone(&shared)),
                 explain: "test".into(),
                 answers_in: None,
