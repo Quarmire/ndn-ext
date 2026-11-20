@@ -59,6 +59,8 @@ ndn-engine = { workspace = true }
 ndn-data   = { workspace = true }
 ndn-app    = { workspace = true }
 ndn-sync   = { workspace = true }
+# tests/asks.rs: an evaluator for the ask exchange.
+async-trait = { workspace = true }
 ndn-namespace = { workspace = true }
 ndn-trust-envelope = { workspace = true }
 # tests/joiner.rs: a host adopts another writer's namespace by name through its engine.

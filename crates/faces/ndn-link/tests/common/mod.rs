@@ -21,9 +21,9 @@ use ndn_data::intro::{
     Departure as DataDeparture, Dialing, FirstDialing, Grant as DataGrant, LinkHint,
 };
 use ndn_data::{
-    Answer, Audience, Clock, Config, Content, DataLayer, Device, Got, IntroPolicy, Introducer,
-    Joined, Keep, NextStep, Offer, Payload, PutOptions, Role, Rule, Share, Sharing, Timestamp,
-    Transport, TypeId,
+    Answer, AnswerConfig, Audience, Clock, Config, Content, DataLayer, Device, Evaluators, Got,
+    IntroPolicy, Introducer, Joined, Keep, NextStep, Offer, Payload, PutOptions, Role, Rule, Share,
+    Sharing, Timestamp, Transport, TypeId,
 };
 use ndn_engine::{EngineBuilder, EngineConfig, ForwarderEngine, ShutdownHandle};
 use ndn_face_quic::{KeyFingerprint, LinkEndpoint, LinkKey, LinkKeySource, LinkTransportConfig};
@@ -519,6 +519,10 @@ pub struct Setup {
     /// (`ndn_identity::adopt_scoped_via_engine`), not from the test's
     /// directory and with no route of its own.
     pub scoped_by_name: bool,
+    /// What its data layer does with asks for an answer (`Config::answers`).
+    pub answers: AnswerConfig,
+    /// The evaluators its data layer knows (`Config::evaluators`).
+    pub evaluators: Evaluators,
     /// Its data layer's sync connection tells no routes
     /// (`Connection::routes` is `None`): it announces its groups only by
     /// its period, never because a face came up.
@@ -535,6 +539,8 @@ impl Setup {
             grant_for: None,
             departure_for: IntroPolicy::new().departure_for,
             scoped_by_name: false,
+            answers: AnswerConfig::default(),
+            evaluators: Evaluators::none(),
             sync_tells_no_routes: false,
         }
     }
@@ -731,6 +737,8 @@ async fn boot(kept: Kept, setup: Setup) -> Embedded {
                 departure_for: setup.departure_for,
                 ..IntroPolicy::new()
             },
+            answers: setup.answers,
+            evaluators: setup.evaluators,
             ..Config::new()
         },
     )

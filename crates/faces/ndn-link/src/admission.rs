@@ -938,8 +938,10 @@ impl Judge<'_> {
                                 Some(grant) => format!(
                                     "this device linked {} {}: the names of the folders the person \
                                      is granted (their collections), of the person's own devices, of \
-                                     the namespaces' certificates and sync groups and of the \
-                                     introduction cross it, and what it pushes is judged at every \
+                                     the namespaces' certificates and sync groups, of the \
+                                     introduction and the ask exchange of the devices of the folder's \
+                                     writers (<device>/32=seal, <device>/32=ask-answer) cross it, \
+                                     and what it pushes is judged at every \
                                      packet by its role in each folder (a reader's entry widens \
                                      nothing; other Data it pushes is dropped); the quotas bound it \
                                      ({}/s from that device), and an entry ends at its date or when \
