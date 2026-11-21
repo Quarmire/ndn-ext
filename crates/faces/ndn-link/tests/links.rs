@@ -175,6 +175,7 @@ fn start_full(
             relays: Default::default(),
             service,
             direct: Default::default(),
+            reliability: Default::default(),
         },
         cancel.child_token(),
     );

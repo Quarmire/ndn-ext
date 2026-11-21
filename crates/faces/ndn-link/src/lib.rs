@@ -372,7 +372,7 @@ pub use memory::{
 pub use ndn_faults::{FAULTY, Faults};
 pub use ndn_mgmt_wire::{LinkDetail, LinkWords, link_code};
 pub use netwatch::{AddressSource, AddressWatch, InterfaceAddresses};
-pub use peer::{LinkMode, PeerId, PeerSpec, RelaySource, RelayUse};
+pub use peer::{LinkMode, LinkReliability, PeerId, PeerSpec, RelaySource, RelayUse};
 pub use policy::Backoff;
 pub use presence::{DirectOptions, PRESENCE_MAX};
 pub use relays::RelayOptions;

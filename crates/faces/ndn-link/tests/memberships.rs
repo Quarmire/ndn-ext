@@ -322,6 +322,7 @@ fn start(
             relays: Default::default(),
             service: Default::default(),
             direct: Default::default(),
+            reliability: Default::default(),
         },
         cancel.child_token(),
     );

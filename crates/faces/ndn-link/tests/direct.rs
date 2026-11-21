@@ -150,6 +150,7 @@ async fn device(home: &Home, name: &str, seed: u8, listen: bool, peers: Vec<Peer
             relays: Default::default(),
             service: Default::default(),
             direct: Default::default(),
+            reliability: Default::default(),
         },
         cancel.clone(),
     );

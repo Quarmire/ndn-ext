@@ -415,6 +415,7 @@ async fn host(me: u8, peer: u8, dial: Option<&str>, reliable: bool) -> Host {
             relays: Default::default(),
             service: RelayService::default(),
             direct: Default::default(),
+            reliability: Default::default(),
         },
         cancel.clone(),
     );

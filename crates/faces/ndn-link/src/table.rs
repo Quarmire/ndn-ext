@@ -485,6 +485,7 @@ impl LinkTable {
                         remote: Some(p.path.handle.remote_address()),
                         rtt: Some(p.path.handle.rtt()),
                         age: now.saturating_duration_since(p.path.since),
+                        reliability: p.path.sender.link_service.snapshot().lp_reliability,
                         via: None,
                     })
                     .collect(),

@@ -467,6 +467,7 @@ impl Host {
                 relays: Default::default(),
                 service: RelayService::default(),
                 direct: Default::default(),
+                reliability: Default::default(),
             },
             cancel.clone(),
         );

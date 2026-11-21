@@ -442,6 +442,7 @@ async fn embedded_of(person: &Person, parts: Parts, setup: Setup) -> Embedded {
                 ..RelayService::default()
             },
             direct: Default::default(),
+            reliability: Default::default(),
         },
         cancel.clone(),
     );
@@ -549,6 +550,7 @@ async fn relay(person: &Person, followed: &[&Person], parts: Parts) -> Relay {
                 ..RelayService::default()
             },
             direct: Default::default(),
+            reliability: Default::default(),
         },
         cancel.clone(),
     );

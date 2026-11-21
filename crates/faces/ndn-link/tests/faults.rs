@@ -174,6 +174,7 @@ async fn member(home: &Home, name: &str, seed: u8, peers: Vec<PeerSpec>) -> Memb
             relays: Default::default(),
             service: Default::default(),
             direct: Default::default(),
+            reliability: Default::default(),
         },
         cancel.clone(),
     );

@@ -30,7 +30,7 @@ use crate::direct::{Direct, Whom, direct_up};
 use crate::grants::Grants;
 use crate::host::{FaceSink, LinkTrust, PathCandidate, PathSource};
 use crate::joined::{JoinedRoutes, JoinedSet};
-use crate::peer::{LinkMode, PeerId, PeerSpec, Peers};
+use crate::peer::{LinkMode, LinkReliability, PeerId, PeerSpec, Peers};
 use crate::policy::{Backoff, ENROLLMENT_IDLE, MESSAGE_DEADLINE};
 use crate::presence::{DirectOptions, MemberEntry};
 use crate::relays::RelayOptions;
@@ -73,6 +73,9 @@ pub struct LinkSetup {
     pub service: RelayService,
     /// Direct paths by membership.
     pub direct: DirectOptions,
+    /// Which of the links this device makes frame NDNLPv2 reliability, by
+    /// how they came to be; a configured peer's own entry asks for it.
+    pub reliability: LinkReliability,
 }
 
 /// How a connection came to be, for [`Links::establish`].
@@ -104,6 +107,8 @@ pub struct Links {
     signal: OnceLock<Arc<Signal>>,
     pub(crate) waiting: OnceLock<Arc<Waiting>>,
     pub(crate) relay_options: RelayOptions,
+    /// Which kinds of link frame NDNLPv2 reliability.
+    pub(crate) reliability: LinkReliability,
     pub(crate) service: RelayService,
     pub(crate) quotas: QuotaState,
     /// The grants of links to the people this device introduced.
@@ -182,6 +187,7 @@ impl Links {
             signal: OnceLock::new(),
             waiting: OnceLock::new(),
             relay_options: setup.relays,
+            reliability: setup.reliability,
             service: setup.service,
             quotas: QuotaState::default(),
             grants: Grants::default(),
@@ -843,7 +849,7 @@ impl Links {
         let peer = admitted.peer.and_then(|i| self.peers.get(i));
         let face_id = self.faces.alloc_face_id();
         let link = hs.admit(face_id, MESSAGE_DEADLINE, admission).await?;
-        let reliability = peer.as_ref().is_some_and(|p| p.reliability);
+        let reliability = self.reliable(&admitted, peer.as_deref());
         let link_service: Arc<dyn ndn_transport::LinkService> = if reliability {
             Arc::new(LpLinkService::with_reliability(
                 ReliabilityConfig::ethernet(),

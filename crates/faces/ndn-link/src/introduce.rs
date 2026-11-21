@@ -193,6 +193,41 @@ impl Links {
         !self.path_candidates(id, peer).is_empty()
     }
 
+    /// Whether the link just admitted frames NDNLPv2 reliability
+    /// ([`LinkReliability`](crate::LinkReliability)): when its peer entry
+    /// asks for it, or when the option of the kind that made it is on. A
+    /// grant link is the grant's kind, an introduction link a stranger
+    /// dialled the introduction kind, and a link this device dialled is the
+    /// kind of the entry it was dialled as: a first contact, a remembered
+    /// peer, or a dial by key.
+    pub(crate) fn reliable(&self, admitted: &Admitted, peer: Option<&PeerSpec>) -> bool {
+        let kinds = &self.reliability;
+        if peer.is_some_and(|p| p.reliability) {
+            return true;
+        }
+        if kinds.granted && admitted.grant.is_some() {
+            return true;
+        }
+        if kinds.introduced
+            && matches!(
+                admitted.enrollment,
+                Some(Enrollment::Introduction(_) | Enrollment::Relay(_, Some(_)))
+            )
+        {
+            return true;
+        }
+        let Some((id, peer)) = admitted.peer.zip(peer) else {
+            return false;
+        };
+        // A first contact is its own kind until the link is made again (then it is
+        // the dial by key it became).
+        if self.first_contacts.lock().contains(&id) {
+            return kinds.first_contact;
+        }
+        (kinds.remembered && peer.remembered)
+            || (kinds.introduced && !peer.remembered && self.introduced.lock().contains_key(&id))
+    }
+
     /// A trust context was adopted: a link to a device dialled by its key
     /// alone, whose namespace this device holds now, is made again so the
     /// device is identified in it (and gets the routes of its identity). The
@@ -676,6 +711,7 @@ mod tests {
                 relays: Default::default(),
                 service: RelayService::default(),
                 direct: Default::default(),
+                reliability: Default::default(),
             },
             cancel.child_token(),
         );

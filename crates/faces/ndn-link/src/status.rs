@@ -174,6 +174,10 @@ pub struct PathStatus {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DirectState {
     /// No direct path is wanted: the device is not reached through a relay,
+    /// The path's link service frames NDNLPv2 reliability: what this device
+    /// sends over it is acknowledged and sent again when it is lost
+    /// ([`LinkReliability`](crate::LinkReliability)).
+    pub reliability: bool,
     /// or it is linked already.
     None,
     /// Direct paths are turned off (the link policy, or the peer entry);

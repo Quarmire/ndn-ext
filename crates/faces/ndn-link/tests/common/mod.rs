@@ -28,8 +28,8 @@ use ndn_data::{
 use ndn_engine::{EngineBuilder, EngineConfig, ForwarderEngine, ShutdownHandle};
 use ndn_face_quic::{KeyFingerprint, LinkEndpoint, LinkKey, LinkKeySource, LinkTransportConfig};
 use ndn_link::{
-    ConfiguredEndpoints, EngineFaces, FaceSink, HostCandidates, LinkDetail, LinkHints, LinkSetup,
-    LinkTrust, Links, Quotas, RelayService, ServePolicy,
+    ConfiguredEndpoints, EngineFaces, FaceSink, HostCandidates, LinkDetail, LinkHints,
+    LinkReliability, LinkSetup, LinkTrust, Links, Quotas, RelayService, ServePolicy,
 };
 use ndn_packet::{Data, Name};
 use ndn_security::self_certifying::Genesis;
@@ -527,6 +527,9 @@ pub struct Setup {
     /// (`Connection::routes` is `None`): it announces its groups only by
     /// its period, never because a face came up.
     pub sync_tells_no_routes: bool,
+    /// Which kinds of its links frame NDNLPv2 reliability
+    /// (`LinkSetup::reliability`).
+    pub reliability: LinkReliability,
 }
 
 impl Setup {
@@ -542,6 +545,7 @@ impl Setup {
             answers: AnswerConfig::default(),
             evaluators: Evaluators::none(),
             sync_tells_no_routes: false,
+            reliability: LinkReliability::default(),
         }
     }
 
@@ -697,6 +701,7 @@ async fn boot(kept: Kept, setup: Setup) -> Embedded {
                 ..RelayService::default()
             },
             direct: Default::default(),
+            reliability: setup.reliability,
         },
         cancel.clone(),
     );

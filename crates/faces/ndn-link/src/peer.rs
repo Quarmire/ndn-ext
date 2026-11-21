@@ -104,7 +104,10 @@ pub struct PeerSpec {
     pub unidentified_routes: Option<Vec<Name>>,
     /// Dial it again whenever its link drops.
     pub persistent: bool,
-    /// NDNLPv2 reliability on its link.
+    /// NDNLPv2 reliability on its link, whatever [`LinkReliability`] says of
+    /// the way the link was made: a configured peer has it only when its
+    /// entry asks, and an entry the library makes for a link of a kind
+    /// ([`LinkReliability`]) has it by that kind's option.
     pub reliability: bool,
     /// Direct paths with it: this device punches them when it is reached
     /// through a relay, and admits its punches. `false` turns both off.
@@ -151,6 +154,70 @@ impl Default for PeerSpec {
             hold: false,
             remembered: false,
             linked_in: false,
+        }
+    }
+}
+
+/// Which links this device makes frame NDNLPv2 reliability (an Ack and a
+/// resend of what the peer did not acknowledge), by how the link came to be.
+/// Each end decides for what it sends: a receiver acknowledges whatever
+/// carries a TxSequence whether or not it frames reliability itself, so the
+/// ends need no agreement and a peer that does not frame it still works.
+///
+/// Every kind is on by default: these links carry the transfers a device's
+/// links exist for (an offer, a joined folder's pieces), and a frame the path
+/// loses costs a piece a whole re-expression timer (250 ms) where the link
+/// layer repairs it in a round trip. What it costs a link whose peer is a
+/// stranger is bounded by the layer, not by the peer: at most
+/// `ReliabilityConfig::max_unacked` frames are kept to resend (the oldest
+/// dropped first), each is resent at most `max_retries` times, and the state
+/// that answers the peer's frames (the Acks owed, the TxSequences seen) is
+/// kept whether or not this device frames reliability. No frame is read
+/// before the link is admitted by its key.
+///
+/// A link of no kind here is as its [`PeerSpec::reliability`] says: a device
+/// the serving policy admits with no entry of its own, and a relay's link,
+/// have none unless the host sets it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LinkReliability {
+    /// The link this device dialled to a device by the key and addresses of a
+    /// code's hint ([`Links::dial_by_key`](crate::Links::dial_by_key), and the
+    /// link a first contact became when it was made again), and the
+    /// introduction link this device took from a stranger while an offer is
+    /// open.
+    pub introduced: bool,
+    /// The link this device dialled to whoever answers at a short code's first
+    /// contact ([`Links::dial_first`](crate::Links::dial_first)), until it is
+    /// made again.
+    pub first_contact: bool,
+    /// A link a grant admitted ([`Links::grant`](crate::Links::grant)), at the
+    /// device that granted it.
+    pub granted: bool,
+    /// A link made again from the link memory
+    /// ([`Links::remember`](crate::Links::remember)), at the device that dials
+    /// it, and the link of a remembered peer that dialled in.
+    pub remembered: bool,
+}
+
+impl Default for LinkReliability {
+    fn default() -> Self {
+        Self {
+            introduced: true,
+            first_contact: true,
+            granted: true,
+            remembered: true,
+        }
+    }
+}
+
+impl LinkReliability {
+    /// No kind frames reliability: links are as their [`PeerSpec`] says.
+    pub const fn none() -> Self {
+        Self {
+            introduced: false,
+            first_contact: false,
+            granted: false,
+            remembered: false,
         }
     }
 }

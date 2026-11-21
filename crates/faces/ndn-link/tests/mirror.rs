@@ -502,6 +502,7 @@ async fn boot(durable: &Arc<Durable>, faulty: bool) -> Embedded {
                 ..RelayService::default()
             },
             direct: Default::default(),
+            reliability: Default::default(),
         },
         cancel.clone(),
     );

@@ -112,6 +112,7 @@ async fn a_build_with_the_fault_layer_says_so_and_no_other_does() {
             relays: Default::default(),
             service: Default::default(),
             direct: Default::default(),
+            reliability: Default::default(),
         },
         cancel.child_token(),
     );

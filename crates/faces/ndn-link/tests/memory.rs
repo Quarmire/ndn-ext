@@ -32,8 +32,8 @@ use ndn_engine::{EngineBuilder, EngineConfig, ForwarderEngine, ShutdownHandle};
 use ndn_face_quic::{KeyFingerprint, LinkEndpoint, LinkKey, LinkKeySource, LinkTransportConfig};
 use ndn_link::{
     ConfiguredEndpoints, DeviceMemory, Direction, EngineFaces, Grant, GrantRole, HostCandidates,
-    LinkDetail, LinkHints, LinkMemory, LinkSetup, LinkState, LinkTrust, Links, MemoryFuture,
-    MemoryOptions, PeerRecord, RelayService, RememberedState, ServePolicy,
+    LinkDetail, LinkHints, LinkMemory, LinkReliability, LinkSetup, LinkState, LinkTrust, Links,
+    MemoryFuture, MemoryOptions, PeerRecord, RelayService, RememberedState, ServePolicy,
 };
 use ndn_packet::{Data, Name};
 use ndn_security::{
@@ -255,6 +255,8 @@ struct Setup {
     /// member let go is refused as a stranger is (these cases are about what
     /// a device remembers; what a mark admits is `tests/departures.rs`).
     departure_for: Duration,
+    /// Which kinds of its links frame NDNLPv2 reliability.
+    reliability: LinkReliability,
 }
 
 impl Setup {
@@ -265,6 +267,7 @@ impl Setup {
             listen: true,
             serve: ServePolicy::Own,
             departure_for: Duration::ZERO,
+            reliability: LinkReliability::default(),
         }
     }
 
@@ -274,6 +277,7 @@ impl Setup {
             listen: false,
             serve: ServePolicy::Own,
             departure_for: Duration::ZERO,
+            reliability: LinkReliability::default(),
         }
     }
 }
@@ -457,6 +461,7 @@ async fn boot(durable: &Arc<Durable>, setup: Setup) -> Embedded {
                 ..RelayService::default()
             },
             direct: Default::default(),
+            reliability: setup.reliability,
         },
         cancel.clone(),
     );
@@ -899,6 +904,77 @@ async fn a_remembered_peer_is_dialled_at_start_and_linked_as_an_identified_devic
     assert!(
         record.last_contact > SystemTime::now() - DAY / 2,
         "the contact is noted: {record:?}"
+    );
+}
+
+/// The link a memory redial makes frames NDNLPv2 reliability at the device that
+/// dialled it (ndn-rs `ndn-link.md` §9 item 3): its peer entry is the remembered one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_link_made_by_a_memory_redial_has_reliability() {
+    let (alice, bobs) = (Person::new("/alice").await, Person::new("/bob").await);
+    let (ann, bob) = acquainted(&alice, &bobs).await;
+    let shelf = Shelf::with(vec![of_ann(&ann, vec![ann.addr.unwrap()], DAY)]);
+    bob.links.remember(shelf, on_this_machine());
+
+    until("bob dials ann from memory", LONG, async || {
+        linked(&bob, ann.key) && linked(&ann, bob.key)
+    })
+    .await;
+
+    let paths: Vec<bool> = bob
+        .links
+        .report()
+        .links
+        .iter()
+        .filter(|l| l.key == Some(ann.key))
+        .flat_map(|l| l.paths.iter().map(|p| p.reliability))
+        .collect();
+    assert!(
+        !paths.is_empty() && paths.iter().all(|r| *r),
+        "the redial's paths {paths:?}: {:#?}",
+        bob.links.report()
+    );
+}
+
+/// A host turns the memory kind off: the link its redial makes has no reliability.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_can_turn_the_memory_kind_off() {
+    let (alice, bobs) = (Person::new("/alice").await, Person::new("/bob").await);
+    let ann = embedded(&alice, ANN, Setup::inviter()).await;
+    let bob = embedded(
+        &bobs,
+        BOB,
+        Setup {
+            reliability: LinkReliability {
+                remembered: false,
+                ..LinkReliability::default()
+            },
+            ..Setup::dialer()
+        },
+    )
+    .await;
+    ann.validator.adopt_context(Arc::clone(&bobs.ctx)).unwrap();
+    bob.validator.adopt_context(Arc::clone(&alice.ctx)).unwrap();
+    ann.links.grant(grant_of(&bob));
+    let shelf = Shelf::with(vec![of_ann(&ann, vec![ann.addr.unwrap()], DAY)]);
+    bob.links.remember(shelf, on_this_machine());
+    until("bob dials ann from memory", LONG, async || {
+        linked(&bob, ann.key) && linked(&ann, bob.key)
+    })
+    .await;
+
+    let paths: Vec<bool> = bob
+        .links
+        .report()
+        .links
+        .iter()
+        .filter(|l| l.key == Some(ann.key))
+        .flat_map(|l| l.paths.iter().map(|p| p.reliability))
+        .collect();
+    assert!(
+        !paths.is_empty() && paths.iter().all(|r| !*r),
+        "the redial's paths {paths:?}: {:#?}",
+        bob.links.report()
     );
 }
 
