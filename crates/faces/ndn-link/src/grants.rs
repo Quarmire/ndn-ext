@@ -52,7 +52,7 @@ use crate::admission::{Identity, Judge, Refusal, is_key_or_certificate_name, lis
 use crate::departures::Departure;
 use crate::introduce::Introductions;
 use crate::links::Links;
-use crate::serving::{QuotaSlot, Quotas, ServePolicy};
+use crate::serving::{QuotaSlot, Quotas, ServePolicy, Serving};
 
 /// What a link under a grant carries: the role the offer admitted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -702,6 +702,9 @@ impl Judge<'_> {
                 .with("shown", list_of(&shown)),
             ));
         }
+        // The quotas bound how many grant links there are; the rates a grant
+        // link takes are the grant link's own, not the strangers'
+        // (`policy::GRANT_FRAMES`).
         let quotas = match self.serve {
             ServePolicy::Listed {
                 quotas: Some(quotas),
@@ -721,7 +724,10 @@ impl Judge<'_> {
             let Some(root) = self.held_roots(&id.namespace).into_iter().min() else {
                 continue;
             };
-            match self.quotas.take(&id.namespace, root, Some(&quotas)) {
+            match self
+                .quotas
+                .take(&id.namespace, root, Some(&quotas), Serving::Granted)
+            {
                 Ok(slot) => admitted.push((id.clone(), slot)),
                 Err(refusal) => return GrantOutcome::Refused(refusal),
             }

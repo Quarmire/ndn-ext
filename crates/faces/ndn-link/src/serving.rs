@@ -28,7 +28,11 @@
 //! link. One root serves a namespace name at a time among the live served
 //! links: a device of another root claiming the same name — or the name of,
 //! or a name under, a namespace this device holds — is refused, since the
-//! relay cannot route both. Its own namespaces are never under quota.
+//! relay cannot route both. Its own namespaces are never under quota. The
+//! rates of a link served under quotas are by its kind: a stranger the policy
+//! admits takes [`Quotas`]' tight ones; a member a grant admits takes the
+//! grant link's, far higher ([`GRANT_FRAMES`], [`GRANT_BYTES`]), since the
+//! member is authenticated, named by a signed grant and revocable.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -39,6 +43,7 @@ use ndn_packet::Name;
 use parking_lot::Mutex;
 
 use crate::admission::{Identity, Judge, Refusal, list};
+use crate::policy::{GRANT_BYTES, GRANT_FRAMES, GRANTS_BYTES, GRANTS_FRAMES};
 
 /// Whom this device serves on links nobody asked for. Expected keys and
 /// devices of [`PeerSpec`](crate::PeerSpec)s are admitted whatever it is.
@@ -90,17 +95,18 @@ impl ServePolicy {
     }
 }
 
-/// Bounds on the devices a relay serves for namespaces other than its own.
-/// Interest rates are per second, with bursts.
+/// Bounds on the devices a relay serves for namespaces other than its own:
+/// the strangers its policy admits. Rates are per second, with bursts; the
+/// members a grant admits take the grant link's ([`GRANT_FRAMES`]).
 #[derive(Clone, Copy, Debug)]
 pub struct Quotas {
     /// Served links at once, all namespaces together.
     pub links_total: usize,
     /// Served links at once of one namespace (one root key).
     pub links_per_namespace: usize,
-    /// Packets one served device may send.
+    /// Packets one served stranger may send.
     pub interests_per_key: RateLimit,
-    /// Packets all served devices of one namespace may send together.
+    /// Packets all served strangers of one namespace may send together.
     pub interests_per_namespace: RateLimit,
 }
 
@@ -168,7 +174,28 @@ struct Live {
 
 struct RootLive {
     links: usize,
-    rate: Option<Arc<SharedRate>>,
+    /// The rates the strangers of this root share, once one is served.
+    stranger: Option<Arc<SharedRate>>,
+    /// The rates the granted members of this root share, once one is served.
+    granted: Option<Arc<SharedRate>>,
+}
+
+/// Whom a served link is for, which decides the rates it takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Serving {
+    /// A stranger the serving policy admitted: [`Quotas`]' rates.
+    Stranger,
+    /// A member a grant admitted: the grant link's rates ([`GRANT_FRAMES`]).
+    Granted,
+}
+
+/// What a served link takes from its peer: its own rates and the buckets its
+/// namespace's links share.
+#[derive(Clone)]
+pub(crate) struct Limits {
+    pub(crate) rate: RateLimit,
+    pub(crate) bandwidth: Option<RateLimit>,
+    pub(crate) shared: Arc<SharedRate>,
 }
 
 /// One served link's place among the quotas; dropping it gives it back.
@@ -176,8 +203,8 @@ pub(crate) struct QuotaSlot {
     live: Arc<Mutex<Live>>,
     pub(crate) namespace: Name,
     root: KeyFingerprint,
-    /// The per-key rate and the namespace's shared one, under quotas.
-    pub(crate) limits: Option<(RateLimit, Arc<SharedRate>)>,
+    /// What the link takes, under quotas.
+    pub(crate) limits: Option<Limits>,
 }
 
 impl Drop for QuotaSlot {
@@ -201,12 +228,14 @@ impl Drop for QuotaSlot {
 
 impl QuotaState {
     /// A slot for a link of `namespace`, whose root key is `root`, under
-    /// `quotas` (none: only the one-root-per-name rule).
+    /// `quotas` (none: only the one-root-per-name rule), taking the rates of
+    /// `serving`.
     pub(crate) fn take(
         &self,
         namespace: &Name,
         root: KeyFingerprint,
         quotas: Option<&Quotas>,
+        serving: Serving,
     ) -> Result<QuotaSlot, Refusal> {
         let mut live = self.live.lock();
         if let Some((bound, _)) = live.names.get(namespace)
@@ -265,12 +294,26 @@ impl QuotaState {
         live.total += 1;
         let entry = live.roots.entry(root).or_insert_with(|| RootLive {
             links: 0,
-            rate: quotas.map(|q| Arc::new(SharedRate::new(q.interests_per_namespace))),
+            stranger: None,
+            granted: None,
         });
         entry.links += 1;
-        let limits = quotas
-            .zip(entry.rate.clone())
-            .map(|(q, rate)| (q.interests_per_key, rate));
+        let limits = quotas.map(|q| match serving {
+            Serving::Stranger => Limits {
+                rate: q.interests_per_key,
+                bandwidth: None,
+                shared: Arc::clone(entry.stranger.get_or_insert_with(|| {
+                    Arc::new(SharedRate::new(q.interests_per_namespace, None))
+                })),
+            },
+            Serving::Granted => Limits {
+                rate: GRANT_FRAMES,
+                bandwidth: Some(GRANT_BYTES),
+                shared: Arc::clone(entry.granted.get_or_insert_with(|| {
+                    Arc::new(SharedRate::new(GRANTS_FRAMES, Some(GRANTS_BYTES)))
+                })),
+            },
+        });
         live.names.entry(namespace.clone()).or_insert((root, 0)).1 += 1;
         Ok(QuotaSlot {
             live: Arc::clone(&self.live),
@@ -340,7 +383,7 @@ impl Judge<'_> {
                 {
                     return self
                         .quotas
-                        .take(&id.namespace, *root, quotas.as_ref())
+                        .take(&id.namespace, *root, quotas.as_ref(), Serving::Stranger)
                         .map(Some);
                 }
                 // A device of a namespace this device holds, under an open
@@ -352,7 +395,7 @@ impl Judge<'_> {
                 {
                     return self
                         .quotas
-                        .take(&id.namespace, *root, Some(quotas))
+                        .take(&id.namespace, *root, Some(quotas), Serving::Stranger)
                         .map(Some);
                 }
                 let anchors = anchors
@@ -394,9 +437,14 @@ impl Judge<'_> {
         };
         match self.serve {
             ServePolicy::Listed { roots, quotas } if roots.contains(&root) => {
-                self.quotas.take(&id.namespace, root, quotas.as_ref()).map(Some)
+                self.quotas
+                    .take(&id.namespace, root, quotas.as_ref(), Serving::Stranger)
+                    .map(Some)
             }
-            ServePolicy::Open { quotas } => self.quotas.take(&id.namespace, root, Some(quotas)).map(Some),
+            ServePolicy::Open { quotas } => self
+                .quotas
+                .take(&id.namespace, root, Some(quotas), Serving::Stranger)
+                .map(Some),
             ServePolicy::Listed { roots, .. } => Err(Refusal::new(
                 CloseReason::NotServed,
                 with_own(

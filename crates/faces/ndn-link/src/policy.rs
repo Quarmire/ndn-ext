@@ -88,7 +88,7 @@ pub const ENROLLMENT_ANSWERS: RateLimit = RateLimit {
 
 /// What a grant link's peer may send of the ask exchange
 /// (`<W>/<role>/<device>/32=ask-answer/<digest>`, ndn-link §8.7 rule 20), per
-/// link, beside the link's own quota (100/s): 10 at once, then 1 a second. An
+/// link, beside the link's own rates ([`GRANT_FRAMES`]): 10 at once, then 1 a second. An
 /// honest asker sends at most `ASK_ATTEMPTS` × `ASK_SENDS` = 3 × 3 = 9 Interests
 /// of one question to one signer and has one ask in flight, so it never meets
 /// this; a peer that floods a signer with asks it must open, verify and answer
@@ -96,6 +96,48 @@ pub const ENROLLMENT_ANSWERS: RateLimit = RateLimit {
 pub const ASK_INTERESTS: RateLimit = RateLimit {
     burst: 10,
     per_sec: 1,
+};
+
+/// What a **grant link's** member may send over its link, in frames: per
+/// link, 65,536 at once, then 32,768 a second. A granted member is
+/// authenticated by its key, named by a signed grant and revocable (the link
+/// closes at the grant's end), so an ordinary transfer must never meet this
+/// and the bytes ([`GRANT_BYTES`]) are the bound. What a transfer costs the
+/// owner to receive: 1 MiB asked by a member is 256 piece Interests of about
+/// 100 bytes, 32 in flight; 1 MiB pushed by a writer is about 1,300 frames
+/// (a piece of 4096 bytes fragments to 4 or 5 datagrams of 1,100 bytes or
+/// more) and 1.2 MiB. The burst covers 50 such transfers back to back; a
+/// second's refill is the frames of 32 MiB at the datagram size, plus the
+/// small ones. Small frames are what this bound is for: 32,768 Interests a
+/// second is already more than a forwarder answers from a store.
+pub const GRANT_FRAMES: RateLimit = RateLimit {
+    burst: 65_536,
+    per_sec: 32_768,
+};
+/// What a grant link's member may send over its link, in bytes: 64 MiB at
+/// once, then 32 MiB a second (256 Mbit/s), counted on the frames received.
+/// This is the bound on a granted member that misbehaves: it can make this
+/// device receive no more than that from its key, and a namespace's members
+/// no more than [`GRANTS_BYTES`] together; what is over it is dropped (an
+/// Interest with a Congestion Nack), and the grant is revocable. It bounds
+/// what the member sends, not what this device answers: the Data an Interest
+/// asks for is bounded by the link's congestion control and by the names the
+/// grant carries.
+pub const GRANT_BYTES: RateLimit = RateLimit {
+    burst: 64 << 20,
+    per_sec: 32 << 20,
+};
+/// What the grant links of one namespace may send together, in frames: four
+/// members' worth (262,144 at once, then 131,072 a second), as the stranger
+/// quotas share one namespace among four keys.
+pub const GRANTS_FRAMES: RateLimit = RateLimit {
+    burst: 262_144,
+    per_sec: 131_072,
+};
+/// The same, in bytes: 256 MiB at once, then 128 MiB a second.
+pub const GRANTS_BYTES: RateLimit = RateLimit {
+    burst: 256 << 20,
+    per_sec: 128 << 20,
 };
 
 /// How far the SignatureTime of a punch request may be from this device's

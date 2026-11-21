@@ -25,9 +25,10 @@
 //! - **Scope.** A side may admit a link that carries less than everything —
 //!   an *enrollment link*, or a link bounded only by its rates
 //!   ([`LinkScope`], [`Carries::Everything`]): its face drops, both ways,
-//!   every packet outside the scope, Nacks the Interests among them, and
-//!   rate-limits what it receives, per link and optionally with a bucket
-//!   several links share ([`SharedRate`]). The verdict tells the peer of an
+//!   every packet outside the scope, Nacks the Interests among them (NoRoute;
+//!   Congestion for one dropped for rate), and rate-limits what it receives
+//!   by frames and bytes, per link and optionally with buckets several links
+//!   share ([`SharedRate`]). The verdict tells the peer of an
 //!   enrollment link.
 //! - **Framing.** NDN packets ride QUIC DATAGRAM frames as NDNLPv2 frames; the
 //!   face's link service fragments a packet larger than the connection's
@@ -94,5 +95,8 @@ pub use message::{
     encode_udp_address,
 };
 pub use probe::{PROBE_LEN, ProbeWatch, decode_probe, encode_probe};
-pub use scope::{Carries, LinkScope, NameFilter, Narrowing, RateLimit, RatedInterests, SharedRate};
+pub use scope::{
+    CONGESTION_NACKS, Carries, LinkScope, NameFilter, Narrowing, RateLimit, RatedInterests,
+    ScopeCounts, SharedRate,
+};
 pub use text::{PEER_TEXT_MAX, bounded_text, clean_text, sanitize_peer_text};

@@ -11,13 +11,19 @@
 //! and a later fragment whose first one was not seen is dropped. Frames
 //! carrying no network packet (acknowledgements) pass.
 //!
-//! An Interest the scope drops is answered with a Nack (NoRoute) at once,
-//! so the requester stops waiting: one arriving from the peer is Nacked to
-//! the peer, one this side would send is Nacked back to this side. Received
-//! packets are rate-limited before they are judged — by the link's own
-//! bucket, then by the bucket of the names a scope rates apart
-//! ([`RatedInterests`]), then by a bucket it shares with other links
-//! ([`SharedRate`]); acknowledgements are not.
+//! An Interest the scope drops for a name it does not carry is answered with a
+//! Nack (NoRoute) at once, so the requester stops waiting: one arriving from
+//! the peer is Nacked to the peer, one this side would send is Nacked back to
+//! this side. An Interest it drops for a rate is answered with a Nack
+//! (Congestion) at once: "dropped for rate, ask again soon", never "not
+//! there". Received packets are rate-limited before they are judged — by the
+//! link's own bucket of frames, then its bucket of bytes (a link bounded by
+//! bandwidth), then by the bucket of the names a scope rates apart
+//! ([`RatedInterests`]; those are dropped without a Nack: an exchange with a
+//! gate of its own), then by a bucket it shares with other links
+//! ([`SharedRate`]); acknowledgements are not. A Nack costs the link a frame
+//! sent, so the Congestion Nacks of one link are bounded too
+//! ([`CONGESTION_NACKS`]): past it a dropped Interest is dropped silently.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -39,6 +45,15 @@ const NAME: u64 = 0x07;
 const REMEMBERED_FRAGMENTED: usize = 32;
 /// How often a scope logs what it dropped, at most.
 const DROP_LOG_EVERY: Duration = Duration::from_secs(10);
+/// The Congestion Nacks one link sends for the Interests its rates dropped:
+/// `burst` at once, refilled at `per_sec`. A peer that floods gets a Nack for
+/// each Interest it lost, until this bucket is empty and one per 8 ms after
+/// that: its flood is never answered with a flood. An honest asker that meets
+/// a rate loses a window of 32 or so, which the burst covers.
+pub const CONGESTION_NACKS: RateLimit = RateLimit {
+    burst: 256,
+    per_sec: 128,
+};
 
 /// Which packets one direction of a scoped link carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,8 +67,8 @@ pub enum Carries {
     Everything,
 }
 
-/// Received packets a scoped link takes: `burst` at once, refilled at
-/// `per_sec`.
+/// A rate: `burst` at once, refilled at `per_sec`. Frames, or bytes where a
+/// bucket counts those ([`LinkScope::bandwidth`]).
 #[derive(Clone, Copy, Debug)]
 pub struct RateLimit {
     pub burst: u32,
@@ -62,9 +77,10 @@ pub struct RateLimit {
 
 /// Some of the Interests the peer sends, held to a bucket of their own beside
 /// the link's: the names `names` take a token of `rate` each, and an Interest
-/// that finds none is dropped like one over the link's rate (silently, counted,
-/// and without taking a token of the shared bucket). What the link's own rate
-/// would allow of other names is not reduced by them.
+/// that finds none is dropped silently (no Nack, unlike one over the link's
+/// rate: an exchange with a gate of its own, whose flood is told nothing),
+/// counted, and without taking a token of the shared bucket. What the link's
+/// own rate would allow of other names is not reduced by them.
 pub struct RatedInterests {
     /// Whether an Interest of that name is rated apart.
     pub names: NameFilter,
@@ -72,26 +88,37 @@ pub struct RatedInterests {
     pub rate: RateLimit,
 }
 
-/// One rate bucket shared by several links (all the links of a namespace a
-/// relay serves, say): together they take no more than its [`RateLimit`].
+/// Buckets shared by several links (all the links of a namespace a relay
+/// serves, say): together they take no more than their [`RateLimit`]s, of
+/// frames and, when given, of bytes.
 pub struct SharedRate {
     rate: RateLimit,
-    bucket: Mutex<Bucket>,
+    bandwidth: Option<RateLimit>,
+    buckets: Mutex<(Bucket, Bucket)>,
 }
 
 impl SharedRate {
-    pub fn new(rate: RateLimit) -> Self {
+    pub fn new(rate: RateLimit, bandwidth: Option<RateLimit>) -> Self {
         Self {
-            bucket: Mutex::new(Bucket::full(rate)),
+            buckets: Mutex::new((
+                Bucket::full(rate),
+                Bucket::full(bandwidth.unwrap_or(RateLimit {
+                    burst: 0,
+                    per_sec: 0,
+                })),
+            )),
             rate,
+            bandwidth,
         }
     }
 
-    fn take(&self) -> bool {
-        self.bucket
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take(self.rate)
+    /// A frame of `len` bytes: a token of the frames and `len` of the bytes.
+    fn take(&self, len: f64) -> bool {
+        let mut buckets = self.buckets.lock().unwrap_or_else(PoisonError::into_inner);
+        buckets.0.take(self.rate, 1.0)
+            && self
+                .bandwidth
+                .is_none_or(|bandwidth| buckets.1.take(bandwidth, len))
     }
 }
 
@@ -108,6 +135,10 @@ pub struct LinkScope {
     pub names: Box<dyn Fn(&Name) -> bool + Send + Sync>,
     /// Bound on received packets.
     pub rate: RateLimit,
+    /// A bound on the bytes received, checked after `rate`: a link bounded by
+    /// bandwidth as well as by frames (`burst` must be at least the largest
+    /// frame). `None`: frames only, which bounds bytes by the frame size.
+    pub bandwidth: Option<RateLimit>,
     /// Interests of some names the peer sends, bounded by a bucket of their
     /// own after `rate`, before `shared`.
     pub rated: Option<RatedInterests>,
@@ -130,6 +161,31 @@ pub struct LinkScope {
     /// When set, the scope narrows in place while [`Narrowing::when`] holds
     /// (asked at every packet), with no reconnect.
     pub narrowing: Option<Narrowing>,
+    /// Where this link counts what it drops for rate and Nacks, with the
+    /// host's other links.
+    pub counts: Option<Arc<ScopeCounts>>,
+}
+
+/// What the scopes of a host's links dropped for rate and answered with a
+/// Nack, in total, so a host's status can show it.
+#[derive(Debug, Default)]
+pub struct ScopeCounts {
+    over_rate: AtomicU64,
+    nacked: AtomicU64,
+}
+
+impl ScopeCounts {
+    /// Frames dropped for a rate (the link's, its bandwidth's, its names' or
+    /// a shared one): Interests, Data and fragments.
+    pub fn over_rate(&self) -> u64 {
+        self.over_rate.load(Ordering::Relaxed)
+    }
+
+    /// Congestion Nacks sent for the Interests dropped for a rate: at most
+    /// one each, and none past [`CONGESTION_NACKS`].
+    pub fn congestion_nacks(&self) -> u64 {
+        self.nacked.load(Ordering::Relaxed)
+    }
 }
 
 /// What a scope carries while it is narrowed: the same names and rates, other
@@ -148,8 +204,8 @@ pub struct Narrowing {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Judged {
     Pass,
-    /// Dropped; `Some` is the Interest to Nack.
-    Drop(Option<Bytes>),
+    /// Dropped; `Some` is the Nack to send and the Interest it answers.
+    Drop(Option<(NackReason, Bytes)>),
 }
 
 /// The fragmented packets of one direction whose verdict is known, by the
@@ -185,15 +241,15 @@ impl Bucket {
         }
     }
 
-    /// Refill for the time since the last take, then take a token if there
-    /// is one.
-    fn take(&mut self, rate: RateLimit) -> bool {
+    /// Refill for the time since the last take, then take `cost` tokens if
+    /// there are that many.
+    fn take(&mut self, rate: RateLimit, cost: f64) -> bool {
         let now = Instant::now();
         let refill = now.duration_since(self.at).as_secs_f64() * f64::from(rate.per_sec);
         self.tokens = (self.tokens + refill).min(f64::from(rate.burst));
         self.at = now;
-        if self.tokens >= 1.0 {
-            self.tokens -= 1.0;
+        if self.tokens >= cost {
+            self.tokens -= cost;
             true
         } else {
             false
@@ -201,13 +257,16 @@ impl Bucket {
     }
 }
 
-/// A scope at work on one link: its verdicts, rate bucket and activity.
+/// A scope at work on one link: its verdicts, rate buckets and activity.
 pub(crate) struct ScopeState {
     scope: LinkScope,
     inbound: Mutex<Fragmented>,
     outbound: Mutex<Fragmented>,
     bucket: Mutex<Bucket>,
+    bandwidth_bucket: Mutex<Bucket>,
     rated_bucket: Mutex<Bucket>,
+    /// What the link may still send of Congestion Nacks.
+    nack_bucket: Mutex<Bucket>,
     started: Instant,
     /// Milliseconds after `started` of the last packet the scope passed.
     last_passed_ms: AtomicU64,
@@ -218,15 +277,17 @@ pub(crate) struct ScopeState {
 impl ScopeState {
     pub(crate) fn new(scope: LinkScope) -> Self {
         let now = Instant::now();
+        let none = RateLimit {
+            burst: 0,
+            per_sec: 0,
+        };
         Self {
             bucket: Mutex::new(Bucket::full(scope.rate)),
-            rated_bucket: Mutex::new(Bucket::full(scope.rated.as_ref().map_or(
-                RateLimit {
-                    burst: 0,
-                    per_sec: 0,
-                },
-                |rated| rated.rate,
-            ))),
+            bandwidth_bucket: Mutex::new(Bucket::full(scope.bandwidth.unwrap_or(none))),
+            rated_bucket: Mutex::new(Bucket::full(
+                scope.rated.as_ref().map_or(none, |rated| rated.rate),
+            )),
+            nack_bucket: Mutex::new(Bucket::full(CONGESTION_NACKS)),
             scope,
             inbound: Mutex::default(),
             outbound: Mutex::default(),
@@ -250,8 +311,16 @@ impl ScopeState {
         let packet = Packet::of(frame);
         if !matches!(packet, Some(Packet::LinkOnly)) {
             if !self.take_token() {
-                self.note_drop("over the rate limit", None);
-                return Judged::Drop(None);
+                return self.congested("over the rate limit", packet.as_ref());
+            }
+            if let Some(bandwidth) = self.scope.bandwidth
+                && !self
+                    .bandwidth_bucket
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take(bandwidth, bytes(frame))
+            {
+                return self.congested("over the bandwidth limit", packet.as_ref());
             }
             if let (
                 Some(rated),
@@ -266,19 +335,21 @@ impl ScopeState {
                     .rated_bucket
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .take(rated.rate)
+                    .take(rated.rate, 1.0)
             {
-                self.note_drop("over the rate limit of its names", Some(name));
+                self.note_over_rate("over the rate limit of its names", Some(name));
                 return Judged::Drop(None);
             }
             if self
                 .scope
                 .shared
                 .as_ref()
-                .is_some_and(|shared| !shared.take())
+                .is_some_and(|shared| !shared.take(bytes(frame)))
             {
-                self.note_drop("over the rate limit shared with other links", None);
-                return Judged::Drop(None);
+                return self.congested(
+                    "over the rate limit shared with other links",
+                    packet.as_ref(),
+                );
             }
         }
         self.judge(
@@ -288,6 +359,45 @@ impl ScopeState {
             self.scope.interests_in.as_deref(),
             self.scope.answers_in.as_deref(),
         )
+    }
+
+    /// A frame dropped for a rate: counted, and when it carries a whole
+    /// Interest, answered with a Congestion Nack while the link's bound on
+    /// those holds. Data and fragments are dropped without one (an asker of
+    /// Data waits for its timer: there is nothing to say to a Data).
+    fn congested(&self, what: &str, packet: Option<&Packet>) -> Judged {
+        let name = match packet {
+            Some(Packet::Network { name, .. }) => Some(name),
+            _ => None,
+        };
+        self.note_over_rate(what, name);
+        let Some(Packet::Network {
+            kind: Kind::Interest,
+            whole: Some(interest),
+            ..
+        }) = packet
+        else {
+            return Judged::Drop(None);
+        };
+        if !self
+            .nack_bucket
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take(CONGESTION_NACKS, 1.0)
+        {
+            return Judged::Drop(None);
+        }
+        if let Some(counts) = &self.scope.counts {
+            counts.nacked.fetch_add(1, Ordering::Relaxed);
+        }
+        Judged::Drop(Some((NackReason::Congestion, interest.clone())))
+    }
+
+    fn note_over_rate(&self, what: &str, name: Option<&Name>) {
+        if let Some(counts) = &self.scope.counts {
+            counts.over_rate.fetch_add(1, Ordering::Relaxed);
+        }
+        self.note_drop(what, name);
     }
 
     /// Judge a frame this side would send.
@@ -314,7 +424,7 @@ impl ScopeState {
         self.bucket
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .take(self.scope.rate)
+            .take(self.scope.rate, 1.0)
     }
 
     fn judge(
@@ -374,7 +484,11 @@ impl ScopeState {
                         Kind::Nack => "a Nack",
                     };
                     self.note_drop(what, Some(&name));
-                    Judged::Drop(whole.filter(|_| kind == Kind::Interest))
+                    Judged::Drop(
+                        whole
+                            .filter(|_| kind == Kind::Interest)
+                            .map(|interest| (NackReason::NoRoute, interest)),
+                    )
                 }
             }
         };
@@ -402,9 +516,14 @@ impl ScopeState {
     }
 }
 
-/// A Nack (NoRoute) for an Interest a scope dropped, as an NDNLPv2 frame.
-pub(crate) fn nack_for(interest: &[u8]) -> Bytes {
-    ndn_packet::lp::encode_lp_nack(NackReason::NoRoute, interest)
+/// A Nack for an Interest a scope dropped, as an NDNLPv2 frame.
+pub(crate) fn nack_for(reason: NackReason, interest: &[u8]) -> Bytes {
+    ndn_packet::lp::encode_lp_nack(reason, interest)
+}
+
+/// What a frame costs the bandwidth buckets: its length.
+fn bytes(frame: &Bytes) -> f64 {
+    f64::from(u32::try_from(frame.len()).unwrap_or(u32::MAX))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -511,12 +630,14 @@ mod tests {
                 burst: 4,
                 per_sec: 1,
             },
+            bandwidth: None,
             rated: None,
             shared: None,
             explain: "test".into(),
             answers_in: None,
             interests_in: None,
             narrowing: None,
+            counts: None,
         })
     }
 
@@ -536,7 +657,7 @@ mod tests {
         let outside = interest("/home/member/phone/album");
         assert_eq!(
             s.received(&ndn_packet::lp::encode_lp_packet(&outside)),
-            Judged::Drop(Some(outside)),
+            Judged::Drop(Some((NackReason::NoRoute, outside))),
             "an Interest outside the scope is dropped, to be Nacked"
         );
         // Data from the peer: the wrong kind for what it may send.
@@ -576,12 +697,14 @@ mod tests {
                 burst: 100,
                 per_sec: 100,
             },
+            bandwidth: None,
             rated: None,
             shared: None,
             explain: "test".into(),
             answers_in: Some(Box::new(move |n: &Name| n.has_prefix(&own))),
             interests_in: None,
             narrowing: None,
+            counts: None,
         });
         let lp = |p: &Bytes| ndn_packet::lp::encode_lp_packet(p);
         assert_eq!(
@@ -623,12 +746,14 @@ mod tests {
                 burst: 100,
                 per_sec: 100,
             },
+            bandwidth: None,
             rated: None,
             shared: None,
             explain: "test".into(),
             answers_in: Some(Box::new(move |n: &Name| n.has_prefix(&asked_in))),
             interests_in: Some(Box::new(move |n: &Name| n.has_prefix(&own_in))),
             narrowing: None,
+            counts: None,
         });
         let lp = |p: &Bytes| ndn_packet::lp::encode_lp_packet(p);
         assert_eq!(
@@ -639,13 +764,13 @@ mod tests {
         let other = interest("/alice/member/laptop/32=held/x");
         assert_eq!(
             s.received(&lp(&other)),
-            Judged::Drop(Some(other)),
+            Judged::Drop(Some((NackReason::NoRoute, other))),
             "an Interest within the names but outside interests_in is dropped, to be Nacked"
         );
         let elsewhere = interest("/carol/private");
         assert_eq!(
             s.received(&lp(&elsewhere)),
-            Judged::Drop(Some(elsewhere)),
+            Judged::Drop(Some((NackReason::NoRoute, elsewhere))),
             "an Interest outside the names is dropped"
         );
         assert_eq!(
@@ -675,6 +800,7 @@ mod tests {
                 burst: 100,
                 per_sec: 100,
             },
+            bandwidth: None,
             rated: None,
             shared: None,
             explain: "test".into(),
@@ -685,6 +811,7 @@ mod tests {
                 receives: Carries::Interests,
                 sends: Carries::Answers,
             }),
+            counts: None,
         });
         let lp = |p: &Bytes| ndn_packet::lp::encode_lp_packet(p);
         let pushed = lp(&data("/bob/x", 10));
@@ -764,15 +891,220 @@ mod tests {
         );
     }
 
+    fn limited(
+        rate: RateLimit,
+        bandwidth: Option<RateLimit>,
+        shared: Option<Arc<SharedRate>>,
+        counts: Option<Arc<ScopeCounts>>,
+    ) -> ScopeState {
+        ScopeState::new(LinkScope {
+            receives: Carries::Everything,
+            sends: Carries::Everything,
+            names: Box::new(|_: &Name| true),
+            rate,
+            bandwidth,
+            rated: None,
+            shared,
+            explain: "test".into(),
+            answers_in: None,
+            interests_in: None,
+            narrowing: None,
+            counts,
+        })
+    }
+
+    /// An Interest the link's rate refuses is Nacked at once with Congestion
+    /// (dropped for rate: ask again soon, not "there is no route"), so its
+    /// asker retries instead of waiting for its timer.
+    #[test]
+    fn an_interest_over_the_rate_is_dropped_to_be_nacked_congestion() {
+        let s = scope(Carries::Interests, Carries::Answers);
+        let asked = interest("/home/CA/STATUS");
+        let inside = ndn_packet::lp::encode_lp_packet(&asked);
+        for _ in 0..4 {
+            assert_eq!(s.received(&inside), Judged::Pass);
+        }
+        assert_eq!(
+            s.received(&inside),
+            Judged::Drop(Some((NackReason::Congestion, asked))),
+            "an Interest over the rate must be dropped with a Congestion Nack"
+        );
+    }
+
+    /// Only an Interest is Nacked: a Data or a fragment over the rate has
+    /// nobody to tell, and is dropped.
+    #[test]
+    fn data_over_the_rate_is_dropped_without_a_nack() {
+        let s = limited(
+            RateLimit {
+                burst: 1,
+                per_sec: 1,
+            },
+            None,
+            None,
+            None,
+        );
+        let wire = |p: &Bytes| ndn_packet::lp::encode_lp_packet(p);
+        assert_eq!(s.received(&wire(&data("/any/a", 10))), Judged::Pass);
+        assert_eq!(
+            s.received(&wire(&data("/any/b", 10))),
+            Judged::Drop(None),
+            "a Data over the rate"
+        );
+    }
+
+    /// A flood is not answered with a flood: a link sends Congestion Nacks
+    /// for the Interests it drops up to `CONGESTION_NACKS`, then drops
+    /// silently; every drop is counted, every Nack counted.
+    #[test]
+    fn the_nacks_of_a_flood_are_bounded_and_counted() {
+        let counts = Arc::new(ScopeCounts::default());
+        let s = limited(
+            RateLimit {
+                burst: 10,
+                per_sec: 1,
+            },
+            None,
+            None,
+            Some(Arc::clone(&counts)),
+        );
+        let flood = u64::from(CONGESTION_NACKS.burst) + 200;
+        let wire = ndn_packet::lp::encode_lp_packet(&interest("/any/x"));
+        let mut nacked = 0;
+        for _ in 0..(10 + flood) {
+            if matches!(s.received(&wire), Judged::Drop(Some(_))) {
+                nacked += 1;
+            }
+        }
+        assert!(
+            (u64::from(CONGESTION_NACKS.burst)..=u64::from(CONGESTION_NACKS.burst) + 2)
+                .contains(&nacked),
+            "{nacked} Nacks for a flood of {flood} dropped Interests: the bound is {}",
+            CONGESTION_NACKS.burst
+        );
+        assert_eq!(counts.over_rate(), flood, "every drop is counted");
+        assert_eq!(counts.congestion_nacks(), nacked, "every Nack is counted");
+    }
+
+    /// The Nack of a rate is the spec's vector (ndn-link.md §19, scope Nack,
+    /// Congestion): the NoRoute one of the same Interest with reason 50.
+    #[test]
+    fn the_congestion_nack_is_the_specs_vector() {
+        let hex = |s: &str| -> Vec<u8> {
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+                .collect()
+        };
+        let interest = hex("051707 0f0804686f6d650802434108034e45570a0401020304"
+            .replace(' ', "")
+            .as_str());
+        assert_eq!(
+            nack_for(NackReason::Congestion, &interest).as_ref(),
+            hex("6424fd032005fd0321013250190517070f0804686f6d650802434108034e45570a0401020304")
+        );
+        assert_eq!(
+            nack_for(NackReason::NoRoute, &interest).as_ref(),
+            hex("6424fd032005fd0321019650190517070f0804686f6d650802434108034e45570a0401020304")
+        );
+    }
+
+    /// A link bounded by bandwidth counts bytes: frames of a size that fit
+    /// the burst pass, the next is over the bandwidth, and what is over it
+    /// is dropped (an Interest with a Congestion Nack, a Data without).
+    #[test]
+    fn a_bandwidth_bound_counts_bytes() {
+        let piece = ndn_packet::lp::encode_lp_packet(&data("/any/piece", 1000));
+        let len = u32::try_from(piece.len()).unwrap();
+        let counts = Arc::new(ScopeCounts::default());
+        let s = limited(
+            RateLimit {
+                burst: 1000,
+                per_sec: 1000,
+            },
+            Some(RateLimit {
+                burst: 2 * len + len / 2,
+                per_sec: 1,
+            }),
+            None,
+            Some(Arc::clone(&counts)),
+        );
+        assert_eq!(s.received(&piece), Judged::Pass);
+        assert_eq!(s.received(&piece), Judged::Pass);
+        assert_eq!(
+            s.received(&piece),
+            Judged::Drop(None),
+            "a third piece is over the bandwidth: {} bytes left of {}",
+            len / 2,
+            2 * len + len / 2
+        );
+        let asked = interest("/any/ask");
+        let ask = ndn_packet::lp::encode_lp_packet(&asked);
+        assert!(u32::try_from(ask.len()).unwrap() < len / 2);
+        assert_eq!(
+            s.received(&ask),
+            Judged::Pass,
+            "an Interest is a few bytes and still fits"
+        );
+        // Acknowledgements take no byte of it.
+        let ack_only = Bytes::from_static(&[0x64, 0x05, 0xFD, 0x03, 0x44, 0x01, 0x05]);
+        for _ in 0..100 {
+            assert_eq!(s.received(&ack_only), Judged::Pass);
+        }
+        assert_eq!(counts.over_rate(), 1);
+    }
+
+    /// The links of a namespace share a bound on bytes too.
+    #[test]
+    fn links_sharing_a_bandwidth_take_no_more_than_it_together() {
+        let piece = ndn_packet::lp::encode_lp_packet(&data("/any/piece", 1000));
+        let len = u32::try_from(piece.len()).unwrap();
+        let shared = Arc::new(SharedRate::new(
+            RateLimit {
+                burst: 1000,
+                per_sec: 1000,
+            },
+            Some(RateLimit {
+                burst: 3 * len + len / 2,
+                per_sec: 1,
+            }),
+        ));
+        let link = || {
+            limited(
+                RateLimit {
+                    burst: 1000,
+                    per_sec: 1000,
+                },
+                None,
+                Some(Arc::clone(&shared)),
+                None,
+            )
+        };
+        let (a, b) = (link(), link());
+        let passed = (0..4)
+            .filter(|_| a.received(&piece) == Judged::Pass)
+            .count()
+            + (0..4)
+                .filter(|_| b.received(&piece) == Judged::Pass)
+                .count();
+        assert_eq!(
+            passed, 3,
+            "three pieces in all pass the namespace's burst of bytes"
+        );
+    }
+
     /// The Interests of the names a scope rates apart take a bucket of their
     /// own, are dropped without a Nack when it is empty, and leave the link's
     /// other names and the shared bucket as they were.
     #[test]
     fn rated_interests_take_a_bucket_of_their_own() {
-        let shared = Arc::new(SharedRate::new(RateLimit {
-            burst: 1000,
-            per_sec: 1000,
-        }));
+        let shared = Arc::new(SharedRate::new(
+            RateLimit {
+                burst: 1000,
+                per_sec: 1000,
+            },
+            None,
+        ));
         let s = ScopeState::new(LinkScope {
             receives: Carries::Everything,
             sends: Carries::Everything,
@@ -781,6 +1113,7 @@ mod tests {
                 burst: 1000,
                 per_sec: 1000,
             },
+            bandwidth: None,
             rated: Some(RatedInterests {
                 names: Box::new(|n: &Name| n.has_prefix(&"/rated".parse::<Name>().unwrap())),
                 rate: RateLimit {
@@ -793,6 +1126,7 @@ mod tests {
             answers_in: None,
             interests_in: None,
             narrowing: None,
+            counts: None,
         });
         let wire = |p: Bytes| ndn_packet::lp::encode_lp_packet(&p);
         let rated = wire(interest("/rated/x"));
@@ -810,7 +1144,7 @@ mod tests {
         assert_eq!(s.received(&plain), Judged::Pass);
         assert_eq!(s.received(&wire(data("/rated/x", 10))), Judged::Pass);
         // The refused Interests took nothing of the shared bucket: 3 + 1 + 1.
-        let left = shared.bucket.lock().unwrap().tokens;
+        let left = shared.buckets.lock().unwrap().0.tokens;
         assert!(
             (994.0..996.0).contains(&left),
             "{left} tokens left of the shared bucket"
@@ -819,10 +1153,13 @@ mod tests {
 
     #[test]
     fn links_sharing_a_rate_take_no_more_than_it_together() {
-        let shared = Arc::new(SharedRate::new(RateLimit {
-            burst: 6,
-            per_sec: 1,
-        }));
+        let shared = Arc::new(SharedRate::new(
+            RateLimit {
+                burst: 6,
+                per_sec: 1,
+            },
+            None,
+        ));
         let link = || {
             ScopeState::new(LinkScope {
                 receives: Carries::Everything,
@@ -832,12 +1169,14 @@ mod tests {
                     burst: 4,
                     per_sec: 1,
                 },
+                bandwidth: None,
                 rated: None,
                 shared: Some(Arc::clone(&shared)),
                 explain: "test".into(),
                 answers_in: None,
                 interests_in: None,
                 narrowing: None,
+                counts: None,
             })
         };
         let (a, b) = (link(), link());

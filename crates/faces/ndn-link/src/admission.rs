@@ -30,7 +30,7 @@ use crate::host::{LinkTrust, OwnMembership};
 use crate::introduce::Introductions;
 use crate::peer::{PeerId, Peers};
 use crate::policy::{ASK_INTERESTS, ENROLLMENT_ANSWERS, ENROLLMENT_INTERESTS, MAX_CHAIN};
-use crate::serving::{QuotaSlot, QuotaState, ServePolicy};
+use crate::serving::{Limits, QuotaSlot, QuotaState, ServePolicy};
 
 /// Who the peer is, from its certificate validated in a held namespace —
 /// or, for a namespace this device does not hold, offline against the
@@ -856,6 +856,7 @@ impl Judge<'_> {
                         || named.iter().any(|d| name.has_prefix(d))
                 }),
                 rate: ENROLLMENT_ANSWERS,
+                bandwidth: None,
                 rated: None,
                 shared: None,
                 answers_in: Some(Box::new(move |name: &Name| {
@@ -865,6 +866,7 @@ impl Judge<'_> {
                     allowed.iter().any(|d| name.has_prefix(d))
                 })),
                 narrowing: None,
+                counts: None,
                 explain: format!(
                     "the link to {} was dialled from an introduction code and the party shows no \
                      certificate this device holds: it carries the answers to what this device \
@@ -893,7 +895,14 @@ impl Judge<'_> {
                 .and_then(|slot| slot.limits.clone().map(|l| (slot, l)))
             {
                 None => self.dialled_admission(admitted).unwrap_or_default(),
-                Some((slot, (rate, shared))) => {
+                Some((
+                    slot,
+                    Limits {
+                        rate,
+                        bandwidth,
+                        shared,
+                    },
+                )) => {
                     let own: Vec<Name> = admitted
                         .identities
                         .iter()
@@ -919,6 +928,7 @@ impl Judge<'_> {
                                 None => Box::new(|_: &Name| true),
                             },
                             rate,
+                            bandwidth,
                             // The ask exchange is rated apart per key: an honest asker
                             // sends nine Interests per signer per question (ndn-link.md
                             // §8.7 rule 20), a flood does not reach the signer's Device.
@@ -932,6 +942,7 @@ impl Judge<'_> {
                                 .as_ref()
                                 .map(|grant| self.grant_pushes(grant.key, own)),
                             interests_in: None,
+                            counts: None,
                             narrowing: admitted.grant.as_ref().map(|grant| {
                                 let table = self.grants.clone();
                                 let key = grant.key;
@@ -952,16 +963,18 @@ impl Judge<'_> {
                                      writers (<device>/32=seal, <device>/32=ask-answer) cross it, \
                                      and what it pushes is judged at every \
                                      packet by its role in each folder (a reader's entry widens \
-                                     nothing; other Data it pushes is dropped); the quotas bound it \
-                                     ({}/s from that device, and its asks of a device \
-                                     (<device>/32=ask-answer) {} at once, then {}/s: an honest ask \
-                                     sends at most 9, so ask again a few seconds later), and an \
+                                     nothing; other Data it pushes is dropped); the link's rates bound it \
+                                     ({}/s and {} MiB/s from that device; what is over is dropped, an \
+                                     Interest with a Nack saying Congestion: ask again soon), and its asks \
+                                     of a device (<device>/32=ask-answer) {} at once, then {}/s: an honest ask \
+                                     sends at most 9, so ask again a few seconds later); and an \
                                      entry ends at its date or when \
                                      the inviter revokes it or the folder's members record leaves \
                                      the person out",
                                     admitted.describe(),
                                     grant.describe(),
                                     rate.per_sec,
+                                    bandwidth.map_or(0, |b| b.per_sec >> 20),
                                     ASK_INTERESTS.burst,
                                     ASK_INTERESTS.per_sec
                                 ),
@@ -994,10 +1007,12 @@ impl Judge<'_> {
                                 || introduced.as_ref().is_some_and(|s| s.0.carries(name))
                         }),
                         rate: ENROLLMENT_INTERESTS,
+                        bandwidth: None,
                         rated: None,
                         shared: None,
                         answers_in: None,
                         interests_in: None,
+                        counts: None,
                         narrowing: None,
                         explain: format!(
                             "the enrollment link of key {} carries only that device's enrollment in \
@@ -1023,10 +1038,12 @@ impl Judge<'_> {
                         sends: Carries::Answers,
                         names: Box::new(move |name: &Name| carried.0.carries(name)),
                         rate: ENROLLMENT_INTERESTS,
+                        bandwidth: None,
                         rated: None,
                         shared: None,
                         answers_in: None,
                         interests_in: None,
+                        counts: None,
                         narrowing: None,
                         explain: format!(
                             "the introduction link of key {} carries only the Interests of the \
@@ -1048,10 +1065,12 @@ impl Judge<'_> {
                         sends: Carries::Answers,
                         names: self.departure_names(key),
                         rate: ENROLLMENT_INTERESTS,
+                        bandwidth: None,
                         rated: None,
                         shared: None,
                         answers_in: None,
                         interests_in: None,
+                        counts: None,
                         narrowing: None,
                         explain: format!(
                             "the departure link of key {key} carries only the Interests for the \
@@ -1077,10 +1096,12 @@ impl Judge<'_> {
                             in_enrollment(&keyring, &scoped, name, false)
                         }),
                         rate: ENROLLMENT_ANSWERS,
+                        bandwidth: None,
                         rated: None,
                         shared: None,
                         answers_in: None,
                         interests_in: None,
+                        counts: None,
                         narrowing: None,
                         explain: format!(
                             "the link to {label} carries only this device's enrollment in {ns} (its \

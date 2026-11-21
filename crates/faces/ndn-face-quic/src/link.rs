@@ -957,10 +957,12 @@ impl Transport for LinkFace {
         if let Some(scope) = &self.scope {
             match scope.sending(&wire) {
                 Judged::Pass => {}
-                Judged::Drop(interest) => {
+                Judged::Drop(nack) => {
                     // An Interest kept from the peer is Nacked to this side.
-                    if let (Some(interest), Some((answers, _))) = (interest, &self.local_answers) {
-                        let _ = answers.try_send(nack_for(&interest));
+                    if let (Some((reason, interest)), Some((answers, _))) =
+                        (nack, &self.local_answers)
+                    {
+                        let _ = answers.try_send(nack_for(reason, &interest));
                     }
                     return Ok(());
                 }
@@ -981,9 +983,10 @@ impl Transport for LinkFace {
             };
             match scope.received(&wire) {
                 Judged::Pass => return Ok(wire),
-                // An Interest the peer may not send here is Nacked to it.
-                Judged::Drop(Some(interest)) => {
-                    let _ = self.connection.send_datagram(nack_for(&interest));
+                // An Interest the peer may not send here, or sends over a
+                // rate, is Nacked to it.
+                Judged::Drop(Some((reason, interest))) => {
+                    let _ = self.connection.send_datagram(nack_for(reason, &interest));
                 }
                 Judged::Drop(None) => {}
             }

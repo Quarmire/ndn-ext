@@ -11,7 +11,7 @@ use parking_lot::Mutex;
 
 use ndn_face_quic::{
     CloseReason, Handshaken, Incoming, KeyFingerprint, LinkEndpoint, LinkError, LinkHandle,
-    LinkHello, LinkKeySource, LinkTransportConfig, PathSession,
+    LinkHello, LinkKeySource, LinkTransportConfig, PathSession, ScopeCounts,
 };
 use ndn_mgmt_wire::{LinkDetail, link_code as code};
 use ndn_packet::Name;
@@ -111,6 +111,9 @@ pub struct Links {
     pub(crate) reliability: LinkReliability,
     pub(crate) service: RelayService,
     pub(crate) quotas: QuotaState,
+    /// What the scopes of this device's links dropped for rate and Nacked, in
+    /// total ([`LinkReport::frames_over_rate`]).
+    pub(crate) scope_counts: Arc<ScopeCounts>,
     /// The grants of links to the people this device introduced.
     pub(crate) grants: Grants,
     /// The departure marks, and what a person let go is told
@@ -190,6 +193,7 @@ impl Links {
             reliability: setup.reliability,
             service: setup.service,
             quotas: QuotaState::default(),
+            scope_counts: Arc::default(),
             grants: Grants::default(),
             departures: Departures::default(),
             direct_options: setup.direct,
@@ -564,6 +568,8 @@ impl Links {
                 .sleepers
                 .wakes_sent
                 .load(std::sync::atomic::Ordering::Relaxed),
+            frames_over_rate: self.scope_counts.over_rate(),
+            congestion_nacks: self.scope_counts.congestion_nacks(),
             links,
             grants: self.grants(),
             memory: self.memory_report(),
@@ -837,7 +843,10 @@ impl Links {
         };
         // What the link carries is decided before the quota slots move to
         // the link's task: the deciding identity's limits bound it.
-        let admission = judge.admission_for(&admitted);
+        let mut admission = judge.admission_for(&admitted);
+        if let Some(scope) = &mut admission.scope {
+            scope.counts = Some(Arc::clone(&self.scope_counts));
+        }
         let quota = (admitted.quota.take(), std::mem::take(&mut admitted.quotas));
         let direction = hs.direction();
         let gone = CancellationToken::new();

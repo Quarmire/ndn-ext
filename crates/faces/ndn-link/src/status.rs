@@ -32,6 +32,14 @@ pub struct LinkReport {
     pub held_total: usize,
     /// Times this device invoked its wake notifier, in total.
     pub wakes_sent: u64,
+    /// Frames this device's links dropped for a rate (a stranger's quotas, a
+    /// grant link's bounds, an introduction link's), in total: Interests, Data
+    /// and fragments. Zero for a member's ordinary use.
+    pub frames_over_rate: u64,
+    /// Congestion Nacks this device sent for the Interests dropped for a rate,
+    /// in total: at most one each, and none past a link's bound on them
+    /// (`ndn_face_quic::CONGESTION_NACKS`).
+    pub congestion_nacks: u64,
     pub links: Vec<LinkStatus>,
     /// The grants in force now ([`Links::grants`](crate::Links::grants)),
     /// linked or not.
