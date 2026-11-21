@@ -58,7 +58,7 @@ ndn-link   = { path = ".", features = ["engine", "introductions"] }
 ndn-engine = { workspace = true }
 ndn-data   = { workspace = true }
 ndn-app    = { workspace = true }
-ndn-sync   = { workspace = true }
+ndn-sync   = { workspace = true, features = ["store-fjall"] }
 # tests/asks.rs: an evaluator for the ask exchange.
 async-trait = { workspace = true }
 ndn-namespace = { workspace = true }
@@ -67,6 +67,12 @@ ndn-trust-envelope = { workspace = true }
 ndn-identity = { path = "../../../../ndn-rs/crates/security/ndn-identity" }
 # tests/common: `NDN_LINK_TEST_LOG=<file> RUST_LOG=…` writes the tracing of a run to a file.
 tracing-subscriber = { workspace = true }
+# examples/ladder.rs, the latency ladder from TCP to ndn-data's put->watch (round 12):
+# raw QUIC on the stack the link uses, and `ndn_sync::store::BackendStore` over
+# fjall (`ndn-sync` above) as the data layer's disk store.
+quinn   = { version = "0.11", default-features = false, features = ["ring", "runtime-tokio", "rustls"] }
+rustls  = { version = "0.23", default-features = false, features = ["ring", "std"] }
+futures = { workspace = true }
 
 [lints]
 workspace = true
