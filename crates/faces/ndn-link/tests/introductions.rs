@@ -32,8 +32,9 @@ use ndn_face_quic::{
     LinkTransportConfig,
 };
 use ndn_link::{
-    ConfiguredEndpoints, EngineFaces, HostCandidates, Introductions, LinkHints, LinkSetup,
-    LinkTrust, Links, PathKind, PeerSpec, Quotas, RelayService, RelaySource, RelayUse, ServePolicy,
+    Candidate, CandidateKind, CandidateSource, ConfiguredEndpoints, EngineFaces, HostCandidates,
+    Introductions, LinkHints, LinkSetup, LinkTrust, Links, PathKind, PeerSpec, Quotas,
+    RelayService, RelaySource, RelayUse, ServePolicy,
 };
 use ndn_packet::encode::{DataBuilder, InterestBuilder};
 use ndn_packet::{Data, Name};
@@ -124,6 +125,11 @@ struct Parts {
 
 impl Parts {
     fn new(device: &str, listen: bool) -> Parts {
+        Parts::bound(device, listen.then(|| "127.0.0.1:0".parse().unwrap()))
+    }
+
+    /// A device whose link socket listens at `at`, when it listens.
+    fn bound(device: &str, at: Option<SocketAddr>) -> Parts {
         let name = n(device);
         let keys = Arc::new(SecurityManager::new());
         let key_name = keys
@@ -136,16 +142,8 @@ impl Parts {
         let fingerprint = link_key.fingerprint();
         let transport = LinkTransportConfig::default();
         let link_key: Arc<dyn LinkKeySource> = Arc::new(link_key);
-        let socket = listen.then(|| {
-            Arc::new(
-                LinkEndpoint::bind(
-                    "127.0.0.1:0".parse().unwrap(),
-                    Arc::clone(&link_key),
-                    &transport,
-                    true,
-                )
-                .unwrap(),
-            )
+        let socket = at.map(|at| {
+            Arc::new(LinkEndpoint::bind(at, Arc::clone(&link_key), &transport, true).unwrap())
         });
         let addr = socket.as_ref().map(|s| s.local_addr().unwrap());
         Parts {
@@ -350,6 +348,11 @@ struct Setup {
     /// Its policy refuses a loopback or link-local address from a code
     /// (`IntroPolicy::local_candidates` off).
     refuse_local: bool,
+    /// Where it listens, when it does (default: a loopback port).
+    bind: Option<SocketAddr>,
+    /// Its sources of candidate addresses (default: `HostCandidates` with
+    /// the loopback, devices on one machine).
+    candidates: Option<Vec<Arc<dyn CandidateSource>>>,
     /// How many candidates of its hint its compact codes carry (`None`: the
     /// policy's default).
     code_candidates: Option<usize>,
@@ -394,7 +397,12 @@ async fn forwarder(person: &Person) -> (ForwarderEngine, ShutdownHandle) {
 }
 
 async fn embedded(person: &Person, device: &str, setup: Setup) -> Embedded {
-    let parts = Parts::new(device, setup.listen);
+    let parts = Parts::bound(
+        device,
+        setup
+            .listen
+            .then(|| setup.bind.unwrap_or_else(|| "127.0.0.1:0".parse().unwrap())),
+    );
     embedded_of(person, parts, setup).await
 }
 
@@ -412,9 +420,11 @@ async fn embedded_of(person: &Person, parts: Parts, setup: Setup) -> Embedded {
             faces: Arc::new(EngineFaces(engine.clone())),
             paths: Arc::new(ConfiguredEndpoints),
             // Devices on one machine: loopback host candidates.
-            candidates: vec![Arc::new(HostCandidates {
-                include_local: true,
-            })],
+            candidates: setup.candidates.unwrap_or_else(|| {
+                vec![Arc::new(HostCandidates {
+                    include_local: true,
+                })]
+            }),
             socket: parts.socket.clone(),
             transport: parts.transport.clone(),
             relays: Default::default(),
@@ -1784,6 +1794,342 @@ async fn a_loopback_first_contact_is_refused_unless_the_policy_allows_local_cand
 
 /// The short code of `code`, read: its device, its secret, and so the token
 /// of its hint record.
+/// A source that lists these addresses on the socket's port as host
+/// candidates, in this order: what a host's interfaces give in the system's
+/// order, the loopback first.
+struct Listed(&'static [&'static str]);
+
+impl CandidateSource for Listed {
+    fn candidates(&self, local: SocketAddr) -> Vec<Candidate> {
+        self.0
+            .iter()
+            .map(|ip| Candidate {
+                kind: CandidateKind::Host,
+                addr: SocketAddr::new(ip.parse().unwrap(), local.port()),
+            })
+            .collect()
+    }
+}
+
+/// The short code carries the one address of the hint's order, so the order
+/// of the host's candidates decides whether another computer can dial it:
+/// the host's sources list the loopback before its LAN address, and the
+/// hint, and so the code, still says the LAN address first, with
+/// `local_candidates` on or off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_short_code_names_an_address_another_computer_reaches_when_the_host_lists_the_loopback_first()
+ {
+    for refuse_local in [false, true] {
+        let alice = Person::new("/alice").await;
+        let laptop = embedded(
+            &alice,
+            "/alice/member/laptop",
+            Setup {
+                listen: true,
+                refuse_local,
+                candidates: Some(vec![Arc::new(Listed(&["127.0.0.1", "10.77.0.5"]))]),
+                ..Setup::default()
+            },
+        )
+        .await;
+        let code = offered(&laptop).await;
+        let port = laptop.addr.unwrap().port();
+        let short = short_of(&code);
+        assert!(
+            short.contains(&format!("10.77.0.5:{port}")) && !short.contains("127.0.0.1"),
+            "local_candidates {}: the code names the loopback: {short}",
+            !refuse_local
+        );
+        let hint = hint_of(&code).expect("a hint");
+        assert_eq!(
+            hint.candidates
+                .iter()
+                .map(|c| c.addr.to_string())
+                .collect::<Vec<_>>(),
+            [format!("10.77.0.5:{port}"), format!("127.0.0.1:{port}")],
+            "the hint lists the address another computer reaches first"
+        );
+    }
+}
+
+const CABLE_ROLE: &str = "NDN_LINK_CABLE_ROLE";
+const CABLE_CODE: &str = "NDN_LINK_CABLE_CODE";
+const CABLE_TEST: &str = "a_short_code_joins_across_two_network_namespaces_joined_by_a_cable";
+const UNSHARE: [&str; 6] = [
+    "--map-root-user",
+    "--net",
+    "--pid",
+    "--fork",
+    "--kill-child",
+    "--mount-proc",
+];
+
+/// A child process, killed and reaped when this goes.
+struct Kill(std::process::Child);
+
+impl Drop for Kill {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Run `argv` to its end; its failure is a panic that says what it said.
+fn run(argv: &[String]) {
+    let out = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .output()
+        .unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+    assert!(
+        out.status.success(),
+        "{argv:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn words(argv: &[&str]) -> Vec<String> {
+    argv.iter().map(|s| (*s).to_owned()).collect()
+}
+
+fn cable_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap()
+}
+
+/// The shape of ndf's scenario F4: Ann's laptop at 10.1.0.1 and Bob's at
+/// 10.9.0.2 in two network namespaces joined by a cable (a veth pair), and
+/// each with the loopback up as a host has it; Ann's also with a container
+/// bridge, `docker0`, which the system lists before her LAN address. Ann
+/// invites Bob, with `local_candidates` on, and he joins by the short code
+/// alone: the code's one address is hers on the cable.
+///
+/// One test binary plays four parts, by `NDN_LINK_CABLE_ROLE`: the test
+/// itself (re-run under `unshare`, a user, network and PID namespace of its
+/// own so that nothing of the host's network is touched and no process
+/// outlives it), the cable (builds the namespaces and runs the two hosts),
+/// Ann and Bob. Skipped, saying why, where the machine has no unprivileged
+/// user namespaces or lacks `ip` or `nsenter`.
+#[test]
+fn a_short_code_joins_across_two_network_namespaces_joined_by_a_cable() {
+    match std::env::var(CABLE_ROLE).as_deref() {
+        Ok("cable") => cable(),
+        Ok("ann") => cable_runtime().block_on(cable_ann()),
+        Ok("bob") => cable_runtime().block_on(cable_bob()),
+        _ => cable_outside(),
+    }
+}
+
+fn cable_outside() {
+    let namespaces = std::process::Command::new("unshare")
+        .args(UNSHARE)
+        .arg("true")
+        .output();
+    if !namespaces.as_ref().is_ok_and(|o| o.status.success()) {
+        eprintln!(
+            "SKIPPED: `unshare {} true` does not work here ({namespaces:?}): the case needs \
+             unprivileged user, network and PID namespaces",
+            UNSHARE.join(" ")
+        );
+        return;
+    }
+    for tool in ["ip", "nsenter"] {
+        if std::process::Command::new(tool).arg("-V").output().is_err() {
+            eprintln!("SKIPPED: `{tool}` is not on PATH (iproute2 and util-linux are needed)");
+            return;
+        }
+    }
+    let exe = std::env::current_exe().unwrap();
+    let out = std::process::Command::new("unshare")
+        .args(UNSHARE)
+        .arg("--")
+        .arg(exe)
+        .args(["--exact", CABLE_TEST, "--nocapture", "--test-threads=1"])
+        .env(CABLE_ROLE, "cable")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("unshare runs");
+    // What the namespaces' side said (Ann's code, who joined): shown with
+    // `--nocapture`, and the whole of it when the case fails.
+    eprint!("{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Inside the new namespaces: this one is Ann's, a held one is Bob's.
+fn cable() {
+    let exe = std::env::current_exe().unwrap();
+    let holder = Kill(
+        std::process::Command::new("unshare")
+            .args(["--net", "--", "sleep", "infinity"])
+            .spawn()
+            .expect("a network namespace for Bob"),
+    );
+    let bob_ns = format!("/proc/{}/ns/net", holder.0.id());
+    let ours = std::fs::read_link("/proc/self/ns/net").unwrap();
+    let until = Instant::now() + Duration::from_secs(5);
+    while std::fs::read_link(&bob_ns).map_or(true, |ns| ns == ours) {
+        assert!(Instant::now() < until, "Bob's namespace did not appear");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let in_bob = |argv: &[&str]| {
+        let mut all = words(&["nsenter", &format!("--net={bob_ns}"), "--"]);
+        all.extend(words(argv));
+        run(&all);
+    };
+    // Ann's host: the loopback, a container bridge (made first, so the
+    // system lists it first), and her address on the cable.
+    let bob_pid = holder.0.id().to_string();
+    for argv in [
+        &["ip", "link", "set", "lo", "up"][..],
+        &["ip", "link", "add", "docker0", "type", "bridge"],
+        &["ip", "addr", "add", "172.17.0.1/16", "dev", "docker0"],
+        &["ip", "link", "set", "docker0", "up"],
+        &[
+            "ip", "link", "add", "name", "ann0", "type", "veth", "peer", "name", "bob0", "netns",
+            &bob_pid,
+        ],
+        &["ip", "addr", "add", "10.1.0.1/24", "dev", "ann0"],
+        &["ip", "link", "set", "ann0", "up"],
+        &["ip", "route", "add", "10.9.0.0/24", "dev", "ann0"],
+    ] {
+        run(&words(argv));
+    }
+    for argv in [
+        &["ip", "link", "set", "lo", "up"][..],
+        &["ip", "addr", "add", "10.9.0.2/24", "dev", "bob0"],
+        &["ip", "link", "set", "bob0", "up"],
+        &["ip", "route", "add", "10.1.0.0/24", "dev", "bob0"],
+    ] {
+        in_bob(argv);
+    }
+
+    let mut ann = Kill(
+        std::process::Command::new(&exe)
+            .args(["--exact", CABLE_TEST, "--nocapture", "--test-threads=1"])
+            .env(CABLE_ROLE, "ann")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("Ann starts"),
+    );
+    let stdout = ann.0.stdout.take().unwrap();
+    let (lines, heard) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if lines.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut seen = Vec::new();
+    let code = loop {
+        match heard.recv_timeout(Duration::from_secs(60)) {
+            Ok(line) => match line.strip_prefix("CODE ") {
+                Some(code) => break code.to_owned(),
+                None => seen.push(line),
+            },
+            Err(_) => panic!("Ann made no short code within 60 s, or ended: {seen:?}"),
+        }
+    };
+    eprintln!("Ann's code: {code}");
+
+    let mut bob = Kill(
+        std::process::Command::new("nsenter")
+            .arg(format!("--net={bob_ns}"))
+            .arg("--")
+            .arg(&exe)
+            .args(["--exact", CABLE_TEST, "--nocapture", "--test-threads=1"])
+            .env(CABLE_ROLE, "bob")
+            .env(CABLE_CODE, &code)
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .expect("Bob starts"),
+    );
+    let until = Instant::now() + Duration::from_secs(150);
+    let status = loop {
+        if let Some(status) = bob.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < until,
+            "Bob did not end within 150 s (Ann's code: {code})"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    while let Ok(line) = heard.try_recv() {
+        seen.push(line);
+    }
+    assert!(
+        status.success(),
+        "Bob did not join by the short code {code} ({status}); Ann said: {seen:?}"
+    );
+    assert!(
+        code.contains("10.1.0.1:") && !code.contains("127.0.0.1") && !code.contains("172.17."),
+        "the code names an address another computer cannot reach: {code}"
+    );
+}
+
+/// Ann: her laptop listens on every address and offers the folder.
+async fn cable_ann() {
+    let alice = Person::new("/alice").await;
+    let laptop = embedded(
+        &alice,
+        "/alice/member/laptop",
+        Setup {
+            listen: true,
+            bind: Some("0.0.0.0:0".parse().unwrap()),
+            ..Setup::default()
+        },
+    )
+    .await;
+    println!("CANDIDATES {:?}", laptop.links.hint_candidates());
+    let code = offered(&laptop).await;
+    println!("CODE {}", short_of(&code));
+    std::future::pending::<()>().await;
+}
+
+/// Bob: a laptop that only dials, holding the short code.
+async fn cable_bob() {
+    let code = std::env::var(CABLE_CODE).expect("Ann's code");
+    let bob = Person::new("/bob").await;
+    let phone = embedded(&bob, "/bob/member/phone", Setup::default()).await;
+    let joined = joins(&phone, &code, Duration::from_secs(45))
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "the join by {code} failed: {e} ({:?})\nbob: {:#?}",
+                e.next(),
+                phone.links.report()
+            )
+        });
+    assert_eq!(
+        joined,
+        Joined {
+            folder: n(FOLDER),
+            role: Role::Writer,
+            inviter: n("/alice"),
+        }
+    );
+    let cover = n(&format!("{FOLDER}/cover"));
+    until(
+        "bob reads alice's cover",
+        Duration::from_secs(60),
+        async || reads(&phone.device, &cover, "cover by alice").await,
+    )
+    .await;
+}
+
 fn read_short(code: &ndn_data::Code) -> ShortCode {
     ShortCode::parse(&short_of(code), true).unwrap_or_else(|e| panic!("{e}"))
 }

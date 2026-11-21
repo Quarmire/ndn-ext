@@ -33,12 +33,14 @@ use ndn_packet::{Data, Interest, Name};
 use ndn_security::{ReplayCheck, ReplayGuard, Signer};
 
 use crate::admission::{Admitted, own_memberships};
-use crate::candidates::{Candidate, CandidateKind, dial_order, interfaces, probe_targets};
+use crate::candidates::{
+    Candidate, CandidateKind, best_first, dial_order, interfaces, probe_targets,
+};
 use crate::links::{Links, NotLinked, Origin, close_code, link_error_detail};
 use crate::peer::PeerId;
 use crate::policy::{
-    Backoff, CANDIDATES_MAX, DIAL_STAGGER, PROBE_INTERVAL, PROBE_WINDOW, PUNCH_ANSWER_TIMEOUT,
-    PUNCH_BURST, PUNCH_CHECKS, PUNCH_GRACE, PUNCH_REFILL, PUNCH_WINDOW, PUNCHES_MAX,
+    Backoff, DIAL_STAGGER, PROBE_INTERVAL, PROBE_WINDOW, PUNCH_ANSWER_TIMEOUT, PUNCH_BURST,
+    PUNCH_CHECKS, PUNCH_GRACE, PUNCH_REFILL, PUNCH_WINDOW, PUNCHES_MAX,
 };
 use crate::punch::{self, PunchMessage};
 use crate::signal::Answer;
@@ -352,7 +354,10 @@ fn now_ms() -> u64 {
 impl Links {
     /// This device's candidate addresses for its link socket `socket`:
     /// reflexive ones (what linked devices see), then the sources' (host,
-    /// advertised, mapped), at most [`CANDIDATES_MAX`].
+    /// advertised, mapped), best first: an address another computer can
+    /// reach before that of a bridge or container interface, and loopback
+    /// and link-local ones last, candidates of a rank in the order given
+    /// ([`best_first`]); the first [`CANDIDATES_MAX`](crate::policy::CANDIDATES_MAX) are kept.
     pub(crate) fn gather(&self, socket: &LinkEndpoint) -> Vec<Candidate> {
         let Ok(local) = socket.local_addr() else {
             return Vec::new();
@@ -373,8 +378,13 @@ impl Links {
                 }
             }
         }
-        out.truncate(CANDIDATES_MAX);
-        out
+        // One candidate has no order to keep: no need to read the interfaces.
+        let ours = if out.len() > 1 {
+            interfaces()
+        } else {
+            Vec::new()
+        };
+        best_first(out, &ours)
     }
 
     /// Why direct paths with an admitted device are off, if they are: its
