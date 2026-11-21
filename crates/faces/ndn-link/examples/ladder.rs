@@ -131,7 +131,13 @@ async fn main() {
             let h = host(1, 2, None, a[1] == "1").await;
             let _guard = produce(&h.node).await;
             println!("ADDR {}", h.addr);
-            std::future::pending::<()>().await
+            let mut lines = BufReader::new(tokio::io::stdin()).lines();
+            while let Some(l) = lines.next_line().await.unwrap() {
+                if l == "COUNTERS" {
+                    let r = h._keep.1.report();
+                    println!("COUNTERS {} {}", r.frames_over_rate, r.congestion_nacks);
+                }
+            }
         }
         Some("a") => child_a(&a[1]).await,
         Some("b") => child_b(&a[1], &a[2]).await,
@@ -163,6 +169,10 @@ async fn child_a(dir: &str) {
                 ann.put(&folder, "bench", &bytes).await;
                 println!("PUT {i} {t0} {}", now_ns());
             }
+            "COUNTERS" => {
+                let (over, nacks) = ann.link_counters();
+                println!("COUNTERS {over} {nacks}");
+            }
             _ => tape::command(w[0]),
         }
     }
@@ -186,7 +196,12 @@ async fn child_b(dir: &str, code: &str) {
     });
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     while let Some(l) = lines.next_line().await.unwrap() {
-        tape::command(&l);
+        if l == "COUNTERS" {
+            let (over, nacks) = bob.link_counters();
+            println!("COUNTERS {over} {nacks}");
+        } else {
+            tape::command(&l);
+        }
     }
 }
 
@@ -531,6 +546,22 @@ struct Reexpressed {
     pieces: [u64; 3],
     failed: [u64; 3],
     nacked: [u64; 3],
+    /// What the links counted over the whole sample of the size (both ends): frames dropped for a rate, congestion Nacks sent.
+    over_rate: [u64; 3],
+    nacks_sent: [u64; 3],
+}
+
+/// The link counters of a child (`COUNTERS` on its stdin): frames its links dropped for a rate, congestion Nacks they sent.
+async fn counters(k: &mut Kid) -> (u64, u64) {
+    let l = k.ask("COUNTERS", "COUNTERS").await;
+    let mut w = l.split(' ').map(|x| x.parse::<u64>().unwrap());
+    (w.next().unwrap(), w.next().unwrap())
+}
+
+/// The same of this process's own links.
+fn own_counters(h: &Host) -> (u64, u64) {
+    let r = h._keep.1.report();
+    (r.frames_over_rate, r.congestion_nacks)
 }
 
 fn loadavg() -> String {
@@ -630,19 +661,25 @@ async fn ladder() {
                     pieces: [0; 3],
                     failed: [0; 3],
                     nacked: [0; 3],
+                    over_rate: [0; 3],
+                    nacks_sent: [0; 3],
                 };
                 for (k, (size, _)) in SIZES.iter().enumerate() {
                     let (f0, n0) = (FAILED.load(Relaxed), NACKED.load(Relaxed));
                     let r0 = REEXPRESSED.load(Relaxed);
+                    let (p0, h0) = (counters(&mut p).await, own_counters(&h));
                     cells[k] = sample!(n, {
                         let before = REEXPRESSED.load(Relaxed);
                         ask(&h.node, mode, *size, window).await;
                         c.runs_with[k] += usize::from(REEXPRESSED.load(Relaxed) > before);
                     });
+                    let (p1, h1) = (counters(&mut p).await, own_counters(&h));
                     c.runs[k] = n + WARM;
                     c.pieces[k] = REEXPRESSED.load(Relaxed) - r0;
                     c.failed[k] = FAILED.load(Relaxed) - f0;
                     c.nacked[k] = NACKED.load(Relaxed) - n0;
+                    c.over_rate[k] = p1.0 - p0.0 + h1.0 - h0.0;
+                    c.nacks_sent[k] = p1.1 - p0.1 + h1.1 - h0.1;
                 }
                 counts.push(c);
                 rungs.push(Rung {
@@ -688,8 +725,9 @@ async fn ladder() {
             if traced {
                 rungs.push(Rung { id: "5p".into(), name: "ndn-data pull of the held version (B: first fetch Interest out -> last Data in)".into(), vs: Some("3c"), cells: pull });
                 timeline = text;
-                put_watch_counts = drops;
+                put_watch_counts.push_str(&format!("Traced runs:\n\n{drops}"));
             } else {
+                put_watch_counts.push_str(&format!("Clean runs (no recorder):\n\n{drops}\n"));
                 rungs.push(Rung {
                     id: "5".into(),
                     name:
@@ -765,8 +803,8 @@ async fn ladder() {
                 let cells: Vec<String> = (0..3)
                     .map(|k| {
                         format!(
-                            "{} of {} runs / {} pieces / {} failed ({} Nack)",
-                            c.runs_with[k], c.runs[k], c.pieces[k], c.failed[k], c.nacked[k]
+                            "{} of {} runs / {} pieces / {} failed ({} Nack) / link: {} frames over rate, {} congestion Nacks",
+                            c.runs_with[k], c.runs[k], c.pieces[k], c.failed[k], c.nacked[k], c.over_rate[k], c.nacks_sent[k]
                         )
                     })
                     .collect();
@@ -774,7 +812,9 @@ async fn ladder() {
             }
         }
         if !put_watch_counts.is_empty() {
-            say!("\nRung 5, traced runs:\n");
+            say!(
+                "\nRung 5 (per size, warm-ups included; the traced runs' fetches and drop notices):\n"
+            );
             say!("{put_watch_counts}");
         }
     }
@@ -957,9 +997,11 @@ async fn put_watch(
     .await;
     line(&mut b.out, "READY").await;
     let (mut c5, mut c5p) = ([None; 3], [None; 3]);
+    use std::fmt::Write;
     let (mut text, mut counts) = (String::new(), String::new());
     for (k, (size, label)) in SIZES.iter().enumerate() {
         let (mut got, mut pull, mut runs) = (Vec::new(), Vec::new(), Vec::new());
+        let (a0, b0) = (counters(&mut a).await, counters(&mut b).await);
         eprintln!("rung 5 {} {label}", if traced { "traced" } else { "clean" });
         for i in 0..WARM + if traced { tl } else { n } {
             if traced {
@@ -1012,6 +1054,13 @@ async fn put_watch(
                 runs.push(r);
             }
         }
+        let (a1, b1) = (counters(&mut a).await, counters(&mut b).await);
+        let _ = writeln!(
+            counts,
+            "- {label} link counters (A and B, warm-up runs included): `frames_over_rate` +{}, `congestion_nacks` +{}",
+            a1.0 - a0.0 + b1.0 - b0.0,
+            a1.1 - a0.1 + b1.1 - b0.1
+        );
         c5[k] = Some((pct(&mut got, 0.5), pct(&mut got, 0.95)));
         if !traced {
             continue;

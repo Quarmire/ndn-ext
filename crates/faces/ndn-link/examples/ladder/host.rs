@@ -514,6 +514,13 @@ impl Host {
         folder
     }
 
+    /// What this device's links counted, in total: frames dropped for a rate (`LinkReport::frames_over_rate`) and congestion
+    /// Nacks sent for them (`congestion_nacks`).
+    pub fn link_counters(&self) -> (u64, u64) {
+        let r = self._links.report();
+        (r.frames_over_rate, r.congestion_nacks)
+    }
+
     /// An offer of `folder` to write in it, the short code that carries it (a day, for one person).
     pub async fn offer(&self, folder: &Name) -> String {
         let until = Timestamp(
