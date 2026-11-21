@@ -1794,8 +1794,6 @@ async fn a_loopback_first_contact_is_refused_unless_the_policy_allows_local_cand
     assert_eq!(joined.folder, n(FOLDER));
 }
 
-/// The short code of `code`, read: its device, its secret, and so the token
-/// of its hint record.
 /// A source that lists these addresses on the socket's port as host
 /// candidates, in this order: what a host's interfaces give in the system's
 /// order, the loopback first.
@@ -2132,6 +2130,8 @@ async fn cable_bob() {
     .await;
 }
 
+/// The short code of `code`, read: its device, its secret, and so the token
+/// of its hint record.
 fn read_short(code: &ndn_data::Code) -> ShortCode {
     ShortCode::parse(&short_of(code), true).unwrap_or_else(|e| panic!("{e}"))
 }
