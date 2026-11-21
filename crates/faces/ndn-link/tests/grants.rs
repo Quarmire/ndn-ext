@@ -805,9 +805,17 @@ async fn a_removed_writers_names_stop_being_carried_and_a_name_outside_the_folde
     bob.engine
         .fib()
         .add_nexthop(&n(&carols.device("phone")), bobs_face_to_ann, 10);
+    let before_relay = interests_at(&carol, ann.key);
     assert!(
         asks(&bob, ann.key, &carols_entry_direct, false).await,
         "{carols_entry_direct}, Carol's entry of the folder, was not relayed by Ann to Carol's link"
+    );
+    let carol_was_asked = interests_at(&carol, ann.key) - before_relay;
+    // What Carol's side of the link was asked: the counter measures the
+    // relay (it rises for the ask above, which Ann relays to Carol).
+    assert!(
+        carol_was_asked > 0,
+        "{carols_entry_direct}: Carol's link carried no Interest of the relay above"
     );
     assert!(
         !asks(&bob, ann.key, &carols_diary_direct, false).await,
@@ -832,9 +840,16 @@ async fn a_removed_writers_names_stop_being_carried_and_a_name_outside_the_folde
     );
     assert!(linked(&ann, bob.key), "Bob's link closed with Carol's");
     // Carol's link is gone, and with it Ann's route to her device name: the
-    // relay ended with her entry, whatever Bob's forwarder sends.
-    assert!(
-        !asks(&bob, ann.key, &carols_entry_direct, false).await,
+    // relay ended with her entry, whatever Bob's forwarder sends. Ann's copy of
+    // Carol's entry (her content store) may answer Bob, who may read it: what
+    // must not happen is that the Interest reaches Carol, so what Carol's side
+    // of the link is asked is what is counted.
+    let before_ask = interests_at(&carol, ann.key);
+    let _answered_from_ann_s_copy = asks(&bob, ann.key, &carols_entry_direct, false).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        interests_at(&carol, ann.key),
+        before_ask,
         "{carols_entry_direct} was relayed to a writer whose link had ended"
     );
 }

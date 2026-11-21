@@ -1055,6 +1055,25 @@ pub async fn asks(on: &Embedded, key: KeyFingerprint, name: &Name, by_prefix: bo
     ask(on, key, name, by_prefix).await.is_ok()
 }
 
+/// The Interests that have arrived on `on`'s forwarder over its links to the
+/// device with `key`: what that device's side of the link was asked.
+pub fn interests_at(on: &Embedded, key: KeyFingerprint) -> u64 {
+    let faces: Vec<_> = on
+        .links
+        .report()
+        .links
+        .iter()
+        .filter(|l| l.key == Some(key))
+        .flat_map(|l| l.paths.iter().map(|p| p.face))
+        .collect();
+    let states = on.engine.face_states();
+    faces
+        .iter()
+        .filter_map(|f| states.get(f))
+        .map(|s| s.counters.in_interests.load(Ordering::Relaxed))
+        .sum()
+}
+
 /// [`asks`], with the reason when it is not answered: a Nack comes back at
 /// once for an Interest a link's scope refused, a timeout for one nobody
 /// answered.
@@ -1063,6 +1082,23 @@ pub async fn ask(
     key: KeyFingerprint,
     name: &Name,
     by_prefix: bool,
+) -> Result<(), String> {
+    ask_over(on, key, name, by_prefix, false).await
+}
+
+/// [`asks`] with MustBeFresh: no forwarder answers it from a copy it cached
+/// (the devices' Data are not fresh), so what answers is a producer the
+/// Interest reaches over the links.
+pub async fn asks_fresh(on: &Embedded, key: KeyFingerprint, name: &Name) -> bool {
+    ask_over(on, key, name, false, true).await.is_ok()
+}
+
+async fn ask_over(
+    on: &Embedded,
+    key: KeyFingerprint,
+    name: &Name,
+    by_prefix: bool,
+    fresh: bool,
 ) -> Result<(), String> {
     let face = on
         .links
@@ -1079,6 +1115,9 @@ pub async fn ask(
         ndn_packet::encode::InterestBuilder::new(name.clone()).lifetime(Duration::from_secs(3));
     if by_prefix {
         builder = builder.can_be_prefix();
+    }
+    if fresh {
+        builder = builder.must_be_fresh();
     }
     let mut consumer = on.engine.app_consumer(on.cancel.child_token());
     consumer
