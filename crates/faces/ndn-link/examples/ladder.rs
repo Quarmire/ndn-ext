@@ -894,13 +894,18 @@ fn heard(r: &Step) -> Option<u128> {
         .min()
 }
 
+/// When one step of a put->watch happened in a run (`None`: no such event in it).
+type Moment = fn(&Step) -> Option<u128>;
+/// A named step of the timeline.
+type Stage<'a> = (&'a str, Moment);
+
 async fn put_watch(
     data: &Path,
     n: usize,
     tl: usize,
     traced: bool,
 ) -> ([Cell; 3], [Cell; 3], String, String) {
-    let steps: [(&str, fn(&Step) -> Option<u128>); 13] = [
+    let steps: [Stage; 13] = [
         ("put returns on A", |r| Some(r.end)),
         ("A: store flush round 1 begins", |r| {
             times(r, 'A', "flush_begin").min()
@@ -1022,11 +1027,7 @@ async fn put_watch(
 }
 
 /// The timeline table of one size, its fetch accounting, and the counts of rung 6 (as two strings).
-fn report_timeline(
-    label: &str,
-    runs: &[Step],
-    steps: &[(&str, fn(&Step) -> Option<u128>)],
-) -> (String, String) {
+fn report_timeline(label: &str, runs: &[Step], steps: &[Stage]) -> (String, String) {
     use std::fmt::Write;
     let (mut t, mut c) = (String::new(), String::new());
     let _ = writeln!(
