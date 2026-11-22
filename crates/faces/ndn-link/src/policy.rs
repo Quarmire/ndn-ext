@@ -145,16 +145,13 @@ pub const GRANT_ANSWERED: RateLimit = RateLimit {
     per_sec: 16 << 20,
 };
 /// What a grant link's member may send of the data layer's asks (names whose
-/// first keyword is `32=grant`, `32=hold` or `32=audit`, followed by the ask:
-/// the grants of a folder's epoch keys, the custody leases and their audits),
-/// all three together, per link, beside the link's other rates: 256 at once,
+/// first keyword is `32=grant`, followed by the ask: the grants of a folder's
+/// epoch keys), per link, beside the link's other rates: 256 at once,
 /// then 16 a second; over it dropped silently. What one honest member asks: a grant ask per
-/// collection and epoch it reads (retried on a backoff of seconds), a hold ask
-/// per record it has held (one at a time per asker, the data layer's
-/// `HOLDS_PER_ASKER`), and an audit of 16 pieces per holder per round, 32 in flight; and
+/// collection and epoch it reads (retried on a backoff of seconds); and
 /// the member's own device never has more than 256 asks in flight (its fetch
 /// slots), so the burst covers all it can have outstanding, and a first
-/// sync of a few hundred collections or audits of several holders at once are
+/// sync of a few hundred collections is
 /// within it. What it must stay under is how fast this device's data layer
 /// can drain asks it cannot answer (a fetch back to the asker that
 /// times out): about 128 a second, so 16 a second leaves it room for 8

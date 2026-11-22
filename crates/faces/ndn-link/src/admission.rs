@@ -976,10 +976,9 @@ impl Judge<'_> {
                             },
                             rate,
                             bandwidth,
-                            // The data layer's own asks (`32=grant`, `32=hold`,
-                            // `32=audit`) are rated apart per key, each a task, a
-                            // fetch back to the member and a signature at the owner
-                            // (ndn-link.md §15.3).
+                            // The data layer's own asks (`32=grant`) are rated apart
+                            // per key, each a task, a fetch back to the member and a
+                            // signature at the owner (ndn-link.md §15.3).
                             rated: if serving != Serving::Stranger {
                                 vec![RatedInterests {
                                     names: Box::new(is_data_ask),
@@ -1021,8 +1020,8 @@ impl Judge<'_> {
                                      of any name; what is over is dropped, an Interest with a Nack \
                                      saying Congestion: ask again soon), what this device answers it \
                                      ({} MiB/s: what is over is dropped, and asked again by its timer), \
-                                     and its grant, hold and audit asks (<device>/32=grant, \
-                                     32=hold, 32=audit) {} at once, then {}/s together (over it is \
+                                     and its grant asks (<device>/32=grant) {} at once, \
+                                     then {}/s (over it is \
                                      dropped without a Nack: ask again later); and an \
                                      entry ends at its date or when \
                                      the inviter revokes it or the folder's members record leaves \
@@ -1042,8 +1041,8 @@ impl Judge<'_> {
                                      but takes the grant link's rates ({}/s of frames and {} MiB/s from \
                                      that device, {}/s of Interests of any name; what is over is dropped, \
                                      an Interest with a Nack saying Congestion: ask again soon), what \
-                                     this device answers it ({} MiB/s), and its grant, hold and \
-                                     audit asks ({} at once, then {}/s); it ends when the \
+                                     this device answers it ({} MiB/s), and its grant asks \
+                                     ({} at once, then {}/s); it ends when the \
                                      certificate lapses; a member or an \
                                      admin certificate of this namespace links with none of these",
                                     admitted.describe(),
@@ -2418,12 +2417,9 @@ mod tests {
             scope.rated.iter().position(|class| (class.names)(&name))
         };
         let grant_ask = rated_for("/a/member/laptop/32=grant/abc");
-        let hold_ask = rated_for("/a/member/laptop/32=hold/abc");
-        let audit_ask = rated_for("/a/member/laptop/32=audit/abc");
         assert!(
-            grant_ask.is_some() && grant_ask == hold_ask && hold_ask == audit_ask,
-            "grant, hold and audit asks are not rated together in a class of their own: \
-             {grant_ask:?} {hold_ask:?} {audit_ask:?}"
+            grant_ask.is_some(),
+            "grant asks are not rated in a class of their own"
         );
         assert_eq!(
             scope.rated[grant_ask.unwrap()].rate.burst,

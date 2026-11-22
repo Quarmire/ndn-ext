@@ -765,21 +765,18 @@ fn entry_carries(surface: Option<&Arc<dyn Introductions>>, entry: &Grant, name: 
 }
 
 /// Whether `name` is an **ask of the data layer** to a device: its first keyword is
-/// `32=grant` (the grant of a folder's epoch key), `32=hold` (a custody lease) or
-/// `32=audit` (the audit of one), after plain components only (a device's name), as
-/// the data layer routes a served name (`served_kind`: the first component that is
-/// no plain one decides). The shape after the keyword is not judged here: a name
-/// that is not an ask is refused by the data layer, and a link that rates more
-/// names than the asks only rates what the data layer would refuse anyway. These
+/// `32=grant` (the grant of a folder's epoch key), after plain components only (a
+/// device's name), as the data layer routes a served name (`served_kind`: the first
+/// component that is no plain one decides). The shape after the keyword is not judged
+/// here: a name that is not an ask is refused by the data layer, and a link that rates
+/// more names than the asks only rates what the data layer would refuse anyway. These
 /// are what a link rates apart ([`crate::policy::DATA_ASKS`]).
 pub(crate) fn is_data_ask(name: &Name) -> bool {
     use ndn_packet::tlv_type::{IMPLICIT_SHA256, KEYWORD, PARAMETERS_SHA256};
     let comps = name.components();
     let plain = |c: &NameComponent| !matches!(c.typ, KEYWORD | IMPLICIT_SHA256 | PARAMETERS_SHA256);
     comps.iter().position(|c| !plain(c)).is_some_and(|at| {
-        at > 0
-            && comps[at].typ == KEYWORD
-            && matches!(comps[at].value.as_ref(), b"grant" | b"hold" | b"audit")
+        at > 0 && comps[at].typ == KEYWORD && comps[at].value.as_ref() == b"grant"
     })
 }
 
@@ -1215,33 +1212,31 @@ mod tests {
     const GENERIC: u64 = ndn_packet::tlv_type::NAME_COMPONENT;
     const PARAMETERS: u64 = ndn_packet::tlv_type::PARAMETERS_SHA256;
 
-    /// R12 H1: the data layer's asks of a device (`32=grant`, `32=hold`, `32=audit` right
-    /// after its name) are what a link rates apart for them, by the first keyword as the data
-    /// layer routes a name; nothing else is.
+    /// R12 H1: the data layer's asks of a device (`32=grant` right after its name) are what
+    /// a link rates apart for them, by the first keyword as the data layer routes a name;
+    /// nothing else is.
     #[test]
     fn the_data_layers_asks_are_rated_by_their_first_keyword() {
         let device = "/alice/member/laptop";
-        for ask in ["grant", "hold", "audit"] {
-            let name = then(device, vec![keyword(ask), octets(GENERIC)]);
-            assert!(is_data_ask(&name), "32={ask} after a device name");
-            // A device name of any depth, and a name with a tail the data layer would refuse.
-            assert!(is_data_ask(&then(
-                "/alice/laptop",
-                vec![keyword(ask), octets(GENERIC)]
-            )));
-            assert!(is_data_ask(&then(
-                "/a/b/c/d/e",
-                vec![keyword(ask), octets(GENERIC)]
-            )));
-            assert!(
-                is_data_ask(&name.clone().append_component(octets(GENERIC))),
-                "a longer name is rated too: nothing slips by the shape"
-            );
-            assert!(
-                !is_data_ask(&nm(&format!("/alice/member/laptop/{ask}/x"))),
-                "a plain component is no keyword"
-            );
-        }
+        let name = then(device, vec![keyword("grant"), octets(GENERIC)]);
+        assert!(is_data_ask(&name), "32=grant after a device name");
+        // A device name of any depth, and a name with a tail the data layer would refuse.
+        assert!(is_data_ask(&then(
+            "/alice/laptop",
+            vec![keyword("grant"), octets(GENERIC)]
+        )));
+        assert!(is_data_ask(&then(
+            "/a/b/c/d/e",
+            vec![keyword("grant"), octets(GENERIC)]
+        )));
+        assert!(
+            is_data_ask(&name.clone().append_component(octets(GENERIC))),
+            "a longer name is rated too: nothing slips by the shape"
+        );
+        assert!(
+            !is_data_ask(&nm("/alice/member/laptop/grant/x")),
+            "a plain component is no keyword"
+        );
         // The first non-plain component decides, as `served_kind` does.
         assert!(!is_data_ask(&then(
             device,
