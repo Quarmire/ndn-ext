@@ -88,9 +88,8 @@ pub trait Introductions: Send + Sync {
     /// The namespaces of the other writers the members record in force for
     /// `folder` lists (the folder's own excluded): whose sync groups a grant
     /// link to a person admitted to `folder` routes (§8.7), so the person's
-    /// device hears them through this one, and whose devices' ask exchange
-    /// (`<device>/32=seal`, `<device>/32=ask-answer/…`) the link carries
-    /// (§8.7 rule 20), as the folder's own namespace's does. Read live, at
+    /// device hears them through this one, and whose public names the link
+    /// carries (§8.7), as the folder's own namespace's does. Read live, at
     /// every look. A device with no data layer lists none. For a data-layer
     /// device it is ndn-data's `IntroductionSurface::writer_namespaces`.
     fn writer_namespaces(&self, folder: &Name) -> Vec<Name> {

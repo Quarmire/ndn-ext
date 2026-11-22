@@ -67,8 +67,8 @@ impl Flood {
     }
 }
 
-/// A device of Ann's namespace the grant link carries the names of (the seal
-/// keys of its ask exchange, `<device>/32=seal/<key>`), a name the sync groups'
+/// A device of Ann's namespace the grant link carries the names of (its seal
+/// keys, `<device>/32=seal/<key>`), a name the sync groups'
 /// multicast strategy does not hold Nacks back for.
 const SIGNER: &str = "/alice/member/lamp";
 
@@ -105,8 +105,8 @@ fn face_to(from: &Embedded, key: KeyFingerprint) -> ndn_app::FaceId {
 /// 3 s), `window` in flight, over `from`'s link to `key`.
 async fn flood(from: &Embedded, key: KeyFingerprint, names: Vec<Name>, window: usize) -> Flood {
     let face = face_to(from, key);
-    // The route the asker's forwarder has to the signer (as the ask exchange's
-    // cases give it): the Interests are pinned to the link's face besides.
+    // The route the asker's forwarder has to the signer: the Interests are
+    // pinned to the link's face besides.
     from.engine.fib().add_nexthop(&n(SIGNER), face, 0);
     let gate = Arc::new(Semaphore::new(window));
     let started = Instant::now();
@@ -250,7 +250,7 @@ fn data_asks(count: usize, tag: u8) -> Vec<Name> {
 
 /// R12 H1: the owner's grant asks and hold asks (the data layer's `32=grant` and `32=hold`
 /// names, what a member's device asks the owner's) are rated apart on a grant link, in a
-/// bucket of their own beside the link's frames, as the ask exchange is: a member's flood of
+/// bucket of their own beside the link's frames: a member's flood of
 /// distinct ones reaches the owner's device at most the burst and the refill of the time
 /// it took (before this, 32,768 a second: each is a task, a fetch back to the member, and
 /// a signature at the owner).

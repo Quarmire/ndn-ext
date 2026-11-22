@@ -11,10 +11,8 @@
 //! and nothing else. It is host-supplied authority to *link*, and a link
 //! under a grant carries only the names of the folder, of the person's own
 //! devices, of the introduction (`Introductions::grant_carries`), the public
-//! names of the namespaces of the folder's writers and the ask exchange
-//! (`<device>/32=seal`, `<device>/32=ask-answer/…`) of the devices of the
-//! folder's namespace and of those writers: not everything this device
-//! serves by name.
+//! names of the namespaces of the folder's writers: not everything this
+//! device serves by name.
 //!
 //! A key holds a **set of entries**, one per folder (a person invited into
 //! two folders has two). The link a grant admits is tagged with the key and
@@ -39,7 +37,6 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ndn_cert::Role;
 use ndn_cert::onboarding::rdr_prefix;
 use ndn_face_quic::{CloseReason, KeyFingerprint, NameFilter};
 use ndn_mgmt_wire::{LinkDetail, link_code as code};
@@ -747,7 +744,7 @@ impl Judge<'_> {
 /// ([`Introductions::carries`]: a person may ask again); and the names of the
 /// folder's collections as the data layer names them
 /// ([`Introductions::grant_carries`]). A device with no data layer carries
-/// the first kind only. The ask exchange of devices is [`entry_asks`]'s.
+/// the first kind only.
 fn entry_carries(surface: Option<&Arc<dyn Introductions>>, entry: &Grant, name: &Name) -> bool {
     entry
         .namespaces
@@ -765,81 +762,6 @@ fn entry_carries(surface: Option<&Arc<dyn Introductions>>, entry: &Grant, name: 
                 .iter()
                 .any(|w| public_name(w, name))
         })
-}
-
-/// Whether `entry` carries `name` as the ask exchange of a device (§8.7 rule
-/// 20): `<W>/<role>/<device>/32=seal[/<key>]` and
-/// `<W>/<role>/<device>/32=ask-answer/<ParametersSha256Digest>` of a namespace
-/// `W` that is its folder's own (the inviter's devices) or one the folder's
-/// record in force lists as a writer's ([`Introductions::writer_namespaces`],
-/// read live, so a writer the record drops is out at the next packet): the
-/// seal key a signer is asked for and the ask and its reply, in both
-/// directions. Who is *answered* is the signer's own gate, not this filter's.
-/// Not a push: the Data of these names is the signer's own, never a peer's
-/// ([`Judge::grant_pushes`] does not use it).
-fn entry_asks(surface: Option<&Arc<dyn Introductions>>, entry: &Grant, name: &Name) -> bool {
-    let Some(w) = ask_exchange_namespace(name) else {
-        return false;
-    };
-    folder_namespace(&entry.folder).is_some_and(|ns| ns.components() == w)
-        || surface.is_some_and(|s| {
-            s.writer_namespaces(&entry.folder)
-                .iter()
-                .any(|ns| ns.components() == w)
-        })
-}
-
-/// The namespace `W` (its components) of a name of the ask exchange of a device,
-/// or `None` for any other name: component-wise, no prefix trick. The name is
-///
-/// - `W/<role>/<device>/32=seal`, or `…/32=seal/<key>` (one generic component of
-///   32 octets), or the same followed by one implicit digest; or
-/// - `W/<role>/<device>/32=ask-answer/<ParametersSha256Digest>` (32 octets),
-///   optionally followed by one implicit digest;
-///
-/// where `<role>` is a generic component that names a role of the layout
-/// ([`Role`]) and `<device>` a generic component: **exactly two components lie
-/// between `W` and the keyword**, and the first keyword of the name is the
-/// exchange's. A name with more or fewer (`W/member/x/y/32=seal`: `y` is no
-/// keyword) or with a role the layout does not name is no device's.
-fn ask_exchange_namespace(name: &Name) -> Option<&[NameComponent]> {
-    use ndn_packet::tlv_type::{IMPLICIT_SHA256, KEYWORD, NAME_COMPONENT, PARAMETERS_SHA256};
-    let comps = name.components();
-    let at = comps.iter().position(|c| c.typ == KEYWORD)?;
-    let (w, device) = comps[..at].split_at(at.checked_sub(2)?);
-    let [role, device] = device else {
-        return None;
-    };
-    if w.is_empty() || Role::from_component(role).is_none() || device.typ != NAME_COMPONENT {
-        return None;
-    }
-    let of = |c: &NameComponent, typ| c.typ == typ && c.value.len() == 32;
-    let key = |c: &NameComponent| of(c, NAME_COMPONENT);
-    let ask = |c: &NameComponent| of(c, PARAMETERS_SHA256);
-    let id = |c: &NameComponent| of(c, IMPLICIT_SHA256);
-    let shaped = match (comps[at].value.as_ref(), &comps[at + 1..]) {
-        (b"seal", []) => true,
-        (b"seal", [k]) => key(k),
-        (b"seal", [k, d]) => key(k) && id(d),
-        (b"ask-answer", [a]) => ask(a),
-        (b"ask-answer", [a, d]) => ask(a) && id(d),
-        _ => false,
-    };
-    shaped.then_some(w)
-}
-
-/// Whether `name` is an **ask** of the ask exchange of a device
-/// (`W/<role>/<device>/32=ask-answer/<ParametersSha256Digest>`, the Interest
-/// that carries the question to a signer; [`ask_exchange_namespace`] says whether
-/// the shape is a device's), as against the plain fetch of a seal key. The
-/// asks are what a link rates apart ([`crate::policy::ASK_INTERESTS`]).
-pub(crate) fn is_ask_answer(name: &Name) -> bool {
-    ask_exchange_namespace(name).is_some()
-        && name
-            .components()
-            .iter()
-            .find(|c| c.typ == ndn_packet::tlv_type::KEYWORD)
-            .is_some_and(|c| c.value.as_ref() == b"ask-answer")
 }
 
 /// Whether `name` is an **ask of the data layer** to a device: its first keyword is
@@ -869,10 +791,7 @@ impl Judge<'_> {
     /// - the names under the person's own devices (`own`);
     /// - what any live entry carries ([`entry_carries`]): the public names of
     ///   its namespaces and its folder's, the introduction, and its folder's
-    ///   collections;
-    /// - the ask exchange of the devices of its folder's namespace and of the
-    ///   writers its record lists ([`entry_asks`]), which is **not** pushable
-    ///   ([`Judge::grant_pushes`] does not use it).
+    ///   collections.
     ///
     /// Nothing else this device serves by name crosses, so an unsealed
     /// collection outside the folders is not answered. The record of a mark
@@ -893,10 +812,9 @@ impl Judge<'_> {
                 return departures.carried_by(&key, name, surface.as_ref(), now);
             }
             own.iter().any(|d| name.has_prefix(d))
-                || entries.iter().any(|e| {
-                    entry_carries(surface.as_ref(), e, name)
-                        || entry_asks(surface.as_ref(), e, name)
-                })
+                || entries
+                    .iter()
+                    .any(|e| entry_carries(surface.as_ref(), e, name))
                 // The record that lets the person go of a folder whose entry
                 // ended while another stands (§8.8): the person is told which
                 // to fetch.
@@ -1295,69 +1213,7 @@ mod tests {
     }
 
     const GENERIC: u64 = ndn_packet::tlv_type::NAME_COMPONENT;
-    const IMPLICIT: u64 = ndn_packet::tlv_type::IMPLICIT_SHA256;
     const PARAMETERS: u64 = ndn_packet::tlv_type::PARAMETERS_SHA256;
-
-    /// The names of the ask exchange of a device, with the namespace they
-    /// belong to (§8.7 rule 20): the seal key (bare, with its key, with its
-    /// implicit digest) and the ask (with its parameters digest, with an
-    /// implicit digest after it), under `<W>/<role>/<device>` for every role
-    /// of the layout.
-    #[test]
-    fn the_ask_exchange_of_a_device_is_its_namespace_and_nothing_else() {
-        for (device, w) in [
-            ("/alice/member/laptop", "/alice"),
-            ("/alice/admin/laptop", "/alice"),
-            ("/alice/node/relay", "/alice"),
-            ("/alice/guest/visit", "/alice"),
-            ("/home/carol/member/x", "/home/carol"),
-        ] {
-            let seal = then(device, vec![keyword("seal")]);
-            let key = octets(GENERIC);
-            let ask = then(device, vec![keyword("ask-answer"), octets(PARAMETERS)]);
-            for shaped in [
-                seal.clone(),
-                seal.clone().append_component(key.clone()),
-                seal.clone()
-                    .append_component(key)
-                    .append_component(octets(IMPLICIT)),
-                ask.clone(),
-                ask.append_component(octets(IMPLICIT)),
-            ] {
-                assert_eq!(
-                    ask_exchange_namespace(&shaped),
-                    Some(nm(w).components()),
-                    "{shaped}"
-                );
-            }
-        }
-    }
-
-    /// What a grant link rates apart is the ask (`…/32=ask-answer/<digest>`
-    /// of a device), not the fetch of a seal key and not a look-alike.
-    #[test]
-    fn only_the_ask_of_a_device_is_rated_apart() {
-        let device = "/alice/member/laptop";
-        let ask = then(device, vec![keyword("ask-answer"), octets(PARAMETERS)]);
-        assert!(is_ask_answer(&ask));
-        assert!(is_ask_answer(
-            &ask.clone().append_component(octets(IMPLICIT))
-        ));
-        let seal = then(device, vec![keyword("seal")]);
-        assert!(!is_ask_answer(&seal), "a seal key is fetched, not asked");
-        assert!(!is_ask_answer(&seal.append_component(octets(GENERIC))));
-        // A shape that is no device's is no ask of the exchange.
-        assert!(!is_ask_answer(&then(
-            "/alice/owner/laptop",
-            vec![keyword("ask-answer"), octets(PARAMETERS)]
-        )));
-        assert!(!is_ask_answer(&then(
-            "/alice/member/laptop/x",
-            vec![keyword("ask-answer"), octets(PARAMETERS)]
-        )));
-        assert!(!is_ask_answer(&then(device, vec![keyword("ask-answer")])));
-        assert!(!is_ask_answer(&nm("/alice/member/laptop/32=log/x")));
-    }
 
     /// R12 H1: the data layer's asks of a device (`32=grant`, `32=hold`, `32=audit` right
     /// after its name) are what a link rates apart for them, by the first keyword as the data
@@ -1401,233 +1257,11 @@ mod tests {
             octets(GENERIC)
         ])));
         // Other served kinds and fetches are not asks of this class.
-        for other in ["held", "seal", "ask-answer", "intro", "hint", "log"] {
+        for other in ["held", "seal", "intro", "hint", "log"] {
             assert!(
                 !is_data_ask(&then(device, vec![keyword(other), octets(GENERIC)])),
                 "{other}"
             );
-        }
-    }
-
-    /// Round 7 L5/L6, for the exchange: exactly two components between the
-    /// namespace and the keyword, the first a role of the layout, and the
-    /// keyword's own tail; nothing that merely starts like one.
-    #[test]
-    fn what_only_looks_like_the_ask_exchange_of_a_device_is_not() {
-        let seal = |device: &str| then(device, vec![keyword("seal")]);
-        let ask = |device: &str| then(device, vec![keyword("ask-answer"), octets(PARAMETERS)]);
-        let not = |name: Name, why: &str| {
-            assert_eq!(ask_exchange_namespace(&name), None, "{why}: {name}");
-        };
-        // The depth: more or fewer components under the namespace.
-        not(seal("/home/member/x/y"), "three components under /home");
-        not(
-            seal("/home/carol/member/x/y"),
-            "three components under carol",
-        );
-        not(then("/alice/member", vec![keyword("seal")]), "no device");
-        not(then("/alice", vec![keyword("seal")]), "no role");
-        not(then("/", vec![keyword("seal")]), "the root");
-        // The role: generic, and one the layout names.
-        not(seal("/alice/owner/laptop"), "a role the layout has none of");
-        not(
-            seal("/alice/Member/laptop"),
-            "a role in another letter case",
-        );
-        not(
-            then(
-                "/alice",
-                vec![keyword("member"), nc("laptop"), keyword("seal")],
-            ),
-            "a keyword for a role",
-        );
-        not(
-            then(
-                "/alice",
-                vec![nc("member"), keyword("laptop"), keyword("seal")],
-            ),
-            "a keyword for a device",
-        );
-        not(
-            then(
-                "/alice",
-                vec![
-                    NameComponent::new(PARAMETERS, bytes::Bytes::from_static(&[1; 32])),
-                    nc("laptop"),
-                    keyword("seal"),
-                ],
-            ),
-            "a digest for a role",
-        );
-        // The keyword: the exchange's, and the first of the name.
-        not(then("/alice/member/laptop", vec![keyword("log")]), "32=log");
-        not(
-            then("/alice/member/laptop", vec![keyword("data")]),
-            "32=data",
-        );
-        not(
-            then(
-                "/alice/member/laptop",
-                vec![keyword("data"), nc("member"), nc("x"), keyword("seal")],
-            ),
-            "a collection whose path reads like a device's seal key",
-        );
-        not(
-            then(
-                "/alice/member/laptop/32=log/alice/32=data/notes",
-                vec![nc("member"), nc("x"), keyword("seal")],
-            ),
-            "a log entry of a collection with such a path",
-        );
-        // The tail of the seal key.
-        let key = octets(GENERIC);
-        let sealed = seal("/alice/member/laptop");
-        not(
-            sealed.clone().append_component(octets(PARAMETERS)),
-            "a parameters digest after a seal",
-        );
-        not(
-            sealed.clone().append_component(octets(IMPLICIT)),
-            "an implicit digest after a bare seal",
-        );
-        not(
-            sealed
-                .clone()
-                .append_component(NameComponent::generic(bytes::Bytes::from_static(&[7; 31]))),
-            "a seal key of 31 octets",
-        );
-        not(
-            sealed.clone().append_component(nc("laptop")),
-            "a seal key of a word",
-        );
-        not(
-            sealed
-                .clone()
-                .append_component(key.clone())
-                .append_component(key.clone()),
-            "two keys",
-        );
-        not(
-            sealed
-                .append_component(key)
-                .append_component(octets(IMPLICIT))
-                .append_component(octets(IMPLICIT)),
-            "two digests",
-        );
-        // The tail of the ask.
-        let asked = ask("/alice/member/laptop");
-        not(
-            then("/alice/member/laptop", vec![keyword("ask-answer")]),
-            "an ask with no digest",
-        );
-        not(
-            then(
-                "/alice/member/laptop",
-                vec![keyword("ask-answer"), octets(GENERIC)],
-            ),
-            "an ask whose last component is no parameters digest",
-        );
-        not(
-            then(
-                "/alice/member/laptop",
-                vec![
-                    keyword("ask-answer"),
-                    NameComponent::new(PARAMETERS, bytes::Bytes::from_static(&[7; 31])),
-                ],
-            ),
-            "an ask whose digest has 31 octets",
-        );
-        not(
-            asked
-                .clone()
-                .append_component(octets(IMPLICIT))
-                .append_component(octets(IMPLICIT)),
-            "two digests after an ask",
-        );
-        not(asked.append_component(nc("x")), "a word after an ask");
-    }
-
-    fn nc(word: &str) -> NameComponent {
-        NameComponent::generic(bytes::Bytes::copy_from_slice(word.as_bytes()))
-    }
-
-    fn ask_of(device: &str) -> Name {
-        then(device, vec![keyword("ask-answer"), octets(PARAMETERS)])
-    }
-
-    fn seal_of(device: &str) -> Name {
-        then(device, vec![keyword("seal")])
-    }
-
-    /// The exchange of the devices of the folder's namespace and of the
-    /// writers the record lists now, whatever the entry's role (a reader's
-    /// Interests are asks too: who is answered is the signer's gate); a
-    /// writer the record drops is out at the next packet, and a name under a
-    /// broader namespace than the writer's, or another's, never is carried.
-    /// It is no push: the entry's Data names do not include it.
-    #[test]
-    fn the_ask_exchange_follows_the_record_live_and_is_no_push() {
-        let writers = Arc::new(Writers(parking_lot::Mutex::new(Vec::new())));
-        let surface: Arc<dyn Introductions> = writers.clone();
-        for role in [GrantRole::Writer, GrantRole::Reader] {
-            let entry = Grant {
-                role,
-                ..grant(None)
-            };
-            let asks = |name: &Name| entry_asks(Some(&surface), &entry, name);
-            // The folder's own namespace (`/alice`), as the inviter's devices.
-            for name in [
-                seal_of("/alice/member/laptop"),
-                ask_of("/alice/admin/tower"),
-            ] {
-                assert!(asks(&name), "{name} not carried: the inviter's device");
-                assert!(
-                    !entry_carries(Some(&surface), &entry, &name),
-                    "{name} is a name the entry's Data may be pushed under"
-                );
-            }
-            // A writer the record does not list yet.
-            let carol = [
-                seal_of("/carol/member/phone"),
-                ask_of("/carol/member/phone"),
-            ];
-            for name in &carol {
-                assert!(!asks(name), "{name} carried before the record lists Carol");
-            }
-            *writers.0.lock() = vec![nm("/carol"), nm("/home/carol/member/x")];
-            for name in &carol {
-                assert!(
-                    asks(name),
-                    "{name} not carried while the record lists Carol"
-                );
-                assert!(!entry_carries(Some(&surface), &entry, name));
-            }
-            // Nothing of a namespace the writer's merely starts like, or lies
-            // under, nor a deeper device of the listed one.
-            for name in [
-                seal_of("/home/member/x"),
-                seal_of("/home/carol/member/other"),
-                seal_of("/home/carol/member/x"),
-                seal_of("/carol/member/phone/member/inner"),
-                seal_of("/dave/member/phone"),
-                seal_of("/bob/member/phone"),
-            ] {
-                assert!(!asks(&name), "{name} carried");
-            }
-            // A writer that is itself a device is the namespace of its own
-            // devices, and of nothing above it.
-            assert!(asks(&seal_of("/home/carol/member/x/member/y")));
-            writers.0.lock().clear();
-            for name in &carol {
-                assert!(!asks(name), "{name} still carried after the drop");
-            }
-            assert!(
-                asks(&seal_of("/alice/member/laptop")),
-                "the inviter's device follows no record"
-            );
-            // No data layer: the inviter's devices only, by the folder's name.
-            assert!(entry_asks(None, &entry, &seal_of("/alice/member/laptop")));
-            assert!(!entry_asks(None, &entry, &carol[0]));
         }
     }
 }

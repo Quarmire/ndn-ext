@@ -59,7 +59,7 @@ ndn-engine = { workspace = true }
 ndn-data   = { workspace = true }
 ndn-app    = { workspace = true }
 ndn-sync   = { workspace = true, features = ["store-fjall"] }
-# tests/asks.rs: an evaluator for the ask exchange.
+# tests/common: the test host's `#[async_trait]` impls.
 async-trait = { workspace = true }
 ndn-namespace = { workspace = true }
 ndn-trust-envelope = { workspace = true }

@@ -86,18 +86,6 @@ pub const ENROLLMENT_ANSWERS: RateLimit = RateLimit {
     per_sec: 128,
 };
 
-/// What a grant link's peer may send of the ask exchange
-/// (`<W>/<role>/<device>/32=ask-answer/<digest>`, ndn-link §8.7 rule 20), per
-/// link, beside the link's own rates ([`GRANT_FRAMES`]): 10 at once, then 1 a second. An
-/// honest asker sends at most `ASK_ATTEMPTS` × `ASK_SENDS` = 3 × 3 = 9 Interests
-/// of one question to one signer and has one ask in flight, so it never meets
-/// this; a peer that floods a signer with asks it must open, verify and answer
-/// is held to a trickle at the link, before the signer's Device sees them.
-pub const ASK_INTERESTS: RateLimit = RateLimit {
-    burst: 10,
-    per_sec: 1,
-};
-
 /// What a **grant link's** member may send over its link, in frames: per
 /// link, 65,536 at once, then 32,768 a second. A granted member is
 /// authenticated by its key, named by a signed grant and revocable (the link
@@ -160,8 +148,7 @@ pub const GRANT_ANSWERED: RateLimit = RateLimit {
 /// first keyword is `32=grant`, `32=hold` or `32=audit`, followed by the ask:
 /// the grants of a folder's epoch keys, the custody leases and their audits),
 /// all three together, per link, beside the link's other rates: 256 at once,
-/// then 16 a second; over it dropped silently, as the ask exchange is
-/// ([`ASK_INTERESTS`]). What one honest member asks: a grant ask per
+/// then 16 a second; over it dropped silently. What one honest member asks: a grant ask per
 /// collection and epoch it reads (retried on a backoff of seconds), a hold ask
 /// per record it has held (one at a time per asker, the data layer's
 /// `HOLDS_PER_ASKER`), and an audit of 16 pieces per holder per round, 32 in flight; and

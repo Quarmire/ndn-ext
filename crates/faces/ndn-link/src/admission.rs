@@ -25,13 +25,11 @@ use ndn_security::{
 };
 
 use crate::departures::Departures;
-use crate::grants::{Grant, GrantOutcome, Grants, is_ask_answer, is_data_ask};
+use crate::grants::{Grant, GrantOutcome, Grants, is_data_ask};
 use crate::host::{LinkTrust, OwnMembership};
 use crate::introduce::Introductions;
 use crate::peer::{PeerId, Peers};
-use crate::policy::{
-    ASK_INTERESTS, DATA_ASKS, ENROLLMENT_ANSWERS, ENROLLMENT_INTERESTS, MAX_CHAIN,
-};
+use crate::policy::{DATA_ASKS, ENROLLMENT_ANSWERS, ENROLLMENT_INTERESTS, MAX_CHAIN};
 use crate::serving::{Limits, QuotaSlot, QuotaState, ServePolicy, Serving};
 
 /// Who the peer is, from its certificate validated in a held namespace —
@@ -978,23 +976,15 @@ impl Judge<'_> {
                             },
                             rate,
                             bandwidth,
-                            // The ask exchange is rated apart per key: an honest asker
-                            // sends nine Interests per signer per question (ndn-link.md
-                            // §8.7 rule 20), a flood does not reach the signer's Device.
-                            // So are the data layer's own asks (`32=grant`, `32=hold`,
-                            // `32=audit`), each a task, a fetch back to the member and a
-                            // signature at the owner (ndn-link.md §15.3).
+                            // The data layer's own asks (`32=grant`, `32=hold`,
+                            // `32=audit`) are rated apart per key, each a task, a
+                            // fetch back to the member and a signature at the owner
+                            // (ndn-link.md §15.3).
                             rated: if serving != Serving::Stranger {
-                                vec![
-                                    RatedInterests {
-                                        names: Box::new(is_ask_answer),
-                                        rate: ASK_INTERESTS,
-                                    },
-                                    RatedInterests {
-                                        names: Box::new(is_data_ask),
-                                        rate: DATA_ASKS,
-                                    },
-                                ]
+                                vec![RatedInterests {
+                                    names: Box::new(is_data_ask),
+                                    rate: DATA_ASKS,
+                                }]
                             } else {
                                 Vec::new()
                             },
@@ -1023,8 +1013,7 @@ impl Judge<'_> {
                                     "this device linked {} {}: the names of the folders the person \
                                      is granted (their collections), of the person's own devices, of \
                                      the namespaces' certificates and sync groups, of the \
-                                     introduction and the ask exchange of the devices of the folder's \
-                                     writers (<device>/32=seal, <device>/32=ask-answer) cross it, \
+                                     introduction and of the folder's writers' namespaces cross it, \
                                      and what it pushes is judged at every \
                                      packet by its role in each folder (a reader's entry widens \
                                      nothing; other Data it pushes is dropped); the link's rates bound it \
@@ -1032,9 +1021,7 @@ impl Judge<'_> {
                                      of any name; what is over is dropped, an Interest with a Nack \
                                      saying Congestion: ask again soon), what this device answers it \
                                      ({} MiB/s: what is over is dropped, and asked again by its timer), \
-                                     and its asks of a device (<device>/32=ask-answer) {} at once, then {}/s \
-                                     (an honest ask sends at most 9, so ask again a few seconds \
-                                     later), and its grant, hold and audit asks (<device>/32=grant, \
+                                     and its grant, hold and audit asks (<device>/32=grant, \
                                      32=hold, 32=audit) {} at once, then {}/s together (over it is \
                                      dropped without a Nack: ask again later); and an \
                                      entry ends at its date or when \
@@ -1046,8 +1033,6 @@ impl Judge<'_> {
                                     bandwidth.map_or(0, |b| b.per_sec >> 20),
                                     interests.map_or(0, |i| i.per_sec),
                                     answered.map_or(0, |a| a.per_sec >> 20),
-                                    ASK_INTERESTS.burst,
-                                    ASK_INTERESTS.per_sec,
                                     DATA_ASKS.burst,
                                     DATA_ASKS.per_sec
                                 ),
@@ -1057,9 +1042,9 @@ impl Judge<'_> {
                                      but takes the grant link's rates ({}/s of frames and {} MiB/s from \
                                      that device, {}/s of Interests of any name; what is over is dropped, \
                                      an Interest with a Nack saying Congestion: ask again soon), what \
-                                     this device answers it ({} MiB/s), and its asks (the ask exchange \
-                                     {} at once, then {}/s; grant, hold and audit asks {} at once, \
-                                     then {}/s); it ends when the certificate lapses; a member or an \
+                                     this device answers it ({} MiB/s), and its grant, hold and \
+                                     audit asks ({} at once, then {}/s); it ends when the \
+                                     certificate lapses; a member or an \
                                      admin certificate of this namespace links with none of these",
                                     admitted.describe(),
                                     slot.namespace,
@@ -1067,8 +1052,6 @@ impl Judge<'_> {
                                     bandwidth.map_or(0, |b| b.per_sec >> 20),
                                     interests.map_or(0, |i| i.per_sec),
                                     answered.map_or(0, |a| a.per_sec >> 20),
-                                    ASK_INTERESTS.burst,
-                                    ASK_INTERESTS.per_sec,
                                     DATA_ASKS.burst,
                                     DATA_ASKS.per_sec
                                 ),
@@ -2492,7 +2475,7 @@ mod tests {
         );
         assert!(same(scope.interests, GRANT_INTERESTS));
         assert!(same(scope.answered, GRANT_ANSWERED));
-        assert_eq!(scope.rated.len(), 2, "the ask exchange and the data asks");
+        assert_eq!(scope.rated.len(), 1, "the data asks");
         assert!(scope.shared.is_some() && scope.bandwidth.is_some());
         assert!(
             (scope.names)(&n("/a/member/laptop/32=log/x")) && (scope.names)(&n("/elsewhere/x")),

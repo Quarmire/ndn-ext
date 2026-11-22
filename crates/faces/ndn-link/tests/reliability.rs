@@ -5,7 +5,7 @@
 //! same link without it does.
 //!
 //! Real data-layer devices on real forwarders over real QUIC (the harness of
-//! `tests/asks.rs`); a link's status says whether its link service frames
+//! `tests/common`); a link's status says whether its link service frames
 //! reliability ([`PathStatus::reliability`]).
 
 mod common;

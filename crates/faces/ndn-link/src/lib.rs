@@ -180,9 +180,7 @@
 //! stands while any entry does. A grant admits that key in those namespaces
 //! only, under the quotas; what its link carries and what the person may push
 //! are judged at every packet against the entries live then: the names of
-//! the folders, of the person's own devices, of the introduction, the ask
-//! exchange (`<device>/32=seal`, `<device>/32=ask-answer/…`) of the devices of
-//! the folder's namespace and of the writers its record lists, and the
+//! the folders, of the person's own devices, of the introduction, and the
 //! namespaces' public ones (certificates, trust contexts, sync groups) cross,
 //! an unsealed collection of this device outside the folders is not answered
 //! over it ([`Introductions::grant_carries`]), and Data the person pushes
