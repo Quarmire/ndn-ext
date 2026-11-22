@@ -6,7 +6,7 @@
 //! [`Identity`], and the link is admitted by any the local policy accepts.
 
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use ndn_cert::onboarding::rdr_prefix;
@@ -25,12 +25,14 @@ use ndn_security::{
 };
 
 use crate::departures::Departures;
-use crate::grants::{Grant, GrantOutcome, Grants, is_ask_answer};
+use crate::grants::{Grant, GrantOutcome, Grants, is_ask_answer, is_data_ask};
 use crate::host::{LinkTrust, OwnMembership};
 use crate::introduce::Introductions;
 use crate::peer::{PeerId, Peers};
-use crate::policy::{ASK_INTERESTS, ENROLLMENT_ANSWERS, ENROLLMENT_INTERESTS, MAX_CHAIN};
-use crate::serving::{Limits, QuotaSlot, QuotaState, ServePolicy};
+use crate::policy::{
+    ASK_INTERESTS, DATA_ASKS, ENROLLMENT_ANSWERS, ENROLLMENT_INTERESTS, MAX_CHAIN,
+};
+use crate::serving::{Limits, QuotaSlot, QuotaState, ServePolicy, Serving};
 
 /// Who the peer is, from its certificate validated in a held namespace —
 /// or, for a namespace this device does not hold, offline against the
@@ -47,6 +49,46 @@ pub(crate) struct Identity {
     /// `Some(root key fingerprint)`: a device of a namespace this device
     /// does not hold, checked offline against that root.
     pub(crate) served: Option<KeyFingerprint>,
+    /// The certificate of the chain (the leaf or an issuer) that lapses first and
+    /// when (its NotAfter), `None` when none has one: the identity holds only
+    /// while all of them are valid, so a live link ends at that time
+    /// ([`Identity::lapse`]).
+    pub(crate) lapses: Option<(Name, SystemTime)>,
+}
+
+/// What to do about a lapsed certificate, for the words a link closed for it carries.
+pub(crate) const RENEW: &str = "renew the certificate (its CA renews a current one; a device \
+                                that was offline across its NotAfter enrolls again) and link again";
+
+impl Identity {
+    /// Why this identity's certificate chain no longer holds at `now`, when a
+    /// certificate of it lapsed (the clock is past its NotAfter): the sentence a
+    /// link closed for it carries ([`RENEW`] says what to do).
+    pub(crate) fn lapse(&self, now: SystemTime) -> Option<String> {
+        let (certificate, at) = self.lapses.as_ref()?;
+        (now > *at).then(|| {
+            format!(
+                "{certificate} lapsed at {} (its NotAfter), so {} no longer has a valid certificate",
+                crate::grants::utc(*at),
+                self.device
+            )
+        })
+    }
+}
+
+/// The certificate of `leaf` and the `chain` it was validated through that lapses
+/// first, with its NotAfter; `None` when none of them has one.
+fn first_lapse(leaf: &Certificate, chain: &[Certificate]) -> Option<(Name, SystemTime)> {
+    std::iter::once(leaf)
+        .chain(chain)
+        .filter(|c| c.valid_until != u64::MAX)
+        .min_by_key(|c| c.valid_until)
+        .map(|c| {
+            (
+                (*c.name).clone(),
+                UNIX_EPOCH + Duration::from_nanos(c.valid_until),
+            )
+        })
 }
 
 /// What one certificate chain a peer sent establishes.
@@ -584,6 +626,7 @@ impl Judge<'_> {
             role: device.role,
             certificates,
             served: None,
+            lapses: first_lapse(leaf, &chain),
         }))
     }
 
@@ -733,6 +776,7 @@ impl Judge<'_> {
             role: device.role,
             certificates,
             served: Some(KeyFingerprint::of_ndn_key(&root.public_key)),
+            lapses: first_lapse(leaf, chain),
         })
     }
 
@@ -857,7 +901,9 @@ impl Judge<'_> {
                 }),
                 rate: ENROLLMENT_ANSWERS,
                 bandwidth: None,
-                rated: None,
+                rated: Vec::new(),
+                interests: None,
+                answered: None,
                 shared: None,
                 answers_in: Some(Box::new(move |name: &Name| {
                     answered.iter().any(|r| name.has_prefix(r))
@@ -898,8 +944,11 @@ impl Judge<'_> {
                 Some((
                     slot,
                     Limits {
+                        serving,
                         rate,
                         bandwidth,
+                        interests,
+                        answered,
                         shared,
                     },
                 )) => {
@@ -932,10 +981,25 @@ impl Judge<'_> {
                             // The ask exchange is rated apart per key: an honest asker
                             // sends nine Interests per signer per question (ndn-link.md
                             // §8.7 rule 20), a flood does not reach the signer's Device.
-                            rated: admitted.grant.as_ref().map(|_| RatedInterests {
-                                names: Box::new(is_ask_answer),
-                                rate: ASK_INTERESTS,
-                            }),
+                            // So are the data layer's own asks (`32=grant`, `32=hold`,
+                            // `32=audit`), each a task, a fetch back to the member and a
+                            // signature at the owner (ndn-link.md §15.3).
+                            rated: if serving != Serving::Stranger {
+                                vec![
+                                    RatedInterests {
+                                        names: Box::new(is_ask_answer),
+                                        rate: ASK_INTERESTS,
+                                    },
+                                    RatedInterests {
+                                        names: Box::new(is_data_ask),
+                                        rate: DATA_ASKS,
+                                    },
+                                ]
+                            } else {
+                                Vec::new()
+                            },
+                            interests,
+                            answered,
                             shared: Some(shared),
                             answers_in: admitted
                                 .grant
@@ -964,10 +1028,15 @@ impl Judge<'_> {
                                      and what it pushes is judged at every \
                                      packet by its role in each folder (a reader's entry widens \
                                      nothing; other Data it pushes is dropped); the link's rates bound it \
-                                     ({}/s and {} MiB/s from that device; what is over is dropped, an \
-                                     Interest with a Nack saying Congestion: ask again soon), and its asks \
-                                     of a device (<device>/32=ask-answer) {} at once, then {}/s: an honest ask \
-                                     sends at most 9, so ask again a few seconds later); and an \
+                                     ({}/s of frames and {} MiB/s from that device, {}/s of Interests \
+                                     of any name; what is over is dropped, an Interest with a Nack \
+                                     saying Congestion: ask again soon), what this device answers it \
+                                     ({} MiB/s: what is over is dropped, and asked again by its timer), \
+                                     and its asks of a device (<device>/32=ask-answer) {} at once, then {}/s \
+                                     (an honest ask sends at most 9, so ask again a few seconds \
+                                     later), and its grant, hold and audit asks (<device>/32=grant, \
+                                     32=hold, 32=audit) {} at once, then {}/s together (over it is \
+                                     dropped without a Nack: ask again later); and an \
                                      entry ends at its date or when \
                                      the inviter revokes it or the folder's members record leaves \
                                      the person out",
@@ -975,8 +1044,33 @@ impl Judge<'_> {
                                     grant.describe(),
                                     rate.per_sec,
                                     bandwidth.map_or(0, |b| b.per_sec >> 20),
+                                    interests.map_or(0, |i| i.per_sec),
+                                    answered.map_or(0, |a| a.per_sec >> 20),
                                     ASK_INTERESTS.burst,
-                                    ASK_INTERESTS.per_sec
+                                    ASK_INTERESTS.per_sec,
+                                    DATA_ASKS.burst,
+                                    DATA_ASKS.per_sec
+                                ),
+                                None if serving == Serving::Guest => format!(
+                                    "this device linked {} as a guest of its own namespace {}: a guest is a \
+                                     friend's device, so its link carries what an own-namespace link does \
+                                     but takes the grant link's rates ({}/s of frames and {} MiB/s from \
+                                     that device, {}/s of Interests of any name; what is over is dropped, \
+                                     an Interest with a Nack saying Congestion: ask again soon), what \
+                                     this device answers it ({} MiB/s), and its asks (the ask exchange \
+                                     {} at once, then {}/s; grant, hold and audit asks {} at once, \
+                                     then {}/s); it ends when the certificate lapses; a member or an \
+                                     admin certificate of this namespace links with none of these",
+                                    admitted.describe(),
+                                    slot.namespace,
+                                    rate.per_sec,
+                                    bandwidth.map_or(0, |b| b.per_sec >> 20),
+                                    interests.map_or(0, |i| i.per_sec),
+                                    answered.map_or(0, |a| a.per_sec >> 20),
+                                    ASK_INTERESTS.burst,
+                                    ASK_INTERESTS.per_sec,
+                                    DATA_ASKS.burst,
+                                    DATA_ASKS.per_sec
                                 ),
                                 None => format!(
                                     "this relay serves {} of {} under its quotas: {}/s from that device, and \
@@ -1008,7 +1102,9 @@ impl Judge<'_> {
                         }),
                         rate: ENROLLMENT_INTERESTS,
                         bandwidth: None,
-                        rated: None,
+                        rated: Vec::new(),
+                        interests: None,
+                        answered: None,
                         shared: None,
                         answers_in: None,
                         interests_in: None,
@@ -1039,7 +1135,9 @@ impl Judge<'_> {
                         names: Box::new(move |name: &Name| carried.0.carries(name)),
                         rate: ENROLLMENT_INTERESTS,
                         bandwidth: None,
-                        rated: None,
+                        rated: Vec::new(),
+                        interests: None,
+                        answered: None,
                         shared: None,
                         answers_in: None,
                         interests_in: None,
@@ -1066,7 +1164,9 @@ impl Judge<'_> {
                         names: self.departure_names(key),
                         rate: ENROLLMENT_INTERESTS,
                         bandwidth: None,
-                        rated: None,
+                        rated: Vec::new(),
+                        interests: None,
+                        answered: None,
                         shared: None,
                         answers_in: None,
                         interests_in: None,
@@ -1097,7 +1197,9 @@ impl Judge<'_> {
                         }),
                         rate: ENROLLMENT_ANSWERS,
                         bandwidth: None,
-                        rated: None,
+                        rated: Vec::new(),
+                        interests: None,
+                        answered: None,
                         shared: None,
                         answers_in: None,
                         interests_in: None,
@@ -2304,6 +2406,143 @@ mod tests {
         );
     }
 
+    /// R12 H1 + M2: a grant link's scope bounds what its member may ask (its own bucket of
+    /// Interests below the frames'), the data layer's asks (a class of rated names of their
+    /// own) and the bytes this device answers it.
+    #[tokio::test]
+    async fn a_grant_links_scope_bounds_its_asks_its_interests_and_what_it_is_answered() {
+        use crate::policy::{DATA_ASKS, GRANT_ANSWERED, GRANT_INTERESTS};
+        let (a, b) = (namespace("/a", 10).await, namespace("/b", 20).await);
+        let world = relay(&a, &[&b], ServePolicy::Own).await;
+        let judge = world.judge();
+        let (bob, chain) = b.device("member", "phone", 22).await;
+        world.grants.put(granted(&bob, &["/b"], GrantRole::Writer));
+        let admitted = judge.decide(&bob, &hello(chain), &CH, None).await.unwrap();
+        let scope = judge.admission_for(&admitted).scope.unwrap();
+        let same = |got: Option<ndn_face_quic::RateLimit>, want: ndn_face_quic::RateLimit| {
+            got.is_some_and(|g| (g.burst, g.per_sec) == (want.burst, want.per_sec))
+        };
+        assert!(
+            same(scope.interests, GRANT_INTERESTS),
+            "a grant link's Interests have no bucket of their own below its frames'"
+        );
+        assert!(
+            same(scope.answered, GRANT_ANSWERED),
+            "what this device answers a grant link's member is not bounded"
+        );
+        let rated_for = |name: &str| {
+            let name = n(name);
+            scope.rated.iter().position(|class| (class.names)(&name))
+        };
+        let grant_ask = rated_for("/a/member/laptop/32=grant/abc");
+        let hold_ask = rated_for("/a/member/laptop/32=hold/abc");
+        let audit_ask = rated_for("/a/member/laptop/32=audit/abc");
+        assert!(
+            grant_ask.is_some() && grant_ask == hold_ask && hold_ask == audit_ask,
+            "grant, hold and audit asks are not rated together in a class of their own: \
+             {grant_ask:?} {hold_ask:?} {audit_ask:?}"
+        );
+        assert_eq!(
+            scope.rated[grant_ask.unwrap()].rate.burst,
+            DATA_ASKS.burst,
+            "the class takes the data asks' rate"
+        );
+        assert_eq!(rated_for("/a/member/laptop/32=log/abc"), None);
+        assert_eq!(rated_for("/b/member/phone/seal"), None);
+    }
+
+    /// R12 L2(a): a guest of a namespace this device holds a certificate in is not
+    /// "own namespace, never limited": its link takes the grant link's rates and bounds
+    /// (frames, bytes, Interests, what it is answered, the ask classes), as a granted
+    /// person's does, and carries every name as before; a member's link has none.
+    #[tokio::test]
+    async fn a_guest_of_an_own_namespace_takes_grant_style_limits_and_a_member_none() {
+        use crate::policy::{GRANT_ANSWERED, GRANT_FRAMES, GRANT_INTERESTS};
+        let a = namespace("/a", 10).await;
+        let world = relay(&a, &[], ServePolicy::Own).await;
+        let judge = world.judge();
+
+        let (member, chain) = a.device("member", "phone", 22).await;
+        let admitted = judge
+            .decide(&member, &hello(chain), &CH, None)
+            .await
+            .unwrap();
+        assert!(admitted.quota.is_none(), "a member's link is never limited");
+        assert!(judge.admission_for(&admitted).scope.is_none());
+
+        let (guest, chain) = a.device("guest", "tablet", 23).await;
+        let admitted = judge
+            .decide(&guest, &hello(chain), &CH, None)
+            .await
+            .expect("a guest of an own namespace links");
+        assert!(
+            admitted.quota.as_ref().is_some_and(|q| q.limits.is_some()),
+            "a guest's link is under no limit: own namespace, never limited"
+        );
+        let scope = judge
+            .admission_for(&admitted)
+            .scope
+            .expect("a guest's link has a scope");
+        let same = |got: Option<ndn_face_quic::RateLimit>, want: ndn_face_quic::RateLimit| {
+            got.is_some_and(|g| (g.burst, g.per_sec) == (want.burst, want.per_sec))
+        };
+        assert_eq!(
+            (scope.rate.burst, scope.rate.per_sec),
+            (GRANT_FRAMES.burst, GRANT_FRAMES.per_sec)
+        );
+        assert!(same(scope.interests, GRANT_INTERESTS));
+        assert!(same(scope.answered, GRANT_ANSWERED));
+        assert_eq!(scope.rated.len(), 2, "the ask exchange and the data asks");
+        assert!(scope.shared.is_some() && scope.bandwidth.is_some());
+        assert!(
+            (scope.names)(&n("/a/member/laptop/32=log/x")) && (scope.names)(&n("/elsewhere/x")),
+            "a guest's link carries what an own-namespace link did"
+        );
+        assert_eq!(
+            (scope.receives, scope.sends),
+            (Carries::Everything, Carries::Everything)
+        );
+        assert!(scope.narrowing.is_none() && scope.answers_in.is_none());
+    }
+
+    /// R12 L2(b): the certificate of an identity that lapses is found by the pure decision
+    /// the timer uses: the earliest NotAfter of the leaf and its issuers, recorded at
+    /// admission, and lapsed once the clock is past it.
+    #[tokio::test]
+    async fn an_identity_records_when_its_chain_first_lapses() {
+        use std::time::{Duration, SystemTime};
+        let a = namespace("/a", 10).await;
+        let world = relay(&a, &[], ServePolicy::Own).await;
+        let judge = world.judge();
+        let (member, chain) = a.device("member", "phone", 22).await;
+        let admitted = judge
+            .decide(&member, &hello(chain), &CH, None)
+            .await
+            .unwrap();
+        let id = admitted.identity().unwrap();
+        let (cert, at) = id
+            .lapses
+            .clone()
+            .expect("the identity does not say when its certificate lapses");
+        let day = Duration::from_secs(24 * 3600);
+        let now = SystemTime::now();
+        assert!(
+            at > now + day - Duration::from_secs(60) && at < now + day + Duration::from_secs(60),
+            "the certificates in the test are valid for 24 hours"
+        );
+        assert!(id.certificates.contains(&cert), "{cert} is in the chain");
+        assert!(id.lapse(now).is_none(), "not lapsed while it is valid");
+        assert!(id.lapse(at).is_none(), "valid at its NotAfter");
+        let lapsed = id.lapse(at + Duration::from_secs(1)).expect("lapsed");
+        assert!(
+            lapsed.contains(&cert.to_string()) && lapsed.contains("NotAfter"),
+            "the reason names the certificate and when it lapsed: {lapsed}"
+        );
+        let mut none = id.clone();
+        none.lapses = None;
+        assert!(none.lapse(at + day).is_none(), "no NotAfter, no lapse");
+    }
+
     /// A grant that ended is named in the refusal of the key's next link,
     /// and serves nothing.
     #[tokio::test]
@@ -2585,6 +2824,7 @@ mod tests {
             role: Role::Member,
             certificates: Vec::new(),
             served: Some(root),
+            lapses: None,
         }
     }
 
@@ -2692,6 +2932,7 @@ mod tests {
         );
         let id = Identity {
             served: None,
+            lapses: None,
             version: 1,
             ..served("/b", "/b/member/phone", THEIRS)
         };
@@ -2732,6 +2973,7 @@ mod tests {
     fn held_in_b(device: &str) -> Identity {
         Identity {
             served: None,
+            lapses: None,
             version: 1,
             ..served("/b", device, THEIRS)
         }

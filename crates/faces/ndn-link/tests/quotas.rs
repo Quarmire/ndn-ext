@@ -206,6 +206,72 @@ async fn a_members_1_mib_transfer_over_a_grant_link_meets_no_quota() {
     );
 }
 
+/// `count` distinct asks of the data layer's own devices a member sends the owner Ann
+/// (`<ANN>/32=grant/<GrantAsk>` and `<ANN>/32=hold/<HoldAsk>`, the names the link carries
+/// for a folder's collections), each its own: a seal key or a nonce that is nobody's.
+fn data_asks(count: usize, tag: u8) -> Vec<Name> {
+    use ndn_data::Seq;
+    use ndn_data::wire::{GrantAsk, HoldAsk, grant_name, hold_ask_name, log_name};
+    let collection = n(common::FOLDER).append("big");
+    (0..count)
+        .map(|i| {
+            let mut random = [tag; 32];
+            random[1..5].copy_from_slice(&u32::try_from(i).unwrap().to_le_bytes());
+            if i % 2 == 0 {
+                let seal = n("/bob/member/phone")
+                    .append_component(NameComponent::keyword(Bytes::from_static(b"seal")))
+                    .append_component(NameComponent::generic(Bytes::copy_from_slice(&random)));
+                grant_name(
+                    &n(ANN),
+                    &GrantAsk {
+                        seal_key: seal,
+                        collection: collection.clone(),
+                        epoch: ndn_data::Epoch {
+                            creator: n(ANN),
+                            seq: Seq(1),
+                        },
+                    },
+                )
+            } else {
+                let mut nonce = [0u8; 16];
+                nonce.copy_from_slice(&random[..16]);
+                hold_ask_name(
+                    &n(ANN),
+                    &HoldAsk {
+                        record: log_name(&n(ANN), Some(&collection), 1 + i as u64),
+                        nonce,
+                        asker: Bytes::from_static(&[0; 8]),
+                    },
+                )
+            }
+        })
+        .collect()
+}
+
+/// R12 H1: the owner's grant asks and hold asks (the data layer's `32=grant` and `32=hold`
+/// names, what a member's device asks the owner's) are rated apart on a grant link, in a
+/// bucket of their own beside the link's frames, as the ask exchange is: a member's flood of
+/// distinct ones reaches the owner's device at most the burst and the refill of the time
+/// it took (before this, 32,768 a second: each is a task, a fetch back to the member, and
+/// a signature at the owner).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_flood_of_distinct_grant_asks_over_a_grant_link_is_bounded() {
+    let (ann, bob) = grant_linked().await;
+    let total = 1000;
+    let got = flood(&bob, ann.key, data_asks(total, 3), total).await;
+    let dropped = ann.links.report().frames_over_rate;
+    let reached = total as u64 - dropped.min(total as u64);
+    let allowed = u64::from(ndn_link::policy::DATA_ASKS.burst)
+        + u64::from(ndn_link::policy::DATA_ASKS.per_sec) * got.took.as_secs()
+        + 10;
+    assert!(
+        reached <= allowed,
+        "{reached} of {total} distinct grant and hold asks reached the owner's device in {:?} \
+         over a grant link: {dropped} were dropped for rate, the bucket allows {allowed}",
+        got.took
+    );
+}
+
 /// A stranger (served by `open`, under the quotas) that floods is limited at
 /// the link, and the Interests it loses are answered with a Congestion Nack at
 /// once, not left to time out.

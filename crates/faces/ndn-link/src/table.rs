@@ -8,7 +8,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -18,7 +18,7 @@ use ndn_packet::Name;
 use ndn_security::{SignedTrustContext, sync_group};
 use ndn_transport::{Face, FaceId};
 
-use crate::admission::Identity;
+use crate::admission::{Identity, RENEW};
 use crate::grants::Grant;
 use crate::host::Route;
 use crate::joined::JoinedSet;
@@ -202,6 +202,9 @@ pub(crate) struct LinkTable {
     /// read under `live` by every registration and reroute, so what a path
     /// is given is always of the newest set.
     joined: Mutex<JoinedSet>,
+    /// Notified when a link is admitted: its certificates may lapse before the
+    /// ones the task that ends lapsed links sleeps for.
+    lapse_wake: Arc<tokio::sync::Notify>,
 }
 
 const ALREADY_LINKED: &str = "a link between these two devices already exists";
@@ -213,6 +216,12 @@ impl LinkTable {
     /// instead. A path of another kind joins the link: a direct path is a
     /// second path of the link to that device, not a link of its own.
     pub(crate) fn register(&self, link: Registration, mine: Option<KeyFingerprint>) -> Option<u64> {
+        let generation = self.register_path(link, mine);
+        self.lapse_wake.notify_one();
+        generation
+    }
+
+    fn register_path(&self, link: Registration, mine: Option<KeyFingerprint>) -> Option<u64> {
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let kind = link.path.kind;
         let text = match kind {
@@ -677,70 +686,118 @@ impl LinkTable {
     /// membership still admits stays, losing the routes of that identity
     /// (returned, for the caller to take from the forwarder).
     pub(crate) fn close_revoked(&self, ctx: &Arc<SignedTrustContext>) -> Vec<Dropped> {
+        self.drop_identities(
+            CloseReason::Revoked,
+            |id| {
+                if !id.device.has_prefix(ctx.namespace()) {
+                    return None;
+                }
+                id.certificates
+                    .iter()
+                    .find(|c| ctx.is_revoked(c))
+                    .map(|revoked| {
+                        format!(
+                            "{revoked} is revoked in {} (trust context v{})",
+                            ctx.namespace(),
+                            ctx.version()
+                        )
+                    })
+            },
+            None,
+        )
+    }
+
+    /// The certificate of an identity of a live link lapsed (the clock passed
+    /// its NotAfter): as for a revocation, take the identity from its link,
+    /// closing a link left with none ([`CloseReason::Unrecognized`]: the key has
+    /// no valid certificate now, as a hello with the lapsed one is refused), and
+    /// return what a link that stays loses.
+    pub(crate) fn close_lapsed(&self, now: SystemTime) -> Vec<Dropped> {
+        self.drop_identities(CloseReason::Unrecognized, |id| id.lapse(now), Some(RENEW))
+    }
+
+    /// When the first certificate of an identity of a live link lapses.
+    pub(crate) fn next_lapse(&self) -> Option<SystemTime> {
+        self.live
+            .lock()
+            .values()
+            .flat_map(|link| link.identities.iter())
+            .filter_map(|id| id.lapses.as_ref().map(|(_, at)| *at))
+            .min()
+    }
+
+    /// Wakes the task that ends the links of lapsed certificates when a link is
+    /// admitted (its identities may lapse before the ones it slept for).
+    pub(crate) fn lapse_wake(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.lapse_wake)
+    }
+
+    /// Take from each link the identities `ended` gives a reason for (every one
+    /// that has: a link may lose several). A link left with no identity is
+    /// closed with `reason` and the words `text; this link is closed[: advice]`;
+    /// one that another membership still admits stays, losing the routes of
+    /// that identity (returned, for the caller to take from the forwarder).
+    fn drop_identities(
+        &self,
+        reason: CloseReason,
+        ended: impl Fn(&Identity) -> Option<String>,
+        advice: Option<&str>,
+    ) -> Vec<Dropped> {
         let mut dropped = Vec::new();
         let mut live = self.live.lock();
         for link in live.values_mut() {
-            let Some(at) = link.identities.iter().position(|id| {
-                id.device.has_prefix(ctx.namespace())
-                    && id.certificates.iter().any(|c| ctx.is_revoked(c))
-            }) else {
-                continue;
-            };
-            let id = link.identities.remove(at);
-            let revoked = id
-                .certificates
+            while let Some((at, text)) = link
+                .identities
                 .iter()
-                .find(|c| ctx.is_revoked(c))
-                .expect("found above");
-            let text = format!(
-                "{revoked} is revoked in {} (trust context v{})",
-                ctx.namespace(),
-                ctx.version()
-            );
-            if link.identities.is_empty() {
-                let text = format!("{text}; this link is closed");
-                for p in &link.paths {
-                    tracing::warn!(target: "face.quic", face = p.path.face.0, peer = %id.device, "{text}");
+                .enumerate()
+                .find_map(|(at, id)| ended(id).map(|text| (at, text)))
+            {
+                let id = link.identities.remove(at);
+                if link.identities.is_empty() {
+                    let text = closed_text(&text, advice);
+                    for p in &link.paths {
+                        tracing::warn!(target: "face.quic", face = p.path.face.0, peer = %id.device, "{text}");
+                    }
+                    link.close(reason, &text);
+                    break;
                 }
-                link.close(CloseReason::Revoked, &text);
-                continue;
-            }
-            let mut prefixes = vec![id.device.clone(), id.namespace.clone()];
-            // The namespace's sync group goes with the last identity in it.
-            if !link.identities.iter().any(|i| i.namespace == id.namespace) {
-                prefixes.push(sync_group(&id.namespace));
-            }
-            let mut routes = Vec::new();
-            for p in &mut link.paths {
-                let gone: Vec<Name> = p
-                    .path
-                    .routes
-                    .iter()
-                    .filter(|r| prefixes.contains(&r.prefix))
-                    .map(|r| r.prefix.clone())
-                    .collect();
-                p.path.routes.retain(|r| !prefixes.contains(&r.prefix));
-                tracing::warn!(
-                    target: "face.quic",
-                    face = p.path.face.0,
-                    peer = %id.device,
-                    "{text}; the link stays, admitted by {}, without its routes in {}",
-                    link.identities.iter().map(|i| i.device.to_string()).collect::<Vec<_>>().join(", "),
-                    ctx.namespace()
-                );
-                if !gone.is_empty() {
-                    routes.push((p.path.face, gone));
+                let mut prefixes = vec![id.device.clone(), id.namespace.clone()];
+                // The namespace's sync group goes with the last identity in it.
+                if !link.identities.iter().any(|i| i.namespace == id.namespace) {
+                    prefixes.push(sync_group(&id.namespace));
                 }
+                let mut routes = Vec::new();
+                for p in &mut link.paths {
+                    let gone: Vec<Name> = p
+                        .path
+                        .routes
+                        .iter()
+                        .filter(|r| prefixes.contains(&r.prefix))
+                        .map(|r| r.prefix.clone())
+                        .collect();
+                    p.path.routes.retain(|r| !prefixes.contains(&r.prefix));
+                    tracing::warn!(
+                        target: "face.quic",
+                        face = p.path.face.0,
+                        peer = %id.device,
+                        "{text}; the link stays, admitted by {}, without its routes in {}",
+                        link.identities.iter().map(|i| i.device.to_string()).collect::<Vec<_>>().join(", "),
+                        id.namespace
+                    );
+                    if !gone.is_empty() {
+                        routes.push((p.path.face, gone));
+                    }
+                }
+                dropped.push(Dropped {
+                    namespace: id.namespace,
+                    routes,
+                    handle: link
+                        .paths
+                        .iter()
+                        .find(|p| p.path.kind == PathKind::Link)
+                        .map(|p| p.path.handle.clone()),
+                });
             }
-            dropped.push(Dropped {
-                namespace: id.namespace,
-                routes,
-                handle: link
-                    .paths
-                    .iter()
-                    .find(|p| p.path.kind == PathKind::Link)
-                    .map(|p| p.path.handle.clone()),
-            });
         }
         dropped
     }
@@ -854,6 +911,15 @@ impl LinkTable {
     }
 }
 
+/// The words a link closed for the loss of its last identity carries: why, that
+/// the link is closed, and (when there is something to do) what to do.
+fn closed_text(why: &str, advice: Option<&str>) -> String {
+    match advice {
+        Some(advice) => format!("{why}; this link is closed: {advice}"),
+        None => format!("{why}; this link is closed"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -899,5 +965,34 @@ mod tests {
             None,
             large
         ));
+    }
+
+    /// R12 L2(b): the words a link closed for a lapsed certificate carries say which
+    /// certificate lapsed and when, that the link is closed, and what to do.
+    #[test]
+    fn a_link_closed_for_a_lapsed_certificate_says_why_and_what_to_do() {
+        use std::time::Duration;
+        let cert: Name = "/a/member/phone/KEY/k/NDNCERT/v=1".parse().unwrap();
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let id = Identity {
+            namespace: "/a".parse().unwrap(),
+            version: 1,
+            device: "/a/member/phone".parse().unwrap(),
+            role: ndn_cert::roles::Role::Member,
+            certificates: vec![cert.clone()],
+            served: None,
+            lapses: Some((cert.clone(), at)),
+        };
+        let why = id.lapse(at + Duration::from_secs(1)).expect("lapsed");
+        let text = closed_text(&why, Some(RENEW));
+        for must in [
+            cert.to_string().as_str(),
+            "2023-11-14 22:13:20 UTC",
+            "NotAfter",
+            "this link is closed",
+            "renew",
+        ] {
+            assert!(text.contains(must), "`{must}` is not in: {text}");
+        }
     }
 }

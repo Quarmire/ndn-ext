@@ -37,13 +37,16 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use ndn_cert::roles::Role;
 use ndn_face_quic::{CloseReason, KeyFingerprint, RateLimit, SharedRate};
 use ndn_mgmt_wire::{LinkDetail, link_code as code};
 use ndn_packet::Name;
 use parking_lot::Mutex;
 
 use crate::admission::{Identity, Judge, Refusal, list};
-use crate::policy::{GRANT_BYTES, GRANT_FRAMES, GRANTS_BYTES, GRANTS_FRAMES};
+use crate::policy::{
+    GRANT_ANSWERED, GRANT_BYTES, GRANT_FRAMES, GRANT_INTERESTS, GRANTS_BYTES, GRANTS_FRAMES,
+};
 
 /// Whom this device serves on links nobody asked for. Expected keys and
 /// devices of [`PeerSpec`](crate::PeerSpec)s are admitted whatever it is.
@@ -178,6 +181,8 @@ struct RootLive {
     stranger: Option<Arc<SharedRate>>,
     /// The rates the granted members of this root share, once one is served.
     granted: Option<Arc<SharedRate>>,
+    /// The rates the guests of this root's namespace share, once one is served.
+    guests: Option<Arc<SharedRate>>,
 }
 
 /// Whom a served link is for, which decides the rates it takes.
@@ -187,14 +192,25 @@ pub(crate) enum Serving {
     Stranger,
     /// A member a grant admitted: the grant link's rates ([`GRANT_FRAMES`]).
     Granted,
+    /// A guest of a namespace this device holds a certificate in: its own
+    /// namespace, but a guest is "a friend's device, short-lived", so its link
+    /// takes the grant link's rates and bounds, with the guests of the
+    /// namespace sharing one bucket (round 12, L2).
+    Guest,
 }
 
 /// What a served link takes from its peer: its own rates and the buckets its
 /// namespace's links share.
 #[derive(Clone)]
 pub(crate) struct Limits {
+    /// Whom the link is for.
+    pub(crate) serving: Serving,
     pub(crate) rate: RateLimit,
     pub(crate) bandwidth: Option<RateLimit>,
+    /// A bound on the Interests alone, below `rate` ([`GRANT_INTERESTS`]).
+    pub(crate) interests: Option<RateLimit>,
+    /// A bound on the bytes this device answers the peer ([`GRANT_ANSWERED`]).
+    pub(crate) answered: Option<RateLimit>,
     pub(crate) shared: Arc<SharedRate>,
 }
 
@@ -296,20 +312,37 @@ impl QuotaState {
             links: 0,
             stranger: None,
             granted: None,
+            guests: None,
         });
         entry.links += 1;
         let limits = quotas.map(|q| match serving {
             Serving::Stranger => Limits {
+                serving,
                 rate: q.interests_per_key,
                 bandwidth: None,
+                interests: None,
+                answered: None,
                 shared: Arc::clone(entry.stranger.get_or_insert_with(|| {
                     Arc::new(SharedRate::new(q.interests_per_namespace, None))
                 })),
             },
             Serving::Granted => Limits {
+                serving,
                 rate: GRANT_FRAMES,
                 bandwidth: Some(GRANT_BYTES),
+                interests: Some(GRANT_INTERESTS),
+                answered: Some(GRANT_ANSWERED),
                 shared: Arc::clone(entry.granted.get_or_insert_with(|| {
+                    Arc::new(SharedRate::new(GRANTS_FRAMES, Some(GRANTS_BYTES)))
+                })),
+            },
+            Serving::Guest => Limits {
+                serving,
+                rate: GRANT_FRAMES,
+                bandwidth: Some(GRANT_BYTES),
+                interests: Some(GRANT_INTERESTS),
+                answered: Some(GRANT_ANSWERED),
+                shared: Arc::clone(entry.guests.get_or_insert_with(|| {
                     Arc::new(SharedRate::new(GRANTS_FRAMES, Some(GRANTS_BYTES)))
                 })),
             },
@@ -375,7 +408,29 @@ impl Judge<'_> {
             Some(root) => root,
             None => {
                 if own.contains(&id.namespace) {
-                    return Ok(None);
+                    // Own namespace: never limited, but for a guest ("a friend's
+                    // device, short-lived"), which takes the grant link's rates and
+                    // bounds (round 12, L2). The namespace's held context's first
+                    // anchor binds the name, as for an open policy below.
+                    if id.role != Role::Guest {
+                        return Ok(None);
+                    }
+                    let Some(root) = self.held_roots(&id.namespace).into_iter().min() else {
+                        return Ok(None);
+                    };
+                    return self
+                        .quotas
+                        .take(
+                            &id.namespace,
+                            root,
+                            Some(&Quotas {
+                                links_total: usize::MAX,
+                                links_per_namespace: usize::MAX,
+                                ..Quotas::default()
+                            }),
+                            Serving::Guest,
+                        )
+                        .map(Some);
                 }
                 let anchors = self.held_roots(&id.namespace);
                 if let ServePolicy::Listed { roots, quotas } = self.serve

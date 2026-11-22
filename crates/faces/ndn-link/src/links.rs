@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, OnceLock, Weak};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use parking_lot::Mutex;
 
@@ -223,6 +223,7 @@ impl Links {
         let _ = links.waiting.set(Waiting::start(&links));
         links.take_punches();
         links.spawn_grant_expiry();
+        links.spawn_certificate_expiry();
         links.watch_addresses(crate::netwatch::AddressWatch::default());
 
         let weak = Arc::downgrade(&links);
@@ -414,7 +415,13 @@ impl Links {
     /// it leaves with no identity; a link another membership still admits
     /// loses that membership's routes and presence.
     fn revoked(&self, ctx: &Arc<ndn_security::SignedTrustContext>) {
-        for dropped in self.table.close_revoked(ctx) {
+        self.dropped(self.table.close_revoked(ctx));
+    }
+
+    /// What a link that stays loses with an identity taken from it (revoked or
+    /// lapsed): the identity's routes and presence.
+    fn dropped(&self, dropped: Vec<crate::table::Dropped>) {
+        for dropped in dropped {
             for (face, prefixes) in &dropped.routes {
                 self.faces.remove_routes(*face, prefixes);
             }
@@ -426,6 +433,45 @@ impl Links {
             }
             self.announce_presence(&dropped.namespace);
         }
+    }
+
+    /// Starts the one task that ends the links of lapsed certificates: the
+    /// certificate that admitted a link was valid at its hello, and a link that
+    /// stands for longer than that keeps an identity it no longer has, so the
+    /// task sleeps until the first NotAfter of the identities of the live links (a
+    /// minute at most at a time, the wall clock read again at each wake:
+    /// [`SLEEP_MAX`](crate::grants)) and wakes when a link is admitted. A link
+    /// closed says which certificate lapsed and what to do ([`Identity::lapse`]).
+    pub(crate) fn spawn_certificate_expiry(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        let cancel = self.cancel_token().clone();
+        tokio::spawn(async move {
+            loop {
+                let Some(links) = weak.upgrade() else { return };
+                // A moment past the NotAfter: a certificate is valid at it.
+                let next = links
+                    .table
+                    .next_lapse()
+                    .map(|at| at + Duration::from_millis(1));
+                let sleep = async {
+                    match crate::grants::sleep_for(next, SystemTime::now()) {
+                        Some(wait) => tokio::time::sleep(wait).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                };
+                let wake = links.table.lapse_wake();
+                let woken = wake.notified();
+                drop(links);
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => return,
+                    () = woken => continue,
+                    () = sleep => {}
+                }
+                let Some(links) = weak.upgrade() else { return };
+                links.dropped(links.table.close_lapsed(SystemTime::now()));
+            }
+        });
     }
 
     /// This device's links now: each device, its paths, and its direct

@@ -120,12 +120,62 @@ pub const GRANT_FRAMES: RateLimit = RateLimit {
 /// device receive no more than that from its key, and a namespace's members
 /// no more than [`GRANTS_BYTES`] together; what is over it is dropped (an
 /// Interest with a Congestion Nack), and the grant is revocable. It bounds
-/// what the member sends, not what this device answers: the Data an Interest
-/// asks for is bounded by the link's congestion control and by the names the
-/// grant carries.
+/// what the member sends; what this device answers it is bounded by
+/// [`GRANT_INTERESTS`] (what the member may ask) and [`GRANT_ANSWERED`] (what
+/// this device sends back).
 pub const GRANT_BYTES: RateLimit = RateLimit {
     burst: 64 << 20,
     per_sec: 32 << 20,
+};
+/// What a grant link's member may **ask** of this device, in Interests (any
+/// name the link carries), per link, beside [`GRANT_FRAMES`] (which counts every
+/// frame, a pushed Data fragment too, and was sized for those): 16,384 at once,
+/// then 4,096 a second, an Interest over it Nacked Congestion as any Interest
+/// dropped for rate is. One member's 1 MiB pull is 256 piece Interests, 32 in
+/// flight, and the burst covers 64 of them at once; the refill is 16 such pulls
+/// a second, which at the data layer's 4 KiB pieces is 16 MiB a second asked
+/// of this device (the 32,768 a second of the frame bucket was 128 MiB a second
+/// of 4 KiB Data, 40 to 90 times the amplification of a bound set at the
+/// frames of the pieces). What the Interests ask for is bounded again by
+/// [`GRANT_ANSWERED`].
+pub const GRANT_INTERESTS: RateLimit = RateLimit {
+    burst: 16_384,
+    per_sec: 4_096,
+};
+/// What this device may **answer** a grant link's member, in bytes (Data, Nacks
+/// and their fragments sent over the link): 64 MiB at once, then 16 MiB a
+/// second (128 Mbit/s). One honest 1 MiB pull is 1.2 MiB on the wire, so the
+/// burst is some 50 of them back to back and the refill is what
+/// [`GRANT_INTERESTS`] asks of 4 KiB pieces; ordinary sync (a few records and
+/// their pieces) is a few KiB. A member that asks for more than this device
+/// is willing to send it has the answers dropped (silently: a Data has no one to
+/// be Nacked to), and asks again when its timer says, so what one key can make
+/// this device send is bounded however many Interests it sends, and a
+/// namespace's members together by [`GRANTS_BYTES`] on what they send.
+pub const GRANT_ANSWERED: RateLimit = RateLimit {
+    burst: 64 << 20,
+    per_sec: 16 << 20,
+};
+/// What a grant link's member may send of the data layer's asks (names whose
+/// first keyword is `32=grant`, `32=hold` or `32=audit`, followed by the ask:
+/// the grants of a folder's epoch keys, the custody leases and their audits),
+/// all three together, per link, beside the link's other rates: 256 at once,
+/// then 16 a second; over it dropped silently, as the ask exchange is
+/// ([`ASK_INTERESTS`]). What one honest member asks: a grant ask per
+/// collection and epoch it reads (retried on a backoff of seconds), a hold ask
+/// per record it has held (one at a time per asker, the data layer's
+/// `HOLDS_PER_ASKER`), and an audit of 16 pieces per holder per round, 32 in flight; and
+/// the member's own device never has more than 256 asks in flight (its fetch
+/// slots), so the burst covers all it can have outstanding, and a first
+/// sync of a few hundred collections or audits of several holders at once are
+/// within it. What it must stay under is how fast this device's data layer
+/// can drain asks it cannot answer (a fetch back to the asker that
+/// times out): about 128 a second, so 16 a second leaves it room for 8
+/// such members and for its own work, where the 32,768 a second of the frame
+/// bucket left it none.
+pub const DATA_ASKS: RateLimit = RateLimit {
+    burst: 256,
+    per_sec: 16,
 };
 /// What the grant links of one namespace may send together, in frames: four
 /// members' worth (262,144 at once, then 131,072 a second), as the stranger

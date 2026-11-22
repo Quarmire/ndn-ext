@@ -279,6 +279,7 @@ mod tests {
             role,
             certificates: Vec::new(),
             served: None,
+            lapses: None,
         }
     }
 

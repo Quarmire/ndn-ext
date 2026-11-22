@@ -222,14 +222,14 @@ impl Parts {
     }
 
     /// The certificate `person` gives this device's key.
-    async fn certified(&self, person: &Person) -> Certificate {
+    async fn certified(&self, person: &Person, validity_ms: u64) -> Certificate {
         let cert = person
             .authority
             .certify(
                 &self.key_name,
                 self.public.clone(),
                 &person.issuer,
-                VALIDITY_MS,
+                validity_ms,
             )
             .await
             .unwrap();
@@ -530,6 +530,9 @@ pub struct Setup {
     /// Which kinds of its links frame NDNLPv2 reliability
     /// (`LinkSetup::reliability`).
     pub reliability: LinkReliability,
+    /// How long the certificate its person gives its key is valid, in
+    /// milliseconds ([`VALIDITY_MS`] unless a case needs one that lapses).
+    pub cert_ms: u64,
 }
 
 impl Setup {
@@ -546,6 +549,7 @@ impl Setup {
             evaluators: Evaluators::none(),
             sync_tells_no_routes: false,
             reliability: LinkReliability::default(),
+            cert_ms: VALIDITY_MS,
         }
     }
 
@@ -621,7 +625,7 @@ struct Kept {
 pub async fn embedded(person: &Person, device: &str, setup: Setup) -> Embedded {
     log_to_file();
     let parts = Parts::new(device, setup.listen);
-    let cert = parts.certified(person).await;
+    let cert = parts.certified(person, setup.cert_ms).await;
     let (validator, trust) = trust(person, &cert);
     boot(
         Kept {

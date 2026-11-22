@@ -54,6 +54,28 @@ pub const CONGESTION_NACKS: RateLimit = RateLimit {
     burst: 256,
     per_sec: 128,
 };
+/// The frames a link receives that carry no network packet and no TxSequence
+/// (acknowledgements, idle frames), together: 1,024 at once, then 1,024 a
+/// second. An honest peer sends them from its idle-Ack pump, which ticks every
+/// 5 ms (200 a second) and sends one frame, or a few when more acks are pending
+/// than one frame holds, so at 100,000 packets a second received (a gigabit of
+/// small packets: far past any scoped link) it sends about 600 a second. A
+/// peer that floods them is held to this before the reliability layer reads
+/// the acks in each (round 12, L1). They take no token of the link's frames.
+pub const LINK_ONLY_FRAMES: RateLimit = RateLimit {
+    burst: 1024,
+    per_sec: 1024,
+};
+/// The frames a link receives that carry a TxSequence and no network packet:
+/// 16 at once, then 4 a second. No honest peer sends one: a frame with a
+/// TxSequence carries the fragment that sequence numbers
+/// (`LpReliability::on_send`), and its acknowledgements carry none. Each one
+/// would make this side remember the sequence for up to two RTOs and queue an
+/// acknowledgement, so a flood of them is a table to fill (round 12, L1).
+pub const STAMPED_LINK_ONLY_FRAMES: RateLimit = RateLimit {
+    burst: 16,
+    per_sec: 4,
+};
 
 /// Which packets one direction of a scoped link carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -139,9 +161,22 @@ pub struct LinkScope {
     /// bandwidth as well as by frames (`burst` must be at least the largest
     /// frame). `None`: frames only, which bounds bytes by the frame size.
     pub bandwidth: Option<RateLimit>,
-    /// Interests of some names the peer sends, bounded by a bucket of their
-    /// own after `rate`, before `shared`.
-    pub rated: Option<RatedInterests>,
+    /// Interests of some names the peer sends, each class held to a bucket of
+    /// its own after `rate`, before `shared` (an Interest takes a token of the
+    /// first class that names it).
+    pub rated: Vec<RatedInterests>,
+    /// A bound on the Interests the peer sends, whatever their names,
+    /// beside `rate` (which counts every frame, a Data fragment too): an
+    /// Interest is a small frame that may cost this side a Data of kilobytes,
+    /// so the Interests are bounded below the frames. An Interest over it is
+    /// dropped, with a Congestion Nack as for any rate. `None`: only `rate`.
+    pub interests: Option<RateLimit>,
+    /// A bound on the bytes of answers (Data, Nacks and their fragments) this
+    /// side sends the peer, counted in [`ScopeState::sending`] (`burst` must be
+    /// at least the largest frame). An answer over it is dropped, so what a
+    /// peer can make this side send is bounded by more than what it asks in
+    /// Interests. `None`: no bound.
+    pub answered: Option<RateLimit>,
     /// A bound on received packets shared with other links, checked after
     /// `rate`.
     pub shared: Option<Arc<SharedRate>>,
@@ -264,7 +299,17 @@ pub(crate) struct ScopeState {
     outbound: Mutex<Fragmented>,
     bucket: Mutex<Bucket>,
     bandwidth_bucket: Mutex<Bucket>,
-    rated_bucket: Mutex<Bucket>,
+    /// One bucket per class of [`LinkScope::rated`], in its order.
+    rated_buckets: Vec<Mutex<Bucket>>,
+    /// The Interests of [`LinkScope::interests`].
+    interest_bucket: Mutex<Bucket>,
+    /// The bytes of answers of [`LinkScope::answered`].
+    answered_bucket: Mutex<Bucket>,
+    /// The frames with no packet in them ([`LINK_ONLY_FRAMES`]).
+    link_only_bucket: Mutex<Bucket>,
+    /// The frames with no packet in them that carry a TxSequence
+    /// ([`STAMPED_LINK_ONLY_FRAMES`]).
+    stamped_bucket: Mutex<Bucket>,
     /// What the link may still send of Congestion Nacks.
     nack_bucket: Mutex<Bucket>,
     started: Instant,
@@ -284,9 +329,15 @@ impl ScopeState {
         Self {
             bucket: Mutex::new(Bucket::full(scope.rate)),
             bandwidth_bucket: Mutex::new(Bucket::full(scope.bandwidth.unwrap_or(none))),
-            rated_bucket: Mutex::new(Bucket::full(
-                scope.rated.as_ref().map_or(none, |rated| rated.rate),
-            )),
+            rated_buckets: scope
+                .rated
+                .iter()
+                .map(|rated| Mutex::new(Bucket::full(rated.rate)))
+                .collect(),
+            interest_bucket: Mutex::new(Bucket::full(scope.interests.unwrap_or(none))),
+            answered_bucket: Mutex::new(Bucket::full(scope.answered.unwrap_or(none))),
+            link_only_bucket: Mutex::new(Bucket::full(LINK_ONLY_FRAMES)),
+            stamped_bucket: Mutex::new(Bucket::full(STAMPED_LINK_ONLY_FRAMES)),
             nack_bucket: Mutex::new(Bucket::full(CONGESTION_NACKS)),
             scope,
             inbound: Mutex::default(),
@@ -305,13 +356,43 @@ impl ScopeState {
     }
 
     /// Judge a frame the peer sent. A frame carrying no network packet (an
-    /// acknowledgement) passes without a token: acknowledgements of the
-    /// fragments this side sends must not crowd out the peer's packets.
+    /// acknowledgement) takes no token of the link's frames, which the peer's
+    /// packets use: acknowledgements of the fragments this side sends must not
+    /// crowd them out. It takes one of a bucket of its own
+    /// ([`LINK_ONLY_FRAMES`]), and when it carries a TxSequence one of a
+    /// smaller one ([`STAMPED_LINK_ONLY_FRAMES`]).
     pub(crate) fn received(&self, frame: &Bytes) -> Judged {
         let packet = Packet::of(frame);
-        if !matches!(packet, Some(Packet::LinkOnly)) {
+        if let Some(Packet::LinkOnly { stamped }) = packet {
+            if !self.take_link_only(stamped) {
+                self.note_over_rate(
+                    if stamped {
+                        "over the rate limit of frames that carry a TxSequence and no packet"
+                    } else {
+                        "over the rate limit of frames that carry no packet"
+                    },
+                    None,
+                );
+                return Judged::Drop(None);
+            }
+        } else {
             if !self.take_token() {
                 return self.congested("over the rate limit", packet.as_ref());
+            }
+            if let (
+                Some(rate),
+                Some(Packet::Network {
+                    kind: Kind::Interest,
+                    ..
+                }),
+            ) = (self.scope.interests, &packet)
+                && !self
+                    .interest_bucket
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take(rate, 1.0)
+            {
+                return self.congested("over the rate limit of Interests", packet.as_ref());
             }
             if let Some(bandwidth) = self.scope.bandwidth
                 && !self
@@ -322,20 +403,12 @@ impl ScopeState {
             {
                 return self.congested("over the bandwidth limit", packet.as_ref());
             }
-            if let (
-                Some(rated),
-                Some(Packet::Network {
-                    kind: Kind::Interest,
-                    name,
-                    ..
-                }),
-            ) = (&self.scope.rated, &packet)
-                && (rated.names)(name)
-                && !self
-                    .rated_bucket
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .take(rated.rate, 1.0)
+            if let Some(Packet::Network {
+                kind: Kind::Interest,
+                name,
+                ..
+            }) = &packet
+                && !self.take_rated(name)
             {
                 self.note_over_rate("over the rate limit of its names", Some(name));
                 return Judged::Drop(None);
@@ -359,6 +432,24 @@ impl ScopeState {
             self.scope.interests_in.as_deref(),
             self.scope.answers_in.as_deref(),
         )
+    }
+
+    /// Whether an Interest of `name` is within the bucket of the first class
+    /// of [`LinkScope::rated`] that names it (it takes a token), or is in none.
+    fn take_rated(&self, name: &Name) -> bool {
+        let Some((i, rated)) = self
+            .scope
+            .rated
+            .iter()
+            .enumerate()
+            .find(|(_, rated)| (rated.names)(name))
+        else {
+            return true;
+        };
+        self.rated_buckets[i]
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take(rated.rate, 1.0)
     }
 
     /// A frame dropped for a rate: counted, and when it carries a whole
@@ -400,15 +491,67 @@ impl ScopeState {
         self.note_drop(what, name);
     }
 
-    /// Judge a frame this side would send.
+    /// Judge a frame this side would send. An answer (a Data, a Nack, or a
+    /// fragment of one) that passes takes its bytes of [`LinkScope::answered`]
+    /// and is dropped, silently, when they are not there: a Data has no one to
+    /// be Nacked to, and its asker's timer asks again.
     pub(crate) fn sending(&self, frame: &Bytes) -> Judged {
-        self.judge(
-            Packet::of(frame),
+        let packet = Packet::of(frame);
+        let answer = matches!(
+            packet,
+            Some(
+                Packet::LaterFragment { .. }
+                    | Packet::Network {
+                        kind: Kind::Data | Kind::Nack,
+                        ..
+                    }
+            )
+        );
+        let name = match &packet {
+            Some(Packet::Network { name, .. }) if self.scope.answered.is_some() => {
+                Some(name.clone())
+            }
+            _ => None,
+        };
+        let verdict = self.judge(
+            packet,
             self.carries(|n| n.sends, self.scope.sends),
             &self.outbound,
             None,
             None,
-        )
+        );
+        if let (Judged::Pass, true, Some(budget)) = (&verdict, answer, self.scope.answered)
+            && !self
+                .answered_bucket
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take(budget, bytes(frame))
+        {
+            self.note_over_rate(
+                "over the budget of bytes this side answers over the link",
+                name.as_ref(),
+            );
+            return Judged::Drop(None);
+        }
+        verdict
+    }
+
+    /// A frame with no packet in it: a token of [`LINK_ONLY_FRAMES`], and
+    /// one of [`STAMPED_LINK_ONLY_FRAMES`] too when it carries a TxSequence.
+    fn take_link_only(&self, stamped: bool) -> bool {
+        if stamped
+            && !self
+                .stamped_bucket
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take(STAMPED_LINK_ONLY_FRAMES, 1.0)
+        {
+            return false;
+        }
+        self.link_only_bucket
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take(LINK_ONLY_FRAMES, 1.0)
     }
 
     /// What one direction carries now: the narrowed kind while the scope is
@@ -440,7 +583,7 @@ impl ScopeState {
             return Judged::Drop(None);
         };
         let verdict = match packet {
-            Packet::LinkOnly => return Judged::Pass,
+            Packet::LinkOnly { .. } => return Judged::Pass,
             Packet::LaterFragment { base } => {
                 if fragmented
                     .lock()
@@ -535,8 +678,9 @@ enum Kind {
 
 /// What a frame carries, as far as a scope cares.
 enum Packet {
-    /// No network packet (acknowledgements, idle frames).
-    LinkOnly,
+    /// No network packet (acknowledgements, idle frames); `stamped` when it
+    /// carries a TxSequence, which no honest peer's does.
+    LinkOnly { stamped: bool },
     /// A network packet whole, or the first fragment of one.
     Network {
         kind: Kind,
@@ -565,7 +709,9 @@ impl Packet {
         }
         let lp = LpPacket::decode(frame.clone()).ok()?;
         let Some(fragment) = lp.fragment else {
-            return Some(Self::LinkOnly);
+            return Some(Self::LinkOnly {
+                stamped: lp.tx_sequence.is_some(),
+            });
         };
         let count = lp.frag_count.unwrap_or(1);
         let index = lp.frag_index.unwrap_or(0);
@@ -631,7 +777,9 @@ mod tests {
                 per_sec: 1,
             },
             bandwidth: None,
-            rated: None,
+            rated: Vec::new(),
+            interests: None,
+            answered: None,
             shared: None,
             explain: "test".into(),
             answers_in: None,
@@ -698,7 +846,9 @@ mod tests {
                 per_sec: 100,
             },
             bandwidth: None,
-            rated: None,
+            rated: Vec::new(),
+            interests: None,
+            answered: None,
             shared: None,
             explain: "test".into(),
             answers_in: Some(Box::new(move |n: &Name| n.has_prefix(&own))),
@@ -747,7 +897,9 @@ mod tests {
                 per_sec: 100,
             },
             bandwidth: None,
-            rated: None,
+            rated: Vec::new(),
+            interests: None,
+            answered: None,
             shared: None,
             explain: "test".into(),
             answers_in: Some(Box::new(move |n: &Name| n.has_prefix(&asked_in))),
@@ -801,7 +953,9 @@ mod tests {
                 per_sec: 100,
             },
             bandwidth: None,
-            rated: None,
+            rated: Vec::new(),
+            interests: None,
+            answered: None,
             shared: None,
             explain: "test".into(),
             answers_in: None,
@@ -903,7 +1057,9 @@ mod tests {
             names: Box::new(|_: &Name| true),
             rate,
             bandwidth,
-            rated: None,
+            rated: Vec::new(),
+            interests: None,
+            answered: None,
             shared,
             explain: "test".into(),
             answers_in: None,
@@ -1114,13 +1270,15 @@ mod tests {
                 per_sec: 1000,
             },
             bandwidth: None,
-            rated: Some(RatedInterests {
+            rated: vec![RatedInterests {
                 names: Box::new(|n: &Name| n.has_prefix(&"/rated".parse::<Name>().unwrap())),
                 rate: RateLimit {
                     burst: 3,
                     per_sec: 1,
                 },
-            }),
+            }],
+            interests: None,
+            answered: None,
             shared: Some(Arc::clone(&shared)),
             explain: "test".into(),
             answers_in: None,
@@ -1170,7 +1328,9 @@ mod tests {
                     per_sec: 1,
                 },
                 bandwidth: None,
-                rated: None,
+                rated: Vec::new(),
+                interests: None,
+                answered: None,
                 shared: Some(Arc::clone(&shared)),
                 explain: "test".into(),
                 answers_in: None,
@@ -1196,5 +1356,199 @@ mod tests {
             passed, 5,
             "each link within its own burst, both within the shared one"
         );
+    }
+
+    /// A scope of everything, with the buckets round 12 added.
+    fn bounded(
+        interests: Option<RateLimit>,
+        answered: Option<RateLimit>,
+        rated: Vec<RatedInterests>,
+    ) -> ScopeState {
+        ScopeState::new(LinkScope {
+            receives: Carries::Everything,
+            sends: Carries::Everything,
+            names: Box::new(|_: &Name| true),
+            rate: RateLimit {
+                burst: 100_000,
+                per_sec: 100_000,
+            },
+            bandwidth: None,
+            rated,
+            interests,
+            answered,
+            shared: None,
+            explain: "test".into(),
+            answers_in: None,
+            interests_in: None,
+            narrowing: None,
+            counts: None,
+        })
+    }
+
+    /// R12 M2(a): the Interests a peer sends have a bucket below the frames', and what is
+    /// over it is Nacked Congestion like any Interest over a rate; Data and fragments take
+    /// none of it.
+    #[test]
+    fn interests_take_a_bucket_of_their_own_below_the_frames() {
+        let s = bounded(
+            Some(RateLimit {
+                burst: 3,
+                per_sec: 1,
+            }),
+            None,
+            Vec::new(),
+        );
+        let wire = |p: &Bytes| ndn_packet::lp::encode_lp_packet(p);
+        let asked = interest("/any/x");
+        let passed = (0..10)
+            .filter(|_| s.received(&wire(&asked)) == Judged::Pass)
+            .count();
+        assert_eq!(passed, 3, "the Interests' burst, then nothing");
+        assert_eq!(
+            s.received(&wire(&asked)),
+            Judged::Drop(Some((NackReason::Congestion, asked))),
+            "an Interest over its bucket is Nacked Congestion"
+        );
+        for _ in 0..1000 {
+            assert_eq!(
+                s.received(&wire(&data("/any/x", 10))),
+                Judged::Pass,
+                "Data takes no token of the Interests' bucket"
+            );
+        }
+    }
+
+    /// R12 M2(b): the bytes of answers this side sends are bounded; Interests this side
+    /// sends and the answers within the burst are not, and a later fragment is counted.
+    #[test]
+    fn the_bytes_of_answers_sent_are_bounded() {
+        let piece = ndn_packet::lp::encode_lp_packet(&data("/any/piece", 1000));
+        let len = u32::try_from(piece.len()).unwrap();
+        let s = bounded(
+            None,
+            Some(RateLimit {
+                burst: 2 * len + len / 2,
+                per_sec: 1,
+            }),
+            Vec::new(),
+        );
+        assert_eq!(s.sending(&piece), Judged::Pass);
+        assert_eq!(s.sending(&piece), Judged::Pass);
+        assert_eq!(
+            s.sending(&piece),
+            Judged::Drop(None),
+            "a third piece is over the budget"
+        );
+        let ask = ndn_packet::lp::encode_lp_packet(&interest("/any/ask"));
+        for _ in 0..100 {
+            assert_eq!(
+                s.sending(&ask),
+                Judged::Pass,
+                "an Interest this side sends is no answer"
+            );
+        }
+        // What the peer sends is not counted by it.
+        assert_eq!(s.received(&piece), Judged::Pass);
+        assert_eq!(s.received(&piece), Judged::Pass);
+        assert_eq!(s.received(&piece), Judged::Pass);
+
+        // Fragments are counted: a Data of 5000 bytes in 1200-byte frames is over a budget
+        // of two frames' worth after its first two fragments.
+        let frames = ndn_packet::fragment::fragment_packet(&data("/any/big", 5000), 1200, 7);
+        assert!(frames.len() > 3);
+        let flen = u32::try_from(frames[0].len()).unwrap();
+        let s = bounded(
+            None,
+            Some(RateLimit {
+                burst: 2 * flen + 10,
+                per_sec: 1,
+            }),
+            Vec::new(),
+        );
+        let passed = frames
+            .iter()
+            .filter(|f| s.sending(&(*f).clone()) == Judged::Pass)
+            .count();
+        assert_eq!(passed, 2, "the budget holds two fragments");
+    }
+
+    /// R12 H1: each class of rated names has its own bucket; Interests of no class take
+    /// none, and a class's flood does not use up another's.
+    #[test]
+    fn each_class_of_rated_names_has_a_bucket_of_its_own() {
+        let class = |prefix: &'static str, burst| RatedInterests {
+            names: Box::new(move |n: &Name| n.has_prefix(&prefix.parse::<Name>().unwrap())),
+            rate: RateLimit { burst, per_sec: 1 },
+        };
+        let s = bounded(None, None, vec![class("/a", 2), class("/b", 5)]);
+        let wire = |name: &str| ndn_packet::lp::encode_lp_packet(&interest(name));
+        let count = |name: &str| {
+            (0..20)
+                .filter(|_| s.received(&wire(name)) == Judged::Pass)
+                .count()
+        };
+        assert_eq!(count("/a/x"), 2);
+        assert_eq!(count("/b/x"), 5, "the other class's bucket is its own");
+        assert_eq!(count("/c/x"), 20, "names of no class are not rated");
+    }
+
+    /// An acknowledgement-only frame, with `acks` acks (and a TxSequence when `stamped`).
+    fn link_only(acks: usize, stamped: Option<u8>) -> Bytes {
+        // Headers ascend by type: the acks (0x0344), then the TxSequence (0x0348). A frame
+        // with a TxSequence and no ack at all is no LpPacket (it has neither fragment nor
+        // acks) and is dropped before any bucket.
+        let mut inner = Vec::new();
+        for i in 0..acks {
+            inner.extend_from_slice(&[0xFD, 0x03, 0x44, 0x01, u8::try_from(i % 200).unwrap()]);
+        }
+        if let Some(seq) = stamped {
+            inner.extend_from_slice(&[0xFD, 0x03, 0x48, 0x01, seq]);
+        }
+        let mut frame = vec![0x64, u8::try_from(inner.len()).unwrap()];
+        frame.extend_from_slice(&inner);
+        Bytes::from(frame)
+    }
+
+    /// R12 L1: a frame with no packet in it takes a token of a bucket of its own, never
+    /// of the link's frames, and one carrying a TxSequence (no honest peer sends one) of a
+    /// small one; the buckets stay clear of what an honest peer sends.
+    #[test]
+    fn frames_with_no_packet_are_rated_and_the_peers_packets_are_not_held_back() {
+        let s = scope(Carries::Interests, Carries::Answers);
+        // An honest peer's idle-Ack pump: 200 frames a second, many acks each, for a while.
+        let acks = link_only(40, None);
+        for _ in 0..u64::from(LINK_ONLY_FRAMES.burst) {
+            assert_eq!(s.received(&acks), Judged::Pass);
+        }
+        let flooded = (0..100_000)
+            .filter(|_| s.received(&acks) == Judged::Pass)
+            .count();
+        // Whatever time passes in the loop refills 1,024 a second.
+        assert!(
+            flooded < 20_000,
+            "{flooded} of 100,000 ack-only frames past the burst passed"
+        );
+        // The link's own frames took none of it.
+        let inside = ndn_packet::lp::encode_lp_packet(&interest("/home/CA/STATUS"));
+        assert_eq!(
+            (0..10)
+                .filter(|_| s.received(&inside) == Judged::Pass)
+                .count(),
+            4,
+            "the whole burst of the link's frames is still there"
+        );
+
+        let s = scope(Carries::Interests, Carries::Answers);
+        let stamped = link_only(1, Some(9));
+        let passed = (0..1000)
+            .filter(|_| s.received(&stamped) == Judged::Pass)
+            .count();
+        assert!(
+            passed <= STAMPED_LINK_ONLY_FRAMES.burst as usize + 2,
+            "{passed} of 1000 frames with a TxSequence and no fragment passed: no honest peer \
+             sends one, the bucket holds {}",
+            STAMPED_LINK_ONLY_FRAMES.burst
+        );
+        assert!(passed >= STAMPED_LINK_ONLY_FRAMES.burst as usize);
     }
 }

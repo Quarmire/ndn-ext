@@ -422,7 +422,7 @@ impl Grants {
 /// given the earliest `until` of the grants in force (`None`: no grant has a
 /// date, the task waits to be woken): until then, but never more than
 /// [`SLEEP_MAX`].
-fn sleep_for(next: Option<SystemTime>, now: SystemTime) -> Option<Duration> {
+pub(crate) fn sleep_for(next: Option<SystemTime>, now: SystemTime) -> Option<Duration> {
     next.map(|at| at.duration_since(now).unwrap_or_default().min(SLEEP_MAX))
 }
 
@@ -842,6 +842,25 @@ pub(crate) fn is_ask_answer(name: &Name) -> bool {
             .is_some_and(|c| c.value.as_ref() == b"ask-answer")
 }
 
+/// Whether `name` is an **ask of the data layer** to a device: its first keyword is
+/// `32=grant` (the grant of a folder's epoch key), `32=hold` (a custody lease) or
+/// `32=audit` (the audit of one), after plain components only (a device's name), as
+/// the data layer routes a served name (`served_kind`: the first component that is
+/// no plain one decides). The shape after the keyword is not judged here: a name
+/// that is not an ask is refused by the data layer, and a link that rates more
+/// names than the asks only rates what the data layer would refuse anyway. These
+/// are what a link rates apart ([`crate::policy::DATA_ASKS`]).
+pub(crate) fn is_data_ask(name: &Name) -> bool {
+    use ndn_packet::tlv_type::{IMPLICIT_SHA256, KEYWORD, PARAMETERS_SHA256};
+    let comps = name.components();
+    let plain = |c: &NameComponent| !matches!(c.typ, KEYWORD | IMPLICIT_SHA256 | PARAMETERS_SHA256);
+    comps.iter().position(|c| !plain(c)).is_some_and(|at| {
+        at > 0
+            && comps[at].typ == KEYWORD
+            && matches!(comps[at].value.as_ref(), b"grant" | b"hold" | b"audit")
+    })
+}
+
 impl Judge<'_> {
     /// The names the link of the person holding `key` carries, judged at
     /// every packet in both directions (§8.7 rule 5) against the entries
@@ -1034,6 +1053,7 @@ mod tests {
             role: ndn_cert::roles::Role::Member,
             certificates: Vec::new(),
             served: None,
+            lapses: None,
         }
     }
 
@@ -1337,6 +1357,56 @@ mod tests {
         )));
         assert!(!is_ask_answer(&then(device, vec![keyword("ask-answer")])));
         assert!(!is_ask_answer(&nm("/alice/member/laptop/32=log/x")));
+    }
+
+    /// R12 H1: the data layer's asks of a device (`32=grant`, `32=hold`, `32=audit` right
+    /// after its name) are what a link rates apart for them, by the first keyword as the data
+    /// layer routes a name; nothing else is.
+    #[test]
+    fn the_data_layers_asks_are_rated_by_their_first_keyword() {
+        let device = "/alice/member/laptop";
+        for ask in ["grant", "hold", "audit"] {
+            let name = then(device, vec![keyword(ask), octets(GENERIC)]);
+            assert!(is_data_ask(&name), "32={ask} after a device name");
+            // A device name of any depth, and a name with a tail the data layer would refuse.
+            assert!(is_data_ask(&then(
+                "/alice/laptop",
+                vec![keyword(ask), octets(GENERIC)]
+            )));
+            assert!(is_data_ask(&then(
+                "/a/b/c/d/e",
+                vec![keyword(ask), octets(GENERIC)]
+            )));
+            assert!(
+                is_data_ask(&name.clone().append_component(octets(GENERIC))),
+                "a longer name is rated too: nothing slips by the shape"
+            );
+            assert!(
+                !is_data_ask(&nm(&format!("/alice/member/laptop/{ask}/x"))),
+                "a plain component is no keyword"
+            );
+        }
+        // The first non-plain component decides, as `served_kind` does.
+        assert!(!is_data_ask(&then(
+            device,
+            vec![keyword("log"), keyword("grant"), octets(GENERIC)]
+        )));
+        assert!(!is_data_ask(&then(
+            device,
+            vec![octets(PARAMETERS), keyword("grant")]
+        )));
+        // No device name before the keyword: not a served name.
+        assert!(!is_data_ask(&Name::from_components([
+            keyword("grant"),
+            octets(GENERIC)
+        ])));
+        // Other served kinds and fetches are not asks of this class.
+        for other in ["held", "seal", "ask-answer", "intro", "hint", "log"] {
+            assert!(
+                !is_data_ask(&then(device, vec![keyword(other), octets(GENERIC)])),
+                "{other}"
+            );
+        }
     }
 
     /// Round 7 L5/L6, for the exchange: exactly two components between the
