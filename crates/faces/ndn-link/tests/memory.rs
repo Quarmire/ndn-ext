@@ -520,7 +520,6 @@ fn note() -> PutOptions {
             revision: 1,
         },
         keep: Keep::Forever,
-        batch: None,
     }
 }
 
