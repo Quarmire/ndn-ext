@@ -615,11 +615,24 @@ async fn throughout(what: &str, span: Duration, mut holds: impl FnMut() -> bool)
     }
 }
 
-/// `from` writes a note into `folder` and `to` reads it: words crossed.
+/// `from` writes a note into `folder` and `to` reads it: words crossed. A put is
+/// refused with `NotReady` (put again) while its device has not walked the summary
+/// of a device of its namespace that may hold a members record of the folder: the
+/// walk runs in the background and a put never waits on other devices, so a put
+/// right after a link came up is asked again until it goes through.
 async fn words_cross(from: &Embedded, to: &Embedded, folder: &Name, tag: &str) {
     let name = folder.clone().append(tag);
     let words = format!("words {tag}");
-    from.device.put(&name, text(&words), note()).await.unwrap();
+    let started = Instant::now();
+    loop {
+        match from.device.put(&name, text(&words), note()).await {
+            Ok(_) => break,
+            Err(e) if e.next() == NextStep::RetryLater && started.elapsed() < LONG => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => panic!("put of {name}: {e}"),
+        }
+    }
     until(&format!("{tag} crosses"), LONG, async || {
         reads(&to.device, &name, &words).await
     })
