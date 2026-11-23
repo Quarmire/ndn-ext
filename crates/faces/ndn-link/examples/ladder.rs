@@ -39,8 +39,6 @@
 #[allow(dead_code)]
 #[path = "ladder/host.rs"]
 mod host;
-#[path = "ladder/newest.rs"]
-mod newest;
 #[path = "ladder/tape.rs"]
 mod tape;
 

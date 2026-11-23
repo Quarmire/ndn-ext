@@ -817,6 +817,20 @@ pub async fn puts(layer: &Device, name: &Name, content: Content, limit: Duration
     }
 }
 
+/// [`puts`] into a register collection: `put_op` of `bytes`.
+pub async fn puts_op(layer: &Device, name: &Name, bytes: &'static [u8], limit: Duration) {
+    let started = Instant::now();
+    loop {
+        match layer.put_op(name, Bytes::from_static(bytes), note()).await {
+            Ok(_) => return,
+            Err(e) if e.next() == NextStep::RetryLater && started.elapsed() < limit => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => panic!("put_op of {name}: {e}"),
+        }
+    }
+}
+
 pub async fn until(what: &str, limit: Duration, mut done: impl AsyncFnMut() -> bool) {
     let start = Instant::now();
     while !done().await {

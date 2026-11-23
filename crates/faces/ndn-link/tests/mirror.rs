@@ -1171,7 +1171,7 @@ async fn a_mirror_grant_of_one_folder_does_not_carry_the_names_of_another() {
     shared(&bob, &other, "/bob").await;
     let diary = n("/bob/32=data/diary");
     bob.device
-        .put(&diary, text("bob's diary"), note())
+        .put_op(&diary, Bytes::from_static(b"bob's diary"), note())
         .await
         .unwrap();
     let diary_entry = newest_entry(&bob, BOB, &diary).await;

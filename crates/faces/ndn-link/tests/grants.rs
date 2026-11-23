@@ -152,7 +152,7 @@ async fn a_grant_link_answers_the_folders_names_and_not_an_unsealed_collection_o
     // record gives it readers, so the layer answers it to whoever asks.
     let diary = n("/alice/32=data/diary");
     ann.device
-        .put(&diary, text("ann's diary"), note())
+        .put_op(&diary, Bytes::from_static(b"ann's diary"), note())
         .await
         .unwrap();
     let diary_entry = newest_entry(&ann, ANN, &diary).await;
@@ -749,7 +749,7 @@ async fn a_removed_writers_names_stop_being_carried_and_a_name_outside_the_folde
         .clone()
         .append_component(NameComponent::keyword(Bytes::from_static(b"data")))
         .append("diary");
-    puts(&carol.device, &diary, text("carol's diary"), LONG).await;
+    puts_op(&carol.device, &diary, b"carol's diary", LONG).await;
     until("ann reads carol's note", LONG, async || {
         reads(&ann.device, &written, "carol writes").await
     })

@@ -18,8 +18,7 @@ use ndn_app::EngineAppExt;
 use ndn_data::intro::{Adopting, Dialing, FirstDialing, Grant, LinkHint, Scoping};
 use ndn_data::{
     Audience, Change, Config, DataLayer, Departure, Device, Frontier, Got, IntroPolicy, Introducer,
-    Keep, MergeRules, Name, Offer, PutOptions, Role, Rule, Share, Sharing, Timestamp, Transport,
-    TypeId,
+    Keep, Name, Offer, PutOptions, Role, Rule, Share, Sharing, Timestamp, Transport, TypeId,
 };
 use ndn_engine::{EngineBuilder, EngineConfig, ForwarderEngine, ShutdownHandle};
 use ndn_face_quic::{KeyFingerprint, LinkEndpoint, LinkKey, LinkKeySource, LinkTransportConfig};
@@ -38,7 +37,8 @@ use ndn_security::{
 use ndn_trust_envelope::TrustEnvelope;
 use tokio_util::sync::CancellationToken;
 
-use super::newest::{NEWEST, Newest};
+/// The merge rule the host shares its folders under: the data layer's built-in newest register.
+const NEWEST: &str = "/ndf/merge/newest/v=1";
 
 /// How long the person's anchor and the device's certificate last, and how long before now they
 /// are valid from (so a peer whose clock stands behind accepts them), in milliseconds.
@@ -412,7 +412,6 @@ impl Host {
         intro.publish(cancel.child_token());
         let store = ndn_sync::store::BackendStore::open_fjall(dir.join("device")).unwrap();
         let config = Config {
-            rules: MergeRules::standard().with(Arc::new(Newest::new())),
             introducer: Some(intro.clone()),
             intro: IntroPolicy {
                 local_candidates: true,
