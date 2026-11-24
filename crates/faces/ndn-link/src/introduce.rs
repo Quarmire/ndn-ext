@@ -1,6 +1,6 @@
 //! Introductions over links: a stranger's link that carries only an
 //! introduction, and dialling a device by its key from a code's link hint
-//! (`ndn-rs/docs/specs/ndn-link.md` §14, data-layer.md §19).
+//! (`ndn-rs/docs/specs/ndn-link.md` §14, invite.md).
 //!
 //! An inviter's host gives its links what its introductions serve
 //! ([`Links::set_introductions`], an [`Introductions`]); a device it knows
@@ -53,7 +53,7 @@ use crate::policy::CANDIDATES_MAX;
 
 /// What a device's introductions serve over a link a stranger dialled
 /// (ndn-link §8.6): the host gives it to [`Links::set_introductions`]. For a
-/// data-layer device it is ndn-data's `IntroductionSurface`.
+/// device with `ndn-invite` it is `ndn_invite::Surface`.
 pub trait Introductions: Send + Sync {
     /// Whether an offer is open: a stranger's introduction link is worth
     /// taking now. With none, a stranger is refused as any other.
@@ -75,14 +75,14 @@ pub trait Introductions: Send + Sync {
     /// groups, and this surface's [`carries`](Introductions::carries); it
     /// carries no other name this device serves, so an unsealed collection
     /// outside the folder is not answered over a grant link. For a
-    /// data-layer device it is ndn-data's `IntroductionSurface::grant_carries`.
+    /// device with `ndn-invite` it is `Surface::grant_carries`.
     fn grant_carries(&self, folder: &Name, name: &Name) -> bool;
 
     /// Whether a packet named `name` may cross the departure link of a
     /// person let go by the members record whose log entry is `record`
     /// (ndn-link §8.8): the entry, its pieces and its cut manifests and
-    /// nothing else. For a data-layer device it is ndn-data's
-    /// `departure_carries`.
+    /// nothing else. For a device with `ndn-invite` it is
+    /// `Surface::departure_carries`.
     fn departure_carries(&self, record: &Name, name: &Name) -> bool;
 
     /// The namespaces of the other writers the members record in force for
@@ -90,8 +90,8 @@ pub trait Introductions: Send + Sync {
     /// link to a person admitted to `folder` routes (§8.7), so the person's
     /// device hears them through this one, and whose public names the link
     /// carries (§8.7), as the folder's own namespace's does. Read live, at
-    /// every look. A device with no data layer lists none. For a data-layer
-    /// device it is ndn-data's `IntroductionSurface::writer_namespaces`.
+    /// every look. A device with no data layer lists none. For a device with
+    /// `ndn-invite` it is `Surface::writer_namespaces`.
     fn writer_namespaces(&self, folder: &Name) -> Vec<Name> {
         let _ = folder;
         Vec::new()

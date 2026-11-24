@@ -1,20 +1,20 @@
-//! A data-layer device's link hint and dial over [`Links`] (feature
-//! `introductions`; ndn-rs data-layer.md §19.2, §19.3).
+//! A device's link hint and dial over [`Links`] for its introductions
+//! (feature `introductions`; ndn-rs invite.md §6.1, §8.2).
 //!
-//! The data layer cannot depend on this crate, so a host gives its
-//! `ndn_data::Introducer` the halves it asks of it — `link_hint`, `dial`,
+//! `ndn-invite` cannot depend on this crate, so a host gives its
+//! `ndn_invite::Host` the halves it asks of it — `link_hint`, `dial`,
 //! `dial_first` and `undial` — by forwarding to a [`LinkHints`].
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ndn_data::intro::{
-    Dialing, FirstDialing, HintCandidate, HintKind, JoinedFolder, LinkHint, introduction_prefixes,
-};
-use ndn_data::version::Timestamp;
-use ndn_data::{DataError, Device, IntroductionSurface, NextStep, Role};
 use ndn_face_quic::KeyFingerprint;
+use ndn_heap::Timestamp;
+use ndn_invite::{
+    Dialing, FirstDialing, HintCandidate, HintKind, InviteError, Invites, JoinedFolder, LinkHint,
+    Role, Surface, introduction_prefixes,
+};
 use ndn_packet::Name;
 
 use crate::departures::{Departure, DepartureSink, DepartureTaking, NotTaken};
@@ -23,29 +23,29 @@ use crate::introduce::Introductions;
 use crate::joined::JoinedRoutes;
 use crate::links::Links;
 
-impl Introductions for IntroductionSurface {
+impl Introductions for Surface {
     fn open(&self) -> bool {
-        IntroductionSurface::open(self)
+        Surface::open(self)
     }
 
     fn carries(&self, name: &Name) -> bool {
-        IntroductionSurface::carries(self, name)
+        Surface::carries(self, name)
     }
 
     fn grant_carries(&self, folder: &Name, name: &Name) -> bool {
-        IntroductionSurface::grant_carries(self, folder, name)
+        Surface::grant_carries(self, folder, name)
     }
 
     fn departure_carries(&self, record: &Name, name: &Name) -> bool {
-        IntroductionSurface::departure_carries(self, record, name)
+        Surface::departure_carries(self, record, name)
     }
 
     fn writer_namespaces(&self, folder: &Name) -> Vec<Name> {
-        IntroductionSurface::writer_namespaces(self, folder)
+        Surface::writer_namespaces(self, folder)
     }
 }
 
-impl DepartureSink for IntroductionSurface {
+impl DepartureSink for Surface {
     fn departure<'a>(
         &'a self,
         from: &'a Name,
@@ -57,7 +57,7 @@ impl DepartureSink for IntroductionSurface {
                 .await
                 .map_err(|e| {
                     // What `NotReady` and `Unavailable` say to do: ask again.
-                    if e.next() == NextStep::RetryLater {
+                    if e.retry() {
                         NotTaken::not_yet(e.to_string())
                     } else {
                         NotTaken::refused(e.to_string())
@@ -82,43 +82,43 @@ impl LinkHints {
     /// The inviter's half: take introduction links for the device's
     /// introductions (its offer fetches and asks), from devices this one
     /// does not know, while one of its offers is open and carrying only what
-    /// the device's [`introductions`](ndn_data::Device::introductions)
-    /// surface carries; and install the grants in force
-    /// ([`Device::grants`]), so a person this device admitted before a
-    /// restart links again with no list kept here. Call it once, on the
-    /// device that makes offers, and forward its introducer's
-    /// [`grant`](ndn_data::intro::Introducer::grant) and
-    /// [`revoke_grant`](ndn_data::intro::Introducer::revoke_grant) to
-    /// [`LinkHints::grant`] and [`LinkHints::revoke_grant`]: the device is the
-    /// single source of grants, and ndn-link keeps none of its own across
-    /// restarts.
+    /// the [`surface`](Invites::surface) of its invitations carries; and
+    /// install the grants and departure marks in force
+    /// ([`Invites::grants`], [`Invites::departures`]), so a person this
+    /// device admitted before a restart links again with no list kept here.
+    /// Call it once, on the device that makes offers, and forward its
+    /// host's [`grant`](ndn_invite::Host::grant),
+    /// [`revoke_grant`](ndn_invite::Host::revoke_grant) and
+    /// [`departure`](ndn_invite::Host::departure) to [`LinkHints::grant`],
+    /// [`LinkHints::revoke_grant`] and [`LinkHints::depart`]: the
+    /// invitations are the single source of grants, and ndn-link keeps none
+    /// of its own across restarts.
     ///
-    /// It is also the joiner's half: the folders this device joined
-    /// ([`Device::joined_folders`]) are given to the links now
-    /// ([`Links::set_joined_routes`]), and again at every change the device
-    /// signals ([`Device::joined_changes`]), by **one** task that ends when the
-    /// device is gone or the links stop. A second call stops the task the first
-    /// started and starts its own: there is never more than one for these
-    /// links, so calling it twice does not follow the device twice. The host
-    /// has no route to make.
-    pub fn serve(&self, device: &Device) {
-        self.links
-            .set_introductions(Arc::new(device.introductions()));
-        self.links
-            .set_departure_sink(Arc::new(device.introductions()));
-        for departure in device.departures() {
+    /// It is also the joiner's half: the spaces this device joined
+    /// ([`Invites::joined_folders`]) are given to the links now
+    /// ([`Links::set_joined_routes`]), and again at every change the
+    /// invitations signal ([`Invites::joined_changes`]), by **one** task that
+    /// ends when the invitations are gone or the links stop. A second call
+    /// stops the task the first started and starts its own: there is never
+    /// more than one for these links, so calling it twice does not follow the
+    /// device twice. The host has no route to make.
+    pub fn serve(&self, invites: &Invites) {
+        let surface = invites.surface();
+        self.links.set_introductions(Arc::new(surface.clone()));
+        self.links.set_departure_sink(Arc::new(surface.clone()));
+        for departure in invites.departures() {
             self.depart(&departure);
         }
-        for grant in device.grants() {
+        for grant in invites.grants() {
             self.grant(&grant);
         }
-        self.follow_joined(device.introductions());
+        self.follow_joined(surface);
     }
 
     /// Give the links the joined folders of `surface` now and at every change
     /// of its `joined_changes`, by one task for these links: the one a former
     /// call started is stopped, and the task ends when the device is gone.
-    fn follow_joined(&self, surface: IntroductionSurface) {
+    fn follow_joined(&self, surface: Surface) {
         let stop = {
             let mut running = self.links.joined_follow.lock();
             if let Some(former) = running.take() {
@@ -156,8 +156,8 @@ impl LinkHints {
     /// person of the grant's namespaces, in the folder's scope and the
     /// role's, until it ends ([`Links::grant`]); the grant is one entry of
     /// the key's set, the entry of its folder. Forward
-    /// [`Introducer::grant`](ndn_data::intro::Introducer::grant) here.
-    pub fn grant(&self, grant: &ndn_data::intro::Grant) {
+    /// [`Host::grant`](ndn_invite::Host::grant) here.
+    pub fn grant(&self, grant: &ndn_invite::Grant) {
         self.links.grant(link_grant(grant));
     }
 
@@ -166,10 +166,11 @@ impl LinkHints {
     /// entries admitted close when this was the last entry
     /// ([`Links::revoke_grant`]), or narrow to the departure when
     /// [`LinkHints::depart`] was told of this folder first. Forward
-    /// [`Introducer::revoke_grant`](ndn_data::intro::Introducer::revoke_grant)
-    /// here. It is **in memory only**: the device calls it before it records
-    /// the end durably, itself. A host that ends a grant of its own accord
-    /// (a person who stays a member) calls [`LinkHints::end_grant_in`] or
+    /// [`Host::revoke_grant`](ndn_invite::Host::revoke_grant)
+    /// here. It is **in memory only**: the invitations call it before they
+    /// record the end durably, themselves. A host that ends a grant of its
+    /// own accord (a person who stays a member) calls
+    /// [`LinkHints::end_grant_in`] or
     /// [`LinkHints::end_grant`], which also make it durable, so that a
     /// restart does not bring it back.
     pub fn revoke_grant(&self, key: &[u8; 32], folder: &Name) {
@@ -179,36 +180,36 @@ impl LinkHints {
     /// A held members record left the person out of a folder: the departure
     /// mark ([`Links::depart`]) that makes the link narrow to the record, or
     /// admit a returning device on a narrow link for it. Forward
-    /// [`Introducer::departure`](ndn_data::intro::Introducer::departure)
-    /// here; the device calls it before
+    /// [`Host::departure`](ndn_invite::Host::departure)
+    /// here; the invitations call it before
     /// [`revoke_grant`](LinkHints::revoke_grant) for the same end.
-    pub fn depart(&self, departure: &ndn_data::intro::Departure) {
+    pub fn depart(&self, departure: &ndn_invite::Departure) {
         self.links.depart(link_departure(departure));
     }
 
     /// The host ends every grant of `key` for good: the links they alone
     /// admitted close now ([`Links::revoke_grants`], in memory, first), then
-    /// the device records the end ([`Device::end_grant`]) behind its store
-    /// barrier. No departure is told: the person was not let go by a record.
-    /// The person stays a member of the folders, which a members record
+    /// the invitations record the end ([`Invites::end_grant`]) behind their
+    /// store's flush. No departure is told: the person was not let go by a
+    /// record. The person stays a member of the spaces, which a members entry
     /// changes, not this. `Ok(true)` when a grant was in force in either
     /// layer.
     ///
-    /// `device` is the one given to [`LinkHints::serve`]; it is a parameter
-    /// and not kept here because the device's introducer holds these hints.
+    /// `invites` is the one given to [`LinkHints::serve`]; it is a parameter
+    /// and not kept here because the invitations' host holds these hints.
     ///
     /// # Errors
-    /// [`DataError::Local`] when the device stopped before the end was
+    /// [`InviteError::Local`] when the device stopped before the end was
     /// durable: the links are closed already, call it again once the device
     /// runs.
-    pub async fn end_grant(&self, device: &Device, key: &[u8; 32]) -> Result<bool, DataError> {
+    pub async fn end_grant(&self, invites: &Invites, key: &[u8; 32]) -> Result<bool, InviteError> {
         let linked = self.links.revoke_grants(&KeyFingerprint(*key));
-        let recorded = device.end_grant(key).await?;
+        let recorded = invites.end_grant(key).await?;
         Ok(linked || recorded)
     }
 
     /// The host ends the grant of `key` for `folder` only, for good
-    /// ([`Links::revoke_grant`], then [`Device::end_grant_in`]): the key's
+    /// ([`Links::revoke_grant`], then [`Invites::end_grant_in`]): the key's
     /// other entries stand, and the links close only when this was the last.
     /// `Ok(true)` when an entry was in force in either layer.
     ///
@@ -216,33 +217,34 @@ impl LinkHints {
     /// As [`LinkHints::end_grant`].
     pub async fn end_grant_in(
         &self,
-        device: &Device,
+        invites: &Invites,
         key: &[u8; 32],
         folder: &Name,
-    ) -> Result<bool, DataError> {
+    ) -> Result<bool, InviteError> {
         let linked = self.links.revoke_grant(&KeyFingerprint(*key), folder);
-        let recorded = device.end_grant_in(key, folder).await?;
+        let recorded = invites.end_grant_in(key, folder).await?;
         Ok(linked || recorded)
     }
 
     /// The host renews the grant of `key` (`until`: a later date, or `None`
-    /// for no date): the device records it durably ([`Device::renew_grant`],
-    /// only while a held members record still admits the person), then this
-    /// device's links hold it as it now stands ([`LinkHints::grant`]), so a
-    /// restart keeps it. Returns the grant as it stands, `None` when no grant
-    /// of `key` is live or no held record admits the person.
+    /// for no date): the invitations record it durably
+    /// ([`Invites::renew_grant`], only while the space's members still admit
+    /// the person), then this device's links hold it as it now stands
+    /// ([`LinkHints::grant`]), so a restart keeps it. Returns the grant as it
+    /// stands, `None` when no grant of `key` is live or no members entry
+    /// admits the person.
     ///
     /// # Errors
-    /// [`DataError::BadRequest`] for a date not after the device's clock,
-    /// [`DataError::Local`] when the device stopped before the change was
+    /// [`InviteError::BadRequest`] for a date not after the device's clock,
+    /// [`InviteError::Local`] when the device stopped before the change was
     /// durable.
     pub async fn renew_grant(
         &self,
-        device: &Device,
+        invites: &Invites,
         key: &[u8; 32],
         until: Option<Timestamp>,
-    ) -> Result<Option<ndn_data::intro::Grant>, DataError> {
-        let renewed = device.renew_grant(key, until).await?;
+    ) -> Result<Option<ndn_invite::Grant>, InviteError> {
+        let renewed = invites.renew_grant(key, until).await?;
         if let Some(grant) = &renewed {
             self.grant(grant);
         }
@@ -301,13 +303,13 @@ impl LinkHints {
     /// the one address `addr` with **no key to expect**, within `within`
     /// ([`Links::dial_first`]). `Ok(key)` is the 32 octets of the key the
     /// handshake proved; the link routes only `inviter`'s introduction
-    /// prefixes (the held pieces, the offer's and the hint record's names:
+    /// prefixes (the offers' and asks' and the hint record's names:
     /// [`introduction_prefixes`]) until the device behind it shows a
     /// certificate this device holds, whoever answered at `addr`. The dial's
     /// hello is empty (no certificate, no membership) and what the party may
     /// send in is bounded to answers under those prefixes and Interests for
-    /// this device's own names. The host's introducer forwards
-    /// [`Introducer::dial_first`](ndn_data::intro::Introducer::dial_first)
+    /// this device's own names. The host forwards
+    /// [`Host::dial_first`](ndn_invite::Host::dial_first)
     /// here, and the join's [`undial`](Self::undial) for the key returned
     /// when it fails or when the verified record names another key.
     pub fn dial_first<'a>(
@@ -355,9 +357,9 @@ fn add_ms(base: SystemTime, ms: u64) -> Option<SystemTime> {
     base.checked_add(Duration::from_millis(ms))
 }
 
-/// The joined folders `surface` lists now, given to `links` as routes, and
-/// said at info with the folders and prefixes.
-fn set_joined(links: &Links, surface: &IntroductionSurface) {
+/// The joined spaces `surface` lists now, given to `links` as routes, and
+/// said at info with the spaces and prefixes.
+fn set_joined(links: &Links, surface: &Surface) {
     let folders = surface.joined_folders();
     tracing::info!(
         target: "face.quic",
@@ -372,7 +374,7 @@ fn set_joined(links: &Links, surface: &IntroductionSurface) {
     links.set_joined_routes(joined_routes(&folders));
 }
 
-/// The data layer's joined folders as ndn-link routes them: the inviter's
+/// The invitations' joined spaces as ndn-link routes them: the inviter's
 /// digest is its link key (a host whose link key is not its device key calls
 /// [`Links::set_joined_routes`] with its own mapping), the owner and the
 /// writers' namespaces as the device derived them.
@@ -388,10 +390,10 @@ fn joined_routes(folders: &[JoinedFolder]) -> Vec<JoinedRoutes> {
         .collect()
 }
 
-/// The data layer's grant as ndn-link holds it. A date no platform clock can
+/// The invitations' grant as ndn-link holds it. A date no platform clock can
 /// count to is a date long past for the grant's purposes: the grant is made
 /// already over, never trusted to be unending and never a panic.
-fn link_grant(grant: &ndn_data::intro::Grant) -> Grant {
+fn link_grant(grant: &ndn_invite::Grant) -> Grant {
     let until = grant
         .until
         .map(|Timestamp(ms)| epoch_plus(ms).unwrap_or(UNIX_EPOCH));
@@ -407,9 +409,9 @@ fn link_grant(grant: &ndn_data::intro::Grant) -> Grant {
     }
 }
 
-/// The data layer's departure mark as ndn-link holds it. A date no platform
+/// The invitations' departure mark as ndn-link holds it. A date no platform
 /// clock can count to is a date long past: the mark is already over.
-fn link_departure(departure: &ndn_data::intro::Departure) -> Departure {
+fn link_departure(departure: &ndn_invite::Departure) -> Departure {
     let Timestamp(until) = departure.until;
     Departure {
         key: KeyFingerprint(departure.key),
@@ -445,9 +447,9 @@ mod tests {
             Some(UNIX_EPOCH + Duration::from_millis(1_500))
         );
 
-        // A grant the data layer made with a date: the link layer's `until`
+        // A grant the invitations made with a date: the link layer's `until`
         // is that instant; with none, none.
-        let make = |until| ndn_data::intro::Grant {
+        let make = |until| ndn_invite::Grant {
             key: [7; 32],
             namespaces: vec!["/bob".parse().unwrap()],
             folder: "/alice/32=data/notebook".parse().unwrap(),

@@ -79,8 +79,8 @@
 //! the issuers its hello showed (consumers fetch its chain from it), plus
 //! the sync group `<ns>/32=sync` of each
 //! namespace the peer was admitted in — held here, or served by the
-//! serving policy ([`group_routes`]; `ndn-rs/docs/specs/data-layer.md`
-//! §12) — which runs with the multicast strategy: by the host's
+//! serving policy ([`group_routes`]; `ndn-rs/docs/specs/heap.md`
+//! §7.7) — which runs with the multicast strategy: by the host's
 //! trust-context library for a held namespace, by the host's
 //! [`FaceSink::transit`] while a served one is in transit. A revocation
 //! that takes a membership from a link takes its routes, the group's with
@@ -194,12 +194,12 @@
 //! departure mark is held ([`Links::depart`]), narrows them in place to that
 //! record, which the person is told of ([`DepartureSink`]), and closes them
 //! once it is carried (`ndn-rs/docs/specs/ndn-link.md` §8.8). With the
-//! `introductions` feature, `LinkHints` gives a data layer device its three
-//! halves (its hint, its dial, its undial), serves its
-//! `ndn_data::IntroductionSurface`, installs the device's grants and
-//! departure marks and registers its departure sink (`LinkHints::serve`,
-//! `grant`, `revoke_grant`; `end_grant`, `end_grant_in` and `renew_grant` make
-//! a host's own end or renewal durable).
+//! `introductions` feature, `LinkHints` gives a device's `ndn_invite::Invites`
+//! its three halves (its hint, its dial, its undial), serves its
+//! `ndn_invite::Surface`, installs its grants and departure marks and
+//! registers its departure sink (`LinkHints::serve`, `grant`,
+//! `revoke_grant`; `end_grant`, `end_grant_in` and `renew_grant` make a
+//! host's own end or renewal durable).
 //!
 //! A person who joined a folder reads the folder's other writers through the
 //! inviter's link, and its forwarder has no route toward their namespaces:
@@ -235,7 +235,7 @@
 //! A device that restarts keeps what it learned of its peers, and links with
 //! them again with no peer entry, relay or list of the host's:
 //! [`Links::remember`] takes a [`LinkMemory`] (with the feature
-//! `introductions`, `DeviceMemory` keeps it in a data-layer node's store, as
+//! `introductions`, `DeviceMemory` keeps it in an `ndn-heap` node's store, as
 //! notes). It records, for each peer a link was admitted for by an identity in
 //! a held namespace, its key, its device and the addresses that worked, and
 //! dials them again in the background. The key is what a redial trusts and an
