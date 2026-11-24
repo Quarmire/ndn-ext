@@ -777,17 +777,18 @@ async fn a_departure_the_sink_is_not_ready_for_is_asked_again() {
     })
     .await;
     lets_go(&ann).await;
+    // Bob's heap may fold Ann's new members entry from the sync already; what
+    // the link guards is that the notice is asked again until it is taken.
     until(
-        "bob's device took the record after being not ready twice",
+        "the sink was asked again after being not ready twice",
         Duration::from_secs(20),
-        async || !lists(&bob, &folder, &bob.ns).await,
+        async || sink.asked().len() >= 3,
     )
     .await;
-    assert!(
-        sink.asked().len() >= 3,
-        "the sink was asked {} times",
-        sink.asked().len()
-    );
+    until("bob's device says it was let go", LONG, async || {
+        !lists(&bob, &folder, &bob.ns).await
+    })
+    .await;
 }
 
 /// L2: a person's `Down` says "let go" only for a record its sink took. A
