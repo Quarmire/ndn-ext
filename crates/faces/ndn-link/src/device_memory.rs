@@ -1,11 +1,13 @@
-//! A data-layer device's local notes as the link memory (feature
-//! `introductions`; `ndn-rs/docs/specs/ndn-link.md` §17C.4): one note per peer,
-//! under the area `link-memory`, named by the peer's key in hex.
+//! A data-layer node's store as the link memory (feature `introductions`;
+//! `ndn-rs/docs/specs/ndn-link.md` §17C.4): one note per peer, named by the
+//! peer's key in hex, at `/localhost/ndn-link/memory/<key>` in the node's
+//! [`DataStore`] (a prefix no device serves; the value is the note's octets).
 //!
-//! The note is local, unauthenticated host data ([`ndn_data::device::LocalNotes`]):
-//! what it holds is a hint and decides nothing, so a note that does not decode
-//! is dropped, and a note whose key is not the one it is named by is dropped
-//! too (a record is only ever read as the key it names).
+//! The note is local, unauthenticated host data: what it holds is a hint and
+//! decides nothing, so a note that does not decode is dropped, and a note whose
+//! key is not the one it is named by is dropped too (a record is only ever read
+//! as the key it names). A note is durable once `save` or `remove` returns: the
+//! store's barrier ([`DataStore::sync`]) passed, on a blocking thread.
 //!
 //! The note holds the peer's key, its device name and its last-seen addresses
 //! in the clear (data-layer.md §19.9 rule 6): the permissions of the device's
@@ -32,19 +34,203 @@
 //! option as the addresses.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, UNIX_EPOCH};
 
 use bytes::Bytes;
-use ndn_data::Device;
-use ndn_data::device::LocalNotes;
 use ndn_face_quic::{Direction, KeyFingerprint};
-use ndn_packet::Name;
+use ndn_packet::{Name, NameComponent};
+use ndn_sync::DataStore;
 
 use crate::memory::{LinkMemory, MemoryFuture, PeerRecord};
 
-/// The area of the device's notes the link memory keeps its records in.
-pub const AREA: &str = "link-memory";
+/// The longest key of a note, in octets.
+const NOTE_PART_MAX: usize = 64;
+
+/// The largest value of a note, in octets.
+const NOTE_VALUE_MAX: usize = 4096;
+
+/// How many notes the link memory holds.
+const NOTES_PER_AREA_MAX: usize = 1024;
+
+/// Notes are counted and written under this lock, not in the store's: counting
+/// the notes reads them from the store. It is shared by every memory of the
+/// process, as two of them may keep one store; a note's write is a store write
+/// and nothing else.
+static WRITING: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// The prefix of the link memory's notes in the store.
+static AREA: LazyLock<Name> =
+    LazyLock::new(|| "/localhost/ndn-link/memory".parse().expect("a valid name"));
+
+/// Why a note was not read, kept or removed.
+#[derive(Debug)]
+enum NoteError {
+    /// The key or the value breaks a rule, or the area is full: nothing was
+    /// written. `why` says which rule and what to do.
+    Refused { name: Name, why: String },
+    /// The store could not make the write durable. The write is in the store
+    /// and not known to be durable.
+    Local { reason: String },
+}
+
+impl std::fmt::Display for NoteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NoteError::Refused { name, why } => write!(f, "{name}: {why}"),
+            NoteError::Local { reason } => write!(f, "local failure: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for NoteError {}
+
+/// `key` as a part of a note's name the rules allow, or the rule it breaks.
+fn check_key(key: &str) -> Result<(), NoteError> {
+    let refuse = |why: String| NoteError::Refused {
+        name: AREA.clone(),
+        why: format!(
+            "a note key {key:?} {why}; use 1 to {NOTE_PART_MAX} octets with no '/' and no \
+             control character"
+        ),
+    };
+    if key.is_empty() {
+        return Err(refuse("is empty".into()));
+    }
+    if key.len() > NOTE_PART_MAX {
+        return Err(refuse(format!("is {} octets long", key.len())));
+    }
+    if key.contains('/') {
+        return Err(refuse("contains a '/'".into()));
+    }
+    if key.chars().any(char::is_control) {
+        return Err(refuse("contains a control character".into()));
+    }
+    Ok(())
+}
+
+fn note_name(key: &str) -> Name {
+    AREA.clone()
+        .append_component(NameComponent::generic(Bytes::copy_from_slice(
+            key.as_bytes(),
+        )))
+}
+
+/// The notes of the link memory in a store: small values by key, durable once
+/// [`put`](Self::put) or [`remove`](Self::remove) returns. Cheap to clone.
+#[derive(Clone)]
+struct Notes {
+    store: Arc<dyn DataStore>,
+}
+
+impl Notes {
+    /// The note `key`: `None` when there is none, [`NoteError::Refused`] when
+    /// the key breaks a rule.
+    fn get(&self, key: &str) -> Result<Option<Bytes>, NoteError> {
+        check_key(key)?;
+        Ok(self.store.get(&note_name(key)))
+    }
+
+    /// Every note, `(key, value)` by key.
+    fn list(&self) -> Result<Vec<(String, Bytes)>, NoteError> {
+        Ok(self.listed())
+    }
+
+    fn listed(&self) -> Vec<(String, Bytes)> {
+        let depth = AREA.components().len();
+        let mut out: Vec<(String, Bytes)> = self
+            .store
+            .scan_under(&AREA, 0)
+            .into_iter()
+            .filter_map(|(name, value)| {
+                let comps = name.components();
+                if comps.len() != depth + 1 {
+                    return None;
+                }
+                let key = std::str::from_utf8(&comps[depth].value).ok()?.to_owned();
+                Some((key, value))
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Keep `value` as the note `key`, replacing one: returns once the store's
+    /// durability barrier passed, so a note a `put` returned for survives a
+    /// power loss.
+    ///
+    /// [`NoteError::Refused`] when the key breaks a rule, when `value` is over
+    /// [`NOTE_VALUE_MAX`] octets, or when the memory holds
+    /// [`NOTES_PER_AREA_MAX`] notes already and `key` is not one of them
+    /// (remove one first); nothing is written. [`NoteError::Local`] when the
+    /// store cannot make the write durable.
+    async fn put(&self, key: &str, value: &[u8]) -> Result<(), NoteError> {
+        check_key(key)?;
+        if value.len() > NOTE_VALUE_MAX {
+            return Err(NoteError::Refused {
+                name: note_name(key),
+                why: format!(
+                    "a note's value is at most {NOTE_VALUE_MAX} octets and this is {}; keep \
+                     less in a note",
+                    value.len()
+                ),
+            });
+        }
+        let name = note_name(key);
+        {
+            // The count and the write are one step: two puts cannot both take
+            // the last place.
+            let _write = WRITING.lock();
+            if !self.store.contains(&name) && self.listed().len() >= NOTES_PER_AREA_MAX {
+                return Err(NoteError::Refused {
+                    name,
+                    why: format!(
+                        "the link memory holds {NOTES_PER_AREA_MAX} notes already, the most it \
+                         may; remove one before keeping another"
+                    ),
+                });
+            }
+            self.store.insert(name, Bytes::copy_from_slice(value));
+        }
+        self.barrier().await
+    }
+
+    /// Remove the note `key` (none is not an error): returns once the store's
+    /// durability barrier passed, so a removal that returned is not undone by
+    /// a power loss. Refusals as [`put`](Self::put).
+    async fn remove(&self, key: &str) -> Result<(), NoteError> {
+        check_key(key)?;
+        {
+            let _write = WRITING.lock();
+            self.store.remove(&note_name(key));
+        }
+        self.barrier().await
+    }
+
+    /// The store's barrier: inline for a store that says it touches no disk,
+    /// on a blocking thread otherwise (it waits for the disk).
+    async fn barrier(&self) -> Result<(), NoteError> {
+        let synced = if self.store.sync_is_immediate() {
+            self.store.sync()
+        } else {
+            let store = Arc::clone(&self.store);
+            tokio::task::spawn_blocking(move || store.sync())
+                .await
+                .map_err(|e| NoteError::Local {
+                    reason: format!(
+                        "the store's barrier did not finish ({e}); the note is not known to be \
+                         durable: try again after the runtime is running"
+                    ),
+                })?
+        };
+        synced.map_err(|e| NoteError::Local {
+            reason: format!(
+                "the store could not make the note durable ({e}); the note is not known to be \
+                 durable: try again, and if it keeps failing check the store's disk"
+            ),
+        })
+    }
+}
 
 const VERSION: u8 = 2;
 /// The records of the first version have no port.
@@ -52,20 +238,21 @@ const VERSION_1: u8 = 1;
 
 /// The key of the note that holds the port this device listens on: not a peer
 /// key (those are 64 hexadecimal digits), so no record is named by it.
-pub const LISTEN_PORT_KEY: &str = "listen-port";
+const LISTEN_PORT_KEY: &str = "listen-port";
 
-/// The link memory kept in a [`Device`]'s local notes: one record per peer
-/// key, written behind the device's store barrier. Give it to
+/// The link memory kept in a node's [`DataStore`]: one record per peer key,
+/// written behind the store's barrier. Give it to
 /// [`Links::remember`](crate::Links::remember).
 pub struct DeviceMemory {
-    notes: LocalNotes,
+    notes: Notes,
 }
 
 impl DeviceMemory {
-    /// The link memory in `device`'s local store.
-    pub fn new(device: &Device) -> Arc<Self> {
+    /// The link memory in `store` (a data-layer node's store, `Node::store()`):
+    /// what an earlier memory over the same store wrote is read back.
+    pub fn new(store: Arc<dyn DataStore>) -> Arc<Self> {
         Arc::new(Self {
-            notes: device.local_notes(AREA),
+            notes: Notes { store },
         })
     }
 }
@@ -386,3 +573,7 @@ mod tests {
         assert!(decode(&[]).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "device_memory_store_tests.rs"]
+mod store_tests;

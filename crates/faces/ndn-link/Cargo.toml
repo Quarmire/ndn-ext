@@ -35,12 +35,15 @@ ndn-namespace = { workspace = true, optional = true }
 # `LinkHints`: a data-layer device's link hint and dial over these links
 # (ndn-rs data-layer.md §19.2, §19.3).
 ndn-data      = { workspace = true, optional = true }
+# `DeviceMemory`: the link memory over a data-layer node's `DataStore`
+# (`ndn_sync::DataStore`, `StoreOp`).
+ndn-sync      = { workspace = true, optional = true }
 # The one definition of the fault profile, shared with ndn-sim (feature `fault-injection`).
 ndn-faults    = { workspace = true, optional = true }
 
 [features]
 engine = ["dep:ndn-engine", "dep:ndn-namespace"]
-introductions = ["dep:ndn-data"]
+introductions = ["dep:ndn-data", "dep:ndn-sync"]
 # The test-only fault layer (ndn-rs ndn-link.md §17B): the seeded profile of the
 # conformance's `--faulty` runs on a real link's face. NEVER enable in a shipped
 # binary; `tools/check-shipped-features.sh` fails when one does.
@@ -57,6 +60,7 @@ tokio = { workspace = true, features = ["full"] }
 ndn-link   = { path = ".", features = ["engine", "introductions"] }
 ndn-engine = { workspace = true }
 ndn-data   = { workspace = true }
+ndn-heap   = { workspace = true }
 ndn-app    = { workspace = true }
 ndn-sync   = { workspace = true, features = ["store-fjall"] }
 # tests/common: the test host's `#[async_trait]` impls.

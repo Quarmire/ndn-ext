@@ -235,7 +235,7 @@
 //! A device that restarts keeps what it learned of its peers, and links with
 //! them again with no peer entry, relay or list of the host's:
 //! [`Links::remember`] takes a [`LinkMemory`] (with the feature
-//! `introductions`, `DeviceMemory` keeps it in a data-layer device's local
+//! `introductions`, `DeviceMemory` keeps it in a data-layer node's store, as
 //! notes). It records, for each peer a link was admitted for by an identity in
 //! a held namespace, its key, its device and the addresses that worked, and
 //! dials them again in the background. The key is what a redial trusts and an
