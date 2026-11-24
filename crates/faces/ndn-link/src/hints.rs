@@ -43,6 +43,10 @@ impl Introductions for Surface {
     fn writer_namespaces(&self, folder: &Name) -> Vec<Name> {
         Surface::writer_namespaces(self, folder)
     }
+
+    fn sync_group(&self, folder: &Name) -> Option<Name> {
+        ndn_heap::wire::sync_group_of(folder)
+    }
 }
 
 impl DepartureSink for Surface {

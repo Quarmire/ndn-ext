@@ -737,10 +737,13 @@ impl Judge<'_> {
 }
 
 /// Whether `entry` carries `name` (§8.7 rule 5): the sync groups, trust
-/// contexts and key and certificate names of its namespaces and of its
-/// folder's (public by design: a hello already carries the chain, and the
-/// group carries no data) and of the other writers' namespaces its folder's
-/// record lists; what this device's introductions serve
+/// contexts and key and certificate names of its namespaces (public by
+/// design: a hello already carries the chain, and the group carries no
+/// data); the trust context and key and certificate names of its folder's
+/// namespace, and the one sync group the data layer gives the folder
+/// ([`Introductions::sync_group`]: that space's, not the owner's others);
+/// the sync groups and the same names of the other writers' namespaces its
+/// folder's record lists; what this device's introductions serve
 /// ([`Introductions::carries`]: a person may ask again); and the names of the
 /// folder's collections as the data layer names them
 /// ([`Introductions::grant_carries`]). A device with no data layer carries
@@ -750,8 +753,13 @@ fn entry_carries(surface: Option<&Arc<dyn Introductions>>, entry: &Grant, name: 
         .namespaces
         .iter()
         .any(|ns| public_name(ns, name))
-        || folder_namespace(&entry.folder)
-            .is_some_and(|ns| !entry.namespaces.contains(&ns) && public_name(&ns, name))
+        || folder_namespace(&entry.folder).is_some_and(|ns| {
+            !entry.namespaces.contains(&ns) && public_name_outside_group(&ns, name)
+        })
+        || surface.is_some_and(|s| {
+            s.sync_group(&entry.folder)
+                .is_some_and(|group| name.has_prefix(&group))
+        })
         || surface.is_some_and(|s| s.carries(name) || s.grant_carries(&entry.folder, name))
         // The sync groups, trust contexts and key and certificate names of
         // the other writers' namespaces the record in force lists, so the
@@ -850,8 +858,13 @@ pub(crate) fn folder_namespace(folder: &Name) -> Option<Name> {
 /// A name of `ns` that is public by design: its sync group, its trust
 /// context, a key or certificate name.
 fn public_name(ns: &Name, name: &Name) -> bool {
-    name.has_prefix(&sync_group(ns))
-        || name.has_prefix(&rdr_prefix(ns))
+    name.has_prefix(&sync_group(ns)) || public_name_outside_group(ns, name)
+}
+
+/// [`public_name`] but for the namespace's sync group: its trust context, a
+/// key or certificate name.
+fn public_name_outside_group(ns: &Name, name: &Name) -> bool {
+    name.has_prefix(&rdr_prefix(ns))
         || (name.has_prefix(ns) && is_key_or_certificate_name(&name.components()[ns.len()..]))
 }
 

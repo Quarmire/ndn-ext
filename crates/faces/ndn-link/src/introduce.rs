@@ -96,6 +96,20 @@ pub trait Introductions: Send + Sync {
         let _ = folder;
         Vec::new()
     }
+
+    /// The sync group the data layer gives the space `folder` (the name its
+    /// nodes announce and hear that space's notices under): a grant link to a
+    /// person admitted to `folder` routes exactly this group over the link and
+    /// carries exactly the names under it ([`Grant::folder`](crate::Grant::folder)),
+    /// not the owner's other groups. `None` for a name that is no space of the
+    /// data layer, and for a device with no data layer (the default): then no
+    /// group of the folder is routed or carried beyond the namespaces' own.
+    /// For a device with `ndn-invite` it is the group of `ndn-heap`
+    /// (`ndn_heap::wire::sync_group_of`).
+    fn sync_group(&self, folder: &Name) -> Option<Name> {
+        let _ = folder;
+        None
+    }
 }
 
 /// What the introduction links of [`Enrollment::Introduction`] carry.

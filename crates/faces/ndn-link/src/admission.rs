@@ -3439,6 +3439,20 @@ mod tests {
         fn departure_carries(&self, record: &Name, name: &Name) -> bool {
             name.has_prefix(record)
         }
+
+        /// `<O>/32=data/<rest>` is grouped as `<O>/32=sync/<rest>`, as the
+        /// data layer derives its group.
+        fn sync_group(&self, folder: &Name) -> Option<Name> {
+            let owner = crate::grants::folder_namespace(folder)?;
+            let rest = &folder.components()[owner.len() + 1..];
+            Some(Name::from_components(
+                ndn_security::sync_group(&owner)
+                    .components()
+                    .iter()
+                    .chain(rest)
+                    .cloned(),
+            ))
+        }
     }
 
     /// A grant link carries the folder's names, the person's own devices, the
@@ -3468,10 +3482,11 @@ mod tests {
             "/b/member/phone/32=log/anything",
             // The introduction, which a person may ask again.
             "/intro/ask",
-            // Sync groups of the grant's namespace and of the folder's, the
-            // trust context, keys and certificates.
+            // Sync groups of the grant's namespace and of the folder (its
+            // own group, not the owner's others), the trust context, keys
+            // and certificates.
             "/b/32=sync/probe",
-            "/a/32=sync/probe",
+            "/a/32=sync/notes/probe",
             "/b/32=trust-context/32=metadata",
             "/b/member/phone/KEY/k/issuer/v=1",
         ] {
@@ -3486,6 +3501,10 @@ mod tests {
             "/a/member/laptop/32=log/a/32=data/diary/seq=1",
             "/b/member/tablet/32=log/x",
             "/b/32=data/anything",
+            // The sync group of another space of the owner, and the owner's
+            // whole group prefix: a grant link carries the folder's group only.
+            "/a/32=sync/diary/probe",
+            "/a/32=sync/probe",
             // Entries of collections whose path has a literal `KEY` component
             // are no key or certificate names.
             "/a/member/laptop/32=log/a/32=data/diary/KEY/x/seq=3",
@@ -3566,8 +3585,12 @@ mod tests {
         );
         assert!(pushes(&n(mine)), "its own devices' answers pass");
         assert!(
-            pushes(&n("/a/32=sync/probe")),
-            "a writer entry carries the folder's public names"
+            pushes(&n("/a/32=sync/notes/probe")),
+            "a writer entry carries the folder's own group"
+        );
+        assert!(
+            !pushes(&n("/a/32=sync/diary/probe")) && !pushes(&n("/a/32=sync/probe")),
+            "the group of a folder the person only reads, or the owner's others, was pushed"
         );
 
         // A promotion shows at the next packet: no new decision, no new link.
@@ -3579,7 +3602,10 @@ mod tests {
         assert!(pushes(&n(&format!("{diary}/page/32=log/x"))));
         // Both readers: nothing is pushed but under the person's own devices.
         world.grants.put(granted_in(&bob, diary, GrantRole::Reader));
-        assert!(!pushes(&n("/a/32=sync/probe")), "no writer entry stands");
+        assert!(
+            !pushes(&n("/a/32=sync/notes/probe")) && !pushes(&n("/a/32=sync/diary/probe")),
+            "no writer entry stands"
+        );
         assert!(!pushes(&n(&format!("{diary}/page/32=log/x"))));
         assert!(pushes(&n(mine)));
 

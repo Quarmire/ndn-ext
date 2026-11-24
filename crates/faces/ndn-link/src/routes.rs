@@ -40,7 +40,8 @@ pub(crate) struct RelayRoutes {
 /// route per prefix and face, and a namespace no longer routed keeps the
 /// route its other entry needs. A link admitted by a live grant entry also
 /// gets, for each held namespace the grant lists, that namespace's public
-/// names outside its devices ([`grant_public_routes`]).
+/// names outside its devices ([`grant_public_routes`]); the groups of the
+/// spaces it is granted are added by [`grant_group_routes`].
 pub(crate) fn routes_for(
     peers: &Peers,
     admitted: &Admitted,
@@ -85,6 +86,31 @@ pub(crate) fn routes_for(
     routes.extend(group_routes(carried, base));
     if let Some(grant) = &admitted.grant {
         routes.extend(grant_public_routes(grant, &admitted.identities));
+    }
+    routes
+}
+
+/// The routes a link admitted by grant entries gets for the sync groups of
+/// the namespaces that own the spaces it is granted (`owners`: the namespace
+/// of each live entry's folder, for a folder the data layer gives a group,
+/// `Introductions::sync_group`): `<O>/32=sync`, once each, unless `have`
+/// routes it already. The data layer's groups of a space lie under its
+/// owner's namespace, not under the namespaces of its writers, so a person
+/// admitted in another namespace hears this device's announcements of a space
+/// (and a version written while no link was up is announced the moment the
+/// link comes up) only when the owner's group prefix is routed over the
+/// link. It is the prefix the data layer's node registers itself, so it
+/// shares the entry of the local member (a longer prefix would shadow it).
+/// What crosses is the grant's filter's: only the names under the granted
+/// space's own group ([`entry_carries`](crate::grants)), so another space's
+/// announcements are routed here and dropped at the link.
+pub(crate) fn grant_group_routes(owners: &[Name], have: &[Route]) -> Vec<Route> {
+    let mut routes: Vec<Route> = Vec::new();
+    for owner in owners {
+        let prefix = sync_group(owner);
+        if !have.iter().chain(&routes).any(|r| r.prefix == prefix) {
+            routes.push(Route { prefix, cost: 0 });
+        }
     }
     routes
 }
@@ -484,6 +510,19 @@ mod tests {
                 route("/bob/CA/KEY", JOINED_ROUTE_COST),
             ]
         );
+    }
+
+    /// The sync group prefix of the owner of each granted space is routed,
+    /// once, unless the link has it already.
+    #[test]
+    fn a_grant_link_routes_the_owners_group_of_each_granted_space_once() {
+        let have = [route("/bob/32=sync", 0), route("/home/32=sync", 0)];
+        let owners = [n("/home"), n("/alice"), n("/alice")];
+        assert_eq!(
+            grant_group_routes(&owners, &have),
+            [route("/alice/32=sync", 0)]
+        );
+        assert!(grant_group_routes(&[], &have).is_empty());
     }
 
     /// A namespace the grant does not list, a served identity and a link no

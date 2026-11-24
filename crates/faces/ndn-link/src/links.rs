@@ -34,7 +34,7 @@ use crate::peer::{LinkMode, LinkReliability, PeerId, PeerSpec, Peers};
 use crate::policy::{Backoff, ENROLLMENT_IDLE, MESSAGE_DEADLINE};
 use crate::presence::{DirectOptions, MemberEntry};
 use crate::relays::RelayOptions;
-use crate::routes::{RelayRoutes, routes_for};
+use crate::routes::{RelayRoutes, grant_group_routes, routes_for};
 use crate::serving::QuotaState;
 use crate::signal::Signal;
 use crate::slots::EnrollmentSlots;
@@ -953,7 +953,23 @@ impl Links {
         let relay = relay_routes
             .clone()
             .filter(|_| peer.as_ref().is_some_and(|p| p.routes.is_none()));
-        let routes = routes_for(&self.peers, &admitted, dials, relay_routes);
+        let mut routes = routes_for(&self.peers, &admitted, dials, relay_routes);
+        // A link a grant admitted also routes the sync group of the owner of
+        // each space the key's entries grant, when the data layer gives the
+        // space a group (the filter carries only that group's names).
+        if admitted.grant.is_some()
+            && let Some(surface) = self.introductions.lock().clone()
+        {
+            let owners: Vec<Name> = self
+                .grants
+                .live_entries(&admitted.fingerprint, SystemTime::now())
+                .iter()
+                .filter(|entry| surface.sync_group(&entry.folder).is_some())
+                .filter_map(|entry| crate::grants::folder_namespace(&entry.folder))
+                .collect();
+            let more = grant_group_routes(&owners, &routes);
+            routes.extend(more);
+        }
         // A person is told of a departure by a full link only: what a peer says
         // on an enrollment, introduction or departure link is not heard, and a
         // grant link tells the returning person of the marks it holds (an

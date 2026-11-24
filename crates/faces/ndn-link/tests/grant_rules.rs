@@ -20,8 +20,8 @@ use ndn_face_quic::{
     LinkKeySource, LinkTransportConfig, Membership,
 };
 use ndn_link::{
-    ConfiguredEndpoints, FaceSink, Grant, GrantRole, LinkMemory, LinkSetup, LinkTrust, Links,
-    MemoryFuture, MemoryOptions, OwnMembership, PeerRecord, PeerSpec, Route,
+    ConfiguredEndpoints, FaceSink, Grant, GrantRole, Introductions, LinkMemory, LinkSetup,
+    LinkTrust, Links, MemoryFuture, MemoryOptions, OwnMembership, PeerRecord, PeerSpec, Route,
 };
 use ndn_packet::{Data, Name};
 use ndn_security::{
@@ -40,13 +40,16 @@ fn n(s: &str) -> Name {
     s.parse().unwrap()
 }
 
-/// What Ann routes over the link of a grant for `/b`: the person's device
-/// and sync group, and the public names of `/b` outside the devices (its
-/// trust context, the root's key and the CA's key).
+/// What Ann routes over the link of a grant for `/b` in `FOLDER`: the
+/// person's device and sync group, the sync group prefix of the folder's
+/// owner (the entry the data layer's node registers; what crosses is the
+/// granted space's group alone), and the public names of `/b` outside the
+/// devices (its trust context, the root's key and the CA's key).
 fn routes_of_a_grant_for_b() -> Vec<Name> {
     let mut routes = vec![
         n("/b/member/phone"),
         n("/b/32=sync"),
+        n("/a/32=sync"),
         ndn_cert::onboarding::rdr_prefix(&n("/b")),
         n("/b/KEY"),
         n("/b/CA/KEY"),
@@ -418,7 +421,39 @@ async fn ann(
         true,
         cancel,
     );
+    links.set_introductions(Arc::new(Grouped));
     (links, faces, addr.unwrap())
+}
+
+/// The data layer as a double: no offer open, nothing carried by itself, and
+/// the sync group of a space `<O>/32=data/<rest>` is `<O>/32=sync/<rest>`.
+struct Grouped;
+
+impl Introductions for Grouped {
+    fn open(&self) -> bool {
+        false
+    }
+    fn carries(&self, _: &Name) -> bool {
+        false
+    }
+    fn grant_carries(&self, _: &Name, _: &Name) -> bool {
+        false
+    }
+    fn departure_carries(&self, _: &Name, _: &Name) -> bool {
+        false
+    }
+    fn sync_group(&self, folder: &Name) -> Option<Name> {
+        let comps = folder.components();
+        let at = comps.iter().position(|c| c.value.as_ref() == b"data")?;
+        let owner = Name::from_components(comps[..at].iter().cloned());
+        Some(Name::from_components(
+            ndn_security::sync_group(&owner)
+                .components()
+                .iter()
+                .chain(&comps[at + 1..])
+                .cloned(),
+        ))
+    }
 }
 
 /// A grant of one key of B links that key — and routes B's device and B's
@@ -1011,11 +1046,13 @@ async fn a_grant_whose_role_changed_narrows_the_pushes_at_the_next_packet() {
         .await;
     let face = at_ann.live.lock()[0];
 
-    // What the phone pushes: Data under the folder namespace's sync group (a
-    // public name a writer's entry carries, a reader's does not) and Data
-    // under its own device name (which either role carries).
+    // What the phone pushes: Data under the folder's own sync group (a name a
+    // writer's entry carries, a reader's does not; the owner's other groups
+    // are carried by neither) and Data under its own device name (which
+    // either role carries).
     let pushed = |name: &str| ndn_packet::encode::DataBuilder::new(n(name), b"x").build();
-    let public = "/a/32=sync/probe";
+    let public = "/a/32=sync/notes/probe";
+    let other_space = "/a/32=sync/diary/probe";
     let own = "/b/member/phone/seal/1";
     let push = async |name: &str| at_phone.send(&pushed(name)).await;
     let arrives = async |name: &str| {
@@ -1034,10 +1071,11 @@ async fn a_grant_whose_role_changed_narrows_the_pushes_at_the_next_packet() {
         true
     };
 
+    push(other_space).await;
     push(public).await;
     assert!(
         arrives(public).await,
-        "a writer's push under a public name crossed"
+        "a writer's push under its folder's group crossed, the owner's other group did not"
     );
 
     // Demoted: the same link, the next packet narrower.
@@ -1109,7 +1147,7 @@ async fn a_writer_of_one_folder_and_a_reader_of_another_push_under_the_writers_n
         .await;
     let face = at_ann.live.lock()[0];
 
-    let (in_a, in_c) = ("/a/32=sync/probe", "/c/32=sync/probe");
+    let (in_a, in_c) = ("/a/32=sync/notes/probe", "/c/32=sync/other/probe");
     let push = async |name: &str| {
         at_phone
             .send(&ndn_packet::encode::DataBuilder::new(n(name), b"x").build())

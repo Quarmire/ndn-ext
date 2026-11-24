@@ -41,10 +41,7 @@ async fn commits_offline_then_links(
     assert!(reads(ann, name, what).await, "ann reads her own commit");
     // No link: nothing of it reaches Bob.
     tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(
-        !reads(bob, name, what).await,
-        "bob read it with no link up"
-    );
+    assert!(!reads(bob, name, what).await, "bob read it with no link up");
 
     let up = Instant::now();
     bob.links.set_online(true);
