@@ -4,7 +4,7 @@
 //!
 //! A grant was built one-sided: the inviter's device admitted the joiner, and the
 //! joiner's `own` policy held a grant for no one. Now the joiner's device keeps
-//! the mirror of the inviter's grant, `Device::grants()` lists it, and the link
+//! the mirror of the inviter's grant, `Invites::grants()` lists it, and the link
 //! the inviter dials is admitted by it as a grant link for that folder only.
 //! With it, an identified peer that opens a link brings the address its record
 //! holds up to date (the IP it came from, the port the record holds; the source
@@ -39,16 +39,15 @@ use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
 use ndn_app::EngineAppExt;
-use ndn_data::intro::{
-    Departure as DataDeparture, Dialing, FirstDialing, Grant as DataGrant, LinkHint,
-};
-use ndn_data::{
-    Answer, Audience, Clock, Config, Content, DataLayer, Device, Got, IntroPolicy, Introducer,
-    Joined, Keep, NextStep, Offer, Payload, PutOptions, Role, Rule, Share, Sharing, Timestamp,
-    Transport, TypeId,
-};
 use ndn_engine::{EngineBuilder, EngineConfig, ForwarderEngine, ShutdownHandle};
 use ndn_face_quic::{KeyFingerprint, LinkEndpoint, LinkKey, LinkKeySource, LinkTransportConfig};
+use ndn_heap::{
+    Clock, Config, Heap, MembersChange, Node, PutOptions, Readers, Share, Timestamp, Transport,
+};
+use ndn_invite::{
+    Adopting, Departure, Dialing, FirstDialing, Grant, Host as InviteHost, IntroPolicy,
+    InviteConfig, InviteError, Invites, Joined, LinkHint, Offer, Role,
+};
 use ndn_link::{
     ConfiguredEndpoints, DeviceMemory, EngineFaces, HostCandidates, LinkDetail, LinkHints,
     LinkMemory, LinkSetup, LinkTrust, Links, MemoryOptions, PeerRecord, RelayService, ServePolicy,
@@ -211,12 +210,12 @@ struct Host {
     hints: OnceLock<LinkHints>,
 }
 
-impl Introducer for Host {
+impl InviteHost for Host {
     fn anchor(&self) -> Option<Bytes> {
         Some(self.anchor.clone())
     }
 
-    fn adopt<'a>(&'a self, link: &'a TrustEnvelope) -> ndn_data::intro::Adopting<'a> {
+    fn adopt<'a>(&'a self, link: &'a TrustEnvelope) -> Adopting<'a> {
         Box::pin(async move {
             let TrustEnvelope::Anchor {
                 namespace: Some(ns),
@@ -270,13 +269,13 @@ impl Introducer for Host {
         }
     }
 
-    fn grant(&self, grant: &DataGrant) {
+    fn grant(&self, grant: &Grant) {
         if let Some(hints) = self.hints.get() {
             hints.grant(grant);
         }
     }
 
-    fn departure(&self, departure: &DataDeparture) {
+    fn departure(&self, departure: &Departure) {
         if let Some(hints) = self.hints.get() {
             hints.depart(departure);
         }
@@ -355,7 +354,8 @@ impl Durable {
 /// A device of a person, alone on a forwarder of its own: its data layer, its
 /// links.
 struct Embedded {
-    device: Device,
+    node: Node,
+    invites: Invites,
     links: Arc<Links>,
     hints: LinkHints,
     key: KeyFingerprint,
@@ -378,7 +378,7 @@ impl Embedded {
     /// owes the store) and its port is free again.
     async fn stop(self) -> Arc<Durable> {
         self.links.shutdown().await;
-        self.device.shutdown();
+        self.node.shutdown();
         self.cancel.cancel();
         let durable = Arc::clone(&self.durable);
         drop(self);
@@ -410,8 +410,10 @@ impl Embedded {
     /// Give the links the memory a device keeps in its own store
     /// (`ndf`'s `links.remember(DeviceMemory::new(&device), …)`).
     fn remembers(&self) {
-        self.links
-            .remember(DeviceMemory::new(&self.device), on_this_machine());
+        self.links.remember(
+            DeviceMemory::new(self.node.store().clone()),
+            on_this_machine(),
+        );
     }
 
     /// What the memory holds of the peer `key` right now (in memory).
@@ -428,11 +430,31 @@ impl Embedded {
 
     /// What the store holds of the peer `key` (written behind).
     fn kept(&self, key: KeyFingerprint) -> Option<PeerRecord> {
-        DeviceMemory::new(&self.device)
+        DeviceMemory::new(self.node.store().clone())
             .load()
             .unwrap()
             .into_iter()
             .find(|r| r.key == key)
+    }
+
+    /// The space `space` this device has open (made, joined or restored).
+    fn heap(&self, space: &Name) -> Heap {
+        self.node
+            .space(space)
+            .unwrap_or_else(|| panic!("{} has not opened {space}", self.durable.ns))
+    }
+
+    /// The open space `name` lies in (the longest one prefixing it) and the
+    /// path of `name` inside it.
+    fn locate(&self, name: &Name) -> Option<(Heap, Name)> {
+        let space = self
+            .node
+            .spaces()
+            .into_iter()
+            .filter(|space| name.has_prefix(space))
+            .max_by_key(Name::len)?;
+        let path = Name::from_components(name.components()[space.len()..].iter().cloned());
+        Some((self.node.space(&space)?, path))
     }
 }
 
@@ -520,7 +542,7 @@ async fn boot(durable: &Arc<Durable>, faulty: bool) -> Embedded {
         hints: OnceLock::new(),
     });
     let _ = host.hints.set(hints.clone());
-    let device = Device::start(
+    let node = Node::start(
         Transport {
             node: engine.app_node(cancel.child_token()),
             sync: engine.app_face(cancel.child_token()),
@@ -532,20 +554,26 @@ async fn boot(durable: &Arc<Durable>, faulty: bool) -> Embedded {
         Config {
             clock,
             first_look: Duration::from_secs(1),
-            introducer: Some(host),
-            intro: IntroPolicy {
-                local_candidates: true,
-                grant_for: None,
-                ..IntroPolicy::new()
-            },
             ..Config::new()
         },
     )
     .await
     .unwrap();
-    hints.serve(&device);
+    let invites = Invites::start(
+        &node,
+        host,
+        IntroPolicy {
+            local_candidates: true,
+            grant_for: None,
+            ..IntroPolicy::new()
+        },
+        InviteConfig::new(),
+    )
+    .unwrap();
+    hints.serve(&invites);
     Embedded {
-        device,
+        node,
+        invites,
         links,
         hints,
         key: durable.parts.fingerprint,
@@ -570,29 +598,38 @@ fn on_this_machine() -> MemoryOptions {
 }
 
 fn note() -> PutOptions {
-    PutOptions {
-        type_id: TypeId {
-            name: n("/types/note"),
-            revision: 1,
-        },
-        keep: Keep::Forever,
-    }
+    PutOptions::default()
 }
 
-fn text(s: &str) -> Content {
-    Content::new().with("text", Bytes::copy_from_slice(s.as_bytes()))
+fn text(s: &str) -> Bytes {
+    Bytes::copy_from_slice(s.as_bytes())
 }
 
-/// Whether `layer` reads `s` as the newest note of `collection`.
-async fn reads(layer: &Device, collection: &Name, s: &str) -> bool {
-    match layer.get(collection).await {
-        Ok(Answer {
-            got: Got::Version(v),
-            ..
-        }) => {
-            matches!(&v.payload, Payload::Entry(c) if c.get("text").is_some_and(|t| t[..] == *s.as_bytes()))
+/// Whether `on` reads `s` as the value of `name` (a path under a space it has
+/// open).
+async fn reads(on: &Embedded, name: &Name, s: &str) -> bool {
+    let Some((heap, path)) = on.locate(name) else {
+        return false;
+    };
+    matches!(heap.get(&path).await, Ok(Some(item)) if item.bytes[..] == *s.as_bytes())
+}
+
+/// `put` as a host does what `NotReady` says (the layer has not seen yet what
+/// the put needs: the space's creation, the epoch's key): again until `LONG`
+/// has passed. `name` is a path under a space `on` has open.
+async fn puts(on: &Embedded, name: &Name, bytes: Bytes) {
+    let (heap, path) = on
+        .locate(name)
+        .unwrap_or_else(|| panic!("{} has opened no space {name} lies in", on.durable.ns));
+    let started = Instant::now();
+    loop {
+        match heap.put(&path, bytes.clone(), note()).await {
+            Ok(_) => return,
+            Err(e) if e.retry() && started.elapsed() < LONG => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => panic!("put of {name}: {e}"),
         }
-        _ => false,
     }
 }
 
@@ -615,25 +652,15 @@ async fn throughout(what: &str, span: Duration, mut holds: impl FnMut() -> bool)
 }
 
 /// `from` writes a note into `folder` and `to` reads it: words crossed. A put is
-/// refused with `NotReady` (put again) while its device has not walked the summary
-/// of a device of its namespace that may hold a members record of the folder: the
-/// walk runs in the background and a put never waits on other devices, so a put
-/// right after a link came up is asked again until it goes through.
+/// refused as one to be asked again (`NotReady`) while its device has not seen
+/// what it needs, so a put right after a link came up is asked again until it
+/// goes through.
 async fn words_cross(from: &Embedded, to: &Embedded, folder: &Name, tag: &str) {
     let name = folder.clone().append(tag);
     let words = format!("words {tag}");
-    let started = Instant::now();
-    loop {
-        match from.device.put(&name, text(&words), note()).await {
-            Ok(_) => break,
-            Err(e) if e.next() == NextStep::RetryLater && started.elapsed() < LONG => {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            Err(e) => panic!("put of {name}: {e}"),
-        }
-    }
+    puts(from, &name, text(&words)).await;
     until(&format!("{tag} crosses"), LONG, async || {
-        reads(&to.device, &name, &words).await
+        reads(to, &name, &words).await
     })
     .await;
 }
@@ -644,54 +671,46 @@ async fn words_cross_both_ways(a: &Embedded, b: &Embedded, folder: &Name, tag: &
     words_cross(b, a, folder, &format!("{tag}-from-b")).await;
 }
 
-/// `folder` of `laptop`'s person, shared with that person alone and with a
-/// cover written into it.
-async fn shared(laptop: &Embedded, folder: &Name, person: &str) {
-    laptop
-        .device
-        .share_folder(
-            folder,
-            Sharing::Whole(Share {
-                rule: Rule::Log,
-                writers: vec![n(person)],
-                readers: vec![Audience::Person(n(person))],
-            }),
-        )
-        .await
-        .unwrap();
-    laptop
-        .device
-        .put(
-            &folder.clone().append("cover"),
-            text("cover by the owner"),
-            note(),
-        )
+/// `folder` of `laptop`'s person, shared with that person alone (once) and
+/// with a cover written into it.
+async fn shared(laptop: &Embedded, folder: &Name) {
+    let heap = match laptop.node.space(folder) {
+        Some(heap) => heap,
+        None => laptop
+            .node
+            .create(
+                folder,
+                Share {
+                    readers: Readers::Persons(Vec::new()),
+                    writers: Vec::new(),
+                },
+            )
+            .await
+            .unwrap(),
+    };
+    heap.put(&n("/cover"), text("cover by the owner"), note())
         .await
         .unwrap();
 }
 
 /// Join with `link` as a host does what `NotReady` says: again with the same
 /// code until `limit` has passed.
-async fn joins(
-    phone: &Embedded,
-    link: &str,
-    limit: Duration,
-) -> Result<Joined, ndn_data::DataError> {
+async fn joins(phone: &Embedded, link: &str, limit: Duration) -> Result<Joined, InviteError> {
     let started = Instant::now();
     loop {
-        match phone.device.join(link).await {
-            Err(e) if e.next() == NextStep::RetryLater && started.elapsed() < limit => {}
+        match phone.invites.join(link).await {
+            Err(e) if e.retry() && started.elapsed() < limit => {}
             other => return other,
         }
     }
 }
 
-/// `inviter` shares `folder` (of `person`, once) and invites `joiner` into it
-/// as `role`; `joiner` joins.
-async fn invites(inviter: &Embedded, joiner: &Embedded, folder: &Name, person: &str, role: Role) {
-    shared(inviter, folder, person).await;
+/// `inviter` shares `folder` (once) and invites `joiner` into it as `role`;
+/// `joiner` joins.
+async fn invites(inviter: &Embedded, joiner: &Embedded, folder: &Name, role: Role) {
+    shared(inviter, folder).await;
     let code = inviter
-        .device
+        .invites
         .offer(
             folder,
             Offer {
@@ -758,25 +777,16 @@ async fn dials(from: &Embedded, to: &Embedded, device: &str) -> Result<(), LinkD
 
 /// The name of the newest entry of `collection` that `device` (the name of
 /// `on`'s device) wrote, as `on` holds it.
-async fn newest_entry(on: &Embedded, device: &str, collection: &Name) -> Name {
-    match on.device.get(collection).await {
-        Ok(Answer {
-            got: Got::Version(v),
-            ..
-        }) => v.name,
-        Ok(Answer {
-            got: Got::State(state),
-            ..
-        }) => {
-            let seq = state
-                .at
-                .iter()
-                .map(|(_, seq)| seq.0)
-                .max()
-                .unwrap_or_else(|| panic!("{collection} has an empty state"));
-            ndn_data::wire::log_name(&n(device), Some(collection), seq)
+async fn newest_entry(on: &Embedded, device: &str, path: &Name) -> Name {
+    let (heap, relative) = on
+        .locate(path)
+        .unwrap_or_else(|| panic!("{} has opened no space {path} lies in", on.durable.ns));
+    match heap.get(&relative).await {
+        Ok(Some(item)) => {
+            assert_eq!(item.id.device, n(device), "{path} was written by {device}");
+            ndn_heap::wire::log_name(&item.id.device, heap.name(), item.id.seq)
         }
-        other => panic!("{collection} has no entry on {device}: {other:?}"),
+        other => panic!("{path} has no entry on {device}: {other:?}"),
     }
 }
 
@@ -814,7 +824,7 @@ async fn ann_invited_bob(alice: &Person, bobs: &Person, faulty: bool) -> (Embedd
     let bob = boot(&Durable::new(bobs, BOB, BOB_AT).await, faulty).await;
     ann.remembers();
     bob.remembers();
-    invites(&ann, &bob, &n(FOLDER), "/alice", Role::Writer).await;
+    invites(&ann, &bob, &n(FOLDER), Role::Writer).await;
     until("both devices wrote what they learned", LONG, async || {
         ann.kept(bob.key).is_some_and(|r| !r.addresses.is_empty())
             && bob.kept(ann.key).is_some_and(|r| !r.addresses.is_empty())
@@ -852,7 +862,7 @@ async fn laptop_moves_and_the_joiner_restarts(faulty: bool) {
     words_cross_both_ways(&ann, &bob, &folder, "before").await;
 
     // Bob's device holds the mirror of Ann's grant, which is what admits her.
-    let mirrored = bob.device.grants();
+    let mirrored = bob.invites.grants();
     assert_eq!(mirrored.len(), 1, "{mirrored:#?}");
     assert_eq!(mirrored[0].key, ann.key.0);
     assert_eq!(mirrored[0].folder, folder);
@@ -997,17 +1007,31 @@ async fn the_source_port_of_a_link_the_peer_opened_is_never_recorded() {
 /// Ann's members record for `folder` again, with `writers` (and the same
 /// people as readers): whoever the record no longer lists is let go of it.
 async fn reshare(ann: &Embedded, folder: &Name, writers: &[Name]) {
-    ann.device
-        .share_folder(
-            folder,
-            Sharing::Whole(Share {
-                rule: Rule::Log,
-                writers: writers.to_vec(),
-                readers: writers.iter().cloned().map(Audience::Person).collect(),
-            }),
-        )
-        .await
-        .unwrap();
+    let heap = ann.heap(folder);
+    let members = heap.members();
+    let readers = match &members.readers {
+        Readers::Persons(persons) => persons.clone(),
+        Readers::Anyone => Vec::new(),
+    };
+    let listed: std::collections::BTreeSet<&Name> =
+        members.writers.iter().chain(&readers).collect();
+    let remove = listed
+        .into_iter()
+        .filter(|p| **p != members.owner && !writers.contains(p))
+        .cloned()
+        .collect();
+    let add = writers
+        .iter()
+        .filter(|w| **w != members.owner && !members.writers.contains(w))
+        .cloned()
+        .collect::<Vec<_>>();
+    heap.change(MembersChange {
+        add_writers: add.clone(),
+        add_readers: add,
+        remove,
+    })
+    .await
+    .unwrap();
 }
 
 /// Ann invited Bob; Bob restarts and does not remember anyone (his links hold
@@ -1087,7 +1111,7 @@ async fn a_peer_whose_entry_ended_by_a_record_is_refused_and_changes_no_record()
 
     reshare(&ann, &n(FOLDER), &[n("/alice")]).await;
     until("bob's device ends the mirror entry", LONG, async || {
-        bob.device.grants().is_empty()
+        bob.invites.grants().is_empty()
     })
     .await;
     until("bob's links end the mirror entry", LONG, async || {
@@ -1127,12 +1151,16 @@ async fn a_peer_whose_entry_the_host_ended_is_refused_and_changes_no_record() {
 
     assert!(
         bob.hints
-            .end_grant(&bob.device, &ann.key.0)
+            .end_grant(&bob.invites, &ann.key.0)
             .await
             .expect("the device made the end durable"),
         "no entry was in force"
     );
-    assert!(bob.device.grants().is_empty(), "{:#?}", bob.device.grants());
+    assert!(
+        bob.invites.grants().is_empty(),
+        "{:#?}",
+        bob.invites.grants()
+    );
     assert!(bob.links.grants().is_empty());
 
     let ann = ann.moves_to(ANN_MOVED_TO).await;
@@ -1168,13 +1196,24 @@ async fn a_mirror_grant_of_one_folder_does_not_carry_the_names_of_another() {
 
     // Bob's own things: a folder of his that Ann was never invited to, and an
     // unsealed collection of his namespace outside any folder.
-    shared(&bob, &other, "/bob").await;
+    shared(&bob, &other).await;
     let diary = n("/bob/32=data/diary");
-    bob.device
-        .put_op(&diary, Bytes::from_static(b"bob's diary"), note())
+    let public = bob
+        .node
+        .create(
+            &diary,
+            Share {
+                readers: Readers::Anyone,
+                writers: Vec::new(),
+            },
+        )
         .await
         .unwrap();
-    let diary_entry = newest_entry(&bob, BOB, &diary).await;
+    public
+        .put(&n("/page"), Bytes::from_static(b"bob's diary"), note())
+        .await
+        .unwrap();
+    let diary_entry = newest_entry(&bob, BOB, &diary.append("page")).await;
     let other_entry = newest_entry(&bob, BOB, &other.clone().append("cover")).await;
     let folder_entry = newest_entry(&bob, ANN, &folder.clone().append("cover")).await;
 
@@ -1205,7 +1244,7 @@ async fn a_link_another_key_opened_changes_only_that_keys_record() {
     let (ann, bob) = ann_invited_bob(&alice, &bobs, false).await;
     let carol = boot(&Durable::new(&carols, CAROL, CAROL_AT).await, false).await;
     carol.remembers();
-    invites(&bob, &carol, &n(FOLDER_C), "/bob", Role::Writer).await;
+    invites(&bob, &carol, &n(FOLDER_C), Role::Writer).await;
     until("bob remembers carol and is linked", LONG, async || {
         bob.kept(carol.key).is_some_and(|r| !r.addresses.is_empty()) && linked(&bob, carol.key)
     })
@@ -1250,8 +1289,8 @@ async fn mutual_invitations_keep_both_entries_and_the_link_closes_with_the_last(
     let ann = embedded(&alice, ANN, ANN_AT).await;
     let bob = embedded(&bobs, BOB, BOB_AT).await;
     let (a, b) = (n(FOLDER), n(FOLDER_B));
-    invites(&ann, &bob, &a, "/alice", Role::Writer).await;
-    invites(&bob, &ann, &b, "/bob", Role::Writer).await;
+    invites(&ann, &bob, &a, Role::Writer).await;
+    invites(&bob, &ann, &b, Role::Writer).await;
     until("both are linked", LONG, async || {
         linked(&ann, bob.key) && linked(&bob, ann.key)
     })
@@ -1267,10 +1306,10 @@ async fn mutual_invitations_keep_both_entries_and_the_link_closes_with_the_last(
         })
         .await;
         assert_eq!(
-            on.device.grants().len(),
+            on.invites.grants().len(),
             2,
             "{who}: {:#?}",
-            on.device.grants()
+            on.invites.grants()
         );
         assert_eq!(
             on.links.grants().len(),
@@ -1278,7 +1317,7 @@ async fn mutual_invitations_keep_both_entries_and_the_link_closes_with_the_last(
             "{who}: {:#?}",
             on.links.grants()
         );
-        assert!(on.device.grants().iter().all(|g| g.key == peer.key.0));
+        assert!(on.invites.grants().iter().all(|g| g.key == peer.key.0));
         let listed: Vec<Name> = on.links.grants().iter().map(|g| g.folder.clone()).collect();
         assert_eq!(
             listed, folders,
@@ -1292,11 +1331,11 @@ async fn mutual_invitations_keep_both_entries_and_the_link_closes_with_the_last(
     // so does the link, and B still carries words both ways.
     assert!(
         ann.hints
-            .end_grant_in(&ann.device, &bob.key.0, &a)
+            .end_grant_in(&ann.invites, &bob.key.0, &a)
             .await
             .unwrap()
     );
-    let left = ann.device.grants();
+    let left = ann.invites.grants();
     assert_eq!(left.len(), 1, "{left:#?}");
     assert_eq!(left[0].folder, b);
     assert_eq!(ann.links.grants().len(), 1);
@@ -1308,16 +1347,16 @@ async fn mutual_invitations_keep_both_entries_and_the_link_closes_with_the_last(
     .await;
     words_cross_both_ways(&ann, &bob, &b, "b-after").await;
     // Bob's entries are untouched: ending an entry of Ann's device is not a record.
-    assert_eq!(bob.device.grants().len(), 2);
+    assert_eq!(bob.invites.grants().len(), 2);
 
     // The last entry of Ann's ends: the link closes.
     assert!(
         ann.hints
-            .end_grant_in(&ann.device, &bob.key.0, &b)
+            .end_grant_in(&ann.invites, &bob.key.0, &b)
             .await
             .unwrap()
     );
-    assert!(ann.device.grants().is_empty());
+    assert!(ann.invites.grants().is_empty());
     until("the link closes with the last entry", LONG, async || {
         !linked(&ann, bob.key) && !linked(&bob, ann.key)
     })

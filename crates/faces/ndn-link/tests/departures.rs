@@ -20,9 +20,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use common::*;
-use ndn_data::{DataLayer, Role};
+use ndn_invite::Role;
 use ndn_link::{DepartureOptions, LinkState};
-use ndn_packet::{Name, NameComponent};
+use ndn_packet::Name;
 use ndn_sync::DataStore;
 
 /// Ann's record for the notebook without Bob.
@@ -31,12 +31,12 @@ async fn lets_go(ann: &Embedded) {
 }
 
 /// Whether `on`'s device lists the namespace of `who` among the writers of
-/// `folder` by the members record it holds.
+/// `folder` by the members entry it holds (a device that holds no such space
+/// lists no one).
 async fn lists(on: &Embedded, folder: &Name, who: &Name) -> bool {
-    on.device
-        .members(folder)
-        .await
-        .is_ok_and(|share| share.writers.iter().any(|w| who.has_prefix(w)))
+    on.node
+        .space(folder)
+        .is_some_and(|heap| heap.members().writers.iter().any(|w| who.has_prefix(w)))
 }
 
 /// What `on` says of why its link to `key` is down, when it is.
@@ -72,11 +72,11 @@ fn record_of(ann: &Embedded, key: ndn_face_quic::KeyFingerprint) -> Name {
 }
 
 /// What a device that is not let go would be answered over its link, and a
-/// narrow link must not answer: Ann's folder entry, her summary root, her
-/// sync group.
+/// narrow link must not answer: Ann's folder entry, another entry of the
+/// folder, her sync group.
 struct Names {
     entry: Name,
-    root: Name,
+    other: Name,
     probe: Name,
 }
 
@@ -84,23 +84,23 @@ struct Names {
 async fn names_of(ann: &Embedded) -> Names {
     answers_probes(ann);
     let later = n(FOLDER).append("later");
-    puts(&ann.device, &later, text("before"), LONG).await;
+    puts(ann, &later, text("before"), LONG).await;
     Names {
         entry: newest_entry(ann, ANN, &later).await,
-        root: ndn_data::wire::root_prefix(&n(ANN), &ann.ns),
+        other: newest_entry(ann, ANN, &n(FOLDER).append("cover")).await,
         probe: probe_prefix(ann).append("departed"),
     }
 }
 
 /// Every name of `names` is answered over `from`'s link to `to`, or none is.
 async fn all_asked(from: &Embedded, to: &Embedded, names: &Names, answered: bool) {
-    for (what, name, prefix) in [
-        ("a folder entry", &names.entry, false),
-        ("a summary root", &names.root, true),
-        ("the sync group", &names.probe, false),
+    for (what, name) in [
+        ("a folder entry", &names.entry),
+        ("another entry of the folder", &names.other),
+        ("the sync group", &names.probe),
     ] {
         assert_eq!(
-            asks(from, to.key, name, prefix).await,
+            asks(from, to.key, name, false).await,
             answered,
             "{what} ({name}) was {}answered over the link",
             if answered { "not " } else { "" }
@@ -147,7 +147,7 @@ async fn let_go_while_online_the_person_is_told_takes_the_record_and_the_link_cl
     .await;
     let names = names_of(&ann).await;
     until("bob reads what ann wrote", LONG, async || {
-        reads(&bob.device, &folder.clone().append("later"), "before").await
+        reads(&bob, &folder.clone().append("later"), "before").await
     })
     .await;
     // The link stays narrow long enough to ask over it.
@@ -166,7 +166,7 @@ async fn let_go_while_online_the_person_is_told_takes_the_record_and_the_link_cl
     })
     .await;
     let record = record_of(&ann, bob.key);
-    assert!(ann.device.grants().is_empty());
+    assert!(ann.invites.grants().is_empty());
     // The record is the one of Ann's line that leaves him out, a log entry of
     // the folder.
     assert!(
@@ -254,10 +254,10 @@ async fn let_go_while_offline_the_mark_admits_a_narrow_link_for_the_record_alone
 }
 
 /// The departed person gets nothing but the record: not another record of
-/// the folder — Carol's, the one that let her go before — nor a cut manifest
-/// of it, and the record's own name, with a cut manifest, is carried.
+/// the folder — Carol's, the one that let her go before — nor any other entry
+/// of it, and the record's own name is carried.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_departed_gets_nothing_but_the_record_not_another_persons_cut() {
+async fn the_departed_gets_nothing_but_the_record_not_another_persons_record() {
     let alice = Person::new("/alice").await;
     let bobs = Person::new("/bob").await;
     let carols = Person::new("/carol").await;
@@ -293,19 +293,14 @@ async fn the_departed_gets_nothing_but_the_record_not_another_persons_cut() {
         !lists(&bob, &folder, &bob.ns).await
     })
     .await;
-    let cut_of = |record: &Name| {
-        record
-            .clone()
-            .append_component(NameComponent::keyword(Bytes::from_static(b"cut")))
-            .append_segment(0)
-    };
+    let cover = newest_entry(&ann, ANN, &folder.clone().append("cover")).await;
     for (what, name) in [
         ("Carol's record", carols_record.clone()),
-        ("a cut manifest of Carol's record", cut_of(&carols_record)),
+        ("an entry of the folder that is no record of his", cover),
     ] {
         assert!(
             !asks(&bob, ann.key, &name, false).await,
-            "{what} ({name}), another person's, crossed Bob's departure link"
+            "{what} ({name}) crossed Bob's departure link"
         );
     }
     // Control: the link is Bob's departure link, which does carry his own
@@ -555,9 +550,7 @@ async fn a_note_changed_in_the_store_leaves_no_mark_at_the_next_start() {
         let bob = embedded(&bobs, "/bob/member/phone", Setup::dialer()).await;
         invited(&ann, &bob, Role::Writer).await;
         let_go_offline(&ann, &bob).await;
-        let notes = ann
-            .store()
-            .scan_under(&n("/localhost/ndn-data/intro/grant"), 0);
+        let notes = ann.store().scan_under(&n("/localhost/ndn-invite/grant"), 0);
         assert_eq!(notes.len(), 1, "{what}: the notes of Ann's store");
         if let Some(tamper) = tamper {
             let (name, value) = notes.into_iter().next().unwrap();
@@ -572,7 +565,7 @@ async fn a_note_changed_in_the_store_leaves_no_mark_at_the_next_start() {
         ann.offers_run_out();
         let marked = tamper.is_none();
         assert_eq!(
-            ann.device.departures().len(),
+            ann.invites.departures().len(),
             usize::from(marked),
             "{what}: the marks Ann's device derives"
         );
@@ -599,16 +592,16 @@ async fn a_note_changed_in_the_store_leaves_no_mark_at_the_next_start() {
 
 /// A sink that records what it is asked, who told, and answers `refuse_first`
 /// of the first asks as not ready, else as the device's own sink does.
-struct Recording {
-    inner: ndn_data::IntroductionSurface,
+struct Sink {
+    inner: ndn_invite::Surface,
     asked: std::sync::Mutex<Vec<(Name, Name, Name)>>,
     refuse_first: AtomicUsize,
 }
 
-impl Recording {
-    fn new(of: &Embedded, refuse_first: usize) -> Arc<Recording> {
-        Arc::new(Recording {
-            inner: of.device.introductions(),
+impl Sink {
+    fn new(of: &Embedded, refuse_first: usize) -> Arc<Sink> {
+        Arc::new(Sink {
+            inner: of.invites.surface(),
             asked: std::sync::Mutex::new(Vec::new()),
             refuse_first: AtomicUsize::new(refuse_first),
         })
@@ -620,7 +613,7 @@ impl Recording {
     }
 }
 
-impl ndn_link::DepartureSink for Recording {
+impl ndn_link::DepartureSink for Sink {
     fn departure<'a>(
         &'a self,
         from: &'a Name,
@@ -648,7 +641,7 @@ impl ndn_link::DepartureSink for Recording {
 
 /// A record name that no log holds: `<device>/32=log/<folder>/seq=<seq>`.
 fn bogus_record(folder: &Name, seq: u64) -> Name {
-    ndn_data::wire::log_name(&n(ANN), Some(folder), seq)
+    ndn_heap::wire::log_name(&n(ANN), folder, seq)
 }
 
 fn an_hour_on() -> std::time::SystemTime {
@@ -666,12 +659,12 @@ async fn a_departure_is_taken_only_from_a_device_of_the_folders_namespace() {
     let ann = embedded(&alice, ANN, Setup::inviter()).await;
     let bob = embedded(&bobs, "/bob/member/phone", Setup::dialer()).await;
     let folder = n(FOLDER);
-    let sink = Recording::new(&bob, 0);
+    let sink = Sink::new(&bob, 0);
     bob.links.set_departure_sink(sink.clone());
     invited(&ann, &bob, Role::Writer).await;
     // A folder of Bob's own, which his device holds a members record of.
     let mine = n("/bob/32=data/mine");
-    reshare(&bob, &mine, std::slice::from_ref(&bobs.ns)).await;
+    shared(&bob, &mine).await;
     until("ann is linked to bob", LONG, async || {
         linked(&ann, bob.key) && linked(&bob, ann.key)
     })
@@ -713,7 +706,7 @@ async fn a_stranger_on_an_introduction_link_is_not_heard() {
     let ann = embedded(&alice, ANN, Setup::inviter()).await;
     // An open offer: a stranger is given an introduction link.
     let _code = offered(&ann, Role::Writer).await;
-    let sink = Recording::new(&ann, 0);
+    let sink = Sink::new(&ann, 0);
     ann.links.set_departure_sink(sink.clone());
 
     let key = LinkKey::from_signer(Arc::new(ndn_security::Ed25519Signer::from_seed(
@@ -772,7 +765,7 @@ async fn a_departure_the_sink_is_not_ready_for_is_asked_again() {
     let ann = embedded(&alice, ANN, Setup::inviter()).await;
     let bob = embedded(&bobs, "/bob/member/phone", Setup::dialer()).await;
     let folder = n(FOLDER);
-    let sink = Recording::new(&bob, 2);
+    let sink = Sink::new(&bob, 2);
     bob.links.set_departure_sink(sink.clone());
     bob.links.set_departure_options(DepartureOptions {
         retry: Duration::from_millis(300),

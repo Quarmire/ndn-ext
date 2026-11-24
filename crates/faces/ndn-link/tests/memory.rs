@@ -22,14 +22,15 @@ use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
 use ndn_app::EngineAppExt;
-use ndn_data::intro::{Dialing, FirstDialing, Grant as DataGrant, LinkHint};
-use ndn_data::{
-    Answer, Audience, Clock, Config, Content, DataLayer, Device, Got, IntroPolicy, Introducer,
-    Joined, Keep, NextStep, Offer, Payload, PutOptions, Role, Rule, Share, Sharing, Timestamp,
-    Transport, TypeId,
-};
 use ndn_engine::{EngineBuilder, EngineConfig, ForwarderEngine, ShutdownHandle};
 use ndn_face_quic::{KeyFingerprint, LinkEndpoint, LinkKey, LinkKeySource, LinkTransportConfig};
+use ndn_heap::{
+    Clock, Config, Heap, MembersChange, Node, PutOptions, Readers, Share, Timestamp, Transport,
+};
+use ndn_invite::{
+    Adopting, Code, Dialing, FirstDialing, Grant as InviteGrant, Host as InviteHost, IntroPolicy,
+    InviteConfig, InviteError, Invites, Joined, LinkHint, Offer, Role,
+};
 use ndn_link::{
     ConfiguredEndpoints, DeviceMemory, Direction, EngineFaces, Grant, GrantRole, HostCandidates,
     LinkDetail, LinkHints, LinkMemory, LinkReliability, LinkSetup, LinkState, LinkTrust, Links,
@@ -172,12 +173,12 @@ struct Host {
     hints: OnceLock<LinkHints>,
 }
 
-impl Introducer for Host {
+impl InviteHost for Host {
     fn anchor(&self) -> Option<Bytes> {
         Some(self.anchor.clone())
     }
 
-    fn adopt<'a>(&'a self, link: &'a TrustEnvelope) -> ndn_data::intro::Adopting<'a> {
+    fn adopt<'a>(&'a self, link: &'a TrustEnvelope) -> Adopting<'a> {
         Box::pin(async move {
             let TrustEnvelope::Anchor {
                 namespace: Some(ns),
@@ -231,7 +232,7 @@ impl Introducer for Host {
         }
     }
 
-    fn grant(&self, grant: &DataGrant) {
+    fn grant(&self, grant: &InviteGrant) {
         if let Some(hints) = self.hints.get() {
             hints.grant(grant);
         }
@@ -355,7 +356,8 @@ impl Durable {
 /// A device of a person, alone on a forwarder of its own: its data layer, its
 /// links.
 struct Embedded {
-    device: Device,
+    node: Node,
+    invites: Invites,
     links: Arc<Links>,
     key: KeyFingerprint,
     addr: Option<SocketAddr>,
@@ -379,7 +381,7 @@ impl Embedded {
     fn offers_run_out(&self) {
         self.skew.store(2 * 3_600_000, Ordering::SeqCst);
         assert!(
-            !self.device.introductions().open(),
+            !self.invites.surface().open(),
             "an offer is still open two hours on"
         );
     }
@@ -388,7 +390,7 @@ impl Embedded {
     /// owes the store) and starts again over what it kept.
     async fn restart(self, setup: Setup) -> Embedded {
         self.links.shutdown().await;
-        self.device.shutdown();
+        self.node.shutdown();
         self.cancel.cancel();
         let durable = Arc::clone(&self.durable);
         drop(self);
@@ -396,16 +398,38 @@ impl Embedded {
     }
 
     /// Give the links the memory a device keeps in its own store
-    /// (`ndf`'s `links.remember(DeviceMemory::new(&device), …)`).
+    /// (`ndf`'s `links.remember(DeviceMemory::new(node.store().clone()), …)`).
     fn remembers_in_the_device(&self) {
-        self.links
-            .remember(DeviceMemory::new(&self.device), on_this_machine());
+        self.links.remember(
+            DeviceMemory::new(self.node.store().clone()),
+            on_this_machine(),
+        );
     }
 
     /// The same with `options`.
     fn remembers_in_the_device_with(&self, options: MemoryOptions) {
         self.links
-            .remember(DeviceMemory::new(&self.device), options);
+            .remember(DeviceMemory::new(self.node.store().clone()), options);
+    }
+
+    /// The space `space` this device has open (made, joined or restored).
+    fn heap(&self, space: &Name) -> Heap {
+        self.node
+            .space(space)
+            .unwrap_or_else(|| panic!("{} has not opened {space}", self.durable.ns))
+    }
+
+    /// The open space `name` lies in (the longest one prefixing it) and the
+    /// path of `name` inside it.
+    fn locate(&self, name: &Name) -> Option<(Heap, Name)> {
+        let space = self
+            .node
+            .spaces()
+            .into_iter()
+            .filter(|space| name.has_prefix(space))
+            .max_by_key(Name::len)?;
+        let path = Name::from_components(name.components()[space.len()..].iter().cloned());
+        Some((self.node.space(&space)?, path))
     }
 }
 
@@ -473,7 +497,7 @@ async fn boot(durable: &Arc<Durable>, setup: Setup) -> Embedded {
         hints: OnceLock::new(),
     });
     let _ = host.hints.set(hints.clone());
-    let device = Device::start(
+    let node = Node::start(
         Transport {
             node: engine.app_node(cancel.child_token()),
             sync: engine.app_face(cancel.child_token()),
@@ -485,22 +509,28 @@ async fn boot(durable: &Arc<Durable>, setup: Setup) -> Embedded {
         Config {
             clock,
             first_look: Duration::from_secs(1),
-            introducer: Some(host),
-            intro: IntroPolicy {
-                local_candidates: true,
-                departure_for: setup.departure_for,
-                ..IntroPolicy::new()
-            },
             ..Config::new()
         },
     )
     .await
     .unwrap();
+    let invites = Invites::start(
+        &node,
+        host,
+        IntroPolicy {
+            local_candidates: true,
+            departure_for: setup.departure_for,
+            ..IntroPolicy::new()
+        },
+        InviteConfig::new(),
+    )
+    .unwrap();
     if setup.listen {
-        hints.serve(&device);
+        hints.serve(&invites);
     }
     Embedded {
-        device,
+        node,
+        invites,
         links,
         key: durable.parts.fingerprint,
         addr,
@@ -514,29 +544,38 @@ async fn boot(durable: &Arc<Durable>, setup: Setup) -> Embedded {
 }
 
 fn note() -> PutOptions {
-    PutOptions {
-        type_id: TypeId {
-            name: n("/types/note"),
-            revision: 1,
-        },
-        keep: Keep::Forever,
-    }
+    PutOptions::default()
 }
 
-fn text(s: &str) -> Content {
-    Content::new().with("text", Bytes::copy_from_slice(s.as_bytes()))
+fn text(s: &str) -> Bytes {
+    Bytes::copy_from_slice(s.as_bytes())
 }
 
-/// Whether `layer` reads `s` as the newest note of `collection`.
-async fn reads(layer: &Device, collection: &Name, s: &str) -> bool {
-    match layer.get(collection).await {
-        Ok(Answer {
-            got: Got::Version(v),
-            ..
-        }) => {
-            matches!(&v.payload, Payload::Entry(c) if c.get("text").is_some_and(|t| t[..] == *s.as_bytes()))
+/// Whether `on` reads `s` as the value of `name` (a path under a space it has
+/// open).
+async fn reads(on: &Embedded, name: &Name, s: &str) -> bool {
+    let Some((heap, path)) = on.locate(name) else {
+        return false;
+    };
+    matches!(heap.get(&path).await, Ok(Some(item)) if item.bytes[..] == *s.as_bytes())
+}
+
+/// `put` as a host does what `NotReady` says (the layer has not seen yet what
+/// the put needs: the space's creation, the epoch's key): again until `LONG`
+/// has passed. `name` is a path under a space `on` has open.
+async fn puts(on: &Embedded, name: &Name, bytes: Bytes) {
+    let (heap, path) = on
+        .locate(name)
+        .unwrap_or_else(|| panic!("{} has opened no space {name} lies in", on.durable.ns));
+    let started = Instant::now();
+    loop {
+        match heap.put(&path, bytes.clone(), note()).await {
+            Ok(_) => return,
+            Err(e) if e.retry() && started.elapsed() < LONG => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => panic!("put of {name}: {e}"),
         }
-        _ => false,
     }
 }
 
@@ -560,31 +599,24 @@ async fn throughout(what: &str, span: Duration, mut holds: impl FnMut() -> bool)
 
 /// Ann's notebook, shared with `/alice` alone and with a cover written into
 /// it: an offer of it as `role` made by her laptop.
-async fn offered(laptop: &Embedded, role: Role) -> ndn_data::Code {
+async fn offered(laptop: &Embedded, role: Role) -> Code {
     let folder = n(FOLDER);
-    laptop
-        .device
-        .share_folder(
+    let heap = laptop
+        .node
+        .create(
             &folder,
-            Sharing::Whole(Share {
-                rule: Rule::Log,
-                writers: vec![n("/alice")],
-                readers: vec![Audience::Person(n("/alice"))],
-            }),
+            Share {
+                readers: Readers::Persons(Vec::new()),
+                writers: Vec::new(),
+            },
         )
         .await
         .unwrap();
-    laptop
-        .device
-        .put(
-            &folder.clone().append("cover"),
-            text("cover by ann"),
-            note(),
-        )
+    heap.put(&n("/cover"), text("cover by ann"), note())
         .await
         .unwrap();
     laptop
-        .device
+        .invites
         .offer(
             &folder,
             Offer {
@@ -605,15 +637,11 @@ async fn offered(laptop: &Embedded, role: Role) -> ndn_data::Code {
 
 /// Join with `link` as a host does what `NotReady` says: again with the same
 /// code until `limit` has passed.
-async fn joins(
-    phone: &Embedded,
-    link: &str,
-    limit: Duration,
-) -> Result<Joined, ndn_data::DataError> {
+async fn joins(phone: &Embedded, link: &str, limit: Duration) -> Result<Joined, InviteError> {
     let started = Instant::now();
     loop {
-        match phone.device.join(link).await {
-            Err(e) if e.next() == NextStep::RetryLater && started.elapsed() < limit => {}
+        match phone.invites.join(link).await {
+            Err(e) if e.retry() && started.elapsed() < limit => {}
             other => return other,
         }
     }
@@ -779,24 +807,21 @@ async fn two_hosts_joined_by_a_code_restart_and_link_again_from_memory_alone() {
     let folder = n(FOLDER);
     let cover = folder.clone().append("cover");
     until("bob reads ann's cover", LONG, async || {
-        reads(&bob.device, &cover, "cover by ann").await
+        reads(&bob, &cover, "cover by ann").await
     })
     .await;
     let from_bob = folder.clone().append("from-bob");
-    bob.device
-        .put(&from_bob, text("hello from bob"), note())
-        .await
-        .unwrap();
+    puts(&bob, &from_bob, text("hello from bob")).await;
     until("ann reads bob's note", LONG, async || {
-        reads(&ann.device, &from_bob, "hello from bob").await
+        reads(&ann, &from_bob, "hello from bob").await
     })
     .await;
 
     // What each device learned of the other is written behind: the key, the
     // device and the address that worked.
     let (ann_notes, bob_notes) = (
-        DeviceMemory::new(&ann.device),
-        DeviceMemory::new(&bob.device),
+        DeviceMemory::new(Arc::clone(ann.node.store())),
+        DeviceMemory::new(Arc::clone(bob.node.store())),
     );
     until("both devices wrote what they learned", LONG, async || {
         ann_notes.load().is_ok_and(|r| r.len() == 1) && bob_notes.load().is_ok_and(|r| r.len() == 1)
@@ -854,25 +879,19 @@ async fn two_hosts_joined_by_a_code_restart_and_link_again_from_memory_alone() {
 
     // And they sync again: each writes after the restart, the other reads it.
     let after_bob = folder.clone().append("after-bob");
-    bob.device
-        .put(&after_bob, text("bob, restarted"), note())
-        .await
-        .unwrap();
+    puts(&bob, &after_bob, text("bob, restarted")).await;
     until(
         "ann reads what bob wrote after the restart",
         LONG,
-        async || reads(&ann.device, &after_bob, "bob, restarted").await,
+        async || reads(&ann, &after_bob, "bob, restarted").await,
     )
     .await;
     let after_ann = folder.append("after-ann");
-    ann.device
-        .put(&after_ann, text("ann, restarted"), note())
-        .await
-        .unwrap();
+    puts(&ann, &after_ann, text("ann, restarted")).await;
     until(
         "bob reads what ann wrote after the restart",
         LONG,
-        async || reads(&bob.device, &after_ann, "ann, restarted").await,
+        async || reads(&bob, &after_ann, "ann, restarted").await,
     )
     .await;
 }
@@ -1287,8 +1306,8 @@ async fn a_removed_members_remembered_key_is_refused() {
     bob.remembers_in_the_device();
     invited(&ann, &bob, Role::Writer).await;
     let (ann_notes, bob_notes) = (
-        DeviceMemory::new(&ann.device),
-        DeviceMemory::new(&bob.device),
+        DeviceMemory::new(Arc::clone(ann.node.store())),
+        DeviceMemory::new(Arc::clone(bob.node.store())),
     );
     until("both devices wrote what they learned", LONG, async || {
         ann_notes.load().is_ok_and(|r| r.len() == 1) && bob_notes.load().is_ok_and(|r| r.len() == 1)
@@ -1303,15 +1322,12 @@ async fn a_removed_members_remembered_key_is_refused() {
     // serve gets no introduction link to take the place of what ends.
     ann.offers_run_out();
     // Ann's record leaves Bob out.
-    ann.device
-        .share_folder(
-            &n(FOLDER),
-            Sharing::Whole(Share {
-                rule: Rule::Log,
-                writers: vec![n("/alice")],
-                readers: vec![Audience::Person(n("/alice"))],
-            }),
-        )
+    ann.heap(&n(FOLDER))
+        .change(MembersChange {
+            add_writers: Vec::new(),
+            add_readers: Vec::new(),
+            remove: vec![bobs.ns.clone()],
+        })
         .await
         .unwrap();
     until("the link closes", LONG, async || {
@@ -1356,29 +1372,30 @@ async fn a_removed_members_remembered_key_is_refused() {
 async fn notes_that_are_not_records_are_dropped_and_the_good_one_is_kept() {
     let (alice, bobs) = (Person::new("/alice").await, Person::new("/bob").await);
     let (ann, bob) = acquainted(&alice, &bobs).await;
-    let memory = DeviceMemory::new(&bob.device);
+    let store = Arc::clone(bob.node.store());
+    let memory = DeviceMemory::new(Arc::clone(&store));
     // Bob's store holds a record of Ann the memory wrote ...
     memory
         .save(&of_ann(&ann, vec![ann.addr.unwrap()], DAY))
         .await
         .unwrap();
     // ... a note that decodes to nothing, and one that decodes to a record
-    // named by another key.
-    let notes = bob.device.local_notes("link-memory");
-    notes.put("not-a-key", b"\x01garbage").await.unwrap();
-    notes.put(&"ab".repeat(32), b"").await.unwrap();
-    let named_wrong = notes.get(&ann.key.to_string()).unwrap().unwrap();
-    notes.put(&"cd".repeat(32), &named_wrong).await.unwrap();
-    assert_eq!(notes.list().unwrap().len(), 4);
+    // named by another key: raw octets under the memory's names in the store.
+    store.insert(memory_note("not-a-key"), Bytes::from_static(b"\x01garbage"));
+    store.insert(memory_note(&"ab".repeat(32)), Bytes::new());
+    let named_wrong = store.get(&memory_note(&ann.key.to_string())).unwrap();
+    store.insert(memory_note(&"cd".repeat(32)), named_wrong);
+    store.sync().unwrap();
+    assert_eq!(memory_notes(&store).len(), 4);
 
     bob.links.remember(memory, on_this_machine());
     until(
         "the notes that are not records are removed",
         LONG,
-        async || notes.list().unwrap().len() == 1,
+        async || memory_notes(&store).len() == 1,
     )
     .await;
-    assert_eq!(notes.list().unwrap()[0].0, ann.key.to_string());
+    assert_eq!(memory_notes(&store)[0], ann.key.to_string());
     until("the one record is dialled", LONG, async || {
         linked(&bob, ann.key) && linked(&ann, bob.key)
     })
@@ -1485,7 +1502,7 @@ async fn a_store_cannot_make_this_device_dial_loopback_or_link_local_addresses()
 /// moment to go).
 async fn stopped(ann: Embedded, port: u16) {
     ann.links.shutdown().await;
-    ann.device.shutdown();
+    ann.node.shutdown();
     ann.cancel.cancel();
     drop(ann);
     for _ in 0..100 {
@@ -1497,17 +1514,39 @@ async fn stopped(ann: Embedded, port: u16) {
     panic!("port {port} is not free ten seconds after the device stopped");
 }
 
+/// The link memory's note `key` in a node's store (ndn-link `DeviceMemory`).
+fn memory_note(key: &str) -> Name {
+    n(&format!("/localhost/ndn-link/memory/{key}"))
+}
+
+/// The keys of the notes the link memory holds in `store`: the entries with
+/// exactly one more component than the memory's name.
+fn memory_notes(store: &Arc<dyn DataStore>) -> Vec<String> {
+    let area = n("/localhost/ndn-link/memory");
+    let mut keys: Vec<String> = store
+        .scan_under(&area, 0)
+        .into_iter()
+        .filter(|(name, _)| name.len() == area.len() + 1)
+        .map(|(name, _)| {
+            String::from_utf8(name.components()[area.len()].value.to_vec()).expect("a text key")
+        })
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// The listening port the memory kept: the note `listen-port`, 2 big-endian
+/// octets.
 fn kept_port(ann: &Embedded) -> Option<u16> {
-    ann.device
-        .local_notes("link-memory")
-        .get("listen-port")
-        .unwrap()
+    ann.node
+        .store()
+        .get(&memory_note("listen-port"))
         .map(|v| u16::from_be_bytes(<[u8; 2]>::try_from(v.as_ref()).expect("2 octets")))
 }
 
 /// SHAPES-R7 D, through a real device restarted over the same store: the
 /// host keeps no port (its socket is bound on a port the system picks); the
-/// device's notes keep the listening port (`link-memory/listen-port`, 2
+/// node's store keeps the listening port (`/localhost/ndn-link/memory/listen-port`, 2
 /// octets), the next start's `remember` binds it again when it is free, and a
 /// start with `persist_addresses = false` removes the note and moves nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
