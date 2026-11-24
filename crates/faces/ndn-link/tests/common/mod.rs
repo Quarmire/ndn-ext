@@ -10,6 +10,7 @@
 
 #![allow(dead_code)]
 
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -17,13 +18,13 @@ use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
 use ndn_app::EngineAppExt;
-use ndn_data::intro::{
-    Departure as DataDeparture, Dialing, FirstDialing, Grant as DataGrant, LinkHint,
+use ndn_heap::{
+    Adopter, Clock, Config, Heap, MembersChange, Node, PutOptions, Readers, Scoping, Share,
+    Timestamp, Transport,
 };
-use ndn_data::{
-    Answer, Audience, Clock, Config, Content, DataLayer, Device, Got, IntroPolicy, Introducer,
-    Joined, Keep, NextStep, Offer, Payload, PutOptions, Role, Rule, Share, Sharing, Timestamp,
-    Transport, TypeId,
+use ndn_invite::{
+    Adopting, Code, Departure, Dialing, FirstDialing, Grant, Host as InviteHost, IntroPolicy,
+    InviteConfig, InviteError, Invites, Joined, LinkHint, Offer, Role,
 };
 use ndn_engine::{EngineBuilder, EngineConfig, ForwarderEngine, ShutdownHandle};
 use ndn_face_quic::{KeyFingerprint, LinkEndpoint, LinkKey, LinkKeySource, LinkTransportConfig};
@@ -298,12 +299,12 @@ struct Host {
     by_name: bool,
 }
 
-impl Introducer for Host {
+impl InviteHost for Host {
     fn anchor(&self) -> Option<Bytes> {
         Some(self.anchor.clone())
     }
 
-    fn adopt<'a>(&'a self, link: &'a TrustEnvelope) -> ndn_data::intro::Adopting<'a> {
+    fn adopt<'a>(&'a self, link: &'a TrustEnvelope) -> Adopting<'a> {
         Box::pin(async move {
             let TrustEnvelope::Anchor {
                 namespace: Some(ns),
@@ -373,7 +374,7 @@ impl Introducer for Host {
         }
     }
 
-    fn grant(&self, grant: &DataGrant) {
+    fn grant(&self, grant: &Grant) {
         if let Some(hints) = self.hints.get() {
             hints.grant(grant);
         }
@@ -385,17 +386,19 @@ impl Introducer for Host {
         }
     }
 
-    fn departure(&self, departure: &DataDeparture) {
+    fn departure(&self, departure: &Departure) {
         if let Some(hints) = self.hints.get() {
             hints.depart(departure);
         }
     }
+}
 
+impl Adopter for Host {
     fn adopt_scoped<'a>(
         &'a self,
         namespace: &'a Name,
         held: Option<&'a ndn_security::ScopedContext>,
-    ) -> ndn_data::intro::Scoping<'a> {
+    ) -> Scoping<'a> {
         Box::pin(async move {
             if self.by_name {
                 let scoped = ndn_identity::adopt_scoped_via_engine(&self.engine, namespace, held)
@@ -472,6 +475,11 @@ impl Introducer for Host {
             Ok(scoped)
         })
     }
+
+    /// What this host carried for the namespace (its sync group, the
+    /// certificates in the validator's cache) is kept: the harness never
+    /// stops carrying a person a space listed.
+    fn release_scoped(&self, _namespace: &Name) {}
 }
 
 /// A connection that is another's in everything but `routes`, which it
@@ -565,10 +573,11 @@ impl Setup {
     }
 }
 
-/// A device of a person, alone on a forwarder of its own: its data layer, its
-/// links.
+/// A device of a person, alone on a forwarder of its own: its data layer
+/// (`node`, and the `invites` over it), its links.
 pub struct Embedded {
-    pub device: Device,
+    pub node: Node,
+    pub invites: Invites,
     pub links: Arc<Links>,
     pub hints: LinkHints,
     pub key: KeyFingerprint,
@@ -599,7 +608,7 @@ impl Embedded {
     pub fn offers_run_out(&self) {
         self.skew.store(2 * 3_600_000, Ordering::SeqCst);
         assert!(
-            !self.device.introductions().open(),
+            !self.invites.surface().open(),
             "an offer is still open two hours on"
         );
     }
@@ -641,12 +650,33 @@ impl Embedded {
         &self.kept.store
     }
 
+    /// The space `space` this device has open (made, joined or restored).
+    pub fn heap(&self, space: &Name) -> Heap {
+        self.node
+            .space(space)
+            .unwrap_or_else(|| panic!("{} has not opened {space}", self.ns))
+    }
+
+    /// The open space `name` lies in (the longest one prefixing it) and the
+    /// path of `name` inside it: how a name of the old data layer, a
+    /// collection under its folder, is read and written in a space.
+    pub fn locate(&self, name: &Name) -> Option<(Heap, Name)> {
+        let space = self
+            .node
+            .spaces()
+            .into_iter()
+            .filter(|space| name.has_prefix(space))
+            .max_by_key(Name::len)?;
+        let path = Name::from_components(name.components()[space.len()..].iter().cloned());
+        Some((self.node.space(&space)?, path))
+    }
+
     /// Stop this run and start the device again over what it kept: its keys,
     /// its trust and its store, on a link socket of its own (a new address
     /// when it listens).
     pub async fn restart(self, setup: Setup) -> Embedded {
         self.links.shutdown().await;
-        self.device.shutdown();
+        self.node.shutdown();
         self.cancel.cancel();
         let mut kept = self.kept.clone();
         kept.parts = kept.parts.rebound(setup.listen);
@@ -714,7 +744,7 @@ async fn boot(kept: Kept, setup: Setup) -> Embedded {
     });
     let _ = host.hints.set(hints.clone());
     let _ = host.links.set(Arc::clone(&links));
-    let device = Device::start(
+    let node = Node::start(
         Transport {
             node: engine.app_node(cancel.child_token()),
             sync: {
@@ -733,19 +763,25 @@ async fn boot(kept: Kept, setup: Setup) -> Embedded {
         Config {
             clock,
             first_look: Duration::from_secs(1),
-            introducer: Some(host),
-            intro: IntroPolicy {
-                local_candidates: true,
-                grant_for: setup.grant_for,
-                departure_for: setup.departure_for,
-                ..IntroPolicy::new()
-            },
+            adopter: Some(Arc::clone(&host) as Arc<dyn Adopter>),
             ..Config::new()
         },
     )
     .await
     .unwrap();
-    hints.serve(&device);
+    let invites = Invites::start(
+        &node,
+        host,
+        IntroPolicy {
+            local_candidates: true,
+            grant_for: setup.grant_for,
+            departure_for: setup.departure_for,
+            ..IntroPolicy::new()
+        },
+        InviteConfig::new(),
+    )
+    .unwrap();
+    hints.serve(&invites);
     let serving = match directory_entry(&ns).filter(|_| setup.scoped_by_name) {
         Some((genesis, newest)) => Some(context::serve_own_context(
             &engine,
@@ -758,7 +794,8 @@ async fn boot(kept: Kept, setup: Setup) -> Embedded {
         None => None,
     };
     Embedded {
-        device,
+        node,
+        invites,
         links,
         hints,
         key: parts.fingerprint,
@@ -775,58 +812,39 @@ async fn boot(kept: Kept, setup: Setup) -> Embedded {
     }
 }
 
+/// The options of a put of this harness: the defaults.
 pub fn note() -> PutOptions {
-    PutOptions {
-        type_id: TypeId {
-            name: n("/types/note"),
-            revision: 1,
-        },
-        keep: Keep::Forever,
-    }
+    PutOptions::default()
 }
 
-pub fn text(s: &str) -> Content {
-    Content::new().with("text", Bytes::copy_from_slice(s.as_bytes()))
+pub fn text(s: &str) -> Bytes {
+    Bytes::copy_from_slice(s.as_bytes())
 }
 
-/// Whether `layer` reads `s` as the newest note of `collection`.
-pub async fn reads(layer: &Device, collection: &Name, s: &str) -> bool {
-    match layer.get(collection).await {
-        Ok(Answer {
-            got: Got::Version(v),
-            ..
-        }) => {
-            matches!(&v.payload, Payload::Entry(c) if c.get("text").is_some_and(|t| t[..] == *s.as_bytes()))
-        }
-        _ => false,
-    }
+/// Whether `on` reads `s` as the value of `name` (a path under a space it
+/// has open).
+pub async fn reads(on: &Embedded, name: &Name, s: &str) -> bool {
+    let Some((heap, path)) = on.locate(name) else {
+        return false;
+    };
+    matches!(heap.get(&path).await, Ok(Some(item)) if item.bytes[..] == *s.as_bytes())
 }
 
-/// `put` as a host does what `NotReady` says (the layer has not walked what
-/// the new name's folder needs yet): again until `limit` has passed.
-pub async fn puts(layer: &Device, name: &Name, content: Content, limit: Duration) {
+/// `put` as a host does what `NotReady` says (the layer has not seen yet
+/// what the put needs: the space's creation, the epoch's key): again until
+/// `limit` has passed. `name` is a path under a space `on` has open.
+pub async fn puts(on: &Embedded, name: &Name, bytes: Bytes, limit: Duration) {
+    let (heap, path) = on
+        .locate(name)
+        .unwrap_or_else(|| panic!("{} has opened no space {name} lies in", on.ns));
     let started = Instant::now();
     loop {
-        match layer.put(name, content.clone(), note()).await {
+        match heap.put(&path, bytes.clone(), note()).await {
             Ok(_) => return,
-            Err(e) if e.next() == NextStep::RetryLater && started.elapsed() < limit => {
+            Err(e) if e.retry() && started.elapsed() < limit => {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             Err(e) => panic!("put of {name}: {e}"),
-        }
-    }
-}
-
-/// [`puts`] into a register collection: `put_op` of `bytes`.
-pub async fn puts_op(layer: &Device, name: &Name, bytes: &'static [u8], limit: Duration) {
-    let started = Instant::now();
-    loop {
-        match layer.put_op(name, Bytes::from_static(bytes), note()).await {
-            Ok(_) => return,
-            Err(e) if e.next() == NextStep::RetryLater && started.elapsed() < limit => {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            Err(e) => panic!("put_op of {name}: {e}"),
         }
     }
 }
@@ -844,33 +862,29 @@ pub const LONG: Duration = Duration::from_secs(60);
 /// `folder` of Ann's, shared with `/alice` alone and with a cover written
 /// into it. Once per folder: it makes the folder's members record.
 pub async fn shared(laptop: &Embedded, folder: &Name) {
-    laptop
-        .device
-        .share_folder(
-            folder,
-            Sharing::Whole(Share {
-                rule: Rule::Log,
-                writers: vec![n("/alice")],
-                readers: vec![Audience::Person(n("/alice"))],
-            }),
-        )
-        .await
-        .unwrap();
-    laptop
-        .device
-        .put(
-            &folder.clone().append("cover"),
-            text("cover by ann"),
-            note(),
-        )
+    let heap = match laptop.node.space(folder) {
+        Some(heap) => heap,
+        None => laptop
+            .node
+            .create(
+                folder,
+                Share {
+                    readers: Readers::Persons(Vec::new()),
+                    writers: Vec::new(),
+                },
+            )
+            .await
+            .unwrap(),
+    };
+    heap.put(&n("/cover"), text("cover by ann"), note())
         .await
         .unwrap();
 }
 
 /// An offer of `folder` (already shared) as `role`, made by Ann's laptop.
-pub async fn offer_of(laptop: &Embedded, folder: &Name, role: Role) -> ndn_data::Code {
+pub async fn offer_of(laptop: &Embedded, folder: &Name, role: Role) -> Code {
     laptop
-        .device
+        .invites
         .offer(
             folder,
             Offer {
@@ -891,7 +905,7 @@ pub async fn offer_of(laptop: &Embedded, folder: &Name, role: Role) -> ndn_data:
 
 /// Ann's notebook, shared with `/alice` alone and with a cover written into
 /// it: an offer of it as `role` made by her laptop.
-pub async fn offered(laptop: &Embedded, role: Role) -> ndn_data::Code {
+pub async fn offered(laptop: &Embedded, role: Role) -> Code {
     let folder = n(FOLDER);
     shared(laptop, &folder).await;
     offer_of(laptop, &folder, role).await
@@ -899,15 +913,11 @@ pub async fn offered(laptop: &Embedded, role: Role) -> ndn_data::Code {
 
 /// Join with `link` as a host does what `NotReady` says: again with the same
 /// code until `limit` has passed.
-pub async fn joins(
-    phone: &Embedded,
-    link: &str,
-    limit: Duration,
-) -> Result<Joined, ndn_data::DataError> {
+pub async fn joins(phone: &Embedded, link: &str, limit: Duration) -> Result<Joined, InviteError> {
     let started = Instant::now();
     loop {
-        match phone.device.join(link).await {
-            Err(e) if e.next() == NextStep::RetryLater && started.elapsed() < limit => {}
+        match phone.invites.join(link).await {
+            Err(e) if e.retry() && started.elapsed() < limit => {}
             other => return other,
         }
     }
@@ -962,7 +972,7 @@ pub async fn invited_in(ann: &Embedded, bob: &Embedded, folder: &Name, role: Rol
     joined(ann, bob, &code, role).await;
 }
 
-async fn joined(ann: &Embedded, bob: &Embedded, code: &ndn_data::Code, role: Role) {
+async fn joined(ann: &Embedded, bob: &Embedded, code: &Code, role: Role) {
     let joined = joins(bob, &code.link, Duration::from_secs(90))
         .await
         .unwrap_or_else(|e| {
@@ -1029,28 +1039,19 @@ pub async fn probes(from: &Embedded, to: &Embedded, tag: &str) -> bool {
     consumer.fetch(probe_prefix(to).append(tag)).await.is_ok()
 }
 
-/// The name of the newest entry of `collection` that `device` (the name of
-/// `on`'s device) wrote, as `on` holds it: a single version's own name, or,
-/// for a merged collection, the log entry of the writer's highest seq.
-pub async fn newest_entry(on: &Embedded, device: &str, collection: &Name) -> Name {
-    match on.device.get(collection).await {
-        Ok(Answer {
-            got: Got::Version(v),
-            ..
-        }) => v.name,
-        Ok(Answer {
-            got: Got::State(state),
-            ..
-        }) => {
-            let seq = state
-                .at
-                .iter()
-                .map(|(_, seq)| seq.0)
-                .max()
-                .unwrap_or_else(|| panic!("{collection} has an empty state on {}", on.ns));
-            ndn_data::wire::log_name(&n(device), Some(collection), seq)
+/// The name of the newest entry of `path` (a name under a space `on` has
+/// open) that `device` (the name of `on`'s device) wrote, as `on` holds it:
+/// the log entry of the value's writer at its seq.
+pub async fn newest_entry(on: &Embedded, device: &str, path: &Name) -> Name {
+    let (heap, relative) = on
+        .locate(path)
+        .unwrap_or_else(|| panic!("{} has opened no space {path} lies in", on.ns));
+    match heap.get(&relative).await {
+        Ok(Some(item)) => {
+            assert_eq!(item.id.device, n(device), "{path} was written by {device}");
+            ndn_heap::wire::log_name(&item.id.device, heap.name(), item.id.seq)
         }
-        other => panic!("{collection} has no entry on {}: {other:?}", on.ns),
+        other => panic!("{path} has no entry on {}: {other:?}", on.ns),
     }
 }
 
@@ -1142,17 +1143,30 @@ pub const SECOND: &str = "/alice/32=data/second";
 /// people as readers): whoever the record no longer lists is let go of the
 /// folder.
 pub async fn reshare(ann: &Embedded, folder: &Name, writers: &[Name]) {
-    ann.device
-        .share_folder(
-            folder,
-            Sharing::Whole(Share {
-                rule: Rule::Log,
-                writers: writers.to_vec(),
-                readers: writers.iter().cloned().map(Audience::Person).collect(),
-            }),
-        )
-        .await
-        .unwrap();
+    let heap = ann.heap(folder);
+    let members = heap.members();
+    let readers = match &members.readers {
+        Readers::Persons(persons) => persons.clone(),
+        Readers::Anyone => Vec::new(),
+    };
+    let listed: BTreeSet<&Name> = members.writers.iter().chain(&readers).collect();
+    let remove = listed
+        .into_iter()
+        .filter(|p| **p != members.owner && !writers.contains(p))
+        .cloned()
+        .collect();
+    let add = writers
+        .iter()
+        .filter(|w| **w != members.owner && !members.writers.contains(w))
+        .cloned()
+        .collect::<Vec<_>>();
+    heap.change(MembersChange {
+        add_writers: add.clone(),
+        add_readers: add,
+        remove,
+    })
+    .await
+    .unwrap();
 }
 
 /// With `NDN_LINK_TEST_LOG=<file>` (and `RUST_LOG`), the tracing of the run

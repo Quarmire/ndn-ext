@@ -1,6 +1,6 @@
 //! A commit made while no link was up is shared at once when the link comes
 //! up, on real QUIC links between real data-layer devices (ndn-rs
-//! `data-layer.md` §12, a group announced when a face comes up).
+//! `heap.md`, a group announced when a face comes up).
 //!
 //! Ann and Bob share a folder and are linked; Bob's link goes down, Ann
 //! commits a version (her announcement of it reaches no one), and the link
@@ -13,7 +13,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::*;
-use ndn_data::Role;
+use ndn_invite::Role;
 
 /// How long after the link comes up Bob has to read what Ann committed with
 /// no link: far under the group's period (30 s), so only an announcement
@@ -37,21 +37,18 @@ async fn commits_offline_then_links(
         !linked(ann, bob.key) && !linked(bob, ann.key)
     })
     .await;
-    puts(&ann.device, name, text(what), LONG).await;
-    assert!(
-        reads(&ann.device, name, what).await,
-        "ann reads her own commit"
-    );
+    puts(ann, name, text(what), LONG).await;
+    assert!(reads(ann, name, what).await, "ann reads her own commit");
     // No link: nothing of it reaches Bob.
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(
-        !reads(&bob.device, name, what).await,
+        !reads(bob, name, what).await,
         "bob read it with no link up"
     );
 
     let up = Instant::now();
     bob.links.set_online(true);
-    while !reads(&bob.device, name, what).await {
+    while !reads(bob, name, what).await {
         assert!(
             up.elapsed() < WITHIN,
             "Bob did not read it within {WITHIN:?} of the link coming up \
@@ -84,7 +81,7 @@ async fn a_commit_made_while_no_link_was_up_is_read_within_seconds_of_the_link_c
     let folder = n(FOLDER);
     let cover = folder.clone().append("cover");
     until("bob reads ann's cover", LONG, async || {
-        reads(&bob.device, &cover, "cover by ann").await
+        reads(&bob, &cover, "cover by ann").await
     })
     .await;
 

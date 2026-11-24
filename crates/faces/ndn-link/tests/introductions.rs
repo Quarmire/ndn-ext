@@ -17,14 +17,12 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use ndn_app::{Consumer, EngineAppExt};
-use ndn_data::intro::{
-    Contact, Dialing, FirstDialing, HintCandidate, HintKind, HintRecord, LINK_HINT_CANDIDATES_MAX,
-    LinkHint, ShortCode, hint_name, hint_prefix, hint_token, introduction_prefixes,
-};
-use ndn_data::{
-    Answer, Audience, Config, Content, DataLayer, Device, Got, IntroPolicy, Introducer, Joined,
-    Keep, NextStep, Offer, Payload, PutOptions, Role, Rule, Share, Sharing, Timestamp, Transport,
-    TypeId,
+use ndn_heap::{Config, NextStep, Node, PutOptions, Readers, Share, Timestamp, Transport};
+use ndn_invite::wire::HintRecord;
+use ndn_invite::{
+    Adopting, Code, Contact, Dialing, FirstDialing, HintCandidate, HintKind, Host as InviteHost,
+    IntroPolicy, InviteConfig, InviteError, Invites, Joined, LINK_HINT_CANDIDATES_MAX, LinkHint,
+    Offer, Role, ShortCode, hint_name, hint_prefix, hint_token, introduction_prefixes,
 };
 use ndn_engine::{EngineBuilder, EngineConfig, ForwarderEngine, ShutdownHandle};
 use ndn_face_quic::{
@@ -240,12 +238,12 @@ struct Host {
     hints: OnceLock<LinkHints>,
 }
 
-impl Introducer for Host {
+impl InviteHost for Host {
     fn anchor(&self) -> Option<Bytes> {
         Some(self.anchor.clone())
     }
 
-    fn adopt<'a>(&'a self, link: &'a TrustEnvelope) -> ndn_data::intro::Adopting<'a> {
+    fn adopt<'a>(&'a self, link: &'a TrustEnvelope) -> Adopting<'a> {
         Box::pin(async move {
             let TrustEnvelope::Anchor {
                 namespace: Some(ns),
@@ -370,7 +368,8 @@ impl Setup {
 /// A device of a person, alone on a forwarder of its own: its data layer,
 /// its links (listening on loopback or dial-only), nothing routed.
 struct Embedded {
-    device: Device,
+    node: Node,
+    invites: Invites,
     links: Arc<Links>,
     validator: Arc<Validator>,
     key: KeyFingerprint,
@@ -457,7 +456,7 @@ async fn embedded_of(person: &Person, parts: Parts, setup: Setup) -> Embedded {
     });
     let _ = host.hints.set(hints.clone());
 
-    let device = Device::start(
+    let node = Node::start(
         Transport {
             node: engine.app_node(cancel.child_token()),
             sync: engine.app_face(cancel.child_token()),
@@ -468,26 +467,32 @@ async fn embedded_of(person: &Person, parts: Parts, setup: Setup) -> Embedded {
         Arc::new(MemoryStore::new()),
         Config {
             first_look: Duration::from_secs(1),
-            introducer: Some(host),
-            // Devices on one machine: hints that name loopback addresses
-            // (unless the case is about a device that refuses them).
-            intro: IntroPolicy {
-                local_candidates: !setup.refuse_local,
-                code_candidates: setup
-                    .code_candidates
-                    .unwrap_or(IntroPolicy::new().code_candidates),
-                ..IntroPolicy::new()
-            },
             ..Config::new()
         },
     )
     .await
     .unwrap();
+    let invites = Invites::start(
+        &node,
+        host,
+        // Devices on one machine: hints that name loopback addresses
+        // (unless the case is about a device that refuses them).
+        IntroPolicy {
+            local_candidates: !setup.refuse_local,
+            code_candidates: setup
+                .code_candidates
+                .unwrap_or(IntroPolicy::new().code_candidates),
+            ..IntroPolicy::new()
+        },
+        InviteConfig::new(),
+    )
+    .unwrap();
     if setup.listen {
-        hints.serve(&device);
+        hints.serve(&invites);
     }
     Embedded {
-        device,
+        node,
+        invites,
         links,
         validator,
         key: parts.fingerprint,
@@ -565,31 +570,23 @@ async fn relay(person: &Person, followed: &[&Person], parts: Parts) -> Relay {
     }
 }
 
-fn note() -> PutOptions {
-    PutOptions {
-        type_id: TypeId {
-            name: n("/types/note"),
-            revision: 1,
-        },
-        keep: Keep::Forever,
-    }
-}
-
-fn text(s: &str) -> Content {
-    Content::new().with("text", Bytes::copy_from_slice(s.as_bytes()))
-}
-
-/// Whether `layer` reads `s` as the newest note of `collection`.
-async fn reads(layer: &Device, collection: &Name, s: &str) -> bool {
-    match layer.get(collection).await {
-        Ok(Answer {
-            got: Got::Version(v),
-            ..
-        }) => {
-            matches!(&v.payload, Payload::Entry(c) if c.get("text").is_some_and(|t| t[..] == *s.as_bytes()))
-        }
-        _ => false,
-    }
+/// Whether `on` reads `s` as the value of `name`, a path under a space it
+/// has open.
+async fn reads(on: &Embedded, name: &Name, s: &str) -> bool {
+    let Some(space) = on
+        .node
+        .spaces()
+        .into_iter()
+        .filter(|space| name.has_prefix(space))
+        .max_by_key(Name::len)
+    else {
+        return false;
+    };
+    let Some(heap) = on.node.space(&space) else {
+        return false;
+    };
+    let path = Name::from_components(name.components()[space.len()..].iter().cloned());
+    matches!(heap.get(&path).await, Ok(Some(item)) if item.bytes[..] == *s.as_bytes())
 }
 
 async fn until(what: &str, limit: Duration, mut done: impl AsyncFnMut() -> bool) {
@@ -602,37 +599,37 @@ async fn until(what: &str, limit: Duration, mut done: impl AsyncFnMut() -> bool)
 
 /// Alice keeps a notebook and writes its cover; her laptop makes an offer
 /// of it as a writer.
-async fn offered(laptop: &Embedded) -> ndn_data::Code {
+async fn offered(laptop: &Embedded) -> Code {
     offered_in(laptop, "/alice", FOLDER).await
 }
 
 /// `person`'s `folder`, shared with `person` alone and with a cover written
 /// into it: an offer of it as a writer, made by `laptop`.
-async fn offered_in(laptop: &Embedded, person: &str, folder: &str) -> ndn_data::Code {
+async fn offered_in(laptop: &Embedded, person: &str, folder: &str) -> Code {
     let folder = n(folder);
+    let heap = match laptop.node.space(&folder) {
+        Some(heap) => heap,
+        None => laptop
+            .node
+            .create(
+                &folder,
+                Share {
+                    readers: Readers::Persons(Vec::new()),
+                    writers: Vec::new(),
+                },
+            )
+            .await
+            .unwrap(),
+    };
+    heap.put(
+        &n("/cover"),
+        Bytes::from(format!("cover by {}", person.trim_start_matches('/'))),
+        PutOptions::default(),
+    )
+    .await
+    .unwrap();
     laptop
-        .device
-        .share_folder(
-            &folder,
-            Sharing::Whole(Share {
-                rule: Rule::Log,
-                writers: vec![n(person)],
-                readers: vec![Audience::Person(n(person))],
-            }),
-        )
-        .await
-        .unwrap();
-    laptop
-        .device
-        .put(
-            &folder.clone().append("cover"),
-            text(&format!("cover by {}", person.trim_start_matches('/'))),
-            note(),
-        )
-        .await
-        .unwrap();
-    laptop
-        .device
+        .invites
         .offer(
             &folder,
             Offer {
@@ -652,7 +649,7 @@ async fn offered_in(laptop: &Embedded, person: &str, folder: &str) -> ndn_data::
 }
 
 /// The link hint `code` carries.
-fn hint_of(code: &ndn_data::Code) -> Option<LinkHint> {
+fn hint_of(code: &Code) -> Option<LinkHint> {
     let Ok(TrustEnvelope::Intro(intro)) = TrustEnvelope::from_uri(&code.link) else {
         panic!("an introduction link");
     };
@@ -662,7 +659,7 @@ fn hint_of(code: &ndn_data::Code) -> Option<LinkHint> {
 }
 
 /// `code`'s link with its hint replaced by `hint`.
-fn with_hint(code: &ndn_data::Code, hint: &LinkHint) -> String {
+fn with_hint(code: &Code, hint: &LinkHint) -> String {
     let Ok(TrustEnvelope::Intro(mut intro)) = TrustEnvelope::from_uri(&code.link) else {
         panic!("an introduction link");
     };
@@ -672,15 +669,11 @@ fn with_hint(code: &ndn_data::Code, hint: &LinkHint) -> String {
 
 /// Join with `link` as a host does what `NotReady` says — joins again with
 /// the same code — until `limit` has passed.
-async fn joins(
-    phone: &Embedded,
-    link: &str,
-    limit: Duration,
-) -> Result<Joined, ndn_data::DataError> {
+async fn joins(phone: &Embedded, link: &str, limit: Duration) -> Result<Joined, InviteError> {
     let started = Instant::now();
     loop {
-        match phone.device.join(link).await {
-            Err(e) if e.next() == NextStep::RetryLater && started.elapsed() < limit => {}
+        match phone.invites.join(link).await {
+            Err(e) if e.retry() && started.elapsed() < limit => {}
             other => return other,
         }
     }
@@ -768,7 +761,7 @@ async fn an_embedded_joiner_with_only_the_code_dials_the_inviter_by_key_and_join
     assert_eq!(
         joined,
         Joined {
-            folder: n(FOLDER),
+            space: n(FOLDER),
             role: Role::Writer,
             inviter: n("/alice"),
         }
@@ -779,7 +772,7 @@ async fn an_embedded_joiner_with_only_the_code_dials_the_inviter_by_key_and_join
     until(
         "bob reads alice's cover",
         Duration::from_secs(60),
-        async || reads(&phone.device, &cover, "cover by alice").await,
+        async || reads(&phone, &cover, "cover by alice").await,
     )
     .await;
     let alice_knows_bob = laptop
@@ -884,7 +877,7 @@ async fn a_code_with_a_full_hint_is_one_qr_and_joins_past_the_dead_candidates() 
                 laptop.links.report()
             )
         });
-    assert_eq!(joined.folder, n(FOLDER));
+    assert_eq!(joined.space, n(FOLDER));
 }
 
 /// The key a hint names is checked by the handshake, whatever answers at an
@@ -995,7 +988,7 @@ async fn substituted_addresses_make_the_dial_fail_and_nothing_else() {
         ],
     };
     let err = phone
-        .device
+        .invites
         .join(&with_hint(&code, &altered))
         .await
         .expect_err("an address of nobody's reaches no one");
@@ -1035,7 +1028,7 @@ async fn a_code_altered_to_name_another_key_reaches_a_party_that_answers_nothing
     };
 
     let err = phone
-        .device
+        .invites
         .join(&with_hint(&code, &altered))
         .await
         .expect_err("the party holding the key cannot answer the offer");
@@ -1199,25 +1192,24 @@ async fn a_first_contact_dial_links_a_key_the_code_did_not_name_and_routes_only_
         phone.links.report()
     );
     assert_eq!(routed_over_any(&phone), introduction_routes(&device));
-    // Three: the held pieces, the ask, and the hint record's family.
-    assert_eq!(routed_over(&phone, laptop.key).len(), 3);
-    assert!(
-        routed_over(&phone, laptop.key)
-            .contains(&ndn_data::intro::hint_prefix(&device).to_string())
-    );
+    // Two: the introduction's family (offers and asks) and the hint
+    // record's.
+    assert_eq!(routed_over(&phone, laptop.key).len(), 2);
+    assert!(routed_over(&phone, laptop.key).contains(&hint_prefix(&device).to_string()));
 
     // What the prefixes name crosses; any other name of the device, and any
     // name at all outside them, has no route and no answer.
     let node = phone._engine.app_node(phone.cancel.child_token());
-    let held = ndn_data::wire::held_name(&device, &code.offer);
+    let offer = code.offer.clone();
     assert!(
-        fetches(&node, held).await,
+        fetches(&node, offer).await,
         "the offer's record crosses the first-contact link: {:#?}",
         laptop.links.report()
     );
     for outside in [
         device.clone().append("private"),
-        ndn_data::wire::log_name(&device, Some(&n(FOLDER)), 1),
+        ndn_heap::wire::log_name(&device, &n(FOLDER), 1),
+        ndn_heap::wire::held_name(&device, &code.offer),
         n("/alice/32=data/notebook/cover"),
         n("/alice"),
     ] {
@@ -1393,14 +1385,13 @@ async fn an_introduction_link_is_taken_only_while_an_offer_is_open_and_carries_o
 
     // No offer: the laptop shares its folder but has made none.
     laptop
-        .device
-        .share_folder(
+        .node
+        .create(
             &n(FOLDER),
-            Sharing::Whole(Share {
-                rule: Rule::Log,
-                writers: vec![n("/alice")],
-                readers: vec![Audience::Person(n("/alice"))],
-            }),
+            Share {
+                readers: Readers::Persons(Vec::new()),
+                writers: Vec::new(),
+            },
         )
         .await
         .unwrap();
@@ -1418,7 +1409,7 @@ async fn an_introduction_link_is_taken_only_while_an_offer_is_open_and_carries_o
     dial().await.unwrap_or_else(|e| panic!("{e:?}"));
     let node = phone._engine.app_node(phone.cancel.child_token());
     let offer = code.offer.clone();
-    let held = |piece: &Name| ndn_data::wire::held_name(&device, piece);
+    let held = |piece: &Name| ndn_heap::wire::held_name(&device, piece);
     let fetched = |name: Name| {
         let node = &node;
         async move {
@@ -1429,16 +1420,20 @@ async fn an_introduction_link_is_taken_only_while_an_offer_is_open_and_carries_o
         }
     };
     assert!(
-        fetched(held(&offer)).await,
+        fetched(offer.clone()).await,
         "the offer's record is answered over the introduction link: {:#?}",
         laptop.links.report()
     );
     // The first entry of the laptop's own log: the record sharing the folder.
-    let other = ndn_data::wire::log_name(&device, Some(&n(FOLDER)), 1);
+    let other = ndn_heap::wire::log_name(&device, &n(FOLDER), 1);
     assert_ne!(other, offer);
     assert!(
+        !fetched(other.clone()).await,
+        "an entry of the inviter's log was answered over the introduction link"
+    );
+    assert!(
         !fetched(held(&other)).await,
-        "a held piece that is no offer was answered over the introduction link"
+        "a held copy that is no offer was answered over the introduction link"
     );
 }
 
@@ -1521,7 +1516,7 @@ async fn a_join_whose_hint_reaches_no_one_goes_on_by_the_relay_the_code_names() 
                 laptop.links.report()
             )
         });
-    assert_eq!(joined.folder, n(FOLDER));
+    assert_eq!(joined.space, n(FOLDER));
     assert!(
         !linked_keys(&phone.links).contains(&laptop.key),
         "the dead hint made no link: {:#?}",
@@ -1539,9 +1534,9 @@ async fn a_join_whose_hint_reaches_no_one_goes_on_by_the_relay_the_code_names() 
     );
 }
 
-/// The short code of `code`: what `Device::offer` made for a host that gives a
+/// The short code of `code`: what `Invites::offer` made for a host that gives a
 /// first contact, or the reason it made none.
-fn short_of(code: &ndn_data::Code) -> String {
+fn short_of(code: &Code) -> String {
     code.short.clone().unwrap_or_else(|| {
         panic!(
             "no short code was made: {}",
@@ -1592,7 +1587,7 @@ async fn a_short_code_over_a_direct_address_joins_an_embedded_joiner_with_no_rou
     assert_eq!(
         joined,
         Joined {
-            folder: n(FOLDER),
+            space: n(FOLDER),
             role: Role::Writer,
             inviter: n("/alice"),
         }
@@ -1601,7 +1596,7 @@ async fn a_short_code_over_a_direct_address_joins_an_embedded_joiner_with_no_rou
     until(
         "bob reads alice's cover",
         Duration::from_secs(60),
-        async || reads(&phone.device, &cover, "cover by alice").await,
+        async || reads(&phone, &cover, "cover by alice").await,
     )
     .await;
     assert!(
@@ -1718,7 +1713,7 @@ async fn a_short_code_over_a_relay_first_contact_joins_through_the_relay() {
                 laptop.links.report()
             )
         });
-    assert_eq!(joined.folder, n(FOLDER));
+    assert_eq!(joined.space, n(FOLDER));
     assert!(
         !linked_keys(&phone.links).contains(&laptop.key),
         "no link to the inviter was made: {:#?}",
@@ -1763,7 +1758,7 @@ async fn a_loopback_first_contact_is_refused_unless_the_policy_allows_local_cand
     );
 
     let err = refusing
-        .device
+        .invites
         .join(&short)
         .await
         .expect_err("a loopback first contact is not dialled by this policy");
@@ -1790,7 +1785,7 @@ async fn a_loopback_first_contact_is_refused_unless_the_policy_allows_local_cand
     let joined = joins(&accepting, &short, Duration::from_secs(90))
         .await
         .unwrap_or_else(|e| panic!("the join failed: {e} ({:?})", e.next()));
-    assert_eq!(joined.folder, n(FOLDER));
+    assert_eq!(joined.space, n(FOLDER));
 }
 
 /// A source that lists these addresses on the socket's port as host
@@ -2115,7 +2110,7 @@ async fn cable_bob() {
     assert_eq!(
         joined,
         Joined {
-            folder: n(FOLDER),
+            space: n(FOLDER),
             role: Role::Writer,
             inviter: n("/alice"),
         }
@@ -2124,14 +2119,14 @@ async fn cable_bob() {
     until(
         "bob reads alice's cover",
         Duration::from_secs(60),
-        async || reads(&phone.device, &cover, "cover by alice").await,
+        async || reads(&phone, &cover, "cover by alice").await,
     )
     .await;
 }
 
 /// The short code of `code`, read: its device, its secret, and so the token
 /// of its hint record.
-fn read_short(code: &ndn_data::Code) -> ShortCode {
+fn read_short(code: &Code) -> ShortCode {
     ShortCode::parse(&short_of(code), true).unwrap_or_else(|e| panic!("{e}"))
 }
 
@@ -2225,11 +2220,11 @@ async fn the_hint_record_crosses_a_relay_hop_as_the_offer_fetch_does() {
     let via = [relay.name.clone()];
 
     // The offer's record, by the route the relay fallback uses today.
-    let held = ndn_data::wire::held_name(&device, &code.offer);
+    let offer = code.offer.clone();
     let until_up = Instant::now();
     let mut offer_record = None;
     while offer_record.is_none() && until_up.elapsed() < Duration::from_secs(60) {
-        offer_record = fetches_via(&node, held.clone(), &via).await;
+        offer_record = fetches_via(&node, offer.clone(), &via).await;
     }
     assert!(
         offer_record.is_some(),
@@ -2339,7 +2334,7 @@ async fn a_stranger_at_the_first_contact_serving_a_forged_hint_record_is_refused
         .encode()
         .unwrap_or_else(|e| panic!("{e}"));
         let err = phone
-            .device
+            .invites
             .join(&forged)
             .await
             .expect_err("a forged hint record must not be believed");
@@ -2474,7 +2469,7 @@ async fn a_short_code_joins_an_inviter_that_also_admits_enrollment_links() {
                 laptop.links.report()
             )
         });
-    assert_eq!(joined.folder, n(FOLDER));
+    assert_eq!(joined.space, n(FOLDER));
     until(
         "alice's link to bob is a full link, by his certificate",
         Duration::from_secs(60),
@@ -2634,7 +2629,7 @@ async fn a_first_contact_of_another_key_than_the_records_leaves_no_link_and_no_r
                 laptop.links.report()
             )
         });
-    assert_eq!(joined.folder, n(FOLDER));
+    assert_eq!(joined.space, n(FOLDER));
     // Time for the namespace's adoption to make the links again.
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert!(
