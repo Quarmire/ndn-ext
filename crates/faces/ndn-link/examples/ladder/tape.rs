@@ -1,5 +1,6 @@
-//! The recorder: the data layer's timeline events (target `ndn_data::timeline`, level trace) and the
-//! link's drop notices (target `face.quic`, level info and above), each kept with this machine's
+//! The recorder: the data layer's timeline events (target `ndn_data::timeline` for the old layer,
+//! `ndn_heap::timeline` for the new; level trace) and the link's drop notices (target `face.quic`, level info and
+//! above), each kept with this machine's
 //! clock. A child installs it only in a traced run (`LADDER_TRACE`); the timed runs have no
 //! subscriber, so every callsite there is the disabled-callsite check and nothing else.
 
@@ -35,7 +36,8 @@ impl tracing::field::Visit for Text {
 }
 
 fn wanted(m: &Metadata<'_>) -> bool {
-    m.target() == "ndn_data::timeline" || (m.target() == "face.quic" && *m.level() <= Level::INFO)
+    matches!(m.target(), "ndn_data::timeline" | "ndn_heap::timeline")
+        || (m.target() == "face.quic" && *m.level() <= Level::INFO)
 }
 
 impl tracing::Subscriber for Tape {

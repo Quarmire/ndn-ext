@@ -61,6 +61,7 @@ tokio = { workspace = true, features = ["full"] }
 # real data-layer devices on them, joining by a code's link hint.
 ndn-link   = { path = ".", features = ["engine", "introductions"] }
 ndn-engine = { workspace = true }
+# examples/ladder.rs: the old data layer (`LADDER_LAYER=old`) until stage 9.
 ndn-data   = { workspace = true }
 ndn-heap   = { workspace = true }
 ndn-invite = { workspace = true }
@@ -74,7 +75,7 @@ ndn-trust-envelope = { workspace = true }
 ndn-identity = { path = "../../../../ndn-rs/crates/security/ndn-identity" }
 # tests/common: `NDN_LINK_TEST_LOG=<file> RUST_LOG=…` writes the tracing of a run to a file.
 tracing-subscriber = { workspace = true }
-# examples/ladder.rs, the latency ladder from TCP to ndn-data's put->watch (round 12):
+# examples/ladder.rs, the latency ladder from TCP to the data layer's put->watch (round 12):
 # raw QUIC on the stack the link uses, and `ndn_sync::store::BackendStore` over
 # fjall (`ndn-sync` above) as the data layer's disk store.
 quinn   = { version = "0.11", default-features = false, features = ["ring", "runtime-tokio", "rustls"] }

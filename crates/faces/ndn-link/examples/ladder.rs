@@ -1,4 +1,4 @@
-//! The latency ladder: where the time goes from a TCP request/response to ndn-data's put->watch, one
+//! The latency ladder: where the time goes from a TCP request/response to the data layer's put->watch, one
 //! cost per rung, as ndf's `examples/ladder.rs` measures it (round 12 reproduces it at this pin so it can be
 //! run before and after a change). Numbers, no gate. Pinned runs are steadier:
 //!
@@ -15,30 +15,37 @@
 //!    `ndn-link` link set up by key (`PeerSpec`): a unsigned, b signed per request (ed25519), c signed and
 //!    verified by the consumer, d = c with NDNLPv2 reliability (`PeerSpec::reliability`).
 //! 4. The same on ONE forwarder with two app faces: a unsigned, b signed and verified.
-//! 5. `ndn_data::Device` put on A -> B's `watch` yields, A and B two processes of this binary, each a
+//! 5. The data layer's put on A -> B's `watch` yields, A and B two processes of this binary, each a
 //!    person with a device on a forwarder of its own and a **fjall store on disk**, linked by
-//!    `ndn-link`: A shares a folder and offers it, B joins by the short code. The clean runs have no recorder;
-//!    the traced runs (`LADDER_TL`) install one in both children (the `ndn_data::timeline` events, see
-//!    `ndn-data`'s `device.rs`) and give the 1 KiB timeline, B's fetches, the flush (fsync) of the commit rounds and
+//!    `ndn-link`: A shares a folder (a space) and offers it, B joins by the short code. The layer is
+//!    `LADDER_LAYER`: `old` (the default) is `ndn_data::Device`; `new` is `ndn_heap::Node` with
+//!    `ndn_invite::Invites` (put = `Heap::put`, watch = `Heap::watch` yielding `Change::Put`). The clean runs have no
+//!    recorder; the traced runs (`LADDER_TL`) install one in both children (the `ndn_data::timeline` events of
+//!    `ndn-data`'s `device.rs`, or `ndn_heap::timeline` of `ndn-heap`'s `sync.rs`: the same event names) and give the
+//!    1 KiB timeline, B's fetches, the flush (fsync) of the commit rounds and
 //!    `5p`, B's pull of the held version (its first fetch Interest out to its last Data in).
 //! 6. Re-expressions: how many pieces of rung 3 were asked again after their timer (and how many asks
 //!    failed outright), and in rung 5's traced runs how many of B's fetches were and how many drop
 //!    notices the link gave.
 //!
-//! A size is asked as ndn-data asks it: pieces of `ndn_data::wire::CHUNK` (4096) bytes, `Config::window` (32)
-//! in flight, each piece its own Interest, re-expressed after 250 ms, 500, 1000 within a 2 s lifetime
-//! (`Config::lifetime`). `RTO_MIN` and `REEXPRESS_MAX` are private to ndn-data: mirrored here.
+//! A size is asked as the layer asks it: pieces of `CHUNK` (4096) bytes (`ndn_data::wire::CHUNK`; for `new`
+//! `ndn_heap::wire::CHUNK` is crate-private, so 4096 is mirrored), `Config::window` in flight (old 32, new
+//! 128), each piece its own Interest, re-expressed after 250 ms, 500, 1000 within the layer's `Config::lifetime`
+//! (old 2 s, new 4 s). `RTO_MIN` and `REEXPRESS_MAX` are private to both layers: mirrored here.
 //!
-//! Knobs (environment): `LADDER_RUNS` runs per size after the 10 warm-ups (200); `LADDER_ONLY`
-//! the rungs to run (`1,2,3,4,5,6`); `LADDER_TL` traced put->watch runs per size (60; 0 skips them);
-//! `LADDER_OUT` a file the report is also written to; `LADDER_DIR` where the stores live (`/tmp/ndn-ladder-data`, a
-//! real disk, never a tmpfs: the flush barrier costs what the disk costs);
+//! Knobs (environment): `LADDER_RUNS` runs per size after the 10 warm-ups (200); `LADDER_LAYER` the data layer of
+//! rungs 5 and 6, and the piece size, window and Interest lifetime of rungs 3 and 4 (`old`, the default, or
+//! `new`); `LADDER_ONLY` the rungs to run (`1,2,3,4,5,6`); `LADDER_TL` traced put->watch runs per size (60; 0
+//! skips them); `LADDER_OUT` a file the report is also written to; `LADDER_DIR` where the stores live
+//! (`/tmp/ndn-ladder-data`, a real disk, never a tmpfs: the flush barrier costs what the disk costs);
 //! `LADDER_KID_CORES_A`, `_B` and `_SRV` the cores (a `taskset -c` list) of the data-layer children and of the
 //! TCP, QUIC and producer servers (unset: they run on the cores the parent has).
 
 #[allow(dead_code)]
 #[path = "ladder/host.rs"]
 mod host;
+#[path = "ladder/old_hints.rs"]
+mod old_hints;
 #[path = "ladder/tape.rs"]
 mod tape;
 
@@ -50,8 +57,8 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures::StreamExt;
+use host::Layer;
 use ndn_app::{Consumer, EngineAppExt, Node};
-use ndn_data::wire::CHUNK;
 use ndn_engine::{EngineBuilder, EngineConfig};
 use ndn_face_quic::{KeyFingerprint, LinkEndpoint, LinkKey, LinkKeySource, LinkTransportConfig};
 use ndn_link::{
@@ -127,7 +134,7 @@ async fn main() {
         Some("quic") => quic_server().await,
         Some("prod") => {
             let h = host(1, 2, None, a[1] == "1").await;
-            let _guard = produce(&h.node).await;
+            let _guard = produce(&h.node, Layer::from_env().chunk()).await;
             println!("ADDR {}", h.addr);
             let mut lines = BufReader::new(tokio::io::stdin()).lines();
             while let Some(l) = lines.next_line().await.unwrap() {
@@ -152,7 +159,7 @@ fn trace_if_asked() {
 /// Child A: Ann's folder, offered. `PUT <i> <size>`: put (clock and `i` first) at one path, say when it returned.
 async fn child_a(dir: &str) {
     trace_if_asked();
-    let ann = host::Host::open(Path::new(dir), 0x11).await;
+    let ann = host::Rig::open(Layer::from_env(), Path::new(dir), 0x11).await;
     let folder = ann.share("ladder").await;
     println!("CODE {}", ann.offer(&folder).await);
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
@@ -179,7 +186,7 @@ async fn child_a(dir: &str) {
 /// Child B: Bob joins by the code and says, for each item the watch delivers, how long after the put started.
 async fn child_b(dir: &str, code: &str) {
     trace_if_asked();
-    let bob = host::Host::open(Path::new(dir), 0x22).await;
+    let bob = host::Rig::open(Layer::from_env(), Path::new(dir), 0x22).await;
     let folder = bob.join(code).await;
     let mut items = Box::pin(bob.watch(&folder).await);
     println!("READY");
@@ -441,13 +448,13 @@ async fn host(me: u8, peer: u8, dial: Option<&str>, reliable: bool) -> Host {
     }
 }
 
-/// Answer `/ladder/<n|s>/<size>/<run>/<piece>` from memory with `min(4096, size - piece * 4096)` bytes: unsigned (`n`) or ed25519-signed per request.
-async fn produce(node: &Node) -> ndn_app::ServeGuard {
+/// Answer `/ladder/<n|s>/<size>/<run>/<piece>` from memory with `min(chunk, size - piece * chunk)` bytes (`chunk`: the layer's piece size, 4096): unsigned (`n`) or ed25519-signed per request.
+async fn produce(node: &Node, chunk: usize) -> ndn_app::ServeGuard {
     let signer = Arc::new(Ed25519Signer::from_seed(
         &[7; 32],
         "/ladder/KEY/1".parse().unwrap(),
     ));
-    let zeros = Bytes::from(vec![0u8; CHUNK]);
+    let zeros = Bytes::from(vec![0u8; chunk]);
     node.serve(
         "/ladder".parse::<Name>().unwrap(),
         move |interest, responder| {
@@ -460,7 +467,7 @@ async fn produce(node: &Node) -> ndn_app::ServeGuard {
                         .parse::<usize>()
                         .unwrap()
                 };
-                let len = num(2).saturating_sub(num(4) * CHUNK).min(CHUNK);
+                let len = num(2).saturating_sub(num(4) * chunk).min(chunk);
                 let b = DataBuilder::new((*interest.name).clone(), &zeros[..len]);
                 let _ = responder
                     .respond_bytes(if c[1].value[0] == b'n' {
@@ -476,13 +483,14 @@ async fn produce(node: &Node) -> ndn_app::ServeGuard {
     .unwrap()
 }
 
-/// Ask for `size` bytes: its pieces, `window` in flight, each re-expressed after 250 ms, 500, 1000; `mode` n (unsigned), s (signed), v (signed and verified here).
+/// Ask for `size` bytes: its pieces of the layer's piece size, its window in flight, each re-expressed after 250 ms, 500, 1000 within its Interest lifetime; `mode` n (unsigned), s (signed), v (signed and verified here).
 /// A piece whose ask fails outright (a Nack, the lifetime) is counted and asked again, up to three times more, so one lost piece cannot end a long run.
-async fn ask(node: &Node, mode: char, size: usize, window: usize) {
+async fn ask(node: &Node, mode: char, size: usize, layer: Layer) {
+    let (chunk, window, lifetime) = (layer.chunk(), layer.window(), layer.lifetime());
     let run = RUN.fetch_add(1, Relaxed);
     let pk =
         Ed25519Signer::from_seed(&[7; 32], "/ladder/KEY/1".parse().unwrap()).public_key_bytes();
-    let got: usize = futures::stream::iter(0..size.div_ceil(CHUNK).max(1))
+    let got: usize = futures::stream::iter(0..size.div_ceil(chunk).max(1))
         .map(|piece| async move {
             let name: Name = format!(
                 "/ladder/{}/{size}/{run}/{piece}",
@@ -495,7 +503,7 @@ async fn ask(node: &Node, mode: char, size: usize, window: usize) {
                 match Consumer::new(node.connection())
                     .fetch_reexpressing(
                         || InterestBuilder::new(name.clone()),
-                        Duration::from_secs(2),
+                        lifetime,
                         Duration::from_millis(250),
                         GAPS_MS.map(Duration::from_millis),
                     )
@@ -574,7 +582,8 @@ async fn ladder() {
         env("LADDER_ONLY", "1,2,3,4,5,6".to_owned()),
     );
     let on = |r: &str| only.split(',').any(|x| x == r);
-    let window = ndn_data::Config::new().window;
+    let layer = Layer::from_env();
+    let window = layer.window();
     let (mut rungs, mut counts): (Vec<Rung>, Vec<Reexpressed>) = (Vec::new(), Vec::new());
     let started = loadavg();
     let data = PathBuf::from(env("LADDER_DIR", "/tmp/ndn-ladder-data".to_owned()))
@@ -668,7 +677,7 @@ async fn ladder() {
                     let (p0, h0) = (counters(&mut p).await, own_counters(&h));
                     cells[k] = sample!(n, {
                         let before = REEXPRESSED.load(Relaxed);
-                        ask(&h.node, mode, *size, window).await;
+                        ask(&h.node, mode, *size, layer).await;
                         c.runs_with[k] += usize::from(REEXPRESSED.load(Relaxed) > before);
                     });
                     let (p1, h1) = (counters(&mut p).await, own_counters(&h));
@@ -693,7 +702,7 @@ async fn ladder() {
         let h = host(1, 2, None, false).await;
         let (cons, _guard) = (
             h.engine.app_node(h.cancel.child_token()),
-            produce(&h.node).await,
+            produce(&h.node, layer.chunk()).await,
         );
         for (mode, id, vs, what) in [
             ('n', "4a", "3a", "ONE forwarder, two app faces, unsigned"),
@@ -701,7 +710,7 @@ async fn ladder() {
         ] {
             let mut cells = [None; 3];
             for (k, (size, _)) in SIZES.iter().enumerate() {
-                cells[k] = sample!(n, ask(&cons, mode, *size, window).await);
+                cells[k] = sample!(n, ask(&cons, mode, *size, layer).await);
             }
             rungs.push(Rung {
                 id: id.into(),
@@ -721,16 +730,25 @@ async fn ladder() {
             }
             let (cells, pull, text, drops) = put_watch(&data, n, tl, traced).await;
             if traced {
-                rungs.push(Rung { id: "5p".into(), name: "ndn-data pull of the held version (B: first fetch Interest out -> last Data in)".into(), vs: Some("3c"), cells: pull });
+                rungs.push(Rung {
+                    id: "5p".into(),
+                    name: format!(
+                        "{} pull of the held version (B: first fetch Interest out -> last Data in)",
+                        layer.name()
+                    ),
+                    vs: Some("3c"),
+                    cells: pull,
+                });
                 timeline = text;
                 put_watch_counts.push_str(&format!("Traced runs:\n\n{drops}"));
             } else {
                 put_watch_counts.push_str(&format!("Clean runs (no recorder):\n\n{drops}\n"));
                 rungs.push(Rung {
                     id: "5".into(),
-                    name:
-                        "ndn-data put on A -> B's watch yields, two processes (clean, no recorder)"
-                            .into(),
+                    name: format!(
+                        "{} put on A -> B's watch yields, two processes (clean, no recorder)",
+                        layer.name()
+                    ),
                     vs: Some("5p"),
                     cells,
                 });
@@ -754,8 +772,15 @@ async fn ladder() {
     );
     say!("- stores on: {}", filesystem(&data));
     say!(
-        "- window {window} pieces of {CHUNK} bytes in flight; re-expression gaps {GAPS_MS:?} ms (the data layer's `RTO_MIN`/`REEXPRESS_MAX` are private: mirrored)"
+        "- window {window} pieces of {} bytes in flight; re-expression gaps {GAPS_MS:?} ms (the data layer's `RTO_MIN`/`REEXPRESS_MAX` are private: mirrored)",
+        layer.chunk()
     );
+    if layer == Layer::New {
+        say!(
+            "- layer: new (`ndn_heap::Node` with `ndn_invite::Invites`): Interest lifetime {} ms (`Config::lifetime`), piece size mirrored (`ndn_heap::wire::CHUNK` is crate-private); timeline target `ndn_heap::timeline`",
+            layer.lifetime().as_millis()
+        );
+    }
     say!("- load average (1 5 15 min) at start: {started}; at end: {finished}\n");
     say!("## Latency, p50 / p95 ms (delta = p50 minus its `vs` rung's)\n");
     say!("| rung | vs | {} |", SIZES.map(|s| s.1).join(" | "));
@@ -862,14 +887,19 @@ struct Step {
     ev: Vec<(u128, char, String)>,
 }
 
+/// What a recorded event says after its timeline target (`ndn_data::timeline` or `ndn_heap::timeline`; one layer runs in a
+/// process): the message first, then its fields.
+fn timeline_text(event: &str) -> Option<&str> {
+    ["ndn_data::timeline ", "ndn_heap::timeline "]
+        .iter()
+        .find_map(|target| event.split_once(target).map(|(_, text)| text))
+}
+
 /// The times of the events of `who` whose text starts with the word `msg` (the message is first in the text).
 fn times<'a>(r: &'a Step, who: char, msg: &'a str) -> impl Iterator<Item = u128> + 'a {
     r.ev.iter()
         .filter(move |e| {
-            e.1 == who
-                && e.2
-                    .split_once("ndn_data::timeline ")
-                    .is_some_and(|(_, t)| t.split(' ').next() == Some(msg))
+            e.1 == who && timeline_text(&e.2).is_some_and(|t| t.split(' ').next() == Some(msg))
         })
         .map(|e| e.0)
 }
@@ -877,9 +907,9 @@ fn texts<'a>(r: &'a Step, who: char, msg: &'a str) -> impl Iterator<Item = (u128
     r.ev.iter()
         .filter(move |e| e.1 == who)
         .filter_map(move |e| {
-            e.2.split_once("ndn_data::timeline ")
-                .filter(|(_, t)| t.split(' ').next() == Some(msg))
-                .map(|(_, t)| (e.0, t))
+            timeline_text(&e.2)
+                .filter(|t| t.split(' ').next() == Some(msg))
+                .map(|t| (e.0, t))
         })
 }
 fn field<'a>(m: &'a str, key: &str) -> Option<&'a str> {
