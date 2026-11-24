@@ -32,8 +32,9 @@ const SERVER_NAME: &str = "ndn-link";
 /// (the kernel grants up to its `rmem_max` / `wmem_max`). A window of pieces of the data layer
 /// reaches a device as some 600 datagrams in a burst (128 Data of 4,096 bytes, fragmented):
 /// the kernel's default of 208 KiB holds about 90, and each datagram it drops there costs the
-/// asker a re-expression timer. 4 MiB holds a window of 128 pieces several times over, and is
-/// what the QUIC datagram buffers below ([`transport_config`]) are sized to.
+/// asker a re-expression timer. 4 MiB holds a window of 128 pieces several times over. It is
+/// asked of the one socket of an endpoint, not of each connection (whose datagram queues keep
+/// quinn's default: [`transport_config`]).
 pub const LINK_SOCKET_BUFFER: usize = 4 * 1024 * 1024;
 
 /// Transport settings of every link of an endpoint.
@@ -796,8 +797,8 @@ fn transport_config(keep_alive: Duration, idle_timeout: Duration) -> quinn::Tran
     // control stream, and no peer needs more.
     t.max_concurrent_bidi_streams(quinn::VarInt::from_u32(1));
     t.max_concurrent_uni_streams(quinn::VarInt::from_u32(0));
-    t.datagram_receive_buffer_size(Some(LINK_SOCKET_BUFFER));
-    t.datagram_send_buffer_size(LINK_SOCKET_BUFFER);
+    // The datagram queues of a connection stay at quinn's own budget: datagrams flow before
+    // the verdict, so a larger one is memory any dialer may fill (see the test).
     t
 }
 
@@ -896,6 +897,35 @@ mod tests {
             assert!(
                 LinkTransportConfig::bounded(keep_alive, idle).is_err(),
                 "{keep_alive:?}, {idle:?}"
+            );
+        }
+    }
+
+    /// Datagrams flow before a link's verdict, from any dialer whose key the handshake
+    /// proves, so what one connection may buffer before admission is memory a stranger can
+    /// fill: with 64 handshakes in flight and 1,024 links, 4 MiB each way is 8 GiB at the
+    /// links and 512 MiB before them. A connection keeps quinn's own budget of datagram
+    /// queues (1.25 MB to receive, 1 MiB to send); a burst of a 128-piece window is 512 KiB
+    /// of content and fits it. The burst the kernel must hold is what
+    /// [`LINK_SOCKET_BUFFER`] raises, on the one socket, not per connection.
+    #[test]
+    fn a_connections_datagram_queues_keep_quinns_default_budget() {
+        let (ours, quinns) = (
+            format!(
+                "{:?}",
+                transport_config(Duration::from_secs(10), Duration::from_secs(30))
+            ),
+            format!("{:?}", quinn::TransportConfig::default()),
+        );
+        for field in ["datagram_receive_buffer_size", "datagram_send_buffer_size"] {
+            let value = |debug: &str| {
+                let at = debug.find(field).expect("the field is in the Debug output");
+                debug[at..].split([',', '\n']).next().unwrap().to_owned()
+            };
+            assert_eq!(
+                value(&ours),
+                value(&quinns),
+                "a connection's datagram queue is not quinn's default"
             );
         }
     }
