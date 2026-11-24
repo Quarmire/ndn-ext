@@ -15,9 +15,8 @@ use std::time::Duration;
 use common::{
     ANN, Embedded, LONG, Person, Setup, dials, embedded, invited, linked, n, offered, until,
 };
-use ndn_data::Role;
-use ndn_data::intro::introduction_prefixes;
 use ndn_face_quic::KeyFingerprint;
+use ndn_invite::{Role, introduction_prefixes};
 use ndn_link::{LinkReliability, PeerSpec};
 
 /// Whether each path `on` has to the device with `key` frames reliability; empty when it
@@ -312,7 +311,7 @@ async fn a_configured_peer_has_reliability_only_when_its_entry_asks() {
     );
 }
 
-/// A transfer over a lossy link, asked as ndn-data asks one: 1 MiB in pieces of
+/// A transfer over a lossy link, asked as ndn-heap asks one: 1 MiB in pieces of
 /// `CHUNK` (4096) bytes, 32 in flight, each piece expressed again after 250 ms, 500,
 /// 1000 (the client of `examples/ladder.rs`, rung 3). What is counted is what the
 /// consumer sees: Interests expressed again for a piece that had not come.

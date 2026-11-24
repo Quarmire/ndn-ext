@@ -29,8 +29,9 @@ use common::{
     reshare, routed_over, text, until,
 };
 use ndn_cert::onboarding::rdr_prefix;
-use ndn_data::{Audience, DataLayer, Role, Rule, Share, Sharing};
 use ndn_face_quic::{KeyFingerprint, LinkEndpoint, LinkKey, LinkKeySource, LinkTransportConfig};
+use ndn_heap::MembersChange;
+use ndn_invite::Role;
 use ndn_link::policy::{JOINED_FOLDERS_MAX, JOINED_ROUTE_COST, JOINED_ROUTES_MAX, VIA_RELAY_COST};
 use ndn_link::{
     ConfiguredEndpoints, FaceSink, Grant, GrantRole, JoinedRoutes, LinkSetup, LinkTrust, Links,
@@ -931,7 +932,10 @@ async fn a_reader_is_routed_the_writers_namespaces_and_what_it_pushes_stays_drop
     );
 
     let pushed = |name: &str| ndn_packet::encode::DataBuilder::new(n(name), b"x").build();
-    let (public, own) = ("/a/32=sync/probe", "/b/member/phone/seal/1");
+    // Public by design, and carried by a grant of `/b`: its namespace's sync
+    // group. (The folder owner's group is the data layer's to name, per
+    // space: with no data layer on this device it carries none of it.)
+    let (public, own) = ("/b/32=sync/probe", "/b/member/phone/seal/1");
     let next = async || {
         let got = tokio::time::timeout(Duration::from_secs(5), at_ann.receive())
             .await
@@ -1068,16 +1072,16 @@ async fn g11(faulty: bool, by_name: bool) {
     // the faulty profile each round trip may take several attempts.
     let patience = if faulty { LONG * 4 } else { LONG };
     let written = folder.clone().append("from-carol");
-    puts(&carol.device, &written, text("carol writes"), patience).await;
+    puts(&carol, &written, text("carol writes"), patience).await;
     until("bob reads carol's note", patience, async || {
-        reads(&bob.device, &written, "carol writes").await
+        reads(&bob, &written, "carol writes").await
     })
     .await;
 
     // The host calls `serve` once more: it follows the device still (one
     // task for these links, the second call's), and the record's change is
     // seen. A record without Carol: Bob's route goes at the next notification.
-    bob.hints.serve(&bob.device);
+    bob.hints.serve(&bob.invites);
     reshare(&ann, &folder, &[alice.ns.clone(), bobs.ns.clone()]).await;
     until(
         "bob's route toward carol is removed",
@@ -1270,18 +1274,27 @@ async fn a_restarted_joiner_is_routed_from_its_device_when_the_link_is_up() {
     .await;
 }
 
-/// Ann's members record for `folder` with `writers` as the writers and
-/// `readers` as the readers.
-async fn share_with(ann: &Embedded, folder: &Name, writers: &[Name], readers: &[Name]) {
-    ann.device
-        .share_folder(
-            folder,
-            Sharing::Whole(Share {
-                rule: Rule::Log,
-                writers: writers.to_vec(),
-                readers: readers.iter().cloned().map(Audience::Person).collect(),
-            }),
-        )
+/// Ann's members record for `folder` again, with `person`, a reader, listed
+/// as a writer too.
+async fn promote(ann: &Embedded, folder: &Name, person: &Name) {
+    ann.heap(folder)
+        .change(MembersChange {
+            add_writers: vec![person.clone()],
+            ..MembersChange::default()
+        })
+        .await
+        .unwrap();
+}
+
+/// Ann's members record for `folder` again, without `person`: a removal takes
+/// the person from both roles (a writer demoted to a reader is this removal
+/// and an admission, so the removal ends the person's grant and mirror).
+async fn removes(ann: &Embedded, folder: &Name, person: &Name) {
+    ann.heap(folder)
+        .change(MembersChange {
+            remove: vec![person.clone()],
+            ..MembersChange::default()
+        })
         .await
         .unwrap();
 }
@@ -1306,7 +1319,6 @@ async fn a_reader_joiner_is_routed_the_namespace_and_not_the_group_until_a_recor
     let carol = embedded(&carols, &carols.device("phone"), named).await;
     let folder = n(common::FOLDER);
     let group = sync_group(&carols.ns);
-    let everyone = [alice.ns.clone(), bobs.ns.clone(), carols.ns.clone()];
     invited(&ann, &bob, Role::Reader).await;
     invited_in(&ann, &carol, &folder, Role::Writer).await;
     until(
@@ -1329,7 +1341,7 @@ async fn a_reader_joiner_is_routed_the_namespace_and_not_the_group_until_a_recor
     assert!(!bob.sink.routed_at_joiner_cost(face, &group));
 
     // A record that makes Bob a writer: the group is routed.
-    share_with(&ann, &folder, &everyone, &everyone).await;
+    promote(&ann, &folder, &bobs.ns).await;
     until(
         "the promoted joiner is routed the group",
         LONG,
@@ -1337,22 +1349,13 @@ async fn a_reader_joiner_is_routed_the_namespace_and_not_the_group_until_a_recor
     )
     .await;
 
-    // One that makes him a reader again: the group goes, the namespace stays.
-    share_with(
-        &ann,
-        &folder,
-        &[alice.ns.clone(), carols.ns.clone()],
-        &everyone,
-    )
-    .await;
-    until("the demoted joiner loses the group", LONG, async || {
-        fib_cost(&bob, &group, face_of(&bob, ann.key)).is_none()
+    // One that removes Bob (the heap has no demotion in place: a writer made a
+    // reader is a removal and an admission, and the removal ends the mirror):
+    // every route of the joiner goes, the group's and the namespace's.
+    removes(&ann, &folder, &bobs.ns).await;
+    until("the removed joiner loses its routes", LONG, async || {
+        bob.sink.joined_now().is_empty() && fib_cost(&bob, &group, face).is_none()
     })
     .await;
-    assert!(bob.sink.removed_route(face_of(&bob, ann.key), &group));
-    assert_eq!(
-        fib_cost(&bob, &carols.ns, face_of(&bob, ann.key)),
-        Some(JOINED_ROUTE_COST)
-    );
     assert_eq!(bob.sink.ever_joined(), vec![carols.ns.clone()]);
 }

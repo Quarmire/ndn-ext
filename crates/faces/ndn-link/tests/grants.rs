@@ -1,5 +1,5 @@
 //! The per-introduction grant on real QUIC links, real forwarders and real
-//! data-layer devices (ndn-rs `ndn-link.md` §8.7, `data-layer.md` §19.8).
+//! data-layer devices (ndn-rs `ndn-link.md` §8.7, `invite.md` grants).
 //!
 //! Ann keeps the default serving policy `own`: she serves the devices of
 //! namespaces she holds a certificate in, and a person she invites is of
@@ -18,12 +18,31 @@ mod common;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use bytes::Bytes;
 use common::*;
 use ndn_app::EngineAppExt;
-use ndn_data::{Audience, DataLayer, Role, Rule, Share, Sharing, Timestamp};
+use ndn_heap::{Readers, Share, Timestamp};
+use ndn_invite::Role;
 use ndn_link::{Grant, GrantRole};
-use ndn_packet::{Name, NameComponent};
+use ndn_packet::Name;
+
+/// A public space of `on` (`space`, made once) with one value in it, and the
+/// path of that value: a collection the layer answers to whoever asks by
+/// name, outside any space a grant offers.
+async fn published(on: &Embedded, space: &Name, words: &str) -> Name {
+    on.node
+        .create(
+            space,
+            Share {
+                readers: Readers::Anyone,
+                writers: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    let entry = space.clone().append("entry");
+    puts(on, &entry, text(words), LONG).await;
+    entry
+}
 
 /// Ann invites Bob, who joins and syncs a note both ways with her, under the
 /// default `own` policy: his link is the grant's, in his namespace only, and
@@ -53,25 +72,19 @@ async fn ann_invites_bob_who_syncs_both_ways_and_carol_gets_no_link() {
     let folder = n(FOLDER);
     let cover = folder.clone().append("cover");
     until("bob reads ann's cover", LONG, async || {
-        reads(&bob.device, &cover, "cover by ann").await
+        reads(&bob, &cover, "cover by ann").await
     })
     .await;
     let from_bob = folder.clone().append("from-bob");
-    bob.device
-        .put(&from_bob, text("hello from bob"), note())
-        .await
-        .unwrap();
+    puts(&bob, &from_bob, text("hello from bob"), LONG).await;
     until("ann reads bob's note", LONG, async || {
-        reads(&ann.device, &from_bob, "hello from bob").await
+        reads(&ann, &from_bob, "hello from bob").await
     })
     .await;
     let from_ann = folder.append("from-ann");
-    ann.device
-        .put(&from_ann, text("hello from ann"), note())
-        .await
-        .unwrap();
+    puts(&ann, &from_ann, text("hello from ann"), LONG).await;
     until("bob reads ann's note", LONG, async || {
-        reads(&bob.device, &from_ann, "hello from ann").await
+        reads(&bob, &from_ann, "hello from ann").await
     })
     .await;
 
@@ -93,9 +106,12 @@ async fn ann_invites_bob_who_syncs_both_ways_and_carol_gets_no_link() {
     );
     assert_eq!(report.grants, grants);
     let routed = routed_over(&ann, bob.key);
+    let owners_group = ndn_security::sync_group(&n("/alice")).to_string();
     assert!(
-        routed.iter().all(|p| p.starts_with("/bob")),
-        "ann routes only bob's namespace over his link: {routed:?}"
+        routed
+            .iter()
+            .all(|p| p.starts_with("/bob") || *p == owners_group),
+        "ann routes only bob's namespace and her own group over his link: {routed:?}"
     );
     // A writer's link is a full link: his Data reaches Ann, hers reaches him.
     assert!(probes(&ann, &bob, "1").await, "a writer's Data was dropped");
@@ -148,24 +164,17 @@ async fn a_grant_link_answers_the_folders_names_and_not_an_unsealed_collection_o
     })
     .await;
 
-    // Ann writes into a collection outside the offered folder; no members
-    // record gives it readers, so the layer answers it to whoever asks.
-    let diary = n("/alice/32=data/diary");
-    ann.device
-        .put_op(&diary, Bytes::from_static(b"ann's diary"), note())
-        .await
-        .unwrap();
+    // Ann writes into a collection outside the offered folder: a public
+    // space of hers, which the layer answers to whoever asks.
+    let diary = published(&ann, &n("/alice/32=data/diary"), "ann's diary").await;
     let diary_entry = newest_entry(&ann, ANN, &diary).await;
     // A note in the folder, which Bob's device fetches by itself.
     let folder = n(FOLDER);
     let shared = folder.clone().append("later");
-    ann.device
-        .put(&shared, text("for bob"), note())
-        .await
-        .unwrap();
+    puts(&ann, &shared, text("for bob"), LONG).await;
     let shared_entry = newest_entry(&ann, ANN, &shared).await;
     until("bob reads the folder's note", LONG, async || {
-        reads(&bob.device, &shared, "for bob").await
+        reads(&bob, &shared, "for bob").await
     })
     .await;
 
@@ -184,10 +193,7 @@ async fn a_grant_link_answers_the_folders_names_and_not_an_unsealed_collection_o
 
     // Bob's own device is reachable: Ann fetches what he wrote.
     let from_bob = folder.append("from-bob");
-    bob.device
-        .put(&from_bob, text("hello from bob"), note())
-        .await
-        .unwrap();
+    puts(&bob, &from_bob, text("hello from bob"), LONG).await;
     let bobs_entry = newest_entry(&bob, "/bob/member/phone", &from_bob).await;
     let mut at_ann = ann.engine.app_consumer(ann.cancel.child_token());
     until(
@@ -213,7 +219,7 @@ async fn a_grant_the_host_ended_does_not_come_back_at_the_restart() {
 
     assert!(
         ann.hints
-            .end_grant(&ann.device, &bob.key.0)
+            .end_grant(&ann.invites, &bob.key.0)
             .await
             .expect("the device made the end durable"),
         "no grant was in force"
@@ -225,11 +231,11 @@ async fn a_grant_the_host_ended_does_not_come_back_at_the_restart() {
     assert!(ann.links.grants().is_empty());
 
     // The restart: the device's grants are installed again.
-    ann.hints.serve(&ann.device);
+    ann.hints.serve(&ann.invites);
     assert!(
-        ann.device.grants().is_empty(),
+        ann.invites.grants().is_empty(),
         "the device still lists a grant the host ended: {:#?}",
-        ann.device.grants()
+        ann.invites.grants()
     );
     assert!(
         ann.links.grants().is_empty(),
@@ -279,14 +285,14 @@ async fn a_hosts_renewal_of_a_grant_survives_the_restart() {
     let at = SystemTime::UNIX_EPOCH + Duration::from_millis(in_two_days.0);
     let renewed = ann
         .hints
-        .renew_grant(&ann.device, &bob.key.0, Some(in_two_days))
+        .renew_grant(&ann.invites, &bob.key.0, Some(in_two_days))
         .await
         .expect("the device made the renewal durable")
         .expect("a grant a held record admits was live");
     assert_eq!(renewed.until, Some(in_two_days));
     assert_eq!(ann.links.grants()[0].until, Some(at));
     assert!(linked(&ann, bob.key), "a renewal closed the link");
-    ann.hints.serve(&ann.device);
+    ann.hints.serve(&ann.invites);
     assert_eq!(
         ann.links.grants()[0].until,
         Some(at),
@@ -295,12 +301,12 @@ async fn a_hosts_renewal_of_a_grant_survives_the_restart() {
 
     // No date at all: it follows the members record.
     ann.hints
-        .renew_grant(&ann.device, &bob.key.0, None)
+        .renew_grant(&ann.invites, &bob.key.0, None)
         .await
         .expect("the device made the renewal durable")
         .expect("a grant a held record admits was live");
     assert_eq!(ann.links.grants()[0].until, None);
-    ann.hints.serve(&ann.device);
+    ann.hints.serve(&ann.invites);
     assert_eq!(ann.links.grants()[0].until, None);
     assert!(linked(&ann, bob.key));
 }
@@ -401,17 +407,7 @@ async fn a_removed_members_link_closes_when_the_record_drops_him() {
     until("ann is linked to bob", LONG, async || linked(&ann, bob.key)).await;
     assert_eq!(ann.links.grants().len(), 1);
 
-    ann.device
-        .share_folder(
-            &n(FOLDER),
-            Sharing::Whole(Share {
-                rule: Rule::Log,
-                writers: vec![n("/alice")],
-                readers: vec![Audience::Person(n("/alice"))],
-            }),
-        )
-        .await
-        .unwrap();
+    reshare(&ann, &n(FOLDER), &[n("/alice")]).await;
     until("the link closes", LONG, async || {
         !linked(&ann, bob.key) && !linked(&bob, ann.key)
     })
@@ -479,16 +475,13 @@ async fn a_readers_grant_drops_the_data_a_reader_pushes_and_what_it_fetches_work
     let folder = n(FOLDER);
     let cover = folder.clone().append("cover");
     until("bob reads ann's cover", LONG, async || {
-        reads(&bob.device, &cover, "cover by ann").await
+        reads(&bob, &cover, "cover by ann").await
     })
     .await;
     let note_name = folder.append("later");
-    ann.device
-        .put(&note_name, text("a later note"), note())
-        .await
-        .unwrap();
+    puts(&ann, &note_name, text("a later note"), LONG).await;
     until("bob reads what ann writes later", LONG, async || {
-        reads(&bob.device, &note_name, "a later note").await
+        reads(&bob, &note_name, "a later note").await
     })
     .await;
     // His Interests reach her and her Data reaches him ...
@@ -610,13 +603,13 @@ async fn two_notes_bob_let_into_both_both_sync_and_letting_him_go_of_one_leaves_
     for folder in [&first, &second] {
         let cover = folder.clone().append("cover");
         until("bob reads ann's cover", LONG, async || {
-            reads(&bob.device, &cover, "cover by ann").await
+            reads(&bob, &cover, "cover by ann").await
         })
         .await;
         let from_bob = folder.clone().append("from-bob");
-        puts(&bob.device, &from_bob, text("bob was here"), LONG).await;
+        puts(&bob, &from_bob, text("bob was here"), LONG).await;
         until("ann reads bob's note", LONG, async || {
-            reads(&ann.device, &from_bob, "bob was here").await
+            reads(&ann, &from_bob, "bob was here").await
         })
         .await;
     }
@@ -635,18 +628,15 @@ async fn two_notes_bob_let_into_both_both_sync_and_letting_him_go_of_one_leaves_
     // The link stands: it was never closed, and the second folder still
     // syncs both ways, with notes written after the first ended.
     let after_ann = second.clone().append("after-ann");
-    ann.device
-        .put(&after_ann, text("still here"), note())
-        .await
-        .unwrap();
+    puts(&ann, &after_ann, text("still here"), LONG).await;
     until("bob reads what ann writes after", LONG, async || {
-        reads(&bob.device, &after_ann, "still here").await
+        reads(&bob, &after_ann, "still here").await
     })
     .await;
     let after_bob = second.clone().append("after-bob");
-    puts(&bob.device, &after_bob, text("and me"), LONG).await;
+    puts(&bob, &after_bob, text("and me"), LONG).await;
     until("ann reads what bob writes after", LONG, async || {
-        reads(&ann.device, &after_bob, "and me").await
+        reads(&ann, &after_bob, "and me").await
     })
     .await;
     assert!(
@@ -658,10 +648,7 @@ async fn two_notes_bob_let_into_both_both_sync_and_letting_him_go_of_one_leaves_
     // What the ended entry carried is not carried now: an entry Ann writes
     // into the first folder is not answered to Bob; the second's is.
     let left = first.clone().append("after-ann");
-    ann.device
-        .put(&left, text("not for bob"), note())
-        .await
-        .unwrap();
+    puts(&ann, &left, text("not for bob"), LONG).await;
     let left_entry = newest_entry(&ann, ANN, &left).await;
     let kept_entry = newest_entry(&ann, ANN, &after_ann).await;
     assert!(
@@ -702,14 +689,14 @@ async fn a_member_reads_another_member_let_in_by_another_invitation() {
         (&carol, "from-carol", "carol writes"),
     ];
     for (who, name, words) in people {
-        puts(&who.device, &folder.clone().append(name), text(words), LONG).await;
+        puts(who, &folder.clone().append(name), text(words), LONG).await;
     }
     // All three read everything.
     for (reader, who) in [(&ann, "ann"), (&bob, "bob"), (&carol, "carol")] {
         for (_, name, words) in people {
             let collection = folder.clone().append(name);
             until(&format!("{who} reads {name}"), LONG, async || {
-                reads(&reader.device, &collection, words).await
+                reads(reader, &collection, words).await
             })
             .await;
         }
@@ -740,22 +727,22 @@ async fn a_removed_writers_names_stop_being_carried_and_a_name_outside_the_folde
         linked(&ann, bob.key) && linked(&ann, carol.key)
     })
     .await;
-    // Carol writes into the folder and, beside it, into a collection of her
-    // own namespace that no record gives readers.
+    // Carol writes into the folder and, beside it, into a public space of her
+    // own namespace outside it.
     let written = folder.clone().append("from-carol");
-    puts(&carol.device, &written, text("carol writes"), LONG).await;
-    let diary = carols
-        .ns
-        .clone()
-        .append_component(NameComponent::keyword(Bytes::from_static(b"data")))
-        .append("diary");
-    puts_op(&carol.device, &diary, b"carol's diary", LONG).await;
+    puts(&carol, &written, text("carol writes"), LONG).await;
+    let diary = published(
+        &carol,
+        &n(&format!("{}/32=data/diary", carols.ns)),
+        "carol's diary",
+    )
+    .await;
     until("ann reads carol's note", LONG, async || {
-        reads(&ann.device, &written, "carol writes").await
+        reads(&ann, &written, "carol writes").await
     })
     .await;
     until("bob reads carol's note", LONG, async || {
-        reads(&bob.device, &written, "carol writes").await
+        reads(&bob, &written, "carol writes").await
     })
     .await;
     // Bob asks for what Carol wrote as the walk does: of Ann, a device that
@@ -766,7 +753,7 @@ async fn a_removed_writers_names_stop_being_carried_and_a_name_outside_the_folde
     // each packet — a listed writer's public names carried, a dropped one's
     // not, her collections outside the folder never — is the unit case
     // `grants::tests::the_public_names_of_a_listed_writer_...`.
-    let held = |name: &Name| ndn_data::wire::held_name(&n(ANN), name);
+    let held = |name: &Name| ndn_heap::wire::held_name(&n(ANN), name);
     let carols_entry = held(&newest_entry(&ann, &carols.device("phone"), &written).await);
     let carols_diary = held(&newest_entry(&carol, &carols.device("phone"), &diary).await);
 

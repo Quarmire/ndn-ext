@@ -17,18 +17,21 @@ use common::{
     ANN, Embedded, LONG, Person, Setup, dials, embedded, invited, linked, n, offered, until,
 };
 use ndn_app::EngineAppExt;
-use ndn_data::intro::{intro_prefix, introduction_prefixes};
-use ndn_data::{Answer, Content, DataLayer, Got, Payload, Role};
 use ndn_face_quic::KeyFingerprint;
+use ndn_heap::wire::{EpochId, GrantAsk, grant_name, seal_key_name};
+use ndn_invite::{Role, intro_prefix, introduction_prefixes};
 use ndn_packet::{Name, NameComponent};
 use tokio::sync::Semaphore;
 
-/// `ndn_data::wire::CHUNK`: the size of a piece the data layer asks.
+/// The size of a piece the data layer asks (`ndn_heap::wire`'s chunk).
 const PIECE: usize = 4096;
 /// A transfer's pieces: 1 MiB.
 const PIECES: usize = 256;
-/// The data layer's window (`Config::new().window`): pieces in flight.
-const WINDOW: usize = 32;
+/// The data layer's window (`ndn_heap::Config::new().window`): the most asks
+/// of one device in flight.
+fn window() -> usize {
+    ndn_heap::Config::new().window
+}
 
 /// How one Interest ended.
 #[derive(Debug, PartialEq, Eq)]
@@ -182,7 +185,7 @@ async fn grant_linked() -> (Embedded, Embedded) {
 async fn a_members_1_mib_transfer_over_a_grant_link_meets_no_quota() {
     let (ann, bob) = grant_linked().await;
     serves_pieces(&ann);
-    let got = flood(&bob, ann.key, pieces_of(PIECES, 1), WINDOW).await;
+    let got = flood(&bob, ann.key, pieces_of(PIECES, 1), window()).await;
     assert_eq!(
         (
             got.count(&Ended::Data),
@@ -210,27 +213,24 @@ async fn a_members_1_mib_transfer_over_a_grant_link_meets_no_quota() {
 /// (`<ANN>/32=grant/<GrantAsk>`, the names the link carries for a folder's
 /// collections), each its own: a seal key that is nobody's.
 fn data_asks(count: usize, tag: u8) -> Vec<Name> {
-    use ndn_data::Seq;
-    use ndn_data::wire::{GrantAsk, grant_name};
-    let collection = n(common::FOLDER).append("big");
+    let space = n(common::FOLDER);
+    let asker = n("/bob/member/phone");
     (0..count)
         .map(|i| {
             let mut random = [tag; 32];
             random[1..5].copy_from_slice(&u32::try_from(i).unwrap().to_le_bytes());
-            let seal = n("/bob/member/phone")
-                .append_component(NameComponent::keyword(Bytes::from_static(b"seal")))
-                .append_component(NameComponent::generic(Bytes::copy_from_slice(&random)));
-            grant_name(
-                &n(ANN),
-                &GrantAsk {
-                    seal_key: seal,
-                    collection: collection.clone(),
-                    epoch: ndn_data::Epoch {
-                        creator: n(ANN),
-                        seq: Seq(1),
-                    },
+            let seal = seal_key_name(&asker, &random);
+            let packet = ndn_packet::encode::DataBuilder::new(seal, b"").sign_digest_sha256();
+            let ask = GrantAsk::new(
+                space.clone(),
+                EpochId {
+                    creator: n(ANN),
+                    seq: 1,
                 },
+                packet,
             )
+            .unwrap();
+            grant_name(&n(ANN), &ask)
         })
         .collect()
 }
@@ -399,15 +399,12 @@ async fn an_introduction_link_keeps_its_tight_quota() {
 async fn a_members_1_mib_note_crosses_a_grant_link_with_nothing_dropped() {
     let (ann, bob) = grant_linked().await;
     let big = n(common::FOLDER).append("big");
-    let blob = Content::new().with("blob", Bytes::from(vec![9u8; 1 << 20]));
-    common::puts(&ann.device, &big, blob, LONG).await;
+    common::puts(&ann, &big, Bytes::from(vec![9u8; 1 << 20]), LONG).await;
     until("bob reads the 1 MiB note", LONG, async || {
-        matches!(
-            bob.device.get(&big).await,
-            Ok(Answer { got: Got::Version(v), .. })
-                if matches!(&v.payload, Payload::Entry(c)
-                    if c.get("blob").is_some_and(|b| b.len() == 1 << 20))
-        )
+        let Some((heap, path)) = bob.locate(&big) else {
+            return false;
+        };
+        matches!(heap.get(&path).await, Ok(Some(item)) if item.bytes.len() == 1 << 20)
     })
     .await;
     let (at_ann, at_bob) = (ann.links.report(), bob.links.report());
