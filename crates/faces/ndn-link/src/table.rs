@@ -910,11 +910,11 @@ impl LinkTable {
         }
     }
 
-    /// Give the full link paths of `key`'s link, when a grant admitted it, the
-    /// routes of `routes` they lack (a route a path has is left alone), and
-    /// tell `apply` the face and what was added, with the table locked (it
-    /// must not call back into the links). A link that is no grant's, or an
-    /// enrollment, introduction or departure path, gets none.
+    /// Give the full link paths of `key`'s link (dialled or accepted, admitted
+    /// by a grant, a peer entry or a policy) the routes of `routes` they lack
+    /// (a route a path has is left alone), and tell `apply` the face and what
+    /// was added, with the table locked (it must not call back into the
+    /// links). An enrollment, introduction or departure path gets none.
     pub(crate) fn add_grant_routes(
         &self,
         key: &KeyFingerprint,
@@ -922,7 +922,7 @@ impl LinkTable {
         mut apply: impl FnMut(FaceId, &[Route]),
     ) {
         let mut live = self.live.lock();
-        let Some(link) = live.get_mut(key).filter(|l| l.grant.is_some()) else {
+        let Some(link) = live.get_mut(key) else {
             return;
         };
         for p in &mut link.paths {

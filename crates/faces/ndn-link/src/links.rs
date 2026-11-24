@@ -988,10 +988,11 @@ impl Links {
             .clone()
             .filter(|_| peer.as_ref().is_some_and(|p| p.routes.is_none()));
         let mut routes = routes_for(&self.peers, &admitted, dials, relay_routes);
-        // A link a grant admitted also routes the sync group of the owner of
-        // each space the key's entries grant, when the data layer gives the
-        // space a group (the filter carries only that group's names).
-        if admitted.grant.is_some() {
+        // A full link to a key some entry grants also routes the sync group
+        // of the owner of each space the key's entries grant, when the data
+        // layer gives the space a group (the filter carries only that
+        // group's names): whichever side dialled it, whatever admitted it.
+        if admitted.enrollment.is_none() {
             let more = grant_group_routes(&self.granted_owners(&admitted.fingerprint), &routes);
             routes.extend(more);
         }
