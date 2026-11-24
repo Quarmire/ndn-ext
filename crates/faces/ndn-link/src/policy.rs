@@ -136,10 +136,13 @@ pub const GRANT_INTERESTS: RateLimit = RateLimit {
 /// burst is some 50 of them back to back and the refill is what
 /// [`GRANT_INTERESTS`] asks of 4 KiB pieces; ordinary sync (a few records and
 /// their pieces) is a few KiB. A member that asks for more than this device
-/// is willing to send it has the answers dropped (silently: a Data has no one to
-/// be Nacked to), and asks again when its timer says, so what one key can make
-/// this device send is bounded however many Interests it sends, and a
-/// namespace's members together by [`GRANTS_BYTES`] on what they send.
+/// is willing to send is told so: an Interest that comes when less than a 32nd
+/// of the burst is left is Nacked Congestion (`ndn_face_quic::scope`, the room
+/// the answers of the Interests already admitted need), and an answer that
+/// still finds the budget empty is dropped silently (a Data has no one to be
+/// Nacked to). So what one key can make this device send is bounded however
+/// many Interests it sends, and a namespace's members together by
+/// [`GRANTS_BYTES`] on what they send.
 pub const GRANT_ANSWERED: RateLimit = RateLimit {
     burst: 64 << 20,
     per_sec: 16 << 20,

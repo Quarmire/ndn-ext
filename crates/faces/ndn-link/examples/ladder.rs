@@ -23,7 +23,12 @@
 //!    recorder; the traced runs (`LADDER_TL`) install one in both children (the `ndn_data::timeline` events of
 //!    `ndn-data`'s `device.rs`, or `ndn_heap::timeline` of `ndn-heap`'s `sync.rs`: the same event names) and give the
 //!    1 KiB timeline, B's fetches, the flush (fsync) of the commit rounds and
-//!    `5p`, B's pull of the held version (its first fetch Interest out to its last Data in).
+//!    `5p`, B's pull of the held version (its first fetch Interest out to its last Data in). Rung 5 is run in
+//!    three series, each with children of its own: the clean runs **paced** under the member quota of the grant
+//!    link (`5`, the figure of the gate: a run is started no sooner than `GRANT_ANSWERED`'s rate allows the answers
+//!    of the one before, 1.25 times its size on the wire; sizes whose gap is under 5 ms are not paced), the clean
+//!    runs **back to back** (`5s`: the sustained throughput of a series that asks for more than the quota allows
+//!    once its burst is spent), and the traced runs, paced.
 //! 6. Re-expressions: how many pieces of rung 3 were asked again after their timer (and how many asks
 //!    failed outright), and in rung 5's traced runs how many of B's fetches were and how many drop
 //!    notices the link gave.
@@ -36,7 +41,8 @@
 //! Knobs (environment): `LADDER_RUNS` runs per size after the 10 warm-ups (200); `LADDER_LAYER` the data layer of
 //! rungs 5 and 6, and the piece size, window and Interest lifetime of rungs 3 and 4 (`old`, the default, or
 //! `new`); `LADDER_ONLY` the rungs to run (`1,2,3,4,5,6`); `LADDER_TL` traced put->watch runs per size (60; 0
-//! skips them); `LADDER_OUT` a file the report is also written to; `LADDER_DIR` where the stores live
+//! skips them); `LADDER_PACE_MIBS` the rate in MiB a second of answers rung 5's paced series stays under (the
+//! link layer's `GRANT_ANSWERED`, 16); `LADDER_OUT` a file the report is also written to; `LADDER_DIR` where the stores live
 //! (`/tmp/ndn-ladder-data`, a real disk, never a tmpfs: the flush barrier costs what the disk costs);
 //! `LADDER_KID_CORES_A`, `_B` and `_SRV` the cores (a `taskset -c` list) of the data-layer children and of the
 //! TCP, QUIC and producer servers (unset: they run on the cores the parent has).
@@ -76,6 +82,10 @@ use tokio_util::sync::CancellationToken;
 
 const SIZES: [(usize, &str); 3] = [(1 << 10, "1 KiB"), (16 << 10, "16 KiB"), (1 << 20, "1 MiB")];
 const WARM: usize = 10;
+/// What the answers of a pull cost on the wire, per byte of the value (the pieces' names and
+/// digests, the frames' headers: a 1 MiB pull measured 1.15 to 1.2 MiB), taken as 1.25 to pace
+/// by.
+const ANSWER_WIRE: f64 = 1.25;
 /// The data layer's `RTO_MIN` and `REEXPRESS_MAX` (private there): an unanswered piece is asked again after 250 ms, 500, 1000.
 const GAPS_MS: [u64; 3] = [250, 500, 1000];
 static RUN: AtomicU64 = AtomicU64::new(0);
@@ -724,11 +734,19 @@ async fn ladder() {
     let mut put_watch_counts = String::new();
     if on("5") {
         let tl = env("LADDER_TL", 60usize);
-        for traced in [false, true] {
+        // What one member key may be answered a second over a grant link (the quota these runs
+        // are paced under): `LADDER_PACE_MIBS`, or the link layer's own number.
+        let quota = f64::from(ndn_link::policy::GRANT_ANSWERED.per_sec) / f64::from(1 << 20);
+        let pace = env("LADDER_PACE_MIBS", quota);
+        // The clean runs paced under the member quota (the figure of the gate), the clean runs
+        // back to back (the sustained throughput of a series that outruns the quota), the traced
+        // runs paced.
+        for (traced, paced) in [(false, true), (false, false), (true, true)] {
             if traced && tl == 0 {
                 continue;
             }
-            let (cells, pull, text, drops) = put_watch(&data, n, tl, traced).await;
+            let (cells, pull, text, drops) =
+                put_watch(&data, n, tl, traced, paced.then_some(pace)).await;
             if traced {
                 rungs.push(Rung {
                     id: "5p".into(),
@@ -740,16 +758,31 @@ async fn ladder() {
                     cells: pull,
                 });
                 timeline = text;
-                put_watch_counts.push_str(&format!("Traced runs:\n\n{drops}"));
-            } else {
-                put_watch_counts.push_str(&format!("Clean runs (no recorder):\n\n{drops}\n"));
+                put_watch_counts.push_str(&format!("Traced runs (paced):\n\n{drops}"));
+            } else if paced {
+                put_watch_counts.push_str(&format!(
+                    "Clean runs, paced (no recorder; each run started no sooner than {pace} MiB a second of answers allows, the member quota being {quota} MiB a second):\n\n{drops}\n"
+                ));
                 rungs.push(Rung {
                     id: "5".into(),
                     name: format!(
-                        "{} put on A -> B's watch yields, two processes (clean, no recorder)",
+                        "{} put on A -> B's watch yields, two processes (clean, no recorder, paced under the member quota)",
                         layer.name()
                     ),
                     vs: Some("5p"),
+                    cells,
+                });
+            } else {
+                put_watch_counts.push_str(&format!(
+                    "Clean runs, back to back (no recorder; the series asks for more than the member quota of {quota} MiB a second allows once its burst is spent):\n\n{drops}\n"
+                ));
+                rungs.push(Rung {
+                    id: "5s".into(),
+                    name: format!(
+                        "{} put on A -> B's watch yields, back to back: sustained throughput under the member quota",
+                        layer.name()
+                    ),
+                    vs: Some("5"),
                     cells,
                 });
             }
@@ -967,11 +1000,14 @@ type Moment = fn(&Step) -> Option<u128>;
 /// A named step of the timeline.
 type Stage<'a> = (&'a str, Moment);
 
+/// The put->watch runs of rung 5: clean (no recorder) or `traced`, each run started no sooner
+/// than `pace` MiB a second of answers allows (`None`: back to back).
 async fn put_watch(
     data: &Path,
     n: usize,
     tl: usize,
     traced: bool,
+    pace: Option<f64>,
 ) -> ([Cell; 3], [Cell; 3], String, String) {
     let steps: [Stage; 13] = [
         ("put returns on A", |r| Some(r.end)),
@@ -1006,7 +1042,11 @@ async fn put_watch(
             times(r, 'B', "verify_begin").min()
         }),
     ];
-    let dir = data.join(if traced { "traced" } else { "clean" });
+    let dir = data.join(match (traced, pace) {
+        (true, _) => "traced",
+        (false, Some(_)) => "paced",
+        (false, None) => "clean",
+    });
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::create_dir_all(dir.join("a")).unwrap();
     std::fs::create_dir_all(dir.join("b")).unwrap();
@@ -1030,8 +1070,31 @@ async fn put_watch(
     for (k, (size, label)) in SIZES.iter().enumerate() {
         let (mut got, mut pull, mut runs) = (Vec::new(), Vec::new(), Vec::new());
         let (a0, b0) = (counters(&mut a).await, counters(&mut b).await);
-        eprintln!("rung 5 {} {label}", if traced { "traced" } else { "clean" });
+        eprintln!(
+            "rung 5 {what} {label}",
+            what = match (traced, pace) {
+                (true, _) => "traced",
+                (false, Some(_)) => "clean, paced",
+                (false, None) => "clean, back to back",
+            }
+        );
+        // The gap between the starts of two runs that keeps their answers under the member
+        // quota: a pull of `size` bytes is `ANSWER_WIRE` times that on the wire. A size whose
+        // gap is under 5 ms is not paced (its quota is out of reach, and idle time between
+        // runs is itself something the machine answers with slower runs).
+        let period = pace
+            .map(|mib_s| {
+                Duration::from_secs_f64(*size as f64 * ANSWER_WIRE / (mib_s * f64::from(1 << 20)))
+            })
+            .filter(|p| *p >= Duration::from_millis(5));
+        let mut last = None;
         for i in 0..WARM + if traced { tl } else { n } {
+            if let Some(period) = period {
+                if let Some(prev) = last {
+                    tokio::time::sleep_until(prev + period).await;
+                }
+                last = Some(tokio::time::Instant::now());
+            }
             if traced {
                 a.ask("CLEAR", "CLEAR").await;
                 b.ask("CLEAR", "CLEAR").await;
