@@ -1051,8 +1051,11 @@ async fn a_grant_whose_role_changed_narrows_the_pushes_at_the_next_packet() {
     // are carried by neither) and Data under its own device name (which
     // either role carries).
     let pushed = |name: &str| ndn_packet::encode::DataBuilder::new(n(name), b"x").build();
-    let public = "/a/32=sync/notes/probe";
-    let other_space = "/a/32=sync/diary/probe";
+    let public = "/a/32=sync/notes/v=2/probe";
+    let other_space = "/a/32=sync/diary/v=2/probe";
+    // A space nested in the folder is a space of its own: its group's name
+    // extends the folder's group's.
+    let nested = "/a/32=sync/notes/f1/v=2/probe";
     let own = "/b/member/phone/seal/1";
     let push = async |name: &str| at_phone.send(&pushed(name)).await;
     let arrives = async |name: &str| {
@@ -1072,10 +1075,12 @@ async fn a_grant_whose_role_changed_narrows_the_pushes_at_the_next_packet() {
     };
 
     push(other_space).await;
+    push(nested).await;
     push(public).await;
     assert!(
         arrives(public).await,
-        "a writer's push under its folder's group crossed, the owner's other group did not"
+        "a writer's push under its folder's group crossed, the owner's other group and a \
+         nested space's did not"
     );
 
     // Demoted: the same link, the next packet narrower.
@@ -1147,7 +1152,7 @@ async fn a_writer_of_one_folder_and_a_reader_of_another_push_under_the_writers_n
         .await;
     let face = at_ann.live.lock()[0];
 
-    let (in_a, in_c) = ("/a/32=sync/notes/probe", "/c/32=sync/other/probe");
+    let (in_a, in_c) = ("/a/32=sync/notes/v=2/probe", "/c/32=sync/other/v=2/probe");
     let push = async |name: &str| {
         at_phone
             .send(&ndn_packet::encode::DataBuilder::new(n(name), b"x").build())

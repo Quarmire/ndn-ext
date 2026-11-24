@@ -741,8 +741,9 @@ impl Judge<'_> {
 /// contexts and key and certificate names of its namespaces (public by
 /// design: a hello already carries the chain, and the group carries no
 /// data); the trust context and key and certificate names of its folder's
-/// namespace, and the one sync group the data layer gives the folder
-/// ([`Introductions::sync_group`]: that space's, not the owner's others);
+/// namespace, and the Sync Interests (`<group>/v=N`) of the one sync group the
+/// data layer gives the folder ([`Introductions::sync_group`]: that space's
+/// exactly, not the owner's others nor a space nested in the folder);
 /// the sync groups and the same names of the other writers' namespaces its
 /// folder's record lists; what this device's introductions serve
 /// ([`Introductions::carries`]: a person may ask again); and the names of the
@@ -759,7 +760,7 @@ fn entry_carries(surface: Option<&Arc<dyn Introductions>>, entry: &Grant, name: 
         })
         || surface.is_some_and(|s| {
             s.sync_group(&entry.folder)
-                .is_some_and(|group| name.has_prefix(&group))
+                .is_some_and(|group| is_sync_name_of(&group, name))
         })
         || surface.is_some_and(|s| s.carries(name) || s.grant_carries(&entry.folder, name))
         // The sync groups, trust contexts and key and certificate names of
@@ -854,6 +855,19 @@ pub(crate) fn folder_namespace(folder: &Name) -> Option<Name> {
         .iter()
         .position(|c| c.typ == ndn_packet::tlv_type::KEYWORD && c.value.as_ref() == b"data")?;
     (at > 0).then(|| Name::from_components(folder.components()[..at].iter().cloned()))
+}
+
+/// Whether `name` is of the sync group `group` and of no other group below it:
+/// the sync protocol names a Sync Interest `<group>/v=N` (the version
+/// component, then what the protocol appends), while a space nested in the
+/// space (`<O>/32=data/n/f1` under `n`) has a group whose name extends the
+/// group's with a generic component, which is never a version.
+fn is_sync_name_of(group: &Name, name: &Name) -> bool {
+    name.has_prefix(group)
+        && name
+            .components()
+            .get(group.len())
+            .is_some_and(|c| c.as_version().is_some())
 }
 
 /// A name of `ns` that is public by design: its sync group, its trust

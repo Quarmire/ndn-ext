@@ -3483,10 +3483,10 @@ mod tests {
             // The introduction, which a person may ask again.
             "/intro/ask",
             // Sync groups of the grant's namespace and of the folder (its
-            // own group, not the owner's others), the trust context, keys
-            // and certificates.
+            // own group's Sync Interests `<group>/v=N`, not the owner's
+            // others), the trust context, keys and certificates.
             "/b/32=sync/probe",
-            "/a/32=sync/notes/probe",
+            "/a/32=sync/notes/v=2",
             "/b/32=trust-context/32=metadata",
             "/b/member/phone/KEY/k/issuer/v=1",
         ] {
@@ -3501,9 +3501,14 @@ mod tests {
             "/a/member/laptop/32=log/a/32=data/diary/seq=1",
             "/b/member/tablet/32=log/x",
             "/b/32=data/anything",
-            // The sync group of another space of the owner, and the owner's
-            // whole group prefix: a grant link carries the folder's group only.
-            "/a/32=sync/diary/probe",
+            // The sync group of another space of the owner, the group of a
+            // space nested in the folder (`notes/f1` is a space of its own, its
+            // group's name extends the folder's), a name under the folder's
+            // group that is no Sync Interest, and the owner's whole group
+            // prefix: a grant link carries the folder's Sync Interests only.
+            "/a/32=sync/diary/v=2",
+            "/a/32=sync/notes/f1/v=2",
+            "/a/32=sync/notes/probe",
             "/a/32=sync/probe",
             // Entries of collections whose path has a literal `KEY` component
             // are no key or certificate names.
@@ -3585,12 +3590,15 @@ mod tests {
         );
         assert!(pushes(&n(mine)), "its own devices' answers pass");
         assert!(
-            pushes(&n("/a/32=sync/notes/probe")),
+            pushes(&n("/a/32=sync/notes/v=2/probe")),
             "a writer entry carries the folder's own group"
         );
         assert!(
-            !pushes(&n("/a/32=sync/diary/probe")) && !pushes(&n("/a/32=sync/probe")),
-            "the group of a folder the person only reads, or the owner's others, was pushed"
+            !pushes(&n("/a/32=sync/diary/v=2/probe"))
+                && !pushes(&n("/a/32=sync/notes/f1/v=2/probe"))
+                && !pushes(&n("/a/32=sync/probe")),
+            "the group of a folder the person only reads, of a space nested in the folder, \
+             or the owner's others, was pushed"
         );
 
         // A promotion shows at the next packet: no new decision, no new link.
@@ -3603,7 +3611,7 @@ mod tests {
         // Both readers: nothing is pushed but under the person's own devices.
         world.grants.put(granted_in(&bob, diary, GrantRole::Reader));
         assert!(
-            !pushes(&n("/a/32=sync/notes/probe")) && !pushes(&n("/a/32=sync/diary/probe")),
+            !pushes(&n("/a/32=sync/notes/v=2/probe")) && !pushes(&n("/a/32=sync/diary/v=2/probe")),
             "no writer entry stands"
         );
         assert!(!pushes(&n(&format!("{diary}/page/32=log/x"))));

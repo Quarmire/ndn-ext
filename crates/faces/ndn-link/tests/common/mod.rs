@@ -1012,13 +1012,14 @@ pub fn routed_over(on: &Embedded, key: KeyFingerprint) -> Vec<String> {
 /// Where a device answers probes: under a sync group, a name the other
 /// device's forwarder routes over the link (the group's route), and not under
 /// the device's own name. The group is the namespace's own, except for the
-/// owner of `FOLDER`: a grant link carries only the granted space's group of
-/// the owner (ndn-link.md §8.7 rule 20), so its probes lie under that.
+/// owner of `FOLDER`: a grant link carries only the Sync Interest names
+/// `<group>/v=N` of the granted space's group of the owner (ndn-link.md §8.7
+/// rule 20), so its probes lie under `<group>/v=2`.
 pub fn probe_prefix(on: &Embedded) -> Name {
     let space = n(FOLDER);
     let owns = ndn_heap::wire::parse_space_name(&space).is_some_and(|s| s.owner == on.ns);
     match ndn_heap::wire::sync_group_of(&space) {
-        Some(group) if owns => group.append("probe"),
+        Some(group) if owns => group.append_version(2).append("probe"),
         _ => sync_group(&on.ns).append("probe"),
     }
 }
