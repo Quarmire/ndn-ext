@@ -28,6 +28,14 @@ pub const ALPN_LINK: &[u8] = b"ndn-link/1";
 /// identified by its key, not a host name, and SNI is not sent.
 const SERVER_NAME: &str = "ndn-link";
 
+/// What each link socket is asked for, in bytes, of its receive buffer and of its send buffer
+/// (the kernel grants up to its `rmem_max` / `wmem_max`). A window of pieces of the data layer
+/// reaches a device as some 600 datagrams in a burst (128 Data of 4,096 bytes, fragmented):
+/// the kernel's default of 208 KiB holds about 90, and each datagram it drops there costs the
+/// asker a re-expression timer. 4 MiB holds a window of 128 pieces several times over, and is
+/// what the QUIC datagram buffers below ([`transport_config`]) are sized to.
+pub const LINK_SOCKET_BUFFER: usize = 4 * 1024 * 1024;
+
 /// Transport settings of every link of an endpoint.
 #[derive(Clone, Debug)]
 pub struct LinkTransportConfig {
@@ -386,6 +394,7 @@ impl LinkEndpoint {
         let direct_server = server_config(Arc::clone(&key), Arc::clone(&direct_transport))?;
         let runtime: Arc<dyn quinn::Runtime> = Arc::new(quinn::TokioRuntime);
         let probes = Arc::new(ProbeTap::default());
+        size_buffers(&socket);
         // quinn's socket state sets the socket non-blocking.
         let socket = Arc::new(ProbeSocket::new(
             runtime.wrap_udp_socket(socket)?,
@@ -625,6 +634,7 @@ impl LinkEndpoint {
     /// Move the endpoint to another socket (an address change of this
     /// device): its links migrate with it.
     pub fn rebind(&self, socket: std::net::UdpSocket) -> std::io::Result<()> {
+        size_buffers(&socket);
         let wrapped = Arc::new(ProbeSocket::new(
             quinn::Runtime::wrap_udp_socket(&quinn::TokioRuntime, socket)?,
             Arc::clone(&self.probes),
@@ -741,6 +751,40 @@ impl Incoming {
     }
 }
 
+/// Ask the kernel for [`LINK_SOCKET_BUFFER`] of `socket`'s receive and send buffers. The kernel
+/// grants up to its `rmem_max` / `wmem_max` and says nothing when that is less, so a request
+/// that was cut is reported (once per socket, at info) with what the socket got.
+fn size_buffers(socket: &std::net::UdpSocket) {
+    let socket = socket2::SockRef::from(socket);
+    let results = [
+        (
+            "receive",
+            socket.set_recv_buffer_size(LINK_SOCKET_BUFFER),
+            socket.recv_buffer_size(),
+        ),
+        (
+            "send",
+            socket.set_send_buffer_size(LINK_SOCKET_BUFFER),
+            socket.send_buffer_size(),
+        ),
+    ];
+    for (which, set, got) in results {
+        match (set, got) {
+            (Err(e), _) => {
+                tracing::warn!(target: "face.quic", "cannot size the link socket's {which} buffer: {e}");
+            }
+            // Linux reports twice what it granted (it counts its own bookkeeping).
+            (Ok(()), Ok(got)) if got < LINK_SOCKET_BUFFER => {
+                tracing::info!(
+                    target: "face.quic",
+                    "the link socket's {which} buffer is {got} bytes, under the {LINK_SOCKET_BUFFER} asked: the kernel's limit (net.core.rmem_max, wmem_max) is lower, and a burst of pieces may be dropped before it is read"
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
 fn transport_config(keep_alive: Duration, idle_timeout: Duration) -> quinn::TransportConfig {
     let mut t = quinn::TransportConfig::default();
     t.keep_alive_interval(Some(keep_alive));
@@ -752,8 +796,8 @@ fn transport_config(keep_alive: Duration, idle_timeout: Duration) -> quinn::Tran
     // control stream, and no peer needs more.
     t.max_concurrent_bidi_streams(quinn::VarInt::from_u32(1));
     t.max_concurrent_uni_streams(quinn::VarInt::from_u32(0));
-    t.datagram_receive_buffer_size(Some(4 * 1024 * 1024));
-    t.datagram_send_buffer_size(4 * 1024 * 1024);
+    t.datagram_receive_buffer_size(Some(LINK_SOCKET_BUFFER));
+    t.datagram_send_buffer_size(LINK_SOCKET_BUFFER);
     t
 }
 

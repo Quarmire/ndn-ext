@@ -54,6 +54,15 @@ pub const CONGESTION_NACKS: RateLimit = RateLimit {
     burst: 256,
     per_sec: 128,
 };
+/// An Interest is admitted over a scope with a budget of answers
+/// ([`LinkScope::answered`]) only while this fraction of its burst is left, as
+/// `1 / ANSWER_ROOM`: the room the answers of the Interests already admitted
+/// take (a window of 128 pieces of 4,096 bytes is 560 KB, a 32nd of the grant
+/// link's 64 MiB is 2 MiB). An Interest that comes when less is left is Nacked
+/// Congestion at once, where its Data, sent later, would be dropped silently
+/// and its asker left to a timer; the budget itself, the bound on what is
+/// sent, is not moved.
+const ANSWER_ROOM: u32 = 32;
 /// The frames a link receives that carry no network packet and no TxSequence
 /// (acknowledgements, idle frames), together: 1,024 at once, then 1,024 a
 /// second. An honest peer sends them from its idle-Ack pump, which ticks every
@@ -290,6 +299,16 @@ impl Bucket {
             false
         }
     }
+
+    /// Refill for the time since the last take, then whether there are
+    /// `least` tokens, taking none.
+    fn holds(&mut self, rate: RateLimit, least: f64) -> bool {
+        let now = Instant::now();
+        let refill = now.duration_since(self.at).as_secs_f64() * f64::from(rate.per_sec);
+        self.tokens = (self.tokens + refill).min(f64::from(rate.burst));
+        self.at = now;
+        self.tokens >= least
+    }
 }
 
 /// A scope at work on one link: its verdicts, rate buckets and activity.
@@ -393,6 +412,24 @@ impl ScopeState {
                     .take(rate, 1.0)
             {
                 return self.congested("over the rate limit of Interests", packet.as_ref());
+            }
+            if let (
+                Some(budget),
+                Some(Packet::Network {
+                    kind: Kind::Interest,
+                    ..
+                }),
+            ) = (self.scope.answered, &packet)
+                && !self
+                    .answered_bucket
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .holds(budget, f64::from(budget.burst / ANSWER_ROOM))
+            {
+                return self.congested(
+                    "over the budget of bytes this side answers over the link: the answer to this Interest would not fit",
+                    packet.as_ref(),
+                );
             }
             if let Some(bandwidth) = self.scope.bandwidth
                 && !self
@@ -1470,6 +1507,70 @@ mod tests {
             .filter(|f| s.sending(&(*f).clone()) == Judged::Pass)
             .count();
         assert_eq!(passed, 2, "the budget holds two fragments");
+    }
+
+    /// Round 12, the ladder: an Interest came while the budget of answers was spent, was
+    /// admitted, and its Data was dropped silently, so its asker sat out a timer of 250 ms
+    /// (1 MiB put->watch p95 of the new layer). An Interest that comes when what this side
+    /// may still answer is under a 32nd of the burst is Nacked Congestion at once, as every
+    /// Interest dropped for a rate is: the answers of the Interests already admitted still
+    /// find their bytes in that 32nd, and the bound on what is sent is the same.
+    #[test]
+    fn an_interest_is_told_at_once_when_the_budget_of_answers_is_nearly_spent() {
+        let piece = ndn_packet::lp::encode_lp_packet(&data("/any/piece", 1000));
+        let len = u32::try_from(piece.len()).unwrap();
+        let counts = Arc::new(ScopeCounts::default());
+        let scope = LinkScope {
+            receives: Carries::Everything,
+            sends: Carries::Everything,
+            names: Box::new(|_: &Name| true),
+            rate: RateLimit {
+                burst: 100_000,
+                per_sec: 100_000,
+            },
+            bandwidth: None,
+            rated: Vec::new(),
+            interests: None,
+            answered: Some(RateLimit {
+                burst: 64 * len,
+                per_sec: 1,
+            }),
+            shared: None,
+            explain: "test".into(),
+            answers_in: None,
+            interests_in: None,
+            narrowing: None,
+            counts: Some(Arc::clone(&counts)),
+        };
+        let s = ScopeState::new(scope);
+        let asked = interest("/any/piece");
+        let ask = ndn_packet::lp::encode_lp_packet(&asked);
+        // 62 answers leave two pieces' worth, a 32nd of the burst: Interests are admitted.
+        for _ in 0..62 {
+            assert_eq!(s.received(&ask), Judged::Pass);
+            assert_eq!(s.sending(&piece), Judged::Pass);
+        }
+        assert_eq!(
+            s.received(&ask),
+            Judged::Pass,
+            "a 32nd of the burst is left"
+        );
+        assert_eq!(s.sending(&piece), Judged::Pass);
+        // One more leaves under a 32nd: the next Interest is Nacked, not admitted.
+        assert_eq!(
+            s.received(&ask),
+            Judged::Drop(Some((NackReason::Congestion, asked))),
+            "an Interest whose answer would not fit was admitted, and its Data would be dropped silently"
+        );
+        assert_eq!(counts.congestion_nacks(), 1);
+        // The answers of the Interests admitted before still find their bytes, up to the
+        // budget itself, which is the bound and is not moved.
+        assert_eq!(s.sending(&piece), Judged::Pass);
+        assert_eq!(
+            s.sending(&piece),
+            Judged::Drop(None),
+            "the budget is the bound on what is sent"
+        );
     }
 
     /// R12 H1: each class of rated names has its own bucket; Interests of no class take

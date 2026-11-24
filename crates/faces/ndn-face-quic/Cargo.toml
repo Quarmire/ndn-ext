@@ -23,6 +23,8 @@ sha2          = { workspace = true }
 # raw public keys, which is what lets the TLS identity be the NDN key itself.
 quinn         = { version = "0.11", default-features = false, features = ["ring", "runtime-tokio", "rustls"] }
 rustls        = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# The receive and send buffers of the link socket (`LinkEndpoint::from_socket`): quinn sets neither.
+socket2       = "0.6"
 # The stateless-reset key (an HMAC key quinn takes as `ring::hmac::Key`).
 ring          = { workspace = true }
 

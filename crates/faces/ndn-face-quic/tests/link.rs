@@ -15,9 +15,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use ndn_face_quic::{
-    Admission, Carries, CloseReason, Departure, HandshakeLimits, KeyFingerprint, Link,
-    LinkEndpoint, LinkError, LinkHello, LinkKey, LinkScope, LinkTransportConfig, LinkVerdict,
-    Presence, PresentDevice, RateLimit, Reachability,
+    Admission, Carries, CloseReason, Departure, HandshakeLimits, KeyFingerprint,
+    LINK_SOCKET_BUFFER, Link, LinkEndpoint, LinkError, LinkHello, LinkKey, LinkScope,
+    LinkTransportConfig, LinkVerdict, Presence, PresentDevice, RateLimit, Reachability,
 };
 use ndn_packet::Name;
 use ndn_packet::encode::{DataBuilder, InterestBuilder};
@@ -413,6 +413,139 @@ async fn an_enrollment_link_carries_only_its_scope_and_says_so() {
         got.fragment.unwrap(),
         answer,
         "only the answer in scope reached the device"
+    );
+}
+
+/// Round 12, the ladder: a relay that has answered what its scope allows used to take the
+/// next Interests in and drop their Data silently, each asker left to its timer (250 ms: the
+/// 1 MiB put->watch p95). Every Interest of a windowed asker is answered now, by its Data or
+/// by a Congestion Nack at once, and none waits for a timer.
+#[tokio::test]
+async fn an_asker_over_the_budget_of_answers_is_nacked_not_left_to_its_timer() {
+    const ASKS: usize = 300;
+    const WINDOW: usize = 2;
+    let dialer = endpoint(ed_key(1), false);
+    let listener = endpoint(ec_key(2), true);
+    let target = addr(&listener);
+    let name = |i: usize| -> Name { format!("/any/piece/{i}").parse().unwrap() };
+    let answer = move |i: usize| DataBuilder::new(name(i), &[7u8; 900]).build();
+    let lp = |wire: Bytes| ndn_packet::lp::encode_lp_packet(&wire);
+    // A budget of 100 answers, refilled too slowly to matter here: the 300 asks spend it.
+    let one = u32::try_from(lp(answer(0)).len()).unwrap();
+    let accept = async {
+        let mut hs = listener.accept().await.unwrap().handshake().await.unwrap();
+        hs.exchange_hello(&hello(2), T).await.unwrap();
+        let scope = LinkScope {
+            receives: Carries::Everything,
+            sends: Carries::Everything,
+            names: Box::new(|_: &Name| true),
+            rate: RateLimit {
+                burst: 100_000,
+                per_sec: 100_000,
+            },
+            bandwidth: None,
+            rated: Vec::new(),
+            interests: None,
+            answered: Some(RateLimit {
+                burst: 100 * one,
+                per_sec: one,
+            }),
+            shared: None,
+            explain: "answers are budgeted".into(),
+            answers_in: None,
+            interests_in: None,
+            narrowing: None,
+            counts: None,
+        };
+        let admission = Admission {
+            verdict: LinkVerdict::default(),
+            scope: Some(scope),
+        };
+        hs.admit(FaceId(2), T, admission).await.unwrap()
+    };
+    let dial = async {
+        let mut hs = dialer.connect(target, None).await.unwrap();
+        hs.exchange_hello(&hello(1), T).await.unwrap();
+        hs.admit(FaceId(1), T, Admission::default()).await.unwrap()
+    };
+    let (device, relay) = tokio::join!(dial, accept);
+
+    // The relay's forwarder answers every Interest its face delivers.
+    let relay_face = Arc::new(relay);
+    let serving = Arc::clone(&relay_face);
+    let served = tokio::spawn(async move {
+        loop {
+            let Ok(Ok(wire)) = tokio::time::timeout(T, serving.face.recv_bytes()).await else {
+                return;
+            };
+            let Ok(lp) = ndn_packet::lp::LpPacket::decode(wire) else {
+                continue;
+            };
+            let Some(interest) = lp.fragment else {
+                continue;
+            };
+            let Ok(interest) = ndn_packet::Interest::decode(interest) else {
+                continue;
+            };
+            let i: usize = interest
+                .name
+                .to_string()
+                .rsplit('/')
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap();
+            let _ = serving
+                .face
+                .send_bytes(ndn_packet::lp::encode_lp_packet(&answer(i)))
+                .await;
+        }
+    });
+
+    // The asker keeps WINDOW in flight, and waits for each reply.
+    let (mut next, mut data, mut nacks, mut asked) = (0usize, 0usize, 0usize, 0usize);
+    let express = |next: &mut usize, asked: &mut usize| {
+        let wire = lp(InterestBuilder::new(name(*next)).build());
+        *next += 1;
+        *asked += 1;
+        wire
+    };
+    for _ in 0..WINDOW {
+        device
+            .face
+            .send_bytes(express(&mut next, &mut asked))
+            .await
+            .unwrap();
+    }
+    while data + nacks < ASKS {
+        let Ok(Ok(wire)) =
+            tokio::time::timeout(Duration::from_secs(2), device.face.recv_bytes()).await
+        else {
+            break;
+        };
+        let lp_in = ndn_packet::lp::LpPacket::decode(wire).unwrap();
+        if lp_in.nack.is_some() {
+            nacks += 1;
+        } else {
+            data += 1;
+        }
+        if asked < ASKS {
+            device
+                .face
+                .send_bytes(express(&mut next, &mut asked))
+                .await
+                .unwrap();
+        }
+    }
+    served.abort();
+    assert_eq!(
+        data + nacks,
+        ASKS,
+        "an Interest was answered by nothing: {data} Data and {nacks} Nacks for {asked} Interests, the rest left to their timer"
+    );
+    assert!(
+        nacks > 0 && data >= 90,
+        "the budget of 100 answers was spent and then told: {data} Data, {nacks} Nacks"
     );
 }
 
@@ -822,6 +955,68 @@ async fn an_endpoint_links_on_a_socket_the_host_bound() {
     let pkt = Bytes::from_static(&[0x05, 0x03, 0x07, 0x01, 0x43]);
     a.face.send_bytes(pkt.clone()).await.unwrap();
     assert_eq!(recv(&b.face).await, pkt);
+}
+
+/// The kernel's limit on a socket buffer a process may ask for (Linux only; `None` elsewhere).
+fn buffer_limit(name: &str) -> Option<usize> {
+    std::fs::read_to_string(format!("/proc/sys/net/core/{name}"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// A window of pieces arrives as hundreds of datagrams at once: 128 Data of 4,096 bytes
+/// fragment to some 600 frames of 1,200 bytes. A socket left at the kernel's default buffer
+/// (208 KiB, which holds about 90 such datagrams once the packet metadata is counted) drops
+/// what its reader has not taken yet, and each datagram lost that way costs the asker a
+/// re-expression timer of 250 ms (round 12: the 1 MiB put->watch p95 was that timer). The
+/// endpoint asks the kernel for [`LINK_SOCKET_BUFFER`] of both buffers on every socket it
+/// uses, one the host bound included, and so does a rebind.
+#[tokio::test]
+async fn a_link_socket_takes_the_buffers_a_burst_of_pieces_needs() {
+    use socket2::SockRef;
+    let (recv_limit, send_limit) = (buffer_limit("rmem_max"), buffer_limit("wmem_max"));
+    let fresh = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let default = (
+        SockRef::from(&fresh).recv_buffer_size().unwrap(),
+        SockRef::from(&fresh).send_buffer_size().unwrap(),
+    );
+    // What the kernel gives for a request, as `getsockopt` reports it (Linux counts the
+    // metadata too and reports twice what was granted).
+    let expected = |limit: Option<usize>, default: usize| match limit {
+        Some(limit) => default.max(2 * limit.min(LINK_SOCKET_BUFFER)),
+        None => default,
+    };
+    let (want_recv, want_send) = (
+        expected(recv_limit, default.0),
+        expected(send_limit, default.1),
+    );
+    let sizes = |socket: &std::net::UdpSocket| {
+        (
+            SockRef::from(socket).recv_buffer_size().unwrap(),
+            SockRef::from(socket).send_buffer_size().unwrap(),
+        )
+    };
+
+    let bound = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let seen = bound.try_clone().unwrap();
+    let config = LinkTransportConfig::default();
+    let endpoint = LinkEndpoint::from_socket(bound, Arc::new(ed_key(2)), &config, true).unwrap();
+    let (recv, send) = sizes(&seen);
+    assert!(
+        recv >= want_recv && send >= want_send,
+        "the endpoint left its socket at {recv} bytes to receive and {send} to send; the kernel allows {want_recv} and {want_send} (default {default:?})"
+    );
+
+    let moved = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let seen = moved.try_clone().unwrap();
+    endpoint.rebind(moved).unwrap();
+    let (recv, send) = sizes(&seen);
+    assert!(
+        recv >= want_recv && send >= want_send,
+        "the rebind left its socket at {recv} bytes to receive and {send} to send; the kernel allows {want_recv} and {want_send}"
+    );
 }
 
 /// Wait until `f` holds, polling.

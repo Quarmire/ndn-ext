@@ -79,7 +79,8 @@ mod text;
 mod verify;
 
 pub use endpoint::{
-    ALPN_LINK, HandshakeLimits, InboundWindow, Incoming, LinkEndpoint, LinkTransportConfig,
+    ALPN_LINK, HandshakeLimits, InboundWindow, Incoming, LINK_SOCKET_BUFFER, LinkEndpoint,
+    LinkTransportConfig,
 };
 pub use key::{KeyError, KeyFingerprint, LinkKey, LinkKeyAlgorithm, LinkKeySource, PeerKey};
 pub use link::{
