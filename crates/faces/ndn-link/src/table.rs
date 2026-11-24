@@ -909,6 +909,38 @@ impl LinkTable {
             }
         }
     }
+
+    /// Give the full link paths of `key`'s link, when a grant admitted it, the
+    /// routes of `routes` they lack (a route a path has is left alone), and
+    /// tell `apply` the face and what was added, with the table locked (it
+    /// must not call back into the links). A link that is no grant's, or an
+    /// enrollment, introduction or departure path, gets none.
+    pub(crate) fn add_grant_routes(
+        &self,
+        key: &KeyFingerprint,
+        routes: &[Route],
+        mut apply: impl FnMut(FaceId, &[Route]),
+    ) {
+        let mut live = self.live.lock();
+        let Some(link) = live.get_mut(key).filter(|l| l.grant.is_some()) else {
+            return;
+        };
+        for p in &mut link.paths {
+            let path = &mut p.path;
+            if !path.full || path.kind != PathKind::Link {
+                continue;
+            }
+            let added: Vec<Route> = routes
+                .iter()
+                .filter(|r| !path.routes.iter().any(|have| have.prefix == r.prefix))
+                .cloned()
+                .collect();
+            if !added.is_empty() {
+                path.routes.extend(added.iter().cloned());
+                apply(path.face, &added);
+            }
+        }
+    }
 }
 
 /// The words a link closed for the loss of its last identity carries: why, that

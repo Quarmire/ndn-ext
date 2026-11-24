@@ -394,6 +394,40 @@ impl Links {
         });
     }
 
+    /// The namespaces owning the spaces the live entries of `key` grant, for
+    /// those the data layer gives a sync group ([`Introductions::sync_group`]).
+    fn granted_owners(&self, key: &KeyFingerprint) -> Vec<Name> {
+        let Some(surface) = self.introductions.lock().clone() else {
+            return Vec::new();
+        };
+        self.grants
+            .live_entries(key, SystemTime::now())
+            .iter()
+            .filter(|entry| surface.sync_group(&entry.folder).is_some())
+            .filter_map(|entry| crate::grants::folder_namespace(&entry.folder))
+            .collect()
+    }
+
+    /// An entry was added for `key` while its link may be up: the link a
+    /// grant admitted routes the group of the new entry's owner at once (two
+    /// people who invited each other share one link, made for the first
+    /// entry). The forwarder is told while the link table is locked.
+    pub(crate) fn route_grant_groups(&self, key: &KeyFingerprint) {
+        let routes = grant_group_routes(&self.granted_owners(key), &[]);
+        if routes.is_empty() {
+            return;
+        }
+        self.table.add_grant_routes(key, &routes, |face, added| {
+            self.faces.add_routes(face, added);
+            tracing::info!(
+                target: "face.quic",
+                face = face.0,
+                added = ?added.iter().map(|r| r.prefix.to_string()).collect::<Vec<_>>(),
+                "a grant for another space was made: the owner's sync group is routed over the link"
+            );
+        });
+    }
+
     /// The namespaces this device shows in a hello: the one of its link
     /// key's certificate and each of its memberships', sorted.
     pub(crate) fn shown_namespaces(&self) -> Vec<Name> {
@@ -957,17 +991,8 @@ impl Links {
         // A link a grant admitted also routes the sync group of the owner of
         // each space the key's entries grant, when the data layer gives the
         // space a group (the filter carries only that group's names).
-        if admitted.grant.is_some()
-            && let Some(surface) = self.introductions.lock().clone()
-        {
-            let owners: Vec<Name> = self
-                .grants
-                .live_entries(&admitted.fingerprint, SystemTime::now())
-                .iter()
-                .filter(|entry| surface.sync_group(&entry.folder).is_some())
-                .filter_map(|entry| crate::grants::folder_namespace(&entry.folder))
-                .collect();
-            let more = grant_group_routes(&owners, &routes);
+        if admitted.grant.is_some() {
+            let more = grant_group_routes(&self.granted_owners(&admitted.fingerprint), &routes);
             routes.extend(more);
         }
         // A person is told of a departure by a full link only: what a peer says

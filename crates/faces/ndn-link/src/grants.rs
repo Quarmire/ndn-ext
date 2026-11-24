@@ -492,6 +492,7 @@ impl Links {
             // The person is invited into the folder again: the departure of
             // an earlier record no longer describes them.
             self.departures.remove(&key, &grant.folder);
+            self.route_grant_groups(&key);
         }
         match replaced {
             Some((previous, How::Expired, true)) => {

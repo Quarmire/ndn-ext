@@ -1192,3 +1192,50 @@ async fn a_writer_of_one_folder_and_a_reader_of_another_push_under_the_writers_n
     );
     cancel.cancel();
 }
+
+/// A second entry of a key whose link is up, for a space of another owner
+/// (two people who invited each other share one link), routes that owner's
+/// sync group over the link at once, not when the link is made again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grant_made_while_the_link_is_up_routes_its_owners_group_at_once() {
+    let cancel = CancellationToken::new();
+    let (a, b, c) = (
+        namespace("/a", 10).await,
+        namespace("/b", 20).await,
+        namespace("/c", 30).await,
+    );
+    let (ann_links, at_ann, addr) = ann(&a, &b, &c, &cancel).await;
+    let phone_b = b.device("member", "phone", 22).await;
+    let entry = |folder: &str| Grant {
+        key: phone_b.fingerprint(),
+        namespaces: vec![n("/b")],
+        role: GrantRole::Writer,
+        folder: n(folder),
+        until: None,
+    };
+    ann_links.grant(entry(FOLDER));
+    let (_phone, at_phone, _) = start(
+        phone_b.link_key(),
+        Trust::new(&[&a, &b, &c], phone_b.chain.clone(), Vec::new()),
+        vec![ann_peer(&ann_links, &addr)],
+        false,
+        &cancel,
+    );
+    at_ann
+        .settles("ann links the phone", |f| f.live.lock().len() == 1)
+        .await;
+    at_phone
+        .settles("the phone has its link", |f| f.live.lock().len() == 1)
+        .await;
+    assert!(at_ann.sorted_routes().contains(&n("/a/32=sync")));
+    assert!(!at_ann.sorted_routes().contains(&n("/c/32=sync")));
+
+    ann_links.grant(entry("/c/32=data/other"));
+    at_ann
+        .settles("the second owner's group is routed", |f| {
+            f.sorted_routes().contains(&n("/c/32=sync"))
+        })
+        .await;
+    assert_eq!(at_ann.live.lock().len(), 1, "the link stayed");
+    cancel.cancel();
+}
