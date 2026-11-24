@@ -12,9 +12,10 @@
 //!   The groups are already routed (multicast) by the libraries that route sync;
 //!   the forwarder is unchanged.
 //! - **Run keys.** [`Signals::open`] makes a fresh Ed25519 run key; the device key
-//!   signs its run header (ndn-data's `Device::signal_header`); the run key signs
-//!   each packet. A receiver admits a header through `Device::signal_admit` and
-//!   checks the sender's membership on every packet (`Device::signal_member`).
+//!   signs its run header (ndn-heap's `signal_header`); the run key signs each packet. A
+//!   receiver admits a header ([`Signals`]' gate: the node's `signal_sender`, then the
+//!   header verified by the node's `signal_view` under the live rule, then `signal_sender`
+//!   again) and checks the sender's membership on every packet (`signal_member`).
 //! - **Sealing.** In a sealed scope every packet is sealed under the scope's
 //!   signal key (XChaCha20-Poly1305) after it is signed.
 //! - **Latest per (sender, address).** A subscriber reads the newest signal per
@@ -29,12 +30,14 @@
 //! Interest to the face it came from, and a hub never attaches to its own rings.
 //! Two hubs in one process (two devices) receive each other's.
 //!
-//! **Hosting.** `Signals::start` takes a connection of its own to the forwarder and
-//! registers this device's namespace group `<ns>/32=sync` on it. Over ndn-ipc that
-//! registers the route; on an in-process engine the host routes the group to the
-//! connection's face, as it does for the Device's sync face, and runs the group
-//! with the multicast strategy (as for sync).
+//! **Hosting.** `Signals::start` takes a [`NodeHandle`], a connection
+//! of its own to the forwarder and the store the node was started with (the clock and the
+//! sequence counter are kept in it). The first [`Signals::subscribe`] to a space routes the
+//! owner's group `<O>/32=sync` to that connection: over ndn-ipc that registers the route; on
+//! an in-process engine the host routes the group to the connection's face, as it does for
+//! the node's sync face, and runs the group with the multicast strategy (as for sync).
 
+mod admit;
 mod clock;
 mod crypto;
 mod queue;
@@ -52,13 +55,16 @@ use std::time::Duration;
 use bytes::Bytes;
 use ed25519_dalek::VerifyingKey;
 use ndn_app::Connection;
-use ndn_data::{DataError, Device, NextStep, SignalKey, SignalRefusal, SignalScope, SignalSender};
 use ndn_foundation_types::{Name, NameComponent};
+use ndn_heap::host::NodeHandle;
+use ndn_heap::{HeapError, NextStep, SignalKey, SignalRefusal, SignalScope, SignalSender};
 use ndn_packet::{Data, Interest};
+use ndn_sync::DataStore;
 use tokio::task::JoinHandle;
 
 use crate::{NamedPublisher, NamedSubscriber};
-use clock::Clock;
+use admit::Gate;
+use clock::{Clock, Durable, SEQ_BLOCK};
 use crypto::RunKey;
 use queue::Queue;
 use state::{Bucket, Latest, ReplayWindow};
@@ -339,10 +345,11 @@ pub enum SignalError {
     /// From the forwarder connection or the local ring.
     #[error("the forwarder connection or the local ring failed: {0}")]
     Io(String),
-    /// Any other refusal of the scope by the data layer (a name that is no
-    /// folder or collection, a local failure, …). Next: as the data error says.
+    /// Any other refusal of the scope by the heap layer (a name that is no
+    /// space, a local failure, a counter the store cannot make durable, …). Next:
+    /// as the heap error says.
     #[error(transparent)]
-    Data(DataError),
+    Heap(HeapError),
 }
 
 impl SignalError {
@@ -356,17 +363,17 @@ impl SignalError {
                 NextStep::FixName
             }
             SignalError::Io(_) => NextStep::FixLocal,
-            SignalError::Data(e) => e.next(),
+            SignalError::Heap(e) => e.next(),
         }
     }
 }
 
-/// A data-layer refusal of a scope as a signal refusal, keeping its next step:
+/// A heap refusal of a scope as a signal refusal, keeping its next step:
 /// no member (or outside a sealed audience) is NotMember, anything that may
-/// succeed later NotReady, every other refusal the data error itself.
-fn scope_error(scope: &Name, e: DataError) -> SignalError {
+/// succeed later NotReady, every other refusal the heap error itself.
+fn scope_error(scope: &Name, e: HeapError) -> SignalError {
     match e {
-        DataError::NotAllowed { .. } | DataError::Sealed { .. } => SignalError::NotMember {
+        HeapError::NotAllowed { .. } | HeapError::Sealed { .. } => SignalError::NotMember {
             scope: scope.clone(),
             why: e.to_string(),
         },
@@ -374,7 +381,7 @@ fn scope_error(scope: &Name, e: DataError) -> SignalError {
             scope: scope.clone(),
             why: e.to_string(),
         },
-        e => SignalError::Data(e),
+        e => SignalError::Heap(e),
     }
 }
 
@@ -624,7 +631,7 @@ struct HubState {
     runs: HashMap<RunId, RunState>,
     /// Run headers being admitted.
     admitting: HashMap<RunId, Admitting>,
-    /// The device's `signal_revocations` the runs held were admitted under.
+    /// The node's `revocations` the runs held were admitted under.
     revocations: u64,
     /// Signature checks of packets not verified yet in this process
     /// ([`CHECK_RATE_PROCESS`]), from the first.
@@ -638,10 +645,11 @@ struct HubState {
 }
 
 struct Hub {
-    device: Device,
+    node: NodeHandle,
     conn: Arc<dyn Connection>,
     options: SignalOptions,
-    listen: Name,
+    /// The prefixes routed to `conn` ([`Hub::route`]); held across the registration.
+    routes: tokio::sync::Mutex<HashSet<Name>>,
     counters: Counters,
     state: Mutex<HubState>,
     closed: AtomicBool,
@@ -650,11 +658,15 @@ struct Hub {
     push: Mutex<Bucket>,
     /// The clock every date and judgement is read from ([`clock::Clock`]).
     clock: Clock,
+    /// The sequence counter and the time hint, kept in the store the process was started with.
+    durable: Durable,
+    /// The certificate fetches run headers wait for ([`Gate`]).
+    gate: Gate,
     /// The next sequence this process gives: one counter for all its runs, so a new run's
     /// start is above every sequence of every run before it (spec §3.3).
     next_seq: AtomicU64,
-    /// The sequence counter the device made durable, as far as this process knows
-    /// ([`Device::signal_sequences`]): every sequence given is below it.
+    /// The sequence counter made durable, as far as this process knows
+    /// ([`Durable::sequences`]): every sequence given is below it.
     reserved: AtomicU64,
     /// A background extension of the counter is running.
     extending: AtomicBool,
@@ -670,12 +682,30 @@ struct Checked {
 type Dropped = (Reason, String);
 
 impl Hub {
-    /// The time this process dates what it sends by ([`Clock::now`]), noted to the device as
+    /// The time this process dates what it sends by ([`Clock::now`]), noted in the store as
     /// the hint a restart continues from (spec §3.5). It never waits.
     fn dating_us(&self) -> u64 {
         let now = self.clock.now();
-        self.device.note_signal_time(now);
+        self.durable.note_time(now);
         now
+    }
+
+    /// Route the owner's sync group of `group` (a space's, `<O>/32=sync/..`) to this
+    /// connection, once: the pushes into the space's group are then delivered here. The
+    /// owner's `<O>/32=sync` is what the node's own sync face is routed by, so this one
+    /// joins it as another next hop; a longer prefix would take the space's Sync Interests
+    /// from the node (a longest-prefix match).
+    async fn route(&self, group: &Name) -> Result<(), SignalError> {
+        let prefix = wire::route_of(group);
+        let mut routed = self.routes.lock().await;
+        if routed.contains(&prefix) {
+            return Ok(());
+        }
+        self.conn.register_prefix(&prefix).await.map_err(|e| {
+            SignalError::Io(format!("cannot register {prefix} on the connection: {e}"))
+        })?;
+        routed.insert(prefix);
+        Ok(())
     }
 
     /// Monotonic µs: the rate buckets and the timers read it, and only compare readings.
@@ -696,9 +726,9 @@ impl Hub {
     }
 
     /// `n` sequences, the first of them returned: one counter for all this process's runs,
-    /// durable in the device before any is given (spec §3.3). Once less than half a block is
+    /// durable in the store before any is given (spec §3.3). Once less than half a block is
     /// left, the next block is asked for in the background, so a send rarely waits. Refused
-    /// with the data layer's reason when the counter can't be made durable: a sequence given
+    /// with the store's reason when the counter can't be made durable: a sequence given
     /// beyond it could be given again after a restart. Refused `TooLarge` when the
     /// sequences are spent.
     async fn sequences(self: &Arc<Self>, n: u64) -> Result<u64, SignalError> {
@@ -715,24 +745,16 @@ impl Hub {
         let end = first + n;
         let reserved = self.reserved.load(Ordering::Acquire);
         if end > reserved {
-            let floor = self
-                .device
-                .signal_sequences(end)
-                .await
-                .map_err(SignalError::Data)?;
+            let floor = self.durable.sequences(end).await?;
             self.reserved.fetch_max(floor, Ordering::AcqRel);
             return Ok(first);
         }
-        if end.saturating_add(Device::SIGNAL_SEQ_BLOCK / 2) > reserved
+        if end.saturating_add(SEQ_BLOCK / 2) > reserved
             && !self.extending.swap(true, Ordering::AcqRel)
         {
             let hub = Arc::clone(self);
             let task = tokio::spawn(async move {
-                if let Ok(floor) = hub
-                    .device
-                    .signal_sequences(reserved.saturating_add(1))
-                    .await
-                {
+                if let Ok(floor) = hub.durable.sequences(reserved.saturating_add(1)).await {
                     hub.reserved.fetch_max(floor, Ordering::AcqRel);
                 }
                 hub.extending.store(false, Ordering::Release);
@@ -855,7 +877,7 @@ impl Hub {
             st.scopes.keys().cloned().collect()
         };
         for scope in scopes {
-            if let Ok(s) = self.device.signal_scope(&scope) {
+            if let Ok(s) = self.node.signal_scope(&scope) {
                 set_keys(&mut self.lock(), &scope, &s, now);
             }
         }
@@ -885,7 +907,7 @@ impl Hub {
         let ahead_ms = self.reading_ms();
         let skew = self.skew_ms();
         let run_id = body.run;
-        let revocations = self.device.signal_revocations();
+        let revocations = self.node.revocations();
         let (key, sender) = {
             let mut guard = self.lock();
             let st = &mut *guard;
@@ -1011,7 +1033,7 @@ impl Hub {
                 "its run signature does not verify by the run's key",
             );
         }
-        if !self.device.signal_member(&body.scope, &sender) {
+        if !self.node.signal_member(&body.scope, &sender) {
             // Its slots are free for members at once (§8.4).
             self.lock().runs.remove(&run_id);
             return self.drop_packet(
@@ -1172,9 +1194,10 @@ impl Hub {
     /// checked here first ([`Self::check_header`]: the packet's run signature
     /// under the run key the header binds, the signer a member); then, while
     /// fewer than [`ADMITTING_PER_SCOPE`] headers of the scope and
-    /// [`ADMITTING_PER_NAMESPACE`] of the signer's namespace are, admitted by
-    /// the device; then the packet and those of the run that came meanwhile
-    /// are processed.
+    /// [`ADMITTING_PER_NAMESPACE`] of the signer's namespace are, admitted
+    /// ([`Gate::admit`]: verified by the node's view of its signer, its
+    /// certificates fetched within a budget); then the packet and those of the
+    /// run that came meanwhile are processed.
     fn admit(
         self: &Arc<Self>,
         body: Inbound,
@@ -1237,12 +1260,12 @@ impl Hub {
             },
         );
         drop(guard);
-        let revocations = self.device.signal_revocations();
+        let revocations = self.node.revocations();
         let hub = Arc::clone(self);
         let task = tokio::spawn(async move {
             let outcome = hub
-                .device
-                .signal_admit(&body.scope, &checked.data)
+                .gate
+                .admit(&hub.node, &body.scope, &checked.data)
                 .await
                 .map_err(refused);
             let Some((attach, waiting)) = hub.admitted(&body, checked, outcome, revocations) else {
@@ -1300,7 +1323,7 @@ impl Hub {
                 "its run header binds a key whose id is another run's".into(),
             ));
         }
-        match ndn_data::wire::parse_signal_run_name(&data.name) {
+        match ndn_heap::wire::parse_signal_run_name(&data.name) {
             Some(n) if n.run == body.run.0 && n.scope == body.scope => {}
             _ => {
                 return Err(malformed(format!(
@@ -1350,7 +1373,7 @@ impl Hub {
             ));
         }
         let sender = self
-            .device
+            .node
             .signal_sender(&body.scope, &data)
             .map_err(refused)?;
         Ok((
@@ -1378,7 +1401,7 @@ impl Hub {
         let run = body.run;
         let now = self.ticks_us();
         let now_ms = self.raw_ms();
-        let current = self.device.signal_revocations();
+        let current = self.node.revocations();
         let mut guard = self.lock();
         let st = &mut *guard;
         let waiting = st
@@ -1525,7 +1548,7 @@ impl Hub {
             .iter()
             .filter(|(_, r)| r.scope == *scope && namespace.is_none_or(|ns| r.namespace == *ns))
         {
-            if !self.device.signal_member(scope, &r.sender) {
+            if !self.node.signal_member(scope, &r.sender) {
                 gone.push(*id);
             } else if now.saturating_sub(r.verified_us) >= idle
                 && idlest.is_none_or(|(_, t)| r.verified_us < t)
@@ -1754,22 +1777,28 @@ fn pushed(wire: Bytes) -> Option<Bytes> {
 // ---- the public handles -----------------------------------------------------------------------
 
 /// One process's signals: a dedicated connection to the forwarder (in-process
-/// engine or ndn-ipc), a Device for gating, keys and run headers. Cheap to clone.
+/// engine or ndn-ipc), the node's gate for membership, keys and run headers, and the
+/// store its clock and sequence counter are kept in. Cheap to clone.
 #[derive(Clone)]
 pub struct Signals {
     hub: Arc<Hub>,
 }
 
 impl Signals {
-    /// Registers this device's own namespace group `<ns>/32=sync` on `conn` and
-    /// starts receiving. `conn` must be a connection of its own (not the Device's).
-    /// On an in-process engine the host routes the group to this connection's face,
-    /// as it routes the Device's sync face. Refused `TooLarge` for a ttl or run
-    /// lifetime over its limit, `Io` when the group can't be registered.
+    /// Starts receiving on `conn`, a connection of its own (not the node's), over the
+    /// `node` it gates by (a [`NodeHandle`] of it: the host keeps the [`ndn_heap::Node`]
+    /// itself, which stops when dropped). The clock and the sequence counter are kept in
+    /// `store` under `/localhost/ndn-surface/` (the store the node was started with, as a
+    /// host gives it): a process started again on the store a stopped one left dates and
+    /// numbers past it. A space's group is routed to `conn` when the space is first
+    /// subscribed ([`Self::subscribe`]), as the host routes its prefix on an in-process
+    /// engine (the owner's `<O>/32=sync`, with the multicast strategy, as for sync). Refused
+    /// `TooLarge` for a ttl or run lifetime over its limit.
     pub async fn start(
-        device: Device,
+        node: NodeHandle,
         conn: Arc<dyn Connection>,
         options: SignalOptions,
+        store: Arc<dyn DataStore>,
     ) -> Result<Signals, SignalError> {
         if options.ttl > TTL_MAX {
             return Err(SignalError::TooLarge {
@@ -1785,32 +1814,27 @@ impl Signals {
                 max: RUN_LIFETIME_MAX.as_millis() as usize,
             });
         }
-        let listen = wire::sync_group(device.namespace());
-        conn.register_prefix(&listen).await.map_err(|e| {
-            SignalError::Io(format!("cannot register {listen} on the connection: {e}"))
-        })?;
-        let clock = Clock::new(
-            options.clock.clone(),
-            device.signal_time_hint(),
-            options.run_lifetime,
-        );
+        let durable = Durable::load(store);
+        let clock = Clock::new(options.clock.clone(), durable.hint(), options.run_lifetime);
         let push = Bucket::new(
             u64::from(options.push_rate.get()),
             u64::from(options.push_burst.get()),
             clock.ticks(),
         );
-        let floor = device.signal_sequence_floor();
+        let floor = durable.floor();
         let hub = Arc::new(Hub {
-            device,
+            node,
             conn: Arc::clone(&conn),
             options,
-            listen,
+            routes: tokio::sync::Mutex::new(HashSet::new()),
             counters: Counters::default(),
             state: Mutex::new(HubState::default()),
             closed: AtomicBool::new(false),
             tasks: Mutex::new(Vec::new()),
             push: Mutex::new(push),
             clock,
+            durable,
+            gate: Gate::default(),
             next_seq: AtomicU64::new(floor),
             reserved: AtomicU64::new(floor),
             extending: AtomicBool::new(false),
@@ -1829,11 +1853,6 @@ impl Signals {
         });
         hub.spawn(task);
         Ok(Signals { hub })
-    }
-
-    /// The group this device listens in: its namespace's `<ns>/32=sync`.
-    pub fn listen(&self) -> &Name {
-        &self.hub.listen
     }
 
     /// The octets of address plus payload that one signal always fits beside in a
@@ -1864,18 +1883,20 @@ impl Signals {
         Ok(())
     }
 
-    /// Signals of `scope` (a folder or a collection), from every member, local or
-    /// remote. Refused with NotMember when this device isn't a member by the record
-    /// in force, NotReady when no record is held yet (or, sealed, the epoch key
-    /// isn't held yet: its ask has started; ask again).
+    /// Signals of `scope` (a space), from every member, local or remote. Refused
+    /// with NotMember when this device isn't a member or a reader by the entries
+    /// held, NotReady when the space's creation isn't held yet (or, sealed, the
+    /// epoch key isn't held yet: its ask has started; ask again). The space's sync
+    /// group is routed to this connection from the first subscription to it.
     pub async fn subscribe(&self, scope: &Name) -> Result<SignalSubscriber, SignalError> {
         self.open_check()?;
         scope_fits(scope)?;
         let s = self
             .hub
-            .device
+            .node
             .signal_scope(scope)
             .map_err(|e| scope_error(scope, e))?;
+        self.hub.route(&s.listen).await?;
         let queue = Arc::new(Queue::default());
         let now = self.hub.ticks_us();
         let digest = ScopeDigest::of(scope);
@@ -1907,7 +1928,7 @@ impl Signals {
         self.open_check()?;
         scope_fits(scope)?;
         self.hub
-            .device
+            .node
             .signal_scope(scope)
             .map_err(|e| scope_error(scope, e))?;
         let start = self.hub.sequences(1).await?;
@@ -1985,7 +2006,7 @@ impl Keyed {
             ring,
         };
         let header = hub
-            .device
+            .node
             .signal_header(scope, &key.id().0, &wire::encode_run_header_body(&body))
             .map_err(|e| scope_error(scope, e))?;
         if header.len() > wire::HEADER_MAX {
@@ -2145,7 +2166,7 @@ impl SignalRun {
         // the moment this device holds a record that removes it.
         let scope = self
             .hub
-            .device
+            .node
             .signal_scope(&self.scope)
             .map_err(|e| scope_error(&self.scope, e))?;
         let mut now = self.hub.dating_us();

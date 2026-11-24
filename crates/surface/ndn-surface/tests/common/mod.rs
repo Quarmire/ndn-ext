@@ -1,6 +1,6 @@
-//! Real devices for the signal tests and bench: namespaces with an anchor, device
-//! keys certified by it, `ndn_data::Device`s started on in-process engines, and a
-//! `Signals` hub per device on a connection of its own, routed as a host routes it.
+//! Real nodes for the signal tests and bench: namespaces with an anchor, device keys
+//! certified by it, `ndn_heap::Node`s started on in-process engines, and a `Signals` hub
+//! per node on a connection of its own, routed as a host routes it.
 
 #![allow(dead_code)]
 
@@ -11,17 +11,16 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::StreamExt;
 use ndn_app::{Connection, EngineAppExt};
-use ndn_data::{Audience, Config, DataLayer, Device, Frontier, Rule, Share, Sharing, Transport};
 use ndn_engine::{EngineBuilder, EngineConfig, ForwarderEngine, ShutdownHandle};
 use ndn_face::net::UdpFace;
+use ndn_heap::{Config, Frontier, Node, Readers, Share, Transport};
 use ndn_packet::Name;
 use ndn_security::{
     Certificate, SecurityManager, SecurityProfile, SignedTrustContext, TrustSchema, Validator,
 };
 use ndn_surface::signal::{SignalError, SignalOptions, SignalSubscriber, Signals, wire};
-use ndn_sync::MemoryStore;
+use ndn_sync::{DataStore, MemoryStore};
 use tokio_util::sync::CancellationToken;
 
 /// The octets of `name`'s encoding as a Name TLV.
@@ -62,8 +61,6 @@ pub struct World {
     issuer: Name,
     anchor: Certificate,
     devices: Vec<(Name, Arc<SecurityManager>, Certificate)>,
-    /// Other namespaces whose trust contexts its devices hold: (namespace, anchor).
-    trusted: Vec<(Name, Certificate)>,
     pub cancel: CancellationToken,
 }
 
@@ -90,7 +87,6 @@ impl World {
             issuer,
             anchor,
             devices: Vec::new(),
-            trusted: Vec::new(),
             cancel: CancellationToken::new(),
         };
         for d in devices {
@@ -115,22 +111,13 @@ impl World {
         &self.ns
     }
 
-    /// Its devices started from now on hold `other`'s trust context too, so a
-    /// record naming `other`'s namespace counts its group.
-    pub fn trust(&mut self, other: &World) {
-        self.trusted.push((other.ns.clone(), other.anchor.clone()));
-    }
-
     /// A validator as each device's host holds it: the namespace's trust context
-    /// (its anchor), those it trusts, and its devices' certificates.
+    /// (its anchor), and its devices' certificates.
     fn validator(&self) -> Arc<Validator> {
         let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
-        let own = [(self.ns.clone(), self.anchor.clone())];
-        for (ns, anchor) in own.iter().chain(&self.trusted) {
-            let ctx = SignedTrustContext::hierarchical(ns.clone()).with_version(1);
-            assert!(ctx.add_anchor(anchor.clone()));
-            validator.adopt_context(Arc::new(ctx)).unwrap();
-        }
+        let ctx = SignedTrustContext::hierarchical(self.ns.clone()).with_version(1);
+        assert!(ctx.add_anchor(self.anchor.clone()));
+        validator.adopt_context(Arc::new(ctx)).unwrap();
         for (_, _, cert) in &self.devices {
             validator.cert_cache().insert(cert.clone());
         }
@@ -178,68 +165,80 @@ impl World {
             node: engine.engine.app_node(self.cancel.child_token()),
             sync: engine.engine.app_face(self.cancel.child_token()),
         };
-        let device = Device::start(
+        let node = Node::start(
             transport,
             name.clone(),
             Arc::clone(keys),
             self.validator(),
-            store,
+            Arc::clone(&store) as Arc<dyn DataStore>,
             Config {
                 first_look: Duration::from_millis(50),
                 ..Config::new()
             },
         )
         .await
-        .expect("the device starts");
+        .expect("the node starts");
         let signals = Signals::start(
-            device.clone(),
+            node.handle(),
             wrap(engine.engine.app_face(self.cancel.child_token())),
             options,
+            store,
         )
         .await
         .expect("signals start");
-        Host { device, signals }
+        Host { node, signals }
     }
 }
 
-/// A device and its signals.
+/// A node and its signals.
 pub struct Host {
-    pub device: Device,
+    pub node: Node,
     pub signals: Signals,
 }
 
 impl Host {
-    /// Share `folder` with every device of the namespace writing; sealed to the
-    /// namespace's person when `sealed`.
-    pub async fn share(&self, folder: &Name, ns: &Name, sealed: bool) {
+    /// Create the space `space` here, shared with no one but the owner's person: every device
+    /// of the namespace writes (and reads); sealed to the owner when `sealed`, public otherwise.
+    pub async fn share(&self, space: &Name, sealed: bool) {
         let readers = if sealed {
-            vec![Audience::Person(ns.clone())]
+            Readers::Persons(Vec::new())
         } else {
-            Vec::new()
+            Readers::Anyone
         };
-        self.device
-            .share_folder(
-                folder,
-                Sharing::Whole(Share {
-                    rule: Rule::Log,
-                    writers: vec![ns.clone()],
+        self.node
+            .create(
+                space,
+                Share {
                     readers,
-                }),
+                    writers: Vec::new(),
+                },
             )
             .await
-            .expect("the owner shares the folder");
+            .expect("the owner creates the space");
     }
 
-    /// Subscribe to `scope` once this device holds what it needs (the record,
-    /// and sealed the epoch key), within `within`. The device follows the scope,
-    /// as a host watching it does, so its owner's record arrives.
-    pub async fn subscribe(&self, scope: &Name, within: Duration) -> SignalSubscriber {
-        let mut changes = self
-            .device
-            .watch(scope, &Frontier::new())
+    /// Open `space` and watch it, as a host does, so its owner's entries arrive: the node
+    /// holds the space for as long as the watch runs.
+    pub async fn follow(&self, space: &Name) {
+        let heap = self
+            .node
+            .open(space)
             .await
-            .expect("the device follows the scope");
-        tokio::spawn(async move { while changes.next().await.is_some() {} });
+            .expect("the node opens the space");
+        let mut changes = heap
+            .watch(&Frontier::new())
+            .await
+            .expect("the node watches the space");
+        tokio::spawn(async move {
+            let _held = heap;
+            while changes.next().await.is_some() {}
+        });
+    }
+
+    /// Subscribe to `scope` once this node holds what it needs (the space's creation, and
+    /// sealed the epoch key), within `within`; it follows the space first ([`Self::follow`]).
+    pub async fn subscribe(&self, scope: &Name, within: Duration) -> SignalSubscriber {
+        self.follow(scope).await;
         let deadline = Instant::now() + within;
         loop {
             match self.signals.subscribe(scope).await {
@@ -247,7 +246,7 @@ impl Host {
                 Err(SignalError::NotReady { .. }) if Instant::now() < deadline => {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
-                Err(e) => panic!("{} cannot subscribe to {scope}: {e}", self.device.name()),
+                Err(e) => panic!("{} cannot subscribe to {scope}: {e}", self.node.name()),
             }
         }
     }

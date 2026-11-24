@@ -11,7 +11,7 @@
 //!   reading holds the time it last dated by, is not deaf to signals dated by real time.
 //! - **the reading** ([`Clock::now`]) dates what this process sends. It starts at
 //!   `max(raw, hint + 1)`, the hint being the time this device last dated by
-//!   ([`Device::signal_time_hint`](ndn_data::Device::signal_time_hint)), and runs on by the
+//!   ([`Durable::hint`]), and runs on by the
 //!   progress of time since: a monotonic clock when the raw clock is the system's (immune to
 //!   the system clock stepping), the raw clock's own forward progress when a host gave one. So a
 //!   clock that stepped back is held where it was while the process runs, and a restart does not
@@ -24,16 +24,21 @@
 //! start (a clock set far ahead, dated by, then corrected), or a raw clock that falls further
 //! behind the reading while running, is not kept: the reading goes to raw, and a warning says
 //! so. Sequences are not dated by the reading, they come from the device's durable counter
-//! (`Device::signal_sequences`), so the reading going to raw never lowers one.
+//! (`Durable::sequences`), so the reading going to raw never lowers one.
 //!
 //! Held within the run lifetime, a forward step persists until real time catches up; a sender
 //! whose clock stays behind real time still dates signals that are expired for receivers
 //! (§13.8).
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use super::{SignalClock, system_us};
+use bytes::Bytes;
+use ndn_foundation_types::Name;
+use ndn_heap::HeapError;
+use ndn_sync::DataStore;
+
+use super::{SignalClock, SignalError, system_us};
 
 /// The layer's clock.
 pub(super) struct Clock {
@@ -141,6 +146,156 @@ impl Clock {
         (s.reading, s.ticks)
     }
 }
+
+/// Sequences made durable at a time (signals.md §3.3, §3.5): a send inside the block held needs
+/// no write, and a crash loses at most one block of the 2^64 sequences.
+pub(super) const SEQ_BLOCK: u64 = 1 << 20;
+
+/// How far a time dated by must be from the hint held before the hint is written again
+/// (signals.md §3.5): the hint is a hint, so a write about once a second is enough.
+const TIME_NOTE_EVERY_US: u64 = 1_000_000;
+
+/// Where the store keeps the sequence counter (`/localhost/ndn-surface/signal-clock`, 8 octets
+/// big-endian): a number made durable above every sequence given, so a restart never gives one
+/// below it. A prefix no device serves and the heap layer never scans.
+fn counter_name() -> Name {
+    "/localhost/ndn-surface/signal-clock"
+        .parse()
+        .expect("a valid name")
+}
+
+/// Where the store keeps the time hint (`/localhost/ndn-surface/signal-time`, 8 octets
+/// big-endian, µs since the Unix epoch): a time signals were dated by, written lazily and never
+/// waited for.
+fn time_name() -> Name {
+    "/localhost/ndn-surface/signal-time"
+        .parse()
+        .expect("a valid name")
+}
+
+/// What a process keeps of signals' clock in the store it was started with: the sequence counter
+/// and the time hint.
+pub(super) struct Durable {
+    store: Arc<dyn DataStore>,
+    held: Mutex<Held>,
+}
+
+struct Held {
+    /// The counter made durable: every sequence given is below it.
+    durable: u64,
+    /// The highest counter written (a write whose barrier may not have returned).
+    written: u64,
+    /// The time hint, as last read or noted (µs since the Unix epoch).
+    hint: u64,
+}
+
+impl Durable {
+    /// What the last run left in `store`: the counter and the hint, 0 for each a process never
+    /// wrote.
+    pub(super) fn load(store: Arc<dyn DataStore>) -> Durable {
+        let read = |name: Name| {
+            store
+                .get(&name)
+                .and_then(|w| w.get(..8).and_then(|b| b.try_into().ok()))
+                .map_or(0, u64::from_be_bytes)
+        };
+        let counter = read(counter_name());
+        let hint = read(time_name());
+        Durable {
+            store,
+            held: Mutex::new(Held {
+                durable: counter,
+                written: counter,
+                hint,
+            }),
+        }
+    }
+
+    fn held(&self) -> std::sync::MutexGuard<'_, Held> {
+        self.held.lock().expect("signal durable lock")
+    }
+
+    /// The sequences given are above this: the counter made durable, 0 where none was given
+    /// (signals.md §3.3). A process starts its counter here, so a sequence is never given twice
+    /// across a restart or a crash, whatever the clock did in between.
+    pub(super) fn floor(&self) -> u64 {
+        self.held().durable
+    }
+
+    /// The time last dated by, as the last run left it (µs since the Unix epoch; 0 where none was
+    /// dated) or as noted since (signals.md §3.5). A hint, not a floor: written without a
+    /// barrier, so after a crash it may be as old as the last barrier, and a clock that finds it
+    /// far ahead of itself does not keep it.
+    pub(super) fn hint(&self) -> u64 {
+        self.held().hint
+    }
+
+    /// A signal was dated by `us` (µs since the Unix epoch). Held as the hint once it differs
+    /// from the hint by a second or more, in either direction: a clock corrected after running
+    /// ahead takes the hint back with it. Written to the store, never waited for.
+    pub(super) fn note_time(&self, us: u64) {
+        let mut held = self.held();
+        if held.hint.abs_diff(us) < TIME_NOTE_EVERY_US {
+            return;
+        }
+        held.hint = us;
+        self.store
+            .insert(time_name(), Bytes::copy_from_slice(&us.to_be_bytes()));
+    }
+
+    /// About to give sequences below `upto`: the counter once it is at least `upto` and durable.
+    /// Below it already, answered at once with no write. Above it, the counter moves to `upto`
+    /// plus [`SEQ_BLOCK`], the store's barrier ([`DataStore::sync`]) passes, and only then does
+    /// this return, so a crash can never leave the counter at or below a sequence given. Asked
+    /// again before the counter returned is neared.
+    ///
+    /// [`HeapError::Local`] when the store cannot make the write durable (check the disk the
+    /// store is on): no sequence is to be given.
+    pub(super) async fn sequences(&self, upto: u64) -> Result<u64, SignalError> {
+        let write = {
+            let mut held = self.held();
+            if held.durable >= upto {
+                return Ok(held.durable);
+            }
+            let target = upto.saturating_add(SEQ_BLOCK);
+            if held.written < target {
+                held.written = target;
+                self.store.insert(
+                    counter_name(),
+                    Bytes::copy_from_slice(&target.to_be_bytes()),
+                );
+            }
+            held.written
+        };
+        self.sync().await.map_err(|e| {
+            SignalError::Heap(HeapError::Local {
+                reason: format!("the store did not make the signal sequence counter durable ({e})"),
+            })
+        })?;
+        let mut held = self.held();
+        held.durable = held.durable.max(write);
+        Ok(held.durable)
+    }
+
+    /// The store's barrier, on a blocking thread: a flush takes as long as the disk does. A
+    /// store whose flush returns at once ([`DataStore::sync_is_immediate`]) is flushed inline.
+    async fn sync(&self) -> std::io::Result<()> {
+        if self.store.sync_is_immediate() {
+            return self.store.sync();
+        }
+        let store = Arc::clone(&self.store);
+        tokio::task::spawn_blocking(move || store.sync())
+            .await
+            .unwrap_or_else(|e| {
+                Err(std::io::Error::other(format!(
+                    "the flush did not finish ({e})"
+                )))
+            })
+    }
+}
+
+#[cfg(test)]
+mod durable_tests;
 
 #[cfg(test)]
 mod tests {

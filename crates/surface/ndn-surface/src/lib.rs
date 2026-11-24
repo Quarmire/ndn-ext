@@ -45,10 +45,10 @@
 //!
 //! ## Signals (feature `signals`)
 //!
-//! `ndn_surface::signal` carries ephemeral live data (presence, cursors, drags) of a data-layer
-//! folder: pushed as unsigned Interests into the members' sync groups, read off a
-//! run's broadcast ring on this host, gated by `ndn-data` (ndn-rs
-//! `docs/specs/signals.md`).
+//! `ndn_surface::signal` carries ephemeral live data (presence, cursors, drags) of an
+//! `ndn-heap` space: pushed as unsigned Interests into the space's sync group, read off a
+//! run's broadcast ring on this host, gated by `ndn-heap` (membership, keys, run headers;
+//! ndn-rs `docs/specs/heap.md` §11 and `docs/specs/signals.md`).
 //!
 //! Scope: the large-frame `SharedBuffer` path and 1:N fan-out remain seams for the
 //! next phase.

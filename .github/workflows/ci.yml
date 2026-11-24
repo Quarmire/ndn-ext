@@ -103,6 +103,10 @@ jobs:
       # tests: they run here, with the feature.
       - name: nextest (ndn-link fault layer)
         run: cargo nextest run --profile ci -p ndn-link --features fault-injection
+      # ndn-surface's signals (the ndn-heap gate, its clock and fetch budget) are
+      # behind the off-by-default `signals` feature; the default run skips them.
+      - name: nextest (ndn-surface signals)
+        run: cargo nextest run --profile ci -p ndn-surface --features signals
       - name: doctests (nextest does not run these)
         run: cargo test --doc
 

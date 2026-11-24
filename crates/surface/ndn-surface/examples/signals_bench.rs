@@ -1,4 +1,4 @@
-//! Signals, measured between real `ndn_data::Device`s on in-process engines:
+//! Signals, measured between real `ndn_heap::Node`s on in-process engines:
 //!
 //! - latency p50/p99 on one host (off the run's ring) and over one link (two
 //!   engines joined by a UDP face on 127.0.0.1), sealed and unsealed;
@@ -68,10 +68,10 @@ async fn open(host: &Host, scope: &Name) -> SignalRun {
     loop {
         match host.signals.open(scope).await {
             Ok(r) => return r,
-            Err(e) if e.next() == ndn_data::NextStep::RetryLater && Instant::now() < deadline => {
+            Err(e) if e.next() == ndn_heap::NextStep::RetryLater && Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            Err(e) => panic!("{} cannot open a run of {scope}: {e}", host.device.name()),
+            Err(e) => panic!("{} cannot open a run of {scope}: {e}", host.node.name()),
         }
     }
 }
@@ -91,7 +91,7 @@ async fn latency(sealed: bool, over_link: bool) -> (u64, u64, usize) {
         .host(b, "/alice/phone", SignalOptions::default())
         .await;
     let scope = folder(sealed);
-    laptop.share(&scope, world.ns(), sealed).await;
+    laptop.share(&scope, sealed).await;
     let mut sub = phone.subscribe(&scope, WITHIN).await;
     let mut run = open(&laptop, &scope).await;
     let want_local = !over_link;
@@ -139,7 +139,7 @@ async fn bytes(sealed: bool) -> Vec<(&'static str, usize, usize, usize)> {
         .await
         .unwrap();
     let scope = folder(sealed);
-    laptop.share(&scope, world.ns(), sealed).await;
+    laptop.share(&scope, sealed).await;
     let mut run = open(&laptop, &scope).await;
     let payload = [0x5Au8; 16];
     let batch: Vec<(&[u8], &[u8])> = (0..8).map(|_| (&b"cursor"[..], &payload[..])).collect();
@@ -205,7 +205,7 @@ async fn throughput(senders: usize, over_link: bool) -> (f64, f64, f64, u64, u64
         .host(b, "/alice/phone", SignalOptions::default())
         .await;
     let scope = folder(false);
-    hosts[0].share(&scope, world.ns(), false).await;
+    hosts[0].share(&scope, false).await;
     let mut sub: SignalSubscriber = phone.subscribe(&scope, WITHIN).await;
     for h in &hosts[1..] {
         // Each sender device follows the folder so its record arrives.
@@ -276,7 +276,7 @@ async fn throughput(senders: usize, over_link: bool) -> (f64, f64, f64, u64, u64
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
     now_us();
-    println!("# signals bench (ndn-surface, real ndn-data devices, in-process engines)");
+    println!("# signals bench (ndn-surface, real ndn-heap nodes, in-process engines)");
     println!();
     println!("## latency, 60 Hz, 600 signals after a 60-signal warm-up");
     println!("| path | sealed | p50 µs | p99 µs | samples |");

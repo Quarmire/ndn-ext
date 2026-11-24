@@ -1,4 +1,4 @@
-//! Signals between real `ndn_data::Device`s: on one host over a run's ring, over
+//! Signals between real `ndn_heap::Node`s: on one host over a run's ring, over
 //! one link between two forwarders, and at 60 Hz from four senders on both.
 
 mod common;
@@ -57,7 +57,7 @@ async fn a_sealed_scopes_signals_cross_a_link_sealed_and_open_for_a_member() {
         .await
         .unwrap();
     let secret = n("/alice/32=data/secret");
-    laptop.share(&secret, world.ns(), true).await;
+    laptop.share(&secret, true).await;
     let mut sub = phone.subscribe(&secret, WITHIN).await;
     let mut run = laptop.signals.open(&secret).await.unwrap();
     let mut seen = None;
@@ -103,7 +103,7 @@ async fn a_signal_past_its_expires_and_the_skew_is_dropped() {
     };
     let phone = world.host(&e, "/alice/phone", ahead).await;
     let board = n("/alice/32=data/board");
-    laptop.share(&board, world.ns(), false).await;
+    laptop.share(&board, false).await;
     let mut sub = phone.subscribe(&board, WITHIN).await;
     let mut run = laptop.signals.open(&board).await.unwrap();
     for i in 0u32..5 {
@@ -132,8 +132,8 @@ async fn a_sender_is_held_to_its_limits() {
     };
     let laptop = world.host(&e, "/alice/laptop", still).await;
     let (board, secret) = (n("/alice/32=data/board"), n("/alice/32=data/secret"));
-    laptop.share(&board, world.ns(), false).await;
-    laptop.share(&secret, world.ns(), true).await;
+    laptop.share(&board, false).await;
+    laptop.share(&secret, true).await;
     let mut run = laptop.signals.open(&board).await.unwrap();
     let too_large = |r: Result<_, SignalError>| match r {
         Err(SignalError::TooLarge { what, .. }) => what,
@@ -173,7 +173,7 @@ async fn a_sender_is_held_to_its_limits() {
                 Duration::from_micros(8334),
                 "one packet per 1/120 s"
             );
-            assert_eq!(e.next(), ndn_data::NextStep::RetryLater);
+            assert_eq!(e.next(), ndn_heap::NextStep::RetryLater);
         }
         other => panic!("over its burst of 30 the run is rate limited, not {other:?}"),
     }
@@ -193,10 +193,10 @@ async fn a_sender_is_held_to_its_limits() {
     world.cancel.cancel();
 }
 
-/// A scope the data layer refuses for its name (no `32=data`) is refused with
-/// that refusal and its own next step — fix the name — not as a membership one.
+/// A scope that is no space name (no `32=data`) is refused with the heap layer's refusal
+/// and its own next step — fix the name — not as a membership one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_scope_that_is_no_data_layer_name_is_refused_with_the_data_layers_reason() {
+async fn a_scope_that_is_no_space_name_is_refused_with_the_heap_layers_reason() {
     let world = World::new("/alice", &["/alice/laptop"]).await;
     let e = engine().await;
     let laptop = world.host(&e, "/alice/laptop", no_ring()).await;
@@ -206,10 +206,10 @@ async fn a_scope_that_is_no_data_layer_name_is_refused_with_the_data_layers_reas
         laptop.signals.open(&bad).await.map(|_| ()),
     ] {
         match refused {
-            Err(e @ SignalError::Data(ndn_data::DataError::BadName { .. })) => {
-                assert_eq!(e.next(), ndn_data::NextStep::FixName, "{e}");
+            Err(e @ SignalError::Heap(ndn_heap::HeapError::BadName { .. })) => {
+                assert_eq!(e.next(), ndn_heap::NextStep::FixName, "{e}");
             }
-            other => panic!("refused with the data layer's BadName, not {other:?}"),
+            other => panic!("refused with the heap layer's BadName, not {other:?}"),
         }
     }
     world.cancel.cancel();
@@ -226,7 +226,7 @@ async fn a_full_signal_arrives_after_its_header_rode_alone() {
         .host(&e, "/alice/phone", SignalOptions::default())
         .await;
     let board = n("/alice/32=data/board");
-    laptop.share(&board, world.ns(), false).await;
+    laptop.share(&board, false).await;
     let mut sub = phone.subscribe(&board, WITHIN).await;
     let mut run = laptop.signals.open(&board).await.unwrap();
     let seq = run.send(&[7; 64], &[9; 768]).await.unwrap();
@@ -263,7 +263,7 @@ async fn a_signal_that_overtakes_its_headers_packet_is_still_delivered() {
         )
         .await;
     let board = n("/alice/32=data/board");
-    laptop.share(&board, world.ns(), false).await;
+    laptop.share(&board, false).await;
     let mut sub = phone.subscribe(&board, WITHIN).await;
     let mut run = laptop.signals.open(&board).await.unwrap();
     let seq = run.send(&[7; 64], &[9; 768]).await.unwrap();
@@ -295,7 +295,7 @@ async fn packets_whose_headers_never_come_are_let_go_as_unknown_runs() {
         )
         .await;
     let board = n("/alice/32=data/board");
-    laptop.share(&board, world.ns(), false).await;
+    laptop.share(&board, false).await;
     let mut sub = phone.subscribe(&board, WITHIN).await;
     let mut runs = Vec::new();
     for _ in 0..RUNS {
@@ -340,7 +340,7 @@ async fn after_its_first_packet_a_local_runs_signals_come_off_its_ring() {
         .host(&e, "/alice/phone", SignalOptions::default())
         .await;
     let board = n("/alice/32=data/board");
-    laptop.share(&board, world.ns(), false).await;
+    laptop.share(&board, false).await;
     let mut sub = phone.subscribe(&board, WITHIN).await;
     let mut run = laptop.signals.open(&board).await.unwrap();
 
@@ -402,7 +402,7 @@ async fn a_members_signals_arrive_over_one_link() {
         .host(&b, "/alice/phone", SignalOptions::default())
         .await;
     let board = n("/alice/32=data/board");
-    laptop.share(&board, world.ns(), false).await;
+    laptop.share(&board, false).await;
     let mut sub = phone.subscribe(&board, WITHIN).await;
     let mut run = laptop.signals.open(&board).await.unwrap();
     let mut seen = None;
@@ -438,7 +438,7 @@ async fn sixty_hertz_from_four(
         .host(receiver_engine, "/alice/phone", SignalOptions::default())
         .await;
     let board = n("/alice/32=data/board");
-    laptop.share(&board, world.ns(), false).await;
+    laptop.share(&board, false).await;
     let mut sub = phone.subscribe(&board, WITHIN).await;
     const SENDERS: usize = 4;
     const PER_SENDER: u64 = 120;
@@ -545,7 +545,7 @@ async fn a_signal_of_512_octets_fits_in_a_scope_with_a_very_long_name() {
         .await;
     for (sealed, octets) in [(false, wire::SCOPE_MAX), (true, wire::SCOPE_MAX - 1)] {
         let scope = scope_of(octets);
-        laptop.share(&scope, world.ns(), sealed).await;
+        laptop.share(&scope, sealed).await;
         let mut sub = phone.subscribe(&scope, WITHIN).await;
         let mut run = laptop.signals.open(&scope).await.unwrap();
         let seq = run
@@ -582,7 +582,7 @@ async fn room_is_exact_and_a_scope_over_scope_max_is_refused_with_its_limit() {
         let room = Signals::room(&scope);
         assert_eq!(room, wire::ROOM);
         assert!(room >= 512);
-        laptop.share(&scope, world.ns(), true).await;
+        laptop.share(&scope, true).await;
         let mut sub = phone.subscribe(&scope, WITHIN).await;
         let mut run = laptop.signals.open(&scope).await.unwrap();
         let payload = [4u8; wire::PAYLOAD_MAX];
@@ -624,7 +624,7 @@ async fn room_is_exact_and_a_scope_over_scope_max_is_refused_with_its_limit() {
         match refused {
             Err(e @ SignalError::ScopeTooLong { size, max, .. }) => {
                 assert_eq!((size, max), (wire::SCOPE_MAX + 1, wire::SCOPE_MAX));
-                assert_eq!(e.next(), ndn_data::NextStep::FixName);
+                assert_eq!(e.next(), ndn_heap::NextStep::FixName);
                 let why = e.to_string();
                 assert!(
                     why.contains("384") && why.contains("shorter"),
@@ -668,7 +668,7 @@ async fn a_device_with_a_long_key_name_opens_runs_in_a_scope_of_scope_max_octets
         (false, scope_of(wire::SCOPE_MAX)),
         (true, scope_of(wire::SCOPE_MAX - 1)),
     ] {
-        sender.share(&scope, world.ns(), sealed).await;
+        sender.share(&scope, sealed).await;
         let mut sub = phone.subscribe(&scope, WITHIN).await;
         let mut run = sender.signals.open(&scope).await.unwrap();
         let seq = run.send(&[1; 64], &[2; 448]).await.unwrap();
@@ -679,7 +679,7 @@ async fn a_device_with_a_long_key_name_opens_runs_in_a_scope_of_scope_max_octets
     }
     let wide = world.host(&e, &longer_s, no_ring()).await;
     let scope = scope_of(wire::SCOPE_MAX - 2);
-    wide.share(&scope, world.ns(), false).await;
+    wide.share(&scope, false).await;
     match wide.signals.open(&scope).await.map(|_| ()) {
         Err(SignalError::ScopeTooLong { size, max, .. }) => {
             assert_eq!(size, wire::SCOPE_MAX - 2);
@@ -703,8 +703,8 @@ async fn a_packet_replayed_into_another_scope_is_refused() {
     let e = engine().await;
     let laptop = world.host(&e, "/alice/laptop", no_ring()).await;
     let (board, notes) = (n("/alice/32=data/board"), n("/alice/32=data/notes"));
-    laptop.share(&board, world.ns(), false).await;
-    laptop.share(&notes, world.ns(), false).await;
+    laptop.share(&board, false).await;
+    laptop.share(&notes, false).await;
     let group = wire::sync_group(world.ns());
     let tap = e.engine.app_face(world.cancel.child_token());
     tap.register_prefix(&group).await.unwrap();

@@ -8,8 +8,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use common::{World, engine, n, no_ring};
-use futures::StreamExt;
-use ndn_data::DataLayer;
 use ndn_surface::signal::{Signal, SignalError, SignalOptions, SignalSubscriber};
 use ndn_sync::MemoryStore;
 
@@ -54,7 +52,7 @@ async fn a_member_restarted_with_its_clock_an_hour_behind_is_heard_again() {
         .host(&e, "/alice/phone", SignalOptions::default())
         .await;
     let board = n("/alice/32=data/board");
-    laptop.share(&board, world.ns(), false).await;
+    laptop.share(&board, false).await;
     let mut sub = phone.subscribe(&board, WITHIN).await;
     let mut run = laptop.signals.open(&board).await.unwrap();
     let mut before = 0;
@@ -67,7 +65,7 @@ async fn a_member_restarted_with_its_clock_an_hour_behind_is_heard_again() {
     }
     run.close().await;
     laptop.signals.shutdown();
-    laptop.device.shutdown();
+    laptop.node.shutdown();
 
     let laptop = world
         .host_on(
@@ -77,12 +75,7 @@ async fn a_member_restarted_with_its_clock_an_hour_behind_is_heard_again() {
             store,
         )
         .await;
-    let mut changes = laptop
-        .device
-        .watch(&board, &ndn_data::Frontier::new())
-        .await
-        .expect("the restarted device follows the folder");
-    tokio::spawn(async move { while changes.next().await.is_some() {} });
+    laptop.follow(&board).await;
     let deadline = std::time::Instant::now() + WITHIN;
     let mut run = loop {
         match laptop.signals.open(&board).await {
@@ -127,7 +120,7 @@ async fn a_clock_that_steps_back_while_running_never_dates_a_signal_earlier() {
         .host(&e, "/alice/phone", SignalOptions::default())
         .await;
     let board = n("/alice/32=data/board");
-    laptop.share(&board, world.ns(), false).await;
+    laptop.share(&board, false).await;
     let mut sub = phone.subscribe(&board, WITHIN).await;
     let mut run = laptop.signals.open(&board).await.unwrap();
     let first = run.send(b"cursor", b"before").await.unwrap();
@@ -173,7 +166,7 @@ async fn a_sender_whose_clock_stays_behind_real_time_is_still_expired_for_receiv
         .host(&e, "/alice/phone", SignalOptions::default())
         .await;
     let board = n("/alice/32=data/board");
-    laptop.share(&board, world.ns(), false).await;
+    laptop.share(&board, false).await;
     let mut sub = phone.subscribe(&board, WITHIN).await;
     let mut run = laptop.signals.open(&board).await.unwrap();
     for i in 0u8..5 {
@@ -229,14 +222,12 @@ fn warnings() -> Arc<std::sync::Mutex<Vec<String>>> {
     Arc::clone(&LOG)
 }
 
-/// A restarted device's run in `board`, asked again while its record is being read.
-async fn reopened(host: &common::Host, board: &ndn_data::Name) -> ndn_surface::signal::SignalRun {
-    let mut changes = host
-        .device
-        .watch(board, &ndn_data::Frontier::new())
-        .await
-        .expect("the restarted device follows the folder");
-    tokio::spawn(async move { while changes.next().await.is_some() {} });
+/// A restarted node's run in `board`, asked again while its space is being read.
+async fn reopened(
+    host: &common::Host,
+    board: &ndn_foundation_types::Name,
+) -> ndn_surface::signal::SignalRun {
+    host.follow(board).await;
     let deadline = std::time::Instant::now() + WITHIN;
     loop {
         match host.signals.open(board).await {
@@ -274,7 +265,7 @@ async fn fifty_quick_restarts_neither_ratchet_the_clock_nor_lower_a_sequence() {
             .host_on(&e, "/alice/laptop", dated_by(system_us), Arc::clone(&store))
             .await;
         if restart == 0 {
-            laptop.share(&board, world.ns(), false).await;
+            laptop.share(&board, false).await;
             sub = Some(phone.subscribe(&board, WITHIN).await);
         }
         let sub = sub.as_mut().expect("subscribed at the first start");
@@ -299,7 +290,7 @@ async fn fifty_quick_restarts_neither_ratchet_the_clock_nor_lower_a_sequence() {
         );
         run.close().await;
         laptop.signals.shutdown();
-        laptop.device.shutdown();
+        laptop.node.shutdown();
     }
     world.cancel.cancel();
 }
@@ -321,13 +312,13 @@ async fn a_clock_corrected_after_a_two_hour_forward_step_is_read_as_it_is_again(
     let laptop = world
         .host_on(&e, "/alice/laptop", ahead, Arc::clone(&store))
         .await;
-    laptop.share(&board, world.ns(), false).await;
+    laptop.share(&board, false).await;
     let mut sub = phone.subscribe(&board, WITHIN).await;
     let mut run = laptop.signals.open(&board).await.unwrap();
     run.send(b"cursor", b"ahead").await.unwrap();
     run.close().await;
     laptop.signals.shutdown();
-    laptop.device.shutdown();
+    laptop.node.shutdown();
 
     // Corrected: the clock reads real time again, and the device starts.
     let laptop = world
@@ -368,7 +359,7 @@ async fn a_receiver_whose_reading_is_ten_minutes_ahead_still_hears_a_right_clock
     let store = Arc::new(MemoryStore::new());
     let laptop = world.host(&e, "/alice/laptop", no_ring()).await;
     let board = n("/alice/32=data/board");
-    laptop.share(&board, world.ns(), false).await;
+    laptop.share(&board, false).await;
 
     // The phone dated by a clock 10 min ahead, then stopped.
     let ahead = dated_by(|| system_us() + 600_000_000);
@@ -380,7 +371,7 @@ async fn a_receiver_whose_reading_is_ten_minutes_ahead_still_hears_a_right_clock
     run.send(b"cursor", b"ahead").await.unwrap();
     run.close().await;
     phone.signals.shutdown();
-    phone.device.shutdown();
+    phone.node.shutdown();
 
     // It starts again with the clock right: its reading is still 10 min ahead.
     let phone = world
@@ -413,7 +404,7 @@ async fn a_device_restarted_with_its_clock_an_hour_behind_still_hears_a_right_cl
     let store = Arc::new(MemoryStore::new());
     let laptop = world.host(&e, "/alice/laptop", no_ring()).await;
     let board = n("/alice/32=data/board");
-    laptop.share(&board, world.ns(), false).await;
+    laptop.share(&board, false).await;
 
     // The phone dated by a right clock, then stopped.
     let phone = world
@@ -424,7 +415,7 @@ async fn a_device_restarted_with_its_clock_an_hour_behind_still_hears_a_right_cl
     run.send(b"cursor", b"before").await.unwrap();
     run.close().await;
     phone.signals.shutdown();
-    phone.device.shutdown();
+    phone.node.shutdown();
 
     // It starts again with its clock an hour behind.
     let behind = dated_by(|| system_us() - HOUR_US);

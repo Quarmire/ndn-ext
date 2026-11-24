@@ -988,20 +988,38 @@ pub fn push_interest(group: &Name, packet: &[u8]) -> Bytes {
     Bytes::from(out)
 }
 
+/// The prefix to route to a connection that is to hear the pushes into `group`: the group's
+/// `<owner>/32=sync`, up to and with the first `sync` keyword. A space's group is
+/// `<owner>/32=sync/<rest of the space's name>`; the owner's sync face is routed by the shorter
+/// prefix, so a connection routed by it joins the face as another next hop, where a route of the
+/// whole group would take the space's Sync Interests from the face (a longest-prefix match).
+/// `group` itself when it names no `sync` keyword.
+pub fn route_of(group: &Name) -> Name {
+    let comps = group.components();
+    match comps
+        .iter()
+        .position(|c| c.typ == tlv_type::KEYWORD && c.value.as_ref() == SYNC_KEYWORD)
+    {
+        Some(at) => Name::from_components(comps[..=at].to_vec()),
+        None => group.clone(),
+    }
+}
+
 /// The packet a push Interest carries: `Some` when `interest` is named
-/// `<group>/32=signal/<digest>`, carries ApplicationParameters, and `digest` is
-/// SHA-256 of its parameters portion. Anything else (an SVS sync Interest, a
-/// fetch) is no push.
+/// `<group>/32=signal/<digest>`, `group` a sync group (`<owner>/32=sync` and what follows),
+/// carries ApplicationParameters, and `digest` is SHA-256 of its parameters portion. Anything
+/// else (an SVS sync Interest, a fetch) is no push.
 pub fn push_packet(interest: &Interest) -> Option<Bytes> {
     let comps = interest.name.components();
-    let [.., sync, signal, digest] = comps else {
+    let [group @ .., signal, digest] = comps else {
         return None;
     };
     if digest.typ != tlv_type::PARAMETERS_SHA256
         || signal.typ != tlv_type::KEYWORD
         || signal.value.as_ref() != SIGNAL_KEYWORD
-        || sync.typ != tlv_type::KEYWORD
-        || sync.value.as_ref() != SYNC_KEYWORD
+        || !group
+            .iter()
+            .any(|c| c.typ == tlv_type::KEYWORD && c.value.as_ref() == SYNC_KEYWORD)
     {
         return None;
     }
@@ -1270,6 +1288,33 @@ mod tests {
             .app_parameters(packet.clone())
             .build();
         assert_eq!(push_packet(&Interest::decode(svs).unwrap()), None);
+    }
+
+    /// A space's group is `<owner>/32=sync/<the space's name after 32=data>`: a push into it is
+    /// a push, a name with no sync group before `32=signal` is none, and the prefix routed to hear
+    /// it is the owner's `<owner>/32=sync`.
+    #[test]
+    fn a_push_into_a_spaces_group_is_a_push_and_is_routed_by_the_owners_group() {
+        let owner = n("/alice");
+        let group = ndn_heap::wire::sync_group_of(
+            &owner
+                .clone()
+                .append_component(NameComponent::keyword(Bytes::from_static(b"data")))
+                .append("board"),
+        )
+        .expect("a space name");
+        assert_eq!(group, sync_group(&owner).append("board"));
+        let packet = body(None, &[(1, b"a", 2, b"p")]);
+        let interest = Interest::decode(push_interest(&group, &packet)).unwrap();
+        assert_eq!(*interest.name, push_name(&group, &packet));
+        assert_eq!(push_packet(&interest).as_deref(), Some(&packet[..]));
+        assert_eq!(route_of(&group), sync_group(&owner));
+        assert_eq!(route_of(&sync_group(&owner)), sync_group(&owner));
+        // No sync group before `32=signal`: no push, whatever else the name is.
+        let elsewhere = n("/alice/board");
+        let interest = Interest::decode(push_interest(&elsewhere, &packet)).unwrap();
+        assert_eq!(push_packet(&interest), None);
+        assert_eq!(route_of(&elsewhere), elsewhere);
     }
 
     /// N9: the framing constants are what the encoder takes, worst case; a signal
