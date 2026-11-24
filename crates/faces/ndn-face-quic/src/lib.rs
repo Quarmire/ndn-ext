@@ -91,9 +91,9 @@ pub use membership::{
     Membership, binding_transcript,
 };
 pub use message::{
-    CloseReason, DEPARTURES_MAX, Departure, LINK_PROTOCOL_VERSION, LinkHello, LinkVerdict,
-    PathSession, Presence, PresentDevice, Reachability, WAKE_TOKEN_MAX, decode_udp_address,
-    encode_udp_address,
+    CloseReason, DEPARTURES_MAX, Departure, FOLLOW_DEPTH_MAX, FOLLOWS_MAX, LINK_PROTOCOL_VERSION,
+    LinkHello, LinkVerdict, PathSession, Presence, PresentDevice, Reachability, WAKE_TOKEN_MAX,
+    decode_udp_address, encode_udp_address,
 };
 pub use probe::{PROBE_LEN, ProbeWatch, decode_probe, encode_probe};
 pub use scope::{

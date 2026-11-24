@@ -41,7 +41,12 @@ pub(crate) struct RelayRoutes {
 /// route its other entry needs. A link admitted by a live grant entry also
 /// gets, for each held namespace the grant lists, that namespace's public
 /// names outside its devices ([`grant_public_routes`]); the groups of the
-/// spaces it is granted are added by [`grant_group_routes`].
+/// spaces it is granted are added by [`grant_group_routes`]. A full link of
+/// an identified peer that no grant admitted also gets the sync group of each
+/// namespace the peer's hello says it follows (`Admitted::follows`, told by
+/// a device to a relay it uses), once, at the link's cost: the claim buys
+/// that route and no other name, no entry and no context, and no link of
+/// another kind (enrollment, introduction, departure, grant) takes it.
 pub(crate) fn routes_for(
     peers: &Peers,
     admitted: &Admitted,
@@ -84,6 +89,13 @@ pub(crate) fn routes_for(
     routes.extend(issuer_routes(&admitted.identities, base));
     let carried = admitted.identities.iter().map(|id| &id.namespace);
     routes.extend(group_routes(carried, base));
+    // The groups a peer says it follows, on a full link of an identified
+    // peer that no grant admitted (a grant link carries the groups of its
+    // granted spaces and nothing it claims).
+    if admitted.grant.is_none() && !admitted.identities.is_empty() {
+        let more = unrouted_groups(&admitted.follows, &routes, base);
+        routes.extend(more);
+    }
     if let Some(grant) = &admitted.grant {
         routes.extend(grant_public_routes(grant, &admitted.identities));
     }
@@ -105,11 +117,17 @@ pub(crate) fn routes_for(
 /// space's own group ([`entry_carries`](crate::grants)), so another space's
 /// announcements are routed here and dropped at the link.
 pub(crate) fn grant_group_routes(owners: &[Name], have: &[Route]) -> Vec<Route> {
+    unrouted_groups(owners, have, 0)
+}
+
+/// The routes at `cost` for the sync groups of `namespaces` (`<ns>/32=sync`),
+/// once each, that `have` does not route already.
+fn unrouted_groups(namespaces: &[Name], have: &[Route], cost: u32) -> Vec<Route> {
     let mut routes: Vec<Route> = Vec::new();
-    for owner in owners {
-        let prefix = sync_group(owner);
+    for ns in namespaces {
+        let prefix = sync_group(ns);
         if !have.iter().chain(&routes).any(|r| r.prefix == prefix) {
-            routes.push(Route { prefix, cost: 0 });
+            routes.push(Route { prefix, cost });
         }
     }
     routes
@@ -294,6 +312,7 @@ mod tests {
             quota: None,
             quotas: Vec::new(),
             grant: None,
+            follows: Vec::new(),
         }
     }
 
@@ -568,5 +587,81 @@ mod tests {
             narrow.grant = Some(grant(&["/bob"]));
             assert!(routes_for(&peers, &narrow, false, None).is_empty());
         }
+    }
+
+    /// A full link whose peer says it follows namespaces gets each one's sync
+    /// group (`<ns>/32=sync`), once, at the link's cost, beside the groups of
+    /// the namespaces its identities were admitted in: a prefix already routed
+    /// is not routed again. The claim routes the group and no other name.
+    #[test]
+    fn a_full_link_routes_the_groups_its_peer_follows_once() {
+        let peers = Peers::new(Vec::new());
+        let mut served = id_in("/bob", "/bob/member/phone");
+        served.served = Some(KeyFingerprint([7; 32]));
+        let mut link = admitted(None, Some(served), None);
+        link.follows = vec![n("/a"), n("/bob"), n("/a"), n("/b/c")];
+        assert_eq!(
+            routes_for(&peers, &link, false, None),
+            [
+                route("/bob/member/phone", 0),
+                route("/bob/32=sync", 0),
+                route("/a/32=sync", 0),
+                route("/b/c/32=sync", 0),
+            ]
+        );
+        // A relay's rank is the link's cost.
+        let rank = RelayRoutes {
+            namespaces: vec![n("/me")],
+            cost: 2,
+        };
+        let routed = routes_for(&peers, &link, true, Some(rank));
+        assert!(routed.contains(&route("/a/32=sync", 2)), "{routed:?}");
+        // No claim, no route.
+        link.follows.clear();
+        assert!(
+            routes_for(&peers, &link, false, None)
+                .iter()
+                .all(|r| r.prefix != n("/a/32=sync")),
+        );
+    }
+
+    /// What a claim does not reach: an enrollment, introduction or departure
+    /// link routes nothing for it, a grant link keeps to the groups of the
+    /// spaces it is granted (rule 20), and a peer no certificate identified
+    /// gets none.
+    #[test]
+    fn a_claim_of_following_routes_nothing_on_an_enrollment_departure_grant_or_unidentified_link() {
+        let peers = Peers::new(Vec::new());
+        let follows = [n("/a")];
+        for enrollment in [
+            Enrollment::Relay(vec![n("/bob")], None),
+            Enrollment::Departure(Vec::new()),
+        ] {
+            let mut link = admitted(
+                None,
+                Some(id_in("/bob", "/bob/member/phone")),
+                Some(enrollment),
+            );
+            link.follows = follows.to_vec();
+            assert!(routes_for(&peers, &link, false, None).is_empty());
+        }
+        // The enrolling device's own link routes its namespace only.
+        let mut device = admitted(None, None, Some(Enrollment::Device(n("/home"))));
+        device.follows = follows.to_vec();
+        assert_eq!(routes_for(&peers, &device, true, None), [route("/home", 0)]);
+        // A grant link's groups are the ones of its granted spaces, not the claimed.
+        let mut grant_link = admitted(None, Some(id_in("/bob", "/bob/member/phone")), None);
+        grant_link.grant = Some(grant(&["/bob"]));
+        grant_link.follows = follows.to_vec();
+        assert!(
+            routes_for(&peers, &grant_link, false, None)
+                .iter()
+                .all(|r| r.prefix != n("/a/32=sync")),
+            "a grant link was routed a group it claimed"
+        );
+        // A link no certificate identified (admitted by its key alone) gets none.
+        let mut unidentified = admitted(None, None, None);
+        unidentified.follows = follows.to_vec();
+        assert!(routes_for(&peers, &unidentified, false, None).is_empty());
     }
 }

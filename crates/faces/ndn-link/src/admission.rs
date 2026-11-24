@@ -182,6 +182,12 @@ pub(crate) struct Admitted {
     /// The grant that admitted the link, when no policy did (it closes
     /// when the grant ends).
     pub(crate) grant: Option<Grant>,
+    /// The namespaces the peer's hello says it follows (`LinkHello::follows`,
+    /// at most [`FOLLOWS_MAX`](ndn_face_quic::FOLLOWS_MAX)): what it tells a
+    /// relay it uses, so that the relay routes their sync groups over the
+    /// link ([`routes_for`](crate::routes)). Only a claim: it buys that route
+    /// on a full link and nothing else.
+    pub(crate) follows: Vec<Name>,
 }
 
 impl Admitted {
@@ -862,7 +868,10 @@ impl Judge<'_> {
         } else {
             Ok(proven.identities)
         };
-        decide_identified(self, fingerprint, identities, peer, dialed)
+        decide_identified(self, fingerprint, identities, peer, dialed).map(|mut admitted| {
+            admitted.follows.clone_from(&hello.follows);
+            admitted
+        })
     }
 
     /// What a link to a peer this device dialled from an introduction code
@@ -1259,6 +1268,7 @@ fn decide_identified(
         quota,
         quotas,
         grant: None,
+        follows: Vec::new(),
     };
 
     if let Some(p) = &config {
@@ -1613,6 +1623,7 @@ fn serve(
                         quota: None,
                         quotas: Vec::new(),
                         grant: None,
+                        follows: Vec::new(),
                     });
                 }
                 GrantOutcome::No(Some(detail)) => {
@@ -1663,6 +1674,7 @@ fn serve(
         quota: None,
         quotas: Vec::new(),
         grant,
+        follows: Vec::new(),
     };
     for (i, (id, quota)) in served.into_iter().enumerate() {
         admitted.identities.push(id);
@@ -2552,6 +2564,44 @@ mod tests {
         );
     }
 
+    /// A served device's hello names the namespaces it follows: the decision
+    /// carries them, and they route only their sync groups over the link,
+    /// beside the group of the namespace the device was served for.
+    #[tokio::test]
+    async fn a_served_devices_follows_are_carried_and_route_their_groups_only() {
+        let (a, b) = (namespace("/a", 10).await, namespace("/b", 20).await);
+        let open = relay(
+            &a,
+            &[&b],
+            ServePolicy::Open {
+                quotas: Quotas::default(),
+            },
+        )
+        .await;
+        let (bob, chain) = b.device("member", "phone", 22).await;
+        let mut claim = hello(chain);
+        claim.follows = vec![n("/c"), n("/a"), n("/c/d")];
+        let admitted = open.judge().decide(&bob, &claim, &CH, None).await.unwrap();
+        assert_eq!(admitted.follows, claim.follows);
+        let routed: Vec<Name> =
+            crate::routes::routes_for(&Peers::new(Vec::new()), &admitted, false, None)
+                .into_iter()
+                .map(|r| r.prefix)
+                .collect();
+        for ns in ["/b", "/c", "/a", "/c/d"] {
+            let group = ndn_security::sync_group(&n(ns));
+            assert!(routed.contains(&group), "{group} in {routed:?}");
+        }
+        assert!(
+            routed.iter().all(|p| p.has_prefix(&n("/b"))
+                || claim
+                    .follows
+                    .iter()
+                    .any(|ns| *p == ndn_security::sync_group(ns))),
+            "a claim routed more than a group: {routed:?}"
+        );
+    }
+
     /// Under `open` a grant adds nothing: the policy serves the device (under
     /// its quotas) and the link is not the grant's. Under `listed` with
     /// quotas a grant is bound by them: it never serves what they refuse.
@@ -2694,6 +2744,63 @@ mod tests {
         let own = judge.own_namespaces();
         assert_eq!(judge.relay_namespaces_of(&user, &own), [n("/a")]);
         assert_eq!(judge.relay_namespaces_of(&advertised, &own), [n("/a")]);
+        // A relay this device uses is told the namespaces it follows; a peer
+        // that is no such relay, or one with `routes` of its own (it routes
+        // those and no more), is told none.
+        assert_eq!(judge.told_follows(&user), Some(vec![n("/b")]));
+        assert_eq!(judge.told_follows(&advertised), Some(vec![n("/b")]));
+        assert_eq!(
+            judge.told_follows(&PeerSpec {
+                relay_use: None,
+                ..user.clone()
+            }),
+            None
+        );
+        assert_eq!(
+            judge.told_follows(&PeerSpec {
+                routes: Some(vec![n("/a")]),
+                ..user.clone()
+            }),
+            None
+        );
+    }
+
+    /// A device that follows more namespaces than a hello names tells the
+    /// first `FOLLOWS_MAX` in order, and none too deep to be a namespace
+    /// there.
+    #[tokio::test]
+    async fn what_a_relay_is_told_is_sorted_and_bounded() {
+        let a = namespace("/a", 10).await;
+        let keyring = Keyring::new();
+        keyring.adopt(Arc::new(a.context())).unwrap();
+        let count = ndn_face_quic::FOLLOWS_MAX + 4;
+        for i in (0..count).rev() {
+            let followed = namespace(&format!("/f{i:02}"), 100 + i as u8).await;
+            keyring.adopt(Arc::new(followed.context())).unwrap();
+        }
+        let deep = "/d".repeat(ndn_face_quic::FOLLOW_DEPTH_MAX + 1);
+        keyring
+            .adopt(Arc::new(namespace(&deep, 99).await.context()))
+            .unwrap();
+        let (_, chain) = a.device("member", "laptop", 12).await;
+        let world = World::new(
+            Bare(Arc::new(keyring), None, chain),
+            Vec::new(),
+            ServePolicy::Own,
+        );
+        let user = PeerSpec {
+            label: "relay".into(),
+            relay_use: Some(RelayUse {
+                source: RelaySource::User,
+                preference: 0,
+            }),
+            ..PeerSpec::default()
+        };
+        let told = world.judge().told_follows(&user).unwrap();
+        let want: Vec<Name> = (0..ndn_face_quic::FOLLOWS_MAX)
+            .map(|i| n(&format!("/f{i:02}")))
+            .collect();
+        assert_eq!(told, want);
     }
 
     /// A listed relay serves a namespace it does not hold by its root key:

@@ -20,10 +20,15 @@
 //! again with backoff while a less preferred one stands in, and once it
 //! links again the stand-in is released ([`CloseReason::Released`]).
 //! Relays beyond the chosen ones stand by, undialled.
+//!
+//! A relay is also told, in this device's hello, the namespaces it follows
+//! ([`Judge::told_follows`]): the relay routes each one's sync group over
+//! the link, so that a Sync Interest of a space this device follows reaches
+//! it through the relay (ndn-link.md §10, Decision 42).
 
 use std::sync::Arc;
 
-use ndn_face_quic::{CloseReason, KeyFingerprint};
+use ndn_face_quic::{CloseReason, FOLLOW_DEPTH_MAX, FOLLOWS_MAX, KeyFingerprint};
 use ndn_mgmt_wire::{LinkDetail, link_code as code};
 use ndn_packet::Name;
 
@@ -396,5 +401,26 @@ impl Judge<'_> {
             }
         }
         routed
+    }
+
+    /// The namespaces this device tells the peer `peer` in its hello, when it
+    /// uses it as a relay that routes the followed namespaces over its link
+    /// (a relay with `routes` of its own routes those and no more): the ones
+    /// it follows ([`Self::followed_namespaces`]), sorted, at most
+    /// [`FOLLOWS_MAX`] each of at most [`FOLLOW_DEPTH_MAX`] components (an
+    /// empty list when it follows none: the relay is still told so). `None`
+    /// for a peer that is no such relay: it is told nothing.
+    pub(crate) fn told_follows(&self, peer: &PeerSpec) -> Option<Vec<Name>> {
+        if peer.relay_use.is_none() || peer.routes.is_some() {
+            return None;
+        }
+        let mut told: Vec<Name> = self
+            .followed_namespaces()
+            .into_iter()
+            .filter(|ns| ns.len() <= FOLLOW_DEPTH_MAX)
+            .collect();
+        told.sort();
+        told.truncate(FOLLOWS_MAX);
+        Some(told)
     }
 }

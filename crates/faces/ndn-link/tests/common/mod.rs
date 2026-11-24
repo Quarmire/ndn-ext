@@ -79,6 +79,10 @@ pub struct Person {
     pub signed: Bytes,
     /// The genesis of a person named by their key.
     pub genesis: Option<Arc<Genesis>>,
+    /// The certificates above a device's: the CA's and the root's, for a
+    /// person made as `ndn-cert` makes a namespace ([`Person::with_ca`]); a
+    /// device's chain is its certificate and these.
+    pub chain: Vec<Certificate>,
 }
 
 impl Person {
@@ -103,6 +107,60 @@ impl Person {
             ctx: Arc::new(ctx),
             signed,
             genesis: None,
+            chain: Vec::new(),
+        }
+    }
+
+    /// A person as `ndn-cert` makes a namespace: a root key with its
+    /// self-signed certificate, and the CA the root certified, which
+    /// certifies each device. A device of such a person is identified by a
+    /// relay that holds no context of the person, from the root its hello
+    /// carries (ndn-link.md §7.1 R1–R7); a [`Person::new`] person, whose
+    /// devices the root certifies directly, only by a device that holds it.
+    pub async fn with_ca(ns: &str) -> Person {
+        let ns = n(ns);
+        let authority = SecurityManager::new();
+        let root = authority
+            .generate_ed25519(ns.clone().append("KEY").append("root"))
+            .unwrap();
+        let root_signer = authority.get_signer_sync(&root).unwrap();
+        let anchor = authority
+            .issue_self_signed_async(&root, root_signer.public_key().unwrap(), VALIDITY_MS)
+            .await
+            .unwrap();
+        let ca = authority
+            .generate_ed25519(ns.clone().append("CA").append("KEY").append("ca"))
+            .unwrap();
+        let ca_public = authority
+            .get_signer_sync(&ca)
+            .unwrap()
+            .public_key()
+            .unwrap();
+        let ca_cert = authority
+            .certify(&ca, ca_public, &root, VALIDITY_MS)
+            .await
+            .unwrap();
+        let schema = ndn_cert::namespace_schema(&ns).unwrap();
+        let ctx = SignedTrustContext::hierarchical(ns.clone())
+            .with_schema_blobs(schema.blobs())
+            .unwrap()
+            .schema_authoritative()
+            .with_ca_endpoint(ns.clone().append("CA"))
+            .with_version(1);
+        assert!(ctx.add_anchor(anchor.clone()));
+        let signed = ctx
+            .sign_into_data(root_signer.as_ref())
+            .unwrap()
+            .raw()
+            .clone();
+        Person {
+            ns,
+            authority,
+            issuer: ca,
+            ctx: Arc::new(ctx),
+            signed,
+            genesis: None,
+            chain: vec![ca_cert, anchor],
         }
     }
 
@@ -132,6 +190,7 @@ impl Person {
             ctx: Arc::new(ctx),
             signed: signed.raw().clone(),
             genesis: Some(Arc::new(first)),
+            chain: Vec::new(),
         }
     }
 
@@ -222,15 +281,23 @@ impl Parts {
         }
     }
 
-    /// The certificate `person` gives this device's key.
+    /// The certificate `person` gives this device's key: named as `ndn-cert`'s
+    /// CA names one for a person made with a CA ([`Person::with_ca`]).
     async fn certified(&self, person: &Person, validity_ms: u64) -> Certificate {
+        let issuer_id = if person.chain.is_empty() {
+            ndn_security::cert_name::DEFAULT_ISSUER
+        } else {
+            ndn_security::cert_name::NDNCERT_ISSUER
+        };
         let cert = person
             .authority
-            .certify(
+            .certify_as(
                 &self.key_name,
                 self.public.clone(),
                 &person.issuer,
                 validity_ms,
+                issuer_id,
+                None,
             )
             .await
             .unwrap();
@@ -276,10 +343,16 @@ fn trust(person: &Person, cert: &Certificate) -> (Arc<Validator>, Arc<Trust>) {
             .unwrap(),
         None => validator.adopt_context(Arc::clone(&person.ctx)).unwrap(),
     }
-    validator.cert_cache().insert(cert.clone());
+    let certificates: Vec<&Certificate> = std::iter::once(cert).chain(&person.chain).collect();
+    for cert in &certificates {
+        validator.cert_cache().insert((*cert).clone());
+    }
     let trust = Arc::new(Trust {
         keyring: Arc::clone(validator.keyring()),
-        chain: vec![cert.data_wire().unwrap()],
+        chain: certificates
+            .iter()
+            .map(|cert| cert.data_wire().unwrap())
+            .collect(),
         validator: Arc::clone(&validator),
     });
     (validator, trust)

@@ -728,6 +728,7 @@ async fn a_stranger_on_an_introduction_link_is_not_heard() {
     let hello = LinkHello {
         certificates: Vec::new(),
         memberships: Vec::new(),
+        follows: Vec::new(),
         direct_path: None,
     };
     hs.exchange_hello(&hello, Duration::from_secs(10))

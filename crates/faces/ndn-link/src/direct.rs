@@ -898,6 +898,7 @@ impl Links {
         let hello = LinkHello {
             certificates: theirs.certificates.clone(),
             memberships: theirs.memberships.clone(),
+            follows: Vec::new(),
             direct_path: None,
         };
         match self
@@ -1027,6 +1028,7 @@ impl Links {
         let hello = LinkHello {
             certificates: theirs.certificates.clone(),
             memberships: theirs.memberships.clone(),
+            follows: Vec::new(),
             direct_path: None,
         };
         let admitted = match self

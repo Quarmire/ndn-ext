@@ -307,7 +307,10 @@ impl Links {
     /// (`relay_routed_namespaces`): one followed later is routed at once,
     /// one no longer followed loses its route; an on-demand relay that is
     /// down routes them to the waiting face. Called on every adoption and
-    /// identity change; a host calls it after [`Keyring::forget`].
+    /// identity change; a host calls it after [`Keyring::forget`]. A relay
+    /// whose link was told other followed namespaces in the hello
+    /// ([`LinkHello::follows`](ndn_face_quic::LinkHello::follows)) is linked
+    /// again to tell it these, as for a change of memberships.
     ///
     /// [`Keyring::forget`]: ndn_security::Keyring::forget
     pub fn followed_changed(&self) {
@@ -319,6 +322,10 @@ impl Links {
             .filter(|(_, p)| p.relay_use.is_some() && p.routes.is_none())
             .map(|(id, p)| (id, judge.relay_routed_namespaces(&p)))
             .collect();
+        // A relay is told the namespaces this device follows in its hello:
+        // one whose hello told others is linked again to tell the new ones.
+        self.table
+            .relink_followed(|id| self.peers.get(id).and_then(|p| judge.told_follows(&p)));
         for change in self.table.reroute_relays(|id| routed.get(&id).cloned()) {
             if !change.removed.is_empty() {
                 self.faces.remove_routes(change.face, &change.removed);
@@ -807,26 +814,39 @@ impl Links {
                 return Err(NotLinked::refused_here(CloseReason::Protocol, detail));
             }
         };
-        let (ours, shown) = if enrolling {
+        let (ours, shown, told) = if enrolling {
             (
                 LinkHello {
                     direct_path: session,
                     ..LinkHello::default()
                 },
                 Vec::new(),
+                None,
             )
         } else {
             // Bound to the key this connection's handshake presented, not
             // one the device switched to since.
             let memberships =
                 own_memberships(self.trust.as_ref(), hs.local_key(), &channel, None).await;
+            // A relay this device uses is told the namespaces it follows,
+            // so that it routes their sync groups here (ndn-link.md §10).
+            let relay = match origin {
+                Origin::Dialed(id) => Some(id),
+                Origin::Accepted => self.peers.find(peer_fp, None),
+                Origin::Direct(_) => None,
+            };
+            let told = relay
+                .and_then(|id| self.peers.get(id))
+                .and_then(|p| self.judge().told_follows(&p));
             (
                 LinkHello {
                     certificates: hello_chain(self.trust.as_ref()),
                     memberships,
+                    follows: told.clone().unwrap_or_default(),
                     direct_path: session,
                 },
                 self.shown_namespaces(),
+                told,
             )
         };
         let theirs = hs.exchange_hello(&ours, MESSAGE_DEADLINE).await?;
@@ -1008,6 +1028,7 @@ impl Links {
             identities: admitted.identities.clone(),
             grant: admitted.grant.clone(),
             shown,
+            told,
             enrolling: enrolling.clone(),
             path: LinkPath {
                 face: face_id,

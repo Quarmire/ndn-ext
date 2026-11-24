@@ -467,6 +467,7 @@ async fn dial_with(
     let hello = LinkHello {
         certificates,
         memberships: memberships(&channel).await,
+        follows: Vec::new(),
         direct_path: None,
     };
     hs.exchange_hello(&hello, T).await?;

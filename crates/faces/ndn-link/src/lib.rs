@@ -82,7 +82,12 @@
 //! serving policy ([`group_routes`]; `ndn-rs/docs/specs/heap.md`
 //! §7.7) — which runs with the multicast strategy: by the host's
 //! trust-context library for a held namespace, by the host's
-//! [`FaceSink::transit`] while a served one is in transit. A revocation
+//! [`FaceSink::transit`] while a served one is in transit. A peer this
+//! device serves or holds also gets the group of each namespace its hello
+//! says it follows (a device tells the relays it uses what it follows,
+//! [`ndn_face_quic::LinkHello::follows`]): a claim that buys that route and
+//! nothing else, so the sync groups of a space reach a follower through a
+//! relay that holds no context of it. A revocation
 //! that takes a membership from a link takes its routes, the group's with
 //! them; the link's end takes them all. Persistent peers are
 //! dialled again with [`Backoff`] whenever their link drops. Between two

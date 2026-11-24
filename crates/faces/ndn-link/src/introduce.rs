@@ -189,6 +189,7 @@ impl Links {
             quota: None,
             quotas: Vec::new(),
             grant: None,
+            follows: Vec::new(),
         })
     }
 

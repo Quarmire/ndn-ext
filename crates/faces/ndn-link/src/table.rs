@@ -142,6 +142,11 @@ struct LiveLink {
     /// (its link key's and its memberships'): when they change, the link
     /// is made again.
     shown: Vec<Name>,
+    /// The namespaces this device told the peer it follows in its hello,
+    /// when the peer is a relay it uses (sorted): when the namespaces it
+    /// would tell now differ, the link is made again to tell them. `None`:
+    /// the hello told nothing.
+    told: Option<Vec<Name>>,
     /// The namespaces this link is an enrollment link for, on either side,
     /// for this device's enrollment: once this device enrolls in one, the
     /// link is made again as a full link.
@@ -166,6 +171,9 @@ pub(crate) struct Registration {
     pub(crate) identities: Vec<Identity>,
     /// The namespaces this device showed in its hello (sorted).
     pub(crate) shown: Vec<Name>,
+    /// The namespaces this device told the peer it follows (`None`: none was
+    /// told, the peer is no relay this device uses).
+    pub(crate) told: Option<Vec<Name>>,
     pub(crate) enrolling: Vec<Name>,
     pub(crate) path: LinkPath,
     /// The grant that admitted the link, when no policy did.
@@ -241,6 +249,7 @@ impl LinkTable {
                     identities: link.identities,
                     grant: link.grant,
                     shown: link.shown,
+                    told: link.told,
                     enrolling: link.enrolling,
                     paths: vec![new],
                 },
@@ -275,6 +284,7 @@ impl LinkTable {
         if kind == PathKind::Link {
             existing.enrolling = link.enrolling;
             existing.shown = link.shown;
+            existing.told = link.told;
         }
         existing.paths.push(new);
         Some(generation)
@@ -619,6 +629,33 @@ impl LinkTable {
                     "none".to_string()
                 } else {
                     crate::admission::list(shown)
+                }
+            ))
+        });
+    }
+
+    /// What this device would tell each relay now (`now`, by peer: the
+    /// followed namespaces, `None` for a peer it tells nothing): close each
+    /// full link whose hello told others, and mark its peer to be dialled
+    /// again, so the relay routes the groups of the namespaces followed now.
+    /// A link whose hello told nothing is left alone.
+    pub(crate) fn relink_followed(&self, now: impl Fn(PeerId) -> Option<Vec<Name>>) {
+        self.relink_where(|link| {
+            let told = link.told.as_ref()?;
+            if !link.enrolling.is_empty() {
+                return None;
+            }
+            let now = link.peer.and_then(&now).unwrap_or_default();
+            if *told == now {
+                return None;
+            }
+            Some(format!(
+                "the namespaces this device follows changed (now {}); it links again to tell \
+                 the relay, which routes their sync groups here",
+                if now.is_empty() {
+                    "none".to_string()
+                } else {
+                    crate::admission::list(&now)
                 }
             ))
         });

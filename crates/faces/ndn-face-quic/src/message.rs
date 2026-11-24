@@ -9,11 +9,16 @@
 //!
 //! Wire: TLV-TYPEs in the application range.
 //! `LinkHello = 0x0450 { LinkVersion 0x0451 (1 byte), Data*, Membership
-//! 0x045C*, DirectPath 0x045A (8 bytes)? }` — the first Data is the
-//! sender's certificate for its link key, the rest its issuers (nearest
-//! first); each [`Membership`] is a namespace the sender is a member of
-//! with another key, bound to this connection; `DirectPath` marks a
+//! 0x045C*, DirectPath 0x045A (8 bytes)?, Follows 0x0456 { Name+ }? }` — the
+//! first Data is the sender's certificate for its link key, the rest its
+//! issuers (nearest first); each [`Membership`] is a namespace the sender is a
+//! member of with another key, bound to this connection; `DirectPath` marks a
 //! connection made for a direct path of the link (the punch's session);
+//! `Follows` names the namespaces the sender follows (holds the trust context
+//! of, with no certificate in it), told to a peer it uses as a relay so that
+//! the relay routes those namespaces' sync groups to it (at most
+//! [`FOLLOWS_MAX`] names, each non-empty and of at most [`FOLLOW_DEPTH_MAX`]
+//! components);
 //! `LinkVerdict = 0x0452 { EnrollmentLink 0x0454 { Name* }? }` — admitted;
 //! with `EnrollmentLink`, admitted as an enrollment link that carries only
 //! the enrollment of the receiver in the namespaces named;
@@ -55,6 +60,7 @@ pub(crate) const LINK_VERDICT: u64 = 0x0452;
 const ENROLLMENT_LINK: u64 = 0x0454;
 pub(crate) const OBSERVED_ADDRESS: u64 = 0x0458;
 const DIRECT_PATH: u64 = 0x045A;
+const FOLLOWS: u64 = 0x0456;
 pub(crate) const REACHABILITY: u64 = 0x0440;
 const HOLD_INTERESTS: u64 = 0x0442;
 const WAKE_TOKEN: u64 = 0x0444;
@@ -63,6 +69,12 @@ const PRESENT_DEVICE: u64 = 0x0448;
 const KEY_DIGEST: u64 = 0x044A;
 pub(crate) const DEPARTURE: u64 = 0x044C;
 
+/// Most namespaces a hello's `Follows` names; a receiver ignores the rest
+/// (and a sender names no more).
+pub const FOLLOWS_MAX: usize = 16;
+/// Most components of a followed namespace's name: a longer name is
+/// malformed in a hello.
+pub const FOLLOW_DEPTH_MAX: usize = 8;
 /// Most distinct `Departure` messages a link takes from its peer, and queues
 /// toward it: a person is let go of a few folders at once, not hundreds.
 pub const DEPARTURES_MAX: usize = 16;
@@ -92,13 +104,29 @@ pub struct LinkHello {
     /// link key, each bound to this connection. A receiver uses at most
     /// [`MEMBERSHIPS_MAX`](crate::MEMBERSHIPS_MAX) of them.
     pub memberships: Vec<Membership>,
+    /// The namespaces the sender follows, told to a peer it uses as a relay
+    /// (empty otherwise): the relay routes the sync group `<ns>/32=sync` of
+    /// each over this link. A claim buys that route and nothing else. At
+    /// most [`FOLLOWS_MAX`] of them, each non-empty and of at most
+    /// [`FOLLOW_DEPTH_MAX`] components; a receiver uses the first
+    /// [`FOLLOWS_MAX`] and takes a longer or empty name for a malformed hello.
+    pub follows: Vec<Name>,
     /// `Some`: this connection is a direct path made by the punch of this
     /// session (the dialer names it; the listener repeats it when it takes
     /// the connection as that direct path).
     pub direct_path: Option<PathSession>,
 }
 
+/// Whether `name` can be a followed namespace: not the root, and at most
+/// [`FOLLOW_DEPTH_MAX`] components.
+fn followable(name: &Name) -> bool {
+    (1..=FOLLOW_DEPTH_MAX).contains(&name.len())
+}
+
 impl LinkHello {
+    /// What a hello says: at most [`FOLLOWS_MAX`] of `follows`, the ones that
+    /// can be a followed namespace (a sender never makes its own hello
+    /// malformed).
     pub(crate) fn encode(&self) -> Bytes {
         let mut w = TlvWriter::new();
         w.write_nested(LINK_HELLO, |w| {
@@ -108,6 +136,19 @@ impl LinkHello {
             }
             for membership in &self.memberships {
                 membership.write(w);
+            }
+            let follows: Vec<&Name> = self
+                .follows
+                .iter()
+                .filter(|ns| followable(ns))
+                .take(FOLLOWS_MAX)
+                .collect();
+            if !follows.is_empty() {
+                w.write_nested(FOLLOWS, |w| {
+                    for ns in follows {
+                        w.write_raw(&ns.encode_to_tlv());
+                    }
+                });
             }
             if let Some(session) = &self.direct_path {
                 w.write_tlv(DIRECT_PATH, session);
@@ -120,6 +161,7 @@ impl LinkHello {
     pub(crate) fn decode(value: &[u8]) -> Result<Self, String> {
         let mut certificates = Vec::new();
         let mut memberships = Vec::new();
+        let mut follows: Vec<Name> = Vec::new();
         let mut direct_path = None;
         let mut version = None;
         let mut cur = value;
@@ -140,6 +182,33 @@ impl LinkHello {
                     Membership::decode(&cur[start..end])
                         .map_err(|e| format!("{e} in the link hello"))?,
                 ),
+                FOLLOWS => {
+                    let mut names = &cur[start..end];
+                    if names.is_empty() {
+                        return Err("a Follows naming no namespace in the link hello".into());
+                    }
+                    while !names.is_empty() {
+                        let (nt, nstart, nend) = split_tlv(names)?;
+                        if nt != NAME {
+                            return Err(format!(
+                                "{nt:#x} where a followed namespace's name belongs in the link hello"
+                            ));
+                        }
+                        let ns = Name::decode(Bytes::copy_from_slice(&names[nstart..nend]))
+                            .map_err(|e| format!("a followed namespace in the link hello: {e}"))?;
+                        if !followable(&ns) {
+                            return Err(format!(
+                                "a followed namespace of {} components in the link hello (it is \
+                                 1 to {FOLLOW_DEPTH_MAX})",
+                                ns.len()
+                            ));
+                        }
+                        if follows.len() < FOLLOWS_MAX {
+                            follows.push(ns);
+                        }
+                        names = &names[nend..];
+                    }
+                }
                 DIRECT_PATH => {
                     direct_path = Some(PathSession::try_from(&cur[start..end]).map_err(|_| {
                         format!(
@@ -157,6 +226,7 @@ impl LinkHello {
             Some(LINK_PROTOCOL_VERSION) => Ok(Self {
                 certificates,
                 memberships,
+                follows,
                 direct_path,
             }),
             Some(v) => Err(format!(
@@ -682,6 +752,11 @@ mod tests {
                     binding: Bytes::from_static(&[1, 2, 3]),
                 }],
                 direct_path: Some([8; 8]),
+                follows: vec!["/a".parse().unwrap(), "/b/c".parse().unwrap()],
+            },
+            LinkHello {
+                follows: vec!["/a".parse().unwrap()],
+                ..LinkHello::default()
             },
         ] {
             let wire = hello.encode();
@@ -689,6 +764,76 @@ mod tests {
             assert_eq!(t, LINK_HELLO);
             assert_eq!(LinkHello::decode(&wire[start..end]).unwrap(), hello);
         }
+    }
+
+    /// The wire of a hello whose `Follows` field holds `names` (each as given:
+    /// the bytes of a Name TLV).
+    fn hello_following(names: &[Vec<u8>]) -> Vec<u8> {
+        let inner: Vec<u8> = names.concat();
+        let mut v = vec![0xFD, 0x04, 0x51, 0x01, 0x01, 0xFD, 0x04, 0x56];
+        assert!(inner.len() < 253);
+        v.push(inner.len() as u8);
+        v.extend(inner);
+        v
+    }
+
+    fn name_tlv(text: &str) -> Vec<u8> {
+        text.parse::<Name>().unwrap().encode_to_tlv().to_vec()
+    }
+
+    #[test]
+    fn a_hello_follows_is_even_names_and_an_older_receiver_skips_it() {
+        let wire = LinkHello {
+            follows: vec!["/a".parse().unwrap(), "/b/c".parse().unwrap()],
+            ..LinkHello::default()
+        }
+        .encode();
+        // The vector of ndn-link.md §19.21: Follows 0x0456 { /a, /b/c }
+        // after the version.
+        assert_eq!(
+            wire.as_ref(),
+            [
+                0xFD, 0x04, 0x50, 0x16, 0xFD, 0x04, 0x51, 0x01, 0x01, 0xFD, 0x04, 0x56, 0x0D, 0x07,
+                0x03, 0x08, 0x01, 0x61, 0x07, 0x06, 0x08, 0x01, 0x62, 0x08, 0x01, 0x63
+            ]
+        );
+        // 0x0456 is even and above 31: a receiver that does not know it skips it.
+        assert!(skippable(0x0456));
+        // An unknown even field beside it is skipped; an odd one is a
+        // malformed hello.
+        let mut v = hello_following(&[name_tlv("/a")]);
+        v.extend([0xFD, 0x04, 0x70, 0x01, 0xAA]);
+        assert_eq!(
+            LinkHello::decode(&v).unwrap().follows,
+            ["/a".parse::<Name>().unwrap()]
+        );
+        v.extend([0xFD, 0x04, 0x71, 0x00]);
+        assert!(LinkHello::decode(&v).is_err());
+    }
+
+    #[test]
+    fn a_hello_follows_is_bounded_and_refuses_what_is_not_a_namespace() {
+        let many: Vec<Vec<u8>> = (0..FOLLOWS_MAX + 3)
+            .map(|i| name_tlv(&format!("/n{i}")))
+            .collect();
+        // Over the limit: the first FOLLOWS_MAX are used, the rest ignored.
+        let big = hello_following(&many);
+        let decoded = LinkHello::decode(&big).unwrap();
+        assert_eq!(decoded.follows.len(), FOLLOWS_MAX);
+        assert_eq!(decoded.follows[0], "/n0".parse::<Name>().unwrap());
+        assert_eq!(
+            decoded.follows[FOLLOWS_MAX - 1],
+            format!("/n{}", FOLLOWS_MAX - 1).parse::<Name>().unwrap()
+        );
+        // The deepest namespace is FOLLOW_DEPTH_MAX components; one more is malformed.
+        let deep = |n: usize| name_tlv(&"/c".repeat(n));
+        assert!(LinkHello::decode(&hello_following(&[deep(FOLLOW_DEPTH_MAX)])).is_ok());
+        assert!(LinkHello::decode(&hello_following(&[deep(FOLLOW_DEPTH_MAX + 1)])).is_err());
+        // The root is no namespace; neither is an empty or a foreign list.
+        assert!(LinkHello::decode(&hello_following(&[vec![0x07, 0x00]])).is_err());
+        assert!(LinkHello::decode(&hello_following(&[])).is_err());
+        assert!(LinkHello::decode(&hello_following(&[vec![0x08, 0x01, 0x61]])).is_err());
+        assert!(LinkHello::decode(&hello_following(&[vec![0x07, 0x05, 0x08]])).is_err());
     }
 
     #[test]
@@ -785,7 +930,7 @@ mod tests {
         // Unknown even types 0–31 are critical, as in NDN packets; above 31
         // they are skipped.
         assert!(LinkHello::decode(&[0xFD, 0x04, 0x51, 0x01, 0x01, 0x0A, 0x00]).is_err());
-        assert!(LinkHello::decode(&[0xFD, 0x04, 0x51, 0x01, 0x01, 0xFD, 0x04, 0x56, 0x00]).is_ok());
+        assert!(LinkHello::decode(&[0xFD, 0x04, 0x51, 0x01, 0x01, 0xFD, 0x04, 0x4E, 0x00]).is_ok());
         assert!(LinkVerdict::decode(&[0x08, 0x00]).is_err());
         // An enrollment link for no namespace means nothing.
         assert!(LinkVerdict::decode(&[0xFD, 0x04, 0x54, 0x00]).is_err());
