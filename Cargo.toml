@@ -158,6 +158,7 @@ ndn-pathcontrol = { path = "../ndn-rs/crates/forwarding/ndn-pathcontrol" }
 ndn-app       = { path = "../ndn-rs/crates/app/ndn-app" }
 ndn-data      = { path = "../ndn-rs/crates/app/ndn-data" }
 ndn-heap      = { path = "../ndn-rs/crates/app/ndn-heap" }
+ndn-invite    = { path = "../ndn-rs/crates/app/ndn-invite" }
 ndn-ipc       = { path = "../ndn-rs/crates/forwarding/ndn-ipc" }
 ndn-config    = { path = "../ndn-rs/crates/platform/ndn-config" }
 ndn-discovery = { path = "crates/discovery/ndn-discovery",     default-features = false }
