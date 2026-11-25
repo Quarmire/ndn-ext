@@ -23,7 +23,6 @@ use common::*;
 use ndn_invite::Role;
 use ndn_link::{DepartureOptions, LinkState};
 use ndn_packet::Name;
-use ndn_sync::DataStore;
 
 /// Ann's record for the notebook without Bob.
 async fn lets_go(ann: &Embedded) {

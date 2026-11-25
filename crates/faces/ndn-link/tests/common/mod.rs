@@ -39,7 +39,7 @@ use ndn_security::{
     Certificate, Keyring, SecurityManager, SecurityProfile, SignedTrustContext, TrustSchema,
     Validator,
 };
-use ndn_sync::MemoryStore;
+use ndn_sync::{DataStore, MemoryStore};
 use ndn_trust_envelope::TrustEnvelope;
 use tokio_util::sync::CancellationToken;
 
@@ -666,12 +666,8 @@ pub struct Embedded {
     pub validator: Arc<Validator>,
     kept: Kept,
     skew: Arc<AtomicU64>,
-}
-
-impl Drop for Embedded {
-    fn drop(&mut self) {
-        self.cancel.cancel();
-    }
+    /// Cancels `cancel` when the device is dropped.
+    _stop: tokio_util::sync::DropGuard,
 }
 
 impl Embedded {
@@ -693,12 +689,22 @@ struct Kept {
     parts: Parts,
     trust: Arc<Trust>,
     validator: Arc<Validator>,
-    store: Arc<MemoryStore>,
+    store: Arc<dyn DataStore>,
     anchor: Bytes,
     ns: Name,
 }
 
 pub async fn embedded(person: &Person, device: &str, setup: Setup) -> Embedded {
+    embedded_on(person, device, setup, Arc::new(MemoryStore::new())).await
+}
+
+/// [`embedded`] over `store`: a directory store opens again after the device closed.
+pub async fn embedded_on(
+    person: &Person,
+    device: &str,
+    setup: Setup,
+    store: Arc<dyn DataStore>,
+) -> Embedded {
     log_to_file();
     let parts = Parts::new(device, setup.listen);
     let cert = parts.certified(person, setup.cert_ms).await;
@@ -708,7 +714,7 @@ pub async fn embedded(person: &Person, device: &str, setup: Setup) -> Embedded {
             parts,
             trust,
             validator,
-            store: Arc::new(MemoryStore::new()),
+            store,
             anchor: person.signed.clone(),
             ns: person.ns.clone(),
         },
@@ -719,8 +725,31 @@ pub async fn embedded(person: &Person, device: &str, setup: Setup) -> Embedded {
 
 impl Embedded {
     /// The device's store: what it keeps across a restart.
-    pub fn store(&self) -> &Arc<MemoryStore> {
+    pub fn store(&self) -> &Arc<dyn DataStore> {
         &self.kept.store
+    }
+
+    /// Stop the device as its host does at the end of a run: its links, then its node, closed;
+    /// then everything the host held (the invitations, the hints, the links, the store) is
+    /// let go. When it returns nothing of the device is left that holds its store.
+    pub async fn close(self) {
+        let _ = self.close_keeping_hints().await;
+    }
+
+    /// [`Self::close`], and a clone of the hints the host held is kept: what a host that
+    /// outlives its device's links holds.
+    pub async fn close_keeping_hints(self) -> LinkHints {
+        let hints = self.hints.clone();
+        let Embedded {
+            node,
+            links,
+            cancel,
+            ..
+        } = self;
+        links.shutdown().await;
+        node.close().await;
+        cancel.cancel();
+        hints
     }
 
     /// The space `space` this device has open (made, joined or restored).
@@ -832,7 +861,7 @@ async fn boot(kept: Kept, setup: Setup) -> Embedded {
         parts.name.clone(),
         Arc::clone(&parts.keys),
         Arc::clone(&validator),
-        Arc::clone(&store) as Arc<dyn ndn_sync::DataStore>,
+        Arc::clone(&store),
         Config {
             clock,
             first_look: Duration::from_secs(1),
@@ -866,6 +895,7 @@ async fn boot(kept: Kept, setup: Setup) -> Embedded {
         )),
         None => None,
     };
+    let stop = cancel.clone().drop_guard();
     Embedded {
         node,
         invites,
@@ -882,6 +912,7 @@ async fn boot(kept: Kept, setup: Setup) -> Embedded {
         skew,
         _shutdown: shutdown,
         _serving: serving,
+        _stop: stop,
     }
 }
 

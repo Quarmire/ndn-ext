@@ -6,7 +6,7 @@
 //! `dial_first` and `undial` — by forwarding to a [`LinkHints`].
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ndn_face_quic::KeyFingerprint;
@@ -73,14 +73,51 @@ impl DepartureSink for Surface {
 
 /// What a data-layer device does over its [`Links`] for an introduction
 /// code's link hint.
+///
+/// **Ownership.** The hints hold the links *weakly*: whoever started the links
+/// ([`Links::start`]) owns them and ends them, and a clone of these hints, in the
+/// `ndn_invite::Host` the invitations hold or anywhere else, never keeps the links (their
+/// sockets, their tasks, the store a [`remember`](Links::remember)ed memory holds) alive. The
+/// host that holds the hints, the invitations that hold the host and the node whose judge
+/// holds it as its adopter are therefore no loop through the links, whatever order the device
+/// is started in and let go in (the hints are written into the host after the links start, as a
+/// host does). Once the links are gone the hints fail closed: [`hint`](Self::hint) is `None`,
+/// [`dial`](Self::dial) and [`dial_first`](Self::dial_first) refuse with the words
+/// "the device's links are closed", and what only changes the links' state
+/// ([`grant`](Self::grant), [`revoke_grant`](Self::revoke_grant),
+/// [`depart`](Self::depart), [`serve`](Self::serve)) says at `warn` that nothing was installed.
 #[derive(Clone)]
 pub struct LinkHints {
-    links: Arc<Links>,
+    links: Weak<Links>,
 }
 
+/// What the hints say where the links are gone: the device's owner let them go (dropped the
+/// last `Arc<Links>`), and an introduction needs links to make or to take.
+const LINKS_GONE: &str = "the device's links are closed: their owner dropped them; start the \
+     links again and give the host new hints over them";
+
 impl LinkHints {
+    /// Hints over `links`. Only a weak reference is kept ([`LinkHints`]'s ownership): the
+    /// caller keeps the `Arc` it started the links with, for as long as the device runs.
     pub fn new(links: Arc<Links>) -> Self {
-        Self { links }
+        Self {
+            links: Arc::downgrade(&links),
+        }
+    }
+
+    /// The links, or `None` once their owner let them go.
+    fn links(&self) -> Option<Arc<Links>> {
+        self.links.upgrade()
+    }
+
+    /// The links for something that only changes their state: where they are gone, nothing is
+    /// installed and it says so.
+    fn links_to(&self, what: &str) -> Option<Arc<Links>> {
+        let links = self.links();
+        if links.is_none() {
+            tracing::warn!("{what} was not installed: {LINKS_GONE}");
+        }
+        links
     }
 
     /// The inviter's half: take introduction links for the device's
@@ -106,37 +143,51 @@ impl LinkHints {
     /// stops the task the first started and starts its own: there is never
     /// more than one for these links, so calling it twice does not follow the
     /// device twice. The host has no route to make.
+    ///
+    /// **Who holds whom.** The links hold the *surface* of the invitations
+    /// ([`Invites::surface`]), which holds the invitations' state weakly: the links never keep
+    /// the invitations, and so the node, alive, and a surface whose invitations are gone
+    /// answers as a device with no offer open and none carried (no introduction link is taken).
+    /// The invitations hold their host strongly, the host holds these hints, and the hints hold
+    /// the links weakly ([`LinkHints`]): so the chain from the invitations to the links is
+    /// one way, and nothing leads back from the links to the invitations, the host or the node.
+    /// Dropping the invitations and the node, in either order, lets the host go, and the links
+    /// go when their owner drops them. If the links are gone already, `serve` installs
+    /// nothing and says so at `warn`.
     pub fn serve(&self, invites: &Invites) {
+        let Some(links) = self.links_to("the surface of the invitations") else {
+            return;
+        };
         let surface = invites.surface();
-        self.links.set_introductions(Arc::new(surface.clone()));
-        self.links.set_departure_sink(Arc::new(surface.clone()));
+        links.set_introductions(Arc::new(surface.clone()));
+        links.set_departure_sink(Arc::new(surface.clone()));
         for departure in invites.departures() {
             self.depart(&departure);
         }
         for grant in invites.grants() {
             self.grant(&grant);
         }
-        self.follow_joined(surface);
+        Self::follow_joined(&links, surface);
     }
 
     /// Give the links the joined folders of `surface` now and at every change
     /// of its `joined_changes`, by one task for these links: the one a former
     /// call started is stopped, and the task ends when the device is gone.
-    fn follow_joined(&self, surface: Surface) {
+    fn follow_joined(links: &Arc<Links>, surface: Surface) {
         let stop = {
-            let mut running = self.links.joined_follow.lock();
+            let mut running = links.joined_follow.lock();
             if let Some(former) = running.take() {
                 former.cancel();
             }
-            let stop = self.links.cancel_token().child_token();
+            let stop = links.cancel_token().child_token();
             *running = Some(stop.clone());
             stop
         };
         // Subscribed before the first read: a change between the two is seen
         // as one more, which changes nothing.
         let mut changes = surface.joined_changes();
-        set_joined(&self.links, &surface);
-        let links = Arc::downgrade(&self.links);
+        set_joined(links, &surface);
+        let links = Arc::downgrade(links);
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -162,7 +213,9 @@ impl LinkHints {
     /// the key's set, the entry of its folder. Forward
     /// [`Host::grant`](ndn_invite::Host::grant) here.
     pub fn grant(&self, grant: &ndn_invite::Grant) {
-        self.links.grant(link_grant(grant));
+        if let Some(links) = self.links_to("a grant") {
+            links.grant(link_grant(grant));
+        }
     }
 
     /// The grant of `key` for `folder` ended before its time (a held members
@@ -176,9 +229,12 @@ impl LinkHints {
     /// own accord (a person who stays a member) calls
     /// [`LinkHints::end_grant_in`] or
     /// [`LinkHints::end_grant`], which also make it durable, so that a
-    /// restart does not bring it back.
+    /// restart does not bring it back. With the links gone there is no link to close and
+    /// nothing is done.
     pub fn revoke_grant(&self, key: &[u8; 32], folder: &Name) {
-        self.links.revoke_grant(&KeyFingerprint(*key), folder);
+        if let Some(links) = self.links() {
+            links.revoke_grant(&KeyFingerprint(*key), folder);
+        }
     }
 
     /// A held members record left the person out of a folder: the departure
@@ -188,7 +244,9 @@ impl LinkHints {
     /// here; the invitations call it before
     /// [`revoke_grant`](LinkHints::revoke_grant) for the same end.
     pub fn depart(&self, departure: &ndn_invite::Departure) {
-        self.links.depart(link_departure(departure));
+        if let Some(links) = self.links_to("a departure mark") {
+            links.depart(link_departure(departure));
+        }
     }
 
     /// The host ends every grant of `key` for good: the links they alone
@@ -207,7 +265,9 @@ impl LinkHints {
     /// durable: the links are closed already, call it again once the device
     /// runs.
     pub async fn end_grant(&self, invites: &Invites, key: &[u8; 32]) -> Result<bool, InviteError> {
-        let linked = self.links.revoke_grants(&KeyFingerprint(*key));
+        let linked = self
+            .links()
+            .is_some_and(|links| links.revoke_grants(&KeyFingerprint(*key)));
         let recorded = invites.end_grant(key).await?;
         Ok(linked || recorded)
     }
@@ -225,7 +285,9 @@ impl LinkHints {
         key: &[u8; 32],
         folder: &Name,
     ) -> Result<bool, InviteError> {
-        let linked = self.links.revoke_grant(&KeyFingerprint(*key), folder);
+        let linked = self
+            .links()
+            .is_some_and(|links| links.revoke_grant(&KeyFingerprint(*key), folder));
         let recorded = invites.end_grant_in(key, folder).await?;
         Ok(linked || recorded)
     }
@@ -257,11 +319,11 @@ impl LinkHints {
 
     /// The hint to put into an offer's code: this device's link key and the
     /// candidate addresses of its listening socket, most promising first.
-    /// `None` when it does not listen or has no usable key.
+    /// `None` when it does not listen or has no usable key, or the links are gone.
     pub fn hint(&self) -> Option<LinkHint> {
-        let key = self.links.key_fingerprint()?;
-        let candidates: Vec<HintCandidate> = self
-            .links
+        let links = self.links()?;
+        let key = links.key_fingerprint()?;
+        let candidates: Vec<HintCandidate> = links
             .hint_candidates()
             .into_iter()
             .filter_map(|c| {
@@ -281,7 +343,8 @@ impl LinkHints {
     /// within `within` ([`Links::dial_by_key`]). `Ok` once the link to the
     /// device holding the hint's key is up; until that device is identified
     /// the link routes only `inviter`'s introduction prefixes, not the
-    /// names the code claims for it.
+    /// names the code claims for it. With the links gone it refuses, saying
+    /// so.
     pub fn dial<'a>(
         &'a self,
         hint: &'a LinkHint,
@@ -289,8 +352,9 @@ impl LinkHints {
         within: Duration,
     ) -> Dialing<'a> {
         Box::pin(async move {
+            let links = self.links().ok_or_else(|| LINKS_GONE.to_string())?;
             let addrs = hint.candidates.iter().map(|c| c.addr).collect();
-            self.links
+            links
                 .dial_by_key(
                     KeyFingerprint(hint.key),
                     inviter.clone(),
@@ -315,7 +379,8 @@ impl LinkHints {
     /// this device's own names. The host forwards
     /// [`Host::dial_first`](ndn_invite::Host::dial_first)
     /// here, and the join's [`undial`](Self::undial) for the key returned
-    /// when it fails or when the verified record names another key.
+    /// when it fails or when the verified record names another key. With the links gone
+    /// it refuses, saying so.
     pub fn dial_first<'a>(
         &'a self,
         inviter: &'a Name,
@@ -323,7 +388,8 @@ impl LinkHints {
         within: Duration,
     ) -> FirstDialing<'a> {
         Box::pin(async move {
-            self.links
+            let links = self.links().ok_or_else(|| LINKS_GONE.to_string())?;
+            links
                 .dial_first(
                     inviter.clone(),
                     addr,
@@ -339,15 +405,17 @@ impl LinkHints {
     /// The join that dialled `hint` failed, or the verified record names
     /// another key than the link's: take down the link it made, if it is
     /// still one that has shown no certificate this device holds
-    /// ([`Links::undial_by_key`]).
+    /// ([`Links::undial_by_key`]). With the links gone there is no link to take down.
     pub fn undial(&self, hint: &LinkHint, inviter: &Name) {
-        self.links.undial_by_key(
-            KeyFingerprint(hint.key),
-            &format!(
-                "the link made by dialling {inviter} from its code is taken down: the join failed, \
-                 or this party's key is not the one the code's verified hint names"
-            ),
-        );
+        if let Some(links) = self.links() {
+            links.undial_by_key(
+                KeyFingerprint(hint.key),
+                &format!(
+                    "the link made by dialling {inviter} from its code is taken down: the join failed, \
+                     or this party's key is not the one the code's verified hint names"
+                ),
+            );
+        }
     }
 }
 
