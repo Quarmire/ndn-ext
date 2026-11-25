@@ -41,5 +41,8 @@ name = "carrier_bench"
 [[example]]
 name = "side_ping"
 
+[[example]]
+name = "link_rss"
+
 [lints]
 workspace = true

@@ -1,7 +1,7 @@
-//! The datagram size of a link on loopback (SHAPES-CHANNEL.md §17): a connection idle after the
-//! handshake finds a path MTU above the 1,200 octets every QUIC path carries, up to the bound
-//! `path_mtu_max` sets; and a link whose bound is raised still carries a burst, because one
-//! GSO batch never exceeds the 65,507 octets of a UDP datagram.
+//! The datagram size of a link on loopback: a connection idle after the handshake finds a path
+//! MTU above the 1,200 octets every QUIC path carries, up to the bound `path_mtu_max` sets
+//! (9,000 by default); and a link on a bound that high still carries a burst, because one GSO
+//! batch never exceeds the 65,507 octets of a UDP datagram.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -71,24 +71,28 @@ async fn size_over(link: &Link, over: usize) -> usize {
 /// QUIC's floor: 1,200 octets of UDP payload carry 1,162 of datagram.
 const FLOOR: usize = 1162;
 
+/// The default bound is 9,000 octets of payload, and an idle loopback link settles on it:
+/// 8,962 of datagram, both ways.
 #[tokio::test]
-async fn an_idle_link_on_loopback_finds_a_datagram_size_over_the_minimum() {
+async fn an_idle_link_on_loopback_settles_on_the_default_bound() {
     let (a, b, _eps) = link(&LinkTransportConfig::default()).await;
-    // The default bound is quinn's own, 1,452 octets of payload: 1,414 of datagram.
-    assert_eq!(size_over(&a, 1400).await, 1414);
-    assert_eq!(size_over(&b, 1400).await, 1414);
+    assert_eq!(size_over(&a, 8000).await, 8962);
+    assert_eq!(size_over(&b, 8000).await, 8962);
 }
 
+/// What an Ethernet path ends at: a bound of 1,452 octets of payload (1,500 less the IPv6
+/// and UDP headers), which the discovery of a link given that bound settles on, 1,414 of
+/// datagram. A path whose own limit is lower than the default bound ends at its limit in the
+/// same way, so the higher default costs an Ethernet path nothing but about a dozen probes.
 #[tokio::test]
-async fn a_raised_path_mtu_bound_is_reached_on_an_idle_link() {
+async fn a_bound_of_ethernets_size_settles_there() {
     let config = LinkTransportConfig {
-        path_mtu_max: 9000,
+        path_mtu_max: 1452,
         ..LinkTransportConfig::default()
     };
     let (a, b, _eps) = link(&config).await;
-    // 9,000 octets of payload: 8,962 of datagram, both ways.
-    assert_eq!(size_over(&a, 8000).await, 8962);
-    assert_eq!(size_over(&b, 8000).await, 8962);
+    assert_eq!(size_over(&a, 1400).await, 1414);
+    assert_eq!(size_over(&b, 1400).await, 1414);
 }
 
 #[tokio::test]

@@ -13,7 +13,7 @@
 //! |---|---|---|
 //! | `only` | `dgram1k,stream1k,stream8k,lat` | rows to run |
 //! | `repeat`, `secs`, `rt`, `workers` | 3, 3, 2, 1 | as in `carrier_bench` |
-//! | `path_mtu_max` | 1452 | `LinkTransportConfig::path_mtu_max` |
+//! | `path_mtu_max` | 1452 | `LinkTransportConfig::path_mtu_max` (this example's own default, that of `carrier_bench`'s raw rows; the library's is 9,000) |
 //! | `raw_dgram`, `raw_stream1k`, `raw_stream8k` | | msg/s of the same row of `carrier_bench` at the same settings |
 //! | `raw_lat` | | its 64 B half round trip p50, in microseconds |
 //!

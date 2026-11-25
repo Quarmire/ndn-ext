@@ -68,14 +68,20 @@ pub struct LinkTransportConfig {
     /// The largest UDP payload a link's path-MTU discovery may reach, and the largest the
     /// endpoint takes: quinn's `MtuDiscoveryConfig::upper_bound` and the endpoint's
     /// `max_udp_payload_size` (which caps what the peer may probe), both, or the search stops
-    /// at the lower. The default is quinn's own bound, which stays within Ethernet's MTU on
-    /// IPv4 and IPv6. Discovery probes upward from 1,200 and keeps what the path acknowledges,
-    /// so a higher bound costs about a dozen probes on a path that carries less, and finds room
-    /// on loopback, a jumbo-frame LAN or a same-host path: at 9,000 a loopback link carries
-    /// 2.9 times the 1 KiB datagrams and 2.4 times the 8 KiB stream messages a second that it
-    /// does at 1,452 (SHAPES-CHANNEL.md §17). quinn allocates, zeroed, one receive buffer of
-    /// this bound times 64 GRO segments times 32 packets for the endpoint (18 MB at 9,000):
-    /// one per socket, not per link. Clamped to 1,200–65,527.
+    /// at the lower. The default is 9,000, the usual jumbo frame. It is a bound, not a size:
+    /// discovery probes upward from 1,200 and settles on what the path acknowledges, so an
+    /// Ethernet path still ends near 1,452 (1,500 less IP and UDP headers; quinn's own bound,
+    /// which this default replaces), a jumbo-frame LAN near 9,000, and loopback or a same-host
+    /// path at the bound. A bound above the path costs about a dozen probes. The gain is on
+    /// the paths that carry more: at 9,000 a loopback link carries 2.9 times the 1 KiB
+    /// datagrams and 2.4 times the 8 KiB stream messages a second that it does at 1,452.
+    /// The bound costs little memory: 200 idle loopback links held 18 KB more resident memory
+    /// each at 9,000 than at 1,452 (89 KB against 71 KB for both ends of a link), and after a
+    /// burst and a 1 MiB stream on each, 107 KB less (the examples' `link_rss`); the decision
+    /// rule was that more than 1 MiB more per connection would keep 1,452. quinn allocates,
+    /// zeroed, one receive buffer of this bound times 64 GRO segments times 32 packets for the
+    /// endpoint (18 MB at 9,000): one per socket, not per link, and untouched pages of it are
+    /// not resident. Clamped to 1,200–65,527.
     pub path_mtu_max: u16,
 }
 
@@ -94,8 +100,9 @@ impl Default for LinkTransportConfig {
     }
 }
 
-/// quinn's own bound of path-MTU discovery: Ethernet's 1,500 less IPv6 and UDP headers.
-const DEFAULT_PATH_MTU_MAX: u16 = 1452;
+/// The default bound of path-MTU discovery: a jumbo frame (the memory this costs per connection
+/// is on [`LinkTransportConfig::path_mtu_max`]).
+const DEFAULT_PATH_MTU_MAX: u16 = 9000;
 /// What every QUIC path carries (the floor of `path_mtu_max`), and the most a QUIC packet may
 /// be (its ceiling).
 const PATH_MTU_FLOOR: u16 = 1200;
