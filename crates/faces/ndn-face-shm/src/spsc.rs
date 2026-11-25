@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use bytes::Bytes;
 
-use ndn_transport::{FaceError, FaceId, FaceKind, FaceTrust, Transport};
+use ndn_transport::{FaceError, FaceId, FaceKind, FaceTrust, SideClass, SideRefused, Transport};
 
 use crate::ShmError;
 
@@ -1564,6 +1564,28 @@ impl Transport for SpscFace {
         _persistency: ndn_transport::FacePersistency,
     ) -> Result<(), ndn_transport::PersistencyError> {
         Err(ndn_transport::PersistencyError::Immutable)
+    }
+
+    /// A side frame is one ring slot: the longest it can be is the slot size.
+    /// (`send_mtu` stays `None`: the link service of a local face never
+    /// fragments, and NDN packets are bounded by the slot at the sender.)
+    fn side_frame_max(&self) -> usize {
+        self.slot_size as usize
+    }
+
+    /// A ring push. The ring is reliable and ordered (a full ring waits), so
+    /// both classes are served and `class` is ignored. A frame over one slot is
+    /// refused `TooLarge`, which the default cannot do (this face has no
+    /// `send_mtu`, so the default would surface the slot check as an I/O error).
+    async fn send_side(&self, frame: Bytes, _class: SideClass) -> Result<(), SideRefused> {
+        let max = self.slot_size as usize;
+        if frame.len() > max {
+            return Err(SideRefused::TooLarge {
+                size: frame.len(),
+                max,
+            });
+        }
+        self.send_bytes(frame).await.map_err(Into::into)
     }
 
     async fn recv_bytes(&self) -> Result<Bytes, FaceError> {
@@ -3462,6 +3484,70 @@ mod tests {
             .expect("closed");
         assert_eq!(&down[..], b"down");
 
+        drop((a, b));
+    }
+
+    /// A side frame crosses the ring byte-identical in both directions, for both
+    /// classes; one over a slot is refused `TooLarge` and nothing is pushed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_side_frame_crosses_the_ring_unchanged_and_over_a_slot_is_refused() {
+        use ndn_transport::SIDE_MARKER;
+        use std::os::unix::net::UnixStream;
+        use std::time::Duration;
+
+        const SLOT: u32 = 256;
+        let (face, fds) = SpscFace::create_anon_with(FaceId(90), 16, SLOT).unwrap();
+        assert_eq!(face.side_frame_max(), SLOT as usize);
+        let (a, b) = UnixStream::pair().unwrap();
+        send_fds(
+            a.as_raw_fd(),
+            &[fds[0].as_raw_fd(), fds[1].as_raw_fd(), fds[2].as_raw_fd()],
+        )
+        .unwrap();
+        drop(fds);
+        let mut recvd = recv_fds(b.as_raw_fd(), 3).unwrap();
+        let e2a_read = recvd.pop().unwrap();
+        let a2e_write = recvd.pop().unwrap();
+        let region = recvd.pop().unwrap();
+        let handle = SpscHandle::from_fds(region, a2e_write, e2a_read).unwrap();
+
+        let frame = |len: usize, fill: u8| {
+            let mut v = vec![fill; len];
+            v[0] = SIDE_MARKER;
+            Bytes::from(v)
+        };
+
+        // face → handle, both classes, the largest frame that fits.
+        for (class, fill) in [(SideClass::Datagram, 0x11), (SideClass::Stream, 0x22)] {
+            let f = frame(SLOT as usize, fill);
+            face.send_side(f.clone(), class).await.unwrap();
+            let got =
+                tokio::time::timeout(Duration::from_secs(2), handle.recv_with(|s| s.to_vec()))
+                    .await
+                    .expect("timed out")
+                    .expect("closed");
+            assert_eq!(got, f.to_vec());
+        }
+
+        // handle → face: the ring is the same carrier in the other direction.
+        let up = frame(40, 0x33);
+        handle.send_bytes(up.clone()).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(2), face.recv_bytes())
+            .await
+            .expect("timed out")
+            .unwrap();
+        assert_eq!(got, up);
+
+        // One octet over a slot is refused, not an I/O error, and nothing is pushed.
+        assert_eq!(
+            face.send_side(frame(SLOT as usize + 1, 0x44), SideClass::Stream)
+                .await,
+            Err(SideRefused::TooLarge {
+                size: SLOT as usize + 1,
+                max: SLOT as usize
+            })
+        );
+        assert!(handle.try_recv().is_none());
         drop((a, b));
     }
 

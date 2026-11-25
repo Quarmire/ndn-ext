@@ -227,6 +227,20 @@ impl Transport for WebTransportFace {
         Some(format!("wts://{}", self.local_addr))
     }
 
+    /// `send_bytes` wraps every packet in an LP packet and fragments it, so a
+    /// side frame would not reach the peer as a marked frame. Refused.
+    async fn send_side(
+        &self,
+        _frame: Bytes,
+        _class: ndn_transport::SideClass,
+    ) -> Result<(), ndn_transport::SideRefused> {
+        Err(ndn_transport::SideRefused::NotCarried)
+    }
+
+    fn side_frame_max(&self) -> usize {
+        0
+    }
+
     async fn recv_bytes(&self) -> Result<Bytes, FaceError> {
         let _guard = self.recv_lock.lock().await;
         let dgram = self

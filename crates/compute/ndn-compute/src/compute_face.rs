@@ -49,6 +49,20 @@ impl Transport for ComputeFace {
         FaceTrust::Program
     }
 
+    /// `send_bytes` decodes an Interest and drops anything else, so a side frame
+    /// would be reported as sent and discarded. Refused instead.
+    async fn send_side(
+        &self,
+        _frame: Bytes,
+        _class: ndn_transport::SideClass,
+    ) -> Result<(), ndn_transport::SideRefused> {
+        Err(ndn_transport::SideRefused::NotCarried)
+    }
+
+    fn side_frame_max(&self) -> usize {
+        0
+    }
+
     async fn recv_bytes(&self) -> Result<Bytes, FaceError> {
         self.rx.lock().await.recv().await.ok_or(FaceError::Closed)
     }
@@ -85,5 +99,24 @@ impl Transport for ComputeFace {
         });
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndn_transport::{SIDE_MARKER, SideClass, SideRefused};
+
+    #[tokio::test]
+    async fn a_compute_face_carries_no_side_frame() {
+        let face = ComputeFace::new(FaceId(4), Arc::new(ComputeRegistry::new()));
+        let frame = Bytes::from_static(&[SIDE_MARKER, 0x20, 1, 2]);
+        for class in [SideClass::Datagram, SideClass::Stream] {
+            assert_eq!(
+                face.send_side(frame.clone(), class).await,
+                Err(SideRefused::NotCarried)
+            );
+        }
+        assert_eq!(face.side_frame_max(), 0);
     }
 }

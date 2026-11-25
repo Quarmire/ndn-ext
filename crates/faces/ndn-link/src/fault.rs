@@ -464,6 +464,29 @@ impl Transport for Faulted {
         self.inner.send_bytes_to(addr, wire).await
     }
 
+    /// The side path is the link's own: like `send_bytes`, what this device sends
+    /// is not faulted here (the peer's layer meets it on arrival), so it goes to
+    /// the link's face as is.
+    async fn send_side(
+        &self,
+        frame: Bytes,
+        class: ndn_transport::SideClass,
+    ) -> Result<(), ndn_transport::SideRefused> {
+        self.inner.send_side(frame, class).await
+    }
+
+    fn forward_side(
+        &self,
+        frame: Bytes,
+        class: ndn_transport::SideClass,
+    ) -> Result<(), ndn_transport::SideRefused> {
+        self.inner.forward_side(frame, class)
+    }
+
+    fn side_frame_max(&self) -> usize {
+        self.inner.side_frame_max()
+    }
+
     fn set_send_mtu(&self, mtu: Option<u64>) -> Result<Option<u64>, MtuError> {
         self.inner.set_send_mtu(mtu)
     }
@@ -969,5 +992,106 @@ mod tests {
         let mut a = [0u8; 32];
         a[7] = 9;
         assert_eq!(end(&KeyFingerprint(a)), 9);
+    }
+
+    /// What records the side path: what `send_side` and `forward_side` were given,
+    /// what `side_frame_max` answers, and a feed of arrivals.
+    struct SideSpy {
+        rx: Mutex<mpsc::UnboundedReceiver<Bytes>>,
+        sent: parking_lot::Mutex<Vec<(Bytes, ndn_transport::SideClass)>>,
+        forwarded: parking_lot::Mutex<Vec<(Bytes, ndn_transport::SideClass)>>,
+    }
+
+    impl Transport for SideSpy {
+        fn id(&self) -> FaceId {
+            FaceId(8)
+        }
+        fn kind(&self) -> FaceKind {
+            FaceKind::Quic
+        }
+        async fn send_bytes(&self, _: Bytes) -> Result<(), FaceError> {
+            panic!("a side frame must not go through send_bytes of the wrapper");
+        }
+        async fn send_side(
+            &self,
+            frame: Bytes,
+            class: ndn_transport::SideClass,
+        ) -> Result<(), ndn_transport::SideRefused> {
+            self.sent.lock().push((frame, class));
+            Ok(())
+        }
+        fn forward_side(
+            &self,
+            frame: Bytes,
+            class: ndn_transport::SideClass,
+        ) -> Result<(), ndn_transport::SideRefused> {
+            self.forwarded.lock().push((frame, class));
+            Err(ndn_transport::SideRefused::Full)
+        }
+        fn side_frame_max(&self) -> usize {
+            1234
+        }
+        async fn recv_bytes(&self) -> Result<Bytes, FaceError> {
+            self.rx.lock().await.recv().await.ok_or(FaceError::Closed)
+        }
+    }
+
+    /// The fault layer leaves the side path of the link alone on send (as it leaves
+    /// `send_bytes`: the peer's layer meets what arrives) and hands the inner
+    /// face's answers through; a marked frame that ARRIVES meets the profile like
+    /// every other frame, with the shared stream's fates.
+    #[tokio::test]
+    async fn the_side_path_is_the_links_and_arrivals_meet_the_profile() {
+        use ndn_transport::{SIDE_MARKER, SideClass, SideRefused};
+
+        let (feed, rx) = mpsc::unbounded_channel();
+        let spy = Arc::new(SideSpy {
+            rx: Mutex::new(rx),
+            sent: parking_lot::Mutex::new(Vec::new()),
+            forwarded: parking_lot::Mutex::new(Vec::new()),
+        });
+        let layer = Arc::new(FaultLayer::default());
+        let inner: Arc<dyn ErasedTransport> = spy.clone();
+        let face = layer.wrap(inner, PEER, Some(ME), Direction::Accepted);
+        let profile = Faults::parse("drop=0.5,dup=0.3,delay=5")
+            .unwrap()
+            .with_seed(3);
+        layer.install(FaultPlan::new(profile));
+
+        // Send: even a plan that drops half of what arrives touches nothing sent.
+        let frame = |i: u8| Bytes::from(vec![SIDE_MARKER, 0x20, i, i, i]);
+        for (i, class) in [SideClass::Datagram, SideClass::Stream]
+            .into_iter()
+            .enumerate()
+        {
+            face.send_side(frame(i as u8), class).await.unwrap();
+        }
+        assert_eq!(
+            *spy.sent.lock(),
+            vec![
+                (frame(0), SideClass::Datagram),
+                (frame(1), SideClass::Stream)
+            ]
+        );
+        assert_eq!(
+            face.forward_side(frame(2), SideClass::Datagram),
+            Err(SideRefused::Full),
+            "the inner face's refusal comes through"
+        );
+        assert_eq!(*spy.forwarded.lock(), vec![(frame(2), SideClass::Datagram)]);
+        assert_eq!(face.side_frame_max(), 1234);
+        assert_eq!(layer.report().met, 0, "nothing sent met the profile");
+
+        // Arrivals: marked frames get the fates the shared stream draws.
+        let frames: Vec<Bytes> = (0..200).map(|i| frame(i as u8)).collect();
+        for f in &frames {
+            feed.send(f.clone()).unwrap();
+        }
+        drop(feed);
+        let got = all(&face).await;
+        let (want, want_report) = expected(&profile, &frames);
+        assert_eq!(sorted(got), sorted(want), "the marked frames delivered");
+        assert_eq!(layer.report().met, want_report.met);
+        assert!(want_report.dropped > 0 && want_report.duplicated > 0);
     }
 }

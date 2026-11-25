@@ -242,6 +242,20 @@ impl Transport for BrowserWebTransportFace {
         Some(self.remote_uri.clone())
     }
 
+    /// `send_bytes` wraps every packet in an LP packet, so a side frame would not
+    /// reach the peer as a marked frame. Refused.
+    async fn send_side(
+        &self,
+        _frame: Bytes,
+        _class: ndn_transport::SideClass,
+    ) -> Result<(), ndn_transport::SideRefused> {
+        Err(ndn_transport::SideRefused::NotCarried)
+    }
+
+    fn side_frame_max(&self) -> usize {
+        0
+    }
+
     async fn recv_bytes(&self) -> Result<Bytes, FaceError> {
         let mut rx = self.rx_in.lock().await;
         match rx.recv().await {

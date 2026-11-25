@@ -134,6 +134,21 @@ impl Transport for WebSocketFace {
         ))
     }
 
+    /// `send_bytes` wraps every packet in an LP packet, so a side frame would
+    /// reach the peer as the fragment of an LP packet, not as a marked frame.
+    /// Refused.
+    async fn send_side(
+        &self,
+        _frame: Bytes,
+        _class: ndn_transport::SideClass,
+    ) -> Result<(), ndn_transport::SideRefused> {
+        Err(ndn_transport::SideRefused::NotCarried)
+    }
+
+    fn side_frame_max(&self) -> usize {
+        0
+    }
+
     async fn recv_bytes(&self) -> Result<Bytes, FaceError> {
         let mut reader = self.reader.lock().await;
         loop {
@@ -211,6 +226,21 @@ impl Transport for TlsWebSocketFace {
     }
     fn local_uri(&self) -> Option<String> {
         Some(format!("wss://{}", self.local_addr))
+    }
+
+    /// `send_bytes` wraps every packet in an LP packet, so a side frame would
+    /// reach the peer as the fragment of an LP packet, not as a marked frame.
+    /// Refused.
+    async fn send_side(
+        &self,
+        _frame: Bytes,
+        _class: ndn_transport::SideClass,
+    ) -> Result<(), ndn_transport::SideRefused> {
+        Err(ndn_transport::SideRefused::NotCarried)
+    }
+
+    fn side_frame_max(&self) -> usize {
+        0
     }
 
     async fn recv_bytes(&self) -> Result<Bytes, FaceError> {

@@ -130,6 +130,21 @@ impl Transport for WebBleFace {
         Some(self.remote_uri.clone())
     }
 
+    /// The GATT framing wraps a packet in an LP packet or cuts it into NDNts
+    /// fragments that the peer's reassembler reads as TLV, so a side frame would
+    /// not arrive as sent. Refused.
+    async fn send_side(
+        &self,
+        _frame: Bytes,
+        _class: ndn_transport::SideClass,
+    ) -> Result<(), ndn_transport::SideRefused> {
+        Err(ndn_transport::SideRefused::NotCarried)
+    }
+
+    fn side_frame_max(&self) -> usize {
+        0
+    }
+
     async fn recv_bytes(&self) -> Result<Bytes, FaceError> {
         let mut rx = self.rx_in.lock().await;
         rx.recv().await.ok_or(FaceError::Closed)
