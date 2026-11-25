@@ -61,8 +61,7 @@ tokio = { workspace = true, features = ["full"] }
 # real data-layer devices on them, joining by a code's link hint.
 ndn-link   = { path = ".", features = ["engine", "introductions"] }
 ndn-engine = { workspace = true }
-# examples/ladder.rs: the old data layer (`LADDER_LAYER=old`) until stage 9.
-ndn-data   = { workspace = true }
+# examples/ladder.rs: the data layer (`ndn-heap`) and its introductions (`ndn-invite`).
 ndn-heap   = { workspace = true }
 ndn-invite = { workspace = true }
 ndn-app    = { workspace = true }
