@@ -10,7 +10,9 @@ use ndn_packet::Name;
 use quinn::{ConnectionError, SendDatagramError};
 use tracing::trace;
 
-use ndn_transport::{FaceError, FaceId, FaceKind, Transport, ip_face_uri};
+use ndn_transport::{
+    FaceError, FaceId, FaceKind, SIDE_MARKER, SideClass, SideRefused, Transport, ip_face_uri,
+};
 
 use crate::endpoint::Permit;
 use crate::key::{KeyFingerprint, LinkKey, PeerKey};
@@ -21,6 +23,7 @@ use crate::message::{
     WAKE_TOKEN_MAX, decode_udp_address, encode_observed_address, skippable, split_tlv,
 };
 use crate::scope::{Judged, LinkScope, ScopeState, nack_for};
+use crate::side::{ChannelPolicy, SideCarrier, SideLimits, SideStats, has_channel_caps};
 
 /// A datagram payload every QUIC path carries: QUIC packets of 1200 bytes
 /// (RFC 9000 §14) less packet and frame overhead. Used only if the
@@ -119,6 +122,10 @@ pub struct Handshaken {
     control: Option<(quinn::SendStream, quinn::RecvStream)>,
     /// The key this side presented in the handshake.
     local: LinkKey,
+    /// The peer's hello carried `ChannelCaps` bit 0 (set by `exchange_hello`).
+    peer_caps: bool,
+    /// This side's hello did.
+    our_caps: bool,
 }
 
 impl Handshaken {
@@ -146,6 +153,8 @@ impl Handshaken {
             endpoint,
             control: None,
             local,
+            peer_caps: false,
+            our_caps: false,
         })
     }
 
@@ -225,6 +234,8 @@ impl Handshaken {
             Err(_) => return Err(self.fail(LinkError::Timeout, deadline)),
         };
         self.control = Some((send, recv));
+        self.peer_caps = has_channel_caps(hello.channel_caps);
+        self.our_caps = has_channel_caps(ours.channel_caps);
         Ok(hello)
     }
 
@@ -279,6 +290,15 @@ impl Handshaken {
             presence: presence_tx,
             departures: departures_tx,
         };
+        let local_close = Arc::new(std::sync::OnceLock::new());
+        let side = SideCarrier::new(
+            self.connection.clone(),
+            self.peer_caps,
+            self.our_caps,
+            admission.channel,
+            Arc::clone(&local_close),
+        );
+        side.spawn(id);
         tokio::spawn(observe(
             self.connection.clone(),
             send,
@@ -293,6 +313,7 @@ impl Handshaken {
                 endpoint: self.endpoint.clone(),
                 scope: scope.clone(),
                 local_answers,
+                side: Arc::clone(&side),
             },
             handle: LinkHandle {
                 connection: self.connection,
@@ -303,7 +324,8 @@ impl Handshaken {
                 reachability,
                 presence,
                 departures,
-                local_close: Arc::default(),
+                local_close,
+                side,
             },
             peer_verdict,
         })
@@ -669,6 +691,9 @@ pub struct Admission {
     /// `Some`: the link carries only this ([`LinkScope`]); `None`: a full
     /// link.
     pub scope: Option<LinkScope>,
+    /// Whether the link carries channel frames, and under which quota. The
+    /// default carries none.
+    pub channel: ChannelPolicy,
 }
 
 /// Answers a scoped face makes for this side (Nacks for the Interests it
@@ -698,6 +723,7 @@ pub struct LinkHandle {
     /// What this side said when it closed the link (the first close wins, as
     /// in QUIC): the connection itself keeps no text of a close made here.
     local_close: Arc<std::sync::OnceLock<(CloseReason, String)>>,
+    side: Arc<SideCarrier>,
 }
 
 impl LinkHandle {
@@ -876,6 +902,20 @@ impl LinkHandle {
         let stats = self.connection.stats();
         stats.frame_tx.datagram + stats.frame_rx.datagram
     }
+
+    /// What the link's side path carried and dropped so far: channel frames
+    /// and octets each way by carrier, and what was refused or dropped.
+    /// Counters only: no address, no key.
+    pub fn side_stats(&self) -> SideStats {
+        self.side.stats()
+    }
+
+    /// Whether the peer's hello advertised `ChannelCaps` (bit 0, channel
+    /// frames). A link carries channel frames only when both sides'
+    /// hellos did and this side's [`ChannelPolicy`] carries.
+    pub fn side_peer_caps(&self) -> bool {
+        self.side.peer_caps()
+    }
 }
 
 /// The face of a link: each NDNLPv2 frame is one QUIC datagram. The face's
@@ -894,6 +934,7 @@ pub struct LinkFace {
         tokio::sync::mpsc::Sender<Bytes>,
         tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Bytes>>,
     )>,
+    side: Arc<SideCarrier>,
 }
 
 impl LinkFace {
@@ -921,6 +962,67 @@ impl LinkFace {
             .read_datagram()
             .await
             .map_err(|_| FaceError::Closed)
+    }
+
+    /// What a writer of channel frames needs to know before it hands one
+    /// over: the octets queued in the connection's datagram send buffer now
+    /// (the input of the headroom rule), and the frame limits.
+    pub fn side_limits(&self) -> SideLimits {
+        self.side.limits()
+    }
+
+    /// What one datagram read is: a channel frame goes to the side path's
+    /// quota (it never reaches the NDN scope, and a drop sends no Nack); any
+    /// other frame is judged by the link's scope, if it has one. `None`: the
+    /// frame was dropped.
+    fn judge_datagram(&self, wire: Bytes) -> Option<Bytes> {
+        if wire.first() == Some(&SIDE_MARKER) {
+            return self.side.received_datagram(&wire).then_some(wire);
+        }
+        let Some(scope) = &self.scope else {
+            return Some(wire);
+        };
+        match scope.received(&wire) {
+            Judged::Pass => Some(wire),
+            // An Interest the peer may not send here, or sends over a
+            // rate, is Nacked to it.
+            Judged::Drop(Some((reason, interest))) => {
+                let _ = self.connection.send_datagram(nack_for(reason, &interest));
+                None
+            }
+            Judged::Drop(None) => None,
+        }
+    }
+
+    /// `recv_bytes` of a link with more than the datagram reader to listen to:
+    /// the Nacks this side's scope answers itself with, and the frames the
+    /// side stream delivered.
+    async fn recv_bytes_from_all(&self) -> Result<Bytes, FaceError> {
+        let mut answers = match &self.local_answers {
+            Some((_, answers)) => Some(answers.lock().await),
+            None => None,
+        };
+        let streams = self.side.reads_stream();
+        loop {
+            tokio::select! {
+                wire = self.read_datagram() => {
+                    if let Some(wire) = self.judge_datagram(wire?) {
+                        return Ok(wire);
+                    }
+                }
+                answer = async {
+                    match answers.as_mut() {
+                        Some(answers) => answers.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(answer) = answer {
+                        return Ok(answer);
+                    }
+                }
+                frame = self.side.next_stream_frame(), if streams => return Ok(frame),
+            }
+        }
     }
 }
 
@@ -975,25 +1077,29 @@ impl Transport for LinkFace {
     }
 
     async fn recv_bytes(&self) -> Result<Bytes, FaceError> {
-        let (Some(scope), Some((_, answers))) = (&self.scope, &self.local_answers) else {
-            return self.read_datagram().await;
-        };
-        let mut answers = answers.lock().await;
+        if self.local_answers.is_some() || self.side.reads_stream() {
+            return self.recv_bytes_from_all().await;
+        }
         loop {
-            let wire = tokio::select! {
-                wire = self.read_datagram() => wire?,
-                Some(answer) = answers.recv() => return Ok(answer),
-            };
-            match scope.received(&wire) {
-                Judged::Pass => return Ok(wire),
-                // An Interest the peer may not send here, or sends over a
-                // rate, is Nacked to it.
-                Judged::Drop(Some((reason, interest))) => {
-                    let _ = self.connection.send_datagram(nack_for(reason, &interest));
-                }
-                Judged::Drop(None) => {}
+            let wire = self.read_datagram().await?;
+            if let Some(wire) = self.judge_datagram(wire) {
+                return Ok(wire);
             }
         }
+    }
+
+    /// The side path's own limits: a datagram carries what the connection
+    /// does now, and the stream's frames are bounded apart.
+    fn side_frame_max(&self) -> usize {
+        self.side.frame_max()
+    }
+
+    async fn send_side(&self, frame: Bytes, class: SideClass) -> Result<(), SideRefused> {
+        self.side.send(frame, class).await
+    }
+
+    fn forward_side(&self, frame: Bytes, class: SideClass) -> Result<(), SideRefused> {
+        self.side.forward(frame, class)
     }
 }
 
@@ -1042,5 +1148,212 @@ mod tests {
         assert!(over.contains("Departure"), "{over}");
         let garbage = heard.take(DEPARTURE, &[0x07, 0x00]).unwrap_err();
         assert!(garbage.contains("Departure"), "{garbage}");
+    }
+
+    // ---- The side stream, as a raw quinn peer sees it ----
+
+    use crate::endpoint::{LinkEndpoint, LinkTransportConfig};
+    use crate::side::STREAM_FRAME_MAX;
+    use ndn_security::Ed25519Signer;
+
+    const T: Duration = Duration::from_secs(5);
+    /// Long enough for a stream that was going to open to have opened, on loopback.
+    const NEVER: Duration = Duration::from_millis(400);
+
+    fn endpoint(seed: u8, listen: bool) -> LinkEndpoint {
+        let key = LinkKey::from_signer(Arc::new(Ed25519Signer::from_seed(
+            &[seed; 32],
+            format!("/ns/member/d{seed}/KEY/k").parse().unwrap(),
+        )))
+        .unwrap();
+        LinkEndpoint::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::new(key),
+            &LinkTransportConfig::default(),
+            listen,
+        )
+        .unwrap()
+    }
+
+    fn hello(caps: u8) -> LinkHello {
+        LinkHello {
+            channel_caps: caps,
+            ..LinkHello::default()
+        }
+    }
+
+    fn carrying() -> Admission {
+        Admission {
+            channel: ChannelPolicy {
+                carry: true,
+                quota: None,
+            },
+            ..Admission::default()
+        }
+    }
+
+    /// Dial and finish both TLS handshakes; no link message was sent yet.
+    async fn handshaken(
+        dialer: &LinkEndpoint,
+        listener: &LinkEndpoint,
+    ) -> (Handshaken, Handshaken) {
+        let target = listener.local_addr().unwrap();
+        let (d, l) = tokio::join!(dialer.connect(target, None), async {
+            listener.accept().await.unwrap().handshake().await
+        });
+        (d.unwrap(), l.unwrap())
+    }
+
+    async fn hellos(d: &mut Handshaken, l: &mut Handshaken, (hd, hl): (LinkHello, LinkHello)) {
+        let (a, b) = tokio::join!(d.exchange_hello(&hd, T), l.exchange_hello(&hl, T));
+        a.unwrap();
+        b.unwrap();
+    }
+
+    async fn admitted(
+        d: Handshaken,
+        l: Handshaken,
+        (ad, al): (Admission, Admission),
+    ) -> (Link, Link) {
+        let (a, b) = tokio::join!(d.admit(FaceId(1), T, ad), l.admit(FaceId(2), T, al));
+        (a.unwrap(), b.unwrap())
+    }
+
+    /// Whether the peer of `raw` grants it a unidirectional stream within `within`.
+    async fn stream_opens(raw: &quinn::Connection, within: Duration) -> bool {
+        tokio::time::timeout(within, raw.open_uni()).await.is_ok()
+    }
+
+    #[tokio::test]
+    async fn no_channel_stream_opens_before_the_verdict_and_none_without_caps() {
+        let (dialer, listener) = (endpoint(1, false), endpoint(2, true));
+
+        // Before the hellos and before the verdict, a raw quinn peer that opens a
+        // unidirectional stream is refused: the link's transport grants none.
+        let (mut d, mut l) = handshaken(&dialer, &listener).await;
+        let raw = d.connection.clone();
+        assert!(
+            !stream_opens(&raw, NEVER).await,
+            "a stream opened before the hellos"
+        );
+        hellos(&mut d, &mut l, (hello(1), hello(1))).await;
+        assert!(
+            !stream_opens(&raw, NEVER).await,
+            "a stream opened before the verdict"
+        );
+        // Both carry: after the verdict the peer has granted exactly one.
+        let (a, b) = admitted(d, l, (carrying(), carrying())).await;
+        let first = tokio::time::timeout(T, raw.open_uni())
+            .await
+            .expect("the verdict grants the stream")
+            .unwrap();
+        assert!(
+            !stream_opens(&raw, NEVER).await,
+            "a second stream opened: the grant is one"
+        );
+        drop(first);
+        assert!(a.handle.side_peer_caps() && b.handle.side_peer_caps());
+
+        // A peer whose hello has no ChannelCaps: no grant, and `send_side` refuses.
+        let (mut d, mut l) = handshaken(&dialer, &listener).await;
+        let raw = d.connection.clone();
+        hellos(&mut d, &mut l, (hello(1), hello(0))).await;
+        let (a, b) = admitted(d, l, (carrying(), carrying())).await;
+        assert!(!a.handle.side_peer_caps() && b.handle.side_peer_caps());
+        assert!(
+            !stream_opens(&raw, NEVER).await,
+            "a peer without caps was granted a stream"
+        );
+        let marked = Bytes::from_static(&[0, 1, 2]);
+        for class in [SideClass::Datagram, SideClass::Stream] {
+            assert_eq!(
+                a.face.send_side(marked.clone(), class).await,
+                Err(SideRefused::PeerLacksChannels)
+            );
+            assert_eq!(
+                b.face.send_side(marked.clone(), class).await,
+                Err(SideRefused::PeerLacksChannels)
+            );
+        }
+
+        // A link whose admission does not carry (an unidentified or introduction
+        // link) grants no stream either, though both hellos had the capability.
+        let (mut d, mut l) = handshaken(&dialer, &listener).await;
+        let raw = d.connection.clone();
+        hellos(&mut d, &mut l, (hello(1), hello(1))).await;
+        let (a, b) = admitted(d, l, (carrying(), Admission::default())).await;
+        assert!(
+            !stream_opens(&raw, NEVER).await,
+            "a link that does not carry granted a stream"
+        );
+        assert_eq!(
+            b.face.send_side(marked.clone(), SideClass::Stream).await,
+            Err(SideRefused::NotCarried)
+        );
+        assert_eq!(b.handle.side_stats().refused, 1);
+        drop(a);
+    }
+
+    /// What a peer sends on the channel stream that is not a channel frame is dropped and
+    /// counted and the stream is stopped, the link stays up; a frame over what the side
+    /// grants closes the link as a protocol error.
+    #[tokio::test]
+    async fn a_malformed_channel_record_stops_the_stream_and_an_oversize_one_closes_the_link() {
+        let (dialer, listener) = (endpoint(1, false), endpoint(2, true));
+        for (record, closes) in [
+            // No marker.
+            (vec![0, 0, 0, 3, 0x07, 1, 2], false),
+            // A record of no octets.
+            (vec![0, 0, 0, 0], false),
+            // One octet over the 1 MiB a side grants.
+            (((STREAM_FRAME_MAX + 1) as u32).to_be_bytes().to_vec(), true),
+        ] {
+            let (mut d, mut l) = handshaken(&dialer, &listener).await;
+            let raw = d.connection.clone();
+            hellos(&mut d, &mut l, (hello(1), hello(1))).await;
+            let (a, b) = admitted(d, l, (carrying(), carrying())).await;
+            let mut stream = tokio::time::timeout(T, raw.open_uni())
+                .await
+                .unwrap()
+                .unwrap();
+            stream.write_all(&record).await.unwrap();
+            let start = std::time::Instant::now();
+            while b.handle.side_stats().dropped_malformed == 0 {
+                assert!(start.elapsed() < T, "the record {record:?} was not counted");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            if closes {
+                match tokio::time::timeout(T, b.handle.closed()).await.unwrap() {
+                    LinkError::RefusedHere { reason, text } => {
+                        assert_eq!(reason, CloseReason::Protocol);
+                        assert!(text.contains("channel frame"), "{text}");
+                    }
+                    other => panic!("expected the Protocol close, got {other:?}"),
+                }
+                match tokio::time::timeout(T, a.handle.closed()).await.unwrap() {
+                    LinkError::Refused { reason, .. } => {
+                        assert_eq!(reason, Some(CloseReason::Protocol));
+                    }
+                    other => panic!("expected the peer's Protocol close, got {other:?}"),
+                }
+            } else {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                assert!(
+                    !a.handle.is_closed() && !b.handle.is_closed(),
+                    "the link stays up"
+                );
+                assert_eq!(b.handle.side_stats().stream_rx_frames, 0);
+                // NDN packets still cross it.
+                let pkt = Bytes::from_static(&[0x05, 0x03, 0x07, 0x01, 0x41]);
+                a.face.send_bytes(pkt.clone()).await.unwrap();
+                assert_eq!(
+                    tokio::time::timeout(T, b.face.recv_bytes())
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    pkt
+                );
+            }
+        }
     }
 }

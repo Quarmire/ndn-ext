@@ -33,9 +33,20 @@
 //! - **Framing.** NDN packets ride QUIC DATAGRAM frames as NDNLPv2 frames; the
 //!   face's link service fragments a packet larger than the connection's
 //!   current datagram size ([`LinkFace`]), and NDNLPv2 reliability can be
-//!   enabled per link. No stream, so no head-of-line blocking.
+//!   enabled per link. No stream, so no head-of-line blocking: NDN packets
+//!   never travel on a stream.
 //!   [`LinkHandle::datagrams`] counts them, so a caller can close a link
 //!   that carried nothing for a while.
+//! - **Side path.** Beside NDN packets a link carries *channel frames*, whose
+//!   first octet is `0x00` (no NDN packet starts with it), as QUIC datagrams
+//!   and on one unidirectional stream per direction, on the link's own
+//!   connection ([`LinkFace::send_side`](ndn_transport::Transport::send_side)).
+//!   Both hellos must carry `ChannelCaps` ([`LinkHello::channel_caps`]) and the
+//!   admitting side's [`ChannelPolicy`] must carry; the stream is granted only
+//!   then, after the verdict. A channel datagram waits behind at most
+//!   [`QUEUE_MAX`] octets of NDN traffic; the bytes each way may be held to a
+//!   [`FairShare`] of a namespace's pool; none of it is judged by the NDN scope
+//!   or answered with a Nack. [`LinkHandle::side_stats`] counts it.
 //! - **Transport.** Keep-alive and idle timeout are set explicitly
 //!   ([`LinkTransportConfig`], within NAT-safe bounds with
 //!   [`LinkTransportConfig::bounded`]); connection migration keeps a link
@@ -75,6 +86,7 @@ mod membership;
 mod message;
 mod probe;
 mod scope;
+mod side;
 mod text;
 mod verify;
 
@@ -91,13 +103,18 @@ pub use membership::{
     Membership, binding_transcript,
 };
 pub use message::{
-    CloseReason, DEPARTURES_MAX, Departure, FOLLOW_DEPTH_MAX, FOLLOW_SPACE_MAX, FOLLOWS_MAX,
-    LINK_PROTOCOL_VERSION, LinkHello, LinkVerdict, PathSession, Presence, PresentDevice,
-    Reachability, WAKE_TOKEN_MAX, check_followed_group, decode_udp_address, encode_udp_address,
+    CHANNEL_CAPS_V1, CloseReason, DEPARTURES_MAX, Departure, FOLLOW_DEPTH_MAX, FOLLOW_SPACE_MAX,
+    FOLLOWS_MAX, LINK_PROTOCOL_VERSION, LinkHello, LinkVerdict, PathSession, Presence,
+    PresentDevice, Reachability, WAKE_TOKEN_MAX, check_followed_group, decode_udp_address,
+    encode_udp_address,
 };
 pub use probe::{PROBE_LEN, ProbeWatch, decode_probe, encode_probe};
 pub use scope::{
-    CONGESTION_NACKS, Carries, LinkScope, NameFilter, Narrowing, RateLimit, RatedInterests,
-    ScopeCounts, SharedRate,
+    CONGESTION_NACKS, Carries, FAIR_CAPACITY, FAIR_FLOOR, FAIR_INTERVAL, FairMember, FairShare,
+    Flow, LinkScope, NameFilter, Narrowing, RateLimit, RatedInterests, ScopeCounts, SharedRate,
+};
+pub use side::{
+    ChannelPolicy, DATAGRAM_SEND_BUFFER, QUEUE_MAX, STREAM_FRAME_MAX, STREAM_QUEUE_MAX, SideLimits,
+    SideStats,
 };
 pub use text::{PEER_TEXT_MAX, bounded_text, clean_text, sanitize_peer_text};

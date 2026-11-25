@@ -25,7 +25,7 @@
 //! sent, so the Congestion Nacks of one link are bounded too
 //! ([`CONGESTION_NACKS`]): past it a dropped Interest is dropped silently.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -150,6 +150,210 @@ impl SharedRate {
             && self
                 .bandwidth
                 .is_none_or(|bandwidth| buckets.1.take(bandwidth, len))
+    }
+}
+
+/// Which way a [`FairMember`]'s bytes go: each has a bucket of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Flow {
+    /// Bytes this side sends the peer.
+    Tx,
+    /// Bytes this side receives from the peer.
+    Rx,
+}
+
+/// The default pool of a [`FairShare`]: 128 MiB/s, an operator's ceiling that
+/// protects the device serving the namespace, not a cap on one member.
+pub const FAIR_CAPACITY: u64 = 128 * 1024 * 1024;
+/// The default least rate a [`FairShare`] gives an active member: 256 KiB/s.
+pub const FAIR_FLOOR: u64 = 256 * 1024;
+/// The default window of a [`FairShare`]: the span an idle member stops
+/// counting after, and the period its rates are recomputed in.
+pub const FAIR_INTERVAL: Duration = Duration::from_secs(1);
+
+/// A pool of bytes per second that the links of a namespace share *fairly*:
+/// no ceiling applies to one member alone (it gets the whole pool, so its
+/// link's congestion control decides); several members active at once get
+/// `capacity / active` each, never under `floor`; a member idle for an
+/// `interval` costs the others nothing. A member is *active* while it has
+/// passed, or tried to pass, a frame in the last `interval`. Rates are
+/// recomputed once per `interval`, from the members active then; each member
+/// has a token bucket per [`Flow`] at its rate, with a burst of one second's
+/// worth. A frame longer than the burst waits for a full bucket and then
+/// takes its whole length as debt, so the average is the rate.
+///
+/// A handle: clones share the pool. A link [`join`](Self::join)s it.
+#[derive(Clone)]
+pub struct FairShare {
+    inner: Arc<FairPool>,
+}
+
+struct FairPool {
+    capacity: u64,
+    floor: u64,
+    interval: Duration,
+    state: Mutex<FairState>,
+}
+
+#[derive(Default)]
+struct FairState {
+    next: u64,
+    members: HashMap<u64, FairSlot>,
+    /// The bytes per second of each member, as of `computed`.
+    rate: f64,
+    computed: Option<Instant>,
+}
+
+struct FairSlot {
+    last_frame: Option<Instant>,
+    buckets: [FairBucket; 2],
+}
+
+struct FairBucket {
+    tokens: f64,
+    at: Instant,
+}
+
+impl FairShare {
+    /// A pool of `capacity` bytes per second, giving an active member at least
+    /// `floor` (and never more than `capacity`), over windows of `interval`.
+    pub fn new(capacity: u64, floor: u64, interval: Duration) -> Self {
+        let capacity = capacity.max(1);
+        Self {
+            inner: Arc::new(FairPool {
+                capacity,
+                floor: floor.min(capacity),
+                interval: interval.max(Duration::from_millis(1)),
+                state: Mutex::new(FairState {
+                    rate: capacity as f64,
+                    ..FairState::default()
+                }),
+            }),
+        }
+    }
+
+    /// A link of the namespace joins the pool. It leaves it when the member is
+    /// dropped.
+    pub fn join(&self) -> FairMember {
+        let mut state = self.inner.lock();
+        let id = state.next;
+        state.next += 1;
+        let now = Instant::now();
+        let rate = state.rate;
+        let full = || FairBucket {
+            tokens: rate,
+            at: now,
+        };
+        let slot = FairSlot {
+            last_frame: None,
+            buckets: [full(), full()],
+        };
+        state.members.insert(id, slot);
+        FairMember {
+            pool: Arc::clone(&self.inner),
+            id,
+        }
+    }
+
+    /// The pool, in bytes per second.
+    pub fn capacity(&self) -> u64 {
+        self.inner.capacity
+    }
+
+    /// How many members are active at `now`: those that passed or tried a
+    /// frame in the last `interval`.
+    pub fn active_at(&self, now: Instant) -> usize {
+        self.inner.lock().active_at(now, self.inner.interval)
+    }
+
+    /// How many members are active now.
+    pub fn active(&self) -> usize {
+        self.active_at(Instant::now())
+    }
+
+    /// The bytes per second each member has as of the last recomputation.
+    pub fn rate(&self) -> u64 {
+        self.inner.lock().rate as u64
+    }
+}
+
+impl Default for FairShare {
+    /// [`FAIR_CAPACITY`], [`FAIR_FLOOR`], [`FAIR_INTERVAL`].
+    fn default() -> Self {
+        Self::new(FAIR_CAPACITY, FAIR_FLOOR, FAIR_INTERVAL)
+    }
+}
+
+impl FairPool {
+    fn lock(&self) -> std::sync::MutexGuard<'_, FairState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl FairState {
+    fn active_at(&self, now: Instant, interval: Duration) -> usize {
+        self.members
+            .values()
+            .filter(|m| {
+                m.last_frame
+                    .is_some_and(|at| now.saturating_duration_since(at) < interval)
+            })
+            .count()
+    }
+}
+
+/// One link's place in a [`FairShare`]: its buckets, one per [`Flow`].
+pub struct FairMember {
+    pool: Arc<FairPool>,
+    id: u64,
+}
+
+impl FairMember {
+    /// Take `len` bytes of `flow` at `now`. `Err` is how long until the
+    /// bucket holds enough (the frame's length, or a full bucket if it is
+    /// longer), a time to wait or to drop for.
+    pub fn admit_at(&self, flow: Flow, len: usize, now: Instant) -> Result<(), Duration> {
+        let pool = &*self.pool;
+        let mut state = pool.lock();
+        let Some(slot) = state.members.get_mut(&self.id) else {
+            return Ok(());
+        };
+        slot.last_frame = Some(now);
+        let due = state
+            .computed
+            .is_none_or(|at| now.saturating_duration_since(at) >= pool.interval);
+        if due {
+            let active = state.active_at(now, pool.interval).max(1);
+            let share = pool.capacity as f64 / active as f64;
+            state.rate = share.clamp(pool.floor as f64, pool.capacity as f64);
+            state.computed = Some(now);
+        }
+        let rate = state.rate;
+        let Some(slot) = state.members.get_mut(&self.id) else {
+            return Ok(());
+        };
+        let bucket = &mut slot.buckets[flow as usize];
+        let refill = now.saturating_duration_since(bucket.at).as_secs_f64() * rate;
+        bucket.tokens = (bucket.tokens + refill).min(rate);
+        bucket.at = now.max(bucket.at);
+        let need = (len as f64).min(rate);
+        if bucket.tokens >= need {
+            bucket.tokens -= len as f64;
+            Ok(())
+        } else {
+            Err(Duration::from_secs_f64((need - bucket.tokens) / rate))
+        }
+    }
+
+    /// [`admit_at`](Self::admit_at) at the current time.
+    pub fn admit(&self, flow: Flow, len: usize) -> Result<(), Duration> {
+        self.admit_at(flow, len, Instant::now())
+    }
+}
+
+impl Drop for FairMember {
+    fn drop(&mut self) {
+        self.pool.lock().members.remove(&self.id);
     }
 }
 
@@ -1651,5 +1855,83 @@ mod tests {
             STAMPED_LINK_ONLY_FRAMES.burst
         );
         assert!(passed >= STAMPED_LINK_ONLY_FRAMES.burst as usize);
+    }
+
+    /// Bytes `member` can take at `now` in `step`-byte frames before it is told to wait.
+    fn drain(member: &FairMember, flow: Flow, step: usize, now: Instant) -> usize {
+        let mut taken = 0;
+        while member.admit_at(flow, step, now).is_ok() {
+            taken += step;
+            assert!(taken <= 1 << 20, "a bucket that never empties");
+        }
+        taken
+    }
+
+    #[test]
+    fn a_lone_member_gets_the_pool_and_two_get_half() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let share = FairShare::new(1000, 10, Duration::from_secs(1));
+        let (a, b) = (share.join(), share.join());
+
+        // One member active: the whole pool, in a burst of one second's worth.
+        assert_eq!(drain(&a, Flow::Tx, 10, at(0)), 1000);
+        assert_eq!(share.active_at(at(0)), 1);
+        // The other direction has a bucket of its own.
+        assert_eq!(drain(&a, Flow::Rx, 10, at(0)), 1000);
+
+        // Both members pass frames within the window.
+        assert!(b.admit_at(Flow::Tx, 1, at(500)).is_ok());
+        assert!(a.admit_at(Flow::Tx, 1, at(600)).is_ok());
+        assert_eq!(share.active_at(at(900)), 2);
+        // Past the window the rates are recomputed with both active: half each.
+        assert!(b.admit_at(Flow::Tx, 1, at(1100)).is_ok());
+        assert_eq!(share.rate(), 500);
+        assert!(a.admit_at(Flow::Tx, 1, at(1100)).is_ok());
+        assert_eq!(drain(&a, Flow::Tx, 10, at(1100)), 490);
+        assert_eq!(drain(&b, Flow::Tx, 10, at(1100)), 490);
+
+        // A member that goes quiet costs the other nothing: past the window
+        // the lone one has the whole pool again.
+        assert!(a.admit_at(Flow::Tx, 1, at(5000)).is_ok());
+        assert_eq!(share.active_at(at(5000)), 1);
+        assert_eq!(share.rate(), 1000);
+        assert_eq!(drain(&a, Flow::Tx, 10, at(5000)), 990);
+    }
+
+    #[test]
+    fn a_fair_share_never_gives_an_active_member_less_than_its_floor() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let share = FairShare::new(1000, 300, Duration::from_secs(1));
+        let members: Vec<FairMember> = (0..10).map(|_| share.join()).collect();
+        for ms in [0, 600, 1100] {
+            for m in &members {
+                assert!(m.admit_at(Flow::Tx, 1, at(ms)).is_ok());
+            }
+        }
+        assert_eq!(
+            share.rate(),
+            300,
+            "ten members, 100 each, lifted to the floor"
+        );
+        // A member that leaves is no longer counted.
+        drop(members);
+        assert_eq!(share.active_at(at(1100)), 0);
+    }
+
+    #[test]
+    fn a_frame_over_the_burst_waits_for_a_full_bucket_and_is_then_charged_whole() {
+        let t0 = Instant::now();
+        let share = FairShare::new(1000, 10, Duration::from_secs(1));
+        let m = share.join();
+        // 2500 bytes in a 1000-byte bucket: admitted from a full bucket and
+        // charged whole, so the bucket is 1500 in debt.
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        assert!(m.admit_at(Flow::Rx, 2500, at(0)).is_ok());
+        let wait = m.admit_at(Flow::Rx, 1, at(0)).unwrap_err();
+        assert!(wait >= Duration::from_millis(1500), "{wait:?}");
+        assert!(m.admit_at(Flow::Rx, 1, at(1400)).is_err());
+        assert!(m.admit_at(Flow::Rx, 1, at(1600)).is_ok());
     }
 }

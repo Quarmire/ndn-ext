@@ -15,14 +15,15 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use ndn_face_quic::{
-    Admission, Carries, CloseReason, Departure, HandshakeLimits, KeyFingerprint,
-    LINK_SOCKET_BUFFER, Link, LinkEndpoint, LinkError, LinkHello, LinkKey, LinkScope,
-    LinkTransportConfig, LinkVerdict, Presence, PresentDevice, RateLimit, Reachability,
+    Admission, Carries, ChannelPolicy, CloseReason, Departure, FairShare, HandshakeLimits,
+    KeyFingerprint, LINK_SOCKET_BUFFER, Link, LinkEndpoint, LinkError, LinkHello, LinkKey,
+    LinkScope, LinkTransportConfig, LinkVerdict, Presence, PresentDevice, QUEUE_MAX, RateLimit,
+    Reachability, ScopeCounts,
 };
 use ndn_packet::Name;
 use ndn_packet::encode::{DataBuilder, InterestBuilder};
 use ndn_security::{EcdsaP256Signer, Ed25519Signer};
-use ndn_transport::{Face, FaceId, LpLinkService, Transport};
+use ndn_transport::{Face, FaceId, LpLinkService, SideClass, SideRefused, Transport};
 
 const T: Duration = Duration::from_secs(5);
 
@@ -401,6 +402,7 @@ async fn an_enrollment_link_carries_only_its_scope_and_says_so() {
                 enrollment_link: Some(vec!["/home".parse().unwrap()]),
             },
             scope: Some(scope),
+            ..Admission::default()
         };
         hs.admit(FaceId(2), T, admission).await.unwrap()
     };
@@ -515,6 +517,7 @@ async fn an_asker_over_the_budget_of_answers_is_nacked_not_left_to_its_timer() {
         let admission = Admission {
             verdict: LinkVerdict::default(),
             scope: Some(scope),
+            ..Admission::default()
         };
         hs.admit(FaceId(2), T, admission).await.unwrap()
     };
@@ -1249,4 +1252,490 @@ async fn datagrams_count_ndn_traffic_and_not_keep_alives() {
     assert_eq!(recv(&a.face).await, pkt);
     assert_eq!(a.handle.datagrams(), a0 + 2, "one sent, one received");
     assert_eq!(b.handle.datagrams(), b0 + 2, "one received, one sent");
+}
+
+// ---- The side path: channel frames beside NDN packets ------------------------------------
+
+/// A channel frame: the marker, `tag` as four octets, then filler up to `len`.
+fn frame(tag: u32, len: usize) -> Bytes {
+    let mut v = vec![0u8; len.max(5)];
+    v[1..5].copy_from_slice(&tag.to_be_bytes());
+    for (i, b) in v.iter_mut().enumerate().skip(5) {
+        *b = (i % 251) as u8 | 1;
+    }
+    Bytes::from(v)
+}
+
+fn carrying() -> Admission {
+    Admission {
+        channel: ChannelPolicy {
+            carry: true,
+            quota: None,
+        },
+        ..Admission::default()
+    }
+}
+
+/// Dial and admit with the given hellos and admissions; the dialer's link first.
+async fn link_with(
+    dialer: &LinkEndpoint,
+    listener: &LinkEndpoint,
+    (hello_d, admission_d): (LinkHello, Admission),
+    (hello_l, admission_l): (LinkHello, Admission),
+) -> (Link, Link) {
+    let target = addr(listener);
+    let accept = async {
+        let mut hs = listener.accept().await.unwrap().handshake().await.unwrap();
+        hs.exchange_hello(&hello_l, T).await.unwrap();
+        hs.admit(FaceId(2), T, admission_l).await.unwrap()
+    };
+    let dial = async {
+        let mut hs = dialer.connect(target, None).await.unwrap();
+        hs.exchange_hello(&hello_d, T).await.unwrap();
+        hs.admit(FaceId(1), T, admission_d).await.unwrap()
+    };
+    tokio::join!(dial, accept)
+}
+
+/// A link both sides of which carry channel frames, with no quota.
+async fn channel_link(dialer: &LinkEndpoint, listener: &LinkEndpoint) -> (Link, Link) {
+    link_with(
+        dialer,
+        listener,
+        (hello(1), carrying()),
+        (hello(2), carrying()),
+    )
+    .await
+}
+
+/// What `face` delivers within `within`, until it delivers nothing for that long.
+async fn drain_for(face: &ndn_face_quic::LinkFace, within: Duration) -> Vec<Bytes> {
+    let mut got = Vec::new();
+    while let Ok(Ok(wire)) = tokio::time::timeout(within, face.recv_bytes()).await {
+        got.push(wire);
+    }
+    got
+}
+
+#[tokio::test]
+async fn a_channel_datagram_reaches_recv_bytes_unchanged_and_is_not_nacked_over_quota() {
+    let dialer = endpoint(ed_key(1), false);
+    let listener = endpoint(ec_key(2), true);
+    // The listener's link is scoped to one frame of NDN traffic, a scope that would drop
+    // (and Nack) a channel frame it judged; its channel quota is 3,000 octets a second.
+    let counts = Arc::new(ScopeCounts::default());
+    let scope = LinkScope {
+        receives: Carries::Everything,
+        sends: Carries::Everything,
+        names: Box::new(|_: &Name| true),
+        rate: RateLimit {
+            burst: 1,
+            per_sec: 1,
+        },
+        bandwidth: None,
+        rated: Vec::new(),
+        interests: None,
+        answered: None,
+        shared: None,
+        explain: "one frame".into(),
+        answers_in: None,
+        interests_in: None,
+        narrowing: None,
+        counts: Some(Arc::clone(&counts)),
+    };
+    let quota = Admission {
+        scope: Some(scope),
+        channel: ChannelPolicy {
+            carry: true,
+            quota: Some(FairShare::new(3000, 100, Duration::from_secs(1))),
+        },
+        ..Admission::default()
+    };
+    let (a, b) = link_with(
+        &dialer,
+        &listener,
+        (hello(1), carrying()),
+        (hello(2), quota),
+    )
+    .await;
+
+    let sent: Vec<Bytes> = (0..6).map(|i| frame(i, 1000)).collect();
+    for f in &sent {
+        a.face
+            .send_side(f.clone(), SideClass::Datagram)
+            .await
+            .unwrap();
+    }
+    let mut got = drain_for(&b.face, Duration::from_millis(400)).await;
+    got.sort_by_key(|f| f[1..5].to_vec());
+    assert_eq!(
+        got,
+        sent[..3],
+        "the quota of 3,000 octets passed three frames of 1,000, each unchanged"
+    );
+    let stats = b.handle.side_stats();
+    assert_eq!(stats.datagram_rx_frames, 3);
+    assert_eq!(stats.datagram_rx_bytes, 3000);
+    assert_eq!(stats.dropped_over_quota, 3);
+    assert_eq!(a.handle.side_stats().datagram_tx_frames, 6);
+    // The NDN scope never saw a channel frame: its rate (one frame) dropped none, and a
+    // Nack answers Interests only, so nothing came back to the sender.
+    assert_eq!(counts.over_rate(), 0);
+    assert_eq!(counts.congestion_nacks(), 0);
+    assert!(
+        drain_for(&a.face, Duration::from_millis(300))
+            .await
+            .is_empty(),
+        "a frame over quota is dropped without a Nack"
+    );
+    // NDN traffic over the same link is still judged by its own scope.
+    let pkt = ndn_packet::lp::encode_lp_packet(
+        &InterestBuilder::new("/any/thing".parse::<Name>().unwrap()).build(),
+    );
+    a.face.send_bytes(pkt.clone()).await.unwrap();
+    assert_eq!(recv(&b.face).await, pkt);
+    assert!(!a.handle.is_closed() && !b.handle.is_closed());
+}
+
+#[tokio::test]
+async fn a_channel_stream_carries_frames_in_order_both_ways_on_the_links_connection() {
+    const FRAMES: u32 = 120;
+    let dialer = endpoint(ed_key(1), false);
+    let listener = endpoint(ec_key(2), true);
+    let (a, b) = channel_link(&dialer, &listener).await;
+    let (a, b) = (Arc::new(a), Arc::new(b));
+    // Frames from tiny to far over the datagram size and the stream's initial window.
+    let size = |i: u32| [20usize, 700, 70_000, 400_000][(i % 4) as usize];
+    let datagrams = (a.handle.datagrams(), b.handle.datagrams());
+
+    let writer = |from: &Arc<Link>| {
+        let from = Arc::clone(from);
+        tokio::spawn(async move {
+            for i in 0..FRAMES {
+                from.face
+                    .send_side(frame(i, size(i)), SideClass::Stream)
+                    .await
+                    .unwrap();
+            }
+        })
+    };
+    let (wa, wb) = (writer(&a), writer(&b));
+    for to in [&a, &b] {
+        for i in 0..FRAMES {
+            let got = recv(&to.face).await;
+            assert_eq!(
+                got,
+                frame(i, size(i)),
+                "frame {i} is in its place, unchanged"
+            );
+        }
+    }
+    wa.await.unwrap();
+    wb.await.unwrap();
+
+    let total: u64 = (0..FRAMES).map(|i| size(i) as u64).sum();
+    for link in [&a, &b] {
+        let s = link.handle.side_stats();
+        assert_eq!(
+            (s.stream_tx_frames, s.stream_tx_bytes),
+            (u64::from(FRAMES), total)
+        );
+        assert_eq!(
+            (s.stream_rx_frames, s.stream_rx_bytes),
+            (u64::from(FRAMES), total)
+        );
+        assert_eq!((s.datagram_tx_frames, s.datagram_rx_frames), (0, 0));
+    }
+    // The stream is not a datagram, and carried no NDN packet: the connection's datagram
+    // counter did not move.
+    assert_eq!((a.handle.datagrams(), b.handle.datagrams()), datagrams);
+
+    // A channel datagram on the same link moves it: one connection carries both.
+    a.face
+        .send_side(frame(900, 300), SideClass::Datagram)
+        .await
+        .unwrap();
+    assert_eq!(recv(&b.face).await, frame(900, 300));
+    assert_eq!(a.handle.datagrams(), datagrams.0 + 1);
+    assert_eq!(b.handle.datagrams(), datagrams.1 + 1);
+    // NDN packets still ride datagrams beside the stream.
+    let pkt = Bytes::from_static(&[0x05, 0x03, 0x07, 0x01, 0x42]);
+    b.face.send_bytes(pkt.clone()).await.unwrap();
+    assert_eq!(recv(&a.face).await, pkt);
+    // Neither side dialed a second connection for the stream.
+    let second = tokio::time::timeout(Duration::from_millis(300), listener.accept()).await;
+    assert!(second.is_err(), "no second connection reached the listener");
+    assert_eq!(a.handle.remote_address(), addr(&listener));
+}
+
+/// What `forward_side` hands the stream is written in order, in front of what `send_side`
+/// writes after it, and a full queue refuses the frame instead of waiting.
+#[tokio::test]
+async fn forwarded_stream_frames_keep_their_order_and_a_full_queue_refuses() {
+    let dialer = endpoint(ed_key(1), false);
+    let listener = endpoint(ec_key(2), true);
+    let (a, b) = channel_link(&dialer, &listener).await;
+    for i in 0..50 {
+        a.face
+            .forward_side(frame(i, 2000), SideClass::Stream)
+            .unwrap();
+    }
+    a.face
+        .send_side(frame(50, 100), SideClass::Stream)
+        .await
+        .unwrap();
+    for i in 0..51 {
+        let got = recv(&b.face).await;
+        assert_eq!(got, frame(i, if i == 50 { 100 } else { 2000 }));
+    }
+    // Frames of 1 MiB fill the 4 MiB queue while the writer has not run: the caller
+    // is told Full, at once.
+    let mut refused = None;
+    for i in 0..64 {
+        if let Err(e) = a
+            .face
+            .forward_side(frame(100 + i, 1024 * 1024), SideClass::Stream)
+        {
+            refused = Some(e);
+            break;
+        }
+    }
+    assert_eq!(refused, Some(SideRefused::Full));
+    assert!(a.handle.side_stats().sink_full >= 1);
+    // A frame over the stream's limit is refused with the limit.
+    assert_eq!(
+        a.face
+            .forward_side(frame(7, 1024 * 1024 + 1), SideClass::Stream),
+        Err(SideRefused::TooLarge {
+            size: 1024 * 1024 + 1,
+            max: 1024 * 1024
+        })
+    );
+}
+
+#[tokio::test]
+async fn the_headroom_rule_bounds_what_a_channel_frame_waits_behind_ndn_datagrams() {
+    const NDN: usize = 20_000;
+    const CHANNEL: usize = 100;
+    let dialer = endpoint(ed_key(1), false);
+    let listener = endpoint(ec_key(2), true);
+    let (a, b) = channel_link(&dialer, &listener).await;
+    let a = Arc::new(a);
+    // The peer reads nothing: the sender's buffer is all that holds the flood.
+    let _b = b;
+
+    let ndn = Bytes::from(vec![0x05u8; 1000]);
+    let flood = {
+        let a = Arc::clone(&a);
+        tokio::spawn(async move {
+            for _ in 0..NDN {
+                // Waits for room: never drops an NDN datagram.
+                a.face.send_bytes(ndn.clone()).await.unwrap();
+            }
+        })
+    };
+    // Wait for NDN datagrams to fill the send buffer past the headroom.
+    let mut forwarded_full = false;
+    let start = std::time::Instant::now();
+    while !forwarded_full {
+        assert!(
+            start.elapsed() < T,
+            "the NDN flood never queued {QUEUE_MAX} octets"
+        );
+        if a.face.side_limits().queued > QUEUE_MAX {
+            // The non-blocking path refuses and counts, and moves nothing.
+            forwarded_full =
+                a.face.forward_side(frame(0, 200), SideClass::Datagram) == Err(SideRefused::Full);
+        }
+        tokio::time::sleep(Duration::from_micros(200)).await;
+    }
+    assert!(a.handle.side_stats().sink_full >= 1);
+    // Channel frames wait for headroom instead.
+    for i in 0..CHANNEL {
+        tokio::time::timeout(
+            T,
+            a.face.send_side(frame(i as u32, 200), SideClass::Datagram),
+        )
+        .await
+        .expect("a channel frame got through the flood")
+        .unwrap();
+    }
+    flood.await.unwrap();
+    let stats = a.handle.side_stats();
+    assert!(
+        stats.queued_peak < QUEUE_MAX as u64,
+        "a channel frame was handed over behind {} octets, over the {QUEUE_MAX} headroom",
+        stats.queued_peak
+    );
+    // The channel datagrams the polling above did not refuse are counted with the rest.
+    assert!(stats.datagram_tx_frames >= CHANNEL as u64);
+    // Everything queued leaves: not one NDN datagram was dropped to make room.
+    let start = std::time::Instant::now();
+    while a.face.side_limits().queued > 0 {
+        assert!(start.elapsed() < T, "the send buffer never drained");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        a.handle.datagrams(),
+        NDN as u64 + stats.datagram_tx_frames,
+        "every NDN and channel datagram left the send buffer"
+    );
+}
+
+#[tokio::test]
+async fn a_frame_over_the_path_size_is_repacked_once() {
+    let dialer = endpoint(ed_key(1), false);
+    let listener = endpoint(ec_key(2), true);
+    let (a, b) = channel_link(&dialer, &listener).await;
+    let max = a.face.side_frame_max();
+    assert_eq!(
+        Some(max),
+        a.face.send_mtu(),
+        "a datagram carries what the connection's datagram size says"
+    );
+    assert_eq!(max, a.handle.max_datagram_size().unwrap());
+    // One octet over the limit: refused with the limit now, on both paths.
+    let over = frame(1, max + 1);
+    let refusal = SideRefused::TooLarge { size: max + 1, max };
+    assert_eq!(
+        a.face.send_side(over.clone(), SideClass::Datagram).await,
+        Err(refusal.clone())
+    );
+    assert_eq!(
+        a.face.forward_side(over.clone(), SideClass::Datagram),
+        Err(refusal)
+    );
+    // Cut to the limit it reports, the frame is accepted and arrives whole.
+    let cut = frame(1, a.face.side_frame_max());
+    a.face
+        .send_side(cut.clone(), SideClass::Datagram)
+        .await
+        .unwrap();
+    assert_eq!(recv(&b.face).await, cut);
+    // The stream takes the frame the datagram could not carry.
+    a.face
+        .send_side(over.clone(), SideClass::Stream)
+        .await
+        .unwrap();
+    assert_eq!(recv(&b.face).await, over);
+    assert_eq!(a.handle.side_stats().refused, 0);
+}
+
+/// Nothing but a channel frame goes on the side path: a frame that does not start with
+/// the marker (an NDN packet) is refused for both carriers, so no NDN packet travels on a
+/// stream or goes unjudged by the scope.
+#[tokio::test]
+async fn only_a_marked_frame_is_carried_on_the_side_path() {
+    let dialer = endpoint(ed_key(1), false);
+    let listener = endpoint(ec_key(2), true);
+    let (a, b) = channel_link(&dialer, &listener).await;
+    let ndn = Bytes::from_static(&[0x05, 0x03, 0x07, 0x01, 0x41]);
+    for class in [SideClass::Datagram, SideClass::Stream] {
+        assert!(matches!(
+            a.face.send_side(ndn.clone(), class).await,
+            Err(SideRefused::Io(_))
+        ));
+        assert!(matches!(
+            a.face.forward_side(ndn.clone(), class),
+            Err(SideRefused::Io(_))
+        ));
+        assert!(matches!(
+            a.face.send_side(Bytes::new(), class).await,
+            Err(SideRefused::Io(_))
+        ));
+    }
+    assert!(
+        drain_for(&b.face, Duration::from_millis(200))
+            .await
+            .is_empty()
+    );
+    assert_eq!(b.handle.side_stats().frames(), 0);
+}
+
+/// A link that does not carry (an unidentified or introduction link) sends nothing,
+/// answers a frame it is sent by dropping and counting it, and stays up.
+#[tokio::test]
+async fn a_link_that_does_not_carry_refuses_channel_frames_and_stays_up() {
+    let dialer = endpoint(ed_key(1), false);
+    let listener = endpoint(ec_key(2), true);
+    let (a, b) = link_with(
+        &dialer,
+        &listener,
+        (hello(1), Admission::default()),
+        (hello(2), carrying()),
+    )
+    .await;
+    assert!(a.handle.side_peer_caps() && b.handle.side_peer_caps());
+    for class in [SideClass::Datagram, SideClass::Stream] {
+        assert_eq!(
+            a.face.send_side(frame(1, 100), class).await,
+            Err(SideRefused::NotCarried)
+        );
+        assert_eq!(
+            a.face.forward_side(frame(1, 100), class),
+            Err(SideRefused::NotCarried)
+        );
+    }
+    assert_eq!(a.handle.side_stats().refused, 4);
+    assert_eq!(a.handle.side_stats().frames(), 0);
+
+    // The carrying side sends one anyway: the other drops and counts it, and tells the
+    // sender nothing.
+    b.face
+        .send_side(frame(2, 100), SideClass::Datagram)
+        .await
+        .unwrap();
+    let pkt = Bytes::from_static(&[0x05, 0x03, 0x07, 0x01, 0x43]);
+    b.face.send_bytes(pkt.clone()).await.unwrap();
+    assert_eq!(
+        recv(&a.face).await,
+        pkt,
+        "the channel frame was dropped, the NDN packet after it delivered"
+    );
+    assert_eq!(a.handle.side_stats().refused, 5);
+    assert_eq!(a.handle.side_stats().datagram_rx_frames, 0);
+    assert!(!a.handle.is_closed() && !b.handle.is_closed());
+}
+
+/// A hello round trip over a real link carries `ChannelCaps`; a side whose hello claims
+/// none makes `send_side` refuse on both sides.
+#[tokio::test]
+async fn a_peer_without_channel_caps_gets_no_side_frames() {
+    let dialer = endpoint(ed_key(1), false);
+    let listener = endpoint(ec_key(2), true);
+    let plain = LinkHello {
+        channel_caps: 0,
+        ..hello(2)
+    };
+    let (a, b) = link_with(
+        &dialer,
+        &listener,
+        (hello(1), carrying()),
+        (plain, carrying()),
+    )
+    .await;
+    assert!(
+        !a.handle.side_peer_caps(),
+        "the listener claimed no channels"
+    );
+    assert!(b.handle.side_peer_caps());
+    for class in [SideClass::Datagram, SideClass::Stream] {
+        assert_eq!(
+            a.face.send_side(frame(1, 100), class).await,
+            Err(SideRefused::PeerLacksChannels)
+        );
+        assert_eq!(
+            b.face.send_side(frame(1, 100), class).await,
+            Err(SideRefused::PeerLacksChannels),
+            "a side that did not claim the capability sends none either"
+        );
+        assert_eq!(
+            a.face.forward_side(frame(1, 100), class),
+            Err(SideRefused::PeerLacksChannels)
+        );
+    }
+    // NDN packets are unaffected.
+    let pkt = Bytes::from_static(&[0x05, 0x03, 0x07, 0x01, 0x44]);
+    a.face.send_bytes(pkt.clone()).await.unwrap();
+    assert_eq!(recv(&b.face).await, pkt);
 }

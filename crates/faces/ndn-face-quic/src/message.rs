@@ -9,7 +9,8 @@
 //!
 //! Wire: TLV-TYPEs in the application range.
 //! `LinkHello = 0x0450 { LinkVersion 0x0451 (1 byte), Data*, Membership
-//! 0x045C*, DirectPath 0x045A (8 bytes)?, Follows 0x0456 { Name+ }? }` — the
+//! 0x045C*, DirectPath 0x045A (8 bytes)?, Follows 0x0456 { Name+ }?,
+//! ChannelCaps 0x044E (1 byte) }` — the
 //! first Data is the sender's certificate for its link key, the rest its
 //! issuers (nearest first); each [`Membership`] is a namespace the sender is a
 //! member of with another key, bound to this connection; `DirectPath` marks a
@@ -19,7 +20,11 @@
 //! an owner's whole group), told to a peer it uses as a relay so that the
 //! relay routes exactly those groups to it (at most [`FOLLOWS_MAX`] names,
 //! each of at most [`FOLLOW_DEPTH_MAX`] components, see
-//! [`check_followed_group`]);
+//! [`check_followed_group`]); `ChannelCaps` is a bit set of what the sender
+//! can carry besides NDN packets (bit 0: channel frames, version 1, see
+//! [`CHANNEL_CAPS_V1`]), always sent; a sender that predates it sends none,
+//! which a receiver reads as no capability, and a side sends no channel frame
+//! to a peer that did not advertise it;
 //! `LinkVerdict = 0x0452 { EnrollmentLink 0x0454 { Name* }? }` — admitted;
 //! with `EnrollmentLink`, admitted as an enrollment link that carries only
 //! the enrollment of the receiver in the namespaces named;
@@ -69,6 +74,13 @@ pub(crate) const PRESENCE: u64 = 0x0446;
 const PRESENT_DEVICE: u64 = 0x0448;
 const KEY_DIGEST: u64 = 0x044A;
 pub(crate) const DEPARTURE: u64 = 0x044C;
+/// The hello's `ChannelCaps`: one octet, a bit set.
+pub(crate) const CHANNEL_CAPS: u64 = 0x044E;
+
+/// Bit 0 of `ChannelCaps`: the sender carries channel frames (first octet
+/// `0x00`, ndn-link.md §9) as QUIC datagrams and on one unidirectional stream
+/// per direction, version 1.
+pub const CHANNEL_CAPS_V1: u8 = 0x01;
 
 /// Most space groups a hello's `Follows` names; a receiver ignores the rest
 /// (and a sender names no more). A device follows spaces, not namespaces, so
@@ -99,9 +111,9 @@ pub const LINK_PROTOCOL_VERSION: u8 = 1;
 /// Upper bound on one link message: a certificate chain is a few KiB.
 pub(crate) const MAX_MESSAGE: usize = 64 * 1024;
 
-/// The first link message: the sender's certificate and its issuers, and
-/// its memberships of other namespaces.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// The first link message: the sender's certificate and its issuers, its
+/// memberships of other namespaces, and what else it can carry.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LinkHello {
     /// Certificate Data wires: the sender's own certificate first, then the
     /// issuer certificates it keeps, nearest first. Empty when the sender
@@ -125,6 +137,24 @@ pub struct LinkHello {
     /// session (the dialer names it; the listener repeats it when it takes
     /// the connection as that direct path).
     pub direct_path: Option<PathSession>,
+    /// `ChannelCaps`: a bit set of what the sender carries besides NDN
+    /// packets ([`CHANNEL_CAPS_V1`]). The default hello claims what this
+    /// implementation speaks; a decoded hello has no bit for a sender that
+    /// predates the field. Only a link whose two hellos both have the bit
+    /// carries channel frames.
+    pub channel_caps: u8,
+}
+
+impl Default for LinkHello {
+    fn default() -> Self {
+        Self {
+            certificates: Vec::new(),
+            memberships: Vec::new(),
+            follows: Vec::new(),
+            direct_path: None,
+            channel_caps: CHANNEL_CAPS_V1,
+        }
+    }
 }
 
 /// Whether `name` is a space group a device can follow, as the data layer
@@ -211,6 +241,7 @@ impl LinkHello {
             if let Some(session) = &self.direct_path {
                 w.write_tlv(DIRECT_PATH, session);
             }
+            w.write_tlv(CHANNEL_CAPS, &[self.channel_caps]);
         });
         w.finish()
     }
@@ -221,6 +252,7 @@ impl LinkHello {
         let mut memberships = Vec::new();
         let mut follows: Vec<Name> = Vec::new();
         let mut direct_path = None;
+        let mut channel_caps = 0;
         let mut version = None;
         let mut cur = value;
         while !cur.is_empty() {
@@ -270,6 +302,15 @@ impl LinkHello {
                         )
                     })?);
                 }
+                CHANNEL_CAPS => match &cur[start..end] {
+                    [caps] => channel_caps = *caps,
+                    other => {
+                        return Err(format!(
+                            "channel capabilities of {} bytes in the link hello (they are one byte)",
+                            other.len()
+                        ));
+                    }
+                },
                 t if skippable(t) => {}
                 t => return Err(format!("unknown critical field {t:#x} in the link hello")),
             }
@@ -281,6 +322,7 @@ impl LinkHello {
                 memberships,
                 follows,
                 direct_path,
+                channel_caps,
             }),
             Some(v) => Err(format!(
                 "the peer speaks link protocol version {v}; this device speaks version \
@@ -809,6 +851,7 @@ mod tests {
                     "/a/32=sync/x".parse().unwrap(),
                     "/b/c/32=sync/y/z".parse().unwrap(),
                 ],
+                channel_caps: 0,
             },
             LinkHello {
                 follows: vec!["/a/32=sync/x".parse().unwrap()],
@@ -852,14 +895,14 @@ mod tests {
         }
         .encode();
         // The vector of ndn-link.md §19.21: Follows 0x0456 { /a/32=sync/x,
-        // /b/c/32=sync/y/z } after the version.
+        // /b/c/32=sync/y/z } after the version, then ChannelCaps 0x044E 01.
         assert_eq!(
             wire.as_ref(),
             [
-                0xFD, 0x04, 0x50, 0x2B, 0xFD, 0x04, 0x51, 0x01, 0x01, 0xFD, 0x04, 0x56, 0x22, 0x07,
+                0xFD, 0x04, 0x50, 0x30, 0xFD, 0x04, 0x51, 0x01, 0x01, 0xFD, 0x04, 0x56, 0x22, 0x07,
                 0x0C, 0x08, 0x01, 0x61, 0x20, 0x04, 0x73, 0x79, 0x6E, 0x63, 0x08, 0x01, 0x78, 0x07,
                 0x12, 0x08, 0x01, 0x62, 0x08, 0x01, 0x63, 0x20, 0x04, 0x73, 0x79, 0x6E, 0x63, 0x08,
-                0x01, 0x79, 0x08, 0x01, 0x7A
+                0x01, 0x79, 0x08, 0x01, 0x7A, 0xFD, 0x04, 0x4E, 0x01, 0x01
             ]
         );
         // 0x0456 is even and above 31: a receiver that does not know it skips it.
@@ -988,10 +1031,52 @@ mod tests {
         assert_eq!(
             wire.as_ref(),
             [
-                0xFD, 0x04, 0x50, 0x11, 0xFD, 0x04, 0x51, 0x01, 0x01, 0xFD, 0x04, 0x5A, 0x08, 1, 2,
-                3, 4, 5, 6, 7, 8
+                0xFD, 0x04, 0x50, 0x16, 0xFD, 0x04, 0x51, 0x01, 0x01, 0xFD, 0x04, 0x5A, 0x08, 1, 2,
+                3, 4, 5, 6, 7, 8, 0xFD, 0x04, 0x4E, 0x01, 0x01
             ]
         );
+    }
+
+    /// `ChannelCaps` (0x044E) is one octet, always encoded, and read as an even
+    /// field: a hello from a sender that predates it decodes with no capability,
+    /// and one whose field is not one octet is malformed.
+    #[test]
+    fn a_hello_carries_channel_caps_and_an_older_hello_has_none() {
+        let wire = LinkHello::default().encode();
+        assert_eq!(
+            wire.as_ref(),
+            [
+                0xFD, 0x04, 0x50, 0x0A, 0xFD, 0x04, 0x51, 0x01, 0x01, 0xFD, 0x04, 0x4E, 0x01, 0x01
+            ]
+        );
+        assert!(skippable(CHANNEL_CAPS));
+        let (_, start, end) = split_tlv(&wire).unwrap();
+        assert_eq!(
+            LinkHello::decode(&wire[start..end]).unwrap().channel_caps,
+            CHANNEL_CAPS_V1
+        );
+        // Always encoded, even when it claims nothing.
+        let none = LinkHello {
+            channel_caps: 0,
+            ..LinkHello::default()
+        }
+        .encode();
+        assert_eq!(&none[none.len() - 5..], [0xFD, 0x04, 0x4E, 0x01, 0x00]);
+        // A sender that predates the field sends none: no capability.
+        let older = [0xFD, 0x04, 0x51, 0x01, 0x01];
+        assert_eq!(LinkHello::decode(&older).unwrap().channel_caps, 0);
+        // Bits beyond the ones this side knows are kept, not an error.
+        let future = [0xFD, 0x04, 0x51, 0x01, 0x01, 0xFD, 0x04, 0x4E, 0x01, 0x03];
+        assert_eq!(LinkHello::decode(&future).unwrap().channel_caps, 0x03);
+        // Not one octet: malformed.
+        for bad in [
+            &[0xFD, 0x04, 0x51, 0x01, 0x01, 0xFD, 0x04, 0x4E, 0x00][..],
+            &[
+                0xFD, 0x04, 0x51, 0x01, 0x01, 0xFD, 0x04, 0x4E, 0x02, 0x01, 0x01,
+            ][..],
+        ] {
+            assert!(LinkHello::decode(bad).is_err());
+        }
     }
 
     #[test]
@@ -1046,7 +1131,7 @@ mod tests {
         // Unknown even types 0–31 are critical, as in NDN packets; above 31
         // they are skipped.
         assert!(LinkHello::decode(&[0xFD, 0x04, 0x51, 0x01, 0x01, 0x0A, 0x00]).is_err());
-        assert!(LinkHello::decode(&[0xFD, 0x04, 0x51, 0x01, 0x01, 0xFD, 0x04, 0x4E, 0x00]).is_ok());
+        assert!(LinkHello::decode(&[0xFD, 0x04, 0x51, 0x01, 0x01, 0xFD, 0x04, 0x70, 0x00]).is_ok());
         assert!(LinkVerdict::decode(&[0x08, 0x00]).is_err());
         // An enrollment link for no namespace means nothing.
         assert!(LinkVerdict::decode(&[0xFD, 0x04, 0x54, 0x00]).is_err());
