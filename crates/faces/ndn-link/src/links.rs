@@ -11,7 +11,7 @@ use parking_lot::Mutex;
 
 use ndn_face_quic::{
     CloseReason, Handshaken, Incoming, KeyFingerprint, LinkEndpoint, LinkError, LinkHandle,
-    LinkHello, LinkKeySource, LinkTransportConfig, PathSession, ScopeCounts,
+    LinkHello, LinkKeySource, LinkTransportConfig, PathSession, ScopeCounts, SideStats,
 };
 use ndn_mgmt_wire::{LinkDetail, link_code as code};
 use ndn_packet::Name;
@@ -24,7 +24,7 @@ use crate::admission::{
 };
 use crate::asleep::{RelayService, Sleepers};
 use crate::candidates::CandidateSource;
-use crate::control::{PeerCtl, idle_check, release};
+use crate::control::{PeerCtl, activity, idle_check, release};
 use crate::departures::Departures;
 use crate::direct::{Direct, Whom, direct_up};
 use crate::grants::Grants;
@@ -585,6 +585,7 @@ impl Links {
                 granted: at
                     .and_then(|i| views[i].granted.as_ref())
                     .map(|g| self.grant_of_link(g)),
+                side: at.map(|i| views[i].side).unwrap_or_default(),
             });
         }
         for (i, v) in views.iter().enumerate() {
@@ -606,6 +607,7 @@ impl Links {
                 down: None,
                 asleep: None,
                 granted: v.granted.as_ref().map(|g| self.grant_of_link(g)),
+                side: v.side,
             });
         }
         for (whom, entry) in &entries {
@@ -625,6 +627,7 @@ impl Links {
                 down: None,
                 asleep: self.asleep_status(fp),
                 granted: None,
+                side: SideStats::default(),
             });
         }
         for (fp, device) in self.sleepers() {
@@ -645,6 +648,7 @@ impl Links {
                 down: None,
                 asleep: self.asleep_status(&fp),
                 granted: None,
+                side: SideStats::default(),
             });
         }
         LinkReport {
@@ -853,6 +857,7 @@ impl Links {
                     memberships,
                     follows: told.clone().unwrap_or_default(),
                     direct_path: session,
+                    ..LinkHello::default()
                 },
                 self.shown_namespaces(),
                 told,
@@ -1155,7 +1160,7 @@ impl Links {
                     Some(quiet) => idle_check(quiet).min(ENROLLMENT_IDLE / 4),
                     None => ENROLLMENT_IDLE / 4,
                 };
-                let (mut carried, mut quiet_since) = (watched.datagrams(), Instant::now());
+                let (mut carried, mut quiet_since) = (activity(&watched), Instant::now());
                 loop {
                     tokio::select! {
                         biased;
@@ -1181,20 +1186,22 @@ impl Links {
                         continue;
                     }
                     let Some(quiet) = quiet else { continue };
-                    let now = watched.datagrams();
+                    let now = activity(&watched);
                     if now != carried {
                         (carried, quiet_since) = (now, Instant::now());
                     } else if quiet_since.elapsed() >= quiet
                         && transit.is_empty()
-                        && !weak.upgrade().is_some_and(|l| l.faces.routes_to(face_id))
+                        && !weak.upgrade().is_some_and(|l| {
+                            l.faces.routes_to(face_id) || l.faces.side_routes(face_id) > 0
+                        })
                     {
                         watched.close(
                             CloseReason::Idle,
                             &format!(
-                                "this link carried no NDN packet for {} s, and nothing on this \
-                                 device routes to it or carries a namespace in transit over it: \
-                                 it is closed; your device dials again when it has something to \
-                                 send or to serve",
+                                "this link carried no NDN packet and no channel frame for {} s, and \
+                                 nothing on this device routes to it or carries a namespace in transit \
+                                 over it: it is closed; your device dials again when it has something \
+                                 to send or to serve",
                                 quiet.as_secs()
                             ),
                         );
@@ -1427,7 +1434,7 @@ impl Links {
     /// no longer asks for, a relay no longer chosen, a removed peer.
     /// Returns once the link ended, with whether this device closed it.
     async fn keep(&self, id: PeerId, ctl: &PeerCtl, handle: &LinkHandle) -> bool {
-        let mut seen = handle.datagrams();
+        let mut seen = activity(handle);
         let mut quiet_since = Instant::now();
         loop {
             // Traffic is looked for every idle_check; once none came, sleep
@@ -1448,7 +1455,7 @@ impl Links {
                 () = ctl.changed() => {}
                 () = tokio::time::sleep(check) => {}
             }
-            let now = handle.datagrams();
+            let now = activity(handle);
             if now != seen {
                 seen = now;
                 quiet_since = Instant::now();

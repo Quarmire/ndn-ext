@@ -106,6 +106,14 @@ pub trait FaceSink: Send + Sync + 'static {
     /// closed.
     fn routes_to(&self, face: FaceId) -> bool;
 
+    /// How many side routes (the forwarder's routes for channel frames,
+    /// which are not NDN packets) point at `face` now. A link with one is
+    /// routed for the quiet-close rule, as one with an NDN route is. A
+    /// forwarder with no side routes answers `0`, the default.
+    fn side_routes(&self, _face: FaceId) -> usize {
+        0
+    }
+
     /// A device of `namespace`, a namespace this device does not hold, is
     /// linked here and served by the serving policy (`true`), or one such
     /// link ended (`false`; calls pair up). While any is linked, the

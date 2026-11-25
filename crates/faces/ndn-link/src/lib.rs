@@ -94,6 +94,26 @@
 //! devices there is one link: when both dial, the link dialled by the device
 //! with the smaller key fingerprint stays ([`keeps_existing`]).
 //!
+//! # Channel frames
+//!
+//! Beside NDN packets a link carries *channel frames* (a first octet of
+//! `0x00`, which no NDN packet starts with) on the same QUIC connection, as
+//! datagrams and on one unidirectional stream per direction, through the
+//! link's [`ndn_transport::Face`] (`send_side`, `forward_side`): a host sees a
+//! link only as a face, never its connection, key or address. Both devices'
+//! hellos must carry `ChannelCaps`, and this device's admission must carry:
+//! an own namespace's `admin`, `member` and `node` on a full link carry them
+//! with no quota; a `guest`, a relay's stranger, an enrollment, introduction
+//! or departure link and a peer known by its key alone carry none (what such a
+//! peer sends is dropped and counted, the link is not closed); a grant link
+//! carries them under its namespace's fair share
+//! ([`ndn_face_quic::FairShare`]), and its names include the asks of a channel
+//! to the devices of the folder's owner namespace (`<device>/32=chan`).
+//! Channel bytes count as a link's activity, and a link the forwarder holds a
+//! side route to ([`FaceSink::side_routes`]) is routed, for the quiet-close
+//! rule; keep-alives and control messages are neither
+//! ([`LinkStatus::side`] counts them).
+//!
 //! # What a host provides
 //!
 //! A host (a forwarder daemon, a mobile app's embedded engine) starts
@@ -369,6 +389,7 @@ pub use memory::{
     LinkMemory, MemoryFuture, MemoryOptions, MemoryReport, PeerRecord, RememberedPeer,
     RememberedState,
 };
+pub use ndn_face_quic::SideStats;
 /// The fault profile a [`FaultPlan`] carries, and the conformance's `--faulty` one
 /// (ndn-rs `ndn-link.md` §17B); **for tests only**.
 #[cfg(feature = "fault-injection")]

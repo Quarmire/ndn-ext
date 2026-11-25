@@ -746,10 +746,12 @@ impl Judge<'_> {
 /// exactly, not the owner's others nor a space nested in the folder);
 /// the sync groups and the same names of the other writers' namespaces its
 /// folder's record lists; what this device's introductions serve
-/// ([`Introductions::carries`]: a person may ask again); and the names of the
+/// ([`Introductions::carries`]: a person may ask again); the names of the
 /// folder's collections as the data layer names them
-/// ([`Introductions::grant_carries`]). A device with no data layer carries
-/// the first kind only.
+/// ([`Introductions::grant_carries`]); and the asks of a channel to a device
+/// of the folder's owner namespace and their answers (`<device>/32=chan/…`,
+/// [`is_chan_name_of`]). A device with no data layer carries the first kind
+/// and the channel names only.
 fn entry_carries(surface: Option<&Arc<dyn Introductions>>, entry: &Grant, name: &Name) -> bool {
     entry
         .namespaces
@@ -758,6 +760,7 @@ fn entry_carries(surface: Option<&Arc<dyn Introductions>>, entry: &Grant, name: 
         || folder_namespace(&entry.folder).is_some_and(|ns| {
             !entry.namespaces.contains(&ns) && public_name_outside_group(&ns, name)
         })
+        || folder_namespace(&entry.folder).is_some_and(|ns| is_chan_name_of(&ns, name))
         || surface.is_some_and(|s| {
             s.sync_group(&entry.folder)
                 .is_some_and(|group| is_sync_name_of(&group, name))
@@ -788,6 +791,22 @@ pub(crate) fn is_data_ask(name: &Name) -> bool {
     comps.iter().position(|c| !plain(c)).is_some_and(|at| {
         at > 0 && comps[at].typ == KEYWORD && comps[at].value.as_ref() == b"grant"
     })
+}
+
+/// Whether `name` is `<device>/32=chan[/…]` for a device of `ns`: the ask of a
+/// channel to that device (the channel layer names its setup under the
+/// sender's device name) or the session answered under
+/// it. The device's name is plain components under `ns` (the first component
+/// that is no plain one decides, as for [`is_data_ask`]), and the keyword is
+/// `chan`; what follows the keyword is the channel layer's to judge.
+fn is_chan_name_of(ns: &Name, name: &Name) -> bool {
+    use ndn_packet::tlv_type::{IMPLICIT_SHA256, KEYWORD, PARAMETERS_SHA256};
+    let comps = name.components();
+    let plain = |c: &NameComponent| !matches!(c.typ, KEYWORD | IMPLICIT_SHA256 | PARAMETERS_SHA256);
+    name.has_prefix(ns)
+        && comps.iter().position(|c| !plain(c)).is_some_and(|at| {
+            at > ns.len() && comps[at].typ == KEYWORD && comps[at].value.as_ref() == b"chan"
+        })
 }
 
 impl Judge<'_> {

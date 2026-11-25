@@ -387,8 +387,7 @@ async fn dial_with(
     let hello = LinkHello {
         certificates,
         memberships: memberships(&channel).await,
-        follows: Vec::new(),
-        direct_path: None,
+        ..LinkHello::default()
     };
     hs.exchange_hello(&hello, T).await?;
     hs.admit(FaceId(1), T, Admission::default()).await.map(drop)
@@ -763,8 +762,7 @@ async fn dial_stalling(
     let hello = LinkHello {
         certificates,
         memberships: Vec::new(),
-        follows: Vec::new(),
-        direct_path: None,
+        ..LinkHello::default()
     };
     hs.exchange_hello(&hello, T).await?;
     stall.await;

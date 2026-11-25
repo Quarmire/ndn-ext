@@ -12,9 +12,9 @@ use bytes::Bytes;
 use ndn_cert::onboarding::rdr_prefix;
 use ndn_cert::roles::{Role, parse_device_key};
 use ndn_face_quic::{
-    Admission, Carries, ChannelBinding, CloseReason, KeyFingerprint, LinkHello, LinkKey, LinkScope,
-    LinkVerdict, MEMBERSHIPS_MAX, Membership, Narrowing, PeerKey, RatedInterests, bounded_text,
-    clean_text,
+    Admission, Carries, ChannelBinding, ChannelPolicy, CloseReason, KeyFingerprint, LinkHello,
+    LinkKey, LinkScope, LinkVerdict, MEMBERSHIPS_MAX, Membership, Narrowing, PeerKey,
+    RatedInterests, bounded_text, clean_text,
 };
 use ndn_mgmt_wire::{LinkDetail, link_code as code};
 use ndn_packet::{Data, Name};
@@ -939,12 +939,59 @@ impl Judge<'_> {
                     }
                 ),
             }),
+            ..Admission::default()
         })
     }
 
-    /// How this side admits the link: what it tells the peer, and what the
-    /// link carries.
+    /// How this side admits the link: what it tells the peer, what the
+    /// link carries as NDN packets (its scope) and whether it carries
+    /// channel frames (ndn-link.md §17A).
     pub(crate) fn admission_for(&self, admitted: &Admitted) -> Admission {
+        Admission {
+            channel: self.channel_policy(admitted),
+            ..self.scoped_admission(admitted)
+        }
+    }
+
+    /// Whether the admitted link carries channel frames, and under which fair
+    /// share (ndn-link.md §17A). An own namespace's `admin`, `member` or
+    /// `node` on a full link: carried, no quota. A `guest`: not carried (a
+    /// guest is no member of a space). A grant link: carried, under its
+    /// root's fair share. A relay's strangers (quota links), enrollment,
+    /// introduction and departure links, and a peer admitted by its expected
+    /// key alone (no identity): not carried, and the link is not closed over
+    /// what such a peer sends. A device of a namespace this device serves
+    /// without limits, or a relay of another namespace this device follows:
+    /// carried as a forwarder, which judges nothing.
+    pub(crate) fn channel_policy(&self, admitted: &Admitted) -> ChannelPolicy {
+        let no = ChannelPolicy::default();
+        if admitted.enrollment.is_some() {
+            return no;
+        }
+        match admitted
+            .quota
+            .as_ref()
+            .and_then(|slot| slot.limits.as_ref())
+        {
+            Some(limits) => match limits.serving {
+                Serving::Granted => ChannelPolicy {
+                    carry: true,
+                    quota: limits.channel.clone(),
+                },
+                Serving::Stranger | Serving::Guest => no,
+            },
+            None => match admitted.identity() {
+                Some(id) if id.role != Role::Guest => ChannelPolicy {
+                    carry: true,
+                    quota: None,
+                },
+                _ => no,
+            },
+        }
+    }
+
+    /// What the link carries as NDN packets, and what it tells the peer.
+    fn scoped_admission(&self, admitted: &Admitted) -> Admission {
         match &admitted.enrollment {
             None => match admitted
                 .quota
@@ -961,6 +1008,7 @@ impl Judge<'_> {
                         interests,
                         answered,
                         shared,
+                        channel: _,
                     },
                 )) => {
                     let own: Vec<Name> = admitted
@@ -1077,6 +1125,7 @@ impl Judge<'_> {
                                 ),
                             },
                         }),
+                        ..Admission::default()
                     }
                 }
             },
@@ -1118,6 +1167,7 @@ impl Judge<'_> {
                             }
                         ),
                     }),
+                    ..Admission::default()
                 }
             }
             Some(Enrollment::Introduction(surface)) => {
@@ -1146,6 +1196,7 @@ impl Judge<'_> {
                             admitted.fingerprint
                         ),
                     }),
+                    ..Admission::default()
                 }
             }
             Some(Enrollment::Departure(marks)) => {
@@ -1176,6 +1227,7 @@ impl Judge<'_> {
                             record.map_or_else(|| "none".to_string(), |r| r.to_string())
                         ),
                     }),
+                    ..Admission::default()
                 }
             }
             Some(Enrollment::Device(ns)) => {
@@ -1205,6 +1257,7 @@ impl Judge<'_> {
                              CA, trust context and certificates) until this device enrolls"
                         ),
                     }),
+                    ..Admission::default()
                 }
             }
         }
@@ -2449,6 +2502,124 @@ mod tests {
         assert_eq!(rated_for("/b/member/phone/seal"), None);
     }
 
+    /// Which links carry channel frames (ndn-link.md §17A): an own namespace's
+    /// admin, member and node on a full link, with no quota; a guest, a relay's
+    /// stranger, an enrollment link and an unidentified peer, not at all; a grant
+    /// link under its namespace's fair share, which its links share.
+    #[tokio::test]
+    async fn admission_for_decides_which_links_carry_channel_frames() {
+        let (a, b) = (namespace("/a", 10).await, namespace("/b", 20).await);
+        let world = relay(&a, &[&b], ServePolicy::Own).await;
+        let judge = world.judge();
+
+        for (role, device, seed) in [
+            ("admin", "laptop", 21),
+            ("member", "phone", 22),
+            ("node", "vps", 24),
+        ] {
+            let (key, chain) = a.device(role, device, seed).await;
+            let admitted = judge.decide(&key, &hello(chain), &CH, None).await.unwrap();
+            let channel = judge.admission_for(&admitted).channel;
+            assert!(channel.carry, "an own namespace's {role} carries channels");
+            assert!(
+                channel.quota.is_none(),
+                "and takes no quota: the link's congestion control decides"
+            );
+        }
+
+        let (guest, chain) = a.device("guest", "tablet", 23).await;
+        let admitted = judge
+            .decide(&guest, &hello(chain), &CH, None)
+            .await
+            .unwrap();
+        let channel = judge.admission_for(&admitted).channel;
+        assert!(
+            !channel.carry && channel.quota.is_none(),
+            "a guest is no space member"
+        );
+
+        // Two grant links of one namespace: carried, under one pool.
+        let (bob, bob_chain) = b.device("member", "phone", 25).await;
+        let (carol, carol_chain) = b.device("member", "tablet", 26).await;
+        world.grants.put(granted(&bob, &["/b"], GrantRole::Writer));
+        world
+            .grants
+            .put(granted(&carol, &["/b"], GrantRole::Reader));
+        let bob_link = judge
+            .decide(&bob, &hello(bob_chain), &CH, None)
+            .await
+            .unwrap();
+        let carol_link = judge
+            .decide(&carol, &hello(carol_chain), &CH, None)
+            .await
+            .unwrap();
+        let (bob_channel, carol_channel) = (
+            judge.admission_for(&bob_link).channel,
+            judge.admission_for(&carol_link).channel,
+        );
+        assert!(bob_channel.carry && carol_channel.carry);
+        let (bob_pool, carol_pool) = (bob_channel.quota.unwrap(), carol_channel.quota.unwrap());
+        assert_eq!(bob_pool.capacity(), ndn_face_quic::FAIR_CAPACITY);
+        let member = bob_pool.join();
+        assert!(member.admit(ndn_face_quic::Flow::Tx, 1).is_ok());
+        assert_eq!(
+            carol_pool.active(),
+            1,
+            "the namespace's links count against one pool"
+        );
+
+        // A relay's stranger (a device of a namespace it serves under quotas).
+        let open = relay(
+            &a,
+            &[&b],
+            ServePolicy::Open {
+                quotas: Quotas::default(),
+            },
+        )
+        .await;
+        let (stranger, chain) = b.device("member", "watch", 27).await;
+        let admitted = open
+            .judge()
+            .decide(&stranger, &hello(chain), &CH, None)
+            .await
+            .unwrap();
+        assert!(admitted.quota.as_ref().is_some_and(|q| q.limits.is_some()));
+        let channel = open.judge().admission_for(&admitted).channel;
+        assert!(
+            !channel.carry && channel.quota.is_none(),
+            "a stranger's quota link carries none"
+        );
+
+        // A device with no certificate gets an enrollment link; a key expected
+        // alone is unidentified: neither carries.
+        let (_, own) = a.device("node", "laptop", 90).await;
+        let enrolling = World::new(
+            Bare(Arc::new(keyring_with(a.context())), None, own),
+            Vec::new(),
+            ServePolicy::Own,
+        );
+        let (newcomer, _) = a.device("member", "new", 28).await;
+        let judge = enrolling.judge();
+        let admitted = judge
+            .decide(&newcomer, &hello(Vec::new()), &CH, None)
+            .await
+            .unwrap();
+        assert!(admitted.enrollment.is_some());
+        let channel = judge.admission_for(&admitted).channel;
+        assert!(!channel.carry && channel.quota.is_none());
+        let unidentified = Admitted {
+            fingerprint: newcomer.fingerprint(),
+            identities: Vec::new(),
+            peer: None,
+            enrollment: None,
+            quota: None,
+            quotas: Vec::new(),
+            grant: None,
+            follows: Vec::new(),
+        };
+        assert!(!judge.admission_for(&unidentified).channel.carry);
+    }
+
     /// R12 L2(a): a guest of a namespace this device holds a certificate in is not
     /// "own namespace, never limited": its link takes the grant link's rates and bounds
     /// (frames, bytes, Interests, what it is answered, the ask classes), as a granted
@@ -3582,6 +3753,10 @@ mod tests {
             "/a/32=sync/notes/v=2",
             "/b/32=trust-context/32=metadata",
             "/b/member/phone/KEY/k/issuer/v=1",
+            // The ask of a channel, to a device of the folder's owner namespace
+            // (`<device>/32=chan/<digest>`), and the session answered under it.
+            "/a/member/laptop/32=chan/32=sha256digest",
+            "/a/node/relay/32=chan",
         ] {
             assert!(names(&n(carried)), "{carried} did not cross the grant link");
         }
@@ -3608,6 +3783,14 @@ mod tests {
             "/a/member/laptop/32=log/a/32=data/diary/KEY/x/seq=3",
             "/b/member/tablet/32=log/b/32=data/diary/KEY/x/seq=3",
             "/somewhere/else",
+            // A channel ask names a device of the folder's owner namespace: not
+            // the namespace itself, not another namespace's device (the grantee's
+            // other devices included), and no other keyword.
+            "/a/32=chan/32=sha256digest",
+            "/c/member/laptop/32=chan/32=sha256digest",
+            "/b/member/tablet/32=chan/32=sha256digest",
+            "/a/member/laptop/32=chan2/x",
+            "/a/member/laptop/32=log/32=chan/x",
         ] {
             assert!(
                 !names(&n(refused)),
@@ -3623,6 +3806,7 @@ mod tests {
             "/b/member/phone/32=log/anything",
             "/a/32=data/notes",
             "/intro/ask",
+            "/a/member/laptop/32=chan/32=sha256digest",
         ] {
             assert!(
                 !names(&n(was_carried)),

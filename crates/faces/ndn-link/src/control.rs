@@ -426,6 +426,15 @@ pub(crate) fn idle_check(idle: Duration) -> Duration {
     (idle / 4).clamp(Duration::from_millis(250), Duration::from_secs(30))
 }
 
+/// What a link has carried so far, for the idle rules: NDN datagrams and
+/// channel datagrams (QUIC DATAGRAM frames), and the octets of channel stream
+/// frames either way. Keep-alives and control messages are none of it
+/// (ndn-link.md §16.2).
+pub(crate) fn activity(handle: &ndn_face_quic::LinkHandle) -> u64 {
+    let side = handle.side_stats();
+    handle.datagrams() + side.stream_tx_bytes + side.stream_rx_bytes
+}
+
 /// The close of a link this device no longer wants: to sleep, or released.
 pub(crate) fn release(handle: &ndn_face_quic::LinkHandle, asleep: bool, text: &str) {
     let reason = if asleep {

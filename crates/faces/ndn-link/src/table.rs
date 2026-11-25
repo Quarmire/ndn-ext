@@ -13,7 +13,7 @@ use std::time::{Instant, SystemTime};
 use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use ndn_face_quic::{CloseReason, Direction, KeyFingerprint, LinkHandle};
+use ndn_face_quic::{CloseReason, Direction, KeyFingerprint, LinkHandle, SideStats};
 use ndn_packet::Name;
 use ndn_security::{SignedTrustContext, sync_group};
 use ndn_transport::{Face, FaceId};
@@ -188,6 +188,8 @@ pub(crate) struct LinkView {
     /// The grant that admitted the link, when one did.
     pub(crate) granted: Option<Grant>,
     pub(crate) paths: Vec<PathStatus>,
+    /// What the paths' side paths carried, together.
+    pub(crate) side: SideStats,
 }
 
 /// Which of the links this device accepted an address change lost.
@@ -508,6 +510,10 @@ impl LinkTable {
                         via: None,
                     })
                     .collect(),
+                side: l.paths.iter().fold(SideStats::default(), |mut all, p| {
+                    all += p.path.handle.side_stats();
+                    all
+                }),
             })
             .collect()
     }

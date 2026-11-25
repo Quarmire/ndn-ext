@@ -38,7 +38,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use ndn_cert::roles::Role;
-use ndn_face_quic::{CloseReason, KeyFingerprint, RateLimit, SharedRate};
+use ndn_face_quic::{CloseReason, FairShare, KeyFingerprint, RateLimit, SharedRate};
 use ndn_mgmt_wire::{LinkDetail, link_code as code};
 use ndn_packet::Name;
 use parking_lot::Mutex;
@@ -181,6 +181,9 @@ struct RootLive {
     stranger: Option<Arc<SharedRate>>,
     /// The rates the granted members of this root share, once one is served.
     granted: Option<Arc<SharedRate>>,
+    /// The fair share of channel bytes the granted members of this root
+    /// share, once one is served (ndn-link.md §17A).
+    channel: Option<FairShare>,
     /// The rates the guests of this root's namespace share, once one is served.
     guests: Option<Arc<SharedRate>>,
 }
@@ -212,6 +215,9 @@ pub(crate) struct Limits {
     /// A bound on the bytes this device answers the peer ([`GRANT_ANSWERED`]).
     pub(crate) answered: Option<RateLimit>,
     pub(crate) shared: Arc<SharedRate>,
+    /// For a grant link: the namespace's fair share of channel bytes, which
+    /// the link's channel frames count against; none for any other.
+    pub(crate) channel: Option<FairShare>,
 }
 
 /// One served link's place among the quotas; dropping it gives it back.
@@ -312,6 +318,7 @@ impl QuotaState {
             links: 0,
             stranger: None,
             granted: None,
+            channel: None,
             guests: None,
         });
         entry.links += 1;
@@ -325,6 +332,7 @@ impl QuotaState {
                 shared: Arc::clone(entry.stranger.get_or_insert_with(|| {
                     Arc::new(SharedRate::new(q.interests_per_namespace, None))
                 })),
+                channel: None,
             },
             Serving::Granted => Limits {
                 serving,
@@ -335,6 +343,7 @@ impl QuotaState {
                 shared: Arc::clone(entry.granted.get_or_insert_with(|| {
                     Arc::new(SharedRate::new(GRANTS_FRAMES, Some(GRANTS_BYTES)))
                 })),
+                channel: Some(entry.channel.get_or_insert_with(FairShare::default).clone()),
             },
             Serving::Guest => Limits {
                 serving,
@@ -345,6 +354,7 @@ impl QuotaState {
                 shared: Arc::clone(entry.guests.get_or_insert_with(|| {
                     Arc::new(SharedRate::new(GRANTS_FRAMES, Some(GRANTS_BYTES)))
                 })),
+                channel: None,
             },
         });
         live.names.entry(namespace.clone()).or_insert((root, 0)).1 += 1;

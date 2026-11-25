@@ -7,7 +7,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use ndn_face_quic::KeyFingerprint;
+use ndn_face_quic::{KeyFingerprint, SideStats};
 use ndn_mgmt_wire::LinkDetail;
 use ndn_packet::Name;
 use ndn_transport::FaceId;
@@ -84,6 +84,11 @@ pub struct LinkStatus {
     /// When a grant, not the serving policy, admitted its link: the grant
     /// as it stands (`granted until … as a writer in …`, [`Grant::describe`]).
     pub granted: Option<Grant>,
+    /// What the link's side path carried and dropped, both carriers, over
+    /// the paths it has now (channel frames and octets each way, and what
+    /// was refused or dropped): counters only. All zero for a device that is
+    /// not linked.
+    pub side: SideStats,
 }
 
 /// A relay this device uses.
