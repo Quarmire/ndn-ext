@@ -1343,14 +1343,14 @@ fn report_timeline(label: &str, runs: &[Step], steps: &[Stage]) -> (String, Stri
     }
 
     // Rung 6 for the put->watch: B's fetches asked again, and the link's drop notices (`face.quic`, rate limited).
-    let drops: Vec<&str> = runs
+    let (oversize, drops): (Vec<&str>, Vec<&str>) = runs
         .iter()
         .flat_map(|r| {
             r.ev.iter()
                 .filter(|e| e.2.starts_with("face.quic ") && e.2.contains("dropped"))
                 .map(|e| e.2.as_str())
         })
-        .collect();
+        .partition(|m| m.contains("datagram over the path size"));
     let cumulative = drops
         .iter()
         .filter_map(|d| field(d, "dropped").and_then(|x| x.parse::<u64>().ok()))
@@ -1359,9 +1359,10 @@ fn report_timeline(label: &str, runs: &[Step], steps: &[Stage]) -> (String, Stri
     let slow = runs.iter().filter(|r| r.got - r.t0 > 150_000_000).count();
     let _ = writeln!(
         c,
-        "- {label}: B's fetches answered after a re-expression {again} of {} ({misses} missed); `face.quic` drop notices {} (rate-limited; the link's own counter at its last notice {cumulative}); runs over 150 ms {slow} of {}",
+        "- {label}: B's fetches answered after a re-expression {again} of {} ({misses} missed); `face.quic` drop notices {} (rate-limited; the link's own counter at its last notice {cumulative}); `datagram over the path size, dropped` {}; runs over 150 ms {slow} of {}",
         all.len(),
         drops.len(),
+        oversize.len(),
         runs.len()
     );
     (t, c)

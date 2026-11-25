@@ -1,6 +1,6 @@
 //! The recorder: the data layer's timeline events (target `ndn_heap::timeline`; level trace) and the
-//! link's drop notices (target `face.quic`, level info and
-//! above), each kept with this machine's
+//! link's events (target `face.quic`, every level: the drop notices at info, and the trace-level
+//! "datagram over the path size, dropped" of a frame over the path's datagram size), each kept with this machine's
 //! clock. A child installs it only in a traced run (`LADDER_TRACE`); the timed runs have no
 //! subscriber, so every callsite there is the disabled-callsite check and nothing else.
 
@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tracing::{Level, Metadata};
+use tracing::Metadata;
 
 /// Nanoseconds since the epoch on this machine's clock: both children and the parent are on it, so
 /// their times subtract.
@@ -36,7 +36,7 @@ impl tracing::field::Visit for Text {
 }
 
 fn wanted(m: &Metadata<'_>) -> bool {
-    m.target() == "ndn_heap::timeline" || (m.target() == "face.quic" && *m.level() <= Level::INFO)
+    m.target() == "ndn_heap::timeline" || m.target() == "face.quic"
 }
 
 impl tracing::Subscriber for Tape {
