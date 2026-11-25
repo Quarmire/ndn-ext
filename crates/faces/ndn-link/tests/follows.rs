@@ -258,7 +258,7 @@ async fn the_hosts_followed_groups_name_exact_spaces_or_are_refused_whole() {
         assert!(refused.to_string().contains(word), "{refused}");
         assert_eq!(
             links.followed_groups(),
-            [doc.clone()],
+            std::slice::from_ref(&doc),
             "a refusal changed the set"
         );
     }
@@ -270,7 +270,7 @@ async fn the_hosts_followed_groups_name_exact_spaces_or_are_refused_whole() {
     let refused = links.set_followed_groups(many.clone()).unwrap_err();
     assert_eq!(refused, FollowedGroupsError::TooMany { given: many.len() });
     assert!(refused.to_string().contains("at most"), "{refused}");
-    assert_eq!(links.followed_groups(), [doc.clone()]);
+    assert_eq!(links.followed_groups(), std::slice::from_ref(&doc));
 
     // The limit itself is fine; a group named twice counts once.
     let mut at_limit = many[..max].to_vec();
