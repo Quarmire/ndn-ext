@@ -12,7 +12,7 @@
 //!
 //! | key | default | meaning |
 //! |---|---|---|
-//! | `only` | `dgram1k,stream1k,stream8k,lat` | rows to run; also `mtu` (idle after the handshake), `crypto` (ring's AEADs), `idle` |
+//! | `only` | `dgram1k,stream1k,stream8k,lat` | rows to run; also `dgram@<size>` and `stream@<size>` (the same rows at another message size, in octets), `mtu` (idle after the handshake), `crypto` (ring's AEADs), `idle` |
 //! | `repeat` | 3 | repetitions of the rows |
 //! | `secs` | 3 | seconds measured per throughput row |
 //! | `rt` | 2 | 2: sender and receiver on their own runtimes; 1: both on one |
@@ -915,6 +915,19 @@ fn main() {
                         .entry("dgram 1 KiB msg/s".into())
                         .or_default()
                         .push(ctx.dgram(1024).recv);
+                }
+                row if row.starts_with("dgram@") || row.starts_with("stream@") => {
+                    let (kind, size) = row.split_once('@').expect("kind@size");
+                    let size: usize = size.parse().expect("`dgram@<size>`: a size in octets");
+                    let recv = if kind == "dgram" {
+                        ctx.dgram(size).recv
+                    } else {
+                        ctx.stream(size).recv
+                    };
+                    summary
+                        .entry(format!("{kind} {size} B msg/s"))
+                        .or_default()
+                        .push(recv);
                 }
                 "stream1k" => {
                     summary

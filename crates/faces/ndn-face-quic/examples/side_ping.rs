@@ -27,18 +27,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use ndn_face_quic::{
-    Admission, ChannelPolicy, Link, LinkEndpoint, LinkHello, LinkKey, LinkTransportConfig,
-};
-use ndn_security::Ed25519Signer;
-use ndn_transport::{FaceId, SideClass, Transport};
+use ndn_face_quic::LinkTransportConfig;
+use ndn_transport::{SideClass, Transport};
 
 mod common;
+#[path = "common/pair.rs"]
+mod pair;
 #[path = "common/sampler.rs"]
 mod sampler;
 use common::{cpu_line, median, runtime, threads, trimmed};
-
-const T: Duration = Duration::from_secs(10);
+use pair::{Pair, connect};
 
 struct Args {
     only: Vec<String>,
@@ -101,88 +99,12 @@ impl Args {
     }
 }
 
-fn key(seed: u8) -> LinkKey {
-    LinkKey::from_signer(Arc::new(Ed25519Signer::from_seed(
-        &[seed; 32],
-        format!("/bench/member/d{seed}/KEY/k").parse().unwrap(),
-    )))
-    .unwrap()
-}
-
-fn carrying() -> Admission {
-    Admission {
-        channel: ChannelPolicy {
-            carry: true,
-            quota: None,
-        },
-        ..Admission::default()
-    }
-}
-
 /// `0x00 | seq | filler`, `len` octets in all.
 fn frame(seq: u32, len: usize) -> Bytes {
     let mut v = vec![0xA5; len];
     v[0] = 0x00;
     v[1..5].copy_from_slice(&seq.to_be_bytes());
     Bytes::from(v)
-}
-
-struct Pair {
-    /// The dialling side, the publisher.
-    tx: Arc<Link>,
-    /// The listening side, the subscriber.
-    rx: Arc<Link>,
-    _eps: [Arc<LinkEndpoint>; 2],
-}
-
-async fn connect(
-    config: &LinkTransportConfig,
-    rt_rx: &tokio::runtime::Handle,
-    rt_tx: &tokio::runtime::Handle,
-) -> Pair {
-    let (c1, c2) = (config.clone(), config.clone());
-    let listener = rt_rx
-        .spawn(async move {
-            Arc::new(
-                LinkEndpoint::bind("127.0.0.1:0".parse().unwrap(), Arc::new(key(2)), &c1, true)
-                    .unwrap(),
-            )
-        })
-        .await
-        .unwrap();
-    let dialer = rt_tx
-        .spawn(async move {
-            Arc::new(
-                LinkEndpoint::bind("127.0.0.1:0".parse().unwrap(), Arc::new(key(1)), &c2, false)
-                    .unwrap(),
-            )
-        })
-        .await
-        .unwrap();
-    let target = listener.local_addr().unwrap();
-    let accept = {
-        let listener = Arc::clone(&listener);
-        rt_rx.spawn(async move {
-            let mut hs = listener.accept().await.unwrap().handshake().await.unwrap();
-            hs.exchange_hello(&LinkHello::default(), T).await.unwrap();
-            hs.admit(FaceId(2), T, carrying()).await.unwrap()
-        })
-    };
-    let dial = {
-        let dialer = Arc::clone(&dialer);
-        rt_tx.spawn(async move {
-            let mut hs = dialer.connect(target, None).await.unwrap();
-            hs.exchange_hello(&LinkHello::default(), T).await.unwrap();
-            hs.admit(FaceId(1), T, carrying()).await.unwrap()
-        })
-    };
-    let (rx, tx) = (accept.await.unwrap(), dial.await.unwrap());
-    assert!(tx.handle.side_peer_caps() && rx.handle.side_peer_caps());
-    Pair {
-        tx: Arc::new(tx),
-        rx: Arc::new(rx),
-        _eps: [listener, dialer],
-    }
 }
 
 struct Ctx {

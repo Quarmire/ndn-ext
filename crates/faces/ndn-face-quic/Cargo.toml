@@ -34,6 +34,14 @@ tokio    = { workspace = true, features = ["full"] }
 # `libc` for the Linux-only sampling profile (per-thread CPU timers) and the UDP_GRO switch.
 rcgen    = { workspace = true }
 libc     = { workspace = true }
+# examples/chan_ping.rs: two data-layer nodes (`ndn-heap`) on one forwarder (`ndn-engine`, `ndn-app`,
+# `ndn-namespace`) with a MemoryStore (`ndn-sync`), their channel frames over one link.
+ndn-heap      = { workspace = true }
+ndn-engine    = { workspace = true }
+ndn-app       = { workspace = true }
+ndn-namespace = { workspace = true }
+ndn-sync      = { workspace = true }
+tokio-util    = { workspace = true }
 
 [[example]]
 name = "carrier_bench"
@@ -43,6 +51,9 @@ name = "side_ping"
 
 [[example]]
 name = "link_rss"
+
+[[example]]
+name = "chan_ping"
 
 [lints]
 workspace = true
