@@ -303,6 +303,61 @@ async fn packets_ride_datagrams_both_ways_and_large_ones_are_fragmented() {
     assert_eq!(whole, big);
 }
 
+/// A burst received between two idle-Ack ticks leaves hundreds of Acks owed.
+/// They go out in datagrams the connection takes (its datagram size, which
+/// the tick reads as it sends, not the face's fragmentation threshold of
+/// 8800): all of them reach the peer. Sent in one packet sized for 8800,
+/// the burst's Acks were over the path size and dropped, each a frame the
+/// peer then resent.
+#[tokio::test]
+async fn the_acks_of_a_burst_reach_the_peer_in_datagrams_that_fit() {
+    const BURST: usize = 600;
+    let dialer = endpoint(ed_key(1), false);
+    let listener = endpoint(ec_key(2), true);
+    let (a, b) = link(&dialer, &listener).await;
+    let service = Arc::new(LpLinkService::new());
+    let face = Face::from_parts(
+        Arc::new(a.face) as Arc<dyn ndn_transport::ErasedTransport>,
+        Arc::clone(&service) as Arc<dyn ndn_transport::LinkService>,
+    );
+
+    for seq in 0..BURST as u64 {
+        let frame =
+            ndn_packet::lp::encode_lp_reliable(&[0x05, 0x03, 0xAA, 0xBB, 0xCC], seq, None, &[]);
+        b.face.send_bytes(frame).await.unwrap();
+    }
+    for _ in 0..BURST {
+        tokio::time::timeout(T, face.recv_bytes())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    // The engine's tick: drain the owed Acks at the transport's limit of now,
+    // each packet sent as it is.
+    while let Some(ack) = service
+        .reliability_feature()
+        .take_acks(face.transport.send_mtu())
+    {
+        face.send_bytes(ack).await.unwrap();
+    }
+
+    let mut acked = 0;
+    while acked < BURST {
+        let frame = recv(&b.face).await;
+        // The datagram size only grows as path MTU discovery finds room, so
+        // its value now is at least what it was when the Acks were sized.
+        let mtu = face.transport.send_mtu().unwrap();
+        assert!(
+            frame.len() <= mtu,
+            "a {} B frame over the {mtu} B datagram size",
+            frame.len()
+        );
+        acked += ndn_packet::lp::extract_acks(&frame).1.len();
+    }
+    assert_eq!(acked, BURST);
+}
+
 /// The next frame `face` delivers.
 async fn recv(face: &ndn_face_quic::LinkFace) -> Bytes {
     tokio::time::timeout(T, face.recv_bytes())

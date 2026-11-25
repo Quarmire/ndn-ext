@@ -901,9 +901,12 @@ impl LinkFace {
         let len = wire.len();
         match self.connection.send_datagram_wait(wire).await {
             Ok(()) => Ok(()),
-            // The path's datagram size shrank between framing and sending:
-            // this frame is lost, as on any datagram link, and recovered the
-            // NDN way.
+            // Every frame is sized to `send_mtu` as it is when sent, and a
+            // repair that no longer fits is cut again to it (ndn-transport's
+            // reliability), so reaching here takes the path's datagram size
+            // falling between that sizing and this call. The frame is lost,
+            // as on any datagram link, and recovered the NDN way; a run that
+            // logs this repeatedly has a sender sizing for a stale limit.
             Err(SendDatagramError::TooLarge) => {
                 trace!(target: "face.quic", face = %self.id, len, "datagram over the path size, dropped");
                 Ok(())
