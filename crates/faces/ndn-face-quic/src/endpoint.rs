@@ -75,13 +75,17 @@ pub struct LinkTransportConfig {
     /// path at the bound. A bound above the path costs about a dozen probes. The gain is on
     /// the paths that carry more: at 9,000 a loopback link carries 2.9 times the 1 KiB
     /// datagrams and 2.4 times the 8 KiB stream messages a second that it does at 1,452.
-    /// The bound costs little memory: 200 idle loopback links held 18 KB more resident memory
-    /// each at 9,000 than at 1,452 (89 KB against 71 KB for both ends of a link), and after a
-    /// burst and a 1 MiB stream on each, 107 KB less (the examples' `link_rss`); the decision
-    /// rule was that more than 1 MiB more per connection would keep 1,452. quinn allocates,
+    /// The bound costs little memory: 200 idle loopback links held 17 KB more resident memory
+    /// each at 9,000 than at 1,452 (90 KB against 73 KB for both ends of a link), and after a
+    /// burst and a 1 MiB stream on each, 206 KB more (1.74 MB against 1.53 MB; the examples'
+    /// `link_rss`, median of three runs); the decision rule was that more than 1 MiB more per
+    /// connection would keep 1,452. quinn allocates,
     /// zeroed, one receive buffer of this bound times 64 GRO segments times 32 packets for the
     /// endpoint (18 MB at 9,000): one per socket, not per link, and untouched pages of it are
-    /// not resident. Clamped to 1,200–65,527.
+    /// not resident. A bound above 3,680 also raises the connection's first congestion window
+    /// to four datagrams of it (quinn's own 14,720 octets leave no room beside a probe of
+    /// 8,000, and a connection that cannot send, its close too, cannot tell a dialer why it
+    /// refused it). Clamped to 1,200–65,527.
     pub path_mtu_max: u16,
 }
 
@@ -103,6 +107,21 @@ impl Default for LinkTransportConfig {
 /// The default bound of path-MTU discovery: a jumbo frame (the memory this costs per connection
 /// is on [`LinkTransportConfig::path_mtu_max`]).
 const DEFAULT_PATH_MTU_MAX: u16 = 9000;
+/// quinn's own initial congestion window (RFC 9002 §7.2: 14,720 octets), the floor of the one
+/// a connection starts with.
+const MIN_INITIAL_WINDOW: u64 = 14_720;
+
+/// The congestion window a connection starts with: quinn-proto sends nothing while the bytes
+/// in flight plus one datagram of the current size reach the window, a connection close
+/// included. Its own 14,720 octets leave no room beside one probe of several kilobytes in
+/// flight, so a connection refused soon after its handshake could not tell the dialer why (the
+/// dialer read a stateless reset). The window keeps room for a datagram of the largest size
+/// beside a probe of it, and is quinn's own value when that is less (what a bound of 1,452 or
+/// below gets).
+fn initial_window(path_mtu_max: u16) -> u64 {
+    MIN_INITIAL_WINDOW.max(4 * u64::from(path_mtu_max))
+}
+
 /// What every QUIC path carries (the floor of `path_mtu_max`), and the most a QUIC packet may
 /// be (its ceiling).
 const PATH_MTU_FLOOR: u16 = 1200;
@@ -901,6 +920,11 @@ fn transport_config(
     let mut discovery = quinn::MtuDiscoveryConfig::default();
     discovery.upper_bound(path_mtu_max);
     t.mtu_discovery_config(Some(discovery));
+    // The first congestion window keeps room beside a probe of the largest size (see
+    // `initial_window`).
+    let mut congestion = quinn::congestion::CubicConfig::default();
+    congestion.initial_window(initial_window(path_mtu_max));
+    t.congestion_controller_factory(Arc::new(congestion));
     // The datagram queues of a connection stay at quinn's own budget: datagrams flow before
     // the verdict, so a larger one is memory any dialer may fill (see the test).
     t
@@ -1042,5 +1066,29 @@ mod tests {
                 "a connection's datagram queue is not quinn's default"
             );
         }
+    }
+
+    /// A connection must be able to send its close beside a probe of the largest size in
+    /// flight: quinn-proto sends only while the bytes in flight plus one datagram of the
+    /// current size are under the congestion window. A bound of 1,452 or below keeps quinn's
+    /// own window, which a lower bound already leaves room in.
+    #[test]
+    fn the_first_window_leaves_room_beside_a_probe_of_the_largest_size() {
+        for bound in [
+            PATH_MTU_FLOOR,
+            1452,
+            4000,
+            DEFAULT_PATH_MTU_MAX,
+            PATH_MTU_CEILING,
+        ] {
+            let (probe, datagram) = (u64::from(bound), u64::from(bound));
+            assert!(
+                probe + datagram < initial_window(bound),
+                "a window of {} octets is blocked by one probe at a bound of {bound}",
+                initial_window(bound)
+            );
+        }
+        assert_eq!(initial_window(1452), MIN_INITIAL_WINDOW);
+        assert_eq!(initial_window(PATH_MTU_FLOOR), MIN_INITIAL_WINDOW);
     }
 }
