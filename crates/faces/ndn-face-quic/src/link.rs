@@ -3,6 +3,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::task::Poll;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -1004,8 +1005,23 @@ impl LinkFace {
         };
         let streams = self.side.reads_stream();
         loop {
+            let datagram = self.read_datagram();
+            tokio::pin!(datagram);
+            // A datagram already queued is taken without registering on the
+            // other sources, which costs more than the read itself on a link
+            // that is saturated; one call in eight listens to them all, so
+            // none is starved.
+            if self.side.datagram_first() {
+                let polled = std::future::poll_fn(|cx| Poll::Ready(datagram.as_mut().poll(cx)));
+                if let Poll::Ready(wire) = polled.await {
+                    if let Some(wire) = self.judge_datagram(wire?) {
+                        return Ok(wire);
+                    }
+                    continue;
+                }
+            }
             tokio::select! {
-                wire = self.read_datagram() => {
+                wire = &mut datagram => {
                     if let Some(wire) = self.judge_datagram(wire?) {
                         return Ok(wire);
                     }

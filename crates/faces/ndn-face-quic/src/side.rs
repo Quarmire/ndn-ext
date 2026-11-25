@@ -8,9 +8,11 @@
 //! - **Datagram.** The frame is one QUIC DATAGRAM frame, read by the face's
 //!   one datagram reader ([`LinkFace`](crate::LinkFace)'s `recv_bytes`) like
 //!   any other and returned to its caller unchanged. A frame leaves only
-//!   while at most [`QUEUE_MAX`] bytes wait in the connection's datagram send
-//!   buffer (the *headroom rule*), so it waits behind at most that much NDN
-//!   traffic and never makes quinn drop an older NDN datagram to find room.
+//!   while fewer than the *headroom* bytes wait in the connection's datagram
+//!   send buffer (about a millisecond of the connection's send rate, between
+//!   [`QUEUE_FLOOR`] and [`QUEUE_CAP`]; the *headroom rule*), so it waits
+//!   behind about that much NDN traffic and never makes quinn drop an older
+//!   NDN datagram to find room.
 //! - **Stream.** One unidirectional stream per direction carries
 //!   `u32 big-endian length | frame` records, opened on the first stream-class
 //!   send. The link's transport configuration grants a peer no unidirectional
@@ -25,13 +27,13 @@
 //! the admitted link) sends nothing, grants nothing, and drops and counts what
 //! the peer sends, without closing the link.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::task::Poll;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use bytes::Bytes;
-use quinn::{ReadExactError, SendDatagramError, VarInt};
+use bytes::{Buf, Bytes, BytesMut};
+use quinn::{SendDatagramError, VarInt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tracing::{debug, trace};
 
@@ -41,17 +43,52 @@ use crate::link::DATAGRAM_FLOOR;
 use crate::message::{CHANNEL_CAPS_V1, CloseReason};
 use crate::scope::{FairMember, FairShare, Flow};
 
-/// Most octets of channel datagrams that may wait in the connection's send
-/// buffer when another is handed to it: the headroom rule. 128 KiB is a
-/// millisecond at 1 Gbit/s. It is two GSO batches of the link socket (64 KiB
-/// each): at 64 KiB one batch drained the whole headroom, the driver found the
-/// queue empty between batches, and a saturating 1 KiB publisher measured 0.92
-/// of raw datagrams (0.97 at 128 KiB, medians of 7 interleaved pairs).
-pub const QUEUE_MAX: usize = 128 * 1024;
+/// The least headroom, in octets of datagrams that may wait in the connection's
+/// send buffer when a channel datagram is handed to it: a millisecond at
+/// 1 Gbit/s, and what any slower connection gets. It is two GSO batches of the
+/// link socket (64 KiB each): at 64 KiB one batch drained the whole headroom, the
+/// driver found the queue empty between batches, and a saturating 1 KiB
+/// publisher measured 0.92 of raw datagrams (0.97 at 128 KiB).
+pub const QUEUE_FLOOR: usize = 128 * 1024;
+
+/// The most headroom: well under the connection's 1 MiB send buffer, so room
+/// for an NDN datagram is always left and none is dropped for a channel frame.
+pub const QUEUE_CAP: usize = 512 * 1024;
+
+/// How much of the connection's send rate the headroom allows to queue: what a
+/// channel datagram waits behind NDN traffic is about this long.
+const HEADROOM_TIME: Duration = Duration::from_millis(1);
+
+/// Shortest window the send rate is measured over (and so how often it is read).
+const RATE_WINDOW_MIN: Duration = Duration::from_millis(1);
+
+/// A window this long replaces the smoothed rate; a shorter one moves it by its
+/// share of this.
+const RATE_WINDOW_FULL: Duration = Duration::from_millis(20);
+
+/// Datagrams sent between two looks at the clock for the rate.
+const RATE_EVERY: u64 = 16;
+
+/// The headroom for a connection sending `rate` octets a second: the octets it
+/// sends in [`HEADROOM_TIME`], within [`QUEUE_FLOOR`] and [`QUEUE_CAP`].
+pub(crate) fn headroom_for(rate: f64) -> usize {
+    let wanted = rate * HEADROOM_TIME.as_secs_f64();
+    if wanted.is_nan() {
+        return QUEUE_FLOOR;
+    }
+    (wanted.clamp(0.0, QUEUE_CAP as f64) as usize).clamp(QUEUE_FLOOR, QUEUE_CAP)
+}
+
+/// The smoothed rate after a window of `dt` in which `inst` octets a second
+/// were sent.
+pub(crate) fn smoothed_rate(rate: f64, inst: f64, dt: Duration) -> f64 {
+    let share = (dt.as_secs_f64() / RATE_WINDOW_FULL.as_secs_f64()).min(1.0);
+    rate + share * (inst - rate)
+}
 
 /// The size of quinn's datagram send buffer
 /// (`TransportConfig::datagram_send_buffer_size`, which the link's transport
-/// configuration leaves at quinn's own 1 MiB): what [`QUEUE_MAX`] is measured
+/// configuration leaves at quinn's own 1 MiB): what the headroom is measured
 /// against, as `queued = DATAGRAM_SEND_BUFFER - datagram_send_buffer_space()`.
 pub const DATAGRAM_SEND_BUFFER: usize = 1024 * 1024;
 
@@ -71,6 +108,13 @@ const INBOX_BYTES: usize = 4 * 1024 * 1024;
 /// Octets one write of the stream writer task takes from its queue (frames are
 /// not split, so a write may pass this by one frame).
 const WRITE_BATCH: usize = 256 * 1024;
+
+/// Frames up to this many octets are written as one copied record; larger ones
+/// as a prefix chunk and the frame itself.
+const SMALL_RECORD: usize = 16 * 1024;
+
+/// Octets one read of the peer's stream takes at most.
+const READ_CHUNK: usize = 256 * 1024;
 
 /// How often a blocked datagram send looks at the send buffer again, once it
 /// has given up yielding (tokio's timers are 1 ms granular: sleeping alone
@@ -187,8 +231,8 @@ impl std::ops::AddAssign for SideStats {
 pub struct SideLimits {
     /// Octets waiting in the connection's datagram send buffer now.
     pub queued: usize,
-    /// A channel datagram leaves only while `queued` is under this
-    /// ([`QUEUE_MAX`]).
+    /// A channel datagram leaves only while `queued` is under this: the
+    /// headroom now, between [`QUEUE_FLOOR`] and [`QUEUE_CAP`].
     pub queue_max: usize,
     /// The longest datagram the connection carries now.
     pub frame_max: usize,
@@ -263,6 +307,14 @@ struct Queue {
     octets: usize,
 }
 
+/// The connection's send rate as last measured: when, the octets it had sent
+/// then (`udp_tx.bytes`), and the smoothed rate in octets a second.
+struct RateSample {
+    at: Instant,
+    bytes: u64,
+    rate: f64,
+}
+
 /// A received stream frame, holding its share of [`INBOX_BYTES`] until the
 /// reader takes it.
 type Inbound = (Bytes, OwnedSemaphorePermit);
@@ -281,7 +333,15 @@ pub(crate) struct SideCarrier {
     counters: Counters,
     stream_tx: tokio::sync::Mutex<StreamTx>,
     queue: Mutex<Queue>,
+    /// The octets in `queue`, as of its last change: lets a send skip the
+    /// queue's lock when `forward_side` queued nothing.
+    queued_octets: AtomicUsize,
     wake: tokio::sync::Notify,
+    /// Calls to the face's reader, to let it look at every source now and then.
+    turn: AtomicU32,
+    /// The headroom now, from the send rate last measured.
+    headroom: AtomicUsize,
+    rate: Mutex<RateSample>,
     stream_rx: tokio::sync::Mutex<mpsc::Receiver<Inbound>>,
     /// Where the stream reader puts frames; taken by [`Self::spawn`].
     inbox: Mutex<Option<mpsc::Sender<Inbound>>>,
@@ -299,6 +359,7 @@ impl SideCarrier {
         local_close: Arc<OnceLock<(CloseReason, String)>>,
     ) -> Arc<Self> {
         let (tx, rx) = mpsc::channel(1024);
+        let sent_bytes = connection.stats().udp_tx.bytes;
         Arc::new(Self {
             connection,
             peer_caps,
@@ -308,7 +369,15 @@ impl SideCarrier {
             counters: Counters::default(),
             stream_tx: tokio::sync::Mutex::new(StreamTx::Idle),
             queue: Mutex::new(Queue::default()),
+            queued_octets: AtomicUsize::new(0),
             wake: tokio::sync::Notify::new(),
+            turn: AtomicU32::new(0),
+            headroom: AtomicUsize::new(QUEUE_FLOOR),
+            rate: Mutex::new(RateSample {
+                at: Instant::now(),
+                bytes: sent_bytes,
+                rate: 0.0,
+            }),
             stream_rx: tokio::sync::Mutex::new(rx),
             inbox: Mutex::new(Some(tx)),
             inbox_budget: Arc::new(Semaphore::new(INBOX_BYTES)),
@@ -352,7 +421,7 @@ impl SideCarrier {
     pub(crate) fn limits(&self) -> SideLimits {
         SideLimits {
             queued: self.queued(),
-            queue_max: QUEUE_MAX,
+            queue_max: self.headroom(),
             frame_max: self.frame_max(),
             stream_frame_max: STREAM_FRAME_MAX,
         }
@@ -433,8 +502,41 @@ impl SideCarrier {
         }
     }
 
+    /// The octets that may wait in the send buffer when a channel datagram is
+    /// handed to it now.
+    fn headroom(&self) -> usize {
+        self.headroom.load(Ordering::Relaxed)
+    }
+
+    /// Measure the connection's send rate over the time since the last look
+    /// (at least [`RATE_WINDOW_MIN`]; a look that finds less waits for the next)
+    /// and set the headroom from it.
+    fn refresh_headroom(&self) {
+        let Ok(mut sample) = self.rate.try_lock() else {
+            return;
+        };
+        let now = Instant::now();
+        let dt = now.saturating_duration_since(sample.at);
+        if dt < RATE_WINDOW_MIN {
+            return;
+        }
+        let bytes = self.connection.stats().udp_tx.bytes;
+        let inst = bytes.saturating_sub(sample.bytes) as f64 / dt.as_secs_f64();
+        sample.rate = smoothed_rate(sample.rate, inst, dt);
+        sample.at = now;
+        sample.bytes = bytes;
+        self.headroom
+            .store(headroom_for(sample.rate), Ordering::Relaxed);
+    }
+
     fn sent_datagram(&self, len: usize, queued: usize) {
-        bump(&self.counters.datagram_tx_frames);
+        let sent = self
+            .counters
+            .datagram_tx_frames
+            .fetch_add(1, Ordering::Relaxed);
+        if sent.is_multiple_of(RATE_EVERY) {
+            self.refresh_headroom();
+        }
         add(&self.counters.datagram_tx_bytes, len);
         // A read first: the peak rarely moves, and a read does not take the
         // counters' cache line from the reader of `side_stats`.
@@ -450,7 +552,9 @@ impl SideCarrier {
     /// for the peer to grant its stream).
     pub(crate) async fn send(&self, frame: Bytes, class: SideClass) -> Result<(), SideRefused> {
         self.check(&frame, class, false)?;
-        self.admit_tx(frame.len()).await?;
+        if self.quota.is_some() {
+            self.admit_tx(frame.len()).await?;
+        }
         match class {
             SideClass::Datagram => self.send_datagram(frame).await,
             SideClass::Stream => self.send_stream(frame).await,
@@ -462,7 +566,7 @@ impl SideCarrier {
         let mut yields = 0;
         let queued = loop {
             let queued = self.queued();
-            if queued < QUEUE_MAX {
+            if queued < self.headroom() {
                 break queued;
             }
             if yields < HEADROOM_YIELDS {
@@ -470,6 +574,7 @@ impl SideCarrier {
                 tokio::task::yield_now().await;
                 continue;
             }
+            self.refresh_headroom();
             if self.connection.close_reason().is_some() {
                 return Err(Self::closed());
             }
@@ -500,8 +605,20 @@ impl SideCarrier {
     async fn send_stream(&self, frame: Bytes) -> Result<(), SideRefused> {
         let mut stream = self.stream_tx.lock().await;
         // What `forward_side` queued before goes first.
-        self.write_queued(&mut stream).await?;
-        self.write_frames(&mut stream, vec![frame]).await
+        if self.queued_octets.load(Ordering::Acquire) > 0 {
+            self.write_queued(&mut stream).await?;
+        }
+        self.write_one(&mut stream, frame).await
+    }
+
+    /// Whether the face's reader should try the datagram queue alone this
+    /// time: seven calls in eight.
+    pub(crate) fn datagram_first(&self) -> bool {
+        // One reader calls this; a lost increment under two only shifts which
+        // call looks at every source.
+        let turn = self.turn.load(Ordering::Relaxed).wrapping_add(1);
+        self.turn.store(turn, Ordering::Relaxed);
+        turn & 7 != 0
     }
 
     /// The non-blocking twin of [`send`](Self::send): a frame that has no room
@@ -512,12 +629,12 @@ impl SideCarrier {
         match class {
             SideClass::Datagram => {
                 let queued = self.queued();
-                if queued >= QUEUE_MAX {
+                if queued >= self.headroom() {
                     bump(&self.counters.sink_full);
                     return Err(SideRefused::Full);
                 }
                 self.try_admit_tx(len)?;
-                // Under `QUEUE_MAX` of the buffer's 1 MiB is in use, so room
+                // Under the headroom (at most `QUEUE_CAP`) of the buffer's 1 MiB is in use, so room
                 // for this frame is there and no older datagram is dropped.
                 match self.connection.send_datagram(frame) {
                     Ok(()) => {
@@ -535,6 +652,7 @@ impl SideCarrier {
                 }
                 self.try_admit_tx(len)?;
                 queue.octets += len + 4;
+                self.queued_octets.store(queue.octets, Ordering::Release);
                 queue.frames.push_back(frame);
                 drop(queue);
                 self.wake.notify_one();
@@ -559,6 +677,7 @@ impl SideCarrier {
                     queue.octets -= frame.len() + 4;
                     batch.extend(queue.frames.pop_front());
                 }
+                self.queued_octets.store(queue.octets, Ordering::Release);
                 batch
             };
             if batch.is_empty() {
@@ -569,6 +688,7 @@ impl SideCarrier {
                 let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
                 queue.frames.clear();
                 queue.octets = 0;
+                self.queued_octets.store(0, Ordering::Release);
                 return Err(e);
             }
         }
@@ -580,6 +700,44 @@ impl SideCarrier {
         &self,
         stream: &mut StreamTx,
         frames: Vec<Bytes>,
+    ) -> Result<(), SideRefused> {
+        let (count, octets) = (frames.len(), frames.iter().map(Bytes::len).sum::<usize>());
+        let mut chunks = Vec::with_capacity(2 * count);
+        for frame in frames {
+            // At most STREAM_FRAME_MAX, checked before it was queued.
+            chunks.push(Bytes::copy_from_slice(&(frame.len() as u32).to_be_bytes()));
+            chunks.push(frame);
+        }
+        self.write_chunks(stream, &mut chunks, count, octets).await
+    }
+
+    /// Write one frame as a record. A small one is copied behind its prefix
+    /// into one buffer, which costs one allocation and no list of chunks; a
+    /// large one goes as a prefix chunk and itself, uncopied.
+    async fn write_one(&self, stream: &mut StreamTx, frame: Bytes) -> Result<(), SideRefused> {
+        let len = frame.len();
+        // At most STREAM_FRAME_MAX, checked before this send.
+        let prefix = (len as u32).to_be_bytes();
+        if len <= SMALL_RECORD {
+            let mut record = BytesMut::with_capacity(4 + len);
+            record.extend_from_slice(&prefix);
+            record.extend_from_slice(&frame);
+            self.write_chunks(stream, &mut [record.freeze()], 1, len)
+                .await
+        } else {
+            let mut chunks = [Bytes::copy_from_slice(&prefix), frame];
+            self.write_chunks(stream, &mut chunks, 1, len).await
+        }
+    }
+
+    /// Write `chunks` (the records of `count` frames of `octets` octets in
+    /// all) in one write, opening the stream first if no frame has gone yet.
+    async fn write_chunks(
+        &self,
+        stream: &mut StreamTx,
+        chunks: &mut [Bytes],
+        count: usize,
+        octets: usize,
     ) -> Result<(), SideRefused> {
         if let StreamTx::Idle = stream {
             let opened = self
@@ -596,15 +754,8 @@ impl SideCarrier {
                 "the channel stream of this link ended".into(),
             ));
         };
-        let (count, octets) = (frames.len(), frames.iter().map(Bytes::len).sum::<usize>());
-        let mut chunks = Vec::with_capacity(2 * count);
-        for frame in frames {
-            // At most STREAM_FRAME_MAX, checked before it was queued.
-            chunks.push(Bytes::copy_from_slice(&(frame.len() as u32).to_be_bytes()));
-            chunks.push(frame);
-        }
         let written = {
-            let write = send.write_all_chunks(&mut chunks);
+            let write = send.write_all_chunks(chunks);
             tokio::pin!(write);
             match std::future::poll_fn(|cx| Poll::Ready(write.as_mut().poll(cx))).await {
                 Poll::Ready(done) => done,
@@ -696,73 +847,76 @@ async fn side_stream(side: Arc<SideCarrier>, face: FaceId, inbox: mpsc::Sender<I
         _ = side.connection.closed() => return,
     };
     let Ok(mut recv) = accepted else { return };
+    let mut buf = BytesMut::new();
     loop {
-        let mut prefix = [0u8; 4];
-        match recv.read_exact(&mut prefix).await {
-            Ok(()) => {}
-            // The peer finished its stream between two records.
-            Err(ReadExactError::FinishedEarly(0)) => return,
-            Err(ReadExactError::FinishedEarly(_)) => {
+        // Every record that is whole in `buf`.
+        while buf.len() >= 4 {
+            let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+            if len > STREAM_FRAME_MAX {
                 bump(&side.counters.dropped_malformed);
+                side.close_protocol(&format!(
+                    "your device sent a channel frame of {len} bytes on the channel stream, over the \
+                     {STREAM_FRAME_MAX} bytes this device grants"
+                ));
+                return;
+            }
+            if len == 0 {
+                bump(&side.counters.dropped_malformed);
+                stop_stream(&side, face, &mut recv, "a channel record of no octets");
+                return;
+            }
+            if buf.len() < 4 + len {
+                break;
+            }
+            let permit = tokio::select! {
+                permit = Arc::clone(&side.inbox_budget).acquire_many_owned(len as u32) => match permit {
+                    Ok(permit) => permit,
+                    Err(_) => return,
+                },
+                _ = side.connection.closed() => return,
+            };
+            // A copy of its own: a frame the reader has not taken yet pins its
+            // own octets and not the buffer they were read into.
+            let frame = Bytes::copy_from_slice(&buf[4..4 + len]);
+            buf.advance(4 + len);
+            if frame[0] != SIDE_MARKER {
+                bump(&side.counters.dropped_malformed);
+                stop_stream(
+                    &side,
+                    face,
+                    &mut recv,
+                    "a channel record that does not start with the marker",
+                );
+                return;
+            }
+            // A stream cannot drop a frame without breaking the channel's order:
+            // over the quota the reader waits, and flow control slows the peer.
+            if let Some(quota) = &side.quota {
+                while let Err(wait) = quota.admit(Flow::Rx, len) {
+                    tokio::select! {
+                        () = tokio::time::sleep(wait.max(HEADROOM_RECHECK)) => {}
+                        _ = side.connection.closed() => return,
+                    }
+                }
+            }
+            bump(&side.counters.stream_rx_frames);
+            add(&side.counters.stream_rx_bytes, len);
+            if inbox.send((frame, permit)).await.is_err() {
+                return;
+            }
+        }
+        // More octets: one read takes what the stream has, many records at a time.
+        match recv.read_chunk(READ_CHUNK, true).await {
+            Ok(Some(chunk)) => buf.extend_from_slice(&chunk.bytes),
+            // The peer finished its stream: between two records, or inside one.
+            Ok(None) => {
+                if !buf.is_empty() {
+                    bump(&side.counters.dropped_malformed);
+                }
                 return;
             }
             // Reset, stopped, or the connection is gone.
-            Err(ReadExactError::ReadError(_)) => return,
-        }
-        let len = u32::from_be_bytes(prefix) as usize;
-        if len > STREAM_FRAME_MAX {
-            bump(&side.counters.dropped_malformed);
-            side.close_protocol(&format!(
-                "your device sent a channel frame of {len} bytes on the channel stream, over the \
-                 {STREAM_FRAME_MAX} bytes this device grants"
-            ));
-            return;
-        }
-        if len == 0 {
-            bump(&side.counters.dropped_malformed);
-            stop_stream(&side, face, &mut recv, "a channel record of no octets");
-            return;
-        }
-        let permit = tokio::select! {
-            permit = Arc::clone(&side.inbox_budget).acquire_many_owned(len as u32) => match permit {
-                Ok(permit) => permit,
-                Err(_) => return,
-            },
-            _ = side.connection.closed() => return,
-        };
-        let mut frame = vec![0u8; len];
-        match recv.read_exact(&mut frame).await {
-            Ok(()) => {}
-            Err(ReadExactError::FinishedEarly(_)) => {
-                bump(&side.counters.dropped_malformed);
-                return;
-            }
-            Err(ReadExactError::ReadError(_)) => return,
-        }
-        if frame[0] != SIDE_MARKER {
-            bump(&side.counters.dropped_malformed);
-            stop_stream(
-                &side,
-                face,
-                &mut recv,
-                "a channel record that does not start with the marker",
-            );
-            return;
-        }
-        // A stream cannot drop a frame without breaking the channel's order:
-        // over the quota the reader waits, and flow control slows the peer.
-        if let Some(quota) = &side.quota {
-            while let Err(wait) = quota.admit(Flow::Rx, len) {
-                tokio::select! {
-                    () = tokio::time::sleep(wait.max(HEADROOM_RECHECK)) => {}
-                    _ = side.connection.closed() => return,
-                }
-            }
-        }
-        bump(&side.counters.stream_rx_frames);
-        add(&side.counters.stream_rx_bytes, len);
-        if inbox.send((Bytes::from(frame), permit)).await.is_err() {
-            return;
+            Err(_) => return,
         }
     }
 }
@@ -779,4 +933,48 @@ fn stop_stream(side: &SideCarrier, face: FaceId, recv: &mut quinn::RecvStream, w
 /// Whether a hello's capabilities include channel frames.
 pub(crate) fn has_channel_caps(caps: u8) -> bool {
     caps & CHANNEL_CAPS_V1 != 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_headroom_is_a_millisecond_of_the_send_rate_between_the_floor_and_the_cap() {
+        let gbit = 1e9 / 8.0;
+        // 1 Gbit/s and slower, and no rate yet: exactly the floor.
+        for rate in [0.0, 1e3, 1e6, gbit / 10.0, gbit, f64::NAN, -5.0] {
+            assert_eq!(headroom_for(rate), QUEUE_FLOOR, "rate {rate}");
+        }
+        // A millisecond of 2.5 and 4 Gbit/s: 312.5 KB and 500 KB.
+        assert_eq!(headroom_for(2.5 * gbit), (2.5 * gbit / 1000.0) as usize);
+        assert_eq!(headroom_for(4.0 * gbit), (4.0 * gbit / 1000.0) as usize);
+        // Faster than the cap: the cap, which leaves room in the 1 MiB buffer.
+        for rate in [4.5 * gbit, 10.0 * gbit, 100.0 * gbit, f64::INFINITY] {
+            assert_eq!(headroom_for(rate), QUEUE_CAP, "rate {rate}");
+        }
+        const { assert!(QUEUE_CAP < DATAGRAM_SEND_BUFFER) };
+        // Never under the floor, never over the cap, and not falling as the rate rises.
+        let mut last = 0;
+        for step in 0..400 {
+            let h = headroom_for(step as f64 * 5e7);
+            assert!((QUEUE_FLOOR..=QUEUE_CAP).contains(&h) && h >= last);
+            last = h;
+        }
+    }
+
+    #[test]
+    fn the_rate_follows_the_windows_it_is_measured_over() {
+        let ms = Duration::from_millis;
+        // A window of the full length replaces the rate; a short one moves it by its share.
+        assert_eq!(smoothed_rate(100.0, 900.0, RATE_WINDOW_FULL), 900.0);
+        assert_eq!(smoothed_rate(100.0, 900.0, ms(500)), 900.0);
+        let half = smoothed_rate(0.0, 1000.0, RATE_WINDOW_FULL / 2);
+        assert!((half - 500.0).abs() < 1e-9, "{half}");
+        let short = smoothed_rate(0.0, 1e9, RATE_WINDOW_MIN);
+        assert!(short > 0.0 && short < 1e9 / 10.0, "{short}");
+        // A burst of one short window does not lift the headroom to the cap
+        // from a link that was idle.
+        assert!(headroom_for(short) < QUEUE_CAP);
+    }
 }

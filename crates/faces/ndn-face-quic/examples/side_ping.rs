@@ -34,6 +34,8 @@ use ndn_security::Ed25519Signer;
 use ndn_transport::{FaceId, SideClass, Transport};
 
 mod common;
+#[path = "common/sampler.rs"]
+mod sampler;
 use common::{cpu_line, median, runtime, threads, trimmed};
 
 const T: Duration = Duration::from_secs(10);
@@ -45,6 +47,7 @@ struct Args {
     rt: usize,
     workers: usize,
     path_mtu_max: u16,
+    profile: Option<String>,
     raw: BTreeMap<String, f64>,
 }
 
@@ -70,6 +73,7 @@ impl Args {
             "raw_stream1k",
             "raw_stream8k",
             "raw_lat",
+            "profile",
         ];
         for k in kv.keys() {
             assert!(known.contains(&k.as_str()), "unknown argument `{k}`");
@@ -87,6 +91,7 @@ impl Args {
             rt: num("rt", 2.0) as usize,
             workers: num("workers", 1.0) as usize,
             path_mtu_max: num("path_mtu_max", 1452.0) as u16,
+            profile: kv.get("profile").cloned(),
             raw: kv
                 .iter()
                 .filter(|(k, _)| k.starts_with("raw_"))
@@ -352,6 +357,14 @@ fn main() {
             pair,
         };
         println!("--- repetition {}", rep + 1);
+        if a.profile.is_some() && rep == 0 {
+            let tids: Vec<u32> = threads()
+                .into_iter()
+                .filter(|(_, c)| ["send", "recv", "both"].contains(&c.name.as_str()))
+                .map(|(t, _)| t)
+                .collect();
+            sampler::start(&tids);
+        }
         for only in &a.only {
             let mut put = |k: &str, v: f64| summary.entry(k.to_owned()).or_default().push(v);
             match only.as_str() {
@@ -379,6 +392,10 @@ fn main() {
                 }
                 other => panic!("unknown row `{other}`"),
             }
+        }
+        if let Some(path) = a.profile.as_deref().filter(|_| rep == 0) {
+            let names = threads().into_iter().map(|(t, c)| (t, c.name)).collect();
+            sampler::dump(path, &names);
         }
         println!(
             "link: datagram size {:?}, side stats {:?}",

@@ -17,8 +17,8 @@ use bytes::Bytes;
 use ndn_face_quic::{
     Admission, Carries, ChannelPolicy, CloseReason, Departure, FairShare, HandshakeLimits,
     KeyFingerprint, LINK_SOCKET_BUFFER, Link, LinkEndpoint, LinkError, LinkHello, LinkKey,
-    LinkScope, LinkTransportConfig, LinkVerdict, Presence, PresentDevice, QUEUE_MAX, RateLimit,
-    Reachability, ScopeCounts,
+    LinkScope, LinkTransportConfig, LinkVerdict, Presence, PresentDevice, QUEUE_CAP, QUEUE_FLOOR,
+    RateLimit, Reachability, ScopeCounts,
 };
 use ndn_packet::Name;
 use ndn_packet::encode::{DataBuilder, InterestBuilder};
@@ -1521,6 +1521,9 @@ async fn the_headroom_rule_bounds_what_a_channel_frame_waits_behind_ndn_datagram
     let listener = endpoint(ec_key(2), true);
     let (a, b) = channel_link(&dialer, &listener).await;
     let a = Arc::new(a);
+    // A link that has sent nothing yet has the floor: a modest rate gets what any link
+    // slower than 1 Gbit/s gets.
+    assert_eq!(a.face.side_limits().queue_max, QUEUE_FLOOR);
     // The peer reads nothing: the sender's buffer is all that holds the flood.
     let _b = b;
 
@@ -1536,13 +1539,15 @@ async fn the_headroom_rule_bounds_what_a_channel_frame_waits_behind_ndn_datagram
     };
     // Wait for NDN datagrams to fill the send buffer past the headroom.
     let mut forwarded_full = false;
+    let mut widest = QUEUE_FLOOR;
     let start = std::time::Instant::now();
     while !forwarded_full {
         assert!(
             start.elapsed() < T,
-            "the NDN flood never queued {QUEUE_MAX} octets"
+            "the NDN flood never queued {QUEUE_FLOOR} octets"
         );
-        if a.face.side_limits().queued > QUEUE_MAX {
+        let limits = a.face.side_limits();
+        if limits.queued > limits.queue_max {
             // The non-blocking path refuses and counts, and moves nothing.
             forwarded_full =
                 a.face.forward_side(frame(0, 200), SideClass::Datagram) == Err(SideRefused::Full);
@@ -1559,12 +1564,17 @@ async fn the_headroom_rule_bounds_what_a_channel_frame_waits_behind_ndn_datagram
         .await
         .expect("a channel frame got through the flood")
         .unwrap();
+        // The headroom each frame was handed over under is at most the widest seen after it.
+        let limits = a.face.side_limits();
+        assert!((QUEUE_FLOOR..=QUEUE_CAP).contains(&limits.queue_max));
+        widest = widest.max(limits.queue_max);
     }
     flood.await.unwrap();
     let stats = a.handle.side_stats();
     assert!(
-        stats.queued_peak < QUEUE_MAX as u64,
-        "a channel frame was handed over behind {} octets, over the {QUEUE_MAX} headroom",
+        stats.queued_peak < widest as u64 && stats.queued_peak < QUEUE_CAP as u64,
+        "a channel frame was handed over behind {} octets, over the {widest} headroom \
+         ({QUEUE_FLOOR} to {QUEUE_CAP})",
         stats.queued_peak
     );
     // The channel datagrams the polling above did not refuse are counted with the rest.

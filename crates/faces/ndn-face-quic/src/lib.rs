@@ -43,8 +43,9 @@
 //!   connection ([`LinkFace::send_side`](ndn_transport::Transport::send_side)).
 //!   Both hellos must carry `ChannelCaps` ([`LinkHello::channel_caps`]) and the
 //!   admitting side's [`ChannelPolicy`] must carry; the stream is granted only
-//!   then, after the verdict. A channel datagram waits behind at most
-//!   [`QUEUE_MAX`] octets of NDN traffic; the bytes each way may be held to a
+//!   then, after the verdict. A channel datagram waits behind
+//!   about a millisecond of the connection's send rate of NDN traffic
+//!   ([`QUEUE_FLOOR`] to [`QUEUE_CAP`]); the bytes each way may be held to a
 //!   [`FairShare`] of a namespace's pool; none of it is judged by the NDN scope
 //!   or answered with a Nack. [`LinkHandle::side_stats`] counts it.
 //! - **Transport.** Keep-alive and idle timeout are set explicitly
@@ -114,7 +115,7 @@ pub use scope::{
     Flow, LinkScope, NameFilter, Narrowing, RateLimit, RatedInterests, ScopeCounts, SharedRate,
 };
 pub use side::{
-    ChannelPolicy, DATAGRAM_SEND_BUFFER, QUEUE_MAX, STREAM_FRAME_MAX, STREAM_QUEUE_MAX, SideLimits,
-    SideStats,
+    ChannelPolicy, DATAGRAM_SEND_BUFFER, QUEUE_CAP, QUEUE_FLOOR, STREAM_FRAME_MAX,
+    STREAM_QUEUE_MAX, SideLimits, SideStats,
 };
 pub use text::{PEER_TEXT_MAX, bounded_text, clean_text, sanitize_peer_text};
