@@ -10,7 +10,7 @@
 //! store's barrier ([`DataStore::sync`]) passed, on a blocking thread.
 //!
 //! The note holds the peer's key, its device name and its last-seen addresses
-//! in the clear (data-layer.md §19.9 rule 6): the permissions of the device's
+//! in the clear (ndn-rs `ndn-link.md` §17C.6): the permissions of the device's
 //! store are the host's to set, and `MemoryOptions::persist_addresses` keeps
 //! the addresses out of it.
 //!

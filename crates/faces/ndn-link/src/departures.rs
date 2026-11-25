@@ -134,9 +134,9 @@ impl std::fmt::Display for NotTaken {
 pub type DepartureTaking<'a> = Pin<Box<dyn Future<Output = Result<(), NotTaken>> + Send + 'a>>;
 
 /// The person's half: what to do with the members record the inviter named.
-/// For a data-layer device it fetches and takes the record
-/// (`Device::take_departure`); [`LinkHints::serve`](crate::LinkHints::serve)
-/// registers the device's.
+/// For an `ndn-invite` device it fetches and takes the record
+/// (`Surface::take_departure`); [`LinkHints::serve`](crate::LinkHints::serve)
+/// registers the invitations'.
 pub trait DepartureSink: Send + Sync {
     /// The peer `from` told this device that the members record named
     /// `record` of `folder` leaves it out (a hint, with no authority: the sink
@@ -517,7 +517,7 @@ impl Links {
     /// ([`Links::revoke_grant`] narrows a link standing, a departure link
     /// admits a returning device). Replaces the mark of the same key and
     /// folder; at most [`DepartureOptions::marks_max`] are kept, the oldest
-    /// forgotten. A host with a data-layer device calls it by
+    /// forgotten. A host with `ndn-invite` invitations calls it by
     /// [`LinkHints::serve`](crate::LinkHints::serve).
     pub fn depart(&self, d: Departure) {
         self.departures.put(d, SystemTime::now());

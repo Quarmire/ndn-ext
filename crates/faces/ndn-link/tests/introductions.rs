@@ -6,7 +6,7 @@
 //! The inviter is daemonless too: one program, an in-process forwarder, its
 //! links on a loopback UDP socket (QUIC, the device's key as the TLS identity).
 //! The cases around it check what the hint's addresses and key may and may not
-//! do (ndn-rs `data-layer.md` §19.3 step 0, §19.7; `ndn-link.md` §13.3): the
+//! do (ndn-rs `invite.md` §8.2 step 0, §18; `ndn-link.md` §13.3): the
 //! key is proved by the handshake, an address only says where to try, and a
 //! code with a full hint is still one QR.
 

@@ -128,7 +128,7 @@ pub struct MemoryOptions {
     pub dials_at_once: usize,
     /// Keep and dial loopback and link-local addresses, which reach only
     /// this machine or this link. Off by default, as for the addresses of a
-    /// code (data-layer.md §19.2): what a store or a stranger's link names
+    /// code (invite.md §6.1): what a store or a stranger's link names
     /// must not make this device send datagrams to services on itself or on
     /// its link (169.254.169.254, say). A host that links devices on one
     /// machine, or one link, turns it on.
@@ -178,7 +178,7 @@ impl MemoryOptions {
 
 /// An address worth dialling: not unspecified, multicast or broadcast, with a
 /// port, and, unless `include_local`, not a loopback or link-local one (the
-/// rule the hint of a code has, data-layer.md §19.2).
+/// rule the hint of a code has, invite.md §6.1).
 fn usable(addr: &SocketAddr, include_local: bool) -> bool {
     let ip = addr.ip().to_canonical();
     addr.port() != 0

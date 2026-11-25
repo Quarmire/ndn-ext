@@ -1,5 +1,5 @@
 //! A person let go is told, on real QUIC links between real data-layer
-//! devices (ndn-rs `ndn-link.md` §8.8, `data-layer.md` §19.8).
+//! devices (ndn-rs `ndn-link.md` §8.8, `invite.md` §11).
 //!
 //! Ann invites Bob into a folder; her members record then leaves him out. The
 //! grant entry ends and Ann's device leaves a **departure mark** (the record's

@@ -847,7 +847,7 @@ impl Judge<'_> {
 }
 
 /// The namespace of a folder name `<O>/32=data[/<path>]`: the components
-/// before its `32=data` marker (data-layer.md §3); `None` for a name with
+/// before its `32=data` marker (heap.md §2.5); `None` for a name with
 /// none or nothing before it.
 pub(crate) fn folder_namespace(folder: &Name) -> Option<Name> {
     let at = folder

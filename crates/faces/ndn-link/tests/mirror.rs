@@ -1,6 +1,6 @@
 //! The mirror grant and address freshness on real QUIC links, real forwarders and
 //! real data-layer devices (ndn-rs `ndn-link.md` §8.7 rules 16–18, §17C;
-//! `data-layer.md` §19.8; SHAPES-R9 B).
+//! `invite.md` §10, §11; SHAPES-R9 B).
 //!
 //! A grant was built one-sided: the inviter's device admitted the joiner, and the
 //! joiner's `own` policy held a grant for no one. Now the joiner's device keeps

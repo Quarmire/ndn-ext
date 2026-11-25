@@ -3,10 +3,10 @@
 //! §8.7, rules 16–18; SHAPES-R9 §A).
 //!
 //! The inviter's grant link carries the names of the folder's other writers
-//! (their summary roots, sync groups, trust contexts, keys and certificates),
+//! (their seal keys, sync groups, trust contexts, keys and certificates),
 //! but only the joiner's own forwarder can send an Interest for them over it:
 //! it needs a route. The device knows which writers the folder's members
-//! record lists (`Device::joined_folders`), the link layer knows which link is
+//! record lists (`Invites::joined_folders`), the link layer knows which link is
 //! the inviter's, and a host keeps no link state, so the link layer installs
 //! the route itself, on the strength of data the device verified and over the
 //! one link that can be trusted to carry it: [`Links::set_joined_routes`].
