@@ -225,6 +225,10 @@ pub(crate) struct Judge<'a> {
     /// carry besides the person's own ([`Introductions::grant_carries`]).
     /// `None`: this device has no data layer to name a folder's collections.
     pub(crate) introductions: Option<Arc<dyn Introductions>>,
+    /// The space groups the host says this device follows
+    /// ([`Links::set_followed_groups`](crate::Links::set_followed_groups)),
+    /// what a relay it uses is told.
+    pub(crate) followed_groups: &'a parking_lot::Mutex<Vec<Name>>,
 }
 
 impl Judge<'_> {
@@ -2042,6 +2046,7 @@ mod tests {
         departures: Departures,
         introductions: Option<Arc<dyn Introductions>>,
         relinked: parking_lot::Mutex<std::collections::HashSet<PeerId>>,
+        followed_groups: parking_lot::Mutex<Vec<Name>>,
     }
 
     impl World {
@@ -2055,6 +2060,7 @@ mod tests {
                 departures: Departures::default(),
                 introductions: None,
                 relinked: Default::default(),
+                followed_groups: Default::default(),
             }
         }
 
@@ -2068,6 +2074,7 @@ mod tests {
                 grants: &self.grants,
                 departures: &self.departures,
                 introductions: self.introductions.clone(),
+                followed_groups: &self.followed_groups,
             }
         }
     }
@@ -2564,9 +2571,10 @@ mod tests {
         );
     }
 
-    /// A served device's hello names the namespaces it follows: the decision
-    /// carries them, and they route only their sync groups over the link,
-    /// beside the group of the namespace the device was served for.
+    /// A served device's hello names the space groups it follows: the
+    /// decision carries them, and they route exactly those groups over the
+    /// link, beside the group of the namespace the device was served for.
+    /// Another space of a followed owner is not routed.
     #[tokio::test]
     async fn a_served_devices_follows_are_carried_and_route_their_groups_only() {
         let (a, b) = (namespace("/a", 10).await, namespace("/b", 20).await);
@@ -2580,7 +2588,7 @@ mod tests {
         .await;
         let (bob, chain) = b.device("member", "phone", 22).await;
         let mut claim = hello(chain);
-        claim.follows = vec![n("/c"), n("/a"), n("/c/d")];
+        claim.follows = vec![n("/c/32=sync/x"), n("/a/32=sync/y"), n("/c/d/32=sync/x/y")];
         let admitted = open.judge().decide(&bob, &claim, &CH, None).await.unwrap();
         assert_eq!(admitted.follows, claim.follows);
         let routed: Vec<Name> =
@@ -2588,18 +2596,26 @@ mod tests {
                 .into_iter()
                 .map(|r| r.prefix)
                 .collect();
-        for ns in ["/b", "/c", "/a", "/c/d"] {
-            let group = ndn_security::sync_group(&n(ns));
-            assert!(routed.contains(&group), "{group} in {routed:?}");
+        for group in [
+            "/b/32=sync",
+            "/c/32=sync/x",
+            "/a/32=sync/y",
+            "/c/d/32=sync/x/y",
+        ] {
+            assert!(routed.contains(&n(group)), "{group} in {routed:?}");
         }
         assert!(
-            routed.iter().all(|p| p.has_prefix(&n("/b"))
-                || claim
-                    .follows
-                    .iter()
-                    .any(|ns| *p == ndn_security::sync_group(ns))),
-            "a claim routed more than a group: {routed:?}"
+            routed
+                .iter()
+                .all(|p| p.has_prefix(&n("/b")) || claim.follows.iter().any(|g| p == g)),
+            "a claim routed more than the groups it names: {routed:?}"
         );
+        for whole in ["/a/32=sync", "/c/32=sync", "/c/d/32=sync"] {
+            assert!(
+                !routed.contains(&n(whole)),
+                "the owner's whole group {whole} was routed: {routed:?}"
+            );
+        }
     }
 
     /// Under `open` a grant adds nothing: the policy serves the device (under
@@ -2744,11 +2760,19 @@ mod tests {
         let own = judge.own_namespaces();
         assert_eq!(judge.relay_namespaces_of(&user, &own), [n("/a")]);
         assert_eq!(judge.relay_namespaces_of(&advertised, &own), [n("/a")]);
-        // A relay this device uses is told the namespaces it follows; a peer
-        // that is no such relay, or one with `routes` of its own (it routes
-        // those and no more), is told none.
-        assert_eq!(judge.told_follows(&user), Some(vec![n("/b")]));
-        assert_eq!(judge.told_follows(&advertised), Some(vec![n("/b")]));
+        // A relay this device uses is told the space groups the host says it
+        // follows, and nothing of the namespaces it holds a context of: with
+        // no group given it is told none (and still told, so it knows), for
+        // a namespace followed names every space of it. A peer that is no
+        // such relay, or one with `routes` of its own (it routes those and no
+        // more), is told nothing.
+        assert_eq!(judge.told_follows(&user), Some(Vec::new()));
+        *world.followed_groups.lock() = vec![n("/b/32=sync/doc")];
+        assert_eq!(judge.told_follows(&user), Some(vec![n("/b/32=sync/doc")]));
+        assert_eq!(
+            judge.told_follows(&advertised),
+            Some(vec![n("/b/32=sync/doc")])
+        );
         assert_eq!(
             judge.told_follows(&PeerSpec {
                 relay_use: None,
@@ -2763,44 +2787,6 @@ mod tests {
             }),
             None
         );
-    }
-
-    /// A device that follows more namespaces than a hello names tells the
-    /// first `FOLLOWS_MAX` in order, and none too deep to be a namespace
-    /// there.
-    #[tokio::test]
-    async fn what_a_relay_is_told_is_sorted_and_bounded() {
-        let a = namespace("/a", 10).await;
-        let keyring = Keyring::new();
-        keyring.adopt(Arc::new(a.context())).unwrap();
-        let count = ndn_face_quic::FOLLOWS_MAX + 4;
-        for i in (0..count).rev() {
-            let followed = namespace(&format!("/f{i:02}"), 100 + i as u8).await;
-            keyring.adopt(Arc::new(followed.context())).unwrap();
-        }
-        let deep = "/d".repeat(ndn_face_quic::FOLLOW_DEPTH_MAX + 1);
-        keyring
-            .adopt(Arc::new(namespace(&deep, 99).await.context()))
-            .unwrap();
-        let (_, chain) = a.device("member", "laptop", 12).await;
-        let world = World::new(
-            Bare(Arc::new(keyring), None, chain),
-            Vec::new(),
-            ServePolicy::Own,
-        );
-        let user = PeerSpec {
-            label: "relay".into(),
-            relay_use: Some(RelayUse {
-                source: RelaySource::User,
-                preference: 0,
-            }),
-            ..PeerSpec::default()
-        };
-        let told = world.judge().told_follows(&user).unwrap();
-        let want: Vec<Name> = (0..ndn_face_quic::FOLLOWS_MAX)
-            .map(|i| n(&format!("/f{i:02}")))
-            .collect();
-        assert_eq!(told, want);
     }
 
     /// A listed relay serves a namespace it does not hold by its root key:

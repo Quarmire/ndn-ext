@@ -14,11 +14,12 @@
 //! issuers (nearest first); each [`Membership`] is a namespace the sender is a
 //! member of with another key, bound to this connection; `DirectPath` marks a
 //! connection made for a direct path of the link (the punch's session);
-//! `Follows` names the namespaces the sender follows (holds the trust context
-//! of, with no certificate in it), told to a peer it uses as a relay so that
-//! the relay routes those namespaces' sync groups to it (at most
-//! [`FOLLOWS_MAX`] names, each non-empty and of at most [`FOLLOW_DEPTH_MAX`]
-//! components);
+//! `Follows` names the space groups the sender follows
+//! (`<owner>/32=sync/<space>`, each a whole group name, never a namespace or
+//! an owner's whole group), told to a peer it uses as a relay so that the
+//! relay routes exactly those groups to it (at most [`FOLLOWS_MAX`] names,
+//! each of at most [`FOLLOW_DEPTH_MAX`] components, see
+//! [`check_followed_group`]);
 //! `LinkVerdict = 0x0452 { EnrollmentLink 0x0454 { Name* }? }` — admitted;
 //! with `EnrollmentLink`, admitted as an enrollment link that carries only
 //! the enrollment of the receiver in the namespaces named;
@@ -69,12 +70,19 @@ const PRESENT_DEVICE: u64 = 0x0448;
 const KEY_DIGEST: u64 = 0x044A;
 pub(crate) const DEPARTURE: u64 = 0x044C;
 
-/// Most namespaces a hello's `Follows` names; a receiver ignores the rest
-/// (and a sender names no more).
-pub const FOLLOWS_MAX: usize = 16;
-/// Most components of a followed namespace's name: a longer name is
-/// malformed in a hello.
-pub const FOLLOW_DEPTH_MAX: usize = 8;
+/// Most space groups a hello's `Follows` names; a receiver ignores the rest
+/// (and a sender names no more). A device follows spaces, not namespaces, so
+/// the count is of spaces: 32 is a few dozen spaces over a handful of
+/// people, and bounds the routes one link makes on a relay.
+pub const FOLLOWS_MAX: usize = 32;
+/// Most components of a followed group's name: a longer name is malformed in
+/// a hello. A group is `<owner>/32=sync/<space>`: an owner namespace of at
+/// most 8 components (the bound a followed namespace had), the keyword, and
+/// at most [`FOLLOW_SPACE_MAX`] components of the space's own name.
+pub const FOLLOW_DEPTH_MAX: usize = 13;
+/// Most components after `32=sync` in a followed group: the space's name
+/// under its owner (one to four, as the data layer names a space).
+pub const FOLLOW_SPACE_MAX: usize = 4;
 /// Most distinct `Departure` messages a link takes from its peer, and queues
 /// toward it: a person is let go of a few folders at once, not hundreds.
 pub const DEPARTURES_MAX: usize = 16;
@@ -104,12 +112,14 @@ pub struct LinkHello {
     /// link key, each bound to this connection. A receiver uses at most
     /// [`MEMBERSHIPS_MAX`](crate::MEMBERSHIPS_MAX) of them.
     pub memberships: Vec<Membership>,
-    /// The namespaces the sender follows, told to a peer it uses as a relay
-    /// (empty otherwise): the relay routes the sync group `<ns>/32=sync` of
-    /// each over this link. A claim buys that route and nothing else. At
-    /// most [`FOLLOWS_MAX`] of them, each non-empty and of at most
+    /// The space groups the sender follows (`<owner>/32=sync/<space>`, as
+    /// [`check_followed_group`] defines them), told to a peer it uses as a
+    /// relay (empty otherwise): the relay routes exactly these groups over
+    /// this link, not the owner's others. A claim buys those routes and
+    /// nothing else. At most [`FOLLOWS_MAX`] of them, each of at most
     /// [`FOLLOW_DEPTH_MAX`] components; a receiver uses the first
-    /// [`FOLLOWS_MAX`] and takes a longer or empty name for a malformed hello.
+    /// [`FOLLOWS_MAX`] and takes a name that is no such group for a
+    /// malformed hello.
     pub follows: Vec<Name>,
     /// `Some`: this connection is a direct path made by the punch of this
     /// session (the dialer names it; the listener repeats it when it takes
@@ -117,16 +127,64 @@ pub struct LinkHello {
     pub direct_path: Option<PathSession>,
 }
 
-/// Whether `name` can be a followed namespace: not the root, and at most
-/// [`FOLLOW_DEPTH_MAX`] components.
-fn followable(name: &Name) -> bool {
-    (1..=FOLLOW_DEPTH_MAX).contains(&name.len())
+/// Whether `name` is a space group a device can follow, as the data layer
+/// names one: `<owner>/32=sync/<s1>[/…/<s4>]` — a non-empty owner namespace
+/// of plain components (no keyword, no digest), the keyword `32=sync`, then
+/// one to [`FOLLOW_SPACE_MAX`] generic components, and at most
+/// [`FOLLOW_DEPTH_MAX`] components in all. A namespace and the owner's whole
+/// group (`<owner>/32=sync`, the prefix of every space of the owner) are
+/// not one: a claim names the spaces it follows, never more.
+///
+/// `Err` says what the name lacks.
+pub fn check_followed_group(name: &Name) -> Result<(), String> {
+    use ndn_packet::tlv_type::{IMPLICIT_SHA256, KEYWORD, NAME_COMPONENT, PARAMETERS_SHA256};
+    let comps = name.components();
+    let Some(at) = comps
+        .iter()
+        .position(|c| c.typ == KEYWORD && c.value.as_ref() == b"sync")
+    else {
+        return Err(format!(
+            "{name} is no space group: it has no 32=sync component (a followed group is \
+             <owner>/32=sync/<space>)"
+        ));
+    };
+    if at == 0 {
+        return Err(format!("{name} has no owner namespace before 32=sync"));
+    }
+    if comps[..at]
+        .iter()
+        .any(|c| matches!(c.typ, KEYWORD | IMPLICIT_SHA256 | PARAMETERS_SHA256))
+    {
+        return Err(format!(
+            "{name} has a keyword or digest component in its owner namespace"
+        ));
+    }
+    let space = &comps[at + 1..];
+    if space.is_empty() {
+        return Err(format!(
+            "{name} is the whole group of its owner, the prefix of every space: name the \
+             space's own group, <owner>/32=sync/<space>"
+        ));
+    }
+    if space.len() > FOLLOW_SPACE_MAX || space.iter().any(|c| c.typ != NAME_COMPONENT) {
+        return Err(format!(
+            "{name}: after 32=sync a group has 1 to {FOLLOW_SPACE_MAX} generic components (the \
+             space's name)"
+        ));
+    }
+    if comps.len() > FOLLOW_DEPTH_MAX {
+        return Err(format!(
+            "{name} has {} components (a followed group has at most {FOLLOW_DEPTH_MAX})",
+            comps.len()
+        ));
+    }
+    Ok(())
 }
 
 impl LinkHello {
     /// What a hello says: at most [`FOLLOWS_MAX`] of `follows`, the ones that
-    /// can be a followed namespace (a sender never makes its own hello
-    /// malformed).
+    /// are followable groups ([`check_followed_group`]; a sender never makes
+    /// its own hello malformed).
     pub(crate) fn encode(&self) -> Bytes {
         let mut w = TlvWriter::new();
         w.write_nested(LINK_HELLO, |w| {
@@ -140,7 +198,7 @@ impl LinkHello {
             let follows: Vec<&Name> = self
                 .follows
                 .iter()
-                .filter(|ns| followable(ns))
+                .filter(|g| check_followed_group(g).is_ok())
                 .take(FOLLOWS_MAX)
                 .collect();
             if !follows.is_empty() {
@@ -185,26 +243,21 @@ impl LinkHello {
                 FOLLOWS => {
                     let mut names = &cur[start..end];
                     if names.is_empty() {
-                        return Err("a Follows naming no namespace in the link hello".into());
+                        return Err("a Follows naming no space group in the link hello".into());
                     }
                     while !names.is_empty() {
                         let (nt, nstart, nend) = split_tlv(names)?;
                         if nt != NAME {
                             return Err(format!(
-                                "{nt:#x} where a followed namespace's name belongs in the link hello"
+                                "{nt:#x} where a followed group's name belongs in the link hello"
                             ));
                         }
-                        let ns = Name::decode(Bytes::copy_from_slice(&names[nstart..nend]))
-                            .map_err(|e| format!("a followed namespace in the link hello: {e}"))?;
-                        if !followable(&ns) {
-                            return Err(format!(
-                                "a followed namespace of {} components in the link hello (it is \
-                                 1 to {FOLLOW_DEPTH_MAX})",
-                                ns.len()
-                            ));
-                        }
+                        let group = Name::decode(Bytes::copy_from_slice(&names[nstart..nend]))
+                            .map_err(|e| format!("a followed group in the link hello: {e}"))?;
+                        check_followed_group(&group)
+                            .map_err(|e| format!("a followed group in the link hello: {e}"))?;
                         if follows.len() < FOLLOWS_MAX {
-                            follows.push(ns);
+                            follows.push(group);
                         }
                         names = &names[nend..];
                     }
@@ -752,10 +805,13 @@ mod tests {
                     binding: Bytes::from_static(&[1, 2, 3]),
                 }],
                 direct_path: Some([8; 8]),
-                follows: vec!["/a".parse().unwrap(), "/b/c".parse().unwrap()],
+                follows: vec![
+                    "/a/32=sync/x".parse().unwrap(),
+                    "/b/c/32=sync/y/z".parse().unwrap(),
+                ],
             },
             LinkHello {
-                follows: vec!["/a".parse().unwrap()],
+                follows: vec!["/a/32=sync/x".parse().unwrap()],
                 ..LinkHello::default()
             },
         ] {
@@ -771,8 +827,12 @@ mod tests {
     fn hello_following(names: &[Vec<u8>]) -> Vec<u8> {
         let inner: Vec<u8> = names.concat();
         let mut v = vec![0xFD, 0x04, 0x51, 0x01, 0x01, 0xFD, 0x04, 0x56];
-        assert!(inner.len() < 253);
-        v.push(inner.len() as u8);
+        if inner.len() < 253 {
+            v.push(inner.len() as u8);
+        } else {
+            v.push(0xFD);
+            v.extend((inner.len() as u16).to_be_bytes());
+        }
         v.extend(inner);
         v
     }
@@ -784,56 +844,112 @@ mod tests {
     #[test]
     fn a_hello_follows_is_even_names_and_an_older_receiver_skips_it() {
         let wire = LinkHello {
-            follows: vec!["/a".parse().unwrap(), "/b/c".parse().unwrap()],
+            follows: vec![
+                "/a/32=sync/x".parse().unwrap(),
+                "/b/c/32=sync/y/z".parse().unwrap(),
+            ],
             ..LinkHello::default()
         }
         .encode();
-        // The vector of ndn-link.md §19.21: Follows 0x0456 { /a, /b/c }
-        // after the version.
+        // The vector of ndn-link.md §19.21: Follows 0x0456 { /a/32=sync/x,
+        // /b/c/32=sync/y/z } after the version.
         assert_eq!(
             wire.as_ref(),
             [
-                0xFD, 0x04, 0x50, 0x16, 0xFD, 0x04, 0x51, 0x01, 0x01, 0xFD, 0x04, 0x56, 0x0D, 0x07,
-                0x03, 0x08, 0x01, 0x61, 0x07, 0x06, 0x08, 0x01, 0x62, 0x08, 0x01, 0x63
+                0xFD, 0x04, 0x50, 0x2B, 0xFD, 0x04, 0x51, 0x01, 0x01, 0xFD, 0x04, 0x56, 0x22, 0x07,
+                0x0C, 0x08, 0x01, 0x61, 0x20, 0x04, 0x73, 0x79, 0x6E, 0x63, 0x08, 0x01, 0x78, 0x07,
+                0x12, 0x08, 0x01, 0x62, 0x08, 0x01, 0x63, 0x20, 0x04, 0x73, 0x79, 0x6E, 0x63, 0x08,
+                0x01, 0x79, 0x08, 0x01, 0x7A
             ]
         );
         // 0x0456 is even and above 31: a receiver that does not know it skips it.
         assert!(skippable(0x0456));
         // An unknown even field beside it is skipped; an odd one is a
         // malformed hello.
-        let mut v = hello_following(&[name_tlv("/a")]);
+        let mut v = hello_following(&[name_tlv("/a/32=sync/x")]);
         v.extend([0xFD, 0x04, 0x70, 0x01, 0xAA]);
         assert_eq!(
             LinkHello::decode(&v).unwrap().follows,
-            ["/a".parse::<Name>().unwrap()]
+            ["/a/32=sync/x".parse::<Name>().unwrap()]
         );
         v.extend([0xFD, 0x04, 0x71, 0x00]);
         assert!(LinkHello::decode(&v).is_err());
     }
 
     #[test]
-    fn a_hello_follows_is_bounded_and_refuses_what_is_not_a_namespace() {
-        let many: Vec<Vec<u8>> = (0..FOLLOWS_MAX + 3)
-            .map(|i| name_tlv(&format!("/n{i}")))
-            .collect();
+    fn a_hello_follows_is_bounded() {
+        let group = |i: usize| format!("/n{i}/32=sync/s");
+        let many: Vec<Vec<u8>> = (0..FOLLOWS_MAX + 3).map(|i| name_tlv(&group(i))).collect();
         // Over the limit: the first FOLLOWS_MAX are used, the rest ignored.
         let big = hello_following(&many);
         let decoded = LinkHello::decode(&big).unwrap();
         assert_eq!(decoded.follows.len(), FOLLOWS_MAX);
-        assert_eq!(decoded.follows[0], "/n0".parse::<Name>().unwrap());
+        assert_eq!(decoded.follows[0], group(0).parse::<Name>().unwrap());
         assert_eq!(
             decoded.follows[FOLLOWS_MAX - 1],
-            format!("/n{}", FOLLOWS_MAX - 1).parse::<Name>().unwrap()
+            group(FOLLOWS_MAX - 1).parse::<Name>().unwrap()
         );
-        // The deepest namespace is FOLLOW_DEPTH_MAX components; one more is malformed.
-        let deep = |n: usize| name_tlv(&"/c".repeat(n));
-        assert!(LinkHello::decode(&hello_following(&[deep(FOLLOW_DEPTH_MAX)])).is_ok());
-        assert!(LinkHello::decode(&hello_following(&[deep(FOLLOW_DEPTH_MAX + 1)])).is_err());
-        // The root is no namespace; neither is an empty or a foreign list.
+        // The sender names no more than FOLLOWS_MAX either.
+        let told = LinkHello {
+            follows: (0..FOLLOWS_MAX + 3)
+                .map(|i| group(i).parse().unwrap())
+                .collect(),
+            ..LinkHello::default()
+        }
+        .encode();
+        let (_, start, end) = split_tlv(&told).unwrap();
+        assert_eq!(
+            LinkHello::decode(&told[start..end]).unwrap().follows.len(),
+            FOLLOWS_MAX
+        );
+    }
+
+    /// A hello's `Follows` names space groups, `<owner>/32=sync/<1 to 4
+    /// components>`, and nothing else: a namespace, the owner's whole group
+    /// (`<owner>/32=sync`, the prefix of every space of the owner) and any
+    /// other name is a malformed hello, so no claim can route more than the
+    /// spaces it names.
+    #[test]
+    fn a_hello_follows_names_exact_groups_and_refuses_what_is_not_one() {
+        let ok = |text: &str| LinkHello::decode(&hello_following(&[name_tlv(text)])).is_ok();
+        assert!(ok("/a/32=sync/x"));
+        assert!(ok("/a/b/c/32=sync/w/x/y/z"));
+        // A namespace, and the group of the owner's every space.
+        assert!(!ok("/a"), "a namespace is no group");
+        assert!(!ok("/a/32=sync"), "the owner's whole group is no space's");
+        // The owner is not empty; a space's name is one to four components.
+        assert!(!ok("/32=sync/x"));
+        assert!(!ok("/a/32=sync/v/w/x/y/z"));
+        // Only the group's own keyword: no other keyword in the owner or after it.
+        assert!(!ok("/a/32=data/x"));
+        assert!(!ok("/a/32=data/32=sync/x"));
+        assert!(!ok("/a/32=sync/32=sync"));
+        assert!(!ok("/a/32=sync/x/32=sync/y"));
+        assert!(!ok("/a/32=sync/x/v=3"));
+        // The deepest group is FOLLOW_DEPTH_MAX components; one more is malformed.
+        let deepest = |owner: usize| format!("{}/32=sync/w/x/y/z", "/o".repeat(owner));
+        assert!(ok(&deepest(FOLLOW_DEPTH_MAX - 5)));
+        assert!(!ok(&deepest(FOLLOW_DEPTH_MAX - 4)));
+        // The root is no group; neither is an empty or a foreign list.
         assert!(LinkHello::decode(&hello_following(&[vec![0x07, 0x00]])).is_err());
         assert!(LinkHello::decode(&hello_following(&[])).is_err());
         assert!(LinkHello::decode(&hello_following(&[vec![0x08, 0x01, 0x61]])).is_err());
         assert!(LinkHello::decode(&hello_following(&[vec![0x07, 0x05, 0x08]])).is_err());
+        // A sender never makes its own hello malformed: it leaves such names out.
+        let wire = LinkHello {
+            follows: vec![
+                "/a".parse().unwrap(),
+                "/a/32=sync".parse().unwrap(),
+                "/a/32=sync/x".parse().unwrap(),
+            ],
+            ..LinkHello::default()
+        }
+        .encode();
+        let (_, start, end) = split_tlv(&wire).unwrap();
+        assert_eq!(
+            LinkHello::decode(&wire[start..end]).unwrap().follows,
+            ["/a/32=sync/x".parse::<Name>().unwrap()]
+        );
     }
 
     #[test]

@@ -8,7 +8,8 @@
 //! namespaces of this device it is used for (a relay the person added: all
 //! of them; a relay a namespace advertises: each namespace of this device
 //! that advertises it) and each namespace this device follows (holds the
-//! trust context of without a certificate in it), at a cost by rank —
+//! trust context of without a certificate in it: the device's own Interests
+//! for it), at a cost by rank —
 //! the most preferred relay 0, the next 1, … — so traffic takes the most
 //! preferred linked relay and moves to the next when it is lost. Choosing
 //! walks the relays by preference (of equal preference, a user's before
@@ -21,14 +22,16 @@
 //! links again the stand-in is released ([`CloseReason::Released`]).
 //! Relays beyond the chosen ones stand by, undialled.
 //!
-//! A relay is also told, in this device's hello, the namespaces it follows
-//! ([`Judge::told_follows`]): the relay routes each one's sync group over
-//! the link, so that a Sync Interest of a space this device follows reaches
-//! it through the relay (ndn-link.md §10, Decision 42).
+//! A relay is also told, in this device's hello, the space groups it
+//! follows ([`Judge::told_follows`], given by the host,
+//! [`Links::set_followed_groups`]): the relay routes exactly those groups
+//! over the link, so that a Sync Interest of a space this device follows
+//! reaches it through the relay (ndn-link.md §10, Decision 42), and no
+//! other space of the same owner does.
 
 use std::sync::Arc;
 
-use ndn_face_quic::{CloseReason, FOLLOW_DEPTH_MAX, FOLLOWS_MAX, KeyFingerprint};
+use ndn_face_quic::{CloseReason, FOLLOWS_MAX, KeyFingerprint};
 use ndn_mgmt_wire::{LinkDetail, link_code as code};
 use ndn_packet::Name;
 
@@ -403,24 +406,108 @@ impl Judge<'_> {
         routed
     }
 
-    /// The namespaces this device tells the peer `peer` in its hello, when it
-    /// uses it as a relay that routes the followed namespaces over its link
-    /// (a relay with `routes` of its own routes those and no more): the ones
-    /// it follows ([`Self::followed_namespaces`]), sorted, at most
-    /// [`FOLLOWS_MAX`] each of at most [`FOLLOW_DEPTH_MAX`] components (an
-    /// empty list when it follows none: the relay is still told so). `None`
-    /// for a peer that is no such relay: it is told nothing.
+    /// The space groups this device tells the peer `peer` in its hello, when
+    /// it uses it as a relay that routes what it follows over its link (a
+    /// relay with `routes` of its own routes those and no more): the groups
+    /// the host gave [`Links::set_followed_groups`], sorted (an empty list
+    /// when it follows none: the relay is still told so). `None` for a peer
+    /// that is no such relay: it is told nothing. The holding of a trust
+    /// context tells nothing here: a namespace names every space of it, and
+    /// the relay is told only the spaces the host says this device follows.
     pub(crate) fn told_follows(&self, peer: &PeerSpec) -> Option<Vec<Name>> {
         if peer.relay_use.is_none() || peer.routes.is_some() {
             return None;
         }
-        let mut told: Vec<Name> = self
-            .followed_namespaces()
-            .into_iter()
-            .filter(|ns| ns.len() <= FOLLOW_DEPTH_MAX)
-            .collect();
-        told.sort();
-        told.truncate(FOLLOWS_MAX);
-        Some(told)
+        Some(self.followed_groups.lock().clone())
+    }
+}
+
+/// Why [`Links::set_followed_groups`] refused a set of groups: nothing was
+/// changed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FollowedGroupsError {
+    /// A name is no space group (`<owner>/32=sync/<space>`): a namespace, or
+    /// the owner's whole group, would have the relay route more than the
+    /// space.
+    NotAGroup {
+        /// The name given.
+        group: Name,
+        /// What it lacks.
+        why: String,
+    },
+    /// More distinct groups than a hello names.
+    TooMany {
+        /// How many distinct groups were given.
+        given: usize,
+    },
+}
+
+impl std::fmt::Display for FollowedGroupsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAGroup { why, .. } => write!(
+                f,
+                "not a followed space group: {why}; give each followed space's own group, \
+                 <owner>/32=sync/<space>"
+            ),
+            Self::TooMany { given } => write!(
+                f,
+                "{given} distinct space groups followed, and a link tells a relay at most \
+                 {FOLLOWS_MAX}: unfollow a space or follow fewer at once"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FollowedGroupsError {}
+
+impl Links {
+    /// The host says which spaces this device follows, as their **exact
+    /// groups**: `<owner>/32=sync/<space>` for each ([`check_followed_group`],
+    /// with the data layer's `ndn_heap::wire::sync_group_of` of the space's
+    /// name; this crate knows no spaces). It replaces the set given before. A
+    /// relay this device uses is told these in its hello and routes exactly
+    /// these groups over the link, so another space of the same owner is not
+    /// routed to this device, and the relay learns of no space the device
+    /// does not follow. A relay whose link was told another set is linked
+    /// again to be told this one ([`Links::followed_changed`]), so call it at
+    /// every change of the spaces followed, with the whole set; with an empty
+    /// set the device follows none.
+    ///
+    /// All or nothing: a name that is no space group (a namespace, or an
+    /// owner's whole group `<owner>/32=sync`, which every space of the owner
+    /// lies under) or more than [`FOLLOWS_MAX`](ndn_face_quic::FOLLOWS_MAX)
+    /// distinct groups is refused, saying why, and the set stays as it was.
+    ///
+    /// [`check_followed_group`]: ndn_face_quic::check_followed_group
+    pub fn set_followed_groups(
+        &self,
+        groups: impl IntoIterator<Item = Name>,
+    ) -> Result<(), FollowedGroupsError> {
+        let mut set = std::collections::BTreeSet::new();
+        for group in groups {
+            if let Err(why) = ndn_face_quic::check_followed_group(&group) {
+                return Err(FollowedGroupsError::NotAGroup { group, why });
+            }
+            set.insert(group);
+        }
+        if set.len() > FOLLOWS_MAX {
+            return Err(FollowedGroupsError::TooMany { given: set.len() });
+        }
+        let set: Vec<Name> = set.into_iter().collect();
+        let changed = {
+            let mut held = self.followed_groups.lock();
+            std::mem::replace(&mut *held, set) != *held
+        };
+        if changed {
+            self.followed_changed();
+        }
+        Ok(())
+    }
+
+    /// The space groups the host says this device follows now, sorted
+    /// ([`Links::set_followed_groups`]).
+    pub fn followed_groups(&self) -> Vec<Name> {
+        self.followed_groups.lock().clone()
     }
 }

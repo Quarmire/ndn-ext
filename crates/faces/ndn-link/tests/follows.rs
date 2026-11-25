@@ -1,25 +1,25 @@
-//! A relay routes the sync group of a space its device follows (ndn-rs
-//! `ndn-link.md` §10, Decision 34), on real QUIC links between real devices on
-//! forwarders of their own.
+//! A relay routes the sync groups of the spaces its device follows, and only
+//! those (ndn-rs `ndn-link.md` §5.10, §10, §13.6, Decision 42), on real QUIC
+//! links between real devices on forwarders of their own.
 //!
 //! Alice (`/sa`) and Bob (`/sb`) reach each other through an open relay (`/sr`)
-//! that holds no context of either. Bob follows `/sa` (holds its trust context,
-//! no certificate in it); Alice's Sync Interests of her group `/sa/32=sync`
-//! leave her forwarder over her relay face and reach Bob only when the relay
-//! routes that group over Bob's link, which it does because Bob's hello told
-//! it he follows `/sa`.
+//! that holds no context of either. Alice has two spaces, `doc` and `chat`
+//! (groups `/sa/32=sync/doc` and `/sa/32=sync/chat`); Bob follows `doc` only:
+//! his host gives his links that exact group ([`Links::set_followed_groups`]).
+//! Alice's Sync Interests of her group `doc` leave her forwarder over her
+//! relay face and reach Bob only when the relay routes that group over Bob's
+//! link, which it does because Bob's hello told it he follows it; the group of
+//! `chat`, another space of the same namespace, is not routed to him.
 
 mod common;
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
 use common::*;
 use ndn_app::EngineAppExt;
-use ndn_link::{PeerSpec, RelaySource, RelayUse};
+use ndn_link::{FollowedGroupsError, PeerSpec, RelaySource, RelayUse};
 use ndn_packet::Name;
-use ndn_security::sync_group;
 
 /// The relay `relay` as a peer entry of a device that uses it.
 fn relay_entry(relay: &Embedded) -> PeerSpec {
@@ -36,9 +36,14 @@ fn relay_entry(relay: &Embedded) -> PeerSpec {
     }
 }
 
-/// Where the group of `ns` is probed.
-fn probe_in(ns: &Name) -> Name {
-    sync_group(ns).append("probe")
+/// The sync group of the space `space` of `owner`, as the data layer names it.
+fn group_of(owner: &Name, space: &str) -> Name {
+    format!("{owner}/32=sync/{space}").parse().unwrap()
+}
+
+/// Where the group `group` is probed.
+fn probe_in(group: &Name) -> Name {
+    group.clone().append("probe")
 }
 
 /// `on` answers every Interest under `prefix` with a Data.
@@ -68,20 +73,15 @@ struct World {
     bob: Embedded,
 }
 
-/// The sync group of `ns`, as the relay's route table shows it.
-fn group(ns: &Name) -> String {
-    sync_group(ns).to_string()
-}
-
 impl World {
-    /// The relay routes the group of Alice's namespace over Bob's link.
-    fn sa_group_at_bob(&self) -> bool {
-        routed_over(&self.relay, self.bob.key).contains(&group(&self.sa.ns))
+    /// The relay routes `group` over Bob's link.
+    fn routes_to_bob(&self, group: &Name) -> bool {
+        routed_over(&self.relay, self.bob.key).contains(&group.to_string())
     }
 }
 
-/// Alice and Bob, each linked to the relay they use. Bob follows `/sa` from
-/// the start when `follows`.
+/// Alice and Bob, each linked to the relay they use. Bob follows the `doc`
+/// group of `/sa` from the start when `follows`.
 async fn world(follows: bool) -> World {
     let (sa, sb, sr) = (
         Person::with_ca("/sa").await,
@@ -92,7 +92,9 @@ async fn world(follows: bool) -> World {
     let alice = embedded(&sa, &sa.device("laptop"), Setup::dialer()).await;
     let bob = embedded(&sb, &sb.device("phone"), Setup::dialer()).await;
     if follows {
-        bob.validator.adopt_context(Arc::clone(&sa.ctx)).unwrap();
+        bob.links
+            .set_followed_groups([group_of(&sa.ns, "doc")])
+            .unwrap();
     }
     alice.links.add_peer(relay_entry(&relay));
     bob.links.add_peer(relay_entry(&relay));
@@ -108,15 +110,18 @@ async fn world(follows: bool) -> World {
     }
 }
 
-/// Bob follows `/sa`: the relay routes `/sa/32=sync` over his link, beside
-/// his own namespace's group, and over no other link that did not claim it
-/// (Alice's carries the group because she is served for `/sa`; a third device
-/// of `/sc` that follows nothing gets neither). The route is the group's
-/// alone: no other name of `/sa` is routed to Bob. Alice's Sync Interest
-/// under the group, from her side of the relay, reaches Bob's forwarder and
-/// his Data comes back.
+/// Bob follows the `doc` space of `/sa`: the relay routes `/sa/32=sync/doc`
+/// over his link, beside his own namespace's group, and over no other link
+/// that did not claim it (Alice's carries `/sa/32=sync` because she is served
+/// for `/sa`; a third device of `/sc` that follows nothing gets neither). The
+/// route is that one group's alone: neither the owner's whole group nor
+/// another space of `/sa` (`chat`) is routed to Bob, and no other name of
+/// `/sa`. Alice's Sync Interest under the `doc` group, from her side of the
+/// relay, reaches Bob's forwarder and his Data comes back; her Sync Interest
+/// under the `chat` group does not reach him, though Bob's forwarder would
+/// answer it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_relay_routes_the_group_of_a_space_its_device_follows_and_alices_sync_interest_reaches_bob()
+async fn a_relay_routes_the_group_of_the_space_its_device_follows_and_no_other_space_of_the_namespace()
  {
     let w = world(true).await;
     let carol_person = Person::with_ca("/sc").await;
@@ -127,21 +132,27 @@ async fn a_relay_routes_the_group_of_a_space_its_device_follows_and_alices_sync_
     })
     .await;
 
-    let group_a = group(&w.sa.ns);
+    let doc = group_of(&w.sa.ns, "doc");
+    let chat = group_of(&w.sa.ns, "chat");
+    let whole = ndn_security::sync_group(&w.sa.ns);
     let at_bob = routed_over(&w.relay, w.bob.key);
     assert!(
-        at_bob.contains(&group_a),
+        at_bob.contains(&doc.to_string()),
         "the relay's routes over Bob's link: {at_bob:?}"
     );
     assert!(
-        at_bob.contains(&group(&n("/sb"))),
+        at_bob.contains(&ndn_security::sync_group(&n("/sb")).to_string()),
         "his own group is routed still: {at_bob:?}"
     );
     assert!(
         at_bob
             .iter()
-            .all(|p| *p == group_a || !p.starts_with("/sa")),
-        "a claim of following routed more than the group: {at_bob:?}"
+            .all(|p| *p == doc.to_string() || !p.starts_with("/sa")),
+        "a claim of following routed more than the one group: {at_bob:?}"
+    );
+    assert!(
+        !at_bob.contains(&whole.to_string()) && !at_bob.contains(&chat.to_string()),
+        "the owner's whole group or another space of it is routed to Bob: {at_bob:?}"
     );
     let at_carol = routed_over(&w.relay, carol.key);
     assert!(
@@ -149,43 +160,45 @@ async fn a_relay_routes_the_group_of_a_space_its_device_follows_and_alices_sync_
         "a device that follows nothing was routed /sa: {at_carol:?}"
     );
 
-    // The probe is Bob's answer under Alice's group, asked from Alice.
-    answers_under(&w.bob, probe_in(&w.sa.ns));
-    let prefix = probe_in(&w.sa.ns);
+    // Bob's forwarder would answer under both groups: only one is routed to him.
+    answers_under(&w.bob, probe_in(&doc));
+    answers_under(&w.bob, probe_in(&chat));
+    let prefix = probe_in(&doc);
     until(
-        "Alice's Sync Interest reaches Bob through the relay",
+        "Alice's Sync Interest of the followed space reaches Bob through the relay",
         Duration::from_secs(20),
         async || fetches(&w.alice, &prefix, "1").await,
     )
     .await;
+    assert!(
+        !fetches(&w.alice, &probe_in(&chat), "1").await,
+        "Alice's Sync Interest of a space Bob does not follow reached him"
+    );
 }
 
-/// A namespace Bob follows after his link to the relay is up reaches the relay
-/// on a link made again (his hello tells the relay what he follows): the
-/// route appears over the new link, and not before.
+/// A space Bob follows after his link to the relay is up reaches the relay on
+/// a link made again (his hello tells the relay what he follows): the route
+/// appears over the new link, and not before.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_namespace_followed_later_is_routed_by_the_relay_once_the_link_is_made_again() {
+async fn a_space_followed_later_is_routed_by_the_relay_once_the_link_is_made_again() {
     let w = world(false).await;
+    let doc = group_of(&w.sa.ns, "doc");
     assert!(
-        !w.sa_group_at_bob(),
+        !w.routes_to_bob(&doc),
         "Bob followed nothing yet: {:?}",
         routed_over(&w.relay, w.bob.key)
     );
 
-    w.bob
-        .validator
-        .adopt_context(Arc::clone(&w.sa.ctx))
-        .unwrap();
-    w.bob.links.followed_changed();
+    w.bob.links.set_followed_groups([doc.clone()]).unwrap();
     until(
-        "the relay routes the group of /sa over Bob's link",
+        "the relay routes the group of the space over Bob's link",
         Duration::from_secs(30),
-        async || linked(&w.bob, w.relay.key) && w.sa_group_at_bob(),
+        async || linked(&w.bob, w.relay.key) && w.routes_to_bob(&doc),
     )
     .await;
 
-    answers_under(&w.bob, probe_in(&w.sa.ns));
-    let prefix = probe_in(&w.sa.ns);
+    answers_under(&w.bob, probe_in(&doc));
+    let prefix = probe_in(&doc);
     until(
         "Alice's Sync Interest reaches Bob through the relay",
         Duration::from_secs(20),
@@ -194,24 +207,76 @@ async fn a_namespace_followed_later_is_routed_by_the_relay_once_the_link_is_made
     .await;
 }
 
-/// A namespace Bob stops following is no longer told: his link is made again
-/// and the relay's route over it goes.
+/// A space Bob stops following is no longer told: his link is made again and
+/// the relay's route over it goes; the one he still follows stays.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_namespace_no_longer_followed_loses_the_relays_route_when_the_link_is_made_again() {
-    let w = world(true).await;
+async fn a_space_no_longer_followed_loses_the_relays_route_when_the_link_is_made_again() {
+    let w = world(false).await;
+    let (doc, chat) = (group_of(&w.sa.ns, "doc"), group_of(&w.sa.ns, "chat"));
+    w.bob
+        .links
+        .set_followed_groups([chat.clone(), doc.clone()])
+        .unwrap();
     until(
-        "the relay routes the group of /sa over Bob's link",
+        "the relay routes both groups over Bob's link",
         Duration::from_secs(30),
-        async || w.sa_group_at_bob(),
+        async || linked(&w.bob, w.relay.key) && w.routes_to_bob(&doc) && w.routes_to_bob(&chat),
     )
     .await;
 
-    w.bob.validator.keyring().forget(&w.sa.ns);
-    w.bob.links.followed_changed();
+    w.bob.links.set_followed_groups([doc.clone()]).unwrap();
     until(
-        "the relay's route over Bob's link goes",
+        "the relay's route of the group Bob left goes",
         Duration::from_secs(30),
-        async || linked(&w.bob, w.relay.key) && !w.sa_group_at_bob(),
+        async || linked(&w.bob, w.relay.key) && !w.routes_to_bob(&chat) && w.routes_to_bob(&doc),
     )
     .await;
+}
+
+/// The host's set is all or nothing, and names space groups only: a
+/// namespace and an owner's whole group (the prefix of every space of the
+/// owner) are refused, saying why, as is a set of more groups than a hello
+/// names; the set given before stays, and the same set again changes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_hosts_followed_groups_name_exact_spaces_or_are_refused_whole() {
+    let w = world(false).await;
+    let doc = group_of(&w.sa.ns, "doc");
+    let links = &w.bob.links;
+    links.set_followed_groups([doc.clone()]).unwrap();
+
+    for (bad, word) in [
+        (w.sa.ns.clone(), "32=sync"),
+        (ndn_security::sync_group(&w.sa.ns), "whole group"),
+    ] {
+        let refused = links
+            .set_followed_groups([group_of(&w.sa.ns, "chat"), bad.clone()])
+            .unwrap_err();
+        assert!(
+            matches!(&refused, FollowedGroupsError::NotAGroup { group, .. } if *group == bad),
+            "{refused:?}"
+        );
+        assert!(refused.to_string().contains(word), "{refused}");
+        assert_eq!(
+            links.followed_groups(),
+            [doc.clone()],
+            "a refusal changed the set"
+        );
+    }
+
+    let max = ndn_face_quic::FOLLOWS_MAX;
+    let many: Vec<Name> = (0..=max)
+        .map(|i| group_of(&w.sa.ns, &format!("s{i}")))
+        .collect();
+    let refused = links.set_followed_groups(many.clone()).unwrap_err();
+    assert_eq!(refused, FollowedGroupsError::TooMany { given: many.len() });
+    assert!(refused.to_string().contains("at most"), "{refused}");
+    assert_eq!(links.followed_groups(), [doc.clone()]);
+
+    // The limit itself is fine; a group named twice counts once.
+    let mut at_limit = many[..max].to_vec();
+    at_limit.push(many[0].clone());
+    links.set_followed_groups(at_limit).unwrap();
+    assert_eq!(links.followed_groups().len(), max);
+    links.set_followed_groups(Vec::new()).unwrap();
+    assert!(links.followed_groups().is_empty());
 }

@@ -134,6 +134,11 @@ pub struct Links {
     /// What strangers' introduction links may carry
     /// ([`Links::set_introductions`]); `None`: this device takes none.
     pub(crate) introductions: Mutex<Option<Arc<dyn crate::introduce::Introductions>>>,
+    /// The space groups the host says this device follows
+    /// ([`Links::set_followed_groups`]): what a relay this device uses is
+    /// told in the hello. Sorted, distinct, each a valid group, at most
+    /// [`FOLLOWS_MAX`](ndn_face_quic::FOLLOWS_MAX).
+    pub(crate) followed_groups: Mutex<Vec<Name>>,
     /// The addresses of peers this device dialled by key from a code's link
     /// hint ([`Links::dial_by_key`]), in the order tried: their paths.
     pub(crate) introduced: Mutex<HashMap<PeerId, Vec<SocketAddr>>>,
@@ -204,6 +209,7 @@ impl Links {
             members: Mutex::new(HashMap::new()),
             present: Mutex::new(HashMap::new()),
             introductions: Mutex::new(None),
+            followed_groups: Mutex::new(Vec::new()),
             introduced: Mutex::new(HashMap::new()),
             first_contacts: Mutex::new(HashSet::new()),
             relinked: Mutex::new(HashSet::new()),
@@ -300,15 +306,17 @@ impl Links {
         }
     }
 
-    /// The namespaces this device follows (or holds a certificate in)
-    /// changed: a trust context was adopted, a membership began or ended,
-    /// or the host forgot a context. Each link path to a relay this device
-    /// uses routes the namespaces it routes over that relay now
-    /// (`relay_routed_namespaces`): one followed later is routed at once,
-    /// one no longer followed loses its route; an on-demand relay that is
-    /// down routes them to the waiting face. Called on every adoption and
-    /// identity change; a host calls it after [`Keyring::forget`]. A relay
-    /// whose link was told other followed namespaces in the hello
+    /// The namespaces this device follows (or holds a certificate in), or the
+    /// space groups it follows, changed: a trust context was adopted, a
+    /// membership began or ended, the host forgot a context, or the host gave
+    /// other groups ([`Links::set_followed_groups`], which calls this). Each
+    /// link path to a relay this device uses routes the namespaces it routes
+    /// over that relay now (`relay_routed_namespaces`): one followed later is
+    /// routed at once, one no longer followed loses its route; an on-demand
+    /// relay that is down routes them to the waiting face. Called on every
+    /// adoption and identity change; a host calls it after
+    /// [`Keyring::forget`]. A relay whose link was told other followed groups
+    /// in the hello
     /// ([`LinkHello::follows`](ndn_face_quic::LinkHello::follows)) is linked
     /// again to tell it these, as for a change of memberships.
     ///
@@ -711,6 +719,7 @@ impl Links {
             grants: &self.grants,
             departures: &self.departures,
             introductions: self.introductions.lock().clone(),
+            followed_groups: &self.followed_groups,
         }
     }
 

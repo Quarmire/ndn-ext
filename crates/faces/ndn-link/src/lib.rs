@@ -378,7 +378,7 @@ pub use netwatch::{AddressSource, AddressWatch, InterfaceAddresses};
 pub use peer::{LinkMode, LinkReliability, PeerId, PeerSpec, RelaySource, RelayUse};
 pub use policy::Backoff;
 pub use presence::{DirectOptions, PRESENCE_MAX};
-pub use relays::RelayOptions;
+pub use relays::{FollowedGroupsError, RelayOptions};
 pub use routes::group_routes;
 pub use serving::{Quotas, ServePolicy};
 pub use status::{
