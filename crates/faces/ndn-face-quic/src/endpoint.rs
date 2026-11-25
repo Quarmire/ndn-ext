@@ -65,6 +65,18 @@ pub struct LinkTransportConfig {
     /// in transit, before the link layer closes it: its keep-alives would
     /// otherwise hold it open for ever.
     pub quiet_close: Duration,
+    /// The largest UDP payload a link's path-MTU discovery may reach, and the largest the
+    /// endpoint takes: quinn's `MtuDiscoveryConfig::upper_bound` and the endpoint's
+    /// `max_udp_payload_size` (which caps what the peer may probe), both, or the search stops
+    /// at the lower. The default is quinn's own bound, which stays within Ethernet's MTU on
+    /// IPv4 and IPv6. Discovery probes upward from 1,200 and keeps what the path acknowledges,
+    /// so a higher bound costs about a dozen probes on a path that carries less, and finds room
+    /// on loopback, a jumbo-frame LAN or a same-host path: at 9,000 a loopback link carries
+    /// 2.9 times the 1 KiB datagrams and 2.4 times the 8 KiB stream messages a second that it
+    /// does at 1,452 (SHAPES-CHANNEL.md §17). quinn allocates, zeroed, one receive buffer of
+    /// this bound times 64 GRO segments times 32 packets for the endpoint (18 MB at 9,000):
+    /// one per socket, not per link. Clamped to 1,200–65,527.
+    pub path_mtu_max: u16,
 }
 
 impl Default for LinkTransportConfig {
@@ -77,9 +89,20 @@ impl Default for LinkTransportConfig {
             direct_idle_timeout: Duration::from_secs(8),
             limits: HandshakeLimits::default(),
             quiet_close: Duration::from_secs(300),
+            path_mtu_max: DEFAULT_PATH_MTU_MAX,
         }
     }
 }
+
+/// quinn's own bound of path-MTU discovery: Ethernet's 1,500 less IPv6 and UDP headers.
+const DEFAULT_PATH_MTU_MAX: u16 = 1452;
+/// What every QUIC path carries (the floor of `path_mtu_max`), and the most a QUIC packet may
+/// be (its ceiling).
+const PATH_MTU_FLOOR: u16 = 1200;
+const PATH_MTU_CEILING: u16 = 65_527;
+/// The most one UDP datagram carries over IPv4 (65,535 less the 8-octet UDP and 20-octet IP
+/// headers). One GSO `sendmsg` is one such datagram's worth of segments.
+const MAX_UDP_PAYLOAD_IPV4: usize = 65_507;
 
 /// Safe bounds of a link's keep-alive: under the floor, keep-alives cost
 /// battery and data for nothing; over the ceiling, NAT bindings expire.
@@ -354,6 +377,8 @@ pub struct LinkEndpoint {
     expected: Arc<Mutex<Expected>>,
     /// Whether inbound attempts are taken at all ([`set_accepting`](Self::set_accepting)).
     accepting: AtomicBool,
+    /// Segments one GSO batch may hold ([`SegmentCap`]), fixed by `path_mtu_max`.
+    gso_segments: usize,
 }
 
 impl LinkEndpoint {
@@ -384,10 +409,22 @@ impl LinkEndpoint {
         let current = key
             .current()
             .map_err(|e| LinkError::NoLinkKey(e.to_string()))?;
-        let transport = Arc::new(transport_config(config.keep_alive, config.idle_timeout));
+        let path_mtu_max = config.path_mtu_max.clamp(PATH_MTU_FLOOR, PATH_MTU_CEILING);
+        // quinn 0.11 does not bound a GSO batch by what one UDP datagram carries: ten segments
+        // of more than 6,550 octets make a `sendmsg` over 65,507 octets, which the kernel
+        // refuses (EMSGSIZE) and quinn-udp counts as sent, so every packet of the batch is
+        // lost and the loss reads as an MTU black hole. A batch holds as many segments of the
+        // largest size discovery may reach as one datagram carries.
+        let gso_segments = (MAX_UDP_PAYLOAD_IPV4 / usize::from(path_mtu_max)).max(1);
+        let transport = Arc::new(transport_config(
+            config.keep_alive,
+            config.idle_timeout,
+            path_mtu_max,
+        ));
         let direct_transport = Arc::new(transport_config(
             config.direct_keep_alive,
             config.direct_idle_timeout,
+            path_mtu_max,
         ));
         let server = listen
             .then(|| server_config(Arc::clone(&key), Arc::clone(&transport)))
@@ -397,12 +434,9 @@ impl LinkEndpoint {
         let probes = Arc::new(ProbeTap::default());
         size_buffers(&socket);
         // quinn's socket state sets the socket non-blocking.
-        let socket = Arc::new(ProbeSocket::new(
-            runtime.wrap_udp_socket(socket)?,
-            Arc::clone(&probes),
-        ));
+        let socket = wrap_socket(socket, Arc::clone(&probes), gso_segments)?;
         let endpoint = quinn::Endpoint::new_with_abstract_socket(
-            endpoint_config(&current),
+            endpoint_config(&current, path_mtu_max),
             server,
             Arc::clone(&socket) as Arc<dyn quinn::AsyncUdpSocket>,
             runtime,
@@ -420,6 +454,7 @@ impl LinkEndpoint {
             direct_server,
             expected: Arc::new(Mutex::new(Expected::default())),
             accepting: AtomicBool::new(true),
+            gso_segments,
         })
     }
 
@@ -636,10 +671,7 @@ impl LinkEndpoint {
     /// device): its links migrate with it.
     pub fn rebind(&self, socket: std::net::UdpSocket) -> std::io::Result<()> {
         size_buffers(&socket);
-        let wrapped = Arc::new(ProbeSocket::new(
-            quinn::Runtime::wrap_udp_socket(&quinn::TokioRuntime, socket)?,
-            Arc::clone(&self.probes),
-        ));
+        let wrapped = wrap_socket(socket, Arc::clone(&self.probes), self.gso_segments)?;
         self.endpoint
             .rebind_abstract(Arc::clone(&wrapped) as Arc<dyn quinn::AsyncUdpSocket>)?;
         *self.socket.lock().unwrap_or_else(PoisonError::into_inner) = wrapped;
@@ -786,7 +818,68 @@ fn size_buffers(socket: &std::net::UdpSocket) {
     }
 }
 
-fn transport_config(keep_alive: Duration, idle_timeout: Duration) -> quinn::TransportConfig {
+/// quinn's socket for `socket`, under the probe tap and with GSO batches of at most
+/// `gso_segments` segments.
+fn wrap_socket(
+    socket: std::net::UdpSocket,
+    probes: Arc<ProbeTap>,
+    gso_segments: usize,
+) -> std::io::Result<Arc<ProbeSocket>> {
+    let udp = quinn::Runtime::wrap_udp_socket(&quinn::TokioRuntime, socket)?;
+    let capped = Arc::new(SegmentCap {
+        inner: udp,
+        max_segments: gso_segments,
+    });
+    Ok(Arc::new(ProbeSocket::new(capped, probes)))
+}
+
+/// The socket with the segments of one GSO transmit bounded (see `from_socket`).
+#[derive(Debug)]
+struct SegmentCap {
+    inner: Arc<dyn quinn::AsyncUdpSocket>,
+    max_segments: usize,
+}
+
+impl quinn::AsyncUdpSocket for SegmentCap {
+    fn create_io_poller(self: Arc<Self>) -> std::pin::Pin<Box<dyn quinn::UdpPoller>> {
+        Arc::clone(&self.inner).create_io_poller()
+    }
+
+    fn try_send(&self, transmit: &quinn::udp::Transmit) -> std::io::Result<()> {
+        self.inner.try_send(transmit)
+    }
+
+    fn poll_recv(
+        &self,
+        cx: &mut std::task::Context,
+        bufs: &mut [std::io::IoSliceMut<'_>],
+        meta: &mut [quinn::udp::RecvMeta],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        self.inner.poll_recv(cx, bufs, meta)
+    }
+
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.inner.local_addr()
+    }
+
+    fn max_transmit_segments(&self) -> usize {
+        self.inner.max_transmit_segments().min(self.max_segments)
+    }
+
+    fn max_receive_segments(&self) -> usize {
+        self.inner.max_receive_segments()
+    }
+
+    fn may_fragment(&self) -> bool {
+        self.inner.may_fragment()
+    }
+}
+
+fn transport_config(
+    keep_alive: Duration,
+    idle_timeout: Duration,
+    path_mtu_max: u16,
+) -> quinn::TransportConfig {
     let mut t = quinn::TransportConfig::default();
     t.keep_alive_interval(Some(keep_alive));
     t.max_idle_timeout(Some(
@@ -797,6 +890,10 @@ fn transport_config(keep_alive: Duration, idle_timeout: Duration) -> quinn::Tran
     // control stream, and no peer needs more.
     t.max_concurrent_bidi_streams(quinn::VarInt::from_u32(1));
     t.max_concurrent_uni_streams(quinn::VarInt::from_u32(0));
+    // Path-MTU discovery runs on every connection after its handshake, up to `path_mtu_max`.
+    let mut discovery = quinn::MtuDiscoveryConfig::default();
+    discovery.upper_bound(path_mtu_max);
+    t.mtu_discovery_config(Some(discovery));
     // The datagram queues of a connection stay at quinn's own budget: datagrams flow before
     // the verdict, so a larger one is memory any dialer may fill (see the test).
     t
@@ -832,9 +929,9 @@ fn server_config(
 /// device key types sign deterministically (Ed25519; P-256 per RFC 6979);
 /// the label starts with a byte no NDN packet or TLS signature input starts
 /// with.
-fn endpoint_config(key: &crate::key::LinkKey) -> quinn::EndpointConfig {
+fn endpoint_config(key: &crate::key::LinkKey, path_mtu_max: u16) -> quinn::EndpointConfig {
     let label = b"ndn-link stateless reset key v1";
-    match key.sign_label(label) {
+    let mut config = match key.sign_label(label) {
         Some(signature) => {
             let seed = Sha256::new()
                 .chain_update(label)
@@ -846,7 +943,13 @@ fn endpoint_config(key: &crate::key::LinkKey) -> quinn::EndpointConfig {
             )))
         }
         None => quinn::EndpointConfig::default(),
-    }
+    };
+    // What this endpoint advertises as the largest datagram it takes, which caps what the peer
+    // may probe: quinn's default of 1,472 would stop a search that `path_mtu_max` raised.
+    config
+        .max_udp_payload_size(path_mtu_max)
+        .expect("path_mtu_max is clamped to 1,200 or more");
+    config
 }
 
 #[cfg(test)]
@@ -913,7 +1016,11 @@ mod tests {
         let (ours, quinns) = (
             format!(
                 "{:?}",
-                transport_config(Duration::from_secs(10), Duration::from_secs(30))
+                transport_config(
+                    Duration::from_secs(10),
+                    Duration::from_secs(30),
+                    DEFAULT_PATH_MTU_MAX
+                )
             ),
             format!("{:?}", quinn::TransportConfig::default()),
         );

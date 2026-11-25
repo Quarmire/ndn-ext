@@ -30,6 +30,16 @@ ring          = { workspace = true }
 
 [dev-dependencies]
 tokio    = { workspace = true, features = ["full"] }
+# examples/carrier_bench.rs: a self-signed certificate for the raw quinn pair it measures, and
+# `libc` for the Linux-only sampling profile (per-thread CPU timers) and the UDP_GRO switch.
+rcgen    = { workspace = true }
+libc     = { workspace = true }
+
+[[example]]
+name = "carrier_bench"
+
+[[example]]
+name = "side_ping"
 
 [lints]
 workspace = true
