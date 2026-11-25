@@ -447,9 +447,7 @@ impl SideCarrier {
     fn check(&self, frame: &Bytes, class: SideClass, size_now: bool) -> Result<(), SideRefused> {
         if frame.first() != Some(&SIDE_MARKER) {
             bump(&self.counters.refused);
-            return Err(SideRefused::Io(
-                "a side frame starts with the marker octet 0x00".into(),
-            ));
+            return Err(SideRefused::Malformed);
         }
         if !self.carry {
             bump(&self.counters.refused);

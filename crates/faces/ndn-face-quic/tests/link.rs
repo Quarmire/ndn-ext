@@ -1641,18 +1641,18 @@ async fn only_a_marked_frame_is_carried_on_the_side_path() {
     let (a, b) = channel_link(&dialer, &listener).await;
     let ndn = Bytes::from_static(&[0x05, 0x03, 0x07, 0x01, 0x41]);
     for class in [SideClass::Datagram, SideClass::Stream] {
-        assert!(matches!(
+        assert_eq!(
             a.face.send_side(ndn.clone(), class).await,
-            Err(SideRefused::Io(_))
-        ));
-        assert!(matches!(
+            Err(SideRefused::Malformed)
+        );
+        assert_eq!(
             a.face.forward_side(ndn.clone(), class),
-            Err(SideRefused::Io(_))
-        ));
-        assert!(matches!(
+            Err(SideRefused::Malformed)
+        );
+        assert_eq!(
             a.face.send_side(Bytes::new(), class).await,
-            Err(SideRefused::Io(_))
-        ));
+            Err(SideRefused::Malformed)
+        );
     }
     assert!(
         drain_for(&b.face, Duration::from_millis(200))
