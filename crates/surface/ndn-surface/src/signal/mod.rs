@@ -503,8 +503,9 @@ impl Reason {
                  the scope with it, or this device fetches the newer record"
             }
             Reason::BadSignature => {
-                "nothing: forged, altered on the way, a revoked key, or a device certificate \
-                 expired (its device renews it)"
+                "nothing: forged, altered on the way, a revoked or suspected key (its owner \
+                 revokes it, or the host unsuspects it), or a device certificate expired (its \
+                 device renews it)"
             }
             Reason::UnknownRun => "nothing: the run's header rides again within a second",
             Reason::UnknownKey => {
@@ -1757,7 +1758,9 @@ fn walk_again(st: &mut HubState, revocations: u64) {
 fn refused(r: SignalRefusal) -> Dropped {
     let reason = match r {
         SignalRefusal::Malformed { .. } => Reason::Malformed,
-        SignalRefusal::BadSignature { .. } => Reason::BadSignature,
+        SignalRefusal::BadSignature { .. } | SignalRefusal::Suspected { .. } => {
+            Reason::BadSignature
+        }
         SignalRefusal::NotMember { .. } => Reason::NotMember,
         SignalRefusal::NotReady { .. } | SignalRefusal::Unverified { .. } => Reason::UnknownRun,
     };
