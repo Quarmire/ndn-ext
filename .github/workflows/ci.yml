@@ -39,13 +39,13 @@ jobs:
         with: { path: ndn-ext }
       # pinned sibling; bump deliberately when adopting newer ndn-rs (see workspace STATE.md)
       - uses: actions/checkout@v4
-        with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: 33a2fd95e953cb3fa28077fcd0f3726455794283, path: ndn-rs }
+        with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: dc79eea5ff5f0333e61f1330dcc4303b016993d4, path: ndn-rs }
       # pinned sibling; bump deliberately when adopting newer ndn-radio-drivers (see workspace STATE.md)
       - uses: actions/checkout@v4
         with: { repository: "${{ github.repository_owner }}/ndn-radio-drivers", ref: 985cd9d70ce0664c6b622da29545c6aa2cd0448c, path: ndn-radio-drivers }
       # pinned sibling; bump deliberately when adopting newer ndn-radio (see workspace STATE.md)
       - uses: actions/checkout@v4
-        with: { repository: "${{ github.repository_owner }}/ndn-radio", ref: 64d601448d7d33b713541ce8af282e8aebb23000, path: ndn-radio }
+        with: { repository: "${{ github.repository_owner }}/ndn-radio", ref: afe017331167b7fecfee4ac20d835fe293dd6ff6, path: ndn-radio }
       - name: Install system dependencies (dbus / libusb / libpcap)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev libusb-1.0-0-dev libpcap-dev pkg-config
       - uses: Swatinem/rust-cache@v2
@@ -76,13 +76,13 @@ jobs:
         with: { path: ndn-ext }
       # pinned sibling; bump deliberately when adopting newer ndn-rs (see workspace STATE.md)
       - uses: actions/checkout@v4
-        with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: 33a2fd95e953cb3fa28077fcd0f3726455794283, path: ndn-rs }
+        with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: dc79eea5ff5f0333e61f1330dcc4303b016993d4, path: ndn-rs }
       # pinned sibling; bump deliberately when adopting newer ndn-radio-drivers (see workspace STATE.md)
       - uses: actions/checkout@v4
         with: { repository: "${{ github.repository_owner }}/ndn-radio-drivers", ref: 985cd9d70ce0664c6b622da29545c6aa2cd0448c, path: ndn-radio-drivers }
       # pinned sibling; bump deliberately when adopting newer ndn-radio (see workspace STATE.md)
       - uses: actions/checkout@v4
-        with: { repository: "${{ github.repository_owner }}/ndn-radio", ref: 64d601448d7d33b713541ce8af282e8aebb23000, path: ndn-radio }
+        with: { repository: "${{ github.repository_owner }}/ndn-radio", ref: afe017331167b7fecfee4ac20d835fe293dd6ff6, path: ndn-radio }
       - name: Install system dependencies (dbus / libusb / libpcap)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev libusb-1.0-0-dev libpcap-dev pkg-config
       - uses: taiki-e/install-action@v2
@@ -120,13 +120,13 @@ jobs:
         with: { path: ndn-ext }
       # pinned sibling; bump deliberately when adopting newer ndn-rs (see workspace STATE.md)
       - uses: actions/checkout@v4
-        with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: 33a2fd95e953cb3fa28077fcd0f3726455794283, path: ndn-rs }
+        with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: dc79eea5ff5f0333e61f1330dcc4303b016993d4, path: ndn-rs }
       # pinned sibling; bump deliberately when adopting newer ndn-radio-drivers (see workspace STATE.md)
       - uses: actions/checkout@v4
         with: { repository: "${{ github.repository_owner }}/ndn-radio-drivers", ref: 985cd9d70ce0664c6b622da29545c6aa2cd0448c, path: ndn-radio-drivers }
       # pinned sibling; bump deliberately when adopting newer ndn-radio (see workspace STATE.md)
       - uses: actions/checkout@v4
-        with: { repository: "${{ github.repository_owner }}/ndn-radio", ref: 64d601448d7d33b713541ce8af282e8aebb23000, path: ndn-radio }
+        with: { repository: "${{ github.repository_owner }}/ndn-radio", ref: afe017331167b7fecfee4ac20d835fe293dd6ff6, path: ndn-radio }
       - name: Install system dependencies (dbus / libusb / libpcap)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev libusb-1.0-0-dev libpcap-dev pkg-config
       - uses: Swatinem/rust-cache@v2
@@ -146,13 +146,13 @@ jobs:
         with: { path: ndn-ext }
       # pinned sibling; bump deliberately when adopting newer ndn-rs (see workspace STATE.md)
       - uses: actions/checkout@v4
-        with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: 33a2fd95e953cb3fa28077fcd0f3726455794283, path: ndn-rs }
+        with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: dc79eea5ff5f0333e61f1330dcc4303b016993d4, path: ndn-rs }
       # pinned sibling; bump deliberately when adopting newer ndn-radio-drivers (see workspace STATE.md)
       - uses: actions/checkout@v4
         with: { repository: "${{ github.repository_owner }}/ndn-radio-drivers", ref: 985cd9d70ce0664c6b622da29545c6aa2cd0448c, path: ndn-radio-drivers }
       # pinned sibling; bump deliberately when adopting newer ndn-radio (see workspace STATE.md)
       - uses: actions/checkout@v4
-        with: { repository: "${{ github.repository_owner }}/ndn-radio", ref: 64d601448d7d33b713541ce8af282e8aebb23000, path: ndn-radio }
+        with: { repository: "${{ github.repository_owner }}/ndn-radio", ref: afe017331167b7fecfee4ac20d835fe293dd6ff6, path: ndn-radio }
       - name: Install system dependencies (dbus / libusb / libpcap)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev libusb-1.0-0-dev libpcap-dev pkg-config
       - uses: Swatinem/rust-cache@v2
@@ -179,13 +179,13 @@ jobs:
         with: { path: ndn-ext }
       # pinned sibling; bump deliberately when adopting newer ndn-rs (see workspace STATE.md)
       - uses: actions/checkout@v4
-        with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: 33a2fd95e953cb3fa28077fcd0f3726455794283, path: ndn-rs }
+        with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: dc79eea5ff5f0333e61f1330dcc4303b016993d4, path: ndn-rs }
       # pinned sibling; bump deliberately when adopting newer ndn-radio-drivers (see workspace STATE.md)
       - uses: actions/checkout@v4
         with: { repository: "${{ github.repository_owner }}/ndn-radio-drivers", ref: 985cd9d70ce0664c6b622da29545c6aa2cd0448c, path: ndn-radio-drivers }
       # pinned sibling; bump deliberately when adopting newer ndn-radio (see workspace STATE.md)
       - uses: actions/checkout@v4
-        with: { repository: "${{ github.repository_owner }}/ndn-radio", ref: 64d601448d7d33b713541ce8af282e8aebb23000, path: ndn-radio }
+        with: { repository: "${{ github.repository_owner }}/ndn-radio", ref: afe017331167b7fecfee4ac20d835fe293dd6ff6, path: ndn-radio }
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ndn-ext
@@ -208,13 +208,13 @@ jobs:
         with: { path: ndn-ext }
       # pinned sibling; bump deliberately when adopting newer ndn-rs (see workspace STATE.md)
       - uses: actions/checkout@v4
-        with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: 33a2fd95e953cb3fa28077fcd0f3726455794283, path: ndn-rs }
+        with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: dc79eea5ff5f0333e61f1330dcc4303b016993d4, path: ndn-rs }
       # pinned sibling; bump deliberately when adopting newer ndn-radio-drivers (see workspace STATE.md)
       - uses: actions/checkout@v4
         with: { repository: "${{ github.repository_owner }}/ndn-radio-drivers", ref: 985cd9d70ce0664c6b622da29545c6aa2cd0448c, path: ndn-radio-drivers }
       # pinned sibling; bump deliberately when adopting newer ndn-radio (see workspace STATE.md)
       - uses: actions/checkout@v4
-        with: { repository: "${{ github.repository_owner }}/ndn-radio", ref: 64d601448d7d33b713541ce8af282e8aebb23000, path: ndn-radio }
+        with: { repository: "${{ github.repository_owner }}/ndn-radio", ref: afe017331167b7fecfee4ac20d835fe293dd6ff6, path: ndn-radio }
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny
