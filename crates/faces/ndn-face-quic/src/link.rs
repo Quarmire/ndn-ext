@@ -297,6 +297,7 @@ impl Handshaken {
             self.peer_caps,
             self.our_caps,
             admission.channel,
+            scope.clone(),
             Arc::clone(&local_close),
         );
         side.spawn(id);
@@ -1371,5 +1372,83 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The peer's channel stream is the one it was granted: when it finishes, or is reset,
+    /// quinn must not hand the peer the credit for a second (the carrier reads one stream
+    /// and never accepts another, so a second would only let the peer buffer a flow-control
+    /// window of bytes nobody reads).
+    #[tokio::test]
+    async fn a_finished_or_reset_channel_stream_is_not_replaced_by_a_second() {
+        let (dialer, listener) = (endpoint(1, false), endpoint(2, true));
+        for finish in [true, false] {
+            let (mut d, mut l) = handshaken(&dialer, &listener).await;
+            let raw = d.connection.clone();
+            hellos(&mut d, &mut l, (hello(1), hello(1))).await;
+            let (a, b) = admitted(d, l, (carrying(), carrying())).await;
+            let mut stream = tokio::time::timeout(T, raw.open_uni())
+                .await
+                .unwrap()
+                .unwrap();
+            stream
+                .write_all(&[0, 0, 0, 3, SIDE_MARKER, 1, 2])
+                .await
+                .unwrap();
+            assert_eq!(
+                tokio::time::timeout(T, b.face.recv_bytes())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                Bytes::from_static(&[SIDE_MARKER, 1, 2])
+            );
+            if finish {
+                stream.finish().unwrap();
+            } else {
+                stream.reset(quinn::VarInt::from_u32(7)).unwrap();
+            }
+            assert!(
+                !stream_opens(&raw, NEVER).await,
+                "a second channel stream opened after the first {}",
+                if finish { "finished" } else { "was reset" }
+            );
+            assert!(!a.handle.is_closed() && !b.handle.is_closed());
+        }
+    }
+
+    /// A peer that advertised the capability but grants no stream (its policy does not
+    /// carry) must not hold this side's stream lane for good: `send_side(Stream)` gives up
+    /// with a refusal that says why, once, and the lane then refuses at once. Datagrams are
+    /// unaffected.
+    #[tokio::test]
+    async fn a_peer_that_never_grants_its_stream_does_not_stall_the_stream_lane() {
+        let (dialer, listener) = (endpoint(1, false), endpoint(2, true));
+        let (mut d, mut l) = handshaken(&dialer, &listener).await;
+        hellos(&mut d, &mut l, (hello(1), hello(1))).await;
+        let (a, b) = admitted(d, l, (carrying(), Admission::default())).await;
+        let marked = Bytes::from_static(&[SIDE_MARKER, 1, 2]);
+        let first = tokio::time::timeout(
+            Duration::from_secs(60),
+            a.face.send_side(marked.clone(), SideClass::Stream),
+        )
+        .await
+        .expect("send_side(Stream) returned instead of waiting for a grant that never comes");
+        let Err(SideRefused::Io(why)) = first else {
+            panic!("expected a refusal that says the peer granted no stream, got {first:?}");
+        };
+        assert!(why.contains("grant"), "{why}");
+        // The lane is closed: the next send refuses at once, not after another wait.
+        let second = tokio::time::timeout(
+            Duration::from_secs(1),
+            a.face.send_side(marked.clone(), SideClass::Stream),
+        )
+        .await
+        .expect("a second send_side(Stream) refuses at once");
+        assert!(matches!(second, Err(SideRefused::Io(_))), "{second:?}");
+        // What was queued for the stream goes the same way: nothing waits behind it.
+        a.face
+            .send_side(marked.clone(), SideClass::Datagram)
+            .await
+            .unwrap();
+        assert!(!a.handle.is_closed() && !b.handle.is_closed());
     }
 }

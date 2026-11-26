@@ -25,7 +25,12 @@
 //! Nothing here costs a link a byte before the verdict: a face exists only
 //! after it. A link that does not carry (a policy of this side's, decided from
 //! the admitted link) sends nothing, grants nothing, and drops and counts what
-//! the peer sends, without closing the link.
+//! the peer sends, without closing the link. Carrying is judged live, not once at
+//! admission: a link whose scope narrows in place ([`Narrowing`](crate::Narrowing): a
+//! grant's last entry ended, the departure link) stops carrying at the moment its
+//! scope narrows, by the same judgement, in both directions: it sends none, drops
+//! and counts the datagrams the peer sends, and stops reading the peer's stream
+//! (which is not taken up again; datagrams follow the judgement). The link stays up.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -41,7 +46,7 @@ use ndn_transport::{FaceId, SIDE_MARKER, SideClass, SideRefused};
 
 use crate::link::DATAGRAM_FLOOR;
 use crate::message::{CHANNEL_CAPS_V1, CloseReason};
-use crate::scope::{FairMember, FairShare, Flow};
+use crate::scope::{FairMember, FairShare, Flow, ScopeState};
 
 /// The least headroom, in octets of datagrams that may wait in the connection's
 /// send buffer when a channel datagram is handed to it: a millisecond at
@@ -128,6 +133,15 @@ const HEADROOM_RECHECK: Duration = Duration::from_millis(1);
 /// it waits to send, not a spin without end.
 const HEADROOM_YIELDS: u32 = 256;
 
+/// How long this side waits for the peer to grant its channel stream before it gives up
+/// the stream for good. The peer grants it right after the verdict, when both hellos
+/// carried `ChannelCaps` and its policy carries; a peer whose policy does not carry (the
+/// hello does not say) never does, and an open that waited for ever would hold the stream
+/// lane (and, through `forward_side`'s writer, its queue) for the life of the link. A
+/// resource bound: whether a stream is granted is the peer's frame, not this clock's, and
+/// a late grant is a peer that is not following the protocol.
+const STREAM_GRANT_WAIT: Duration = Duration::from_secs(10);
+
 /// Why this side stopped a channel stream.
 const STREAM_MALFORMED: VarInt = VarInt::from_u32(1);
 
@@ -139,6 +153,8 @@ pub struct ChannelPolicy {
     /// Whether this side carries channel frames on the link. `false` (the
     /// default): it sends none, grants the peer no stream, and drops and
     /// counts the marked frames the peer sends, without closing the link.
+    /// `true`: it carries them while the link's scope is not narrowed (a
+    /// scope that narrows in place ends the carriage with it).
     pub carry: bool,
     /// `Some`: the bytes the link carries each way are held to a fair share
     /// of this pool, with the namespace's other links on it
@@ -329,6 +345,8 @@ pub(crate) struct SideCarrier {
     our_caps: bool,
     /// This side's policy carries channel frames on this link.
     carry: bool,
+    /// The link's scope: while it is narrowed (a grant ended) the link carries nothing.
+    scope: Option<Arc<ScopeState>>,
     quota: Option<FairMember>,
     counters: Counters,
     stream_tx: tokio::sync::Mutex<StreamTx>,
@@ -356,6 +374,7 @@ impl SideCarrier {
         peer_caps: bool,
         our_caps: bool,
         policy: ChannelPolicy,
+        scope: Option<Arc<ScopeState>>,
         local_close: Arc<OnceLock<(CloseReason, String)>>,
     ) -> Arc<Self> {
         let (tx, rx) = mpsc::channel(1024);
@@ -365,6 +384,7 @@ impl SideCarrier {
             peer_caps,
             our_caps,
             carry: policy.carry,
+            scope,
             quota: policy.quota.as_ref().map(FairShare::join),
             counters: Counters::default(),
             stream_tx: tokio::sync::Mutex::new(StreamTx::Idle),
@@ -385,10 +405,17 @@ impl SideCarrier {
         })
     }
 
-    /// Both hellos carried the capability and this side's policy carries:
-    /// channel frames flow, and the stream is granted.
+    /// Whether this side carries channel frames on the link now: its policy carries and the
+    /// link's scope is not narrowed. Judged at every use, by the scope's own
+    /// [`Narrowing::when`](crate::Narrowing), so a grant that ends stops the carriage at once.
+    fn carrying(&self) -> bool {
+        self.carry && !self.scope.as_ref().is_some_and(|scope| scope.narrowed())
+    }
+
+    /// Both hellos carried the capability and this side carries now: channel
+    /// frames flow, and the stream is granted.
     pub(crate) fn enabled(&self) -> bool {
-        self.peer_caps && self.our_caps && self.carry
+        self.peer_caps && self.our_caps && self.carrying()
     }
 
     pub(crate) fn peer_caps(&self) -> bool {
@@ -449,7 +476,7 @@ impl SideCarrier {
             bump(&self.counters.refused);
             return Err(SideRefused::Malformed);
         }
-        if !self.carry {
+        if !self.carrying() {
             bump(&self.counters.refused);
             return Err(SideRefused::NotCarried);
         }
@@ -663,6 +690,15 @@ impl SideCarrier {
     /// lock. A stream that ended drops them.
     async fn write_queued(&self, stream: &mut StreamTx) -> Result<(), SideRefused> {
         loop {
+            // A scope that narrowed since these were queued: they are not sent.
+            if !self.carrying() {
+                let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
+                queue.frames.clear();
+                queue.octets = 0;
+                self.queued_octets.store(0, Ordering::Release);
+                bump(&self.counters.refused);
+                return Err(SideRefused::NotCarried);
+            }
             let batch = {
                 let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
                 let mut batch = Vec::new();
@@ -738,11 +774,20 @@ impl SideCarrier {
         octets: usize,
     ) -> Result<(), SideRefused> {
         if let StreamTx::Idle = stream {
-            let opened = self
-                .connection
-                .open_uni()
-                .await
-                .map_err(|_| Self::closed())?;
+            let opened =
+                match tokio::time::timeout(STREAM_GRANT_WAIT, self.connection.open_uni()).await {
+                    Ok(Ok(opened)) => opened,
+                    Ok(Err(_)) => return Err(Self::closed()),
+                    Err(_) => {
+                        *stream = StreamTx::Ended;
+                        return Err(SideRefused::Io(format!(
+                            "the peer of this link granted no channel stream in {} s (it does not \
+                         carry channel frames, or is not following the protocol): this link has \
+                         no channel stream; datagrams are unaffected",
+                            STREAM_GRANT_WAIT.as_secs()
+                        )));
+                    }
+                };
             *stream = StreamTx::Open(opened);
         }
         // The stream is `Ended` while a write is in flight: a send that is
@@ -845,8 +890,18 @@ async fn side_stream(side: Arc<SideCarrier>, face: FaceId, inbox: mpsc::Sender<I
         _ = side.connection.closed() => return,
     };
     let Ok(mut recv) = accepted else { return };
+    // The one stream this side grants is taken: grant no other. quinn hands the peer the
+    // credit for another stream when the first finishes or is reset, and nothing here would
+    // ever accept it (the peer could buffer a flow-control window of bytes nobody reads).
+    side.connection
+        .set_max_concurrent_uni_streams(VarInt::from_u32(0));
     let mut buf = BytesMut::new();
     loop {
+        if !side.carrying() {
+            bump(&side.counters.refused);
+            stop_stream(face, &mut recv, "the link no longer carries channel frames");
+            return;
+        }
         // Every record that is whole in `buf`.
         while buf.len() >= 4 {
             let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
@@ -860,7 +915,7 @@ async fn side_stream(side: Arc<SideCarrier>, face: FaceId, inbox: mpsc::Sender<I
             }
             if len == 0 {
                 bump(&side.counters.dropped_malformed);
-                stop_stream(&side, face, &mut recv, "a channel record of no octets");
+                stop_stream(face, &mut recv, "a channel record of no octets");
                 return;
             }
             if buf.len() < 4 + len {
@@ -880,7 +935,6 @@ async fn side_stream(side: Arc<SideCarrier>, face: FaceId, inbox: mpsc::Sender<I
             if frame[0] != SIDE_MARKER {
                 bump(&side.counters.dropped_malformed);
                 stop_stream(
-                    &side,
                     face,
                     &mut recv,
                     "a channel record that does not start with the marker",
@@ -896,6 +950,12 @@ async fn side_stream(side: Arc<SideCarrier>, face: FaceId, inbox: mpsc::Sender<I
                         _ = side.connection.closed() => return,
                     }
                 }
+            }
+            // The wait may have been long: judge again before the frame is delivered.
+            if !side.carrying() {
+                bump(&side.counters.refused);
+                stop_stream(face, &mut recv, "the link no longer carries channel frames");
+                return;
             }
             bump(&side.counters.stream_rx_frames);
             add(&side.counters.stream_rx_bytes, len);
@@ -919,13 +979,11 @@ async fn side_stream(side: Arc<SideCarrier>, face: FaceId, inbox: mpsc::Sender<I
     }
 }
 
-/// Stop the peer's channel stream after a malformed record, and grant no
-/// other: the link stays up.
-fn stop_stream(side: &SideCarrier, face: FaceId, recv: &mut quinn::RecvStream, why: &str) {
+/// Stop the peer's channel stream (a malformed record, or a link that no longer carries): the
+/// link stays up. No other stream is granted: the credit went with the stream's acceptance.
+fn stop_stream(face: FaceId, recv: &mut quinn::RecvStream, why: &str) {
     debug!(target: "face.quic", face = %face, "stopping the channel stream: {why}");
     let _ = recv.stop(STREAM_MALFORMED);
-    side.connection
-        .set_max_concurrent_uni_streams(VarInt::from_u32(0));
 }
 
 /// Whether a hello's capabilities include channel frames.

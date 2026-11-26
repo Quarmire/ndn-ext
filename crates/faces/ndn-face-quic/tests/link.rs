@@ -11,14 +11,15 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
 use ndn_face_quic::{
     Admission, Carries, ChannelPolicy, CloseReason, Departure, FairShare, HandshakeLimits,
     KeyFingerprint, LINK_SOCKET_BUFFER, Link, LinkEndpoint, LinkError, LinkHello, LinkKey,
-    LinkScope, LinkTransportConfig, LinkVerdict, Presence, PresentDevice, QUEUE_CAP, QUEUE_FLOOR,
-    RateLimit, Reachability, ScopeCounts,
+    LinkScope, LinkTransportConfig, LinkVerdict, Narrowing, Presence, PresentDevice, QUEUE_CAP,
+    QUEUE_FLOOR, RateLimit, Reachability, ScopeCounts,
 };
 use ndn_packet::Name;
 use ndn_packet::encode::{DataBuilder, InterestBuilder};
@@ -1748,4 +1749,125 @@ async fn a_peer_without_channel_caps_gets_no_side_frames() {
     let pkt = Bytes::from_static(&[0x05, 0x03, 0x07, 0x01, 0x44]);
     a.face.send_bytes(pkt.clone()).await.unwrap();
     assert_eq!(recv(&b.face).await, pkt);
+}
+
+/// A link whose scope narrows in place (a grant's last entry ended: the departure link,
+/// ndn-link §8.8) stops carrying channel frames both ways at the moment the scope narrows,
+/// by the same judgement (`Narrowing::when`), and stays up: this side sends none (`NotCarried`),
+/// drops and counts the datagrams the peer sends, stops reading the peer's stream and delivers
+/// none of it.
+#[tokio::test]
+async fn a_link_whose_scope_narrows_stops_carrying_channel_frames_both_ways() {
+    let dialer = endpoint(ed_key(1), false);
+    let listener = endpoint(ec_key(2), true);
+    let narrowed = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&narrowed);
+    let scope = LinkScope {
+        receives: Carries::Everything,
+        sends: Carries::Everything,
+        names: Box::new(|_: &Name| true),
+        rate: RateLimit {
+            burst: 1000,
+            per_sec: 1000,
+        },
+        bandwidth: None,
+        rated: Vec::new(),
+        interests: None,
+        answered: None,
+        shared: None,
+        explain: "a grant link".into(),
+        answers_in: None,
+        interests_in: None,
+        narrowing: Some(Narrowing {
+            when: Box::new(move || flag.load(Ordering::SeqCst)),
+            receives: Carries::Interests,
+            sends: Carries::Answers,
+        }),
+        counts: None,
+    };
+    let grant_link = Admission {
+        scope: Some(scope),
+        channel: ChannelPolicy {
+            carry: true,
+            quota: None,
+        },
+        ..Admission::default()
+    };
+    let (a, b) = link_with(
+        &dialer,
+        &listener,
+        (hello(1), carrying()),
+        (hello(2), grant_link),
+    )
+    .await;
+
+    // While the grant stands, frames flow both ways on both carriers.
+    for (from, to) in [(&a, &b), (&b, &a)] {
+        for class in [SideClass::Datagram, SideClass::Stream] {
+            from.face.send_side(frame(1, 200), class).await.unwrap();
+            assert_eq!(recv(&to.face).await, frame(1, 200));
+        }
+    }
+    let before = b.handle.side_stats();
+    assert_eq!((before.datagram_rx_frames, before.stream_rx_frames), (1, 1));
+
+    // The grant ends: the scope narrows.
+    narrowed.store(true, Ordering::SeqCst);
+
+    // This side sends none, by either call.
+    for class in [SideClass::Datagram, SideClass::Stream] {
+        assert_eq!(
+            b.face.send_side(frame(2, 200), class).await,
+            Err(SideRefused::NotCarried)
+        );
+        assert_eq!(
+            b.face.forward_side(frame(2, 200), class),
+            Err(SideRefused::NotCarried)
+        );
+    }
+
+    // The peer's datagram is dropped and counted, the stream is stopped: its writer finds
+    // the stream stopped within a bounded number of frames, and none is delivered.
+    a.face
+        .send_side(frame(3, 200), SideClass::Datagram)
+        .await
+        .unwrap();
+    let mut stopped = false;
+    for i in 0..500 {
+        if a.face
+            .send_side(frame(10 + i, 200), SideClass::Stream)
+            .await
+            .is_err()
+        {
+            stopped = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        stopped,
+        "the narrowed side stopped reading the peer's channel stream"
+    );
+    for _ in 0..500 {
+        if b.handle.side_stats().refused > before.refused {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let after = b.handle.side_stats();
+    assert!(
+        after.refused > before.refused,
+        "the peer's datagram was dropped and counted"
+    );
+    assert_eq!(
+        (after.datagram_rx_frames, after.stream_rx_frames),
+        (1, 1),
+        "no frame was delivered after the scope narrowed"
+    );
+    assert!(
+        drain_for(&b.face, Duration::from_millis(300))
+            .await
+            .is_empty()
+    );
+    assert!(!a.handle.is_closed() && !b.handle.is_closed());
 }

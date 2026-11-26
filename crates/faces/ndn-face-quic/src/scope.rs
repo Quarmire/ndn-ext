@@ -572,6 +572,16 @@ impl ScopeState {
         }
     }
 
+    /// Whether the scope is narrowed now ([`Narrowing::when`], the judgement that picks what
+    /// the link carries as NDN packets). A narrowed link is one whose reason to be broad ended
+    /// (a grant's last entry, a departure): it carries no channel frames either.
+    pub(crate) fn narrowed(&self) -> bool {
+        self.scope
+            .narrowing
+            .as_ref()
+            .is_some_and(|narrowing| (narrowing.when)())
+    }
+
     /// How long the scope has passed no packet (either way).
     pub(crate) fn idle_for(&self) -> Duration {
         let last = Duration::from_millis(self.last_passed_ms.load(Ordering::Relaxed));

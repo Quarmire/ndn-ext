@@ -3916,6 +3916,41 @@ mod tests {
         );
     }
 
+    /// A grant link carries channel frames, and the carriage rides the scope's own
+    /// narrowing: the link's carrier (`ndn-face-quic`) stops carrying when the scope's
+    /// `Narrowing::when` holds, so the entry that ends narrows the NDN scope and stops the
+    /// channel frames by one judgement, never two that could differ.
+    #[tokio::test]
+    async fn a_grant_links_channel_carriage_ends_with_the_narrowing_of_its_last_entry() {
+        let (a, b) = (namespace("/a", 10).await, namespace("/b", 20).await);
+        let mut world = relay(&a, &[&b], ServePolicy::Own).await;
+        world.introductions = Some(Arc::new(Surface));
+        let (bob, chain) = b.device("member", "phone", 22).await;
+        let key = bob.fingerprint();
+        let notes = "/a/32=data/notes";
+        world.grants.put(granted_in(&bob, notes, GrantRole::Writer));
+        let judge = world.judge();
+        let admitted = judge
+            .decide(&bob, &hello(chain), &CH, None)
+            .await
+            .expect("the entry serves bob");
+        let admission = judge.admission_for(&admitted);
+        assert!(
+            admission.channel.carry,
+            "a grant link carries channel frames"
+        );
+        let narrowing = admission
+            .scope
+            .and_then(|scope| scope.narrowing)
+            .expect("a grant link narrows in place");
+        assert!(!(narrowing.when)(), "the entry stands: carried");
+        assert!(world.grants.take(&key, &n(notes)).is_some());
+        assert!(
+            (narrowing.when)(),
+            "the last entry ended: the scope narrows, and with it the carriage"
+        );
+    }
+
     /// A key whose last entry ended and that holds a mark of the folder is
     /// admitted on a departure link: Interests toward this device, answers
     /// toward the peer, the record and the keys that validate it and nothing
