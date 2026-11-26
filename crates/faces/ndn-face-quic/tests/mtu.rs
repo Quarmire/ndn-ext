@@ -71,13 +71,39 @@ async fn size_over(link: &Link, over: usize) -> usize {
 /// QUIC's floor: 1,200 octets of UDP payload carry 1,162 of datagram.
 const FLOOR: usize = 1162;
 
-/// The default bound is 9,000 octets of payload, and an idle loopback link settles on it:
-/// 8,962 of datagram, both ways.
+/// What the old default bound of 1,452 octets of payload carried as a datagram (the payload
+/// less the 38 octets of QUIC header, tag and frame overhead): the ceiling quinn's own default
+/// stopped discovery at.
+const OLD_CEILING: usize = 1452 - 38;
+
+/// The datagram a payload of the default bound carries: 9,000 less the same 38.
+const BOUND: usize = 9000 - 38;
+
+/// The default bound is 9,000 octets of payload; an idle loopback link climbs past the old
+/// 1,452 ceiling toward it, both ways, and never past it.
+///
+/// The size is not asserted exact. Discovery is quinn's binary search over 1,200..=9,000 that
+/// stops when the next probe would move less than `minimum_change` (20) octets, then probes the
+/// bound itself if that is still 20 or more away: payloads 5,100, 7,050, 8,025, 8,512, 8,756,
+/// 8,878, 8,939, 8,969, 9,000. A probe that is lost lowers the search's upper bound and ends it
+/// lower: a lost 9,000 ends it at 8,969 (8,931 of datagram, seen once under load), a lost
+/// earlier probe sooner. So what holds on any machine is the band: above 8,000 (the search
+/// reached its top tiers, far past the old ceiling) and at most the bound (the endpoint's
+/// `max_udp_payload_size` caps what the peer probes).
 #[tokio::test]
-async fn an_idle_link_on_loopback_settles_on_the_default_bound() {
+async fn an_idle_link_on_loopback_climbs_past_the_old_ceiling_toward_the_default_bound() {
     let (a, b, _eps) = link(&LinkTransportConfig::default()).await;
-    assert_eq!(size_over(&a, 8000).await, 8962);
-    assert_eq!(size_over(&b, 8000).await, 8962);
+    for (side, link) in [("dialer", &a), ("listener", &b)] {
+        let size = size_over(link, 8000).await;
+        assert!(
+            size > 8000 && size > OLD_CEILING,
+            "the {side} settled on {size} of datagram: discovery did not climb toward the bound"
+        );
+        assert!(
+            size <= BOUND,
+            "the {side} settled on {size} of datagram, over the bound's {BOUND}"
+        );
+    }
 }
 
 /// What an Ethernet path ends at: a bound of 1,452 octets of payload (1,500 less the IPv6
