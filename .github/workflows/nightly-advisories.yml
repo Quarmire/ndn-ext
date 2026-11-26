@@ -34,13 +34,13 @@ jobs:
         with: { path: ndn-ext }
       # pinned sibling; bump deliberately when adopting newer ndn-rs (see workspace STATE.md)
       - uses: actions/checkout@v4
-        with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: 694715f75d96977fba24a6a076c9a5b46a2dc62c, path: ndn-rs }
+        with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: 33a2fd95e953cb3fa28077fcd0f3726455794283, path: ndn-rs }
       # pinned sibling; bump deliberately when adopting newer ndn-radio-drivers (see workspace STATE.md)
       - uses: actions/checkout@v4
         with: { repository: "${{ github.repository_owner }}/ndn-radio-drivers", ref: 985cd9d70ce0664c6b622da29545c6aa2cd0448c, path: ndn-radio-drivers }
       # pinned sibling; bump deliberately when adopting newer ndn-radio (see workspace STATE.md)
       - uses: actions/checkout@v4
-        with: { repository: "${{ github.repository_owner }}/ndn-radio", ref: e4961e83d42b36dfa9723d4ab76f86dc99b35830, path: ndn-radio }
+        with: { repository: "${{ github.repository_owner }}/ndn-radio", ref: 64d601448d7d33b713541ce8af282e8aebb23000, path: ndn-radio }
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny
