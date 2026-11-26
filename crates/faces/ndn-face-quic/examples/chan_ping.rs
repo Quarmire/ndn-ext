@@ -26,6 +26,8 @@
 //! | `paths` | 256 | distinct paths the throughput rows rotate over (`Latest` keeps the newest per path: one path would measure frames per second, not messages) |
 //! | `consume` | `poll` | `poll`: `Items::next` per message; `batch`: `next_batch`; the `cpu` row runs both unless given |
 //! | `msgs` | 1000000 | messages the `cpu` row times |
+//! | `sealed` | 1 | `1`: the space is sealed (readers are named persons: an epoch and an audience, the frames are AES-GCM sealed); `0`: a public space (`Readers::Anyone`: no epoch, no audience; the frames are sealed the same way, so the rows differ only in the setup) |
+//! | `timer` | 1 | `1`: each ping waits for its pong under `tokio::time::timeout` (a timer registered and cancelled per round trip, which the raw rows do not do); `0`: no per-ping timer, a lost pong stalls the row (the harness's own cost, isolated) |
 //! | `raw_lat`, `raw_thr_<size>` | | the raw datagram row (`carrier_bench`, `side_ping`) at the same settings: the summary prints the gates of §12.1 and §12.3 |
 //! | `profile` | | a file: the sampled CPU profile of the `send` and `recv` threads (SHAPES-CHANNEL.md §17.1) |
 //!
@@ -88,6 +90,8 @@ struct Args {
     paths: usize,
     consume: Option<Consume>,
     msgs: usize,
+    sealed: bool,
+    timer: bool,
     profile: Option<String>,
     raw: BTreeMap<String, f64>,
 }
@@ -112,6 +116,8 @@ impl Args {
             "paths",
             "consume",
             "msgs",
+            "sealed",
+            "timer",
             "profile",
         ];
         for k in kv.keys() {
@@ -139,6 +145,8 @@ impl Args {
                 other => panic!("consume is `poll` or `batch`, got `{other}`"),
             }),
             msgs: num("msgs", 1_000_000.0) as usize,
+            sealed: num("sealed", 1.0) != 0.0,
+            timer: num("timer", 1.0) != 0.0,
             profile: kv.get("profile").cloned(),
             raw: kv
                 .iter()
@@ -514,7 +522,11 @@ impl Ctx {
         let carol = nodes.pop().unwrap();
         let bob = nodes.pop().unwrap();
         let share = Share {
-            readers: Readers::Persons(vec![name("/bob"), name("/carol")]),
+            readers: if self.args.sealed {
+                Readers::Persons(vec![name("/bob"), name("/carol")])
+            } else {
+                Readers::Anyone
+            },
             writers: vec![name("/carol")],
         };
         let bob_heap = self.rt_tx.block_on(bob.create(&space(), share)).unwrap();
@@ -761,6 +773,7 @@ impl Ctx {
             })
         };
         let bob = rig.bob_heap.clone();
+        let timer = self.args.timer;
         let (c0, t0) = (threads(), Instant::now());
         let (mut samples, lost) = self.rt_tx.block_on(async move {
             let (ping, pong) = (name("/ping"), name("/pong"));
@@ -773,7 +786,7 @@ impl Ctx {
                 bob.emit(&ping, payload.clone(), EmitOptions::default())
                     .await
                     .unwrap();
-                let answer = tokio::time::timeout(Duration::from_secs(1), async {
+                let wait = async {
                     loop {
                         match bob_items.next().await {
                             Some(Ok(got)) if got.path == pong => return true,
@@ -781,8 +794,14 @@ impl Ctx {
                             None => return false,
                         }
                     }
-                })
-                .await;
+                };
+                let answer = if timer {
+                    tokio::time::timeout(Duration::from_secs(1), wait)
+                        .await
+                        .map_err(|_| ())
+                } else {
+                    Ok(wait.await)
+                };
                 match answer {
                     Ok(true) => {
                         i += 1;
