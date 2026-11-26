@@ -404,7 +404,7 @@ async fn a_members_1_mib_note_crosses_a_grant_link_with_nothing_dropped() {
         let Some((heap, path)) = bob.locate(&big) else {
             return false;
         };
-        matches!(heap.get(&path).await, Ok(Some(item)) if item.bytes.len() == 1 << 20)
+        matches!(heap.kept(&path).await, Ok(Some(item)) if item.bytes.len() == 1 << 20)
     })
     .await;
     let (at_ann, at_bob) = (ann.links.report(), bob.links.report());

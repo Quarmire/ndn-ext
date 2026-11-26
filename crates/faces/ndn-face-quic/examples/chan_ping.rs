@@ -1,4 +1,4 @@
-//! The channel (`Heap::emit` -> `Heap::live`'s `Items`, ndn-heap) over one link, measured by the
+//! The channel (`Heap::emit` -> `Heap::get`'s `Items`, ndn-heap) over one link, measured by the
 //! method of `carrier_bench` and `side_ping` (SHAPES-CHANNEL.md §12.7, rung C1): two data-layer
 //! nodes, a writer (`/bob/phone`, on the `send` runtime) and a reader (`/carol/tablet`, on the
 //! `recv` runtime), whose channel is set up by the real signed ask (`NodeHandle::ask_channel`) and
@@ -587,6 +587,14 @@ fn everything() -> Select {
     Select::Prefix(Name::root())
 }
 
+/// What these receivers take: the emissions of the channel, not the kept values.
+fn emissions() -> GetOptions {
+    GetOptions {
+        kept: false,
+        ..GetOptions::default()
+    }
+}
+
 /// Take what `Items` yields until it ends, counting items and their size mismatches.
 async fn consume(
     mut items: Items,
@@ -639,7 +647,7 @@ impl Ctx {
         );
         let items = rig
             .carol_heap
-            .live(everything(), GetOptions::default())
+            .get(everything(), emissions())
             .expect("carol is a member");
         let subscriber = self.rt_rx.spawn(consume(
             items,
@@ -750,11 +758,11 @@ impl Ctx {
     fn latency(&self, rig: &Rig) -> (f64, f64, f64) {
         let mut bob_items = rig
             .bob_heap
-            .live(everything(), GetOptions::default())
+            .get(everything(), emissions())
             .expect("bob is a member");
         let mut carol_items = rig
             .carol_heap
-            .live(everything(), GetOptions::default())
+            .get(everything(), emissions())
             .expect("carol is a member");
         let echo = {
             let carol = rig.carol_heap.clone();
@@ -832,7 +840,7 @@ impl Ctx {
         let rig = self.rig(None, Some(Arc::clone(&tap)), &dropped);
         let mut items = rig
             .carol_heap
-            .live(everything(), GetOptions::default())
+            .get(everything(), emissions())
             .expect("carol is a member");
         let paths: Vec<Name> = (0..14).map(|i| name(&format!("/c/{i}"))).collect();
         let payload = Bytes::from(vec![0xA5; 64]);

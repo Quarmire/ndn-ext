@@ -10,7 +10,7 @@
 //! (`NodeHandle::ask_channel`: the Interest goes receiver -> relay -> sender, the session Data
 //! returns over the reverse path with its `SideRoute` and installs a route at every hop) and the
 //! frames (`Heap::emit` -> the sender's forwarder -> link -> the relay's table -> a link for each
-//! receiver -> the receivers' forwarders -> `Heap::live`'s `Items`).
+//! receiver -> the receivers' forwarders -> `Heap::get`'s `Items`).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

@@ -4,7 +4,7 @@
 //! routes toward the people's names and its side table. Each receiver asks the sender for the
 //! channel with the real signed ask: the Interest goes receiver -> relay -> sender, the session
 //! Data returns with its `SideRoute` and installs a route at every hop, and `Heap::emit` at the
-//! sender reaches both receivers' `Heap::live` through the relay.
+//! sender reaches both receivers' `Heap::get` through the relay.
 
 use std::time::{Duration, Instant};
 
@@ -25,7 +25,13 @@ use relay::{Build, Mesh, Party, Runtimes, name};
 fn live(party: &Party) -> Items {
     party
         .heap
-        .live(Select::Prefix(Name::root()), GetOptions::default())
+        .get(
+            Select::Prefix(Name::root()),
+            GetOptions {
+                kept: false,
+                ..GetOptions::default()
+            },
+        )
         .expect("a member of the space")
 }
 

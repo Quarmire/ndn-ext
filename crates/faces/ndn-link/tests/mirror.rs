@@ -611,7 +611,7 @@ async fn reads(on: &Embedded, name: &Name, s: &str) -> bool {
     let Some((heap, path)) = on.locate(name) else {
         return false;
     };
-    matches!(heap.get(&path).await, Ok(Some(item)) if item.bytes[..] == *s.as_bytes())
+    matches!(heap.kept(&path).await, Ok(Some(item)) if item.bytes[..] == *s.as_bytes())
 }
 
 /// `put` as a host does what `NotReady` says (the layer has not seen yet what
@@ -781,7 +781,7 @@ async fn newest_entry(on: &Embedded, device: &str, path: &Name) -> Name {
     let (heap, relative) = on
         .locate(path)
         .unwrap_or_else(|| panic!("{} has opened no space {path} lies in", on.durable.ns));
-    match heap.get(&relative).await {
+    match heap.kept(&relative).await {
         Ok(Some(item)) => {
             assert_eq!(item.id.device, n(device), "{path} was written by {device}");
             ndn_heap::wire::log_name(&item.id.device, heap.name(), item.id.seq)

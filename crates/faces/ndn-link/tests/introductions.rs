@@ -586,7 +586,7 @@ async fn reads(on: &Embedded, name: &Name, s: &str) -> bool {
         return false;
     };
     let path = Name::from_components(name.components()[space.len()..].iter().cloned());
-    matches!(heap.get(&path).await, Ok(Some(item)) if item.bytes[..] == *s.as_bytes())
+    matches!(heap.kept(&path).await, Ok(Some(item)) if item.bytes[..] == *s.as_bytes())
 }
 
 async fn until(what: &str, limit: Duration, mut done: impl AsyncFnMut() -> bool) {

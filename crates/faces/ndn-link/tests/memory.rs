@@ -557,7 +557,7 @@ async fn reads(on: &Embedded, name: &Name, s: &str) -> bool {
     let Some((heap, path)) = on.locate(name) else {
         return false;
     };
-    matches!(heap.get(&path).await, Ok(Some(item)) if item.bytes[..] == *s.as_bytes())
+    matches!(heap.kept(&path).await, Ok(Some(item)) if item.bytes[..] == *s.as_bytes())
 }
 
 /// `put` as a host does what `NotReady` says (the layer has not seen yet what

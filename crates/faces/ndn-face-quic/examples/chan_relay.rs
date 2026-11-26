@@ -5,7 +5,7 @@
 //! own (`send`, `recvA` to `recvD`, and `relay` for the relay's), joined by real QUIC links on
 //! loopback. The channel is set up by the real signed ask over the links, and the frames travel
 //! `Heap::emit` -> the sender's forwarder -> link -> [the relay's side table -> a link for each
-//! receiver] -> the receivers' forwarders -> `Heap::live`'s `Items`.
+//! receiver] -> the receivers' forwarders -> `Heap::get`'s `Items`.
 //!
 //! Shapes (`shapes`, comma separated):
 //!
@@ -186,6 +186,14 @@ fn everything() -> Select {
     Select::Prefix(Name::root())
 }
 
+/// What these receivers take: the emissions of the channel, not the kept values.
+fn emissions() -> GetOptions {
+    GetOptions {
+        kept: false,
+        ..GetOptions::default()
+    }
+}
+
 struct Ctx {
     args: Args,
     ctl: Arc<tokio::runtime::Runtime>,
@@ -254,11 +262,7 @@ impl Ctx {
             .mesh
             .receivers
             .iter()
-            .map(|r| {
-                r.heap
-                    .live(everything(), GetOptions::default())
-                    .expect("a member")
-            })
+            .map(|r| r.heap.get(everything(), emissions()).expect("a member"))
             .collect();
         self.ctl.block_on(async {
             for (i, r) in rig.mesh.receivers.iter().enumerate() {
@@ -565,7 +569,7 @@ impl Ctx {
         let mut bob_items = m
             .sender
             .heap
-            .live(everything(), GetOptions::default())
+            .get(everything(), emissions())
             .expect("the sender is a member");
         let items = self.open(rig);
         // The sender takes the echoing receiver's channel too: the pongs come back over the same
