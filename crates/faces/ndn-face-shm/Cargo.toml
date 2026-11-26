@@ -11,6 +11,7 @@ classification = "extension"
 [dependencies]
 portable-atomic = { workspace = true }
 ndn-transport = { workspace = true }
+ndn-foundation-types = { workspace = true, features = ["std"] }
 bytes         = { workspace = true, features = ["std"] }
 thiserror     = { workspace = true }
 tokio         = { workspace = true, features = ["net", "rt", "macros", "time"] }

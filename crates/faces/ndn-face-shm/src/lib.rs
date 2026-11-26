@@ -19,6 +19,10 @@
 #[cfg(unix)]
 pub mod spsc;
 
+/// The ring carrier: the broadcast ring as a face, and what it is found, gated and served by.
+#[cfg(unix)]
+pub mod ring_carrier;
+
 /// Re-export of [`spsc::slot_size_for_mtu`] for callers that don't depend
 /// on the `spsc` submodule directly.
 #[cfg(unix)]
@@ -81,3 +85,7 @@ pub use spsc::{
 pub use spsc::{
     BroadcastReader, BroadcastWriter, connect_broadcast_handoff, serve_broadcast_handoff,
 };
+
+/// The channel ring as a face ([`ring_carrier`]).
+#[cfg(unix)]
+pub use ring_carrier::{RingError, RingFace, RingSecret, RingStats};

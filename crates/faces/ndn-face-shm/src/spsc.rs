@@ -1197,6 +1197,11 @@ pub struct SpscFace {
     e2a_off: usize,
     a2e_rx: tokio::io::unix::AsyncFd<std::os::unix::io::OwnedFd>,
     e2a_tx: std::os::unix::io::OwnedFd,
+    /// Held for the length of one push into the e2a ring. The ring has one
+    /// producer in law, but the sender task (`send_bytes`) and any number of
+    /// forwarder reader tasks (`forward_side`) all push on this face, so a push
+    /// is exclusive. A push copies at most one slot under it and never waits.
+    tx: std::sync::Mutex<()>,
     // `None` for an anonymous (fd-passed) face: it has no named FIFOs to unlink —
     // its wakeup channels are anonymous pipes received over the control socket.
     a2e_pipe_path: Option<PathBuf>,
@@ -1258,6 +1263,7 @@ impl SpscFace {
             e2a_off,
             a2e_rx,
             e2a_tx,
+            tx: std::sync::Mutex::new(()),
             a2e_pipe_path: Some(a2e_path),
             e2a_pipe_path: Some(e2a_path),
         })
@@ -1299,6 +1305,7 @@ impl SpscFace {
             e2a_off,
             a2e_rx,
             e2a_tx: e2a_w,
+            tx: std::sync::Mutex::new(()),
             a2e_pipe_path: None,
             e2a_pipe_path: None,
         };
@@ -1399,22 +1406,26 @@ impl SpscFace {
             unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_E2A_PARKED) as *mut u32) };
         let mut f = Some(f);
         loop {
-            if self.e2a_has_space() {
-                // Sole producer: space can't vanish, so the commit succeeds.
-                let committed = unsafe {
-                    ring_reserve_commit(
-                        self.shm.as_ptr(),
-                        self.e2a_off,
-                        OFF_E2A_TAIL,
-                        OFF_E2A_HEAD,
-                        self.capacity,
-                        self.slot_size,
-                        len,
-                        f.take().unwrap(),
-                    )
-                };
-                debug_assert!(committed);
-                break;
+            {
+                let _push = self.tx.lock().unwrap_or_else(|e| e.into_inner());
+                if self.e2a_has_space() {
+                    // The lock makes this the only producer: space can't vanish,
+                    // so the commit succeeds.
+                    let committed = unsafe {
+                        ring_reserve_commit(
+                            self.shm.as_ptr(),
+                            self.e2a_off,
+                            OFF_E2A_TAIL,
+                            OFF_E2A_HEAD,
+                            self.capacity,
+                            self.slot_size,
+                            len,
+                            f.take().unwrap(),
+                        )
+                    };
+                    debug_assert!(committed);
+                    break;
+                }
             }
             tokio::task::yield_now().await;
         }
@@ -1425,6 +1436,7 @@ impl SpscFace {
     }
 
     fn try_push_e2a(&self, data: &[u8]) -> bool {
+        let _push = self.tx.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             ring_push(
                 self.shm.as_ptr(),
@@ -1439,6 +1451,7 @@ impl SpscFace {
     }
 
     fn try_push_batch_e2a(&self, pkts: &[&[u8]]) -> usize {
+        let _push = self.tx.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             ring_push_batch(
                 self.shm.as_ptr(),
@@ -1479,6 +1492,23 @@ impl SpscFace {
             if parked.load(Ordering::SeqCst) != 0 {
                 pipe_write(&self.e2a_tx);
             }
+        }
+        Ok(())
+    }
+}
+
+impl SpscFace {
+    /// The refusals every side call shares: not a side frame, or longer than a slot.
+    fn check_side(&self, frame: &[u8]) -> Result<(), SideRefused> {
+        if frame.first() != Some(&ndn_transport::SIDE_MARKER) {
+            return Err(SideRefused::Malformed);
+        }
+        let max = self.slot_size as usize;
+        if frame.len() > max {
+            return Err(SideRefused::TooLarge {
+                size: frame.len(),
+                max,
+            });
         }
         Ok(())
     }
@@ -1574,18 +1604,33 @@ impl Transport for SpscFace {
     }
 
     /// A ring push. The ring is reliable and ordered (a full ring waits), so
-    /// both classes are served and `class` is ignored. A frame over one slot is
-    /// refused `TooLarge`, which the default cannot do (this face has no
-    /// `send_mtu`, so the default would surface the slot check as an I/O error).
+    /// both classes are served and `class` is ignored. Refuses what the default
+    /// refuses, with the slot as the limit: a frame that does not start with the
+    /// marker is [`Malformed`](SideRefused::Malformed) (an NDN packet never takes
+    /// the side path) and one over a slot [`TooLarge`](SideRefused::TooLarge)
+    /// (this face has no `send_mtu`, so the default would surface the slot check
+    /// as an I/O error).
     async fn send_side(&self, frame: Bytes, _class: SideClass) -> Result<(), SideRefused> {
-        let max = self.slot_size as usize;
-        if frame.len() > max {
-            return Err(SideRefused::TooLarge {
-                size: frame.len(),
-                max,
-            });
-        }
+        self.check_side(&frame)?;
         self.send_bytes(frame).await.map_err(Into::into)
+    }
+
+    /// The non-blocking twin of [`send_side`](Self::send_side), for a forwarder
+    /// that must not stall its reader: a push into the ring if a slot is free,
+    /// else [`Full`](SideRefused::Full) at once (the frame is dropped by the
+    /// caller, who counts it). A reader parked on the ring is woken as `send_side`
+    /// wakes it. `class` is ignored: the ring is one reliable, ordered carrier.
+    fn forward_side(&self, frame: Bytes, _class: SideClass) -> Result<(), SideRefused> {
+        self.check_side(&frame)?;
+        if !self.try_push_e2a(&frame) {
+            return Err(SideRefused::Full);
+        }
+        let parked =
+            unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_E2A_PARKED) as *mut u32) };
+        if parked.load(Ordering::SeqCst) != 0 {
+            pipe_write(&self.e2a_tx);
+        }
+        Ok(())
     }
 
     async fn recv_bytes(&self) -> Result<Bytes, FaceError> {
@@ -2515,6 +2560,10 @@ pub struct BroadcastWriter {
     max_consumers: u32,
     consumers: std::sync::Mutex<Vec<(u32, OwnedFd)>>, // (registry idx, wake write end)
     next_idx: AtomicU32,
+    /// Held for one publish: the ring has one writer in law, but a face over it is
+    /// called from the sender's task and from a forwarder's reader tasks at once, so
+    /// the tail and the slot being filled are touched by one publisher at a time.
+    publishing: std::sync::Mutex<()>,
 }
 
 impl BroadcastWriter {
@@ -2548,6 +2597,7 @@ impl BroadcastWriter {
             max_consumers,
             consumers: std::sync::Mutex::new(Vec::new()),
             next_idx: AtomicU32::new(0),
+            publishing: std::sync::Mutex::new(()),
         })
     }
 
@@ -2587,6 +2637,7 @@ impl BroadcastWriter {
     }
 
     fn commit(&self, len: usize, fill: impl FnOnce(&mut [u8])) {
+        let _publishing = self.publishing.lock().unwrap_or_else(|e| e.into_inner());
         let t = self.tail().load(Ordering::Relaxed);
         let slot = unsafe {
             self.data.as_ptr().add(
@@ -2761,6 +2812,12 @@ impl BroadcastReader {
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
+    /// Frames the writer has published so far (the ring's absolute tail): a reader that
+    /// has received `n` of them since it attached, from `published() - n` frames it did
+    /// not, knows what it missed.
+    pub fn published(&self) -> u64 {
+        self.tail().load(Ordering::Acquire)
+    }
     /// This reader's registry index.
     pub fn index(&self) -> u32 {
         self.idx
@@ -2920,7 +2977,11 @@ pub fn connect_broadcast_handoff(
     use std::io::Read;
     let mut s = std::os::unix::net::UnixStream::connect(path).map_err(ShmError::Io)?;
     if !mutual_auth_client(&mut s, token).map_err(ShmError::Io)? {
-        return Err(ShmError::Io(std::io::Error::other(
+        // PermissionDenied, not `other`: a caller that retries a connect that raced the
+        // producer's bind must not retry this (each retry is one more rejection the
+        // producer counts toward giving up serving, `HANDOFF_MAX_REJECTS`).
+        return Err(ShmError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
             "broadcast handoff: producer failed authentication (possible name squatter)",
         )));
     }
@@ -3549,6 +3610,219 @@ mod tests {
         );
         assert!(handle.try_recv().is_none());
         drop((a, b));
+    }
+
+    /// An anonymous face and the handle of its peer, over a ring of `capacity` slots of
+    /// `slot` octets.
+    fn anon_pair(id: u64, capacity: u32, slot: u32) -> (SpscFace, SpscHandle) {
+        use std::os::unix::net::UnixStream;
+        let (face, fds) = SpscFace::create_anon_with(FaceId(id), capacity, slot).unwrap();
+        let (a, b) = UnixStream::pair().unwrap();
+        send_fds(
+            a.as_raw_fd(),
+            &[fds[0].as_raw_fd(), fds[1].as_raw_fd(), fds[2].as_raw_fd()],
+        )
+        .unwrap();
+        drop(fds);
+        let mut recvd = recv_fds(b.as_raw_fd(), 3).unwrap();
+        let e2a_read = recvd.pop().unwrap();
+        let a2e_write = recvd.pop().unwrap();
+        let region = recvd.pop().unwrap();
+        let handle = SpscHandle::from_fds(region, a2e_write, e2a_read).unwrap();
+        (face, handle)
+    }
+
+    fn marked(len: usize, fill: u8) -> Bytes {
+        let mut v = vec![fill; len];
+        v[0] = ndn_transport::SIDE_MARKER;
+        Bytes::from(v)
+    }
+
+    /// A full ring refuses `forward_side` as `Full` at once and keeps every frame it took;
+    /// `send_side` on the same full ring waits for room and then lands, in order, behind
+    /// them (the ring is reliable and ordered, so a sender that may wait does).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_full_ring_refuses_forward_side_without_blocking_and_send_side_waits_for_room() {
+        use std::time::Duration;
+        let (face, handle) = anon_pair(91, 4, 128);
+        for (i, class) in [
+            SideClass::Datagram,
+            SideClass::Stream,
+            SideClass::Datagram,
+            SideClass::Stream,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                face.forward_side(marked(60, i as u8 + 1), class),
+                Ok(()),
+                "frame {i} fits a ring of 4"
+            );
+        }
+        for class in [SideClass::Datagram, SideClass::Stream] {
+            assert_eq!(
+                face.forward_side(marked(60, 9), class),
+                Err(SideRefused::Full),
+                "a full ring is refused, never waited on"
+            );
+        }
+        // send_side waits: nothing lands while the ring is full.
+        let mut waiting = Box::pin(face.send_side(marked(61, 5), SideClass::Stream));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), &mut waiting)
+                .await
+                .is_err(),
+            "send_side on a full ring waits"
+        );
+        // The peer takes one frame: the waiting send lands behind the four.
+        let first = handle.recv_bytes().await.unwrap();
+        assert_eq!(first, marked(60, 1));
+        tokio::time::timeout(Duration::from_secs(2), &mut waiting)
+            .await
+            .expect("room made, the waiting send completes")
+            .unwrap();
+        for want in [marked(60, 2), marked(60, 3), marked(60, 4), marked(61, 5)] {
+            assert_eq!(handle.recv_bytes().await.unwrap(), want, "in order");
+        }
+        assert!(
+            handle.try_recv().is_none(),
+            "the refused frames were not pushed"
+        );
+    }
+
+    /// `forward_side` meets the same refusals as `send_side`: an NDN packet (first octet
+    /// not the marker) is `Malformed`, a frame over a slot `TooLarge`, and nothing is pushed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_side_path_of_a_ring_refuses_ndn_packets_and_oversize_frames_on_both_calls() {
+        let (face, handle) = anon_pair(92, 8, 100);
+        let ndn = Bytes::from_static(&[0x06, 0x05, 1, 2, 3, 4, 5]);
+        let over = marked(101, 1);
+        for class in [SideClass::Datagram, SideClass::Stream] {
+            assert_eq!(
+                face.forward_side(ndn.clone(), class),
+                Err(SideRefused::Malformed)
+            );
+            assert_eq!(
+                face.send_side(ndn.clone(), class).await,
+                Err(SideRefused::Malformed)
+            );
+            let too_large = SideRefused::TooLarge {
+                size: 101,
+                max: 100,
+            };
+            assert_eq!(
+                face.forward_side(over.clone(), class),
+                Err(too_large.clone())
+            );
+            assert_eq!(face.send_side(over.clone(), class).await, Err(too_large));
+        }
+        assert_eq!(
+            face.forward_side(Bytes::new(), SideClass::Datagram),
+            Err(SideRefused::Malformed),
+            "an empty frame is not a side frame"
+        );
+        assert!(handle.try_recv().is_none());
+    }
+
+    /// A frame `forward_side` pushes wakes a reader that parked on the ring, as `send_side`
+    /// does: a relay that only ever calls `forward_side` must not strand its peer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forward_side_wakes_a_parked_reader() {
+        use std::time::Duration;
+        let (face, handle) = anon_pair(93, 8, 128);
+        let reading = tokio::spawn(async move { handle.recv_bytes().await });
+        // Long enough for the reader to spin out and park on the wake pipe.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        face.forward_side(marked(50, 7), SideClass::Datagram)
+            .unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(2), reading)
+            .await
+            .expect("the parked reader woke")
+            .unwrap();
+        assert_eq!(got, Some(marked(50, 7)));
+    }
+
+    /// `forward_side` is called from the reader tasks of every face that routes to this
+    /// one while the face's own sender task pushes NDN packets: the ring has one producer
+    /// in law and many in fact, so a push must be exclusive. Eight threads push 300 tagged
+    /// frames each, half through `forward_side` and half through `send_bytes`, at once;
+    /// the peer sees every frame once, intact, in each producer's own order.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_producers_never_tear_or_lose_a_frame() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        const PRODUCERS: usize = 8;
+        const EACH: u32 = 300;
+        let (face, handle) = anon_pair(94, 16, 64);
+        let face = Arc::new(face);
+        let tagged = |p: usize, seq: u32| {
+            let mut v = vec![p as u8; 48];
+            v[0] = ndn_transport::SIDE_MARKER;
+            v[1..5].copy_from_slice(&seq.to_be_bytes());
+            Bytes::from(v)
+        };
+        let rt = tokio::runtime::Handle::current();
+        // Producers stop when the test ends, whichever way: a failed assertion must not
+        // leave threads spinning on a ring nobody drains.
+        struct Stop(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _stop_on_exit = Stop(Arc::clone(&stop));
+        let mut pushers = Vec::new();
+        for p in 0..PRODUCERS {
+            let (face, rt, stop) = (Arc::clone(&face), rt.clone(), Arc::clone(&stop));
+            pushers.push(tokio::task::spawn_blocking(move || {
+                for seq in 0..EACH {
+                    let frame = tagged(p, seq);
+                    if p % 2 == 0 {
+                        loop {
+                            match face.forward_side(frame.clone(), SideClass::Datagram) {
+                                Ok(()) => break,
+                                Err(SideRefused::Full) if !stop.load(Ordering::Relaxed) => {
+                                    std::thread::yield_now()
+                                }
+                                Err(_) => return,
+                            }
+                        }
+                    } else if rt
+                        .block_on(tokio::time::timeout(
+                            Duration::from_secs(10),
+                            face.send_bytes(frame),
+                        ))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }));
+        }
+        let mut next = [0u32; PRODUCERS];
+        let reading = async {
+            for _ in 0..PRODUCERS as u32 * EACH {
+                let got = handle.recv_bytes().await.expect("the ring is open");
+                assert_eq!(got.len(), 48, "a frame is whole");
+                let p = got[5] as usize;
+                assert!(
+                    got[5..].iter().all(|b| *b == p as u8) && p < PRODUCERS,
+                    "a frame is one producer's, not two interleaved"
+                );
+                let seq = u32::from_be_bytes(got[1..5].try_into().unwrap());
+                assert_eq!(seq, next[p], "producer {p}'s frames arrive in its order");
+                next[p] += 1;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(30), reading)
+            .await
+            .expect("every frame arrived");
+        for pusher in pushers {
+            pusher.await.unwrap();
+        }
+        assert!(handle.try_recv().is_none(), "no frame twice");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
