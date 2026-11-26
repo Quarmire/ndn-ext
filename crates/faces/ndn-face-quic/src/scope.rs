@@ -176,8 +176,9 @@ pub const FAIR_INTERVAL: Duration = Duration::from_secs(1);
 /// link's congestion control decides); several members active at once get
 /// `capacity / active` each, never under `floor`; a member idle for an
 /// `interval` costs the others nothing. A member is *active* while it has
-/// passed, or tried to pass, a frame in the last `interval`. Rates are
-/// recomputed once per `interval`, from the members active then; each member
+/// passed, or tried to pass, a frame in the last `interval`, or joined in
+/// it. Rates are recomputed once per `interval` and when a member joins,
+/// from the members active then; each member
 /// has a token bucket per [`Flow`] at its rate, with a burst of one second's
 /// worth. A frame longer than the burst waits for a full bucket and then
 /// takes its whole length as debt, so the average is the rate.
@@ -205,6 +206,7 @@ struct FairState {
 }
 
 struct FairSlot {
+    joined: Instant,
     last_frame: Option<Instant>,
     buckets: [FairBucket; 2],
 }
@@ -234,17 +236,33 @@ impl FairShare {
 
     /// A link of the namespace joins the pool. It leaves it when the member is
     /// dropped.
+    ///
+    /// The link counts as active from the moment it joins, for one `interval`, and the
+    /// pool's rate is recomputed then with it counted: its first burst is its fair share of
+    /// the pool as it is now, not the rate left over from when the pool had fewer members
+    /// active (which, for links that join together after a quiet spell, would give each
+    /// of them the whole pool's second).
     pub fn join(&self) -> FairMember {
-        let mut state = self.inner.lock();
+        self.join_at(Instant::now())
+    }
+
+    /// [`join`](Self::join) at `now`.
+    pub fn join_at(&self, now: Instant) -> FairMember {
+        let pool = &*self.inner;
+        let mut state = pool.lock();
         let id = state.next;
         state.next += 1;
-        let now = Instant::now();
+        let active = state.active_at(now, pool.interval) + 1;
+        state.rate =
+            (pool.capacity as f64 / active as f64).clamp(pool.floor as f64, pool.capacity as f64);
+        state.computed = Some(now);
         let rate = state.rate;
         let full = || FairBucket {
             tokens: rate,
             at: now,
         };
         let slot = FairSlot {
+            joined: now,
             last_frame: None,
             buckets: [full(), full()],
         };
@@ -291,13 +309,12 @@ impl FairPool {
 }
 
 impl FairState {
+    /// The members that passed or tried a frame in the last `interval`, or joined in it.
     fn active_at(&self, now: Instant, interval: Duration) -> usize {
+        let within = |at: Instant| now.saturating_duration_since(at) < interval;
         self.members
             .values()
-            .filter(|m| {
-                m.last_frame
-                    .is_some_and(|at| now.saturating_duration_since(at) < interval)
-            })
+            .filter(|m| within(m.joined) || m.last_frame.is_some_and(within))
             .count()
     }
 }
@@ -1882,7 +1899,7 @@ mod tests {
         let t0 = Instant::now();
         let at = |ms: u64| t0 + Duration::from_millis(ms);
         let share = FairShare::new(1000, 10, Duration::from_secs(1));
-        let (a, b) = (share.join(), share.join());
+        let a = share.join_at(at(0));
 
         // One member active: the whole pool, in a burst of one second's worth.
         assert_eq!(drain(&a, Flow::Tx, 10, at(0)), 1000);
@@ -1890,11 +1907,12 @@ mod tests {
         // The other direction has a bucket of its own.
         assert_eq!(drain(&a, Flow::Rx, 10, at(0)), 1000);
 
-        // Both members pass frames within the window.
+        // A second link joins: both pass frames within the window.
+        let b = share.join_at(at(500));
         assert!(b.admit_at(Flow::Tx, 1, at(500)).is_ok());
         assert!(a.admit_at(Flow::Tx, 1, at(600)).is_ok());
         assert_eq!(share.active_at(at(900)), 2);
-        // Past the window the rates are recomputed with both active: half each.
+        // Both count (the joiner from the moment it came): half each.
         assert!(b.admit_at(Flow::Tx, 1, at(1100)).is_ok());
         assert_eq!(share.rate(), 500);
         assert!(a.admit_at(Flow::Tx, 1, at(1100)).is_ok());
@@ -1928,6 +1946,49 @@ mod tests {
         // A member that leaves is no longer counted.
         drop(members);
         assert_eq!(share.active_at(at(1100)), 0);
+    }
+
+    /// Links that join a pool together share one second's worth of it between them, not one
+    /// each: a new link's first burst is its fair share counting itself and the links that
+    /// joined in the same interval, never the rate left over from when the pool was idle.
+    #[test]
+    fn links_that_join_at_once_share_a_burst_of_the_pool_instead_of_one_each() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let share = FairShare::new(1000, 10, Duration::from_secs(1));
+        // The pool was busy with one link, then idle for much longer than an interval: the
+        // rate it holds is the whole pool's.
+        let old = share.join_at(at(0));
+        assert_eq!(drain(&old, Flow::Tx, 10, at(0)), 1000);
+        assert_eq!(share.rate(), 1000);
+        // Three links join at the same moment, long after.
+        let joined: Vec<FairMember> = (0..3).map(|_| share.join_at(at(60_000))).collect();
+        let burst: usize = joined
+            .iter()
+            .map(|m| drain(m, Flow::Tx, 10, at(60_000)))
+            .sum();
+        assert!(
+            burst <= 1000,
+            "three new links together took a burst of {burst} octets from a pool of 1000 a second"
+        );
+        // Each of them has a share, not nothing.
+        assert!(burst >= 900, "the three took only {burst}");
+        // And a link that joins a busy pool starts at the rate that includes it, not the rate
+        // the pool had before it came: 4 active members, the fifth joins.
+        let busy: Vec<FairMember> = (0..4).map(|_| share.join_at(at(70_000))).collect();
+        for ms in [70_000, 70_500, 71_100] {
+            for m in busy.iter().chain(joined.iter()) {
+                let _ = m.admit_at(Flow::Rx, 1, at(ms));
+            }
+        }
+        let rate = share.rate();
+        let fifth = share.join_at(at(71_200));
+        let burst = drain(&fifth, Flow::Tx, 1, at(71_200));
+        assert!(
+            (burst as u64) < rate,
+            "a link joining a pool whose members get {rate} a second started with a burst of {burst}, \
+             the rate before it came"
+        );
     }
 
     #[test]
