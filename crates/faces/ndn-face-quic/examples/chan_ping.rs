@@ -233,6 +233,10 @@ impl Carrier for FaceCarrier {
         true
     }
 
+    fn stream_frame_max(&self) -> usize {
+        self.link.face.side_limits().stream_frame_max
+    }
+
     fn try_send_datagram(&self, frame: Bytes) -> Result<(), CarrierRefused> {
         self.link
             .face
@@ -301,6 +305,10 @@ impl Carrier for Tap {
 
     fn has_stream(&self) -> bool {
         false
+    }
+
+    fn stream_frame_max(&self) -> usize {
+        0
     }
 
     fn try_send_datagram(&self, frame: Bytes) -> Result<(), CarrierRefused> {
