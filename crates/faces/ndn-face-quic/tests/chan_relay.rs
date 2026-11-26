@@ -411,3 +411,128 @@ async fn a_receiver_that_left_takes_the_channel_again_on_a_direct_link() {
 async fn a_receiver_that_left_takes_the_channel_again_behind_a_relay() {
     a_receiver_that_left_takes_the_channel_again(true).await;
 }
+
+/// One receiver, asked and ready (the route standing, `HELLO` seen), on links built with `build`;
+/// the sender's link then waits for its datagram size to reach at least `datagram`.
+async fn ready_on(relay: bool, build: Build, datagram: usize) -> (Mesh, Items) {
+    let mesh = Mesh::new(&Runtimes::current(), 1, relay, build).await;
+    let mut items = live(&mesh.receivers[0]);
+    let here = tokio::runtime::Handle::current();
+    Mesh::ask(&here, &mesh.receivers[0].node, &mesh.sender.node).await;
+    eventually("HELLO", || items.hello_seen()).await;
+    eventually("the sender's link takes the datagram size", || {
+        mesh.sender.link.max_datagram_size() >= Some(datagram)
+    })
+    .await;
+    (mesh, items)
+}
+
+/// `build` with every link's path MTU search going up to `path_mtu_max`.
+fn mtu(path_mtu_max: u16) -> Build {
+    Build {
+        transport: ndn_face_quic::LinkTransportConfig {
+            path_mtu_max,
+            ..ndn_face_quic::LinkTransportConfig::default()
+        },
+        ..Build::default()
+    }
+}
+
+/// What the sender's link carried during a burst.
+#[derive(Debug)]
+struct Carried {
+    datagrams: u64,
+    datagram_octets: u64,
+    stream_frames: u64,
+    refused: u64,
+}
+
+impl Carried {
+    fn octets_a_datagram(&self) -> u64 {
+        self.datagram_octets / self.datagrams.max(1)
+    }
+}
+
+/// The sender emits `count` messages of `size` octets and the receiver takes them all, each
+/// whole; what the sender's link carried meanwhile.
+async fn burst(mesh: &Mesh, items: &mut Items, count: usize, size: usize) -> Carried {
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let before = mesh.sender.link.side_stats();
+    let payload = vec![7u8; size];
+    for i in 0..count {
+        emit(mesh, &format!("/burst/{i}"), &payload).await;
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    while seen.len() < count {
+        let got = next(items).await.expect("an item");
+        assert_eq!(got.bytes.len(), size, "a message arrives whole");
+        seen.insert(got.path.to_string());
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let after = mesh.sender.link.side_stats();
+    Carried {
+        datagrams: after.datagram_tx_frames - before.datagram_tx_frames,
+        datagram_octets: after.datagram_tx_bytes - before.datagram_tx_bytes,
+        stream_frames: after.stream_tx_frames - before.stream_tx_frames,
+        refused: after.refused - before.refused,
+    }
+}
+
+/// A forwarder-attached node sizes its datagram frames to what the link behind its forwarder
+/// takes now, not to a fixed 1,200 octets: on a link whose datagram size is 8,962, a message of
+/// 3,000 octets goes as a datagram, whole, instead of on the stream; nothing is refused. With a
+/// relay the first hop is the same link and the relay's link toward the receiver takes it too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_message_over_1200_octets_goes_as_a_datagram_through_a_forwarder_attached_node() {
+    for relay in [false, true] {
+        let (mesh, mut items) = ready_on(relay, mtu(9000), 8_900).await;
+        let limit = mesh.sender.link.max_datagram_size().unwrap() as u64;
+        let carried = burst(&mesh, &mut items, 16, 3_000).await;
+        assert!(
+            carried.datagrams >= 16 && carried.datagrams <= 17,
+            "relay {relay}: 16 messages of 3,000 octets took {carried:?}, link limit {limit}"
+        );
+        assert!(
+            carried.datagram_octets >= 16 * 3_000,
+            "relay {relay}: the messages did not go as datagrams: {carried:?}"
+        );
+        assert!(
+            carried.octets_a_datagram() > 3_000 && carried.octets_a_datagram() <= limit,
+            "relay {relay}: {carried:?}, link limit {limit}"
+        );
+        assert_eq!(carried.refused, 0, "relay {relay}: {carried:?}");
+        if let Some(relay_site) = &mesh.relay {
+            let stats = relay_site.engine.side().stats();
+            assert_eq!(stats.sink_error, 0, "relay {relay}: {stats:?}");
+        }
+    }
+}
+
+/// The frame follows a smaller live limit as it follows a larger one: on links whose datagram
+/// size is 1,414, a 1,300-octet message goes as a datagram (over 1,200, within the link), and one
+/// of 1,500 goes on the stream, whole: no frame is ever over what the link takes, none is
+/// refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_frame_never_exceeds_the_live_limit_of_a_smaller_link() {
+    let (mesh, mut items) = ready_on(false, mtu(1_452), 1_400).await;
+    let limit = mesh.sender.link.max_datagram_size().unwrap() as u64;
+    assert!(
+        limit < 1_500,
+        "the search stops at the configured size: {limit}"
+    );
+    let fits = burst(&mesh, &mut items, 16, 1_300).await;
+    assert!(
+        fits.datagrams >= 16 && fits.datagram_octets >= 16 * 1_300,
+        "a message over 1,200 within the link goes as a datagram: {fits:?}, link limit {limit}"
+    );
+    assert!(
+        fits.octets_a_datagram() > 1_300 && fits.octets_a_datagram() <= limit,
+        "{fits:?}, link limit {limit}"
+    );
+    let over = burst(&mesh, &mut items, 8, 1_500).await;
+    assert!(
+        over.stream_frames >= 1 && over.datagrams == 0,
+        "a message over the link's datagram size goes on the stream: {over:?}"
+    );
+    assert_eq!((fits.refused, over.refused), (0, 0), "{fits:?} {over:?}");
+}
