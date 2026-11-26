@@ -67,6 +67,15 @@ impl FaceSink for EngineFaces {
         self.0.fib().routes_to(face)
     }
 
+    /// The routes of the engine's side table that have `face` as their source or as a sink.
+    fn side_routes(&self, face: FaceId) -> usize {
+        self.0.side().routes_to(face)
+    }
+
+    fn side_remove_face(&self, face: FaceId) {
+        self.0.side().remove_face(face);
+    }
+
     fn transit(&self, namespace: &Name, served: bool) {
         let transit = self.0.transit();
         if served {
@@ -137,6 +146,41 @@ mod tests {
         faces.transit(&home, true);
         faces.transit(&home, false);
         assert_eq!(strategy_at(&engine, "/home/32=sync"), Some(multicast));
+        shutdown.shutdown().await;
+    }
+
+    /// `EngineFaces` answers the quiet-close rule from the engine's side table (the routes that
+    /// have the face as source or sink) and takes a face's routes from it on request.
+    #[tokio::test]
+    async fn the_engine_counts_a_faces_side_routes_and_drops_them_on_request() {
+        use ndn_engine::side::SideId;
+        use std::time::Duration;
+
+        let (engine, shutdown) = EngineBuilder::new(EngineConfig::default())
+            .security(Arc::new(SecurityManager::new()))
+            .build()
+            .await
+            .unwrap();
+        let faces = EngineFaces(engine.clone());
+        let (a, b, c) = (FaceId(10), FaceId(11), FaceId(12));
+        assert_eq!(faces.side_routes(a), 0);
+        let side = engine.side();
+        let ttl = Duration::from_secs(30);
+        side.install(SideId(1), a, b, ttl).unwrap(); // a is route 1's source
+        side.install(SideId(2), c, a, ttl).unwrap(); // a is route 2's sink
+        side.install(SideId(3), c, b, ttl).unwrap(); // a has no part in route 3
+        assert_eq!(faces.side_routes(a), 2);
+        assert_eq!(faces.side_routes(b), 2);
+        assert_eq!(faces.side_routes(c), 2);
+
+        faces.side_remove_face(a);
+        assert_eq!(faces.side_routes(a), 0, "the face's routes are gone");
+        assert_eq!(
+            faces.side_routes(b),
+            1,
+            "route 1 went with its source, route 3 stays"
+        );
+        assert_eq!(faces.side_routes(c), 1, "route 2 had no sink left");
         shutdown.shutdown().await;
     }
 }

@@ -114,6 +114,17 @@ pub trait FaceSink: Send + Sync + 'static {
         0
     }
 
+    /// The link of `face` lost the identity that authorized channel frames
+    /// over it but stays (another membership still admits it): the
+    /// forwarder drops every side route that has `face` as its source or as a
+    /// sink, so no channel frame crosses it on the strength of the lost
+    /// identity. A receiver behind the link asks again and the new Data
+    /// installs the routes the link's remaining identities allow. A face that
+    /// ends is taken from the table by the forwarder's own
+    /// [`remove_face`](Self::remove_face); a forwarder with no side routes
+    /// does nothing, the default.
+    fn side_remove_face(&self, _face: FaceId) {}
+
     /// A device of `namespace`, a namespace this device does not hold, is
     /// linked here and served by the serving policy (`true`), or one such
     /// link ended (`false`; calls pair up). While any is linked, the

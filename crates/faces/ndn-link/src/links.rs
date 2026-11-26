@@ -478,6 +478,9 @@ impl Links {
             for (face, prefixes) in &dropped.routes {
                 self.faces.remove_routes(*face, prefixes);
             }
+            for face in &dropped.faces {
+                self.faces.side_remove_face(*face);
+            }
             if let Some(handle) = &dropped.handle {
                 handle.send_presence(&ndn_face_quic::Presence {
                     namespace: dropped.namespace.clone(),

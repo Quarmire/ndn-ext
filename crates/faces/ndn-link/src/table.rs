@@ -111,6 +111,9 @@ pub(crate) struct Member {
 pub(crate) struct Dropped {
     pub(crate) namespace: Name,
     pub(crate) routes: Vec<(FaceId, Vec<Name>)>,
+    /// Every face of the link's paths: the forwarder's side routes over them
+    /// were installed under channel authority the link no longer has.
+    pub(crate) faces: Vec<FaceId>,
     pub(crate) handle: Option<LinkHandle>,
 }
 
@@ -899,6 +902,7 @@ impl LinkTable {
                 dropped.push(Dropped {
                     namespace: id.namespace,
                     routes,
+                    faces: link.paths.iter().map(|p| p.path.face).collect(),
                     handle: link
                         .paths
                         .iter()

@@ -210,6 +210,8 @@ impl LinkTrust for Trust {
 struct Recorder {
     next: AtomicU64,
     live: Mutex<Vec<FaceId>>,
+    /// The faces the links asked the forwarder to take its side routes from.
+    side_removed: Mutex<Vec<FaceId>>,
     routes: Mutex<Vec<(FaceId, Route)>>,
     /// Woken on every change of the faces or routes.
     changed: tokio::sync::Notify,
@@ -280,6 +282,10 @@ impl FaceSink for Recorder {
     }
     fn routes_to(&self, face: FaceId) -> bool {
         self.routes.lock().iter().any(|(f, _)| *f == face)
+    }
+    fn side_remove_face(&self, face: FaceId) {
+        self.side_removed.lock().push(face);
+        self.changed.notify_waiters();
     }
     fn transit(&self, _: &Name, _: bool) {}
 }
@@ -714,6 +720,63 @@ async fn revoking_one_membership_keeps_the_link_by_another_and_the_last_closes_i
     at_phone
         .settles("the device's side closes", |r| r.live.lock().is_empty())
         .await;
+    cancel.cancel();
+}
+
+/// A link that loses an identity and stays (another membership still admits it) asks the
+/// forwarder to take its side routes from the link's face: the routes were installed
+/// under channel authority the link no longer has. A link that ends is taken from the
+/// forwarder by `remove_face`, which the forwarder answers with its own cleanup.
+#[tokio::test]
+async fn a_link_that_loses_an_identity_and_stays_has_its_side_routes_taken_from_its_face() {
+    let cancel = CancellationToken::new();
+    let (a, c) = (namespace("/a", 10).await, namespace("/c", 30).await);
+    let relay_c = c.device("node", "relay", 90).await;
+    let relay_a = a.device("node", "relay", 91).await;
+    let trust = Trust::new(
+        &[&a, &c],
+        relay_c.chain.clone(),
+        vec![relay_a.membership(&a)],
+    );
+    let keyring = Arc::clone(&trust.keyring);
+    let (_relay, at_relay, addr) = start(relay_c.link_key(), trust, Vec::new(), true, &cancel);
+    let phone = phone(&a, &c).await;
+    let (_phone, _at_phone, _) = start(
+        phone.a.link_key(),
+        Trust::new(
+            &[&a, &c],
+            phone.a.chain.clone(),
+            vec![phone.c.membership(&c)],
+        ),
+        vec![relay_peer("/c/node/relay", addr)],
+        false,
+        &cancel,
+    );
+    at_relay
+        .settles("the relay routes the phone in both namespaces", |r| {
+            r.routed().len() == 4
+        })
+        .await;
+    let face = at_relay.live.lock()[0];
+    assert!(
+        at_relay.side_removed.lock().is_empty(),
+        "a link that keeps every identity keeps its side routes"
+    );
+
+    keyring
+        .adopt_update(c.context_revoking(2, Some("/c/member/phone/KEY/k")))
+        .unwrap();
+    at_relay
+        .settles("the link loses its C identity and stays", |r| {
+            r.routed().len() == 2
+        })
+        .await;
+    assert_eq!(
+        *at_relay.side_removed.lock(),
+        vec![face],
+        "the forwarder is asked once to take the link's side routes"
+    );
+    assert_eq!(at_relay.live.lock().len(), 1, "the link stays");
     cancel.cancel();
 }
 

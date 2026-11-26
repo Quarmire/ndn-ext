@@ -483,6 +483,14 @@ impl Transport for Faulted {
         self.inner.forward_side(frame, class)
     }
 
+    fn forward_side_from(
+        &self,
+        frame: Bytes,
+        class: ndn_transport::SideClass,
+        ingress: FaceId,
+    ) -> Result<(), ndn_transport::SideRefused> {
+        self.inner.forward_side_from(frame, class, ingress)
+    }
     fn side_frame_max(&self) -> usize {
         self.inner.side_frame_max()
     }
@@ -1000,6 +1008,7 @@ mod tests {
         rx: Mutex<mpsc::UnboundedReceiver<Bytes>>,
         sent: parking_lot::Mutex<Vec<(Bytes, ndn_transport::SideClass)>>,
         forwarded: parking_lot::Mutex<Vec<(Bytes, ndn_transport::SideClass)>>,
+        ingressed: parking_lot::Mutex<Vec<(Bytes, FaceId)>>,
     }
 
     impl Transport for SideSpy {
@@ -1028,6 +1037,15 @@ mod tests {
             self.forwarded.lock().push((frame, class));
             Err(ndn_transport::SideRefused::Full)
         }
+        fn forward_side_from(
+            &self,
+            frame: Bytes,
+            _class: ndn_transport::SideClass,
+            ingress: FaceId,
+        ) -> Result<(), ndn_transport::SideRefused> {
+            self.ingressed.lock().push((frame, ingress));
+            Ok(())
+        }
         fn side_frame_max(&self) -> usize {
             1234
         }
@@ -1049,6 +1067,7 @@ mod tests {
             rx: Mutex::new(rx),
             sent: parking_lot::Mutex::new(Vec::new()),
             forwarded: parking_lot::Mutex::new(Vec::new()),
+            ingressed: parking_lot::Mutex::new(Vec::new()),
         });
         let layer = Arc::new(FaultLayer::default());
         let inner: Arc<dyn ErasedTransport> = spy.clone();
@@ -1080,6 +1099,14 @@ mod tests {
         );
         assert_eq!(*spy.forwarded.lock(), vec![(frame(2), SideClass::Datagram)]);
         assert_eq!(face.side_frame_max(), 1234);
+        // The forwarder says which face a frame came over: the layer passes that on.
+        face.forward_side_from(frame(3), SideClass::Datagram, FaceId(5))
+            .unwrap();
+        assert_eq!(
+            *spy.ingressed.lock(),
+            vec![(frame(3), FaceId(5))],
+            "the ingress face reaches the inner face"
+        );
         assert_eq!(layer.report().met, 0, "nothing sent met the profile");
 
         // Arrivals: marked frames get the fates the shared stream draws.
