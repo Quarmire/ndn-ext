@@ -686,6 +686,7 @@ async fn conn_send_task(
                             incoming_face_id: None,
                             next_hop_face_id: Some(fid.0),
                             cache_policy: None,
+                            side_route: None,
                         };
                         encode_lp_with_headers(&pkt, &headers)
                     }
