@@ -693,6 +693,55 @@ async fn offline_closes_every_link_and_makes_no_attempt_and_online_links_the_pee
     words_cross(&ann, &bob, LONG).await;
 }
 
+/// Dials of one device at once (the peer entry the host keeps dialled, and the dials by key
+/// that a join or a hint makes) leave one link between the two devices, not none, whatever
+/// order the two ends see the connections come up in. A new connection of a device that
+/// dialled replaces its older one at each end by that end's own order; when the ends order
+/// two of them differently each closes the one the other keeps, and both dials answered `Ok`
+/// with no link left. Each of thirty devices starts with Ann in its peers (its own dial of
+/// her begins at once) and dials her three times by her key at the same time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dials_of_one_device_at_once_leave_one_link_and_not_none() {
+    let home = Home::new();
+    let ann = dev(&home, "ann", 1, "127.0.0.1:0", Vec::new()).await;
+    for round in 0..30u8 {
+        let bob = dev(
+            &home,
+            &format!("bob{round}"),
+            10 + round,
+            "127.0.0.1:0",
+            vec![peer_to(&ann)],
+        )
+        .await;
+        let dial = || {
+            bob.links.dial_by_key(
+                ann.key,
+                ann.name.clone(),
+                vec![ann.addr],
+                Duration::from_secs(10),
+                Vec::new(),
+            )
+        };
+        let (a, b, c) = tokio::join!(dial(), dial(), dial());
+        for answer in [a, b, c] {
+            if let Err(why) = answer {
+                panic!("round {round}: a dial of Ann was not answered Ok: {why:?}");
+            }
+        }
+        // Bob's dials answer when his end registered the link: Ann's end follows.
+        within("both ends hold the link", LONG, || {
+            linked(&ann, bob.key) && linked(&bob, ann.key)
+        })
+        .await;
+        throughout(
+            &format!("round {round}: the dials answered Ok and the link ended"),
+            Duration::from_millis(600),
+            || linked(&ann, bob.key) && linked(&bob, ann.key),
+        )
+        .await;
+    }
+}
+
 /// SHAPES-R7 D: an offline device refuses inbound handshakes before they
 /// begin, with no reply of substance: the dialling device gets no answer (its
 /// handshake times out) and not a refusal it could read.

@@ -39,7 +39,7 @@ use crate::serving::QuotaState;
 use crate::signal::Signal;
 use crate::slots::EnrollmentSlots;
 use crate::status::{DirectState, DirectStatus, LinkReport, LinkStatus, PathKind, PathStatus};
-use crate::table::{LinkPath, LinkTable, Registration};
+use crate::table::{ALREADY_LINKED, DialTurns, LinkPath, LinkTable, Registration};
 use crate::waiting::{WaitFor, Waiting};
 use crate::watch::{LinkStates, Next};
 
@@ -102,6 +102,9 @@ pub struct Links {
     /// Dial-only sockets, by address family (`true`: IPv4).
     pub(crate) dialers: Mutex<HashMap<bool, Arc<LinkEndpoint>>>,
     pub(crate) table: LinkTable,
+    /// One dialled connection at a time through the registration of its link, per device
+    /// dialled ([`DialTurns`]).
+    dial_turns: DialTurns,
     enrollment_slots: EnrollmentSlots,
     pub(crate) direct: Direct,
     signal: OnceLock<Arc<Signal>>,
@@ -190,6 +193,7 @@ impl Links {
             socket: setup.socket,
             dialers: Mutex::new(HashMap::new()),
             table: LinkTable::default(),
+            dial_turns: DialTurns::default(),
             enrollment_slots: EnrollmentSlots::default(),
             direct: Direct::default(),
             reliability: setup.reliability,
@@ -787,6 +791,25 @@ impl Links {
             return Err(NotLinked::refused_here(CloseReason::Shutdown, detail));
         }
         let peer_fp = hs.peer_key().fingerprint();
+        // One connection at a time is made to a device this one dials, through the
+        // registration of its link ([`DialTurns`]): the dial that waited for another's turn and
+        // finds that link up is the second of a pair made together, and the first stays. It is
+        // refused here, before its hello, so the device that accepted it never has the two to
+        // choose between.
+        let dial_turn = match origin {
+            Origin::Dialed(_) => {
+                let (turn, waited) = self.dial_turns.take(peer_fp).await;
+                if waited && self.table.has_dialed_link(&peer_fp) {
+                    hs.refuse(CloseReason::Replaced, ALREADY_LINKED);
+                    return Err(NotLinked::refused_here(
+                        CloseReason::Replaced,
+                        LinkDetail::new(code::LINK_EXISTS, ALREADY_LINKED),
+                    ));
+                }
+                Some(turn)
+            }
+            _ => None,
+        };
         // A direct path is named by both hellos: the dialer's punch session,
         // and the session the listener punches with that key.
         let session = match origin {
@@ -1058,13 +1081,13 @@ impl Links {
                 joined: Vec::new(),
             },
         };
-        let Some(generation) = self.table.register(registration, self.my_fingerprint()) else {
+        let registered = self.table.register(registration, self.my_fingerprint());
+        // The link is in the table: the next connection to this device may go on.
+        drop(dial_turn);
+        let Some(generation) = registered else {
             return Err(NotLinked::refused_here(
                 CloseReason::Replaced,
-                LinkDetail::new(
-                    code::LINK_EXISTS,
-                    "a link between these two devices already exists",
-                ),
+                LinkDetail::new(code::LINK_EXISTS, ALREADY_LINKED),
             ));
         };
         self.faces.add_face(face, self.cancel.child_token());
@@ -1413,6 +1436,9 @@ impl Links {
                 };
                 match attempt.await {
                     Ok(handle) => return Ok(handle),
+                    // Another dial of this device reached the same device first: no other path
+                    // of it is tried for a second link.
+                    Err(e) if link_exists(&e.detail) => return Err(e),
                     Err(e) => last = e,
                 }
             }
@@ -1545,6 +1571,12 @@ fn hex(session: &PathSession) -> String {
     session.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Whether a dial failed because this device refused the connection for another that
+/// reaches the same device (the cause the detail of such a refusal carries).
+pub(crate) fn link_exists(detail: &LinkDetail) -> bool {
+    detail.code == code::LINK_EXISTS || detail.causes.iter().any(|c| c.code == code::LINK_EXISTS)
+}
+
 /// The close reason `reason` as details carry it: its code (§6.1), hex.
 pub(crate) fn close_code(reason: CloseReason) -> String {
     format!("0x{:02x}", reason.code())
@@ -1630,6 +1662,9 @@ impl From<LinkError> for NotLinked {
 /// close it when it is no longer wanted. Ends when the peer is removed.
 pub(crate) async fn dial_loop(links: Weak<Links>, id: PeerId, ctl: Arc<PeerCtl>) {
     let mut backoff = Backoff::default();
+    // The link of a dial of the same device made at the same time that this peer's dial gave
+    // way to: it is this peer's link as well (the next turn of the loop keeps it).
+    let mut sibling: Option<LinkHandle> = None;
     loop {
         let Some(this) = links.upgrade() else { return };
         let cancel = this.cancel.clone();
@@ -1662,7 +1697,8 @@ pub(crate) async fn dial_loop(links: Weak<Links>, id: PeerId, ctl: Arc<PeerCtl>)
 
         // Linked (dialled, or the other device dialled this one): keep it
         // while it is wanted.
-        if let Some(handle) = this.table.link_to(id) {
+        let adopted = sibling.take();
+        if let Some(handle) = this.table.link_to(id).or(adopted) {
             backoff.reset();
             let closed_here = this.keep(id, &ctl, &handle).await;
             // A relay that closed its link saying it shuts down is not
@@ -1738,6 +1774,14 @@ pub(crate) async fn dial_loop(links: Weak<Links>, id: PeerId, ctl: Arc<PeerCtl>)
         };
         let attempt = this.dial_once(id, &peer).await;
         drop(turn);
+        if let Err(e) = &attempt
+            && link_exists(&e.detail)
+            && let Some(handle) = peer.key.and_then(|key| this.table.link_to_key(&key))
+        {
+            sibling = Some(handle);
+            ctl.dialled(None);
+            continue;
+        }
         let wait = match attempt {
             Ok(_) => {
                 ctl.dialled(None);

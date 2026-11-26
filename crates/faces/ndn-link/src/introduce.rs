@@ -47,7 +47,7 @@ use tokio::task::JoinSet;
 use crate::admission::{Admitted, Enrollment, Refusal};
 use crate::candidates::Candidate;
 use crate::host::PathCandidate;
-use crate::links::{Links, Origin, dial_loop};
+use crate::links::{Links, Origin, dial_loop, link_exists};
 use crate::peer::{PeerId, PeerSpec};
 use crate::policy::CANDIDATES_MAX;
 
@@ -326,6 +326,12 @@ impl Links {
                 self.keep_dialled(id);
                 Ok(())
             }
+            // Another dial of this device to the same key came up first and its link is the
+            // one this dial asked for ([`DialTurns`](crate::table::DialTurns)).
+            Err(e) if link_exists(&e) && self.table.is_linked(&key) => {
+                self.forget_dialled(id);
+                Ok(())
+            }
             Err(e) => {
                 self.watch_failed(id, Some(key), &e, crate::watch::Next::Gone);
                 self.forget_dialled(id);
@@ -429,6 +435,11 @@ impl Links {
         match self.establish(hs, Origin::Dialed(id)).await {
             Ok(_handle) => {
                 self.keep_dialled(id);
+                Ok(key)
+            }
+            // Another dial of this device to the same key came up first (the same as above).
+            Err(e) if link_exists(&e.detail) && self.table.is_linked(&key) => {
+                self.forget_dialled(id);
                 Ok(key)
             }
             Err(e) => {

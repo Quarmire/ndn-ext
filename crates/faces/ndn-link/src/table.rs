@@ -6,8 +6,8 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Instant, SystemTime};
 
 use parking_lot::Mutex;
@@ -217,8 +217,54 @@ pub(crate) struct LinkTable {
     lapse_wake: Arc<tokio::sync::Notify>,
 }
 
-const ALREADY_LINKED: &str = "a link between these two devices already exists";
+pub(crate) const ALREADY_LINKED: &str = "a link between these two devices already exists";
 const ALREADY_DIRECT: &str = "a newer direct path between these two devices took this one's place";
+
+/// The turn to establish a dialled link to one device: a device dials another's key one
+/// connection at a time through the registration of its link.
+///
+/// Two connections of the same dialler to the same device that come up together are, to each
+/// end, "the newer replaces the older" ([`register`](LinkTable::register)), and the two ends
+/// see them register in orders of their own: when the orders differ each end closes the
+/// connection the other keeps and the device pair is left with no link. The dialler is the
+/// one end that can choose, so it does not run two at once: the second waits for the first's
+/// link to be registered (its hello is not sent before) and, finding it there, stays out of
+/// its way ([`Links::establish`](crate::Links)).
+#[derive(Default)]
+pub(crate) struct DialTurns(Mutex<HashMap<KeyFingerprint, Weak<tokio::sync::Mutex<()>>>>);
+
+/// The turn of one connection to a device, given back when dropped.
+pub(crate) struct DialTurn {
+    _held: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl DialTurns {
+    /// Wait for the turn to establish a link to `key`; whether another connection to it held
+    /// the turn first.
+    pub(crate) async fn take(&self, key: KeyFingerprint) -> (DialTurn, bool) {
+        let turn = {
+            let mut turns = self.0.lock();
+            turns.retain(|_, turn| turn.strong_count() > 0);
+            match turns.get(&key).and_then(Weak::upgrade) {
+                Some(turn) => turn,
+                None => {
+                    let turn = Arc::new(tokio::sync::Mutex::new(()));
+                    turns.insert(key, Arc::downgrade(&turn));
+                    turn
+                }
+            }
+        };
+        match Arc::clone(&turn).try_lock_owned() {
+            Ok(held) => (DialTurn { _held: held }, false),
+            Err(_) => (
+                DialTurn {
+                    _held: turn.lock_owned().await,
+                },
+                true,
+            ),
+        }
+    }
+}
 
 impl LinkTable {
     /// Record an admitted path and return its generation; `None` when the
@@ -326,6 +372,25 @@ impl LinkTable {
     /// Whether the device with key `fingerprint` is linked (over any path).
     pub(crate) fn is_linked(&self, fingerprint: &KeyFingerprint) -> bool {
         self.live.lock().contains_key(fingerprint)
+    }
+
+    /// Whether this device holds a link path to the device with key `fingerprint` that it
+    /// dialled and that is not closed: the first of a pair of dials, when a second of the same
+    /// device (made at the same time) comes after it.
+    pub(crate) fn has_dialed_link(&self, fingerprint: &KeyFingerprint) -> bool {
+        self.live.lock().get(fingerprint).is_some_and(|l| {
+            l.paths.iter().any(|p| {
+                p.path.kind == PathKind::Link
+                    && p.path.direction == Direction::Dialed
+                    && !p.path.handle.is_closed()
+            })
+        })
+    }
+
+    /// The link path to the device with key `fingerprint`, whichever peer entry or other
+    /// device made it.
+    pub(crate) fn link_to_key(&self, fingerprint: &KeyFingerprint) -> Option<LinkHandle> {
+        self.path_to(|_, fp| fp == fingerprint, PathKind::Link)
     }
 
     /// Whether the device with key `fingerprint` is linked and has shown a
@@ -998,6 +1063,35 @@ fn closed_text(why: &str, advice: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_second_dial_of_one_device_waits_for_the_first_and_another_device_does_not() {
+        let turns = DialTurns::default();
+        let (a, b) = (KeyFingerprint([1; 32]), KeyFingerprint([2; 32]));
+        let (first, waited) = turns.take(a).await;
+        assert!(!waited);
+        // Another device's dial is not held up by the first.
+        let (other, waited) = turns.take(b).await;
+        assert!(!waited);
+        drop(other);
+        // The second of the same device waits until the first is given back.
+        let second = turns.take(a);
+        tokio::pin!(second);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut second)
+                .await
+                .is_err(),
+            "the second dial took its turn with the first holding it"
+        );
+        drop(first);
+        let (second, waited) = second.await;
+        assert!(waited, "the second dial did not say it waited");
+        drop(second);
+        // Nothing is kept for a device nobody dials.
+        let (_third, waited) = turns.take(a).await;
+        assert!(!waited);
+        assert!(turns.0.lock().len() <= 1);
+    }
 
     #[test]
     fn when_both_dial_the_smaller_fingerprints_dial_stays() {
