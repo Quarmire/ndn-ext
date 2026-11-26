@@ -1160,7 +1160,11 @@ impl Links {
                     Some(quiet) => idle_check(quiet).min(ENROLLMENT_IDLE / 4),
                     None => ENROLLMENT_IDLE / 4,
                 };
-                let (mut carried, mut quiet_since) = (activity(&watched), Instant::now());
+                let routed_side = |l: &Arc<Self>| l.faces.side_routes(face_id) > 0;
+                let (mut carried, mut quiet_since) = (
+                    activity(&watched, weak.upgrade().is_some_and(|l| routed_side(&l))),
+                    Instant::now(),
+                );
                 loop {
                     tokio::select! {
                         biased;
@@ -1186,23 +1190,24 @@ impl Links {
                         continue;
                     }
                     let Some(quiet) = quiet else { continue };
-                    let now = activity(&watched);
+                    let routed = weak.upgrade().is_some_and(|l| routed_side(&l));
+                    let now = activity(&watched, routed);
                     if now != carried {
                         (carried, quiet_since) = (now, Instant::now());
                     } else if quiet_since.elapsed() >= quiet
                         && transit.is_empty()
-                        && !weak.upgrade().is_some_and(|l| {
-                            l.faces.routes_to(face_id) || l.faces.side_routes(face_id) > 0
-                        })
+                        && !weak
+                            .upgrade()
+                            .is_some_and(|l| l.faces.routes_to(face_id) || routed_side(&l))
                     {
                         watched.close(
                             CloseReason::Idle,
                             &format!(
-                                "this link carried no NDN packet and no channel frame for {} s, and \
-                                 nothing on this device routes to it or carries a namespace in transit \
-                                 over it: it is closed; your device dials again when it has something \
-                                 to send or to serve",
-                                quiet.as_secs()
+                                "this link carried no NDN packet and no channel frame that something \
+                                 routes for {} s, and nothing on this device routes to it or carries a \
+                                 namespace in transit over it: it is closed; your device dials again \
+                                 when it has something to send or to serve",
+                            quiet.as_secs()
                             ),
                         );
                     }
@@ -1434,7 +1439,7 @@ impl Links {
     /// no longer asks for, a relay no longer chosen, a removed peer.
     /// Returns once the link ended, with whether this device closed it.
     async fn keep(&self, id: PeerId, ctl: &PeerCtl, handle: &LinkHandle) -> bool {
-        let mut seen = activity(handle);
+        let mut seen = activity(handle, true);
         let mut quiet_since = Instant::now();
         loop {
             // Traffic is looked for every idle_check; once none came, sleep
@@ -1455,7 +1460,7 @@ impl Links {
                 () = ctl.changed() => {}
                 () = tokio::time::sleep(check) => {}
             }
-            let now = activity(handle);
+            let now = activity(handle, true);
             if now != seen {
                 seen = now;
                 quiet_since = Instant::now();

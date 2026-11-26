@@ -109,9 +109,9 @@
 //! carries them under its namespace's fair share
 //! ([`ndn_face_quic::FairShare`]), and its names include the asks of a channel
 //! to the devices of the folder's owner namespace (`<device>/32=chan`).
-//! Channel bytes count as a link's activity, and a link the forwarder holds a
-//! side route to ([`FaceSink::side_routes`]) is routed, for the quiet-close
-//! rule; keep-alives and control messages are neither
+//! Channel stream bytes count as a link's activity for the quiet-close rule only while the
+//! forwarder holds a side route to the link ([`FaceSink::side_routes`], which also makes the
+//! link routed); keep-alives and control messages are neither
 //! ([`LinkStatus::side`] counts them).
 //!
 //! # What a host provides

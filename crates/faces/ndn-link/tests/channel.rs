@@ -342,10 +342,11 @@ async fn a_guests_link_carries_no_channel_frames_drops_what_the_guest_sends_and_
     cancel.cancel();
 }
 
-/// A link another device dialed here that carries no NDN packet is closed once quiet; a
-/// link that carries channel frames on its stream (which are no datagrams) is not.
+/// A link another device dialed here that carries no NDN packet is closed once quiet, and
+/// channel stream bytes do not keep it open while nothing routes them: a peer that sends
+/// channel frames the forwarder drops (no side route to its link) is not using the link.
 #[tokio::test]
-async fn channel_stream_bytes_keep_a_link_from_being_quiet_and_an_idle_one_closes() {
+async fn channel_stream_bytes_nobody_routes_do_not_keep_a_link_open() {
     let cancel = CancellationToken::new();
     let home = Home::new();
     let quiet = Duration::from_secs(1);
@@ -360,12 +361,19 @@ async fn channel_stream_bytes_keep_a_link_from_being_quiet_and_an_idle_one_close
     .await;
     let face = busy.at.link_face();
     let sending = tokio::spawn(async move {
-        for i in 0..24u8 {
-            face.send_side(frame(i, 1000), SideClass::Stream)
+        let mut sent = 0u32;
+        for i in 0..60u8 {
+            if face
+                .send_side(frame(i, 1000), SideClass::Stream)
                 .await
-                .unwrap();
+                .is_err()
+            {
+                break;
+            }
+            sent += 1;
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
+        sent
     });
     within(
         "the idle link closes as quiet",
@@ -373,17 +381,60 @@ async fn channel_stream_bytes_keep_a_link_from_being_quiet_and_an_idle_one_close
         || idle.at.live.lock().is_empty(),
     )
     .await;
-    assert_eq!(
-        busy.at.live.lock().len(),
+    within(
+        "the link whose channel stream bytes nothing routes closes as quiet too",
+        Duration::from_secs(8),
+        || l.at.live.lock().is_empty(),
+    )
+    .await;
+    assert!(
+        sending.await.unwrap() > 0,
+        "the frames did cross before the link was closed"
+    );
+    cancel.cancel();
+}
+
+/// While the forwarder holds a side route to a link, what the peer sends on its channel
+/// stream is routed traffic: the link is not quiet however long it carries no NDN packet,
+/// and once the route goes the quiet period runs from the last channel byte.
+#[tokio::test]
+async fn channel_stream_bytes_count_as_activity_while_the_link_has_a_side_route() {
+    let cancel = CancellationToken::new();
+    let home = Home::new();
+    let l = device(
+        &home,
+        "member",
+        "l",
         1,
-        "the link carrying channel stream frames stayed"
-    );
-    sending.await.unwrap();
-    assert_eq!(
-        side_of(&busy, l.key).stream_tx_frames,
-        24,
-        "every frame crossed while the link was held open"
-    );
+        Some(Duration::from_secs(1)),
+        Vec::new(),
+        &cancel,
+    )
+    .await;
+    l.at.side_routes.store(1, Ordering::SeqCst);
+    let busy = device(&home, "member", "busy", 2, None, dials(&l), &cancel).await;
+    within("both link", Duration::from_secs(10), || {
+        busy.at.live.lock().len() == 1 && l.at.live.lock().len() == 1
+    })
+    .await;
+    let (face, reader) = (busy.at.link_face(), l.at.link_face());
+    let reading = tokio::spawn(async move { while reader.recv_bytes().await.is_ok() {} });
+    for i in 0..8u8 {
+        face.send_side(frame(i, 1000), SideClass::Stream)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert_eq!(l.at.live.lock().len(), 1, "a routed link stays");
+    // The route goes and the peer sends no more: the link closes once quiet.
+    l.at.side_routes.store(0, Ordering::SeqCst);
+    within(
+        "the unrouted quiet link closes",
+        Duration::from_secs(8),
+        || l.at.live.lock().is_empty(),
+    )
+    .await;
+    reading.abort();
     cancel.cancel();
 }
 
