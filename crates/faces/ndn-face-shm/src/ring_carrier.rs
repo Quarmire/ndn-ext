@@ -460,6 +460,12 @@ impl Transport for RingFace {
         }
     }
 
+    /// A lossy broadcast ring has no ordered, reliable stream: the datagram class only, and
+    /// only on a writer (a reader carries nothing out).
+    fn side_carries(&self, class: SideClass) -> bool {
+        class == SideClass::Datagram && self.side_frame_max() != 0
+    }
+
     /// Publish one frame into the ring. Datagram class only; see [`forward_side`](Self::forward_side).
     async fn send_side(&self, frame: Bytes, class: SideClass) -> Result<(), SideRefused> {
         self.publish(&frame, class)
@@ -895,6 +901,28 @@ mod tests {
         );
     }
 
+    /// What each shared-memory face carries, as the forwarder and a sender that asks see it: the
+    /// ordered, reliable ring of two processes (`SpscFace`) carries both classes, the lossy
+    /// broadcast ring's writer the datagram class only, and its reader nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_shared_memory_faces_report_which_side_classes_they_carry() {
+        let (spsc, _fds) = crate::spsc::SpscFace::create_anon_with(FaceId(90), 16, 256).unwrap();
+        assert!(spsc.side_carries(SideClass::Datagram) && spsc.side_carries(SideClass::Stream));
+        let name = ring_name("carries");
+        let writer = RingFace::offer(FaceId(1), &name, &SECRET, 300)
+            .await
+            .unwrap();
+        let reader = RingFace::attach(FaceId(2), &name, &SECRET).await.unwrap();
+        assert!(writer.side_carries(SideClass::Datagram));
+        assert!(
+            !writer.side_carries(SideClass::Stream),
+            "a lossy ring has no stream"
+        );
+        assert!(
+            !reader.side_carries(SideClass::Datagram) && !reader.side_carries(SideClass::Stream)
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_writer_refuses_what_the_side_path_refuses_and_is_never_full() {
         let name = ring_name("writer");
@@ -930,6 +958,15 @@ mod tests {
             Ok(())
         );
         assert_eq!(recv(&reader).await.unwrap(), frame(300, 1));
+
+        // The face says so as a fact of its medium: a writer carries the datagram class only, a
+        // reader (which carries nothing out) none.
+        assert!(writer.side_carries(SideClass::Datagram));
+        assert!(
+            !writer.side_carries(SideClass::Stream),
+            "a lossy ring has no stream"
+        );
+        assert!(!reader.side_carries(SideClass::Datagram));
 
         // Only the datagram class exists on a lossy ring: the stream class is refused, counted
         // by the face, and the forwarder counts it `class_unsupported` (NotCarried).

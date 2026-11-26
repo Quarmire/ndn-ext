@@ -494,6 +494,9 @@ impl Transport for Faulted {
     fn side_frame_max(&self) -> usize {
         self.inner.side_frame_max()
     }
+    fn side_carries(&self, class: ndn_transport::SideClass) -> bool {
+        self.inner.side_carries(class)
+    }
 
     fn set_send_mtu(&self, mtu: Option<u64>) -> Result<Option<u64>, MtuError> {
         self.inner.set_send_mtu(mtu)
@@ -1049,6 +1052,9 @@ mod tests {
         fn side_frame_max(&self) -> usize {
             1234
         }
+        fn side_carries(&self, class: ndn_transport::SideClass) -> bool {
+            class == ndn_transport::SideClass::Datagram
+        }
         async fn recv_bytes(&self) -> Result<Bytes, FaceError> {
             self.rx.lock().await.recv().await.ok_or(FaceError::Closed)
         }
@@ -1099,6 +1105,13 @@ mod tests {
         );
         assert_eq!(*spy.forwarded.lock(), vec![(frame(2), SideClass::Datagram)]);
         assert_eq!(face.side_frame_max(), 1234);
+        // What the link's medium carries is the link's too: the layer does not claim a stream
+        // the inner face lacks.
+        assert!(face.side_carries(SideClass::Datagram));
+        assert!(
+            !face.side_carries(SideClass::Stream),
+            "the inner face has no stream"
+        );
         // The forwarder says which face a frame came over: the layer passes that on.
         face.forward_side_from(frame(3), SideClass::Datagram, FaceId(5))
             .unwrap();

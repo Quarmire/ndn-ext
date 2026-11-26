@@ -1664,6 +1664,8 @@ async fn a_frame_over_the_path_size_is_repacked_once() {
     let listener = endpoint(ec_key(2), true);
     let (a, b) = channel_link(&dialer, &listener).await;
     let max = a.face.side_frame_max();
+    // A QUIC link has both carriers: the datagram and an ordered, reliable stream.
+    assert!(a.face.side_carries(SideClass::Datagram) && a.face.side_carries(SideClass::Stream));
     assert_eq!(
         Some(max),
         a.face.send_mtu(),
