@@ -549,6 +549,17 @@ async fn a_note_changed_in_the_store_leaves_no_mark_at_the_next_start() {
         let bob = embedded(&bobs, "/bob/member/phone", Setup::dialer()).await;
         invited(&ann, &bob, Role::Writer).await;
         let_go_offline(&ann, &bob).await;
+        // The departure is told to the host in memory first, and the note that keeps the mark is
+        // written after (`judge_inviter_notes`): "Ann holds the departure" says nothing of the
+        // note. Change the note only once it holds the mark, or the write that follows replaces
+        // the changed note (and a restart before it finds no mark at all).
+        until("Ann's note keeps the mark", LONG, async || {
+            ann.store()
+                .scan_under(&n("/localhost/ndn-invite/grant"), 0)
+                .iter()
+                .any(|(_, note)| note[FLAGS] & MARKED != 0)
+        })
+        .await;
         let notes = ann.store().scan_under(&n("/localhost/ndn-invite/grant"), 0);
         assert_eq!(notes.len(), 1, "{what}: the notes of Ann's store");
         if let Some(tamper) = tamper {
