@@ -44,6 +44,11 @@ pub enum ShmError {
     PacketTooLarge,
     #[error("SHM face closed (peer died or cancelled)")]
     Closed,
+    /// The ring's owner answered the handoff with a refusal instead of the ring: it has no
+    /// place for another reader, or could not set one up. The text is the owner's reason
+    /// and says what to do.
+    #[error("the ring's owner refused the attach: {0}")]
+    Refused(String),
 }
 
 #[cfg(unix)]

@@ -81,6 +81,11 @@ const fn slot_stride(slot_size: u32) -> usize {
 /// path (~sub-µs on modern hardware).
 const SPIN_ITERS: u32 = 64;
 
+/// A ring that is never empty yields to the runtime once in this many packets handed
+/// out ([`SpscFace::recv_bytes`]): the reader loop that calls it awaits nothing else, so
+/// without this a peer that keeps the ring full holds a worker thread.
+const POPS_PER_YIELD: u32 = 32;
+
 fn shm_total_size(capacity: u32, slot_size: u32) -> usize {
     HEADER_SIZE + 2 * capacity as usize * slot_stride(slot_size)
 }
@@ -127,6 +132,57 @@ fn a2e_pipe_path(name: &str) -> PathBuf {
 
 fn e2a_pipe_path(name: &str) -> PathBuf {
     PathBuf::from(format!("/tmp/.ndn-{name}.e2a.pipe"))
+}
+
+/// Check that the region behind `fd`, handed over by a peer, is sealed against what the
+/// peer must not do to it (see [`ShmRegion::from_fd_sealed`]): shrinking or growing it
+/// always; writing it too when `writable` is false. A no-op where there are no seals
+/// (not Linux).
+#[cfg(target_os = "linux")]
+fn check_peer_seals(fd: RawFd, writable: bool) -> Result<(), ShmError> {
+    let mut need = libc::F_SEAL_SHRINK | libc::F_SEAL_GROW;
+    if !writable {
+        need |= libc::F_SEAL_FUTURE_WRITE;
+    }
+    let have = unsafe { libc::fcntl(fd, libc::F_GET_SEALS) };
+    if have == -1 {
+        let e = std::io::Error::last_os_error();
+        return Err(ShmError::Io(std::io::Error::new(
+            e.kind(),
+            format!(
+                "the shared-memory region a peer handed over cannot be checked for seals ({e}): \
+                 it is not a sealed memfd, so the peer could resize it under this process; \
+                 refuse it and attach to a ring whose owner creates sealed regions"
+            ),
+        )));
+    }
+    let missing = need & !have;
+    if missing != 0 {
+        let mut what = Vec::new();
+        if missing & libc::F_SEAL_SHRINK != 0 {
+            what.push("shrinking (the peer could make this process fault with SIGBUS)");
+        }
+        if missing & libc::F_SEAL_GROW != 0 {
+            what.push("growing");
+        }
+        if missing & libc::F_SEAL_FUTURE_WRITE != 0 {
+            what.push("writing (any process with the object could forge what readers see)");
+        }
+        return Err(ShmError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "the shared-memory region a peer handed over is not sealed against {}: refuse it, \
+                 and ask the ring's owner to create its regions with this crate (sealed memfds)",
+                what.join(", ")
+            ),
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn check_peer_seals(_fd: RawFd, _writable: bool) -> Result<(), ShmError> {
+    Ok(())
 }
 
 /// Verify the object behind `fd` is at least `size` bytes before it's mapped — a
@@ -242,17 +298,110 @@ impl ShmRegion {
         })
     }
 
-    /// Create an **anonymous**, capability-scoped SHM region: `shm_open` a
-    /// high-entropy `O_EXCL` name at `0o600`, map it, then `shm_unlink` the name
-    /// *immediately* so the region survives only through the returned fd — it
-    /// never lingers in `/dev/shm` for another process to list/open. The fd is
-    /// then handed to the peer out-of-band via `SCM_RIGHTS` ([`send_fds`]).
+    /// Create an **anonymous**, capability-scoped SHM region. The fd is handed to
+    /// the peer out-of-band ([`send_fds`]); the region never appears in a shared
+    /// namespace.
     ///
-    /// This is the portable stand-in for Linux `memfd_create` (which is absent on
-    /// macOS, the dev target): `O_CREAT|O_EXCL` + a retry loop defeats name
-    /// pre-creation, and the immediate unlink + `0o600` close the `/dev/shm`
-    /// listing leak the named-region path has.
+    /// **Linux:** a `memfd` sealed against `F_SEAL_SHRINK | F_SEAL_GROW` (and
+    /// `F_SEAL_SEAL`, so no peer can add a seal that would stop another peer mapping
+    /// it). Every holder of the fd may write the *contents* — that is what the
+    /// region is for — but none can truncate it, so no peer can make a mapping of it
+    /// fault (`SIGBUS`) in another process. The seals are applied after the region
+    /// is sized and mapped.
+    ///
+    /// **Other Unix (macOS):** there is no `memfd`, so the region is a `shm_open`
+    /// object at `0o600`, unlinked at once; its fd **can** be `ftruncate`d by
+    /// whoever holds it. There the "a peer cannot shrink the region" guarantee
+    /// does not hold: only the same-uid, token-gated peers that are handed the fd
+    /// can do it.
     fn create_anon(size: usize) -> Result<(Self, OwnedFd), ShmError> {
+        #[cfg(target_os = "linux")]
+        {
+            Self::create_sealed_memfd(size, false)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Self::create_anon_posix(size)
+        }
+    }
+
+    /// A `memfd` of `size` bytes, mapped read-write here, then sealed against
+    /// resizing; with `peers_read_only` also against any later write through the fd
+    /// (`F_SEAL_FUTURE_WRITE`), which leaves **this** process's existing writable
+    /// mapping working and refuses every other writable mapping and `write(2)`,
+    /// whatever descriptor it comes through — a `/proc/self/fd/N` reopen with
+    /// `O_RDWR` included, which is what a plain `O_RDONLY` fd does not stop for a
+    /// same-uid peer.
+    #[cfg(target_os = "linux")]
+    fn create_sealed_memfd(
+        size: usize,
+        peers_read_only: bool,
+    ) -> Result<(Self, OwnedFd), ShmError> {
+        let fd = unsafe {
+            libc::memfd_create(
+                c"ndn-shm".as_ptr(),
+                libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+            )
+        };
+        if fd == -1 {
+            let e = std::io::Error::last_os_error();
+            return Err(ShmError::Io(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "memfd_create failed ({e}): a shared-memory ring needs sealed memfd regions \
+                     (Linux 3.17, 5.1 for write seals); run on a kernel that has them, or allow \
+                     memfd_create in this process's seccomp filter"
+                ),
+            )));
+        }
+        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+        if unsafe { libc::ftruncate(fd, size as libc::off_t) } == -1 {
+            return Err(ShmError::Io(std::io::Error::last_os_error()));
+        }
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        if p == libc::MAP_FAILED {
+            return Err(ShmError::Io(std::io::Error::last_os_error()));
+        }
+        // Owned from here: a failed seal unmaps.
+        let region = ShmRegion {
+            ptr: p as *mut u8,
+            size,
+            shm_name: None,
+        };
+        let mut seals = libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL;
+        if peers_read_only {
+            seals |= libc::F_SEAL_FUTURE_WRITE;
+        }
+        if unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, seals) } == -1 {
+            let e = std::io::Error::last_os_error();
+            return Err(ShmError::Io(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "sealing a shared-memory region failed ({e}): the ring needs F_SEAL_SHRINK, \
+                     F_SEAL_GROW and F_SEAL_FUTURE_WRITE (Linux 5.1)"
+                ),
+            )));
+        }
+        Ok((region, owned))
+    }
+
+    /// The portable stand-in for the sealed `memfd` (see [`create_anon`](Self::create_anon)):
+    /// `shm_open` a high-entropy `O_EXCL` name at `0o600`, map it, then `shm_unlink` the
+    /// name *immediately* so the region survives only through the returned fd. The
+    /// `O_EXCL` retry loop defeats name pre-creation, the immediate unlink and `0o600`
+    /// close the `/dev/shm` listing leak the named-region path has. The fd can be
+    /// resized by its holders.
+    #[cfg(not(target_os = "linux"))]
+    fn create_anon_posix(size: usize) -> Result<(Self, OwnedFd), ShmError> {
         static ANON_CTR: AtomicU64 = AtomicU64::new(0);
         let pid = unsafe { libc::getpid() };
         for _ in 0..64 {
@@ -334,18 +483,41 @@ impl ShmRegion {
         })
     }
 
-    /// Create an anonymous region the **producer maps read-write** while handing
-    /// consumers a **read-only fd**: the only writable access is the producer's own
-    /// mapping (which is never transmittable), so no other process — not a consumer,
-    /// not a third party who obtains the fd — can ever write the region. This is the
+    /// Create an anonymous region the **producer maps read-write** while consumers
+    /// can only ever read it: the only writable access is the producer's own mapping
+    /// (which is never transmittable), so no other process — not a consumer, not a
+    /// third party who obtains the fd — can write the region. This is the
     /// kernel-enforced single-writer foundation: integrity + origin without a
     /// per-frame signature, because forgery is *impossible*, not merely *trusted*.
     ///
-    /// Mechanism: open the object `O_RDWR`, open a *second* `O_RDONLY` fd to the same
-    /// object, `shm_unlink` the name, map the RW fd, then close it (the mapping stays
-    /// writable). The returned `OwnedFd` is read-only — `SCM_RIGHTS` preserves the
-    /// `O_RDONLY` mode, and `mmap(PROT_WRITE)` on it is refused by the kernel.
+    /// **Linux:** a `memfd` sealed with `F_SEAL_FUTURE_WRITE | F_SEAL_SHRINK |
+    /// F_SEAL_GROW | F_SEAL_SEAL` after the producer mapped it. The seal is on the
+    /// object, not on the descriptor, so it holds against a peer of the **same uid**
+    /// too: reopening `/proc/self/fd/N` (or `/proc/<pid>/fd/N`) with `O_RDWR`, then
+    /// `mmap(PROT_WRITE)`, `write(2)` or `ftruncate`, all fail with `EPERM`.
+    ///
+    /// **Other Unix (macOS):** the object is `shm_open`ed `0o600`, a second `O_RDONLY`
+    /// fd is what consumers get, the name is unlinked and the writable fd closed.
+    /// A consumer cannot map it writable through that fd, but nothing stops a process
+    /// of the **same uid** that can reach the object some other way from reopening
+    /// it read-write: there the guarantee is across uids only.
     fn create_anon_ro(size: usize) -> Result<(Self, OwnedFd), ShmError> {
+        #[cfg(target_os = "linux")]
+        {
+            Self::create_sealed_memfd(size, true)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Self::create_anon_ro_posix(size)
+        }
+    }
+
+    /// See [`create_anon_ro`](Self::create_anon_ro): open the object `O_RDWR`, open a
+    /// *second* `O_RDONLY` fd to it, `shm_unlink` the name, map the RW fd, then close it
+    /// (the mapping stays writable). The returned `OwnedFd` is read-only — `SCM_RIGHTS`
+    /// preserves the `O_RDONLY` mode, and `mmap(PROT_WRITE)` on it is refused.
+    #[cfg(not(target_os = "linux"))]
+    fn create_anon_ro_posix(size: usize) -> Result<(Self, OwnedFd), ShmError> {
         static ANON_RO_CTR: AtomicU64 = AtomicU64::new(0);
         let pid = unsafe { libc::getpid() };
         for _ in 0..64 {
@@ -434,6 +606,27 @@ impl ShmRegion {
             size,
             shm_name: None,
         })
+    }
+
+    /// Map a region **a peer handed over** as the fd of a ring: first check, on Linux,
+    /// that the object is sealed so the peer cannot change it under this mapping, then
+    /// map it. `writable`: a region this process writes (the peer may write it
+    /// too, so it must at least be unshrinkable); otherwise a region only the peer
+    /// writes, which must also be sealed against any further write, and is mapped
+    /// read-only. A region that is not sealed is refused, with the reason: a peer
+    /// that can still `ftruncate` it can make this process fault (`SIGBUS`) on any
+    /// access, and a peer that can still write a region meant to be read-only can
+    /// forge what its readers see.
+    ///
+    /// Not Linux: there are no seals; this is [`from_fd`](Self::from_fd) or
+    /// [`from_fd_ro`](Self::from_fd_ro).
+    fn from_fd_sealed(fd: RawFd, size: usize, writable: bool) -> Result<Self, ShmError> {
+        check_peer_seals(fd, writable)?;
+        if writable {
+            Self::from_fd(fd, size)
+        } else {
+            Self::from_fd_ro(fd, size)
+        }
     }
 
     fn as_ptr(&self) -> *mut u8 {
@@ -593,7 +786,48 @@ unsafe fn ring_push_batch(
     to_push
 }
 
-/// Returns `None` if empty.
+/// A ring whose cursors say something no correct producer and consumer can have
+/// written: more unread slots than the ring has. Either cursor lives in memory the
+/// peer can write, so a peer that sets the tail (or the head) far off — `head + 2^31` —
+/// would otherwise make the consumer pop garbage slots forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RingCorrupt {
+    head: u32,
+    tail: u32,
+    capacity: u32,
+}
+
+impl std::fmt::Display for RingCorrupt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the ring's read cursor is {} and its write cursor {}: {} unread slots in a ring of \
+             {}, which no correct peer writes — the peer corrupted the ring (or is hostile), so \
+             the face is closed; restart the peer and let it reconnect",
+            self.head,
+            self.tail,
+            self.tail.wrapping_sub(self.head),
+            self.capacity,
+        )
+    }
+}
+
+/// The unread slots of a ring, or why the cursors cannot be believed: `h == t` is
+/// empty, `t - h <= capacity` is a ring the producer has filled at most, anything else
+/// is a cursor the peer wrote.
+fn ring_unread(h: u32, t: u32, capacity: u32) -> Result<u32, RingCorrupt> {
+    let n = t.wrapping_sub(h);
+    if n > capacity {
+        return Err(RingCorrupt {
+            head: h,
+            tail: t,
+            capacity,
+        });
+    }
+    Ok(n)
+}
+
+/// `Ok(None)` if empty; `Err` if the cursors are out of range (see [`RingCorrupt`]).
 ///
 /// # Safety
 /// Same as [`ring_push`].
@@ -604,14 +838,14 @@ unsafe fn ring_pop(
     head_off: usize,
     capacity: u32,
     slot_size: u32,
-) -> Option<Bytes> {
+) -> Result<Option<Bytes>, RingCorrupt> {
     let tail_a = unsafe { AtomicU32::from_ptr(base.add(tail_off) as *mut u32) };
     let head_a = unsafe { AtomicU32::from_ptr(base.add(head_off) as *mut u32) };
 
     let h = head_a.load(Ordering::Relaxed);
     let t = tail_a.load(Ordering::Acquire);
-    if h == t {
-        return None;
+    if ring_unread(h, t, capacity)? == 0 {
+        return Ok(None);
     }
 
     let idx = (h % capacity) as usize;
@@ -622,14 +856,15 @@ unsafe fn ring_pop(
     let data = unsafe { Bytes::copy_from_slice(std::slice::from_raw_parts(slot.add(4), len)) };
 
     head_a.store(h.wrapping_add(1), Ordering::Release);
-    Some(data)
+    Ok(Some(data))
 }
 
 /// **Zero-copy consume:** borrow the head slot's payload in place, run `f` on it,
 /// then advance head — no intermediate `Bytes` allocation/`memcpy` (unlike
 /// [`ring_pop`]). The borrow is confined to `f`'s execution and head is advanced
 /// only after `f` returns, so the single producer cannot overwrite the slot
-/// mid-read (it cannot reuse this index until head passes it). `None` if empty.
+/// mid-read (it cannot reuse this index until head passes it). `Ok(None)` if empty,
+/// and then the closure is left in the `Option` untouched; `Err` if the cursors are out of range.
 ///
 /// For a consumer that processes-and-discards within `f` (e.g. a renderer, a
 /// digest, or a streaming sink) this removes the slot→heap copy. It is NOT for a
@@ -638,22 +873,22 @@ unsafe fn ring_pop(
 ///
 /// # Safety
 /// Same as [`ring_pop`].
-unsafe fn ring_peek_consume<R>(
+unsafe fn ring_peek_consume<R, F: FnOnce(&[u8]) -> R>(
     base: *mut u8,
     ring_off: usize,
     tail_off: usize,
     head_off: usize,
     capacity: u32,
     slot_size: u32,
-    f: impl FnOnce(&[u8]) -> R,
-) -> Option<R> {
+    f: &mut Option<F>,
+) -> Result<Option<R>, RingCorrupt> {
     let tail_a = unsafe { AtomicU32::from_ptr(base.add(tail_off) as *mut u32) };
     let head_a = unsafe { AtomicU32::from_ptr(base.add(head_off) as *mut u32) };
 
     let h = head_a.load(Ordering::Relaxed);
     let t = tail_a.load(Ordering::Acquire);
-    if h == t {
-        return None;
+    if ring_unread(h, t, capacity)? == 0 {
+        return Ok(None);
     }
 
     let idx = (h % capacity) as usize;
@@ -662,10 +897,10 @@ unsafe fn ring_peek_consume<R>(
     let len = len.min(slot_size as usize);
     let out = {
         let view = unsafe { std::slice::from_raw_parts(slot.add(4), len) };
-        f(view)
+        (f.take().expect("a consume closure is called once"))(view)
     };
     head_a.store(h.wrapping_add(1), Ordering::Release);
-    Some(out)
+    Ok(Some(out))
 }
 
 /// Send file descriptors to a connected Unix-socket peer via `SCM_RIGHTS`,
@@ -851,34 +1086,123 @@ fn nonce() -> std::io::Result<[u8; 32]> {
     Ok(n)
 }
 
-/// **Producer-side mutual auth** over a connected blocking stream: prove knowledge
-/// of capability `k` to the consumer and verify the consumer's proof — the raw `k`
-/// never crosses the wire. Returns `Ok(true)` iff the consumer proved `k`. Because
-/// the consumer independently verifies the producer, a squatter that doesn't know
-/// `k` is rejected by the consumer and never harvests the secret.
-pub fn mutual_auth_server(
-    s: &mut std::os::unix::net::UnixStream,
+/// The whole of one handshake on a control socket — connect, mutual authentication, and
+/// the hand-over of the fds — may take this long, **on either end**. A peer that is
+/// silent, or answers a byte at a time, is dropped when it passes; the listener serves
+/// the others meanwhile (see [`Handoff`]), and a client whose owner is silent gets an
+/// error that says so instead of waiting for ever.
+pub const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A control-socket stream whose every read and write is bounded by one deadline for
+/// the whole exchange: before each call the stream's timeout is set to what is left, so
+/// a peer that trickles bytes cannot stretch the handshake past the deadline.
+struct Bounded<'a> {
+    s: &'a mut std::os::unix::net::UnixStream,
+    end: std::time::Instant,
+    /// Who is silent, for the error: "the client" or "the ring's owner".
+    silent: &'static str,
+}
+
+impl Bounded<'_> {
+    fn timed_out(&self) -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "{} did not answer within {} s of the control-socket handshake",
+                self.silent,
+                HANDSHAKE_TIMEOUT.as_secs()
+            ),
+        )
+    }
+
+    /// Set the stream's timeouts to the time left; the deadline passing is an error.
+    fn arm(&self) -> std::io::Result<()> {
+        let left = self
+            .end
+            .saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Err(self.timed_out());
+        }
+        self.s.set_read_timeout(Some(left))?;
+        self.s.set_write_timeout(Some(left))
+    }
+
+    /// A timeout of the socket as the handshake's own, other errors as they are.
+    fn mapped(&self, e: std::io::Error) -> std::io::Error {
+        if matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ) {
+            self.timed_out()
+        } else {
+            e
+        }
+    }
+}
+
+impl std::io::Read for Bounded<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.arm()?;
+        let r = self.s.read(buf);
+        r.map_err(|e| self.mapped(e))
+    }
+}
+
+impl std::io::Write for Bounded<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.arm()?;
+        let r = self.s.write(buf);
+        r.map_err(|e| self.mapped(e))
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.s.flush()
+    }
+}
+
+/// What a producer's side of the handshake found.
+enum Auth {
+    /// The peer proved the capability.
+    Proved,
+    /// The peer answered, and the proof is wrong.
+    Wrong,
+    /// The peer closed before sending a single octet: a probe (a writer checking whether
+    /// a socket path is live), not an attempt.
+    Probe,
+}
+
+fn auth_server_over<S: std::io::Read + std::io::Write>(
+    s: &mut S,
     k: &ShmToken,
-) -> std::io::Result<bool> {
-    use std::io::{Read, Write};
+) -> std::io::Result<Auth> {
     let mut nc = [0u8; 32];
-    s.read_exact(&mut nc)?;
+    let first = loop {
+        match s.read(&mut nc) {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            r => break r?,
+        }
+    };
+    if first == 0 {
+        return Ok(Auth::Probe);
+    }
+    s.read_exact(&mut nc[first..])?;
     let ns = nonce()?;
     s.write_all(&ns)?;
     s.write_all(&auth_mac(k, AUTH_TAG_SERVER, &nc, &ns))?;
     let mut proof_c = [0u8; 32];
     s.read_exact(&mut proof_c)?;
-    Ok(ct_eq(&proof_c, &auth_mac(k, AUTH_TAG_CLIENT, &nc, &ns)))
+    Ok(
+        if ct_eq(&proof_c, &auth_mac(k, AUTH_TAG_CLIENT, &nc, &ns)) {
+            Auth::Proved
+        } else {
+            Auth::Wrong
+        },
+    )
 }
 
-/// **Consumer-side mutual auth**: send a nonce, verify the producer proved `k`
-/// (reject a squatter, revealing nothing), then send our own proof. Returns
-/// `Ok(true)` iff the producer is authentic; the caller must abort on `false`.
-pub fn mutual_auth_client(
-    s: &mut std::os::unix::net::UnixStream,
+fn auth_client_over<S: std::io::Read + std::io::Write>(
+    s: &mut S,
     k: &ShmToken,
 ) -> std::io::Result<bool> {
-    use std::io::{Read, Write};
     let nc = nonce()?;
     s.write_all(&nc)?;
     let mut ns = [0u8; 32];
@@ -890,6 +1214,61 @@ pub fn mutual_auth_client(
     }
     s.write_all(&auth_mac(k, AUTH_TAG_CLIENT, &nc, &ns))?;
     Ok(true)
+}
+
+/// **Producer-side mutual auth** over a connected blocking stream: prove knowledge
+/// of capability `k` to the consumer and verify the consumer's proof — the raw `k`
+/// never crosses the wire. Returns `Ok(true)` iff the consumer proved `k`. Because
+/// the consumer independently verifies the producer, a squatter that doesn't know
+/// `k` is rejected by the consumer and never harvests the secret. The exchange is
+/// bounded by [`HANDSHAKE_TIMEOUT`] as a whole (`TimedOut` after it); the stream's own
+/// timeouts are cleared on return.
+pub fn mutual_auth_server(
+    s: &mut std::os::unix::net::UnixStream,
+    k: &ShmToken,
+) -> std::io::Result<bool> {
+    let end = std::time::Instant::now() + HANDSHAKE_TIMEOUT;
+    let out = auth_server_over(
+        &mut Bounded {
+            s: &mut *s,
+            end,
+            silent: "the client",
+        },
+        k,
+    );
+    let _ = s.set_read_timeout(None);
+    let _ = s.set_write_timeout(None);
+    match out? {
+        Auth::Proved => Ok(true),
+        Auth::Wrong => Ok(false),
+        Auth::Probe => Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "the client closed before the handshake began",
+        )),
+    }
+}
+
+/// **Consumer-side mutual auth**: send a nonce, verify the producer proved `k`
+/// (reject a squatter, revealing nothing), then send our own proof. Returns
+/// `Ok(true)` iff the producer is authentic; the caller must abort on `false`. Bounded
+/// by [`HANDSHAKE_TIMEOUT`] as a whole: a producer that does not answer is a `TimedOut`
+/// error, not a wait for ever. The stream's own timeouts are cleared on return.
+pub fn mutual_auth_client(
+    s: &mut std::os::unix::net::UnixStream,
+    k: &ShmToken,
+) -> std::io::Result<bool> {
+    let end = std::time::Instant::now() + HANDSHAKE_TIMEOUT;
+    let out = auth_client_over(
+        &mut Bounded {
+            s: &mut *s,
+            end,
+            silent: "the ring's owner",
+        },
+        k,
+    );
+    let _ = s.set_read_timeout(None);
+    let _ = s.set_write_timeout(None);
+    out
 }
 
 /// Unauthorized connections one *process* (kernel-reported uid + pid of the
@@ -1115,18 +1494,112 @@ impl UnauthGate {
     }
 }
 
-/// Accept connections until one passes `gate`; connections from a peer over its
-/// bound are closed at once, unread. Only an `accept` failure (listener closed)
-/// ends this — unauthorized connections never do.
-async fn accept_admitted(
-    listener: &tokio::net::UnixListener,
-    gate: &UnauthGate,
-    what: &str,
-) -> std::io::Result<(std::os::unix::net::UnixStream, Peer)> {
-    loop {
-        let (stream, _addr) = listener.accept().await?;
+/// Handshakes one listener runs at once, in all. A silent peer holds one of these for
+/// at most [`HANDSHAKE_TIMEOUT`]; a connection that arrives with all taken is closed at
+/// once (its client sees the end of the stream and retries).
+const HANDSHAKES_IN_FLIGHT_MAX: usize = 16;
+
+/// Handshakes in flight for one uid. Less than the total, so that one user opening
+/// silent connections cannot take every place and keep the others out.
+const HANDSHAKES_PER_UID_MAX: usize = 8;
+
+/// How a connection's handshake ended.
+enum Handshake {
+    /// The peer proved the capability; the stream is ready for the hand-over.
+    Authorized(std::os::unix::net::UnixStream),
+    /// The peer answered and did not know the capability.
+    Wrong,
+    /// The peer connected and closed without a word.
+    Probe,
+    /// The peer went silent past the deadline, or the socket failed mid-way.
+    Failed(std::io::Error),
+}
+
+/// One connection's handshake, bounded by [`HANDSHAKE_TIMEOUT`] in all (blocking: it runs
+/// on a blocking task).
+fn run_handshake(mut s: std::os::unix::net::UnixStream, token: ShmToken) -> Handshake {
+    let end = std::time::Instant::now() + HANDSHAKE_TIMEOUT;
+    let out = auth_server_over(
+        &mut Bounded {
+            s: &mut s,
+            end,
+            silent: "the client",
+        },
+        &token,
+    );
+    match out {
+        Ok(Auth::Proved) => {
+            // The hand-over that follows is bounded too.
+            let _ = s.set_read_timeout(None);
+            let _ = s.set_write_timeout(Some(HANDSHAKE_TIMEOUT));
+            Handshake::Authorized(s)
+        }
+        Ok(Auth::Wrong) => Handshake::Wrong,
+        Ok(Auth::Probe) => Handshake::Probe,
+        Err(e) => Handshake::Failed(e),
+    }
+}
+
+/// The accept loop of a control socket. Each connection's handshake runs in a task of its
+/// own (at most [`HANDSHAKES_IN_FLIGHT_MAX`], [`HANDSHAKES_PER_UID_MAX`] per uid, each
+/// ended by [`HANDSHAKE_TIMEOUT`]), so a peer that connects and sends nothing, or one
+/// octet at a time, holds one place for five seconds and never the loop. The
+/// [`UnauthGate`] is applied on accept and fed when a handshake ends: a wrong proof or a
+/// silent peer counts against the peer, a connect-and-close with no octet (a probe, such
+/// as [`bind_exclusive`](crate::ring_carrier::bind_exclusive)'s) does not.
+///
+/// **Only a failure of the listener ends the loop** — a connection's failure, at any
+/// step, is logged with its reason and what to do, and the loop goes on.
+struct Handoff {
+    listener: tokio::net::UnixListener,
+    token: ShmToken,
+    what: &'static str,
+    gate: UnauthGate,
+    in_flight: tokio::task::JoinSet<(Peer, Handshake)>,
+    per_uid: std::collections::HashMap<Option<u32>, usize>,
+}
+
+impl Handoff {
+    fn new(listener: tokio::net::UnixListener, token: ShmToken, what: &'static str) -> Self {
+        Self {
+            listener,
+            token,
+            what,
+            gate: UnauthGate::new(),
+            in_flight: tokio::task::JoinSet::new(),
+            per_uid: std::collections::HashMap::new(),
+        }
+    }
+
+    fn uid(peer: Peer) -> Option<u32> {
+        match peer {
+            Peer::Process { uid, .. } => Some(uid),
+            Peer::Unidentified => None,
+        }
+    }
+
+    /// The next connection whose peer proved the capability.
+    async fn next_authorized(&mut self) -> std::io::Result<std::os::unix::net::UnixStream> {
+        loop {
+            tokio::select! {
+                accepted = self.listener.accept() => match accepted {
+                    Ok((stream, _addr)) => self.admit(stream),
+                    Err(e) => self.accept_failed(e).await?,
+                },
+                Some(done) = self.in_flight.join_next(), if !self.in_flight.is_empty() => {
+                    if let Some(s) = self.settle(done) {
+                        return Ok(s);
+                    }
+                }
+            }
+        }
+    }
+
+    /// A connection arrived: refuse it cheaply, or start its handshake.
+    fn admit(&mut self, stream: tokio::net::UnixStream) {
+        let what = self.what;
         let peer = Peer::of(&stream);
-        if let Err(r) = gate.admit(peer, std::time::Instant::now()) {
+        if let Err(r) = self.gate.admit(peer, std::time::Instant::now()) {
             tracing::debug!(
                 "{what}: refused a connection from {peer} without reading it: {} is over its \
                  {} unauthorized connections; it is served again in {}s — if this is a \
@@ -1135,32 +1608,131 @@ async fn accept_admitted(
                 r.scope.bound(),
                 r.retry_in.as_secs() + 1,
             );
-            continue; // dropping the stream closes it
+            return; // dropping the stream closes it
         }
-        let std_stream = stream.into_std()?;
-        std_stream.set_nonblocking(false)?;
-        return Ok((std_stream, peer));
+        let uid = Self::uid(peer);
+        let busy = self.per_uid.get(&uid).copied().unwrap_or(0);
+        if self.in_flight.len() >= HANDSHAKES_IN_FLIGHT_MAX || busy >= HANDSHAKES_PER_UID_MAX {
+            tracing::debug!(
+                "{what}: refused a connection from {peer}: {} handshakes are in flight ({busy} of \
+                 this peer's uid); each ends within {} s — the client retries",
+                self.in_flight.len(),
+                HANDSHAKE_TIMEOUT.as_secs(),
+            );
+            return;
+        }
+        let std_stream = match stream
+            .into_std()
+            .and_then(|s| s.set_nonblocking(false).map(|()| s))
+        {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    "{what}: could not take over a connection from {peer} ({e}); it is dropped \
+                     and the listener keeps serving — the client should connect again"
+                );
+                return;
+            }
+        };
+        *self.per_uid.entry(uid).or_default() += 1;
+        let token = self.token;
+        self.in_flight
+            .spawn_blocking(move || (peer, run_handshake(std_stream, token)));
+    }
+
+    /// A handshake ended: the authorized stream, or nothing (the peer is counted or not).
+    fn settle(
+        &mut self,
+        done: Result<(Peer, Handshake), tokio::task::JoinError>,
+    ) -> Option<std::os::unix::net::UnixStream> {
+        let what = self.what;
+        let (peer, outcome) = match done {
+            Ok(d) => d,
+            Err(e) => {
+                // The peer is not known: forget the per-uid counts rather than keep a stale one.
+                self.per_uid.clear();
+                tracing::warn!(
+                    "{what}: a handshake task failed ({e}); that connection is dropped and the \
+                     listener keeps serving"
+                );
+                return None;
+            }
+        };
+        let uid = Self::uid(peer);
+        if let Some(n) = self.per_uid.get_mut(&uid) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                self.per_uid.remove(&uid);
+            }
+        }
+        match outcome {
+            Handshake::Authorized(s) => return Some(s),
+            Handshake::Wrong => note_unauthorized(&mut self.gate, peer, what),
+            Handshake::Probe => tracing::debug!(
+                "{what}: {peer} connected and closed without a word (a probe): not counted"
+            ),
+            Handshake::Failed(e) => {
+                tracing::debug!(
+                    "{what}: the handshake with {peer} failed ({e}): counted as an unauthorized \
+                     connection; a legitimate client retries"
+                );
+                note_unauthorized(&mut self.gate, peer, what);
+            }
+        }
+        None
+    }
+
+    /// `accept` failed. Resource exhaustion and aborted connections are not the listener's
+    /// end: wait and go on. Anything else (the listener closed) ends the loop.
+    async fn accept_failed(&self, e: std::io::Error) -> std::io::Result<()> {
+        let what = self.what;
+        match e.raw_os_error() {
+            Some(n) if [libc::EMFILE, libc::ENFILE, libc::ENOMEM, libc::ENOBUFS].contains(&n) => {
+                tracing::warn!(
+                    "{what}: accept failed ({e}): this process is out of file descriptors or \
+                     memory. Waiting 100 ms and trying again; close descriptors this process \
+                     holds, or raise its limit"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                Ok(())
+            }
+            _ if matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::Interrupted
+                    | std::io::ErrorKind::WouldBlock
+            ) =>
+            {
+                Ok(())
+            }
+            _ => Err(e),
+        }
+    }
+
+    /// Say why one hand-over to an authorized peer failed, and go on.
+    fn handover_failed(&self, why: &str, e: &dyn std::fmt::Display) {
+        tracing::warn!(
+            "{}: {why} ({e}). That attempt is dropped and the listener keeps serving — if the \
+             client left, it should connect again; if the owner could not set up a place for it \
+             (the reason above), act on that",
+            self.what
+        );
     }
 }
 
-/// Run the mutual-auth handshake on a blocking task; `Some(stream)` iff the peer
-/// proved the capability. An IO error (peer aborted) counts as unauthorized,
-/// not fatal — a failed or squatter handshake must not kill the serve loop.
-async fn authenticate(
-    std_stream: std::os::unix::net::UnixStream,
-    token: ShmToken,
-    what: &str,
-) -> std::io::Result<Option<std::os::unix::net::UnixStream>> {
+/// Run `f` on `s` on a blocking task (the hand-over is a few small socket calls, bounded
+/// by the stream's write timeout).
+async fn on_blocking<F>(s: std::os::unix::net::UnixStream, f: F) -> std::io::Result<()>
+where
+    F: FnOnce(&mut std::os::unix::net::UnixStream) -> std::io::Result<()> + Send + 'static,
+{
     tokio::task::spawn_blocking(move || {
-        let mut s = std_stream;
-        if mutual_auth_server(&mut s, &token).unwrap_or(false) {
-            Some(s)
-        } else {
-            None
-        }
+        let mut s = s;
+        f(&mut s)
     })
     .await
-    .map_err(|e| std::io::Error::other(format!("{what} token task: {e}")))
+    .map_err(|e| std::io::Error::other(format!("hand-over task: {e}")))?
 }
 
 /// Count an unauthorized connection against `peer`; warn once when that
@@ -1186,29 +1758,24 @@ fn note_unauthorized(gate: &mut UnauthGate, peer: Peer, what: &str) {
 /// (constant-time compared), so the socket may be world-connectable; an
 /// unauthorized connector is **rejected and the loop keeps listening** — a bad
 /// connector can't consume the one-shot handoff (the accept-until-authorized
-/// hardening). Unauthorized attempts are bounded **per peer credential**
-/// ([`UnauthGate`]): one process over its bound is refused cheaply while every
-/// other peer is still served — the listener never stops because of them. Async
-/// accept; the brief blocking `SCM_RIGHTS` exchange runs on a blocking task so
-/// it never stalls the runtime.
+/// hardening), and neither can an authorized one that leaves before taking the fds:
+/// the handoff is spent only by a hand-over that succeeded. Unauthorized attempts are
+/// bounded **per peer credential** ([`UnauthGate`]) and every handshake by
+/// [`HANDSHAKE_TIMEOUT`], run apart from the accept loop: a peer that connects and
+/// says nothing delays no one.
 pub async fn serve_fd_handoff(
     listener: tokio::net::UnixListener,
     token: ShmToken,
     fds: [OwnedFd; 3],
 ) -> std::io::Result<()> {
-    let mut gate = UnauthGate::new();
+    let mut hs = Handoff::new(listener, token, "shm control");
     loop {
-        let (std_stream, peer) = accept_admitted(&listener, &gate, "shm control").await?;
-        // Read + check the token on a blocking task; hand back the stream if it
-        // matched (so the fd send happens only for an authorized client).
-        let Some(s) = authenticate(std_stream, token, "shm control").await? else {
-            note_unauthorized(&mut gate, peer, "shm control");
-            continue; // an unauthorized connector must not consume the handoff
-        };
+        let s = hs.next_authorized().await?;
         let raw = [fds[0].as_raw_fd(), fds[1].as_raw_fd(), fds[2].as_raw_fd()];
-        return tokio::task::spawn_blocking(move || send_fds(s.as_raw_fd(), &raw))
-            .await
-            .map_err(|e| std::io::Error::other(format!("shm control send task: {e}")))?;
+        match on_blocking(s, move |s| send_fds(s.as_raw_fd(), &raw)).await {
+            Ok(()) => return Ok(()),
+            Err(e) => hs.handover_failed("could not hand the fds to an authorized client", &e),
+        }
     }
 }
 
@@ -1217,7 +1784,8 @@ pub async fn serve_fd_handoff(
 /// set of three fds (a freshly-created ring pair) and hand them to that peer. The
 /// caller's `mint` typically creates a new [`SpscFace`] and stashes it so it can
 /// broadcast to every attached peer. Unauthorized connectors are rejected and the
-/// loop continues. Returns only on accept error (socket closed).
+/// loop continues; so does a failure to mint or to hand over for one peer. Returns
+/// only when the listener fails (socket closed).
 #[cfg(unix)]
 pub async fn serve_fd_handoff_loop<F>(
     listener: tokio::net::UnixListener,
@@ -1227,40 +1795,152 @@ pub async fn serve_fd_handoff_loop<F>(
 where
     F: FnMut() -> std::io::Result<[OwnedFd; 3]>,
 {
-    let mut gate = UnauthGate::new();
+    let mut hs = Handoff::new(listener, token, "shm control");
     loop {
-        let (std_stream, peer) = accept_admitted(&listener, &gate, "shm control").await?;
-        let Some(s) = authenticate(std_stream, token, "shm control").await? else {
-            note_unauthorized(&mut gate, peer, "shm control");
-            continue; // unauthorized — drop and keep listening
-        };
+        let s = hs.next_authorized().await?;
         // Mint a fresh ring for this peer; on failure, drop the peer and continue.
         let fds = match mint() {
             Ok(fds) => fds,
-            Err(_) => continue,
+            Err(e) => {
+                hs.handover_failed("could not create a ring for an authorized client", &e);
+                continue;
+            }
         };
         let raw = [fds[0].as_raw_fd(), fds[1].as_raw_fd(), fds[2].as_raw_fd()];
-        tokio::task::spawn_blocking(move || send_fds(s.as_raw_fd(), &raw))
-            .await
-            .map_err(|e| std::io::Error::other(format!("shm control send task: {e}")))??;
+        if let Err(e) = on_blocking(s, move |s| send_fds(s.as_raw_fd(), &raw)).await {
+            hs.handover_failed("could not hand the fds to an authorized client", &e);
+        }
         // `fds` (our copies) drop here; the peer holds its dup'd set.
     }
 }
 
+/// Connect to a control socket by `path` inside `end`: a connect that would wait (the
+/// listener's backlog is full, or nothing accepts) is a `TimedOut` error at the deadline,
+/// not a wait for ever.
+pub(crate) fn connect_bounded(
+    path: &std::path::Path,
+    end: std::time::Instant,
+) -> std::io::Result<std::os::unix::net::UnixStream> {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = path.as_os_str().as_bytes();
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if bytes.len() >= addr.sun_path.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("control socket path is too long for a unix socket: {path:?}"),
+        ));
+    }
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (d, b) in addr.sun_path.iter_mut().zip(bytes) {
+        *d = *b as libc::c_char;
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const EXTRA: libc::c_int = libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    const EXTRA: libc::c_int = 0;
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | EXTRA, 0) };
+    if fd == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // Owned from here: closed on every return.
+    let sock = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+    if EXTRA == 0 {
+        set_nonblock_cloexec(fd).map_err(|e| match e {
+            ShmError::Io(e) => e,
+            other => std::io::Error::other(other.to_string()),
+        })?;
+    }
+    loop {
+        let r = unsafe {
+            libc::connect(
+                fd,
+                &addr as *const libc::sockaddr_un as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+            )
+        };
+        if r == 0 {
+            break;
+        }
+        let e = std::io::Error::last_os_error();
+        match e.kind() {
+            std::io::ErrorKind::Interrupted => {}
+            std::io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= end {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "the control socket {path:?} did not accept the connection within {} s \
+                             (its backlog is full: the process behind it is not serving)",
+                            HANDSHAKE_TIMEOUT.as_secs()
+                        ),
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            _ => return Err(e),
+        }
+    }
+    sock.set_nonblocking(false)?;
+    Ok(sock)
+}
+
+/// The client's half common to every handoff: connect, authenticate the producer, all
+/// inside [`HANDSHAKE_TIMEOUT`]. Returns the stream and the deadline the rest of the
+/// exchange must keep.
+fn client_session(
+    path: &std::path::Path,
+    token: &ShmToken,
+    what: &str,
+) -> Result<(std::os::unix::net::UnixStream, std::time::Instant), ShmError> {
+    let end = std::time::Instant::now() + HANDSHAKE_TIMEOUT;
+    let mut s = connect_bounded(path, end).map_err(ShmError::Io)?;
+    let proved = auth_client_over(
+        &mut Bounded {
+            s: &mut s,
+            end,
+            silent: "the ring's owner",
+        },
+        token,
+    )
+    .map_err(ShmError::Io)?;
+    if !proved {
+        // PermissionDenied, not `other`: a caller that retries a connect that raced the
+        // producer's bind must not retry this (each retry is one more rejection counted
+        // against this process's `UNAUTH_PER_PEER_MAX` allowance).
+        return Err(ShmError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{what}: producer failed authentication (possible name squatter)"),
+        )));
+    }
+    Ok((s, end))
+}
+
+/// Receive up to `max` fds inside the handshake's deadline.
+fn recv_fds_by(
+    s: &mut std::os::unix::net::UnixStream,
+    end: std::time::Instant,
+    max: usize,
+) -> Result<Vec<OwnedFd>, ShmError> {
+    let b = Bounded {
+        s,
+        end,
+        silent: "the ring's owner",
+    };
+    b.arm().map_err(ShmError::Io)?;
+    recv_fds(b.s.as_raw_fd(), max).map_err(|e| ShmError::Io(b.mapped(e)))
+}
+
 /// **Client side of the Option-A handshake:** connect to the control socket at
 /// `path`, present `token`, receive the face's three fds, and build the
-/// [`SpscHandle`]. Blocking — call via `spawn_blocking` from async code.
+/// [`SpscHandle`]. Blocking — call via `spawn_blocking` from async code. The whole
+/// exchange is bounded by [`HANDSHAKE_TIMEOUT`]: a producer that does not answer is a
+/// `TimedOut` error saying so.
 pub fn connect_fd_handoff(
     path: &std::path::Path,
     token: &ShmToken,
 ) -> Result<SpscHandle, ShmError> {
-    let mut s = std::os::unix::net::UnixStream::connect(path).map_err(ShmError::Io)?;
-    if !mutual_auth_client(&mut s, token).map_err(ShmError::Io)? {
-        return Err(ShmError::Io(std::io::Error::other(
-            "shm control: producer failed authentication (possible name squatter)",
-        )));
-    }
-    let mut fds = recv_fds(s.as_raw_fd(), 3).map_err(ShmError::Io)?;
+    let (mut s, end) = client_session(path, token, "shm control")?;
+    let mut fds = recv_fds_by(&mut s, end, 3)?;
     if fds.len() != 3 {
         return Err(ShmError::Io(std::io::Error::other(
             "shm control: expected 3 fds",
@@ -1285,38 +1965,31 @@ pub async fn serve_sealed_handoff(
     token: ShmToken,
     fds: [OwnedFd; 3],
 ) -> std::io::Result<()> {
-    let mut gate = UnauthGate::new();
+    let mut hs = Handoff::new(listener, token, "shm control");
     loop {
-        let (std_stream, peer) = accept_admitted(&listener, &gate, "shm control").await?;
-        let Some(s) = authenticate(std_stream, token, "shm control").await? else {
-            note_unauthorized(&mut gate, peer, "shm control");
-            continue;
-        };
+        let s = hs.next_authorized().await?;
         let raw = [fds[0].as_raw_fd(), fds[1].as_raw_fd(), fds[2].as_raw_fd()];
-        return tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-            send_fds(s.as_raw_fd(), &raw)
-        })
-        .await
-        .map_err(|e| std::io::Error::other(format!("shm control send task: {e}")))?;
+        match on_blocking(s, move |s| send_fds(s.as_raw_fd(), &raw)).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                hs.handover_failed("could not hand the sealed fds to an authorized client", &e)
+            }
+        }
     }
 }
 
 /// **Sealed handoff (consumer side):** connect, mutually authenticate, and receive
 /// the three sealed-ring fds `[data_ro, ctrl_rw, wake_r]`. The geometry is read from
 /// the data-region header by [`SealedReader::from_fds`], not the wire. Blocking —
-/// call via `spawn_blocking`, then build the reader in async context.
+/// call via `spawn_blocking`, then build the reader in async context. Bounded by
+/// [`HANDSHAKE_TIMEOUT`] as a whole.
 #[cfg(unix)]
 pub fn connect_sealed_handoff(
     path: &std::path::Path,
     token: &ShmToken,
 ) -> Result<(OwnedFd, OwnedFd, OwnedFd), ShmError> {
-    let mut s = std::os::unix::net::UnixStream::connect(path).map_err(ShmError::Io)?;
-    if !mutual_auth_client(&mut s, token).map_err(ShmError::Io)? {
-        return Err(ShmError::Io(std::io::Error::other(
-            "shm control: producer failed authentication (possible name squatter)",
-        )));
-    }
-    let fds = recv_fds(s.as_raw_fd(), 3).map_err(ShmError::Io)?;
+    let (mut s, end) = client_session(path, token, "shm control")?;
+    let fds = recv_fds_by(&mut s, end, 3)?;
     if fds.len() != 3 {
         return Err(ShmError::Io(std::io::Error::other(
             "shm control: expected 3 sealed fds",
@@ -1427,6 +2100,12 @@ pub struct SpscFace {
     // its wakeup channels are anonymous pipes received over the control socket.
     a2e_pipe_path: Option<PathBuf>,
     e2a_pipe_path: Option<PathBuf>,
+    /// Why the face was closed on a ring it could not believe: the peer wrote a cursor no
+    /// correct peer writes (see [`RingCorrupt`]). Set once; `recv_bytes` answers
+    /// [`FaceError::Closed`] from then on, which ends the forwarder's reader for the face.
+    corrupt: std::sync::OnceLock<String>,
+    /// Packets handed out, so a hot ring yields to the runtime every [`POPS_PER_YIELD`].
+    pops: AtomicU32,
 }
 
 impl SpscFace {
@@ -1487,6 +2166,8 @@ impl SpscFace {
             tx: std::sync::Mutex::new(()),
             a2e_pipe_path: Some(a2e_path),
             e2a_pipe_path: Some(e2a_path),
+            corrupt: std::sync::OnceLock::new(),
+            pops: AtomicU32::new(0),
         })
     }
 
@@ -1529,6 +2210,8 @@ impl SpscFace {
             tx: std::sync::Mutex::new(()),
             a2e_pipe_path: None,
             e2a_pipe_path: None,
+            corrupt: std::sync::OnceLock::new(),
+            pops: AtomicU32::new(0),
         };
         Ok((face, [region_fd, a2e_w, e2a_r]))
     }
@@ -1549,7 +2232,11 @@ impl SpscFace {
         Self::create_anon_with(id, capacity_for_slot(ss), ss)
     }
 
-    fn try_pop_a2e(&self) -> Option<Bytes> {
+    /// The a2e ring's next packet. The face is closed (`Err(Closed)`, from then on) when
+    /// the peer has written a cursor no correct peer writes: the reason is kept
+    /// ([`closed_reason`](Self::closed_reason)) and logged once.
+    fn pop_a2e(&self) -> Result<Option<Bytes>, FaceError> {
+        self.check_ring()?;
         unsafe {
             ring_pop(
                 self.shm.as_ptr(),
@@ -1560,19 +2247,16 @@ impl SpscFace {
                 self.slot_size,
             )
         }
+        .map_err(|c| self.close_corrupt(c))
     }
 
-    /// Cheap, allocation-free check: is there a packet waiting in the a2e ring?
-    /// Sole-consumer invariant: if this returns `true`, a following
-    /// [`Self::try_peek_consume_a2e`] is guaranteed to find the packet (only we
-    /// remove from this ring; the producer can only add).
-    fn a2e_has_data(&self) -> bool {
-        let tail = unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_A2E_TAIL) as *mut u32) };
-        let head = unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_A2E_HEAD) as *mut u32) };
-        head.load(Ordering::Relaxed) != tail.load(Ordering::Acquire)
-    }
-
-    fn try_peek_consume_a2e<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+    /// In-place twin of [`pop_a2e`](Self::pop_a2e): `f` is called, once, only when a
+    /// packet was there.
+    fn peek_consume_a2e<R, F: FnOnce(&[u8]) -> R>(
+        &self,
+        f: &mut Option<F>,
+    ) -> Result<Option<R>, FaceError> {
+        self.check_ring()?;
         unsafe {
             ring_peek_consume(
                 self.shm.as_ptr(),
@@ -1584,6 +2268,52 @@ impl SpscFace {
                 f,
             )
         }
+        .map_err(|c| self.close_corrupt(c))
+    }
+
+    /// `Err(Closed)` once the ring was found corrupt.
+    fn check_ring(&self) -> Result<(), FaceError> {
+        if self.corrupt.get().is_some() {
+            Err(FaceError::Closed)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Close the face for a ring the peer corrupted: keep the reason, log it once.
+    fn close_corrupt(&self, c: RingCorrupt) -> FaceError {
+        let reason = c.to_string();
+        if self.corrupt.set(reason.clone()).is_ok() {
+            tracing::error!(face = %self.id, "shm face closed: {reason}");
+        }
+        FaceError::Closed
+    }
+
+    /// The e2a ring is full for good when the peer wrote its read cursor out of range
+    /// (the write cursor is ours): close the face rather than wait for room that never
+    /// comes.
+    fn check_e2a(&self) -> Result<(), FaceError> {
+        let tail = unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_E2A_TAIL) as *mut u32) };
+        let head = unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_E2A_HEAD) as *mut u32) };
+        let (h, t) = (head.load(Ordering::Acquire), tail.load(Ordering::Relaxed));
+        ring_unread(h, t, self.capacity)
+            .map(|_| ())
+            .map_err(|c| self.close_corrupt(c))
+    }
+
+    /// Why the face closed itself, if it did: the peer corrupted the ring (the text says
+    /// which cursors and what to do). `None` while the ring is sound.
+    pub fn closed_reason(&self) -> Option<&str> {
+        self.corrupt.get().map(String::as_str)
+    }
+
+    /// Yield to the runtime on every [`POPS_PER_YIELD`]-th packet handed out, so a peer
+    /// that keeps the ring full cannot hold a worker thread: a reader loop that awaits
+    /// nothing else has no other point at which to give it up.
+    async fn relax(&self) {
+        if self.pops.fetch_add(1, Ordering::Relaxed) % POPS_PER_YIELD == POPS_PER_YIELD - 1 {
+            tokio::task::yield_now().await;
+        }
     }
 
     /// **Non-blocking, zero-syscall receive** — the busy-poll low-latency path.
@@ -1591,16 +2321,18 @@ impl SpscFace {
     /// A tight `loop { if let Some(p) = face.try_recv() {…} else { spin_loop() } }`
     /// hits the shared-memory round-trip floor (~hundreds of ns) at the cost of a
     /// busy core; use [`recv_bytes`](Self::recv_bytes) (spin-then-park) when CPU
-    /// efficiency matters more than the last microsecond.
+    /// efficiency matters more than the last microsecond. `None` for ever once the face
+    /// closed itself ([`closed_reason`](Self::closed_reason)).
     pub fn try_recv(&self) -> Option<Bytes> {
-        self.try_pop_a2e()
+        self.pop_a2e().ok().flatten()
     }
 
     /// Non-blocking, zero-copy [`recv_with`](Self::recv_with): if a packet is
     /// waiting, consume it in place via `f`; else `None`. The busy-poll path with
     /// no slot→heap copy.
     pub fn try_recv_with<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
-        self.try_peek_consume_a2e(f)
+        let mut f = Some(f);
+        self.peek_consume_a2e(&mut f).ok().flatten()
     }
 
     fn e2a_has_space(&self) -> bool {
@@ -1648,6 +2380,7 @@ impl SpscFace {
                     break;
                 }
             }
+            self.check_e2a()?;
             tokio::task::yield_now().await;
         }
         if parked.load(Ordering::SeqCst) != 0 {
@@ -1706,6 +2439,7 @@ impl SpscFace {
         while start < views.len() {
             let pushed = self.try_push_batch_e2a(&views[start..]);
             if pushed == 0 {
+                self.check_e2a()?;
                 tokio::task::yield_now().await;
                 continue;
             }
@@ -1747,25 +2481,22 @@ impl SpscFace {
             unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_A2E_PARKED) as *mut u32) };
         let mut f = Some(f);
         loop {
-            if self.a2e_has_data() {
-                return Ok(self
-                    .try_peek_consume_a2e(f.take().unwrap())
-                    .expect("data present"));
+            if let Some(out) = self.peek_consume_a2e(&mut f)? {
+                self.relax().await;
+                return Ok(out);
             }
             for _ in 0..SPIN_ITERS {
                 std::hint::spin_loop();
-                if self.a2e_has_data() {
-                    return Ok(self
-                        .try_peek_consume_a2e(f.take().unwrap())
-                        .expect("data present"));
+                if let Some(out) = self.peek_consume_a2e(&mut f)? {
+                    self.relax().await;
+                    return Ok(out);
                 }
             }
             parked.store(1, Ordering::SeqCst);
-            if self.a2e_has_data() {
+            if let Some(out) = self.peek_consume_a2e(&mut f)? {
                 parked.store(0, Ordering::Relaxed);
-                return Ok(self
-                    .try_peek_consume_a2e(f.take().unwrap())
-                    .expect("data present"));
+                self.relax().await;
+                return Ok(out);
             }
             pipe_await(&self.a2e_rx)
                 .await
@@ -1854,16 +2585,22 @@ impl Transport for SpscFace {
         Ok(())
     }
 
+    /// The next packet of the a2e ring. A peer that corrupts the ring's cursors closes
+    /// the face (`Err(Closed)`, the reason in [`closed_reason`](SpscFace::closed_reason));
+    /// a peer that keeps the ring full does not hold the thread: every
+    /// [`POPS_PER_YIELD`]-th packet yields to the runtime.
     async fn recv_bytes(&self) -> Result<Bytes, FaceError> {
         let parked =
             unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_A2E_PARKED) as *mut u32) };
         loop {
-            if let Some(pkt) = self.try_pop_a2e() {
+            if let Some(pkt) = self.pop_a2e()? {
+                self.relax().await;
                 return Ok(pkt);
             }
             for _ in 0..SPIN_ITERS {
                 std::hint::spin_loop();
-                if let Some(pkt) = self.try_pop_a2e() {
+                if let Some(pkt) = self.pop_a2e()? {
+                    self.relax().await;
                     return Ok(pkt);
                 }
             }
@@ -1871,8 +2608,9 @@ impl Transport for SpscFace {
             // is never missed.
             parked.store(1, Ordering::SeqCst);
             // Recheck: catches pushes between the first check and the flag store.
-            if let Some(pkt) = self.try_pop_a2e() {
+            if let Some(pkt) = self.pop_a2e()? {
                 parked.store(0, Ordering::Relaxed);
+                self.relax().await;
                 return Ok(pkt);
             }
 
@@ -1897,6 +2635,7 @@ impl Transport for SpscFace {
             if self.try_push_e2a(&pkt) {
                 break;
             }
+            self.check_e2a()?;
             tokio::task::yield_now().await;
         }
         if parked.load(Ordering::SeqCst) != 0 {
@@ -1917,6 +2656,9 @@ pub struct SpscHandle {
     e2a_rx: tokio::io::unix::AsyncFd<std::os::unix::io::OwnedFd>,
     a2e_tx: std::os::unix::io::OwnedFd,
     cancel: tokio_util::sync::CancellationToken,
+    /// Set when the engine side wrote a cursor out of range: the handle reads nothing
+    /// more (see [`RingCorrupt`]).
+    corrupt: std::sync::OnceLock<String>,
 }
 
 impl SpscHandle {
@@ -1981,6 +2723,7 @@ impl SpscHandle {
             e2a_rx,
             a2e_tx,
             cancel: tokio_util::sync::CancellationToken::new(),
+            corrupt: std::sync::OnceLock::new(),
         })
     }
 
@@ -1998,6 +2741,10 @@ impl SpscHandle {
         // Read the header from the fd to learn the geometry, then map the full
         // region. (O_NONBLOCK on the pipe ends rides the open-file-description
         // across SCM_RIGHTS, so the received fds are already non-blocking.)
+        // The region is the peer's to hand over, so it must be one the peer cannot shrink
+        // under this mapping (Linux: sealed memfd).
+        check_peer_seals(region_fd.as_raw_fd(), true)?;
+        fstat_at_least(region_fd.as_raw_fd(), HEADER_SIZE)?;
         let (capacity, slot_size) = unsafe {
             let p = libc::mmap(
                 std::ptr::null_mut(),
@@ -2028,7 +2775,7 @@ impl SpscHandle {
         // gigabytes — rather than trust the header.
         validate_geometry(capacity, slot_size)?;
         let size = shm_total_size(capacity, slot_size);
-        let shm = ShmRegion::from_fd(region_fd.as_raw_fd(), size)?;
+        let shm = ShmRegion::from_fd_sealed(region_fd.as_raw_fd(), size, true)?;
         // region_fd may now be dropped — the mapping persists. The pipe fds are
         // retained (they carry the wakeups).
         drop(region_fd);
@@ -2046,6 +2793,7 @@ impl SpscHandle {
             e2a_rx,
             a2e_tx: a2e_write,
             cancel: tokio_util::sync::CancellationToken::new(),
+            corrupt: std::sync::OnceLock::new(),
         })
     }
 
@@ -2068,7 +2816,10 @@ impl SpscHandle {
     }
 
     fn try_pop_e2a(&self) -> Option<Bytes> {
-        unsafe {
+        if self.corrupt.get().is_some() {
+            return None;
+        }
+        match unsafe {
             ring_pop(
                 self.shm.as_ptr(),
                 self.e2a_off,
@@ -2077,7 +2828,26 @@ impl SpscHandle {
                 self.capacity,
                 self.slot_size,
             )
+        } {
+            Ok(pkt) => pkt,
+            Err(c) => {
+                self.close_corrupt(c);
+                None
+            }
         }
+    }
+
+    /// The other side wrote a cursor no correct peer writes: read nothing more, say why.
+    fn close_corrupt(&self, c: RingCorrupt) {
+        let reason = c.to_string();
+        if self.corrupt.set(reason.clone()).is_ok() {
+            tracing::error!("shm handle closed: {reason}");
+        }
+    }
+
+    /// Why the handle stopped reading, if the ring was corrupted. `None` while sound.
+    pub fn closed_reason(&self) -> Option<&str> {
+        self.corrupt.get().map(String::as_str)
     }
 
     fn try_push_batch_a2e(&self, pkts: &[&[u8]]) -> usize {
@@ -2175,6 +2945,9 @@ impl SpscHandle {
             if let Some(pkt) = self.try_pop_e2a() {
                 return Some(pkt);
             }
+            if self.corrupt.get().is_some() {
+                return None;
+            }
             for _ in 0..SPIN_ITERS {
                 std::hint::spin_loop();
                 if let Some(pkt) = self.try_pop_e2a() {
@@ -2200,14 +2973,11 @@ impl SpscHandle {
         }
     }
 
-    fn e2a_has_data(&self) -> bool {
-        let tail = unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_E2A_TAIL) as *mut u32) };
-        let head = unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_E2A_HEAD) as *mut u32) };
-        head.load(Ordering::Relaxed) != tail.load(Ordering::Acquire)
-    }
-
-    fn try_peek_consume_e2a<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
-        unsafe {
+    fn try_peek_consume_e2a<R, F: FnOnce(&[u8]) -> R>(&self, f: &mut Option<F>) -> Option<R> {
+        if self.corrupt.get().is_some() {
+            return None;
+        }
+        match unsafe {
             ring_peek_consume(
                 self.shm.as_ptr(),
                 self.e2a_off,
@@ -2217,6 +2987,12 @@ impl SpscHandle {
                 self.slot_size,
                 f,
             )
+        } {
+            Ok(out) => out,
+            Err(c) => {
+                self.close_corrupt(c);
+                None
+            }
         }
     }
 
@@ -2231,7 +3007,8 @@ impl SpscHandle {
     /// Non-blocking, zero-copy [`recv_with`](Self::recv_with): consume the next
     /// packet in place via `f` if waiting, else `None`.
     pub fn try_recv_with<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
-        self.try_peek_consume_e2a(f)
+        let mut f = Some(f);
+        self.try_peek_consume_e2a(&mut f)
     }
 
     fn a2e_has_space(&self) -> bool {
@@ -2303,19 +3080,22 @@ impl SpscHandle {
             unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_E2A_PARKED) as *mut u32) };
         let mut f = Some(f);
         loop {
-            if self.e2a_has_data() {
-                return self.try_peek_consume_e2a(f.take().unwrap());
+            if let Some(out) = self.try_peek_consume_e2a(&mut f) {
+                return Some(out);
+            }
+            if self.corrupt.get().is_some() {
+                return None;
             }
             for _ in 0..SPIN_ITERS {
                 std::hint::spin_loop();
-                if self.e2a_has_data() {
-                    return self.try_peek_consume_e2a(f.take().unwrap());
+                if let Some(out) = self.try_peek_consume_e2a(&mut f) {
+                    return Some(out);
                 }
             }
             parked.store(1, Ordering::SeqCst);
-            if self.e2a_has_data() {
+            if let Some(out) = self.try_peek_consume_e2a(&mut f) {
                 parked.store(0, Ordering::Relaxed);
-                return self.try_peek_consume_e2a(f.take().unwrap());
+                return Some(out);
             }
             tokio::select! {
                 result = pipe_await(&self.e2a_rx) => {
@@ -2604,6 +3384,13 @@ impl SealedReader {
         wake_fd: OwnedFd,
     ) -> Result<Self, ShmError> {
         // Read magic + geometry from the header page first (small, always in bounds).
+        // Regions a peer hands over are checked before they are mapped: the data region
+        // must be sealed against any write and any resize (a reader of it cannot be
+        // faulted, nor shown a frame the producer did not write), the control region
+        // against resizing.
+        check_peer_seals(data_fd.as_raw_fd(), false)?;
+        check_peer_seals(ctrl_fd.as_raw_fd(), true)?;
+        fstat_at_least(data_fd.as_raw_fd(), SEALED_DATA_HEADER)?;
         let (capacity, slot_size) = unsafe {
             let p = libc::mmap(
                 std::ptr::null_mut(),
@@ -2633,9 +3420,12 @@ impl SealedReader {
         {
             return Err(ShmError::InvalidMagic);
         }
-        let data =
-            ShmRegion::from_fd_ro(data_fd.as_raw_fd(), sealed_data_size(capacity, slot_size))?;
-        let ctrl = ShmRegion::from_fd(ctrl_fd.as_raw_fd(), SEALED_CTRL_SIZE)?;
+        let data = ShmRegion::from_fd_sealed(
+            data_fd.as_raw_fd(),
+            sealed_data_size(capacity, slot_size),
+            false,
+        )?;
+        let ctrl = ShmRegion::from_fd_sealed(ctrl_fd.as_raw_fd(), SEALED_CTRL_SIZE, true)?;
         // data_fd / ctrl_fd may now drop — the mappings persist.
         set_nonblock_cloexec(wake_fd.as_raw_fd())?;
         let wake_rx = tokio::io::unix::AsyncFd::new(wake_fd).map_err(ShmError::Io)?;
@@ -2742,17 +3532,23 @@ impl SealedReader {
 //     copies under it and rejects a frame the producer overwrote mid-read. Because
 //     the producer never blocks (lossy), zero-copy borrows are unsound here — the
 //     reader copies into its own buffer, unlike the reliable SPSC sealed ring.
-//   * REG (RW to all): magic | max_consumers | per-consumer entries (parked u32 |
-//     cursor u64). The producer wakes only parked consumers; it never reads a
-//     consumer cursor for flow control (it can't be stalled).
+//   * REG, one per reader (RW to that reader, RO to the writer): magic |
+//     max_consumers | idx | one entry (parked u32 | cursor u64). The reader writes only
+//     its own entry in its own page; the writer maps the page read-only to read `parked`
+//     and wakes only parked readers; it never reads a reader's cursor for flow control
+//     (it can't be stalled). No reader has the fd of another's page, so one reader can
+//     neither write another's `parked` word nor corrupt the header a later attach reads.
+//   Every region is a memfd sealed against shrinking and growing (Linux), so no peer can
+//   make the writer's or another reader's mapping fault; the DATA region is also sealed
+//   against writes through any fd, so no reader — of any uid — can write the ring.
 // ===========================================================================
 
 const BCAST_MAGIC: u64 = 0x4E44_4E5F_4243_5354; // b"NDN_BCST"
 const BCAST_OFF_TAIL: usize = 64; // in DATA (own cache line)
 const BCAST_DATA_HEADER: usize = 128; // slots start here in DATA
 const BCAST_SLOT_HDR: usize = 16; // seq:u64 | len:u32 | pad, per slot
-const BCAST_REG_HEADER: usize = 64; // entries start here in REG
-const BCAST_REG_STRIDE: usize = 64; // one cache line per consumer entry
+const BCAST_REG_HEADER: usize = 64; // the entry starts here in a reader's REG page
+const BCAST_REG_STRIDE: usize = 64; // one cache line for the entry
 const BCAST_OFF_PARKED: usize = 0; // within a REG entry
 const BCAST_OFF_CURSOR: usize = 8; // within a REG entry (diagnostic)
 const BCAST_WRITING: u64 = u64::MAX; // slot seq sentinel: producer is mid-write
@@ -2764,23 +3560,61 @@ fn bcast_slot_stride(slot_size: u32) -> usize {
 fn bcast_data_size(capacity: u32, slot_size: u32) -> usize {
     BCAST_DATA_HEADER + capacity as usize * bcast_slot_stride(slot_size)
 }
-fn bcast_reg_size(max_consumers: u32) -> usize {
-    BCAST_REG_HEADER + max_consumers as usize * BCAST_REG_STRIDE
+
+/// Size of one reader's registry page: header + its one entry.
+const BCAST_ENTRY_SIZE: usize = BCAST_REG_HEADER + BCAST_REG_STRIDE;
+
+/// One reader as the writer holds it.
+struct Consumer {
+    idx: u32,
+    /// The reader's registry page mapped **read-only**: the writer reads the reader's
+    /// `parked` word here and can write nothing there. The reader maps the same page
+    /// read-write; no other reader has a way to it.
+    entry: ShmRegion,
+    /// Write end of the reader's wakeup pipe. It closing at the other end (the reader
+    /// left) is how the writer learns the slot is free.
+    wake: OwnedFd,
+}
+
+impl Consumer {
+    fn parked(&self) -> &AtomicU32 {
+        let off = BCAST_REG_HEADER + BCAST_OFF_PARKED;
+        unsafe { AtomicU32::from_ptr(self.entry.as_ptr().add(off) as *mut u32) }
+    }
+}
+
+/// Whether nothing holds the read end of the pipe `w` any more: the reader that owned it
+/// has gone (it dropped, or its process ended).
+fn pipe_reader_gone(w: &OwnedFd) -> bool {
+    let mut p = libc::pollfd {
+        fd: w.as_raw_fd(),
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    let r = unsafe { libc::poll(&mut p, 1, 0) };
+    r > 0 && p.revents & (libc::POLLERR | libc::POLLHUP) != 0
+}
+
+/// Wake the reader; `false` if its pipe has no reader left (it is gone).
+fn pipe_write_alive(tx: &OwnedFd) -> bool {
+    let b = [1u8];
+    let n = unsafe { libc::write(tx.as_raw_fd(), b.as_ptr() as *const libc::c_void, 1) };
+    n >= 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EPIPE)
 }
 
 /// Producer end of a broadcast ring. Writes frames into the data region (which it
-/// alone can write) and serves each consumer a **read-only** data fd, the shared
-/// **read-write** registry fd, a private wakeup pipe, and its registry index.
+/// alone can write) and serves each consumer a data fd that **cannot be written** by
+/// anyone (sealed), a registry page of its **own**, a private wakeup pipe, and its index.
 pub struct BroadcastWriter {
     data: ShmRegion,     // read-write mapping (consumers map the same region read-only)
-    reg: ShmRegion,      // read-write mapping (shared consumer registry)
-    data_ro_fd: OwnedFd, // the read-only data fd, cloned per consumer
-    reg_rw_fd: OwnedFd,  // the registry fd, cloned per consumer
+    data_ro_fd: OwnedFd, // the sealed data fd, cloned per consumer
     capacity: u32,
     slot_size: u32,
     max_consumers: u32,
-    consumers: std::sync::Mutex<Vec<(u32, OwnedFd)>>, // (registry idx, wake write end)
-    next_idx: AtomicU32,
+    /// The readers in place. A reader that has left (its wakeup pipe has no reader) is
+    /// dropped from here when the next one registers or the next wake finds it gone, and
+    /// its index is free again.
+    consumers: std::sync::Mutex<Vec<Consumer>>,
     /// Held for one publish: the ring has one writer in law, but a face over it is
     /// called from the sender's task and from a forwarder's reader tasks at once, so
     /// the tail and the slot being filled are touched by one publisher at a time.
@@ -2789,8 +3623,9 @@ pub struct BroadcastWriter {
 
 impl BroadcastWriter {
     /// Create a broadcast ring sized for `capacity` slots of `slot_size` bytes and up
-    /// to `max_consumers` readers. The producer holds the writable mappings; consumers
-    /// are added later with [`register_consumer`](Self::register_consumer).
+    /// to `max_consumers` readers **at a time**. The producer holds the writable mapping
+    /// of the data region; consumers are added later with
+    /// [`register_consumer`](Self::register_consumer).
     pub fn create(capacity: u32, slot_size: u32, max_consumers: u32) -> Result<Self, ShmError> {
         if capacity == 0 || slot_size == 0 || max_consumers == 0 {
             return Err(ShmError::Io(std::io::Error::new(
@@ -2799,25 +3634,19 @@ impl BroadcastWriter {
             )));
         }
         let (data, data_ro_fd) = ShmRegion::create_anon_ro(bcast_data_size(capacity, slot_size))?;
-        let (reg, reg_rw_fd) = ShmRegion::create_anon(bcast_reg_size(max_consumers))?;
         unsafe {
             (data.as_ptr() as *mut u64).write_unaligned(BCAST_MAGIC);
             (data.as_ptr().add(8) as *mut u32).write_unaligned(capacity);
             (data.as_ptr().add(12) as *mut u32).write_unaligned(slot_size);
-            (reg.as_ptr() as *mut u64).write_unaligned(BCAST_MAGIC);
-            (reg.as_ptr().add(8) as *mut u32).write_unaligned(max_consumers);
-            // tail, parked flags, cursors are zero from ftruncate.
+            // tail is zero from ftruncate.
         }
         Ok(Self {
             data,
-            reg,
             data_ro_fd,
-            reg_rw_fd,
             capacity,
             slot_size,
             max_consumers,
             consumers: std::sync::Mutex::new(Vec::new()),
-            next_idx: AtomicU32::new(0),
             publishing: std::sync::Mutex::new(()),
         })
     }
@@ -2825,31 +3654,52 @@ impl BroadcastWriter {
     fn tail(&self) -> &AtomicU64 {
         unsafe { AtomicU64::from_ptr(self.data.as_ptr().add(BCAST_OFF_TAIL) as *mut u64) }
     }
-    fn entry_parked(&self, idx: u32) -> &AtomicU32 {
-        let off = BCAST_REG_HEADER + idx as usize * BCAST_REG_STRIDE + BCAST_OFF_PARKED;
-        unsafe { AtomicU32::from_ptr(self.reg.as_ptr().add(off) as *mut u32) }
-    }
 
-    /// Allocate a registry slot and a private wakeup pipe for a new consumer; returns
-    /// `(data_ro_fd, reg_rw_fd, wake_read_fd, idx)` to hand it. Errors once
-    /// `max_consumers` is reached.
+    /// Allocate a reader's place: a registry page of its own, a private wakeup pipe and
+    /// the lowest free index. Returns `(data_fd, reg_fd, wake_read_fd, idx)` to hand it.
+    ///
+    /// A place is free again once its reader has left (the wakeup pipe it held has no
+    /// reader), so a ring serves any number of readers over its life, up to
+    /// `max_consumers` at once. When all places are held by live readers the error is
+    /// [`ShmError::Refused`], which says so and what to do.
     pub fn register_consumer(&self) -> Result<(OwnedFd, OwnedFd, OwnedFd, u32), ShmError> {
-        let idx = self.next_idx.fetch_add(1, Ordering::Relaxed);
-        if idx >= self.max_consumers {
-            return Err(ShmError::Io(std::io::Error::other(
-                "broadcast ring: max consumers reached",
+        let mut consumers = self.consumers.lock().unwrap_or_else(|e| e.into_inner());
+        consumers.retain(|c| !pipe_reader_gone(&c.wake));
+        let Some(idx) = (0..self.max_consumers).find(|i| consumers.iter().all(|c| c.idx != *i))
+        else {
+            return Err(ShmError::Refused(format!(
+                "ring has no free reader slots: all {} are held by live readers (a slot frees \
+                 when its reader leaves); ask the owner to restart it with room for more, or \
+                 retry when a reader has left",
+                self.max_consumers
             )));
-        }
+        };
         let (wake_r, wake_w) = anon_pipe()?;
+        let (page, reg_fd) = ShmRegion::create_anon(BCAST_ENTRY_SIZE)?;
+        unsafe {
+            (page.as_ptr() as *mut u64).write_unaligned(BCAST_MAGIC);
+            (page.as_ptr().add(8) as *mut u32).write_unaligned(self.max_consumers);
+            (page.as_ptr().add(12) as *mut u32).write_unaligned(idx);
+            // parked and cursor are zero from ftruncate.
+        }
+        // Keep only a read-only view: what the writer reads of the reader's page, it
+        // cannot write; the writable mapping above ends here.
+        let entry = ShmRegion::from_fd_ro(reg_fd.as_raw_fd(), BCAST_ENTRY_SIZE)?;
+        drop(page);
         let data_ro = self.data_ro_fd.try_clone().map_err(ShmError::Io)?;
-        let reg_rw = self.reg_rw_fd.try_clone().map_err(ShmError::Io)?;
-        self.consumers.lock().unwrap().push((idx, wake_w));
-        Ok((data_ro, reg_rw, wake_r, idx))
+        consumers.push(Consumer {
+            idx,
+            entry,
+            wake: wake_w,
+        });
+        Ok((data_ro, reg_fd, wake_r, idx))
     }
 
-    /// Number of consumers registered so far.
+    /// Readers in place now (a reader that has left is not counted).
     pub fn consumer_count(&self) -> usize {
-        self.consumers.lock().unwrap().len()
+        let mut consumers = self.consumers.lock().unwrap_or_else(|e| e.into_inner());
+        consumers.retain(|c| !pipe_reader_gone(&c.wake));
+        consumers.len()
     }
 
     /// Total frames published (the absolute tail).
@@ -2877,12 +3727,10 @@ impl BroadcastWriter {
         }
         seq.store(t, Ordering::Release);
         self.tail().store(t.wrapping_add(1), Ordering::Release);
-        // Wake every parked consumer; the producer is never paced by them.
-        for (idx, wake) in self.consumers.lock().unwrap().iter() {
-            if self.entry_parked(*idx).load(Ordering::SeqCst) != 0 {
-                pipe_write(wake);
-            }
-        }
+        // Wake every parked consumer; the producer is never paced by them. A reader whose
+        // pipe has no reader left is gone: its place is freed.
+        let mut consumers = self.consumers.lock().unwrap_or_else(|e| e.into_inner());
+        consumers.retain(|c| c.parked().load(Ordering::SeqCst) == 0 || pipe_write_alive(&c.wake));
     }
 
     /// Publish one frame in place (zero-copy on the *write* side): `fill` writes up to
@@ -2910,7 +3758,7 @@ enum BcastPeek {
 }
 
 /// Consumer end of a broadcast ring: maps the data region **read-only** (cannot
-/// forge), the registry **read-write** (writes only its own parked flag + cursor),
+/// forge), its own registry page **read-write** (writes only its own parked flag + cursor),
 /// owns a private wakeup-pipe read end (EOF = producer gone), and tracks its own
 /// absolute cursor. Starts at the live tail (new frames only). Lossy: if the
 /// producer laps the cursor, frames are counted in [`dropped`](Self::dropped) and
@@ -2929,7 +3777,10 @@ pub struct BroadcastReader {
 impl BroadcastReader {
     /// Build a reader from the fds + index handed by the producer
     /// ([`BroadcastWriter::register_consumer`] / [`connect_broadcast_handoff`]):
-    /// `data_fd` read-only, `reg_fd` read-write, `wake_fd` the wakeup pipe read end.
+    /// `data_fd` sealed against writes, `reg_fd` the reader's own registry page
+    /// (read-write), `wake_fd` the wakeup pipe read end. A region the producer has not
+    /// sealed against resizing (and the data region against writing) is refused with the
+    /// reason, on Linux.
     /// Geometry is read from the (producer-written, read-only) data header and
     /// **bounded** so a bogus size can never drive an over-map. Must run within a
     /// Tokio runtime (for the wakeup `AsyncFd`).
@@ -2939,6 +3790,11 @@ impl BroadcastReader {
         wake_fd: OwnedFd,
         idx: u32,
     ) -> Result<Self, ShmError> {
+        // What a peer hands over must be unshrinkable under our mappings, and the data
+        // region unwritable by anyone, before it is mapped or read.
+        check_peer_seals(data_fd.as_raw_fd(), false)?;
+        check_peer_seals(reg_fd.as_raw_fd(), true)?;
+        fstat_at_least(data_fd.as_raw_fd(), BCAST_DATA_HEADER)?;
         // DATA header: magic + capacity + slot_size.
         let (capacity, slot_size) = unsafe {
             let p = libc::mmap(
@@ -2965,35 +3821,24 @@ impl BroadcastReader {
         if capacity == 0 || slot_size == 0 || bcast_data_size(capacity, slot_size) > BCAST_MAX_MAP {
             return Err(ShmError::InvalidMagic);
         }
-        // REG header: magic + max_consumers (to size the mapping + bound idx).
-        let max_consumers = unsafe {
-            let p = libc::mmap(
-                std::ptr::null_mut(),
-                BCAST_REG_HEADER,
-                libc::PROT_READ,
-                libc::MAP_SHARED,
-                reg_fd.as_raw_fd(),
-                0,
-            );
-            if p == libc::MAP_FAILED {
-                return Err(ShmError::Io(std::io::Error::last_os_error()));
-            }
-            let base = p as *const u8;
-            let magic = (base as *const u64).read_unaligned();
-            let mc = (base.add(8) as *const u32).read_unaligned();
-            libc::munmap(p, BCAST_REG_HEADER);
-            if magic != BCAST_MAGIC {
-                return Err(ShmError::InvalidMagic);
-            }
-            mc
+        let data = ShmRegion::from_fd_sealed(
+            data_fd.as_raw_fd(),
+            bcast_data_size(capacity, slot_size),
+            false,
+        )?;
+        // The reader's own page: header (magic, max_consumers, idx) and its one entry. Only
+        // this reader holds its fd, so what it finds in the header is what the writer wrote
+        // unless this reader itself changed it.
+        let reg = ShmRegion::from_fd_sealed(reg_fd.as_raw_fd(), BCAST_ENTRY_SIZE, true)?;
+        let (magic, max_consumers) = unsafe {
+            (
+                (reg.as_ptr() as *const u64).read_unaligned(),
+                (reg.as_ptr().add(8) as *const u32).read_unaligned(),
+            )
         };
-        if idx >= max_consumers || bcast_reg_size(max_consumers) > BCAST_MAX_MAP {
+        if magic != BCAST_MAGIC || idx >= max_consumers {
             return Err(ShmError::InvalidMagic);
         }
-
-        let data =
-            ShmRegion::from_fd_ro(data_fd.as_raw_fd(), bcast_data_size(capacity, slot_size))?;
-        let reg = ShmRegion::from_fd(reg_fd.as_raw_fd(), bcast_reg_size(max_consumers))?;
         set_nonblock_cloexec(wake_fd.as_raw_fd())?;
         let wake_rx = tokio::io::unix::AsyncFd::new(wake_fd).map_err(ShmError::Io)?;
 
@@ -3019,11 +3864,11 @@ impl BroadcastReader {
         unsafe { AtomicU64::from_ptr(self.data.as_ptr().add(BCAST_OFF_TAIL) as *mut u64) }
     }
     fn parked(&self) -> &AtomicU32 {
-        let off = BCAST_REG_HEADER + self.idx as usize * BCAST_REG_STRIDE + BCAST_OFF_PARKED;
+        let off = BCAST_REG_HEADER + BCAST_OFF_PARKED;
         unsafe { AtomicU32::from_ptr(self.reg.as_ptr().add(off) as *mut u32) }
     }
     fn write_cursor(&self, v: u64) {
-        let off = BCAST_REG_HEADER + self.idx as usize * BCAST_REG_STRIDE + BCAST_OFF_CURSOR;
+        let off = BCAST_REG_HEADER + BCAST_OFF_CURSOR;
         unsafe {
             AtomicU64::from_ptr(self.reg.as_ptr().add(off) as *mut u64).store(v, Ordering::Relaxed);
         }
@@ -3129,73 +3974,114 @@ impl BroadcastReader {
     }
 }
 
+/// First octet of a refusal on the broadcast handoff: where a hand-over's fd message
+/// would be, the owner sends `REFUSAL`, one octet of length and that many octets of
+/// reason, and closes. A reader that gets no fds reads the reason and returns it.
+const REFUSAL: u8 = 0xEE;
+
+/// Tell a client, best effort, why it is not given the ring.
+fn refuse(s: &mut std::os::unix::net::UnixStream, reason: &str) {
+    use std::io::Write;
+    let bytes = reason.as_bytes();
+    let n = bytes.len().min(255);
+    let mut msg = Vec::with_capacity(2 + n);
+    msg.push(REFUSAL);
+    msg.push(n as u8);
+    msg.extend_from_slice(&bytes[..n]);
+    let _ = s.write_all(&msg);
+}
+
 /// **Broadcast handoff (producer side):** serve the ring fds to **every** authorized
 /// consumer that connects (unlike the 1:1 sealed handoff, this loops). Each consumer
-/// gets a fresh registry slot + wakeup pipe via [`BroadcastWriter::register_consumer`];
+/// gets a fresh registry page + wakeup pipe via [`BroadcastWriter::register_consumer`];
 /// the three fds ride one `SCM_RIGHTS` message and the registry index follows as four
 /// bytes. Unauthorized connectors are bounded per peer credential ([`UnauthGate`]):
-/// one process over its bound is refused while the others are still served. Runs
-/// until the listener errors or is dropped (spawn it and hold the handle).
+/// one process over its bound is refused while the others are still served.
+///
+/// Each connection's handshake runs apart from this loop and is bounded by
+/// [`HANDSHAKE_TIMEOUT`], so a peer that connects and says nothing delays no one. **A
+/// failure with one connection never ends the loop**: a reader that leaves after
+/// authenticating, a socket that fails mid-hand-over, a ring with no free reader slot (the
+/// client is told why, in a refusal it reads) are logged, with what to do, and the next
+/// connection is served. Runs until the listener fails or is dropped (spawn it and hold
+/// the handle).
 #[cfg(unix)]
 pub async fn serve_broadcast_handoff(
     listener: tokio::net::UnixListener,
     token: ShmToken,
     writer: std::sync::Arc<BroadcastWriter>,
 ) -> std::io::Result<()> {
-    let mut gate = UnauthGate::new();
+    let mut hs = Handoff::new(listener, token, "broadcast handoff");
     loop {
-        let (std_stream, peer) = accept_admitted(&listener, &gate, "broadcast handoff").await?;
-        let Some(s) = authenticate(std_stream, token, "broadcast handoff").await? else {
-            note_unauthorized(&mut gate, peer, "broadcast handoff");
-            continue;
-        };
-        let (data_ro, reg_rw, wake_r, idx) = writer
-            .register_consumer()
-            .map_err(|e| std::io::Error::other(format!("broadcast register: {e}")))?;
-        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        let s = hs.next_authorized().await?;
+        let ring = std::sync::Arc::clone(&writer);
+        let sent = on_blocking(s, move |s| {
             use std::io::Write;
-            send_fds(
-                s.as_raw_fd(),
-                &[data_ro.as_raw_fd(), reg_rw.as_raw_fd(), wake_r.as_raw_fd()],
-            )?;
-            // The registry index follows the fd message as four bytes.
-            let mut s = s;
-            s.write_all(&idx.to_le_bytes())?;
-            Ok(())
+            match ring.register_consumer() {
+                Ok((data_ro, reg_rw, wake_r, idx)) => {
+                    send_fds(
+                        s.as_raw_fd(),
+                        &[data_ro.as_raw_fd(), reg_rw.as_raw_fd(), wake_r.as_raw_fd()],
+                    )?;
+                    // The registry index follows the fd message as four bytes.
+                    s.write_all(&idx.to_le_bytes())
+                }
+                Err(e) => {
+                    let reason = match &e {
+                        ShmError::Refused(why) => why.clone(),
+                        other => {
+                            format!("the ring's owner could not set up a reader slot: {other}")
+                        }
+                    };
+                    refuse(s, &reason);
+                    Err(std::io::Error::other(reason))
+                }
+            }
         })
-        .await
-        .map_err(|e| std::io::Error::other(format!("broadcast handoff send task: {e}")))??;
+        .await;
+        if let Err(e) = sent {
+            hs.handover_failed("could not hand the ring to an authorized reader", &e);
+        }
         // Keep serving the next consumer.
     }
 }
 
 /// **Broadcast handoff (consumer side):** connect, mutually authenticate, and receive
 /// the three ring fds `[data_ro, reg_rw, wake_r]` plus this consumer's registry index.
-/// Blocking — call via `spawn_blocking`, then build the reader in async context.
+/// Blocking — call via `spawn_blocking`, then build the reader in async context. The
+/// whole exchange is bounded by [`HANDSHAKE_TIMEOUT`]: an owner that does not answer is a
+/// `TimedOut` error that says so, and an owner with no place for this reader is
+/// [`ShmError::Refused`] with its reason.
 #[cfg(unix)]
 pub fn connect_broadcast_handoff(
     path: &std::path::Path,
     token: &ShmToken,
 ) -> Result<(OwnedFd, OwnedFd, OwnedFd, u32), ShmError> {
     use std::io::Read;
-    let mut s = std::os::unix::net::UnixStream::connect(path).map_err(ShmError::Io)?;
-    if !mutual_auth_client(&mut s, token).map_err(ShmError::Io)? {
-        // PermissionDenied, not `other`: a caller that retries a connect that raced the
-        // producer's bind must not retry this (each retry is one more rejection counted
-        // against this process's `UNAUTH_PER_PEER_MAX` allowance).
-        return Err(ShmError::Io(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "broadcast handoff: producer failed authentication (possible name squatter)",
-        )));
+    let (mut s, end) = client_session(path, token, "broadcast handoff")?;
+    let fds = recv_fds_by(&mut s, end, 3)?;
+    let mut b = Bounded {
+        s: &mut s,
+        end,
+        silent: "the ring's owner",
+    };
+    if fds.is_empty() {
+        // A refusal: its length, then its reason.
+        let mut len = [0u8; 1];
+        b.read_exact(&mut len).map_err(ShmError::Io)?;
+        let mut why = vec![0u8; len[0] as usize];
+        b.read_exact(&mut why).map_err(ShmError::Io)?;
+        return Err(ShmError::Refused(
+            String::from_utf8_lossy(&why).into_owned(),
+        ));
     }
-    let fds = recv_fds(s.as_raw_fd(), 3).map_err(ShmError::Io)?;
     if fds.len() != 3 {
         return Err(ShmError::Io(std::io::Error::other(
             "broadcast handoff: expected 3 ring fds",
         )));
     }
     let mut idx_buf = [0u8; 4];
-    s.read_exact(&mut idx_buf).map_err(ShmError::Io)?;
+    b.read_exact(&mut idx_buf).map_err(ShmError::Io)?;
     let mut it = fds.into_iter();
     let data = it.next().unwrap();
     let reg = it.next().unwrap();

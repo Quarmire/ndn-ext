@@ -13,11 +13,18 @@
 //!   lossy ring has no reliable stream): a stream-class frame is refused
 //!   [`NotCarried`](SideRefused::NotCarried), which the forwarder counts as `class_unsupported`.
 //!   NDN packets never travel on a ring: `send_bytes` is refused.
-//! * **A reader is receive-only, and cannot forge.** It maps the ring's data region read-only (the
-//!   kernel refuses a writable mapping of the fd the writer hands out), owns only its own
-//!   cursor in the registry, and its face carries nothing out ([`side_frame_max`](Transport::side_frame_max)
-//!   is 0). A frame is what the writer's process wrote, so a local reader needs no per-frame
-//!   signature to know where a frame came from.
+//! * **A reader is receive-only, and cannot forge.** It maps the ring's data region read-only: the
+//!   region is a sealed memfd (`F_SEAL_FUTURE_WRITE`, `F_SEAL_SHRINK`, `F_SEAL_GROW`), so no
+//!   writable mapping, `write(2)` or `ftruncate` of it succeeds through *any* descriptor of it
+//!   (a `/proc/self/fd/N` reopen with `O_RDWR` included) — this holds against a reader of the
+//!   **same uid** too. A reader owns only a registry page of its own (it can neither write the
+//!   other readers' wake flags nor reach the header a later attach reads, and no reader can
+//!   shrink a region under the writer), and its face carries nothing out
+//!   ([`side_frame_max`](Transport::side_frame_max) is 0). A frame is what the writer's process
+//!   wrote, so a local reader needs no per-frame signature to know where a frame came from.
+//!   *Not Linux:* there is no `memfd` sealing; the data fd is an `O_RDONLY` open of a `0o600`
+//!   object, which keeps readers of other uids from writing the ring, and a same-uid process that
+//!   can reopen the object read-write is not stopped.
 //! * **Exact-size frames.** A frame is published with its own length and read with it: no padding,
 //!   no `Name`/`Data` dressing.
 //! * **End of stream.** The writer's drop publishes a one-octet frame (`0x00`, [`EOS`]); a channel
@@ -57,7 +64,9 @@ use crate::spsc::{
 /// Slots in a ring: a reader that falls this many frames behind is lapped.
 pub const RING_SLOTS: u32 = 256;
 
-/// Readers one ring serves over its life (a reader that leaves does not free its place).
+/// Readers one ring serves at a time. A reader that leaves (its end of the wakeup pipe closes)
+/// frees its place, so a ring serves any number of readers over its life; when all places are held
+/// by live readers an attach is [`Declined`](RingError::Declined) with that reason.
 pub const RING_READERS: u32 = 32;
 
 /// Octets a slot has beyond the longest frame (the ring's own bookkeeping per slot is separate).
@@ -109,7 +118,12 @@ pub enum RingError {
          may have taken the ring's name"
     )]
     Refused,
-    /// The ring was found but would not hand its fds over within [`ATTACH_TRIES`] tries.
+    /// The ring's owner had no place for this reader, or could not set one up: it said why.
+    #[error("the ring's owner declined the attach: {0}")]
+    Declined(String),
+    /// The ring was found but gave no ring: its control socket did not answer within
+    /// [`HANDSHAKE_TIMEOUT`](crate::spsc::HANDSHAKE_TIMEOUT), or would not hand its fds over
+    /// within [`ATTACH_TRIES`] tries.
     #[error(
         "the ring accepted no attach in {ms} ms ({last}): the sender's process is not serving \
          it; try again, or use the link carriers"
@@ -198,13 +212,20 @@ pub fn sealed_geometry(frame_max: usize) -> (u32, u32) {
 
 /// Bind a writer's control socket **exclusively**: refuse to hijack a live owner. If the path is
 /// in use it is probed: a live listener is an error (the name is served), a stale socket (no
-/// listener, a crashed writer's) is reclaimed.
+/// listener, a crashed writer's) is reclaimed. The probe is bounded (one second): a listener
+/// whose backlog is full is live. The listener does not count the probe's connect-and-close as an
+/// unauthorized attempt.
 pub fn bind_exclusive(path: &Path) -> Result<tokio::net::UnixListener, RingError> {
     match tokio::net::UnixListener::bind(path) {
         Ok(l) => Ok(l),
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            if std::os::unix::net::UnixStream::connect(path).is_ok() {
-                return Err(RingError::AlreadyServed(path.to_path_buf()));
+            let probe = crate::spsc::connect_bounded(path, std::time::Instant::now() + PROBE_WAIT);
+            match probe {
+                Ok(_) => return Err(RingError::AlreadyServed(path.to_path_buf())),
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                    return Err(RingError::AlreadyServed(path.to_path_buf()));
+                }
+                Err(_) => {}
             }
             let _ = std::fs::remove_file(path);
             tokio::net::UnixListener::bind(path).map_err(RingError::Io)
@@ -212,6 +233,9 @@ pub fn bind_exclusive(path: &Path) -> Result<tokio::net::UnixListener, RingError
         Err(e) => Err(RingError::Io(e)),
     }
 }
+
+/// How long [`bind_exclusive`] waits for a socket already at the path to accept its probe.
+const PROBE_WAIT: Duration = Duration::from_secs(1);
 
 enum End {
     Writer {
@@ -281,7 +305,11 @@ impl RingFace {
     /// [`NotHere`](RingError::NotHere) at once when no control socket of that name exists: a
     /// receiver attaches iff the ring is served on this host. A bound socket that is not yet
     /// accepting is retried [`ATTACH_TRIES`] times, [`ATTACH_PAUSE`] apart, off the runtime's
-    /// threads; a failed authentication ([`Refused`](RingError::Refused)) is final at once.
+    /// threads; a failed authentication ([`Refused`](RingError::Refused)) is final at once, and so
+    /// is an owner that answers nothing within [`HANDSHAKE_TIMEOUT`](crate::spsc::HANDSHAKE_TIMEOUT)
+    /// ([`NotServing`](RingError::NotServing), which says so) — an attach never waits for ever on a
+    /// silent socket — and an owner with no place for the reader
+    /// ([`Declined`](RingError::Declined), with its reason).
     pub async fn attach(id: FaceId, ring: &Name, secret: &[u8]) -> Result<Self, RingError> {
         let path = control_path(ring);
         if !path.exists() {
@@ -300,6 +328,13 @@ impl RingFace {
                 Ok(parts) => break parts,
                 Err(ShmError::Io(e)) if e.kind() == std::io::ErrorKind::PermissionDenied => {
                     return Err(RingError::Refused);
+                }
+                Err(ShmError::Refused(why)) => return Err(RingError::Declined(why)),
+                Err(ShmError::Io(e)) if e.kind() == std::io::ErrorKind::TimedOut => {
+                    return Err(RingError::NotServing {
+                        ms: started.elapsed().as_millis(),
+                        last: e.to_string(),
+                    });
                 }
                 Err(_) if tried + 1 < ATTACH_TRIES => {
                     tried += 1;
@@ -646,9 +681,14 @@ mod tests {
             libc::MAP_FAILED,
             "a writable mapping of the data region is refused"
         );
+        // A sealed memfd refuses with EPERM (Linux); an O_RDONLY fd of a shm object with EACCES.
         assert_eq!(
             std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::EACCES)
+            Some(if cfg!(target_os = "linux") {
+                libc::EPERM
+            } else {
+                libc::EACCES
+            })
         );
         let ro = unsafe {
             libc::mmap(
