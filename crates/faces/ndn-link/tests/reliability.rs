@@ -311,10 +311,13 @@ async fn a_configured_peer_has_reliability_only_when_its_entry_asks() {
     );
 }
 
-/// A transfer over a lossy link, asked as ndn-heap asks one: 1 MiB in pieces of
-/// `CHUNK` (4096) bytes, 32 in flight, each piece expressed again after 250 ms, 500,
-/// 1000 (the client of `examples/ladder.rs`, rung 3). What is counted is what the
-/// consumer sees: Interests expressed again for a piece that had not come.
+/// A transfer over a link that loses Interests, asked as ndn-heap asks one: 1 MiB in pieces of
+/// `CHUNK` (4096) bytes, 32 in flight, a piece expressed again once if it has not come after
+/// `GAP`. The loss is a fact, not a chance: the first Interest of every tenth piece is lost and
+/// every later arrival of that Interest (the link's own retransmission, or the consumer's) is
+/// delivered, so each run loses the same 26 Interests whatever the order frames arrive in.
+/// What is counted is what the consumer sees: Interests expressed again because the gap passed
+/// with the piece not come (a Congestion Nack's repeat is not one).
 #[cfg(feature = "fault-injection")]
 mod lossy {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -322,7 +325,7 @@ mod lossy {
     use bytes::Bytes;
     use futures::StreamExt;
     use ndn_app::{Consumer, EngineAppExt};
-    use ndn_link::{FaultPlan, Faults};
+    use ndn_link::{FaultKind, FaultPlan, FaultVerdict, Faults};
     use ndn_packet::Name;
     use ndn_packet::encode::InterestBuilder;
 
@@ -331,13 +334,21 @@ mod lossy {
 
     const CHUNK: usize = 4096;
     const SIZE: usize = 1 << 20;
+    const PIECES: usize = SIZE / CHUNK;
     const WINDOW: usize = 32;
-    const GAPS_MS: [u64; 3] = [250, 500, 1000];
+    /// The first Interest of every `LOST_EVERY`th piece (0, 10, 20, ...) is lost.
+    const LOST_EVERY: usize = 10;
+    /// How long a piece waits before the consumer expresses it again. Far longer than any
+    /// repair the link makes (a retransmission after its timeout), so that what is expressed
+    /// again is what the link did not repair, and no run depends on how fast the host is.
+    const GAP: Duration = Duration::from_secs(5);
+    const BUDGET: Duration = Duration::from_secs(30);
 
     /// What a transfer cost its consumer.
     #[derive(Debug)]
     pub struct Cost {
-        /// The Interests expressed beyond the first, summed over the pieces.
+        /// The Interests expressed again because the gap passed with the piece not come,
+        /// summed over the pieces.
         pub reexpressed: u64,
         /// Asks that failed outright (a Nack, the lifetime) and were asked again.
         pub failed: u64,
@@ -369,11 +380,38 @@ mod lossy {
         probe_prefix(producer).append("bulk")
     }
 
-    /// Lose 1 in 10 of the frames that arrive on `at`'s links, the seed fixed.
-    pub fn lossy(at: &Embedded, seed: u64) {
-        at.links.inject_faults(FaultPlan::new(
-            Faults::parse("drop=0.1").unwrap().with_seed(seed),
-        ));
+    /// The piece an Interest under `prefix` asks for (its last component, in digits).
+    fn piece_of(prefix: &Name, name: &Name) -> Option<usize> {
+        if !name.has_prefix(prefix) {
+            return None;
+        }
+        let last = name.components().last()?;
+        std::str::from_utf8(last.value.as_ref()).ok()?.parse().ok()
+    }
+
+    /// Lose the first Interest of every tenth piece under `prefix` that arrives on `at`'s
+    /// links, and nothing else: no draw, no seed. (Every later arrival of the same Interest
+    /// passes, so the loss is repaired, by the link or by the consumer, exactly once.)
+    pub fn lossy(at: &Embedded, prefix: &Name) {
+        let prefix = prefix.clone();
+        let lost = std::sync::Mutex::new(std::collections::HashSet::new());
+        at.links
+            .inject_faults(FaultPlan::new(Faults::parse("drop=0").unwrap()).verdict(
+                move |frame| {
+                    let piece = (frame.kind == FaultKind::Interest)
+                        .then_some(frame.name.as_ref())
+                        .flatten()
+                        .and_then(|name| piece_of(&prefix, name));
+                    match piece {
+                        Some(piece)
+                            if piece % LOST_EVERY == 0 && lost.lock().unwrap().insert(piece) =>
+                        {
+                            FaultVerdict::Drop
+                        }
+                        _ => FaultVerdict::Pass,
+                    }
+                },
+            ));
     }
 
     /// Ask the 1 MiB under `prefix` (run `run` of it) from `consumer`.
@@ -387,7 +425,7 @@ mod lossy {
         let (reexpressed, failed) = (AtomicU64::new(0), AtomicU64::new(0));
         let (reexpressed_ref, failed_ref) = (&reexpressed, &failed);
         let node = &node;
-        let got: usize = futures::stream::iter(0..SIZE / CHUNK)
+        let got: usize = futures::stream::iter(0..PIECES)
             .map(|piece| async move {
                 let name = prefix
                     .clone()
@@ -395,17 +433,23 @@ mod lossy {
                     .append(piece.to_string());
                 let mut tries = 0;
                 loop {
+                    let congested = AtomicU64::new(0);
                     match Consumer::new(node.connection())
-                        .fetch_reexpressing(
+                        .fetch_reexpressing_noting(
                             || InterestBuilder::new(name.clone()),
-                            Duration::from_secs(2),
+                            BUDGET,
                             Duration::from_millis(250),
-                            GAPS_MS.map(Duration::from_millis),
+                            [GAP],
+                            || {
+                                congested.fetch_add(1, Ordering::Relaxed);
+                            },
                         )
                         .await
                     {
                         Ok((data, expressed)) => {
-                            reexpressed_ref.fetch_add(u64::from(expressed - 1), Ordering::Relaxed);
+                            let again = u64::from(expressed - 1)
+                                .saturating_sub(congested.load(Ordering::Relaxed));
+                            reexpressed_ref.fetch_add(again, Ordering::Relaxed);
                             break data.content().map_or(0, |c| c.len());
                         }
                         Err(_) if tries < 3 => {
@@ -461,7 +505,7 @@ mod lossy {
         })
         .await;
 
-        lossy(&ann, 11);
+        lossy(&ann, &bulk(&ann));
         transfer(&phone, &ann, &bulk(&ann), 1).await
     }
 
@@ -496,22 +540,32 @@ mod lossy {
         })
         .await;
 
-        lossy(&bob, 11);
+        lossy(&bob, &bulk(&bob));
         transfer(&ann, &bob, &bulk(&bob), 1).await
     }
 
-    /// With a kind's reliability on, a 1 MiB transfer over a link of that kind that loses
-    /// 1 in 10 frames needs no (or far fewer) re-expressions; with it off, the same
-    /// transfer over the same link needs some.
+    /// With a kind's reliability on, a 1 MiB transfer over a link of that kind that loses 26
+    /// Interests needs no re-expression and no second ask: the link repairs every one before
+    /// the consumer's gap. With it off, the same transfer over the same link needs exactly one
+    /// re-expression for each Interest lost.
     fn repaired(kind: &str, off: &Cost, on: &Cost) {
         println!("{kind}: off {off:?}\n{kind}: on  {on:?}");
-        assert!(
-            off.reexpressed > 0 && off.faults.as_ref().is_some_and(|f| f.dropped > 0),
-            "the loss costs the transfer nothing with reliability off, so the case shows nothing: {kind}: off {off:?}"
+        let lost = PIECES.div_ceil(LOST_EVERY) as u64;
+        for (what, cost) in [("off", off), ("on", on)] {
+            assert_eq!(
+                cost.faults.as_ref().map(|f| f.dropped),
+                Some(lost),
+                "the fault layer did not lose the {lost} Interests the case plans, {kind}: {what} {cost:?}"
+            );
+        }
+        assert_eq!(
+            off.reexpressed, lost,
+            "without reliability each lost Interest costs one re-expression, so the case shows nothing otherwise: {kind}: off {off:?}"
         );
-        assert!(
-            on.reexpressed * 4 <= off.reexpressed && on.failed == 0,
-            "reliability on did not repair the loss of the {kind}: off {off:?}, on {on:?}"
+        assert_eq!(
+            (on.reexpressed, on.failed),
+            (0, 0),
+            "reliability on did not repair the loss of the {kind} before the consumer asked again: off {off:?}, on {on:?}"
         );
     }
 

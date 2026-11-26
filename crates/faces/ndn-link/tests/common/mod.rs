@@ -1063,30 +1063,50 @@ pub async fn dials(from: &Embedded, ann: &Embedded) -> Result<(), LinkDetail> {
         .await
 }
 
+/// How long a join keeps asking again (what `NotReady` and a retry say) before a test
+/// calls it failed.
+pub const JOIN_LIMIT: Duration = Duration::from_secs(90);
+
 /// Invite `bob` as `role` into the notebook (shared with a cover) and have
 /// him join.
 pub async fn invited(ann: &Embedded, bob: &Embedded, role: Role) {
+    invited_within(ann, bob, role, JOIN_LIMIT).await;
+}
+
+/// [`invited`], asking again for `limit` instead of [`JOIN_LIMIT`]: a test whose links
+/// lose, forge and delay packets by a random profile ends a join that never succeeds
+/// after the patience it gives its other waits.
+pub async fn invited_within(ann: &Embedded, bob: &Embedded, role: Role, limit: Duration) {
     let code = offered(ann, role).await;
-    joined(ann, bob, &code, role).await;
+    joined(ann, bob, &code, role, limit).await;
 }
 
 /// Invite `bob` as `role` into `folder`, already shared, and have him join.
 pub async fn invited_in(ann: &Embedded, bob: &Embedded, folder: &Name, role: Role) {
-    let code = offer_of(ann, folder, role).await;
-    joined(ann, bob, &code, role).await;
+    invited_in_within(ann, bob, folder, role, JOIN_LIMIT).await;
 }
 
-async fn joined(ann: &Embedded, bob: &Embedded, code: &Code, role: Role) {
-    let joined = joins(bob, &code.link, Duration::from_secs(90))
-        .await
-        .unwrap_or_else(|e| {
-            panic!(
-                "the join failed: {e} ({:?})\nbob: {:#?}\nann: {:#?}",
-                e.next(),
-                bob.links.report(),
-                ann.links.report()
-            )
-        });
+/// [`invited_in`], asking again for `limit`.
+pub async fn invited_in_within(
+    ann: &Embedded,
+    bob: &Embedded,
+    folder: &Name,
+    role: Role,
+    limit: Duration,
+) {
+    let code = offer_of(ann, folder, role).await;
+    joined(ann, bob, &code, role, limit).await;
+}
+
+async fn joined(ann: &Embedded, bob: &Embedded, code: &Code, role: Role, limit: Duration) {
+    let joined = joins(bob, &code.link, limit).await.unwrap_or_else(|e| {
+        panic!(
+            "the join failed: {e} ({:?})\nbob: {:#?}\nann: {:#?}",
+            e.next(),
+            bob.links.report(),
+            ann.links.report()
+        )
+    });
     assert_eq!(joined.role, role);
 }
 

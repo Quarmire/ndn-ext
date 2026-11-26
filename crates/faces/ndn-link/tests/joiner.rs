@@ -1014,8 +1014,18 @@ async fn g11(faulty: bool, by_name: bool) {
         inject(&[&ann, &bob, &carol]);
     }
 
-    invited(&ann, &bob, Role::Writer).await;
-    invited_in(&ann, &carol, &folder, Role::Writer).await;
+    // The faulty profile loses, forges and delays at random: a join that keeps being
+    // refused or not ready is asked again for as long as the test's other waits last.
+    let patience = if faulty { LONG * 4 } else { LONG };
+    common::invited_within(&ann, &bob, Role::Writer, patience.max(common::JOIN_LIMIT)).await;
+    common::invited_in_within(
+        &ann,
+        &carol,
+        &folder,
+        Role::Writer,
+        patience.max(common::JOIN_LIMIT),
+    )
+    .await;
     until("ann is linked to both", LONG, async || {
         linked(&ann, bob.key) && linked(&ann, carol.key)
     })
@@ -1070,7 +1080,6 @@ async fn g11(faulty: bool, by_name: bool) {
 
     // Carol writes, Bob reads it through Ann, no route of the test's. Under
     // the faulty profile each round trip may take several attempts.
-    let patience = if faulty { LONG * 4 } else { LONG };
     let written = folder.clone().append("from-carol");
     puts(&carol, &written, text("carol writes"), patience).await;
     until("bob reads carol's note", patience, async || {
