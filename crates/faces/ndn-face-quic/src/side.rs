@@ -95,7 +95,7 @@ pub const DATAGRAM_SEND_BUFFER: usize = 1024 * 1024;
 /// The longest channel frame on the stream (a record's payload). A peer that
 /// sends a longer one has sent more than this side grants: the link is closed
 /// as a protocol error.
-pub const STREAM_FRAME_MAX: usize = 1024 * 1024;
+pub const STREAM_FRAME_MAX: usize = ndn_transport::side_header::STREAM_FRAME_GRANT;
 
 /// Octets of stream frames [`forward_side`](ndn_transport::Transport::forward_side)
 /// may have queued in front of the stream writer, records' prefixes included.
