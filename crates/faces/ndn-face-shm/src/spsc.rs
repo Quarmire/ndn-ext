@@ -892,9 +892,292 @@ pub fn mutual_auth_client(
     Ok(true)
 }
 
-/// Reject this many unauthorized connections before giving up — a backstop in
-/// case the (unguessable) socket path ever leaks and is flooded.
-const HANDOFF_MAX_REJECTS: u32 = 16;
+/// Unauthorized connections one *process* (kernel-reported uid + pid of the
+/// connecting peer) may make inside [`UNAUTH_WINDOW`] before the producer
+/// refuses its connections until the window passes.
+const UNAUTH_PER_PEER_MAX: u32 = 16;
+
+/// Unauthorized connections one *uid* may make inside [`UNAUTH_WINDOW`] summed
+/// over all its processes. The per-process bound alone is evaded by forking (a
+/// fresh pid gets a fresh allowance, uid unchanged); this larger second bound
+/// caps that. It is larger so that a few honest misconfigured clients of one
+/// user (each its own pid) don't reach it, and it is keyed by uid — never
+/// shared across users — so a hostile user cannot lock out another user's
+/// clients. Same-uid processes are inside the capability's trust boundary
+/// (anything that user runs can read the token the same way the client does),
+/// so refusing that uid for one window costs nothing the attacker didn't
+/// already hold.
+const UNAUTH_PER_UID_MAX: u32 = 64;
+
+/// Fixed window, opened by a counter's first unauthorized connection and
+/// measured on the monotonic clock. When it ends the counter is forgotten.
+/// Refused connections do not extend it (so a peer is served again exactly one
+/// window after its first failure, however hard it keeps knocking). This
+/// bounds *availability* only; authorization is always the token handshake and
+/// never depends on this table or on time.
+const UNAUTH_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Hard bound on counters kept. When full, the counter with the oldest window
+/// is evicted, so a process minting pids cannot grow the table (it can at most
+/// forget older counters, which only relaxes the availability bound).
+const UNAUTH_TABLE_MAX: usize = 1024;
+
+/// The credential the kernel reports for the connecting process
+/// (`SO_PEERCRED`, taken at `connect`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Peer {
+    Process {
+        uid: u32,
+        pid: Option<i32>,
+    },
+    /// `peer_cred` failed. All such peers share one bucket with the per-process
+    /// bound — we cannot tell them apart, so they cannot be allowed an unbounded
+    /// number of tries each.
+    Unidentified,
+}
+
+impl Peer {
+    fn of(stream: &tokio::net::UnixStream) -> Self {
+        match stream.peer_cred() {
+            Ok(c) => Peer::Process {
+                uid: c.uid(),
+                pid: c.pid(),
+            },
+            Err(_) => Peer::Unidentified,
+        }
+    }
+}
+
+impl std::fmt::Display for Peer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Peer::Process { uid, pid: Some(p) } => write!(f, "uid {uid} pid {p}"),
+            Peer::Process { uid, pid: None } => write!(f, "uid {uid} (pid unknown)"),
+            Peer::Unidentified => write!(f, "an unidentified peer (no SO_PEERCRED)"),
+        }
+    }
+}
+
+/// What a counter counts: one process, or all processes of one uid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Scope {
+    Process(Peer),
+    Uid(u32),
+}
+
+impl Scope {
+    fn bound(self) -> u32 {
+        match self {
+            Scope::Process(_) => UNAUTH_PER_PEER_MAX,
+            Scope::Uid(_) => UNAUTH_PER_UID_MAX,
+        }
+    }
+}
+
+impl std::fmt::Display for Scope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Scope::Process(p) => write!(f, "{p}"),
+            Scope::Uid(u) => write!(f, "uid {u} (all its processes)"),
+        }
+    }
+}
+
+/// A peer over its bound: who, and how long until the window passes.
+#[derive(Debug, PartialEq, Eq)]
+struct Refusal {
+    scope: Scope,
+    retry_in: std::time::Duration,
+}
+
+#[derive(Clone, Copy)]
+struct Counter {
+    window_start: std::time::Instant,
+    failures: u32,
+    /// Insertion order, to break eviction ties between equal `window_start`s.
+    seq: u64,
+}
+
+/// Per-credential bound on unauthorized connections to a handoff socket, so one
+/// misbehaving local process cannot make the producer stop serving the rest.
+///
+/// **Rule for a peer over its bound: it is refused until its window passes,
+/// whether or not it would now authenticate.** Refusal happens before any read
+/// (cheap: the stream is just closed), so authorization is not even attempted,
+/// and an attacker can never learn from timing or outcome whether a guess was
+/// close. The alternative — still serving an over-bound peer that authenticates
+/// — needs the full handshake (reads, entropy, two MACs) for every attempt of a
+/// hammering peer, which is exactly the cost the bound exists to cap. An honest
+/// client stuck behind its own earlier failures retries after the window.
+/// Successes never clear a counter (else a peer alternates one good connect
+/// with a flood).
+///
+/// The clock is passed in (`now`, monotonic) so tests do not sleep.
+struct UnauthGate {
+    table: std::collections::HashMap<Scope, Counter>,
+    next_seq: u64,
+}
+
+impl UnauthGate {
+    fn new() -> Self {
+        Self {
+            table: std::collections::HashMap::new(),
+            next_seq: 0,
+        }
+    }
+
+    fn scopes(peer: Peer) -> [Option<Scope>; 2] {
+        match peer {
+            Peer::Process { uid, .. } => [Some(Scope::Process(peer)), Some(Scope::Uid(uid))],
+            Peer::Unidentified => [Some(Scope::Process(peer)), None],
+        }
+    }
+
+    fn remaining(c: &Counter, now: std::time::Instant) -> std::time::Duration {
+        UNAUTH_WINDOW.saturating_sub(now.saturating_duration_since(c.window_start))
+    }
+
+    /// The counter for `scope` if its window is still open.
+    fn live(&self, scope: Scope, now: std::time::Instant) -> Option<&Counter> {
+        self.table
+            .get(&scope)
+            .filter(|c| !Self::remaining(c, now).is_zero())
+    }
+
+    /// Admit a new connection from `peer`, or say why not.
+    fn admit(&self, peer: Peer, now: std::time::Instant) -> Result<(), Refusal> {
+        for scope in Self::scopes(peer).into_iter().flatten() {
+            if let Some(c) = self.live(scope, now)
+                && c.failures >= scope.bound()
+            {
+                return Err(Refusal {
+                    scope,
+                    retry_in: Self::remaining(c, now),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Count one unauthorized connection from `peer`. Returns the refusal that
+    /// now applies if this failure is the one that reached a bound.
+    fn record_failure(&mut self, peer: Peer, now: std::time::Instant) -> Option<Refusal> {
+        let mut tripped = None;
+        for scope in Self::scopes(peer).into_iter().flatten() {
+            if self.live(scope, now).is_none() {
+                // Absent or past its window: start a fresh window, within the hard bound.
+                self.table.remove(&scope);
+                self.make_room(now);
+                let seq = self.next_seq;
+                self.next_seq += 1;
+                self.table.insert(
+                    scope,
+                    Counter {
+                        window_start: now,
+                        failures: 0,
+                        seq,
+                    },
+                );
+            }
+            let c = self.table.get_mut(&scope).expect("inserted above");
+            c.failures = c.failures.saturating_add(1);
+            if c.failures == scope.bound() && tripped.is_none() {
+                tripped = Some(Refusal {
+                    scope,
+                    retry_in: Self::remaining(c, now),
+                });
+            }
+        }
+        tripped
+    }
+
+    /// Leave space for one more counter: drop counters whose window has passed,
+    /// and if the table is still full, the one with the oldest window.
+    fn make_room(&mut self, now: std::time::Instant) {
+        if self.table.len() < UNAUTH_TABLE_MAX {
+            return;
+        }
+        self.table.retain(|_, c| !Self::remaining(c, now).is_zero());
+        while self.table.len() >= UNAUTH_TABLE_MAX {
+            let oldest = self
+                .table
+                .iter()
+                .min_by_key(|(_, c)| (c.window_start, c.seq))
+                .map(|(s, _)| *s)
+                .expect("table is non-empty when full");
+            self.table.remove(&oldest);
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.table.len()
+    }
+}
+
+/// Accept connections until one passes `gate`; connections from a peer over its
+/// bound are closed at once, unread. Only an `accept` failure (listener closed)
+/// ends this — unauthorized connections never do.
+async fn accept_admitted(
+    listener: &tokio::net::UnixListener,
+    gate: &UnauthGate,
+    what: &str,
+) -> std::io::Result<(std::os::unix::net::UnixStream, Peer)> {
+    loop {
+        let (stream, _addr) = listener.accept().await?;
+        let peer = Peer::of(&stream);
+        if let Err(r) = gate.admit(peer, std::time::Instant::now()) {
+            tracing::debug!(
+                "{what}: refused a connection from {peer} without reading it: {} is over its \
+                 {} unauthorized connections; it is served again in {}s — if this is a \
+                 legitimate client, fix its token and retry then",
+                r.scope,
+                r.scope.bound(),
+                r.retry_in.as_secs() + 1,
+            );
+            continue; // dropping the stream closes it
+        }
+        let std_stream = stream.into_std()?;
+        std_stream.set_nonblocking(false)?;
+        return Ok((std_stream, peer));
+    }
+}
+
+/// Run the mutual-auth handshake on a blocking task; `Some(stream)` iff the peer
+/// proved the capability. An IO error (peer aborted) counts as unauthorized,
+/// not fatal — a failed or squatter handshake must not kill the serve loop.
+async fn authenticate(
+    std_stream: std::os::unix::net::UnixStream,
+    token: ShmToken,
+    what: &str,
+) -> std::io::Result<Option<std::os::unix::net::UnixStream>> {
+    tokio::task::spawn_blocking(move || {
+        let mut s = std_stream;
+        if mutual_auth_server(&mut s, &token).unwrap_or(false) {
+            Some(s)
+        } else {
+            None
+        }
+    })
+    .await
+    .map_err(|e| std::io::Error::other(format!("{what} token task: {e}")))
+}
+
+/// Count an unauthorized connection against `peer`; warn once when that
+/// reaches a bound (later refusals log at debug).
+fn note_unauthorized(gate: &mut UnauthGate, peer: Peer, what: &str) {
+    if let Some(r) = gate.record_failure(peer, std::time::Instant::now()) {
+        tracing::warn!(
+            "{what}: {} made {} unauthorized connections; refusing all its connections for \
+             {}s. The other peers are unaffected. If this is a legitimate client it holds a \
+             wrong token — give it the token minted for this socket and retry after that; \
+             otherwise stop the process",
+            r.scope,
+            r.scope.bound(),
+            r.retry_in.as_secs(),
+        );
+    }
+}
 
 /// **Engine side of the Option-A handshake:** serve the face's three fds
 /// (`[region, a2e_write, e2a_read]` from [`SpscFace::create_anon_with`]) to the
@@ -903,53 +1186,29 @@ const HANDOFF_MAX_REJECTS: u32 = 16;
 /// (constant-time compared), so the socket may be world-connectable; an
 /// unauthorized connector is **rejected and the loop keeps listening** — a bad
 /// connector can't consume the one-shot handoff (the accept-until-authorized
-/// hardening). Async accept; the brief blocking `SCM_RIGHTS` exchange runs on a
-/// blocking task so it never stalls the runtime.
+/// hardening). Unauthorized attempts are bounded **per peer credential**
+/// ([`UnauthGate`]): one process over its bound is refused cheaply while every
+/// other peer is still served — the listener never stops because of them. Async
+/// accept; the brief blocking `SCM_RIGHTS` exchange runs on a blocking task so
+/// it never stalls the runtime.
 pub async fn serve_fd_handoff(
     listener: tokio::net::UnixListener,
     token: ShmToken,
     fds: [OwnedFd; 3],
 ) -> std::io::Result<()> {
-    let mut rejects = 0u32;
+    let mut gate = UnauthGate::new();
     loop {
-        let (stream, _addr) = listener.accept().await?;
-        let std_stream = stream.into_std()?;
-        std_stream.set_nonblocking(false)?;
+        let (std_stream, peer) = accept_admitted(&listener, &gate, "shm control").await?;
         // Read + check the token on a blocking task; hand back the stream if it
         // matched (so the fd send happens only for an authorized client).
-        let authorized = tokio::task::spawn_blocking(
-            move || -> std::io::Result<Option<std::os::unix::net::UnixStream>> {
-                let mut s = std_stream;
-                // Mutual challenge-response: prove the capability without sending it.
-                // An auth IO error (peer aborted) counts as "rejected", not fatal —
-                // a failed/squatter handshake must not kill the serve loop.
-                Ok(if mutual_auth_server(&mut s, &token).unwrap_or(false) {
-                    Some(s)
-                } else {
-                    None
-                })
-            },
-        )
-        .await
-        .map_err(|e| std::io::Error::other(format!("shm control token task: {e}")))??;
-
-        match authorized {
-            Some(s) => {
-                let raw = [fds[0].as_raw_fd(), fds[1].as_raw_fd(), fds[2].as_raw_fd()];
-                return tokio::task::spawn_blocking(move || send_fds(s.as_raw_fd(), &raw))
-                    .await
-                    .map_err(|e| std::io::Error::other(format!("shm control send task: {e}")))?;
-            }
-            None => {
-                rejects += 1;
-                if rejects >= HANDOFF_MAX_REJECTS {
-                    return Err(std::io::Error::other(
-                        "shm control: too many unauthorized connections",
-                    ));
-                }
-                // keep listening — an unauthorized connector must not consume the handoff
-            }
-        }
+        let Some(s) = authenticate(std_stream, token, "shm control").await? else {
+            note_unauthorized(&mut gate, peer, "shm control");
+            continue; // an unauthorized connector must not consume the handoff
+        };
+        let raw = [fds[0].as_raw_fd(), fds[1].as_raw_fd(), fds[2].as_raw_fd()];
+        return tokio::task::spawn_blocking(move || send_fds(s.as_raw_fd(), &raw))
+            .await
+            .map_err(|e| std::io::Error::other(format!("shm control send task: {e}")))?;
     }
 }
 
@@ -968,27 +1227,11 @@ pub async fn serve_fd_handoff_loop<F>(
 where
     F: FnMut() -> std::io::Result<[OwnedFd; 3]>,
 {
+    let mut gate = UnauthGate::new();
     loop {
-        let (stream, _addr) = listener.accept().await?;
-        let std_stream = stream.into_std()?;
-        std_stream.set_nonblocking(false)?;
-        let authorized = tokio::task::spawn_blocking(
-            move || -> std::io::Result<Option<std::os::unix::net::UnixStream>> {
-                let mut s = std_stream;
-                // Mutual challenge-response: prove the capability without sending it.
-                // An auth IO error (peer aborted) counts as "rejected", not fatal —
-                // a failed/squatter handshake must not kill the serve loop.
-                Ok(if mutual_auth_server(&mut s, &token).unwrap_or(false) {
-                    Some(s)
-                } else {
-                    None
-                })
-            },
-        )
-        .await
-        .map_err(|e| std::io::Error::other(format!("shm control token task: {e}")))??;
-
-        let Some(s) = authorized else {
+        let (std_stream, peer) = accept_admitted(&listener, &gate, "shm control").await?;
+        let Some(s) = authenticate(std_stream, token, "shm control").await? else {
+            note_unauthorized(&mut gate, peer, "shm control");
             continue; // unauthorized — drop and keep listening
         };
         // Mint a fresh ring for this peer; on failure, drop the peer and continue.
@@ -1034,41 +1277,19 @@ pub fn connect_fd_handoff(
 /// sealed-ring fds `[data_ro, ctrl_rw, wake_r]`. The geometry is read from the data
 /// region header by the consumer (authoritative), so no metadata rides the wire.
 /// Like [`serve_fd_handoff`] but for the sealed ring. One consumer (1:1);
-/// unauthorized connectors are rejected.
+/// unauthorized connectors are rejected, bounded per peer credential
+/// ([`UnauthGate`]); the listener never stops because of them.
 #[cfg(unix)]
 pub async fn serve_sealed_handoff(
     listener: tokio::net::UnixListener,
     token: ShmToken,
     fds: [OwnedFd; 3],
 ) -> std::io::Result<()> {
-    let mut rejects = 0u32;
+    let mut gate = UnauthGate::new();
     loop {
-        let (stream, _addr) = listener.accept().await?;
-        let std_stream = stream.into_std()?;
-        std_stream.set_nonblocking(false)?;
-        let authorized = tokio::task::spawn_blocking(
-            move || -> std::io::Result<Option<std::os::unix::net::UnixStream>> {
-                let mut s = std_stream;
-                // Mutual challenge-response: prove the capability without sending it.
-                // An auth IO error (peer aborted) counts as "rejected", not fatal —
-                // a failed/squatter handshake must not kill the serve loop.
-                Ok(if mutual_auth_server(&mut s, &token).unwrap_or(false) {
-                    Some(s)
-                } else {
-                    None
-                })
-            },
-        )
-        .await
-        .map_err(|e| std::io::Error::other(format!("shm control token task: {e}")))??;
-
-        let Some(s) = authorized else {
-            rejects += 1;
-            if rejects >= HANDOFF_MAX_REJECTS {
-                return Err(std::io::Error::other(
-                    "shm control: too many unauthorized connections",
-                ));
-            }
+        let (std_stream, peer) = accept_admitted(&listener, &gate, "shm control").await?;
+        let Some(s) = authenticate(std_stream, token, "shm control").await? else {
+            note_unauthorized(&mut gate, peer, "shm control");
             continue;
         };
         let raw = [fds[0].as_raw_fd(), fds[1].as_raw_fd(), fds[2].as_raw_fd()];
@@ -2912,38 +3133,20 @@ impl BroadcastReader {
 /// consumer that connects (unlike the 1:1 sealed handoff, this loops). Each consumer
 /// gets a fresh registry slot + wakeup pipe via [`BroadcastWriter::register_consumer`];
 /// the three fds ride one `SCM_RIGHTS` message and the registry index follows as four
-/// bytes. Runs until the listener errors or is dropped (spawn it and hold the handle).
+/// bytes. Unauthorized connectors are bounded per peer credential ([`UnauthGate`]):
+/// one process over its bound is refused while the others are still served. Runs
+/// until the listener errors or is dropped (spawn it and hold the handle).
 #[cfg(unix)]
 pub async fn serve_broadcast_handoff(
     listener: tokio::net::UnixListener,
     token: ShmToken,
     writer: std::sync::Arc<BroadcastWriter>,
 ) -> std::io::Result<()> {
-    let mut rejects = 0u32;
+    let mut gate = UnauthGate::new();
     loop {
-        let (stream, _addr) = listener.accept().await?;
-        let std_stream = stream.into_std()?;
-        std_stream.set_nonblocking(false)?;
-        let authorized = tokio::task::spawn_blocking(
-            move || -> std::io::Result<Option<std::os::unix::net::UnixStream>> {
-                let mut s = std_stream;
-                Ok(if mutual_auth_server(&mut s, &token).unwrap_or(false) {
-                    Some(s)
-                } else {
-                    None
-                })
-            },
-        )
-        .await
-        .map_err(|e| std::io::Error::other(format!("broadcast handoff token task: {e}")))??;
-
-        let Some(s) = authorized else {
-            rejects += 1;
-            if rejects >= HANDOFF_MAX_REJECTS {
-                return Err(std::io::Error::other(
-                    "broadcast handoff: too many unauthorized connections",
-                ));
-            }
+        let (std_stream, peer) = accept_admitted(&listener, &gate, "broadcast handoff").await?;
+        let Some(s) = authenticate(std_stream, token, "broadcast handoff").await? else {
+            note_unauthorized(&mut gate, peer, "broadcast handoff");
             continue;
         };
         let (data_ro, reg_rw, wake_r, idx) = writer
@@ -2978,8 +3181,8 @@ pub fn connect_broadcast_handoff(
     let mut s = std::os::unix::net::UnixStream::connect(path).map_err(ShmError::Io)?;
     if !mutual_auth_client(&mut s, token).map_err(ShmError::Io)? {
         // PermissionDenied, not `other`: a caller that retries a connect that raced the
-        // producer's bind must not retry this (each retry is one more rejection the
-        // producer counts toward giving up serving, `HANDOFF_MAX_REJECTS`).
+        // producer's bind must not retry this (each retry is one more rejection counted
+        // against this process's `UNAUTH_PER_PEER_MAX` allowance).
         return Err(ShmError::Io(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "broadcast handoff: producer failed authentication (possible name squatter)",
@@ -4159,5 +4362,217 @@ mod tests {
         }
         serve.abort();
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Env var that turns [`bad_peer_helper_process`] into the misbehaving peer.
+    const BAD_PEER_ENV: &str = "NDN_SHM_TEST_BAD_PEER_SOCK";
+
+    /// Not a test of its own: when re-executed by
+    /// [`unauthorized_peer_does_not_lock_out_other_peers`] (env var set) this
+    /// process is the misbehaving peer — a *different* pid from the test process,
+    /// so a different credential. Its first `UNAUTH_PER_PEER_MAX` wrong-token
+    /// handshakes are answered (`Ok(false)`); once over its bound the producer
+    /// closes it without a handshake (`Err`).
+    #[test]
+    fn bad_peer_helper_process() {
+        let Ok(path) = std::env::var(BAD_PEER_ENV) else {
+            return;
+        };
+        let wrong = [0xAAu8; 32];
+        let mut answered = 0u32;
+        let mut cut_off = 0u32;
+        for _ in 0..24 {
+            let Ok(mut s) = std::os::unix::net::UnixStream::connect(&path) else {
+                cut_off += 1;
+                continue;
+            };
+            match mutual_auth_client(&mut s, &wrong) {
+                Ok(false) => answered += 1,
+                Ok(true) => panic!("wrong token authenticated"),
+                Err(_) => cut_off += 1,
+            }
+        }
+        println!("bad-peer-done answered={answered} cut_off={cut_off}");
+    }
+
+    /// One local process hammering the control socket with a wrong token must not
+    /// stop the producer serving *other* processes (it used to give up after 16
+    /// unauthorized connections, so any local process knowing the path could deny
+    /// every later attach).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unauthorized_peer_does_not_lock_out_other_peers() {
+        let token = mint_token().unwrap();
+        let path = control_socket_path(&token);
+        let _ = std::fs::remove_file(&path);
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let writer = std::sync::Arc::new(BroadcastWriter::create(8, 64, 4).unwrap());
+        let serve = tokio::spawn(serve_broadcast_handoff(listener, token, writer.clone()));
+
+        let sock = path.clone();
+        let out = tokio::task::spawn_blocking(move || {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "spsc::tests::bad_peer_helper_process",
+                    "--nocapture",
+                ])
+                .env(BAD_PEER_ENV, sock)
+                .output()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "bad-peer helper failed: {stdout}");
+        assert!(
+            stdout.contains("bad-peer-done"),
+            "bad-peer helper did not run: {stdout}"
+        );
+
+        // A different process (this one) still attaches.
+        let p = path.clone();
+        let attached = tokio::task::spawn_blocking(move || connect_broadcast_handoff(&p, &token))
+            .await
+            .unwrap();
+        assert!(
+            attached.is_ok(),
+            "legitimate attach after another peer's bad connects failed: {:?}",
+            attached.err()
+        );
+        assert!(!serve.is_finished(), "serve loop must keep running");
+        serve.abort();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn proc_peer(uid: u32, pid: i32) -> Peer {
+        Peer::Process {
+            uid,
+            pid: Some(pid),
+        }
+    }
+
+    /// Fail `peer` until it is refused; returns the refusal from the failure that tripped it.
+    fn trip(gate: &mut UnauthGate, peer: Peer, now: std::time::Instant) -> Refusal {
+        for _ in 0..UNAUTH_PER_PEER_MAX - 1 {
+            assert_eq!(gate.record_failure(peer, now), None, "tripped early");
+        }
+        gate.record_failure(peer, now)
+            .expect("the failure that reaches the bound reports the refusal")
+    }
+
+    /// One peer over its bound is refused; another process (even of the same
+    /// uid), another uid, and the unidentified bucket are unaffected.
+    #[test]
+    fn unauth_gate_refuses_only_the_offending_peer() {
+        let t0 = std::time::Instant::now();
+        let mut gate = UnauthGate::new();
+        let bad = proc_peer(1000, 4242);
+        assert!(gate.admit(bad, t0).is_ok());
+        let r = trip(&mut gate, bad, t0);
+        assert_eq!(r.scope, Scope::Process(bad));
+        assert_eq!(gate.admit(bad, t0).unwrap_err().scope, Scope::Process(bad));
+        assert!(
+            gate.admit(proc_peer(1000, 4243), t0).is_ok(),
+            "same uid, other pid"
+        );
+        assert!(gate.admit(proc_peer(1001, 4242), t0).is_ok(), "other uid");
+        assert!(gate.admit(Peer::Unidentified, t0).is_ok());
+    }
+
+    /// Forking to change pid keeps the uid counter: once the uid's total reaches
+    /// the larger bound, every process of that uid is refused, other uids not.
+    #[test]
+    fn unauth_gate_uid_bound_stops_pid_cycling() {
+        let t0 = std::time::Instant::now();
+        let mut gate = UnauthGate::new();
+        let mut tripped = None;
+        for i in 0..UNAUTH_PER_UID_MAX {
+            // one failure per fresh pid: no per-process bound is ever reached
+            let r = gate.record_failure(proc_peer(1000, 100 + i as i32), t0);
+            if r.is_some() {
+                tripped = r;
+            }
+        }
+        assert_eq!(tripped.expect("uid bound reached").scope, Scope::Uid(1000));
+        assert!(
+            gate.admit(proc_peer(1000, 99_999), t0).is_err(),
+            "a never-seen pid of the offending uid is refused"
+        );
+        assert!(gate.admit(proc_peer(1001, 100), t0).is_ok());
+    }
+
+    /// Peers whose credential cannot be read share one bucket with the
+    /// per-process bound; identified peers are not affected by it.
+    #[test]
+    fn unauth_gate_unidentified_peers_share_a_bounded_bucket() {
+        let t0 = std::time::Instant::now();
+        let mut gate = UnauthGate::new();
+        trip(&mut gate, Peer::Unidentified, t0);
+        assert_eq!(
+            gate.admit(Peer::Unidentified, t0).unwrap_err().scope,
+            Scope::Process(Peer::Unidentified)
+        );
+        assert!(gate.admit(proc_peer(1000, 1), t0).is_ok());
+    }
+
+    /// The counter table has a hard size bound however many distinct peers
+    /// fail, and eviction takes the oldest counter (a tripped peer whose window
+    /// is oldest is forgotten first; a recent one is kept).
+    #[test]
+    fn unauth_gate_table_stays_bounded_and_evicts_oldest() {
+        let t0 = std::time::Instant::now();
+        let mut gate = UnauthGate::new();
+        let oldest = proc_peer(5, 1);
+        trip(&mut gate, oldest, t0);
+        let mut newest = oldest;
+        for i in 0..(UNAUTH_TABLE_MAX as u32 * 3) {
+            // distinct uid per peer so both its counters are new entries
+            newest = proc_peer(10_000 + i, 1);
+            gate.record_failure(
+                newest,
+                t0 + std::time::Duration::from_micros(1 + u64::from(i)),
+            );
+            assert!(
+                gate.len() <= UNAUTH_TABLE_MAX,
+                "table grew to {} (max {UNAUTH_TABLE_MAX})",
+                gate.len()
+            );
+        }
+        assert!(
+            gate.admit(oldest, t0 + std::time::Duration::from_secs(1))
+                .is_ok(),
+            "the oldest counter was evicted"
+        );
+        // a peer tripped now is retained and refused
+        let late = proc_peer(9, 9);
+        let at = t0 + std::time::Duration::from_secs(2);
+        trip(&mut gate, late, at);
+        assert!(gate.admit(late, at).is_err());
+        assert!(gate.len() <= UNAUTH_TABLE_MAX);
+        let _ = newest;
+    }
+
+    /// A refused peer is served again once its window (from the first failure,
+    /// monotonic clock) has passed, and then has a fresh allowance.
+    #[test]
+    fn unauth_gate_serves_peer_again_after_window() {
+        let t0 = std::time::Instant::now();
+        let mut gate = UnauthGate::new();
+        let peer = proc_peer(1000, 7);
+        let later = t0 + std::time::Duration::from_secs(5);
+        for _ in 0..UNAUTH_PER_PEER_MAX - 1 {
+            gate.record_failure(peer, t0);
+        }
+        gate.record_failure(peer, later); // reaches the bound; does not extend the window
+        let almost = t0 + UNAUTH_WINDOW - std::time::Duration::from_millis(1);
+        let r = gate.admit(peer, almost).unwrap_err();
+        assert_eq!(r.retry_in, std::time::Duration::from_millis(1));
+        // knocking while refused doesn't move the window either
+        assert!(gate.admit(peer, almost).is_err());
+        let reopened = t0 + UNAUTH_WINDOW;
+        assert!(gate.admit(peer, reopened).is_ok(), "window passed");
+        // fresh allowance: one failure doesn't trip it again
+        assert_eq!(gate.record_failure(peer, reopened), None);
+        assert!(gate.admit(peer, reopened).is_ok());
     }
 }
