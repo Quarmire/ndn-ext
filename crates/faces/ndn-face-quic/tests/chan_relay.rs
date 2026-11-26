@@ -1,5 +1,5 @@
 //! Stage 4 end to end (SHAPES-CHANNEL.md §8, §13): a channel fanned out through forwarders over
-//! real QUIC links. A sender, a relay and two receivers, each on a forwarder of its own
+//! real QUIC links. A sender, a relay and up to four receivers, each on a forwarder of its own
 //! (`examples/common/relay.rs`); the relay has no identity, no trust and no data layer, only
 //! routes toward the people's names and its side table. Each receiver asks the sender for the
 //! channel with the real signed ask: the Interest goes receiver -> relay -> sender, the session
@@ -70,35 +70,40 @@ async fn emit(mesh: &Mesh, path: &str, bytes: &[u8]) {
         .expect("the sender is a writer");
 }
 
-/// Both receivers asked, the route standing at every hop, and the sender's `HELLO` seen at both.
+/// Every receiver asked, the route standing at every hop, and the sender's `HELLO` seen at all.
 struct Fanned {
     mesh: Mesh,
-    a: Items,
-    b: Items,
+    items: Vec<Items>,
     channel: u64,
 }
 
-async fn fanned_out() -> Fanned {
-    let mesh = Mesh::new(&Runtimes::current(), 2, true, Build::default()).await;
-    let (a, b) = (live(&mesh.receivers[0]), live(&mesh.receivers[1]));
+async fn fanned_out(receivers: usize) -> Fanned {
+    let mesh = Mesh::new(&Runtimes::current(), receivers, true, Build::default()).await;
+    let items: Vec<Items> = mesh.receivers.iter().map(live).collect();
     let here = tokio::runtime::Handle::current();
-    let info_a = Mesh::ask(&here, &mesh.receivers[0].node, &mesh.sender.node).await;
-    let info_b = Mesh::ask(&here, &mesh.receivers[1].node, &mesh.sender.node).await;
-    assert_eq!(info_a.channel, info_b.channel, "one channel, two receivers");
+    let mut channel = None;
+    for r in &mesh.receivers {
+        let info = Mesh::ask(&here, &r.node, &mesh.sender.node).await;
+        assert_eq!(
+            *channel.get_or_insert(info.channel),
+            info.channel,
+            "one channel, {receivers} receivers"
+        );
+    }
+    let channel = channel.expect("a receiver");
     let relay = mesh.relay.as_ref().expect("a relay");
-    eventually("the relay holds both receivers as sinks", || {
-        relay.engine.side().sinks(SideId(info_a.channel)) == 2
+    eventually("the relay holds every receiver as a sink", || {
+        relay.engine.side().sinks(SideId(channel)) == receivers
     })
     .await;
-    eventually("HELLO at both receivers", || {
-        a.hello_seen() && b.hello_seen()
+    eventually("HELLO at every receiver", || {
+        items.iter().all(Items::hello_seen)
     })
     .await;
     Fanned {
-        channel: info_a.channel,
+        channel,
         mesh,
-        a,
-        b,
+        items,
     }
 }
 
@@ -112,8 +117,8 @@ struct Counts {
     relay_link_rx_from_sender: u64,
     relay_in: u64,
     relay_out: u64,
-    relay_link_tx: [u64; 2],
-    receiver_link_rx: [u64; 2],
+    relay_link_tx: Vec<u64>,
+    receiver_link_rx: Vec<u64>,
 }
 
 fn counts(mesh: &Mesh) -> Counts {
@@ -129,45 +134,37 @@ fn counts(mesh: &Mesh) -> Counts {
         relay_link_rx_from_sender: rx_frames(&mesh.relay_links[0]),
         relay_in: r.frames_in,
         relay_out: r.frames_out,
-        relay_link_tx: [
-            tx_frames(&mesh.relay_links[1]),
-            tx_frames(&mesh.relay_links[2]),
-        ],
-        receiver_link_rx: [
-            rx_frames(&mesh.receivers[0].link),
-            rx_frames(&mesh.receivers[1].link),
-        ],
+        relay_link_tx: mesh.relay_links[1..].iter().map(tx_frames).collect(),
+        receiver_link_rx: mesh.receivers.iter().map(|r| rx_frames(&r.link)).collect(),
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn two_receivers_behind_a_relay_get_every_message_and_the_sender_link_carries_one_copy_of_each_frame()
- {
+/// `receivers` behind a relay get every message, and one copy of each frame leaves the sender.
+async fn one_copy(receivers: usize) {
     let Fanned {
         mesh,
-        mut a,
-        mut b,
+        mut items,
         channel,
-    } = fanned_out().await;
+    } = fanned_out(receivers).await;
     let relay = mesh.relay.as_ref().unwrap();
 
-    // The relay holds the route with two sinks; the sender's forwarder holds it with one (the
-    // relay), the receivers' with one each (their node).
+    // The relay holds the route with a sink for each receiver; the sender's forwarder holds it
+    // with one (the relay), the receivers' with one each (their node).
     let routes = relay.engine.side().list();
     let route = routes.iter().find(|r| r.id == channel).expect("the route");
-    assert_eq!(route.sinks.len(), 2, "the relay's sinks: {route:?}");
+    assert_eq!(route.sinks.len(), receivers, "the relay's sinks: {route:?}");
     let at_sender = mesh.sender.site.engine.side().list();
     let sender_route = at_sender.iter().find(|r| r.id == channel).expect("route");
     assert_eq!(sender_route.sinks.len(), 1, "one link out of the sender");
 
-    // Quiet, then one message at a time (so that each is a frame of its own), each seen by both.
+    // Quiet, then one message at a time (so that each is a frame of its own), each seen by all.
     tokio::time::sleep(Duration::from_millis(300)).await;
     let before = counts(&mesh);
     const M: u64 = 12;
     for i in 0..M {
         let (path, payload) = (format!("/m/{i}"), format!("message {i}"));
         emit(&mesh, &path, payload.as_bytes()).await;
-        for items in [&mut a, &mut b] {
+        for items in &mut items {
             let got = next(items).await.expect("an item");
             assert_eq!(got.path.to_string(), path);
             assert_eq!(&got.bytes[..], payload.as_bytes());
@@ -178,6 +175,7 @@ async fn two_receivers_behind_a_relay_get_every_message_and_the_sender_link_carr
     let after = counts(&mesh);
     let d = |f: fn(&Counts) -> u64| f(&after) - f(&before);
     let sent = d(|c| c.sender_link_tx);
+    let n = receivers as u64;
 
     // Every message was a frame at least (the checkpoints that follow are frames too).
     assert!(sent >= M, "{M} messages sent in {sent} frames");
@@ -193,7 +191,7 @@ async fn two_receivers_behind_a_relay_get_every_message_and_the_sender_link_carr
         sent,
         "sender: frames out\n{before:?}\n{after:?}"
     );
-    // ...the relay received exactly those and made a copy for each of its two sinks, and each
+    // ...the relay received exactly those and made a copy for each of its sinks, and each
     // receiver's link carried the same frames once...
     assert_eq!(
         d(|c| c.relay_link_rx_from_sender),
@@ -201,8 +199,8 @@ async fn two_receivers_behind_a_relay_get_every_message_and_the_sender_link_carr
         "{before:?}\n{after:?}"
     );
     assert_eq!(d(|c| c.relay_in), sent, "{before:?}\n{after:?}");
-    assert_eq!(d(|c| c.relay_out), 2 * sent, "{before:?}\n{after:?}");
-    for i in 0..2 {
+    assert_eq!(d(|c| c.relay_out), n * sent, "{before:?}\n{after:?}");
+    for i in 0..receivers {
         assert_eq!(
             after.relay_link_tx[i] - before.relay_link_tx[i],
             sent,
@@ -223,13 +221,28 @@ async fn two_receivers_behind_a_relay_get_every_message_and_the_sender_link_carr
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_receivers_behind_a_relay_get_every_message_and_the_sender_link_carries_one_copy_of_each_frame()
+ {
+    one_copy(2).await;
+}
+
+/// Rung `C3` of the stage 4 gate (SHAPES-CHANNEL.md §13): one sender, four receivers behind a
+/// relay. The sender's link carries one copy of each frame, whoever is behind the relay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn four_receivers_behind_a_relay_get_every_message_and_the_sender_link_carries_one_copy_of_each_frame()
+ {
+    one_copy(4).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_receiver_that_unsubscribes_leaves_the_other_receiving_and_the_relay_with_one_sink() {
     let Fanned {
         mesh,
-        a,
-        mut b,
+        mut items,
         channel,
-    } = fanned_out().await;
+    } = fanned_out(2).await;
+    let mut b = items.pop().unwrap();
+    let a = items.pop().unwrap();
     let relay = mesh.relay.as_ref().unwrap();
     let route_sinks = |site: &relay::Site| site.engine.side().sinks(SideId(channel));
     let unsubs = relay.engine.side().stats().unsubs;

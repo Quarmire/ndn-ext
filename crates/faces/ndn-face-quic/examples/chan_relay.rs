@@ -1,7 +1,8 @@
 //! The channel through forwarders (stage 4, SHAPES-CHANNEL.md §8, §13) measured by the method of
-//! `chan_ping`: a sender (`/bob/phone`) and one or two receivers (`/carol/tablet`, `/dave/watch`),
+//! `chan_ping`: a sender (`/bob/phone`) and one to four receivers (`/carol/tablet`, `/dave/watch`,
+//! `/erin/laptop`, `/frank/phone`),
 //! each device on a forwarder of its own (`ndn-engine`) and each forwarder on a runtime of its
-//! own (`send`, `recvA`, `recvB`, and `relay` for the relay's), joined by real QUIC links on
+//! own (`send`, `recvA` to `recvD`, and `relay` for the relay's), joined by real QUIC links on
 //! loopback. The channel is set up by the real signed ask over the links, and the frames travel
 //! `Heap::emit` -> the sender's forwarder -> link -> [the relay's side table -> a link for each
 //! receiver] -> the receivers' forwarders -> `Heap::live`'s `Items`.
@@ -13,14 +14,16 @@
 //! | `direct` | one receiver linked to the sender (one link, no relay) |
 //! | `relay1` | one receiver behind a relay (two links) |
 //! | `relay2` | two receivers behind a relay (three links): one copy of each frame leaves the sender |
+//! | `relay4` | four receivers behind a relay (five links): rung `C3` |
 //!
 //! Rows (`only`, comma separated), run for each shape:
 //!
 //! | row | meaning |
 //! |---|---|
-//! | `lat:<size>` | the half round trip of `size` octets: `emit` /ping at the sender -> receiver A's `Items` -> A `emit`s /pong -> the sender's `Items`; 1,000 warm-up (and 300 ms) then 10,000 timed round trips, the lowest and highest 1 % dropped. In `relay2` B receives the pings too (and counts them) |
+//! | `lat:<size>` | the half round trip of `size` octets, for each receiver in turn (the others receive the pings too and count them): `emit` /ping at the sender -> the receiver's `Items` -> it `emit`s /pong -> the sender's `Items`; 1,000 warm-up (and 300 ms) then 10,000 timed round trips, the lowest and highest 1 % dropped |
 //! | `thr:<size>` | back-to-back `emit` of `size` octets over `paths` paths for `secs` seconds after 0.5 s; each receiver counts what its `Items` yields |
 //! | `paced:<size>:<per second>` | `size` octets at a fixed rate for `secs` seconds after 0.5 s: the CPU (schedstat) of each runtime, as a share of one core, with the checkpoint period of `checkpoint` |
+//! | `c3:<size>:<messages>` | rung `C3` of the stage 4 gate (SHAPES-CHANNEL.md §13; use it with `relay4`): `messages` of `size` octets in windows of 20, each delivered to every receiver before the next; then the frame counts of the sender's link, the relay's table and its links, and a `C3 PASS` or `C3 FAIL` line: the sender link carries one copy of each frame (relay frames in = the sender link's frames out; relay frames out = receivers x that; every link of a receiver carries the same). The process exits 1 on a FAIL |
 //!
 //! Arguments are `key=value` words:
 //!
@@ -63,6 +66,7 @@ enum Shape {
     Direct,
     Relay1,
     Relay2,
+    Relay4,
 }
 
 impl Shape {
@@ -71,15 +75,29 @@ impl Shape {
             Shape::Direct => "direct",
             Shape::Relay1 => "relay1",
             Shape::Relay2 => "relay2",
+            Shape::Relay4 => "relay4",
         }
     }
 
     fn receivers(self) -> usize {
-        if self == Shape::Relay2 { 2 } else { 1 }
+        match self {
+            Shape::Direct | Shape::Relay1 => 1,
+            Shape::Relay2 => 2,
+            Shape::Relay4 => 4,
+        }
     }
 
     fn relayed(self) -> bool {
         self != Shape::Direct
+    }
+
+    /// ` recv A` for a shape with more than one receiver, nothing for one.
+    fn recv_tag(self, i: usize) -> String {
+        if self.receivers() > 1 {
+            format!(" recv {}", LETTERS[i])
+        } else {
+            String::new()
+        }
     }
 }
 
@@ -130,13 +148,14 @@ impl Args {
         Self {
             shapes: kv
                 .get("shapes")
-                .map_or("direct,relay1,relay2", String::as_str)
+                .map_or("direct,relay1,relay2,relay4", String::as_str)
                 .split(',')
                 .map(|s| match s {
                     "direct" => Shape::Direct,
                     "relay1" => Shape::Relay1,
                     "relay2" => Shape::Relay2,
-                    other => panic!("shapes are direct, relay1, relay2, got `{other}`"),
+                    "relay4" => Shape::Relay4,
+                    other => panic!("shapes are direct, relay1, relay2, relay4, got `{other}`"),
                 })
                 .collect(),
             only: kv
@@ -172,7 +191,7 @@ struct Ctx {
     ctl: Arc<tokio::runtime::Runtime>,
     send: Arc<tokio::runtime::Runtime>,
     relay: Arc<tokio::runtime::Runtime>,
-    recv: [Arc<tokio::runtime::Runtime>; 2],
+    recv: Vec<Arc<tokio::runtime::Runtime>>,
 }
 
 /// The mesh of one shape, built for the rows asked.
@@ -182,24 +201,31 @@ struct Rig {
 }
 
 impl Ctx {
-    fn new(args: &Args) -> Self {
+    fn new(args: &Args, receivers: usize) -> Self {
         Self {
             args: args.clone(),
             ctl: runtime("ctl", 1),
             send: runtime("send", args.workers),
             relay: runtime("relay", args.workers),
-            recv: [
-                runtime("recvA", args.workers),
-                runtime("recvB", args.workers),
-            ],
+            recv: (0..receivers)
+                .map(|i| runtime(&format!("recv{}", LETTERS[i]), args.workers))
+                .collect(),
         }
+    }
+
+    /// The labels of the runtimes' threads, for the CPU shares.
+    fn runtime_names(&self) -> Vec<String> {
+        ["send".to_owned(), "relay".to_owned()]
+            .into_iter()
+            .chain((0..self.recv.len()).map(|i| format!("recv{}", LETTERS[i])))
+            .collect()
     }
 
     fn rig(&self, shape: Shape) -> Rig {
         let rts = Runtimes {
             send: self.send.handle().clone(),
             relay: self.relay.handle().clone(),
-            recv: [self.recv[0].handle().clone(), self.recv[1].handle().clone()],
+            recv: self.recv.iter().map(|r| r.handle().clone()).collect(),
         };
         let build = Build {
             transport: LinkTransportConfig {
@@ -287,8 +313,52 @@ fn receiver_stats(m: &Mesh) -> Vec<(ndn_face_quic::SideStats, ndn_engine::side::
         .collect()
 }
 
-/// The labels of the runtimes' threads, for the CPU shares.
-const RUNTIMES: [&str; 4] = ["send", "relay", "recvA", "recvB"];
+/// The receivers' labels (and their runtimes' threads: `recvA` ...).
+const LETTERS: [&str; 4] = ["A", "B", "C", "D"];
+
+/// What moved frames, read at one moment: the sender's link and engine, the relay's engine and
+/// links (empty for a direct link), the receivers' links.
+struct Wire {
+    sender_tx: u64,
+    sender_in: u64,
+    sender_out: u64,
+    relay_rx: u64,
+    relay_in: u64,
+    relay_out: u64,
+    relay_tx: Vec<u64>,
+    recv_rx: Vec<u64>,
+}
+
+fn rx_frames(s: &ndn_face_quic::SideStats) -> u64 {
+    s.datagram_rx_frames + s.stream_rx_frames
+}
+
+fn wire(m: &Mesh) -> Wire {
+    let sender = m.sender.site.engine.side().stats();
+    let relay = m.relay.as_ref().map(|r| r.engine.side().stats());
+    Wire {
+        sender_tx: frames(&m.sender.link.side_stats()),
+        sender_in: sender.frames_in,
+        sender_out: sender.frames_out,
+        relay_rx: m
+            .relay_links
+            .first()
+            .map_or(0, |l| rx_frames(&l.side_stats())),
+        relay_in: relay.as_ref().map_or(0, |r| r.frames_in),
+        relay_out: relay.as_ref().map_or(0, |r| r.frames_out),
+        relay_tx: m
+            .relay_links
+            .iter()
+            .skip(1)
+            .map(|l| frames(&l.side_stats()))
+            .collect(),
+        recv_rx: m
+            .receivers
+            .iter()
+            .map(|r| rx_frames(&r.link.side_stats()))
+            .collect(),
+    }
+}
 
 fn cores(
     before: &BTreeMap<u32, ThreadCpu>,
@@ -400,7 +470,7 @@ impl Ctx {
         let size_f = size as f64 * 8.0 / 1e9;
         let per_rx = rates
             .iter()
-            .zip(["A", "B"])
+            .zip(LETTERS)
             .map(|(r, who)| {
                 format!(
                     "{who} {r:>9.0} msg/s ({:.2} Gbit/s, {:.1} % of emitted)",
@@ -445,11 +515,16 @@ impl Ctx {
                 r1.wrong_source - r0.wrong_source,
                 out.join(", ")
             );
+            println!(
+                "    fan-out: relay frames out / sender link frames out = {:.3} ({} receivers behind the relay; one copy per frame leaves the sender)",
+                (r1.frames_out - r0.frames_out) as f64 / (sent_frames as f64).max(1.0),
+                m.receivers.len()
+            );
         }
         for (i, ((a0, e0), (a1, e1))) in rx0.iter().zip(&rx1).enumerate() {
             println!(
                 "    receiver {}: link received {:.0} datagram + {:.0} stream frames/s; its forwarder: frames in {:.0}/s, out {:.0}/s, sink_full {}, unrouted {}, wrong_source {}, quota {}",
-                ["A", "B"][i],
+                LETTERS[i],
                 (a1.datagram_rx_frames - a0.datagram_rx_frames) as f64 / wall,
                 (a1.stream_rx_frames - a0.stream_rx_frames) as f64 / wall,
                 (e1.frames_in - e0.frames_in) as f64 / wall,
@@ -471,27 +546,32 @@ impl Ctx {
         };
         println!(
             "    cpu per delivered message (all receivers): {}",
-            RUNTIMES.map(per).join(", ")
+            self.runtime_names()
+                .iter()
+                .map(|t| per(t))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
         std::thread::sleep(Duration::from_millis(300));
         rates
     }
 
-    /// The half round trip of `size` octets, `emit` to `Items` and back through A: the sender
-    /// emits /ping, A's `Items` yields it and A emits /pong, the sender's `Items` yields it. 1,000
-    /// warm-up round trips (and at least 300 ms), 10,000 timed, the outer percents dropped. B, if
-    /// there is one, counts the pings.
-    fn latency(&self, rig: &Rig, size: usize) -> (f64, f64, f64) {
+    /// The half round trip of `size` octets, `emit` to `Items` and back through receiver `echo`:
+    /// the sender emits /ping, the receiver's `Items` yields it and it emits /pong, the sender's
+    /// `Items` yields it. 1,000 warm-up round trips (and at least 300 ms), 10,000 timed, the
+    /// outer percents dropped. The other receivers, if there are any, count the pings.
+    fn latency(&self, rig: &Rig, size: usize, echo: usize) -> (f64, f64, f64) {
         let m = &rig.mesh;
         let mut bob_items = m
             .sender
             .heap
             .live(everything(), GetOptions::default())
             .expect("the sender is a member");
-        let mut items = self.open(rig);
-        // The sender takes A's channel too: the pongs come back over the same links.
+        let items = self.open(rig);
+        // The sender takes the echoing receiver's channel too: the pongs come back over the same
+        // links.
         self.ctl.block_on(async {
-            Mesh::ask(self.send.handle(), &m.sender.node, &m.receivers[0].node).await;
+            Mesh::ask(self.send.handle(), &m.sender.node, &m.receivers[echo].node).await;
             let start = Instant::now();
             while !bob_items.hello_seen() {
                 assert!(
@@ -501,22 +581,29 @@ impl Ctx {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         });
-        let mut b_drain = None;
-        let b_seen = Arc::new(AtomicU64::new(0));
-        if items.len() == 2 {
-            let b = items.pop().unwrap();
-            b_drain = Some(self.recv[1].spawn(consume(
-                b,
-                size,
-                Arc::clone(&b_seen),
-                Arc::new(AtomicU64::new(0)),
-                Arc::new(AtomicU64::new(0)),
-            )));
+        // The other receivers drain and count the pings.
+        let mut drains = Vec::new();
+        let mut counted = Vec::new();
+        let mut echo_items = None;
+        for (i, it) in items.into_iter().enumerate() {
+            if i == echo {
+                echo_items = Some(it);
+            } else {
+                let seen = Arc::new(AtomicU64::new(0));
+                counted.push((i, Arc::clone(&seen)));
+                drains.push(self.recv[i].spawn(consume(
+                    it,
+                    size,
+                    seen,
+                    Arc::new(AtomicU64::new(0)),
+                    Arc::new(AtomicU64::new(0)),
+                )));
+            }
         }
-        let mut a_items = items.pop().unwrap();
-        let echo = {
-            let a = m.receivers[0].heap.clone();
-            self.recv[0].spawn(async move {
+        let mut a_items = echo_items.expect("the echoing receiver");
+        let echo_task = {
+            let a = m.receivers[echo].heap.clone();
+            self.recv[echo].spawn(async move {
                 let pong = name("/pong");
                 while let Some(item) = a_items.next().await {
                     if let Ok(got) = item
@@ -572,28 +659,36 @@ impl Ctx {
             (out, lost)
         });
         let (c1, wall) = (threads(), t0.elapsed().as_secs_f64());
-        echo.abort();
-        if let Some(b) = b_drain {
-            b.abort();
+        echo_task.abort();
+        for d in &drains {
+            d.abort();
         }
         println!("    cpu: {}", cpu_line(&c0, &c1, wall));
         let (p50, p99, mean) = trimmed(&mut samples);
+        let others = counted
+            .iter()
+            .map(|(i, s)| {
+                format!(
+                    "{} counted {} pings",
+                    LETTERS[*i],
+                    s.load(Ordering::Relaxed)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
         println!(
-            "row {} lat{size} p50 {p50:.1} us  p99 {p99:.1} us  mean {mean:.1} us (half round trip, emit -> Items, 10,000 after 1,000, outer 1% dropped; {lost} round trips timed out{})",
+            "row {} lat{size}{} p50 {p50:.1} us  p99 {p99:.1} us  mean {mean:.1} us (half round trip, emit -> Items, 10,000 after 1,000, outer 1% dropped; {lost} round trips timed out{}{others})",
             rig.shape.label(),
-            if rig.shape == Shape::Relay2 {
-                format!("; B counted {} pings", b_seen.load(Ordering::Relaxed))
-            } else {
-                String::new()
-            }
+            rig.shape.recv_tag(echo),
+            if others.is_empty() { "" } else { "; " },
         );
         std::thread::sleep(Duration::from_millis(300));
         (p50, p99, mean)
     }
 
     /// `size` octets, `rate` a second, for `secs` seconds after 0.5 s; each receiver's `Items`
-    /// consumed. Returns the share of one core each runtime used (send, relay, recvA, recvB).
-    fn paced(&self, rig: &Rig, size: usize, rate: u64) -> [f64; 4] {
+    /// consumed. Returns the share of one core each runtime used (`runtime_names` order).
+    fn paced(&self, rig: &Rig, size: usize, rate: u64) -> Vec<f64> {
         let m = &rig.mesh;
         let items = self.open(rig);
         let (seen, notices, bad) = (
@@ -651,20 +746,185 @@ impl Ctx {
         for s in &subscribers {
             s.abort();
         }
-        let shares = RUNTIMES.map(|t| cores(&c0, &c1, wall, t));
+        let shares: Vec<f64> = self
+            .runtime_names()
+            .iter()
+            .map(|t| cores(&c0, &c1, wall, t))
+            .collect();
+        let per_runtime = self
+            .runtime_names()
+            .iter()
+            .zip(&shares)
+            .map(|(t, s)| format!("{t} {:.2} %", s * 100.0))
+            .collect::<Vec<_>>()
+            .join(", ");
         println!(
-            "row {} paced {size} B at {rate}/s, checkpoint {} ms: delivered {:.0} msg/s (all receivers); CPU, share of one core: send {:.2} %, relay {:.2} %, recvA {:.2} %, recvB {:.2} %",
+            "row {} paced {size} B at {rate}/s, checkpoint {} ms: delivered {:.0} msg/s (all receivers); CPU, share of one core: {per_runtime}",
             rig.shape.label(),
             self.args.checkpoint.as_millis(),
             (n1 - n0) as f64 / wall,
-            shares[0] * 100.0,
-            shares[1] * 100.0,
-            shares[2] * 100.0,
-            shares[3] * 100.0,
         );
         println!("    cpu: {}", cpu_line(&c0, &c1, wall));
         std::thread::sleep(Duration::from_millis(300));
-        shares.map(|s| s * 100.0)
+        shares.into_iter().map(|s| s * 100.0).collect()
+    }
+
+    /// Rung `C3` of the stage 4 gate (SHAPES-CHANNEL.md §13): `count` messages of `size` octets
+    /// go out in windows of 20, each window delivered to every receiver before the next; then the
+    /// frame counts of the links and of the relay's table say whether the sender's link carried
+    /// one copy of each frame. Prints the counters and a `C3 PASS` or `C3 FAIL` line; returns
+    /// whether it passed.
+    fn one_copy(&self, rig: &Rig, size: usize, count: u64) -> bool {
+        const WINDOW: u64 = 20;
+        let m = &rig.mesh;
+        let n = m.receivers.len();
+        let items = self.open(rig);
+        let (notices, bad) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+        let seen: Vec<Arc<AtomicU64>> = items.iter().map(|_| Arc::new(AtomicU64::new(0))).collect();
+        let subscribers: Vec<JoinHandle<()>> = items
+            .into_iter()
+            .zip(&seen)
+            .enumerate()
+            .map(|(i, (items, seen))| {
+                self.recv[i].spawn(consume(
+                    items,
+                    size,
+                    Arc::clone(seen),
+                    Arc::clone(&notices),
+                    Arc::clone(&bad),
+                ))
+            })
+            .collect();
+        // Quiet (the HELLO and the first checkpoints are over), then the messages.
+        std::thread::sleep(Duration::from_millis(300));
+        let w0 = wire(m);
+        let sent_all = {
+            let (heap, seen) = (m.sender.heap.clone(), seen.clone());
+            self.send.block_on(async move {
+                let payload = Bytes::from(vec![0xA5; size]);
+                let mut i = 0;
+                while i < count {
+                    let upto = (i + WINDOW).min(count);
+                    for k in i..upto {
+                        heap.emit(
+                            &name(&format!("/c3/{k}")),
+                            payload.clone(),
+                            EmitOptions::default(),
+                        )
+                        .await
+                        .map_err(|e| format!("emit refused: {e} (next: {:?})", e.next()))?;
+                    }
+                    let start = Instant::now();
+                    while seen.iter().any(|s| s.load(Ordering::Relaxed) < upto) {
+                        if start.elapsed() > Duration::from_secs(10) {
+                            return Err(format!(
+                                "messages up to {upto} not at every receiver within 10 s: {:?}",
+                                seen.iter()
+                                    .map(|s| s.load(Ordering::Relaxed))
+                                    .collect::<Vec<_>>()
+                            ));
+                        }
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    i = upto;
+                }
+                Ok::<(), String>(())
+            })
+        };
+        // Whatever follows the messages (checkpoints) is counted on every link alike.
+        std::thread::sleep(Duration::from_millis(300));
+        let w1 = wire(m);
+        for s in &subscribers {
+            s.abort();
+        }
+        let delta = |f: fn(&Wire) -> u64| f(&w1) - f(&w0);
+        let sent = delta(|w| w.sender_tx);
+        let mut problems = Vec::new();
+        if let Err(e) = sent_all {
+            problems.push(e);
+        }
+        if sent < count {
+            problems.push(format!("{count} messages went out in {sent} frames"));
+        }
+        let mut check = |what: String, got: u64, want: u64| {
+            if got != want {
+                problems.push(format!("{what}: {got}, expected {want}"));
+            }
+        };
+        check(
+            "sender engine frames in".into(),
+            delta(|w| w.sender_in),
+            sent,
+        );
+        check(
+            "sender engine frames out".into(),
+            delta(|w| w.sender_out),
+            sent,
+        );
+        if m.relay.is_some() {
+            check(
+                "relay link frames in from the sender".into(),
+                delta(|w| w.relay_rx),
+                sent,
+            );
+            check("relay frames in".into(), delta(|w| w.relay_in), sent);
+            check(
+                "relay frames out".into(),
+                delta(|w| w.relay_out),
+                n as u64 * sent,
+            );
+            for (who, (a, b)) in LETTERS.iter().zip(w1.relay_tx.iter().zip(&w0.relay_tx)) {
+                check(format!("relay link {who} frames out"), a - b, sent);
+            }
+        }
+        for (who, (a, b)) in LETTERS.iter().zip(w1.recv_rx.iter().zip(&w0.recv_rx)) {
+            check(format!("receiver {who} link frames in"), a - b, sent);
+        }
+        for (who, got) in LETTERS.iter().zip(&seen) {
+            check(
+                format!("receiver {who} items"),
+                got.load(Ordering::Relaxed),
+                count,
+            );
+        }
+        check("wrong-size items".into(), bad.load(Ordering::Relaxed), 0);
+        println!(
+            "row {} c3 {size} B x {count}: sender link frames out {sent} ({} beyond the messages); sender engine in {} out {}; relay in {} out {} ({n} x {sent} expected); relay links out {:?}; receivers' links in {:?}; items per receiver {:?}",
+            rig.shape.label(),
+            sent.saturating_sub(count),
+            delta(|w| w.sender_in),
+            delta(|w| w.sender_out),
+            delta(|w| w.relay_in),
+            delta(|w| w.relay_out),
+            w1.relay_tx
+                .iter()
+                .zip(&w0.relay_tx)
+                .map(|(a, b)| a - b)
+                .collect::<Vec<_>>(),
+            w1.recv_rx
+                .iter()
+                .zip(&w0.recv_rx)
+                .map(|(a, b)| a - b)
+                .collect::<Vec<_>>(),
+            seen.iter()
+                .map(|s| s.load(Ordering::Relaxed))
+                .collect::<Vec<_>>(),
+        );
+        let ok = problems.is_empty();
+        if ok {
+            println!(
+                "C3 PASS ({}): the sender link carries one copy of each frame ({sent} frames out of the sender for {count} messages; every one of {n} receivers got all {count}, each over a link of its own)",
+                rig.shape.label()
+            );
+        } else {
+            println!(
+                "C3 FAIL ({}): the sender link does not carry one copy of each frame: {}. Next: if the relay's frames out are not receivers x frames in, no route was installed at the relay (`side/list` on it); if the sender link carries more than the relay took in, the sender sent per receiver",
+                rig.shape.label(),
+                problems.join("; ")
+            );
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        ok
     }
 }
 
@@ -679,10 +939,11 @@ fn main() {
         a.sealed
     );
     let mut summary: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    let mut c3_failed = false;
     for rep in 0..a.repeat {
         println!("--- repetition {}", rep + 1);
         for &shape in &a.shapes {
-            let ctx = Ctx::new(&a);
+            let ctx = Ctx::new(&a, shape.receivers());
             println!("-- shape {}", shape.label());
             let rig = ctx.rig(shape);
             for only in &a.only {
@@ -692,19 +953,25 @@ fn main() {
                 match parts.as_slice() {
                     ["lat", size] => {
                         let size: usize = size.parse().expect("a size");
-                        let (p50, p99, _) = ctx.latency(&rig, size);
-                        put(format!("{label} lat{size} p50 us"), p50);
-                        put(format!("{label} lat{size} p99 us"), p99);
+                        for echo in 0..shape.receivers() {
+                            let (p50, p99, _) = ctx.latency(&rig, size, echo);
+                            let tag = shape.recv_tag(echo);
+                            put(format!("{label} lat{size} p50 us{tag}"), p50);
+                            put(format!("{label} lat{size} p99 us{tag}"), p99);
+                        }
                     }
                     ["thr", size] => {
                         let size: usize = size.parse().expect("a size");
                         let rates = ctx.throughput(&rig, size);
-                        for (rate, who) in rates.iter().zip(["A", "B"]) {
+                        for (rate, who) in rates.iter().zip(LETTERS) {
                             put(format!("{label} thr {size} B msg/s ({who})"), *rate);
                         }
-                        if rates.len() == 2 {
+                        if rates.len() > 1 {
                             put(
-                                format!("{label} thr {size} B msg/s (A+B)"),
+                                format!(
+                                    "{label} thr {size} B msg/s ({})",
+                                    LETTERS[..rates.len()].join("+")
+                                ),
                                 rates.iter().sum(),
                             );
                         }
@@ -714,15 +981,24 @@ fn main() {
                             (size.parse().expect("a size"), rate.parse().expect("a rate"));
                         let shares = ctx.paced(&rig, size, rate);
                         let ck = a.checkpoint.as_millis();
-                        for (who, share) in RUNTIMES.iter().zip(shares) {
+                        for (who, share) in ctx.runtime_names().iter().zip(shares) {
                             put(
                                 format!("{label} paced {size} B {rate}/s ck {ck} ms: {who} % core"),
                                 share,
                             );
                         }
                     }
+                    ["c3", size, count] => {
+                        let (size, count): (usize, u64) = (
+                            size.parse().expect("a size"),
+                            count.parse().expect("a count"),
+                        );
+                        c3_failed |= !ctx.one_copy(&rig, size, count);
+                    }
                     _ => {
-                        panic!("unknown row `{only}` (lat:<size>, thr:<size>, paced:<size>:<rate>)")
+                        panic!(
+                            "unknown row `{only}` (lat:<size>, thr:<size>, paced:<size>:<rate>, c3:<size>:<messages>)"
+                        )
                     }
                 }
             }
@@ -741,4 +1017,8 @@ fn main() {
         println!("{k:<56} {m:>12.1} [{lo:.1}, {hi:.1}]");
     }
     println!("load average at end: {}", loadavg());
+    if c3_failed {
+        println!("C3 FAILED in at least one repetition (see the `C3 FAIL` lines above)");
+        std::process::exit(1);
+    }
 }

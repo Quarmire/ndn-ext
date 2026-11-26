@@ -1,5 +1,5 @@
 //! The topology `tests/chan_relay.rs` and `examples/chan_relay.rs` share (SHAPES-CHANNEL.md §8,
-//! §13 stage 4): a **sender** device, an optional **relay** and one or two **receivers**, each on
+//! §13 stage 4): a **sender** device, an optional **relay** and one to four **receivers**, each on
 //! a forwarder of its own (`ndn-engine`, in this process), joined by real QUIC links on loopback
 //! (`LinkFace`, which a forwarder takes as a face like any other). The sender and receivers run
 //! the data layer (`ndn-heap` `Node`s over their forwarder's app faces, `attach_forwarder`); the
@@ -31,9 +31,17 @@ use tokio_util::sync::CancellationToken;
 use crate::pair::connect_ids;
 
 /// The people: the sender's namespace, then the receivers' (a receiver is the owner of its own).
-const PEOPLE: [&str; 3] = ["/bob", "/carol", "/dave"];
+const PEOPLE: [&str; 5] = ["/bob", "/carol", "/dave", "/erin", "/frank"];
 /// Their devices.
-const DEVICES: [&str; 3] = ["/bob/phone", "/carol/tablet", "/dave/watch"];
+const DEVICES: [&str; 5] = [
+    "/bob/phone",
+    "/carol/tablet",
+    "/dave/watch",
+    "/erin/laptop",
+    "/frank/phone",
+];
+/// The most receivers a mesh takes.
+pub const MAX_RECEIVERS: usize = PEOPLE.len() - 1;
 
 pub fn name(uri: &str) -> Name {
     uri.parse().expect("a valid name")
@@ -118,7 +126,7 @@ async fn world(devices: &[&str]) -> Vec<Dev> {
 pub struct Runtimes {
     pub send: Handle,
     pub relay: Handle,
-    pub recv: [Handle; 2],
+    pub recv: Vec<Handle>,
 }
 
 impl Runtimes {
@@ -128,7 +136,7 @@ impl Runtimes {
         Self {
             send: here.clone(),
             relay: here.clone(),
-            recv: [here.clone(), here],
+            recv: vec![here; MAX_RECEIVERS],
         }
     }
 }
@@ -304,11 +312,11 @@ impl Default for Build {
 }
 
 impl Mesh {
-    /// `receivers` (1 or 2) devices behind a relay (`relay`) or, for one, directly linked to the
-    /// sender. The space is created by the sender, whose record each receiver holds before this
-    /// returns.
+    /// `receivers` (1 to `MAX_RECEIVERS`) devices behind a relay (`relay`) or, for one, directly
+    /// linked to the sender. The space is created by the sender, whose record each receiver holds
+    /// before this returns.
     pub async fn new(rt: &Runtimes, receivers: usize, relay: bool, build: Build) -> Mesh {
-        assert!((1..=2).contains(&receivers) && (relay || receivers == 1));
+        assert!((1..=MAX_RECEIVERS).contains(&receivers) && (relay || receivers == 1));
         let people = receivers + 1;
         let mut devs = world(&DEVICES[..people]).await;
         let sender_site = Site::start(&rt.send, SideConfig::default()).await;
