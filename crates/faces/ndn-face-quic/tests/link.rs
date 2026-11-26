@@ -1514,6 +1514,71 @@ async fn forwarded_stream_frames_keep_their_order_and_a_full_queue_refuses() {
     );
 }
 
+/// A sink face that cannot take a frame refuses it `Full` and moves nothing, and the receiver
+/// sees exactly the gap: the frames the sink took arrive in order, none of the refused ones
+/// ever do, and the frame sent once the sink had room arrives after a hole of the refused
+/// tags (docs/specs/channel.md: relays are lossy under congestion, visibly: the next frame's
+/// sequence shows the gap). Counted by the face as `sink_full`.
+#[tokio::test]
+async fn a_congested_sink_refuses_and_the_receiver_sees_exactly_the_gap() {
+    let dialer = endpoint(ed_key(1), false);
+    let listener = endpoint(ec_key(2), true);
+    let (a, b) = channel_link(&dialer, &listener).await;
+    // 1 MiB frames fill the 4 MiB queue while the writer has not run: some are taken, then
+    // every one is refused at once.
+    let (mut taken, mut refused) = (Vec::new(), Vec::new());
+    for tag in 100..132u32 {
+        match a
+            .face
+            .forward_side(frame(tag, 1024 * 1024), SideClass::Stream)
+        {
+            Ok(()) => taken.push(tag),
+            Err(SideRefused::Full) => refused.push(tag),
+            Err(other) => panic!("a sink either takes a frame or says Full, got {other}"),
+        }
+    }
+    assert!(!taken.is_empty(), "an empty queue takes frames");
+    assert!(
+        !refused.is_empty(),
+        "a 4 MiB queue is full after {} MiB",
+        taken.len()
+    );
+    assert!(
+        taken.iter().all(|t| *t < refused[0]),
+        "the queue refuses once it is full, not before"
+    );
+    assert_eq!(a.handle.side_stats().sink_full, refused.len() as u64);
+    // The receiver drains what the sink took, in order.
+    for tag in &taken {
+        assert_eq!(recv(&b.face).await, frame(*tag, 1024 * 1024));
+    }
+    // The sink has room again: the next frame is taken, and arrives after a hole that is
+    // exactly the refused tags.
+    let later = 200u32;
+    let start = std::time::Instant::now();
+    while a
+        .face
+        .forward_side(frame(later, 1024), SideClass::Stream)
+        .is_err()
+    {
+        assert!(start.elapsed() < T, "the queue never had room again");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let got = recv(&b.face).await;
+    assert_eq!(got, frame(later, 1024));
+    let seen: Vec<u32> = taken.iter().copied().chain([later]).collect();
+    assert!(
+        refused.iter().all(|t| !seen.contains(t)),
+        "no refused frame reached the receiver"
+    );
+    assert!(
+        drain_for(&b.face, Duration::from_millis(300))
+            .await
+            .is_empty(),
+        "and nothing else came"
+    );
+}
+
 #[tokio::test]
 async fn the_headroom_rule_bounds_what_a_channel_frame_waits_behind_ndn_datagrams() {
     const NDN: usize = 20_000;
