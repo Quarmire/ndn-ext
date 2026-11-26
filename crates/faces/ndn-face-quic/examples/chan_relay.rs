@@ -37,6 +37,7 @@
 //! | `checkpoint` | 20 | the checkpoint period, ms (`ChannelConfig::checkpoint`: 1 to 2,000) |
 //! | `sealed` | 1 | `1`: a sealed space (readers are named persons); `0`: a public one |
 //! | `timer` | 1 | `1`: each ping waits for its pong under `tokio::time::timeout`; `0`: no timer |
+//! | `trust` | `prompt` | `prompt` or `verified`: `GetOptions::trust` of every receiver (`Verified` delivers a frame only after a signed checkpoint listing it verified: up to one checkpoint period of latency) |
 //!
 //! Each repetition builds every shape afresh, in the order given. Pin from the command line:
 //! `taskset -c 10-13 target-shared/release/examples/chan_relay`.
@@ -48,7 +49,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use ndn_face_quic::LinkTransportConfig;
-use ndn_heap::{EmitOptions, GetOptions, Items, Name, Select};
+use ndn_heap::{EmitOptions, GetOptions, Items, Name, Select, Trust};
 use tokio::task::JoinHandle;
 
 mod common;
@@ -112,6 +113,7 @@ struct Args {
     paths: usize,
     checkpoint: Duration,
     sealed: bool,
+    trust: Trust,
     timer: bool,
 }
 
@@ -136,6 +138,7 @@ impl Args {
             "paths",
             "checkpoint",
             "sealed",
+            "trust",
             "timer",
         ];
         for k in kv.keys() {
@@ -171,6 +174,11 @@ impl Args {
             paths: num("paths", 256.0) as usize,
             checkpoint: Duration::from_millis(num("checkpoint", 20.0) as u64),
             sealed: num("sealed", 1.0) != 0.0,
+            trust: match kv.get("trust").map_or("prompt", String::as_str) {
+                "prompt" => Trust::Prompt,
+                "verified" => Trust::Verified,
+                other => panic!("trust is `prompt` or `verified`, got `{other}`"),
+            },
             timer: num("timer", 1.0) != 0.0,
         }
     }
@@ -187,9 +195,10 @@ fn everything() -> Select {
 }
 
 /// What these receivers take: the emissions of the channel, not the kept values.
-fn emissions() -> GetOptions {
+fn emissions(trust: Trust) -> GetOptions {
     GetOptions {
         kept: false,
+        trust,
         ..GetOptions::default()
     }
 }
@@ -262,7 +271,11 @@ impl Ctx {
             .mesh
             .receivers
             .iter()
-            .map(|r| r.heap.get(everything(), emissions()).expect("a member"))
+            .map(|r| {
+                r.heap
+                    .get(everything(), emissions(self.args.trust))
+                    .expect("a member")
+            })
             .collect();
         self.ctl.block_on(async {
             for (i, r) in rig.mesh.receivers.iter().enumerate() {
@@ -569,7 +582,7 @@ impl Ctx {
         let mut bob_items = m
             .sender
             .heap
-            .get(everything(), emissions())
+            .get(everything(), emissions(self.args.trust))
             .expect("the sender is a member");
         let items = self.open(rig);
         // The sender takes the echoing receiver's channel too: the pongs come back over the same
@@ -936,11 +949,12 @@ fn main() {
     let a = Args::parse();
     println!("load average at start: {}", loadavg());
     println!(
-        "path_mtu_max {}, paths {}, checkpoint {} ms, sealed {}",
+        "path_mtu_max {}, paths {}, checkpoint {} ms, sealed {}, trust {:?}",
         a.path_mtu_max,
         a.paths,
         a.checkpoint.as_millis(),
-        a.sealed
+        a.sealed,
+        a.trust
     );
     let mut summary: BTreeMap<String, Vec<f64>> = BTreeMap::new();
     let mut c3_failed = false;

@@ -28,6 +28,7 @@
 //! | `msgs` | 1000000 | messages the `cpu` row times |
 //! | `sealed` | 1 | `1`: the space is sealed (readers are named persons: an epoch and an audience, the frames are AES-GCM sealed); `0`: a public space (`Readers::Anyone`: no epoch, no audience; the frames are sealed the same way, so the rows differ only in the setup) |
 //! | `timer` | 1 | `1`: each ping waits for its pong under `tokio::time::timeout` (a timer registered and cancelled per round trip, which the raw rows do not do); `0`: no per-ping timer, a lost pong stalls the row (the harness's own cost, isolated) |
+//! | `trust` | `prompt` | `prompt` or `verified`: `GetOptions::trust` of every receiver (`Verified` delivers a frame only after a signed checkpoint listing it verified: the rows then include up to one checkpoint period of latency) |
 //! | `raw_lat`, `raw_thr_<size>` | | the raw datagram row (`carrier_bench`, `side_ping`) at the same settings: the summary prints the gates of §12.1 and §12.3 |
 //! | `profile` | | a file: the sampled CPU profile of the `send` and `recv` threads (SHAPES-CHANNEL.md §17.1) |
 //!
@@ -44,7 +45,7 @@ use ndn_engine::{EngineBuilder, ForwarderEngine};
 use ndn_face_quic::{Link, LinkTransportConfig};
 use ndn_heap::{
     Carrier, CarrierFuture, CarrierRefused, Config, Delivery, EmitOptions, GetOptions, Heap, Items,
-    Name, Node, Readers, Select, Share, host::NodeHandle,
+    Name, Node, Readers, Select, Share, Trust, host::NodeHandle,
 };
 use ndn_security::{Certificate, SecurityManager, SignedTrustContext, TrustSchema, Validator};
 use ndn_sync::{DataStore, MemoryStore};
@@ -91,6 +92,7 @@ struct Args {
     consume: Option<Consume>,
     msgs: usize,
     sealed: bool,
+    trust: Trust,
     timer: bool,
     profile: Option<String>,
     raw: BTreeMap<String, f64>,
@@ -117,6 +119,7 @@ impl Args {
             "consume",
             "msgs",
             "sealed",
+            "trust",
             "timer",
             "profile",
         ];
@@ -146,6 +149,11 @@ impl Args {
             }),
             msgs: num("msgs", 1_000_000.0) as usize,
             sealed: num("sealed", 1.0) != 0.0,
+            trust: match kv.get("trust").map_or("prompt", String::as_str) {
+                "prompt" => Trust::Prompt,
+                "verified" => Trust::Verified,
+                other => panic!("trust is `prompt` or `verified`, got `{other}`"),
+            },
             timer: num("timer", 1.0) != 0.0,
             profile: kv.get("profile").cloned(),
             raw: kv
@@ -588,9 +596,10 @@ fn everything() -> Select {
 }
 
 /// What these receivers take: the emissions of the channel, not the kept values.
-fn emissions() -> GetOptions {
+fn emissions(trust: Trust) -> GetOptions {
     GetOptions {
         kept: false,
+        trust,
         ..GetOptions::default()
     }
 }
@@ -647,7 +656,7 @@ impl Ctx {
         );
         let items = rig
             .carol_heap
-            .get(everything(), emissions())
+            .get(everything(), emissions(self.args.trust))
             .expect("carol is a member");
         let subscriber = self.rt_rx.spawn(consume(
             items,
@@ -758,11 +767,11 @@ impl Ctx {
     fn latency(&self, rig: &Rig) -> (f64, f64, f64) {
         let mut bob_items = rig
             .bob_heap
-            .get(everything(), emissions())
+            .get(everything(), emissions(self.args.trust))
             .expect("bob is a member");
         let mut carol_items = rig
             .carol_heap
-            .get(everything(), emissions())
+            .get(everything(), emissions(self.args.trust))
             .expect("carol is a member");
         let echo = {
             let carol = rig.carol_heap.clone();
@@ -840,7 +849,7 @@ impl Ctx {
         let rig = self.rig(None, Some(Arc::clone(&tap)), &dropped);
         let mut items = rig
             .carol_heap
-            .get(everything(), emissions())
+            .get(everything(), emissions(self.args.trust))
             .expect("carol is a member");
         let paths: Vec<Name> = (0..14).map(|i| name(&format!("/c/{i}"))).collect();
         let payload = Bytes::from(vec![0xA5; 64]);
@@ -944,8 +953,8 @@ fn main() {
     let a = Args::parse();
     println!("load average at start: {}", loadavg());
     println!(
-        "path_mtu_max {}, paths {}, consume {:?}",
-        a.path_mtu_max, a.paths, a.consume
+        "path_mtu_max {}, paths {}, consume {:?}, trust {:?}",
+        a.path_mtu_max, a.paths, a.consume, a.trust
     );
     let mut summary: BTreeMap<String, Vec<f64>> = BTreeMap::new();
     for rep in 0..a.repeat {
