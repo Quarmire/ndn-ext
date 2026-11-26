@@ -42,9 +42,9 @@
 //!   hold it fails the client's check.
 //!
 //! The handoff protocol, the ring and its mutual authentication are `spsc.rs`'s, unchanged. The
-//! functions in this file that the signals' `ndn-surface` also had (`rendezvous_token`,
-//! `capability_token`, `bind_exclusive`, `sealed_geometry`, the attach retry) are moved here with
-//! the labels renamed `ndn-channel\0…`.
+//! rendezvous, capability and exclusive-bind helpers (`rendezvous_token`, `capability_token`,
+//! `bind_exclusive`, `sealed_geometry`, the attach retry) are this file's, labelled
+//! `ndn-channel\0…`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -767,15 +767,14 @@ mod tests {
             capability_token(&ring_name("tokens2"), b"a"),
             "a secret cannot be lifted to another ring"
         );
-        // The label is the channel's, not the signals' (`ndn-surface`), so a ring and a signal
-        // surface of one name can never share a path or a capability.
+        // The labels are the channel's: a rendezvous and a capability of one name never collide.
         assert_eq!(
             rendezvous_token(&n),
             sha256_parts(&[b"ndn-channel\x00rendezvous\x00", &n.encode_to_tlv()])
         );
         assert_ne!(
             rendezvous_token(&n),
-            sha256_parts(&[b"ndn-surface\x00rendezvous\x00", &n.encode_to_tlv()])
+            sha256_parts(&[b"ndn-channel\x00capability\x00", &n.encode_to_tlv()])
         );
         assert_eq!(
             capability_token(&n, b"s"),

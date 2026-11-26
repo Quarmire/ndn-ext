@@ -4,7 +4,6 @@ exclude = [
     "crates/faces/ndn-face-afxdp/bpf/redirect-ebpf",
 ]
 members = [
-    "crates/surface/ndn-surface",
     "crates/dashboard/ndn-dashboard-core",
     "crates/dashboard/ndn-viz",
     "crates/ratelimit/ndn-ratelimit",
@@ -84,7 +83,6 @@ default-members = [
     "crates/time/ndn-timekeeper",
     "crates/time/ndn-time-driver",
     "crates/strategies/ndn-strategy-cclf",
-    "crates/surface/ndn-surface",
     "examples/ble/macos",
     "examples/radio-ping",
 ]
@@ -216,8 +214,6 @@ base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 # Cryptography
 ring          = "0.17"
 ed25519-dalek = "2"
-# Sealed signals (ndn-surface `signals`): XChaCha20-Poly1305, 24-octet nonces.
-chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
 # Static-key X25519 for onion-circuit hop-key agreement (a relay re-uses its
 # long-lived onion key across every Interest, which ring's one-shot
 # EphemeralPrivateKey can't model).
