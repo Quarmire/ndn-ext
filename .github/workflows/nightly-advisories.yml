@@ -34,7 +34,7 @@ jobs:
         with: { path: ndn-ext }
       # pinned sibling; bump deliberately when adopting newer ndn-rs (see workspace STATE.md)
       - uses: actions/checkout@v4
-        with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: dc79eea5ff5f0333e61f1330dcc4303b016993d4, path: ndn-rs }
+        with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: 14466d3c0a3df08ca24144b30b266eec8b8c5745, path: ndn-rs }
       # pinned sibling; bump deliberately when adopting newer ndn-radio-drivers (see workspace STATE.md)
       - uses: actions/checkout@v4
         with: { repository: "${{ github.repository_owner }}/ndn-radio-drivers", ref: 985cd9d70ce0664c6b622da29545c6aa2cd0448c, path: ndn-radio-drivers }
