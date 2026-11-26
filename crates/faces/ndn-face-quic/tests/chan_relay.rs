@@ -336,3 +336,59 @@ async fn a_receiver_linked_to_the_sender_directly_gets_every_message() {
         assert_eq!(&got.bytes[..], payload.as_bytes());
     }
 }
+
+/// A receiver lets the channel go (its `Items` dropped: the session ends, an `Unsub` goes up the
+/// links and every route of the channel goes) and later takes it again: the same ask, a new
+/// session, a route made anew at every hop, and the frames flow again.
+async fn a_receiver_that_left_takes_the_channel_again(relay: bool) {
+    let mesh = Mesh::new(&Runtimes::current(), 1, relay, Build::default()).await;
+    let here = tokio::runtime::Handle::current();
+    for round in 0..3 {
+        let mut items = live(&mesh.receivers[0]);
+        let info = Mesh::ask(&here, &mesh.receivers[0].node, &mesh.sender.node).await;
+        let waiting = Instant::now();
+        while !items.hello_seen() {
+            assert!(
+                waiting.elapsed() < Duration::from_secs(5),
+                "round {round}: no HELLO within 5 s of the ask\nsender table {:?}\nsender link {:?}\nreceiver table {:?}\nreceiver link {:?}\nrelay table {:?}",
+                mesh.sender.site.engine.side().stats(),
+                mesh.sender.link.side_stats(),
+                mesh.receivers[0].site.engine.side().stats(),
+                mesh.receivers[0].link.side_stats(),
+                mesh.relay.as_ref().map(|r| r.engine.side().stats()),
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let (path, payload) = (format!("/again/{round}"), format!("round {round}"));
+        emit(&mesh, &path, payload.as_bytes()).await;
+        let got = next(&mut items).await.expect("an item");
+        assert_eq!(got.path.to_string(), path);
+        assert_eq!(&got.bytes[..], payload.as_bytes());
+
+        drop(items);
+        eventually("every route of the channel is gone", || {
+            mesh.sender.site.engine.side().sinks(SideId(info.channel)) == 0
+                && mesh.receivers[0]
+                    .site
+                    .engine
+                    .side()
+                    .sinks(SideId(info.channel))
+                    == 0
+                && mesh
+                    .relay
+                    .as_ref()
+                    .is_none_or(|r| r.engine.side().sinks(SideId(info.channel)) == 0)
+        })
+        .await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_receiver_that_left_takes_the_channel_again_on_a_direct_link() {
+    a_receiver_that_left_takes_the_channel_again(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_receiver_that_left_takes_the_channel_again_behind_a_relay() {
+    a_receiver_that_left_takes_the_channel_again(true).await;
+}
