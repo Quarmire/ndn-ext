@@ -416,7 +416,7 @@ async fn a_receiver_that_left_takes_the_channel_again_behind_a_relay() {
 /// the sender's link then waits for its datagram size to reach at least `datagram`.
 async fn ready_on(relay: bool, build: Build, datagram: usize) -> (Mesh, Items) {
     let mesh = Mesh::new(&Runtimes::current(), 1, relay, build).await;
-    let mut items = live(&mesh.receivers[0]);
+    let items = live(&mesh.receivers[0]);
     let here = tokio::runtime::Handle::current();
     Mesh::ask(&here, &mesh.receivers[0].node, &mesh.sender.node).await;
     eventually("HELLO", || items.hello_seen()).await;

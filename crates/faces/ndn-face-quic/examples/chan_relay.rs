@@ -32,6 +32,7 @@
 //! | `shapes` | `direct,relay1,relay2` | shapes |
 //! | `only` | `thr:64,lat:64` | rows |
 //! | `repeat`, `secs`, `workers` | 3, 3, 1 | as in `chan_ping`; `workers` per runtime |
+//! | `relay_workers` | `workers` | worker threads of the relay's runtime alone: with one, the relay's two QUIC links share a thread, and at 1 KiB it is the first thing to saturate (frames the sender's link sent that never reach its table are dropped by the kernel) |
 //! | `path_mtu_max` | 9000 | `LinkTransportConfig::path_mtu_max` |
 //! | `paths` | 256 | distinct paths the `thr` rows rotate over |
 //! | `checkpoint` | 20 | the checkpoint period, ms (`ChannelConfig::checkpoint`: 1 to 2,000) |
@@ -109,6 +110,7 @@ struct Args {
     repeat: usize,
     secs: f64,
     workers: usize,
+    relay_workers: usize,
     path_mtu_max: u16,
     paths: usize,
     checkpoint: Duration,
@@ -134,6 +136,7 @@ impl Args {
             "repeat",
             "secs",
             "workers",
+            "relay_workers",
             "path_mtu_max",
             "paths",
             "checkpoint",
@@ -170,6 +173,7 @@ impl Args {
             repeat: num("repeat", 3.0) as usize,
             secs: num("secs", 3.0),
             workers: num("workers", 1.0) as usize,
+            relay_workers: num("relay_workers", num("workers", 1.0)) as usize,
             path_mtu_max: num("path_mtu_max", 9000.0) as u16,
             paths: num("paths", 256.0) as usize,
             checkpoint: Duration::from_millis(num("checkpoint", 20.0) as u64),
@@ -223,7 +227,7 @@ impl Ctx {
             args: args.clone(),
             ctl: runtime("ctl", 1),
             send: runtime("send", args.workers),
-            relay: runtime("relay", args.workers),
+            relay: runtime("relay", args.relay_workers),
             recv: (0..receivers)
                 .map(|i| runtime(&format!("recv{}", LETTERS[i]), args.workers))
                 .collect(),
