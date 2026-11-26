@@ -44,6 +44,23 @@ pub async fn connect(
     rt_rx: &tokio::runtime::Handle,
     rt_tx: &tokio::runtime::Handle,
 ) -> Pair {
+    let (rx, tx, eps) = connect_ids(config, rt_rx, rt_tx, FaceId(2), FaceId(1)).await;
+    Pair {
+        tx: Arc::new(tx),
+        rx: Arc::new(rx),
+        _eps: eps,
+    }
+}
+
+/// The two ends of one link (`rx` listens, `tx` dials) with the face ids the caller gives: faces
+/// that go into forwarders take their id from the forwarder's face table.
+pub async fn connect_ids(
+    config: &LinkTransportConfig,
+    rt_rx: &tokio::runtime::Handle,
+    rt_tx: &tokio::runtime::Handle,
+    id_rx: FaceId,
+    id_tx: FaceId,
+) -> (Link, Link, [Arc<LinkEndpoint>; 2]) {
     let (c1, c2) = (config.clone(), config.clone());
     let listener = rt_rx
         .spawn(async move {
@@ -69,7 +86,7 @@ pub async fn connect(
         rt_rx.spawn(async move {
             let mut hs = listener.accept().await.unwrap().handshake().await.unwrap();
             hs.exchange_hello(&LinkHello::default(), T).await.unwrap();
-            hs.admit(FaceId(2), T, carrying()).await.unwrap()
+            hs.admit(id_rx, T, carrying()).await.unwrap()
         })
     };
     let dial = {
@@ -77,14 +94,10 @@ pub async fn connect(
         rt_tx.spawn(async move {
             let mut hs = dialer.connect(target, None).await.unwrap();
             hs.exchange_hello(&LinkHello::default(), T).await.unwrap();
-            hs.admit(FaceId(1), T, carrying()).await.unwrap()
+            hs.admit(id_tx, T, carrying()).await.unwrap()
         })
     };
     let (rx, tx) = (accept.await.unwrap(), dial.await.unwrap());
     assert!(tx.handle.side_peer_caps() && rx.handle.side_peer_caps());
-    Pair {
-        tx: Arc::new(tx),
-        rx: Arc::new(rx),
-        _eps: [listener, dialer],
-    }
+    (rx, tx, [listener, dialer])
 }

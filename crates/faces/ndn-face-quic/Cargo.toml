@@ -36,6 +36,8 @@ rcgen    = { workspace = true }
 libc     = { workspace = true }
 # examples/chan_ping.rs: two data-layer nodes (`ndn-heap`) on one forwarder (`ndn-engine`, `ndn-app`,
 # `ndn-namespace`) with a MemoryStore (`ndn-sync`), their channel frames over one link.
+# examples/chan_relay.rs and tests/chan_relay.rs: the same nodes on forwarders of their own, a relay
+# between them, every hop a link.
 ndn-heap      = { workspace = true }
 ndn-engine    = { workspace = true }
 ndn-app       = { workspace = true }
@@ -54,6 +56,9 @@ name = "link_rss"
 
 [[example]]
 name = "chan_ping"
+
+[[example]]
+name = "chan_relay"
 
 [lints]
 workspace = true
