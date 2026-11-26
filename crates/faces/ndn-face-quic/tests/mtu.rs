@@ -79,6 +79,10 @@ const OLD_CEILING: usize = 1452 - 38;
 /// The datagram a payload of the default bound carries: 9,000 less the same 38.
 const BOUND: usize = 9000 - 38;
 
+/// Where the search has certainly climbed: its top tiers, far past the old ceiling.
+const CLIMBED: usize = 8000;
+const _: () = assert!(CLIMBED > OLD_CEILING && CLIMBED < BOUND);
+
 /// The default bound is 9,000 octets of payload; an idle loopback link climbs past the old
 /// 1,452 ceiling toward it, both ways, and never past it.
 ///
@@ -94,9 +98,9 @@ const BOUND: usize = 9000 - 38;
 async fn an_idle_link_on_loopback_climbs_past_the_old_ceiling_toward_the_default_bound() {
     let (a, b, _eps) = link(&LinkTransportConfig::default()).await;
     for (side, link) in [("dialer", &a), ("listener", &b)] {
-        let size = size_over(link, 8000).await;
+        let size = size_over(link, CLIMBED).await;
         assert!(
-            size > 8000 && size > OLD_CEILING,
+            size > CLIMBED,
             "the {side} settled on {size} of datagram: discovery did not climb toward the bound"
         );
         assert!(
@@ -141,7 +145,13 @@ async fn a_burst_at_a_raised_bound_arrives_whole() {
         ..LinkTransportConfig::default()
     };
     let (a, b, _eps) = link(&config).await;
-    assert_eq!(size_over(&a, 8000).await, 8962);
+    // Discovery may still be climbing (the size is read as soon as it is past `CLIMBED`), so the
+    // size after the burst is compared with this one, not with a settled value.
+    let before = size_over(&a, CLIMBED).await;
+    assert!(
+        (CLIMBED + 1..=BOUND).contains(&before),
+        "{before} of datagram: discovery did not climb toward the bound"
+    );
     // The test task does not yield between sends until the connection's send buffer is full,
     // so the driver finds the whole burst queued.
     const FRAMES: usize = 800;
@@ -159,5 +169,9 @@ async fn a_burst_at_a_raised_bound_arrives_whole() {
             other => panic!("{got} of {FRAMES} frames arrived, then {other:?}"),
         }
     }
-    assert_eq!(size_over(&a, 8000).await, 8962, "the burst kept the size");
+    let after = size_over(&a, before - 1).await;
+    assert!(
+        (before..=BOUND).contains(&after),
+        "the burst kept the size: {before} of datagram before it, {after} after"
+    );
 }
