@@ -741,9 +741,10 @@ impl Judge<'_> {
 /// contexts and key and certificate names of its namespaces (public by
 /// design: a hello already carries the chain, and the group carries no
 /// data); the trust context and key and certificate names of its folder's
-/// namespace, and the Sync Interests (`<group>/v=N`) of the one sync group the
-/// data layer gives the folder ([`Introductions::sync_group`]: that space's
-/// exactly, not the owner's others nor a space nested in the folder);
+/// namespace, and the names of the one sync group the data layer gives the
+/// folder ([`Introductions::sync_group`]: that space's exactly, not the owner's others
+/// nor a space nested in the folder): its Sync Interests (`<group>/v=N`) and its
+/// channel announce (`<group>/32=chan/<digest>`, [`is_announce_of`]);
 /// the sync groups and the same names of the other writers' namespaces its
 /// folder's record lists; what this device's introductions serve
 /// ([`Introductions::carries`]: a person may ask again); the names of the
@@ -763,7 +764,7 @@ fn entry_carries(surface: Option<&Arc<dyn Introductions>>, entry: &Grant, name: 
         || folder_namespace(&entry.folder).is_some_and(|ns| is_chan_name_of(&ns, name))
         || surface.is_some_and(|s| {
             s.sync_group(&entry.folder)
-                .is_some_and(|group| is_sync_name_of(&group, name))
+                .is_some_and(|group| is_sync_name_of(&group, name) || is_announce_of(&group, name))
         })
         || surface.is_some_and(|s| s.carries(name) || s.grant_carries(&entry.folder, name))
         // The sync groups, trust contexts and key and certificate names of
@@ -887,6 +888,27 @@ fn is_sync_name_of(group: &Name, name: &Name) -> bool {
             .components()
             .get(group.len())
             .is_some_and(|c| c.as_version().is_some())
+}
+
+/// Whether `name` is the **channel announce** of the sync group `group`:
+/// `<group>/32=chan/<ParametersSha256Digest>` and nothing else (channel.md §9: the
+/// channel layer's unsigned hint that a device has live data, pushed into the one
+/// group every member's forwarder carries). It is named for the group exactly: the
+/// group's own two components, the keyword and one 32-octet parameters digest, so the
+/// announce of a space nested in the space (`<group>/f1/32=chan/…`, whose next
+/// component is a generic one) and of a sibling group is not it. It is not a Sync
+/// Interest ([`is_sync_name_of`] judges those, by their version component) and not an
+/// ask ([`is_chan_name_of`], which lies under a device); the three are kept apart so
+/// that carrying one never carries another.
+fn is_announce_of(group: &Name, name: &Name) -> bool {
+    use ndn_packet::tlv_type::{KEYWORD, PARAMETERS_SHA256};
+    let comps = name.components();
+    name.has_prefix(group)
+        && comps.len() == group.len() + 2
+        && comps[group.len()].typ == KEYWORD
+        && comps[group.len()].value.as_ref() == b"chan"
+        && comps[group.len() + 1].typ == PARAMETERS_SHA256
+        && comps[group.len() + 1].value.len() == 32
 }
 
 /// A name of `ns` that is public by design: its sync group, its trust
@@ -1305,5 +1327,90 @@ mod tests {
                 "{other}"
             );
         }
+    }
+
+    /// The one sync group a data layer gives the folder.
+    struct OneGroup(Name);
+
+    impl Introductions for OneGroup {
+        fn open(&self) -> bool {
+            false
+        }
+        fn carries(&self, _: &Name) -> bool {
+            false
+        }
+        fn grant_carries(&self, _: &Name, _: &Name) -> bool {
+            false
+        }
+        fn departure_carries(&self, _: &Name, _: &Name) -> bool {
+            false
+        }
+        fn sync_group(&self, _: &Name) -> Option<Name> {
+            Some(self.0.clone())
+        }
+    }
+
+    /// The channel announce of the granted space's group (`<group>/32=chan/<digest>`,
+    /// channel.md §9) crosses a grant link: without it a member never hears that the
+    /// person's device has live data. Only that name does: not the announce of another
+    /// group, of a space nested in the group or of a sibling, and no other name that
+    /// follows the group with the keyword; Sync Interests stay what the version
+    /// component makes them, and with no data layer the group carries nothing.
+    #[test]
+    fn the_announce_of_the_granted_group_crosses_and_no_other_does() {
+        let group = "/alice/32=sync/notes";
+        let surface: Arc<dyn Introductions> = Arc::new(OneGroup(nm(group)));
+        let entry = grant(None);
+        let digest = || octets(PARAMETERS);
+        let carried = |name: &Name| entry_carries(Some(&surface), &entry, name);
+
+        let announce = then(group, vec![keyword("chan"), digest()]);
+        assert!(
+            carried(&announce),
+            "the announce of the granted group: {announce}"
+        );
+        assert!(
+            !entry_carries(None, &entry, &announce),
+            "with no data layer the group is none of this device's to carry"
+        );
+        // Another group, a sibling space, a space nested in the group.
+        for other in [
+            "/alice/32=sync/diary",
+            "/alice/32=sync/notes2",
+            "/alice/32=sync/notes/f1",
+            "/carol/32=sync/notes",
+        ] {
+            let name = then(other, vec![keyword("chan"), digest()]);
+            assert!(!carried(&name), "the announce of {other} crossed: {name}");
+        }
+        // What is no announce of the group: no digest, a digest of the wrong size, a
+        // generic component for the keyword, another keyword, a longer tail.
+        let short = NameComponent::new(PARAMETERS, bytes::Bytes::from_static(&[7; 31]));
+        for (what, name) in [
+            ("no digest", then(group, vec![keyword("chan")])),
+            ("a short digest", then(group, vec![keyword("chan"), short])),
+            (
+                "a generic digest",
+                then(group, vec![keyword("chan"), octets(GENERIC)]),
+            ),
+            (
+                "another keyword",
+                then(group, vec![keyword("grant"), digest()]),
+            ),
+            (
+                "a generic component for the keyword",
+                nm(&format!("{group}/chan")).append_component(digest()),
+            ),
+            (
+                "a longer tail",
+                then(group, vec![keyword("chan"), digest(), octets(GENERIC)]),
+            ),
+            ("the group alone", nm(group)),
+        ] {
+            assert!(!carried(&name), "{what} crossed: {name}");
+        }
+        // The Sync Interests of the group are the version component's, as before.
+        let sync = nm(group).append_component(NameComponent::version(1));
+        assert!(carried(&sync), "a Sync Interest of the group: {sync}");
     }
 }
