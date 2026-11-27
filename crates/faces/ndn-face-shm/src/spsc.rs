@@ -2389,6 +2389,17 @@ impl SpscFace {
         Ok(())
     }
 
+    /// Whether the e2a ring has a free slot now: the read [`try_push_e2a`](Self::try_push_e2a)
+    /// makes first. The consumer only frees slots, so a slot seen free stays free until this
+    /// side pushes.
+    fn has_room_e2a(&self) -> bool {
+        let tail = unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_E2A_TAIL) as *mut u32) };
+        let head = unsafe { AtomicU32::from_ptr(self.shm.as_ptr().add(OFF_E2A_HEAD) as *mut u32) };
+        let t = tail.load(Ordering::Relaxed);
+        let h = head.load(Ordering::Acquire);
+        t.wrapping_sub(h) < self.capacity
+    }
+
     fn try_push_e2a(&self, data: &[u8]) -> bool {
         let _push = self.tx.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
@@ -2583,6 +2594,11 @@ impl Transport for SpscFace {
             pipe_write(&self.e2a_tx);
         }
         Ok(())
+    }
+
+    /// Whether the e2a ring has a free slot: what `forward_side` reads first.
+    fn side_room(&self, _class: SideClass) -> bool {
+        self.has_room_e2a()
     }
 
     /// The next packet of the a2e ring. A peer that corrupts the ring's cursors closes
@@ -4734,6 +4750,10 @@ mod tests {
     async fn a_full_ring_refuses_forward_side_without_blocking_and_send_side_waits_for_room() {
         use std::time::Duration;
         let (face, handle) = anon_pair(91, 4, 128);
+        assert!(
+            face.side_room(SideClass::Datagram),
+            "an empty ring has room"
+        );
         for (i, class) in [
             SideClass::Datagram,
             SideClass::Stream,
@@ -4756,6 +4776,10 @@ mod tests {
                 "a full ring is refused, never waited on"
             );
         }
+        assert!(
+            !face.side_room(SideClass::Datagram),
+            "a full ring has no room"
+        );
         // send_side waits: nothing lands while the ring is full.
         let mut waiting = Box::pin(face.send_side(marked(61, 5), SideClass::Stream));
         assert!(
