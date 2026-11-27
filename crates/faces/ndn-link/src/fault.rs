@@ -500,6 +500,9 @@ impl Transport for Faulted {
     fn side_room(&self, class: ndn_transport::SideClass) -> bool {
         self.inner.side_room(class)
     }
+    fn side_room_for(&self, frame: &[u8], class: ndn_transport::SideClass) -> bool {
+        self.inner.side_room_for(frame, class)
+    }
 
     fn set_send_mtu(&self, mtu: Option<u64>) -> Result<Option<u64>, MtuError> {
         self.inner.set_send_mtu(mtu)
