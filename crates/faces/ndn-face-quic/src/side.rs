@@ -454,6 +454,23 @@ impl SideCarrier {
         }
     }
 
+    /// Whether [`forward`](Self::forward) would take a frame of `class` now and not refuse it
+    /// [`Full`](SideRefused::Full): the datagram class while fewer octets wait in the send
+    /// buffer than the headroom, the stream class while its queue is under its bound. The read
+    /// `forward` makes first, without the frame; room is not reserved.
+    pub(crate) fn room(&self, class: SideClass) -> bool {
+        match class {
+            SideClass::Datagram => self.queued() < self.headroom(),
+            SideClass::Stream => {
+                self.queue
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .octets
+                    < STREAM_QUEUE_MAX
+            }
+        }
+    }
+
     /// Octets waiting in the connection's datagram send buffer.
     fn queued(&self) -> usize {
         DATAGRAM_SEND_BUFFER.saturating_sub(self.connection.datagram_send_buffer_space())

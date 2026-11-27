@@ -1125,6 +1125,10 @@ impl Transport for LinkFace {
     fn forward_side(&self, frame: Bytes, class: SideClass) -> Result<(), SideRefused> {
         self.side.forward(frame, class)
     }
+
+    fn side_room(&self, class: SideClass) -> bool {
+        self.side.room(class)
+    }
 }
 
 #[cfg(test)]

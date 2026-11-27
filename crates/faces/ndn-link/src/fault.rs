@@ -497,6 +497,9 @@ impl Transport for Faulted {
     fn side_carries(&self, class: ndn_transport::SideClass) -> bool {
         self.inner.side_carries(class)
     }
+    fn side_room(&self, class: ndn_transport::SideClass) -> bool {
+        self.inner.side_room(class)
+    }
 
     fn set_send_mtu(&self, mtu: Option<u64>) -> Result<Option<u64>, MtuError> {
         self.inner.set_send_mtu(mtu)
