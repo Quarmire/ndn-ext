@@ -912,6 +912,13 @@ impl LinkHandle {
         self.side.stats()
     }
 
+    /// The QUIC connection's own counters (packets, datagrams and frames each way, and the
+    /// path's congestion window, losses and congestion events): read-only, for diagnosing a
+    /// link's throughput. No address, no key.
+    pub fn quic_stats(&self) -> quinn::ConnectionStats {
+        self.connection.stats()
+    }
+
     /// Whether the peer's hello advertised `ChannelCaps` (bit 0, channel
     /// frames). A link carries channel frames only when both sides'
     /// hellos did and this side's [`ChannelPolicy`] carries.
@@ -1450,5 +1457,33 @@ mod tests {
             .await
             .unwrap();
         assert!(!a.handle.is_closed() && !b.handle.is_closed());
+    }
+
+    /// `quic_stats` reads the connection's own counters: a datagram a link sends is counted by
+    /// the sender as a QUIC datagram frame and a UDP datagram, and by the receiver as received.
+    #[tokio::test]
+    async fn quic_stats_count_the_datagrams_a_link_carried() {
+        let (dialer, listener) = (endpoint(1, false), endpoint(2, true));
+        let (mut d, mut l) = handshaken(&dialer, &listener).await;
+        hellos(&mut d, &mut l, (hello(1), hello(1))).await;
+        let (a, b) = admitted(d, l, (carrying(), carrying())).await;
+        let (sent, received) = (a.handle.quic_stats(), b.handle.quic_stats());
+        let wire = Bytes::from_static(b"\x64\x03\x01\x02\x03");
+        a.face.send_bytes(wire.clone()).await.unwrap();
+        assert_eq!(b.face.recv_bytes().await.unwrap(), wire);
+        let (sent_after, received_after) = (a.handle.quic_stats(), b.handle.quic_stats());
+        assert_eq!(
+            sent_after.frame_tx.datagram - sent.frame_tx.datagram,
+            1,
+            "the sender counted one datagram frame"
+        );
+        assert!(sent_after.udp_tx.datagrams > sent.udp_tx.datagrams);
+        assert_eq!(
+            received_after.frame_rx.datagram - received.frame_rx.datagram,
+            1,
+            "the receiver counted it"
+        );
+        assert!(received_after.udp_rx.datagrams > received.udp_rx.datagrams);
+        assert!(sent_after.path.cwnd > 0);
     }
 }

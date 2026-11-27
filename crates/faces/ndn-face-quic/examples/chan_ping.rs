@@ -13,7 +13,7 @@
 //! | row | meaning |
 //! |---|---|
 //! | `lat` | the 64 B half round trip: `emit` /ping -> `Items` -> `emit` /pong -> `Items`; 1,000 warm-up (and 300 ms) then 10,000 timed round trips, the lowest and highest 1 % dropped |
-//! | `thr:<size>` | back-to-back `emit` of `size` octets over `paths` paths for `secs` seconds after 0.5 s; the reader counts what `Items` yields |
+//! | `thr:<size>` | back-to-back `emit` of `size` octets over `paths` paths for `secs` seconds after 0.5 s; the reader counts what `Items` yields. Under the row line: the writer's side stats, a `link:` line (UDP datagrams and syscalls each way, kernel drops of both sockets, QUIC datagram frames sent / received / taken by the face reader, so what quinn's queue dropped, the sender's cwnd, losses, congestion events and rtt: `LinkHandle::quic_stats`), the CPU of the `send` and `recv` threads |
 //! | `cpu` | the per-message CPU of §12.5 with no link: 14 messages of 64 B per frame into a recording carrier (sender ns/message), then the frames through `deliver_frame` and `Items` (receiver ns/message) by `poll_next` and by `next_batch` |
 //!
 //! Arguments are `key=value` words:
@@ -30,6 +30,7 @@
 //! | `timer` | 1 | `1`: each ping waits for its pong under `tokio::time::timeout` (a timer registered and cancelled per round trip, which the raw rows do not do); `0`: no per-ping timer, a lost pong stalls the row (the harness's own cost, isolated) |
 //! | `trust` | `prompt` | `prompt` or `verified`: `GetOptions::trust` of every receiver (`Verified` delivers a frame only after a signed checkpoint listing it verified: the rows then include up to one checkpoint period of latency) |
 //! | `raw_lat`, `raw_thr_<size>` | | the raw datagram row (`carrier_bench`, `side_ping`) at the same settings: the summary prints the gates of §12.1 and §12.3 |
+//! | `timeline` | 0 | `1`: a thread samples the link every 250 ms during each `thr` row and prints the receiver's backlog (QUIC datagrams the sender sent minus those the receiver's connection processed, the kernel socket queue), the resident set, the frames the face reader took and the items delivered |
 //! | `profile` | | a file: the sampled CPU profile of the `send` and `recv` threads (SHAPES-CHANNEL.md §17.1) |
 //!
 //! Pin from the command line: `taskset -c 10-13 target-shared/release/examples/chan_ping`.
@@ -94,6 +95,7 @@ struct Args {
     sealed: bool,
     trust: Trust,
     timer: bool,
+    timeline: bool,
     profile: Option<String>,
     raw: BTreeMap<String, f64>,
 }
@@ -121,6 +123,7 @@ impl Args {
             "sealed",
             "trust",
             "timer",
+            "timeline",
             "profile",
         ];
         for k in kv.keys() {
@@ -155,6 +158,7 @@ impl Args {
                 other => panic!("trust is `prompt` or `verified`, got `{other}`"),
             },
             timer: num("timer", 1.0) != 0.0,
+            timeline: num("timeline", 0.0) != 0.0,
             profile: kv.get("profile").cloned(),
             raw: kv
                 .iter()
@@ -162,6 +166,161 @@ impl Args {
                 .map(|(k, v)| (k.clone(), v.parse().expect("a number")))
                 .collect(),
         }
+    }
+}
+
+/// Octets queued in the kernel receive queue of the UDP socket bound to `port` (/proc/net/udp,
+/// `rx_queue`).
+fn socket_queue(port: u16) -> u64 {
+    let want = format!(":{port:04X}");
+    std::fs::read_to_string("/proc/net/udp")
+        .unwrap_or_default()
+        .lines()
+        .skip(1)
+        .filter_map(|l| {
+            let mut f = l.split_whitespace();
+            let local = f.nth(1)?;
+            let queues = f.nth(2)?;
+            local
+                .ends_with(&want)
+                .then(|| u64::from_str_radix(queues.split(':').nth(1)?, 16).ok())?
+        })
+        .sum()
+}
+
+/// The resident set of this process, in MiB.
+fn rss_mib() -> u64 {
+    std::fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
+        .map_or(0, |pages| (pages * 4096) >> 20)
+}
+
+/// Every 250 ms until `stop`: how far the receiver is behind the sender (QUIC datagrams the sender
+/// put on the wire minus those the receiver's connection processed: what waits in the kernel
+/// socket and in quinn's queue between its endpoint and the connection), the kernel socket queue,
+/// the resident set, and the rates of frames taken by the face reader and of items delivered.
+fn timeline(
+    pair: &Pair,
+    stop: Arc<AtomicBool>,
+    seen: Arc<AtomicU64>,
+) -> std::thread::JoinHandle<Vec<String>> {
+    let (tx, rx) = (Arc::clone(&pair.tx), Arc::clone(&pair.rx));
+    std::thread::spawn(move || {
+        let t0 = Instant::now();
+        let port = rx.handle.local_address().map_or(0, |a| a.port());
+        let (mut last, mut taken0, mut seen0) = (
+            Instant::now(),
+            rx.handle.side_stats().datagram_rx_frames,
+            seen.load(Ordering::Relaxed),
+        );
+        let mut lines = Vec::new();
+        while !stop.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(250));
+            let (a, b) = (tx.handle.quic_stats(), rx.handle.quic_stats());
+            let (taken, got, now) = (
+                rx.handle.side_stats().datagram_rx_frames,
+                seen.load(Ordering::Relaxed),
+                Instant::now(),
+            );
+            let dt = now.duration_since(last).as_secs_f64();
+            lines.push(format!(
+                "    t {:>5.2} s: behind {:>6} dgrams ({:>5.1} MB), kernel queue {:>8} B, rss {:>5} MiB, reader {:>7.0} frames/s, items {:>7.0} /s, rtt {:?}, cwnd {}",
+                t0.elapsed().as_secs_f64(),
+                a.udp_tx.datagrams.saturating_sub(b.udp_rx.datagrams),
+                a.udp_tx.bytes.saturating_sub(b.udp_rx.bytes) as f64 / 1e6,
+                socket_queue(port),
+                rss_mib(),
+                (taken - taken0) as f64 / dt,
+                (got - seen0) as f64 / dt,
+                a.path.rtt,
+                a.path.cwnd,
+            ));
+            (last, taken0, seen0) = (now, taken, got);
+        }
+        lines
+    })
+}
+
+/// Kernel receive-queue drops of the UDP socket bound to `port` (the last column of
+/// /proc/net/udp), for the datagrams the kernel dropped because the socket's buffer was full.
+fn socket_drops(port: u16) -> u64 {
+    let want = format!(":{port:04X}");
+    std::fs::read_to_string("/proc/net/udp")
+        .unwrap_or_default()
+        .lines()
+        .skip(1)
+        .filter(|l| {
+            l.split_whitespace()
+                .nth(1)
+                .is_some_and(|a| a.ends_with(&want))
+        })
+        .filter_map(|l| l.split_whitespace().last()?.parse::<u64>().ok())
+        .sum()
+}
+
+/// What the two ends of the link counted, for the diagnosis line of a throughput row: the
+/// QUIC connections' own counters (`quic_stats`), the side path's, and the sockets' kernel drops.
+#[derive(Clone)]
+struct Snap {
+    tx: quinn::ConnectionStats,
+    rx: quinn::ConnectionStats,
+    rx_side: ndn_face_quic::SideStats,
+    tx_drops: u64,
+    rx_drops: u64,
+}
+
+impl Snap {
+    fn take(pair: &Pair) -> Self {
+        let port = |l: &Link| l.handle.local_address().map_or(0, |a| a.port());
+        Self {
+            tx: pair.tx.handle.quic_stats(),
+            rx: pair.rx.handle.quic_stats(),
+            rx_side: pair.rx.handle.side_stats(),
+            tx_drops: socket_drops(port(&pair.tx)),
+            rx_drops: socket_drops(port(&pair.rx)),
+        }
+    }
+
+    /// One line: the sender's UDP datagrams and `sendmsg`s, the receiver's UDP datagrams and
+    /// `recvmsg`s, kernel drops at each socket, QUIC datagram frames sent / received by the
+    /// connections, frames the face reader took off the connection's datagram queue (the
+    /// difference to the frames received is what quinn's datagram queue dropped), and the
+    /// sender's congestion state.
+    fn since(&self, then: &Self, wall: f64) -> String {
+        let d = |a: u64, b: u64| a.saturating_sub(b);
+        let (txf, rxf) = (
+            d(self.tx.frame_tx.datagram, then.tx.frame_tx.datagram),
+            d(self.rx.frame_rx.datagram, then.rx.frame_rx.datagram),
+        );
+        let taken = d(
+            self.rx_side.datagram_rx_frames,
+            then.rx_side.datagram_rx_frames,
+        );
+        format!(
+            "    link: udp tx {} dgrams / {} sendmsg, udp rx {} dgrams / {} recvmsg, kernel drops tx {} rx {}; quic datagram frames sent {} received {} taken by reader {} (dropped in quinn queue {}, {:.1} %); sender: cwnd {} lost {} congestion events {} rtt {:?}; acks sent by rx {}  [{:.0} frames/s sent, {:.0} taken]",
+            d(self.tx.udp_tx.datagrams, then.tx.udp_tx.datagrams),
+            d(self.tx.udp_tx.ios, then.tx.udp_tx.ios),
+            d(self.rx.udp_rx.datagrams, then.rx.udp_rx.datagrams),
+            d(self.rx.udp_rx.ios, then.rx.udp_rx.ios),
+            d(self.tx_drops, then.tx_drops),
+            d(self.rx_drops, then.rx_drops),
+            txf,
+            rxf,
+            taken,
+            d(rxf, taken),
+            100.0 * d(rxf, taken) as f64 / rxf.max(1) as f64,
+            self.tx.path.cwnd,
+            d(self.tx.path.lost_packets, then.tx.path.lost_packets),
+            d(
+                self.tx.path.congestion_events,
+                then.tx.path.congestion_events
+            ),
+            self.tx.path.rtt,
+            d(self.rx.frame_tx.acks, then.rx.frame_tx.acks),
+            txf as f64 / wall,
+            taken as f64 / wall,
+        )
     }
 }
 
@@ -701,23 +860,38 @@ impl Ctx {
             })
         };
         let tx = &rig.pair.as_ref().expect("a link").tx;
+        let sampler = self.args.timeline.then(|| {
+            timeline(
+                rig.pair.as_ref().expect("a link"),
+                Arc::clone(&stop),
+                Arc::clone(&seen),
+            )
+        });
         std::thread::sleep(Duration::from_millis(500));
-        let (c0, s0, n0, t0, st0) = (
+        let pair = rig.pair.as_ref().expect("a link");
+        let (c0, s0, n0, t0, st0, k0) = (
             threads(),
             sent.load(Ordering::Relaxed),
             seen.load(Ordering::Relaxed),
             Instant::now(),
             tx.handle.side_stats(),
+            Snap::take(pair),
         );
         std::thread::sleep(Duration::from_secs_f64(self.args.secs));
-        let (c1, s1, n1, wall, st1) = (
+        let (c1, s1, n1, wall, st1, k1) = (
             threads(),
             sent.load(Ordering::Relaxed),
             seen.load(Ordering::Relaxed),
             t0.elapsed().as_secs_f64(),
             tx.handle.side_stats(),
+            Snap::take(pair),
         );
         stop.store(true, Ordering::Relaxed);
+        if let Some(sampler) = sampler {
+            for line in sampler.join().unwrap_or_default() {
+                println!("{line}");
+            }
+        }
         publisher.abort();
         subscriber.abort();
         let recv = (n1 - n0) as f64 / wall;
@@ -743,6 +917,7 @@ impl Ctx {
             notices.load(Ordering::Relaxed),
             failed.load(Ordering::Relaxed),
         );
+        println!("{}", k1.since(&k0, wall));
         println!("    cpu: {}", cpu_line(&c0, &c1, wall));
         let per = |thread: &str| -> String {
             let ns = |a: &std::collections::BTreeMap<u32, common::ThreadCpu>| -> u64 {
