@@ -1344,11 +1344,14 @@ async fn a_channel_datagram_reaches_recv_bytes_unchanged_and_is_not_nacked_over_
         narrowing: None,
         counts: Some(Arc::clone(&counts)),
     };
+    // The pool is 6,000 octets a second and a second member of it is active (a work-conserving
+    // pool holds a member alone to nothing), so the link's share is 3,000.
+    let pool = FairShare::new(6000, 100, Duration::from_secs(1));
     let quota = Admission {
         scope: Some(scope),
         channel: ChannelPolicy {
             carry: true,
-            quota: Some(FairShare::new(3000, 100, Duration::from_secs(1))),
+            quota: Some(pool.clone()),
         },
         ..Admission::default()
     };
@@ -1359,6 +1362,8 @@ async fn a_channel_datagram_reaches_recv_bytes_unchanged_and_is_not_nacked_over_
         (hello(2), quota),
     )
     .await;
+    let rival = pool.join();
+    assert!(rival.admit(ndn_face_quic::Flow::Rx, 1).is_ok());
 
     let sent: Vec<Bytes> = (0..6).map(|i| frame(i, 1000)).collect();
     for f in &sent {
@@ -1396,6 +1401,64 @@ async fn a_channel_datagram_reaches_recv_bytes_unchanged_and_is_not_nacked_over_
     a.face.send_bytes(pkt.clone()).await.unwrap();
     assert_eq!(recv(&b.face).await, pkt);
     assert!(!a.handle.is_closed() && !b.handle.is_closed());
+}
+
+/// The owner's own link (no quota) is not touched by a flood of a link that shares a pool:
+/// the pool charges its members and no other link, so the flooded link is cut to its share
+/// and counted `dropped_over_quota` while the own link's frames all arrive, uncounted.
+#[tokio::test]
+async fn a_pools_flood_never_charges_an_own_link_that_has_no_quota() {
+    const FRAMES: u32 = 12;
+    let pool = FairShare::new(4000, 100, Duration::from_secs(1));
+    let granted_admission = Admission {
+        channel: ChannelPolicy {
+            carry: true,
+            quota: Some(pool.clone()),
+        },
+        ..Admission::default()
+    };
+    let (gd, gl) = (endpoint(ed_key(1), false), endpoint(ec_key(2), true));
+    let (g_peer, granted) = link_with(
+        &gd,
+        &gl,
+        (hello(1), carrying()),
+        (hello(2), granted_admission),
+    )
+    .await;
+    let (od, ol) = (endpoint(ed_key(3), false), endpoint(ec_key(4), true));
+    let (o_peer, own) = channel_link(&od, &ol).await;
+    // A second member of the pool is active: the granted link gets half, 2,000 a second.
+    let rival = pool.join();
+    assert!(rival.admit(ndn_face_quic::Flow::Rx, 1).is_ok());
+
+    for i in 0..FRAMES {
+        g_peer
+            .face
+            .send_side(frame(i, 1000), SideClass::Datagram)
+            .await
+            .unwrap();
+        o_peer
+            .face
+            .send_side(frame(i, 1000), SideClass::Datagram)
+            .await
+            .unwrap();
+    }
+    let got_own = drain_for(&own.face, Duration::from_millis(400)).await;
+    let got_granted = drain_for(&granted.face, Duration::from_millis(400)).await;
+    assert_eq!(got_own.len(), FRAMES as usize, "the own link lost frames");
+    let own_stats = own.handle.side_stats();
+    assert_eq!(own_stats.datagram_rx_frames, u64::from(FRAMES));
+    assert_eq!(own_stats.dropped_over_quota, 0);
+    let stats = granted.handle.side_stats();
+    assert!(
+        (2..=4).contains(&got_granted.len()),
+        "the flooded link passed {} of {FRAMES} frames of 1,000 over a share of 2,000 a second",
+        got_granted.len()
+    );
+    assert_eq!(
+        stats.dropped_over_quota,
+        u64::from(FRAMES) - got_granted.len() as u64
+    );
 }
 
 #[tokio::test]

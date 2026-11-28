@@ -162,28 +162,57 @@ pub enum Flow {
     Rx,
 }
 
-/// The default pool of a [`FairShare`]: 128 MiB/s, an operator's ceiling that
-/// protects the device serving the namespace, not a cap on one member.
+/// The least pool a [`FairShare`] divides among members that contend: 128 MiB/s
+/// in each direction. It is a floor under what the links have carried, not a
+/// cap: a member alone is not held to it, and a pool whose links carried more
+/// divides that more ([`FairShare::carried`]).
 pub const FAIR_CAPACITY: u64 = 128 * 1024 * 1024;
-/// The default least rate a [`FairShare`] gives an active member: 256 KiB/s.
+/// The default least rate a [`FairShare`] gives an active member that
+/// contends with others: 256 KiB/s.
 pub const FAIR_FLOOR: u64 = 256 * 1024;
 /// The default window of a [`FairShare`]: the span an idle member stops
-/// counting after, and the period its rates are recomputed in.
+/// counting after, and the period its rates are recomputed in and the
+/// pool's `carried` mark is measured and decayed in.
 pub const FAIR_INTERVAL: Duration = Duration::from_secs(1);
 
-/// A pool of bytes per second that the links of a namespace share *fairly*:
-/// no ceiling applies to one member alone (it gets the whole pool, so its
-/// link's congestion control decides); several members active at once get
-/// `capacity / active` each, never under `floor`; a member idle for an
-/// `interval` costs the others nothing. A member is *active* while it has
-/// passed, or tried to pass, a frame in the last `interval`, or joined in
-/// it. Rates are recomputed once per `interval` and when a member joins,
-/// from the members active then; each member
-/// has a token bucket per [`Flow`] at its rate, with a burst of one second's
-/// worth. A frame longer than the burst waits for a full bucket and then
-/// takes its whole length as debt, so the average is the rate.
+/// What a pool's `carried` mark keeps after one `interval` without matching
+/// it.
+const FAIR_DECAY: f64 = 0.9;
+
+/// A pool of bytes per second that the links of a namespace share *fairly*,
+/// and that is work-conserving: it never holds back a member that is alone.
 ///
-/// A handle: clones share the pool. A link [`join`](Self::join)s it.
+/// - A member is *active* while it has passed, or tried to pass, a frame in
+///   the last `interval`, or joined in it.
+/// - **Alone** (one member active), a member takes no bucket: every frame is
+///   admitted, so only its link's own bounds hold it (congestion control,
+///   flow control, the datagram headroom, the stream queue). The bytes it
+///   passes are measured.
+/// - **Contending** (two or more active), each active member has a token bucket
+///   per [`Flow`] at `clamp(max(capacity, carried) / active, floor,
+///   max(capacity, carried))` bytes per second, with a burst of one second's
+///   worth; a frame longer than the burst waits for a full bucket and then
+///   takes its whole length as debt, so the average is the rate. A member
+///   that was alone starts from the bucket it last held, at most one burst
+///   of its new rate: it gets no free burst beyond its share.
+/// - `carried` (per flow) is a decaying high-water mark of the bytes per second
+///   the pool's members were admitted, measured once per `interval`: it keeps
+///   `0.9` of itself per interval and rises to the rate measured. Measured
+///   while one member was alone, it is what that member's link carried.
+///   Measured in an interval where members contended it never rises above the
+///   pool they divided (a member's burst is not counted above it) and holds
+///   there while they took nine tenths of it or more, so contention does not
+///   ratchet the pool up and a pool the contenders use does not leak away.
+///   `capacity` is the least pool contenders divide, so `carried` never
+///   lowers it; the bytes of members contending are bounded by
+///   `max(capacity, carried)` a second plus one burst per member (and the
+///   `floor` of each, when there are many).
+/// - A member idle for an `interval` costs the others nothing, and the
+///   rates are recomputed once per `interval`, when a member joins and when an
+///   idle member passes a frame again, from the members active then.
+///
+/// Memory is `O(members)`. A handle: clones share the pool. A link
+/// [`join`](Self::join)s it.
 #[derive(Clone)]
 pub struct FairShare {
     inner: Arc<FairPool>,
@@ -196,13 +225,28 @@ struct FairPool {
     state: Mutex<FairState>,
 }
 
-#[derive(Default)]
 struct FairState {
     next: u64,
     members: HashMap<u64, FairSlot>,
-    /// The bytes per second of each member, as of `computed`.
+    /// The members counted active, as of the last recomputation.
+    active: usize,
+    /// What the pool holds per [`Flow`].
+    flows: [FairFlow; 2],
+    /// When the measuring window began.
+    window: Option<Instant>,
+    /// Whether two members or more were active at some time of the window.
+    contended: bool,
+}
+
+#[derive(Clone, Copy)]
+struct FairFlow {
+    /// The bytes per second of each contending member, as of the last
+    /// recomputation.
     rate: f64,
-    computed: Option<Instant>,
+    /// The decaying high-water mark of the bytes per second admitted.
+    carried: f64,
+    /// The bytes admitted since the window began.
+    admitted: f64,
 }
 
 struct FairSlot {
@@ -217,18 +261,29 @@ struct FairBucket {
 }
 
 impl FairShare {
-    /// A pool of `capacity` bytes per second, giving an active member at least
-    /// `floor` (and never more than `capacity`), over windows of `interval`.
+    /// A pool of `capacity` bytes per second at least (what contenders divide
+    /// while the links have carried less), giving an active member that
+    /// contends at least `floor` (and never more than the pool), over
+    /// windows of `interval`.
     pub fn new(capacity: u64, floor: u64, interval: Duration) -> Self {
         let capacity = capacity.max(1);
+        let flow = FairFlow {
+            rate: capacity as f64,
+            carried: 0.0,
+            admitted: 0.0,
+        };
         Self {
             inner: Arc::new(FairPool {
                 capacity,
                 floor: floor.min(capacity),
                 interval: interval.max(Duration::from_millis(1)),
                 state: Mutex::new(FairState {
-                    rate: capacity as f64,
-                    ..FairState::default()
+                    next: 0,
+                    members: HashMap::new(),
+                    active: 0,
+                    flows: [flow; 2],
+                    window: None,
+                    contended: false,
                 }),
             }),
         }
@@ -252,28 +307,32 @@ impl FairShare {
         let mut state = pool.lock();
         let id = state.next;
         state.next += 1;
-        let active = state.active_at(now, pool.interval) + 1;
-        state.rate =
-            (pool.capacity as f64 / active as f64).clamp(pool.floor as f64, pool.capacity as f64);
-        state.computed = Some(now);
-        let rate = state.rate;
-        let full = || FairBucket {
-            tokens: rate,
-            at: now,
-        };
         let slot = FairSlot {
             joined: now,
             last_frame: None,
-            buckets: [full(), full()],
+            buckets: [0, 1].map(|_| FairBucket {
+                tokens: 0.0,
+                at: now,
+            }),
         };
         state.members.insert(id, slot);
+        state.window.get_or_insert(now);
+        state.recompute(now, pool);
+        // The buckets start at the rate that counts the joiner.
+        let flows = state.flows;
+        if let Some(slot) = state.members.get_mut(&id) {
+            for (bucket, flow) in slot.buckets.iter_mut().zip(flows) {
+                bucket.tokens = flow.rate;
+            }
+        }
         FairMember {
             pool: Arc::clone(&self.inner),
             id,
         }
     }
 
-    /// The pool, in bytes per second.
+    /// The least pool contenders divide, in bytes per second, in each
+    /// direction.
     pub fn capacity(&self) -> u64 {
         self.inner.capacity
     }
@@ -289,9 +348,18 @@ impl FairShare {
         self.active_at(Instant::now())
     }
 
-    /// The bytes per second each member has as of the last recomputation.
-    pub fn rate(&self) -> u64 {
-        self.inner.lock().rate as u64
+    /// The bytes per second each member has when it contends in `flow`, as of
+    /// the last recomputation: `max(capacity, carried)` over the members
+    /// active (a member alone takes no bucket, whatever this is).
+    pub fn rate(&self, flow: Flow) -> u64 {
+        self.inner.lock().flows[flow as usize].rate as u64
+    }
+
+    /// The high-water mark of the bytes per second the members were admitted
+    /// in `flow`, decayed, as of the last measurement. The pool contenders
+    /// divide is the greater of this and [`capacity`](Self::capacity).
+    pub fn carried(&self, flow: Flow) -> u64 {
+        self.inner.lock().flows[flow as usize].carried as u64
     }
 }
 
@@ -306,6 +374,12 @@ impl FairPool {
     fn lock(&self) -> std::sync::MutexGuard<'_, FairState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
+
+    /// What each of `active` contenders gets of a pool that carried `carried`.
+    fn share(&self, carried: f64, active: usize) -> f64 {
+        let pool = (self.capacity as f64).max(carried);
+        (pool / active.max(1) as f64).clamp(self.floor as f64, pool)
+    }
 }
 
 impl FairState {
@@ -317,6 +391,45 @@ impl FairState {
             .filter(|m| within(m.joined) || m.last_frame.is_some_and(within))
             .count()
     }
+
+    /// Count the active members at `now` and set the rates from them.
+    fn recompute(&mut self, now: Instant, pool: &FairPool) {
+        self.active = self.active_at(now, pool.interval);
+        self.contended |= self.active >= 2;
+        for flow in &mut self.flows {
+            flow.rate = pool.share(flow.carried, self.active);
+        }
+    }
+
+    /// Close the measuring window at `now`: decay the `carried` marks, raise
+    /// them to what was admitted (to no more than the pool, when members
+    /// contended in the window), and recompute the rates.
+    fn roll(&mut self, now: Instant, pool: &FairPool) {
+        if let Some(start) = self.window {
+            let interval = pool.interval.as_secs_f64();
+            let secs = now
+                .saturating_duration_since(start)
+                .as_secs_f64()
+                .max(interval);
+            let decay = FAIR_DECAY.powf(secs / interval);
+            for flow in &mut self.flows {
+                let mut measured = flow.admitted / secs;
+                if self.contended {
+                    // Members that took (nearly) all of the pool hold it where it is;
+                    // their bursts are not counted above it.
+                    let pool_now = (pool.capacity as f64).max(flow.carried);
+                    if measured >= pool_now * FAIR_DECAY {
+                        measured = pool_now;
+                    }
+                }
+                flow.carried = (flow.carried * decay).max(measured);
+                flow.admitted = 0.0;
+            }
+        }
+        self.window = Some(now);
+        self.contended = false;
+        self.recompute(now, pool);
+    }
 }
 
 /// One link's place in a [`FairShare`]: its buckets, one per [`Flow`].
@@ -326,26 +439,33 @@ pub struct FairMember {
 }
 
 impl FairMember {
-    /// Take `len` bytes of `flow` at `now`. `Err` is how long until the
-    /// bucket holds enough (the frame's length, or a full bucket if it is
-    /// longer), a time to wait or to drop for.
+    /// Take `len` bytes of `flow` at `now`. A member alone in the pool is
+    /// always admitted. `Err` is how long until the bucket holds enough (the
+    /// frame's length, or a full bucket if it is longer), a time to wait or
+    /// to drop for.
     pub fn admit_at(&self, flow: Flow, len: usize, now: Instant) -> Result<(), Duration> {
         let pool = &*self.pool;
         let mut state = pool.lock();
         let Some(slot) = state.members.get_mut(&self.id) else {
             return Ok(());
         };
+        let within = |at: Instant| now.saturating_duration_since(at) < pool.interval;
+        let was_active = within(slot.joined) || slot.last_frame.is_some_and(within);
         slot.last_frame = Some(now);
         let due = state
-            .computed
+            .window
             .is_none_or(|at| now.saturating_duration_since(at) >= pool.interval);
         if due {
-            let active = state.active_at(now, pool.interval).max(1);
-            let share = pool.capacity as f64 / active as f64;
-            state.rate = share.clamp(pool.floor as f64, pool.capacity as f64);
-            state.computed = Some(now);
+            state.roll(now, pool);
+        } else if !was_active {
+            // An idle member comes back: the rates count it from this frame.
+            state.recompute(now, pool);
         }
-        let rate = state.rate;
+        if state.active <= 1 {
+            state.flows[flow as usize].admitted += len as f64;
+            return Ok(());
+        }
+        let rate = state.flows[flow as usize].rate;
         let Some(slot) = state.members.get_mut(&self.id) else {
             return Ok(());
         };
@@ -356,6 +476,7 @@ impl FairMember {
         let need = (len as f64).min(rate);
         if bucket.tokens >= need {
             bucket.tokens -= len as f64;
+            state.flows[flow as usize].admitted += len as f64;
             Ok(())
         } else {
             Err(Duration::from_secs_f64((need - bucket.tokens) / rate))
@@ -365,6 +486,38 @@ impl FairMember {
     /// [`admit_at`](Self::admit_at) at the current time.
     pub fn admit(&self, flow: Flow, len: usize) -> Result<(), Duration> {
         self.admit_at(flow, len, Instant::now())
+    }
+
+    /// Whether [`admit_at`](Self::admit_at) of `len` bytes of `flow` would pass at `now`,
+    /// taking nothing: no tokens are spent, the member is not marked active, the window is
+    /// not measured. A member alone (or the only one active, counting this one) always would;
+    /// an idle one is judged as if it were counted, at the rate that gives.
+    pub fn would_admit_at(&self, flow: Flow, len: usize, now: Instant) -> bool {
+        let pool = &*self.pool;
+        let state = pool.lock();
+        let Some(slot) = state.members.get(&self.id) else {
+            return true;
+        };
+        let within = |at: Instant| now.saturating_duration_since(at) < pool.interval;
+        let counted = within(slot.joined) || slot.last_frame.is_some_and(within);
+        let active = if counted {
+            state.active.max(1)
+        } else {
+            state.active + 1
+        };
+        if active <= 1 {
+            return true;
+        }
+        let flow_pool = &state.flows[flow as usize];
+        let rate = pool.share(flow_pool.carried, active);
+        let bucket = &slot.buckets[flow as usize];
+        let refill = now.saturating_duration_since(bucket.at).as_secs_f64() * rate;
+        (bucket.tokens + refill).min(rate) >= (len as f64).min(rate)
+    }
+
+    /// [`would_admit_at`](Self::would_admit_at) at the current time.
+    pub fn would_admit(&self, flow: Flow, len: usize) -> bool {
+        self.would_admit_at(flow, len, Instant::now())
     }
 }
 
@@ -1897,18 +2050,46 @@ mod tests {
         taken
     }
 
+    /// A lone member is not held to the pool: it passes many times `capacity` octets in one
+    /// interval, in either direction, and every frame is admitted.
     #[test]
-    fn a_lone_member_gets_the_pool_and_two_get_half() {
+    fn a_lone_member_is_not_capped_by_the_pool() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let share = FairShare::new(1000, 10, Duration::from_secs(1));
+        let a = share.join_at(at(0));
+        for flow in [Flow::Tx, Flow::Rx] {
+            let mut passed = 0;
+            for i in 0..500 {
+                let now = at(i * 2);
+                assert!(
+                    a.admit_at(flow, 100, now).is_ok(),
+                    "a lone member was refused after {passed} octets of {flow:?} in {} ms, \
+                     the pool being 1000 a second",
+                    i * 2
+                );
+                passed += 100;
+            }
+            assert_eq!(passed, 50 * 1000, "fifty times the pool in under a second");
+        }
+    }
+
+    /// Changed from the fixed-pool test of the same name: a member alone used to drain a
+    /// bucket of the pool's 1000 and now is admitted without one; the share of two and the
+    /// return to lone after a quiet spell are as before.
+    #[test]
+    fn a_lone_member_takes_no_bucket_and_two_get_half() {
         let t0 = Instant::now();
         let at = |ms: u64| t0 + Duration::from_millis(ms);
         let share = FairShare::new(1000, 10, Duration::from_secs(1));
         let a = share.join_at(at(0));
 
-        // One member active: the whole pool, in a burst of one second's worth.
-        assert_eq!(drain(&a, Flow::Tx, 10, at(0)), 1000);
+        // One member active: three times the pool at once, in each direction.
+        for flow in [Flow::Tx, Flow::Rx] {
+            assert!(a.admit_at(flow, 3000, at(0)).is_ok());
+            assert!(a.would_admit_at(flow, 3000, at(0)));
+        }
         assert_eq!(share.active_at(at(0)), 1);
-        // The other direction has a bucket of its own.
-        assert_eq!(drain(&a, Flow::Rx, 10, at(0)), 1000);
 
         // A second link joins: both pass frames within the window.
         let b = share.join_at(at(500));
@@ -1917,17 +2098,181 @@ mod tests {
         assert_eq!(share.active_at(at(900)), 2);
         // Both count (the joiner from the moment it came): half each.
         assert!(b.admit_at(Flow::Tx, 1, at(1100)).is_ok());
-        assert_eq!(share.rate(), 500);
+        assert_eq!(share.rate(Flow::Tx), 500);
         assert!(a.admit_at(Flow::Tx, 1, at(1100)).is_ok());
         assert_eq!(drain(&a, Flow::Tx, 10, at(1100)), 490);
         assert_eq!(drain(&b, Flow::Tx, 10, at(1100)), 490);
 
         // A member that goes quiet costs the other nothing: past the window
-        // the lone one has the whole pool again.
+        // the lone one takes no bucket again.
         assert!(a.admit_at(Flow::Tx, 1, at(5000)).is_ok());
         assert_eq!(share.active_at(at(5000)), 1);
-        assert_eq!(share.rate(), 1000);
-        assert_eq!(drain(&a, Flow::Tx, 10, at(5000)), 990);
+        assert_eq!(share.rate(Flow::Tx), 1000);
+        assert!(a.admit_at(Flow::Tx, 5000, at(5000)).is_ok());
+    }
+
+    /// A member that was alone is moved onto its bucket when a second member becomes active:
+    /// it keeps no burst beyond its share, whatever it carried alone.
+    #[test]
+    fn a_member_that_was_alone_gets_no_free_burst_when_a_second_becomes_active() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let share = FairShare::new(1000, 10, Duration::from_secs(1));
+        let a = share.join_at(at(0));
+        for ms in (0..2000).step_by(100) {
+            assert!(a.admit_at(Flow::Tx, 5000, at(ms)).is_ok());
+        }
+        // 50,000 octets a second carried alone: the pool the two will divide.
+        let carried = share.carried(Flow::Tx);
+        assert!((45_000..=50_000).contains(&carried), "carried {carried}");
+        // A second member becomes active (it joined long ago and was idle).
+        let b = share.join_at(at(0));
+        assert!(b.admit_at(Flow::Tx, 1, at(2000)).is_ok());
+        assert_eq!(share.active_at(at(2000)), 2);
+        let rate = share.rate(Flow::Tx) as usize;
+        assert!(
+            rate >= 22_000,
+            "half of the carried pool, not of 1000: {rate}"
+        );
+        let burst = drain(&a, Flow::Tx, 100, at(2000));
+        assert!(
+            burst <= rate,
+            "a member that was alone took {burst} at once, over its share {rate}"
+        );
+        assert!(burst >= rate - 100, "and still has its share: {burst}");
+    }
+
+    /// Members that contend divide what the pool carried alone, not the fixed capacity, and
+    /// split it about equally; the pool does not leak away while they use it.
+    #[test]
+    fn contenders_split_what_the_lone_member_carried_about_equally() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let share = FairShare::new(1000, 10, Duration::from_secs(1));
+        let a = share.join_at(at(0));
+        // Alone: 10,000 octets a second, ten times `capacity`.
+        for ms in (0..3000).step_by(100) {
+            assert!(a.admit_at(Flow::Tx, 1000, at(ms)).is_ok());
+        }
+        let alone = share.carried(Flow::Tx);
+        assert!((9_000..=10_000).contains(&alone), "carried {alone}");
+
+        // A second link comes; both flood for eight seconds (100 octets every 10 ms each,
+        // 10,000 a second each, twice what a half is).
+        let b = share.join_at(at(3050));
+        let (mut taken_a, mut taken_b) = (0usize, 0usize);
+        for ms in (3050..11_050).step_by(10) {
+            let counted = ms >= 6000;
+            if a.admit_at(Flow::Tx, 100, at(ms)).is_ok() && counted {
+                taken_a += 100;
+            }
+            if b.admit_at(Flow::Tx, 100, at(ms)).is_ok() && counted {
+                taken_b += 100;
+            }
+        }
+        // Five seconds counted.
+        let (sum, half) = (taken_a + taken_b, 5 * 10_000 / 2);
+        for taken in [taken_a, taken_b] {
+            assert!(
+                taken.abs_diff(half) * 10 <= half,
+                "a member took {taken} of about {half} (a: {taken_a}, b: {taken_b})"
+            );
+        }
+        assert!(
+            sum.abs_diff(50_000) * 10 <= 50_000,
+            "together {sum}: what the lone member carried, not 5 x 1000 of the capacity"
+        );
+        assert!(
+            taken_a.abs_diff(taken_b) * 10 <= half,
+            "{taken_a} and {taken_b}"
+        );
+    }
+
+    /// However many contend and flood, their bytes are bounded by the pool (here the
+    /// capacity, nothing having been carried alone): `capacity` a second plus one burst
+    /// each. The mark of what was carried does not rise on bursts.
+    #[test]
+    fn many_contenders_together_never_pass_more_than_the_pool_and_a_burst_each() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let share = FairShare::new(1000, 10, Duration::from_secs(1));
+        let members: Vec<FairMember> = (0..5).map(|_| share.join_at(at(0))).collect();
+        let mut taken = 0usize;
+        for ms in (0..10_000).step_by(10) {
+            for m in &members {
+                if m.admit_at(Flow::Rx, 100, at(ms)).is_ok() {
+                    taken += 100;
+                }
+            }
+        }
+        // Ten seconds of 1000 a second, and a burst of one share (200) for each member.
+        assert!(taken <= 10_000 + 5 * 200, "{taken} passed");
+        assert!(taken >= 9_000, "{taken} passed: the pool is used");
+        assert!(
+            share.carried(Flow::Rx) <= 1000,
+            "{}",
+            share.carried(Flow::Rx)
+        );
+        assert_eq!(share.carried(Flow::Tx), 0);
+    }
+
+    /// What a link carried is forgotten as it decays: a pool whose members went quiet
+    /// divides the capacity again.
+    #[test]
+    fn the_carried_mark_decays_when_the_pool_carries_less() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let share = FairShare::new(1000, 10, Duration::from_secs(1));
+        let a = share.join_at(at(0));
+        for ms in (0..3000).step_by(100) {
+            assert!(a.admit_at(Flow::Tx, 1000, at(ms)).is_ok());
+        }
+        assert!(share.carried(Flow::Tx) >= 9_000);
+        assert!(a.admit_at(Flow::Tx, 1, at(103_000)).is_ok());
+        assert!(
+            share.carried(Flow::Tx) < 1000,
+            "{}",
+            share.carried(Flow::Tx)
+        );
+        assert_eq!(share.rate(Flow::Tx), 1000);
+    }
+
+    /// `would_admit` reads the bucket and takes nothing: it spends no tokens, marks no
+    /// activity, and is true for a member alone whatever the length.
+    #[test]
+    fn would_admit_reads_without_taking_or_marking_activity() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let share = FairShare::new(1000, 10, Duration::from_secs(1));
+        let a = share.join_at(at(0));
+        let b = share.join_at(at(0));
+        let idle = share.join_at(at(0));
+        // Three active at the start: a third of the pool each.
+        assert!(a.admit_at(Flow::Tx, 1, at(0)).is_ok());
+        assert!(b.admit_at(Flow::Tx, 1, at(0)).is_ok());
+        let rate = share.rate(Flow::Tx) as usize;
+        assert_eq!(rate, 333);
+        // Reading spends nothing: the bucket still gives its share, once.
+        for _ in 0..5 {
+            assert!(b.would_admit_at(Flow::Tx, 300, at(0)));
+        }
+        assert!(b.admit_at(Flow::Tx, 300, at(0)).is_ok());
+        // Now it would not, and says so as often as asked, until the bucket refills.
+        for _ in 0..3 {
+            assert!(!b.would_admit_at(Flow::Tx, 300, at(0)));
+        }
+        assert!(b.admit_at(Flow::Tx, 300, at(0)).is_err());
+        assert!(!b.would_admit_at(Flow::Tx, 300, at(500)));
+        assert!(b.would_admit_at(Flow::Tx, 300, at(900)));
+        // The other direction has its own bucket.
+        assert!(b.would_admit_at(Flow::Rx, 300, at(0)));
+        // Asking marked nothing: a member that only asks is no more active than before.
+        let _ = idle.would_admit_at(Flow::Tx, 1, at(5000));
+        assert_eq!(share.active_at(at(5000)), 0);
+        // A member alone is never told to wait, whatever the length.
+        assert!(a.admit_at(Flow::Tx, 1, at(5000)).is_ok());
+        assert_eq!(share.active_at(at(5000)), 1);
+        assert!(a.would_admit_at(Flow::Tx, 1 << 30, at(5000)));
     }
 
     #[test]
@@ -1942,7 +2287,7 @@ mod tests {
             }
         }
         assert_eq!(
-            share.rate(),
+            share.rate(Flow::Tx),
             300,
             "ten members, 100 each, lifted to the floor"
         );
@@ -1962,8 +2307,8 @@ mod tests {
         // The pool was busy with one link, then idle for much longer than an interval: the
         // rate it holds is the whole pool's.
         let old = share.join_at(at(0));
-        assert_eq!(drain(&old, Flow::Tx, 10, at(0)), 1000);
-        assert_eq!(share.rate(), 1000);
+        assert!(old.admit_at(Flow::Tx, 1000, at(0)).is_ok());
+        assert_eq!(share.rate(Flow::Tx), 1000);
         // Three links join at the same moment, long after.
         let joined: Vec<FairMember> = (0..3).map(|_| share.join_at(at(60_000))).collect();
         let burst: usize = joined
@@ -1984,7 +2329,7 @@ mod tests {
                 let _ = m.admit_at(Flow::Rx, 1, at(ms));
             }
         }
-        let rate = share.rate();
+        let rate = share.rate(Flow::Tx);
         let fifth = share.join_at(at(71_200));
         let burst = drain(&fifth, Flow::Tx, 1, at(71_200));
         assert!(
@@ -1994,18 +2339,23 @@ mod tests {
         );
     }
 
+    /// Changed to hold a second active member: the debt rule is a bucket's, and a member
+    /// alone takes no bucket. Two members of a 2000 pool have 1000 each.
     #[test]
     fn a_frame_over_the_burst_waits_for_a_full_bucket_and_is_then_charged_whole() {
         let t0 = Instant::now();
-        let share = FairShare::new(1000, 10, Duration::from_secs(1));
-        let m = share.join();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let share = FairShare::new(2000, 10, Duration::from_secs(1));
+        let (m, other) = (share.join_at(at(0)), share.join_at(at(0)));
         // 2500 bytes in a 1000-byte bucket: admitted from a full bucket and
         // charged whole, so the bucket is 1500 in debt.
-        let at = |ms: u64| t0 + Duration::from_millis(ms);
         assert!(m.admit_at(Flow::Rx, 2500, at(0)).is_ok());
         let wait = m.admit_at(Flow::Rx, 1, at(0)).unwrap_err();
         assert!(wait >= Duration::from_millis(1500), "{wait:?}");
+        // The other member keeps trying, so the pool stays contended.
+        assert!(other.admit_at(Flow::Rx, 1, at(1400)).is_ok());
         assert!(m.admit_at(Flow::Rx, 1, at(1400)).is_err());
+        assert!(other.admit_at(Flow::Rx, 1, at(1600)).is_ok());
         assert!(m.admit_at(Flow::Rx, 1, at(1600)).is_ok());
     }
 }
