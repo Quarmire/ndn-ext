@@ -125,7 +125,16 @@ impl Ctx {
             let _g = self.rt_rx.enter();
             let (face, seen) = (Arc::clone(&self.pair.rx), Arc::clone(&seen));
             tokio::spawn(async move {
-                while face.face.recv_bytes().await.is_ok() {
+                // The datagrams and the channel stream's frames are read apart (the forwarder
+                // runs one task for each): a subscriber that counts both reads both.
+                loop {
+                    let got = tokio::select! {
+                        wire = face.face.recv_bytes() => wire,
+                        frame = face.face.recv_side_stream() => frame,
+                    };
+                    if got.is_err() {
+                        break;
+                    }
                     seen.fetch_add(1, Ordering::Relaxed);
                 }
             })

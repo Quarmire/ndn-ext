@@ -232,11 +232,18 @@ async fn within(what: &str, limit: Duration, mut done: impl FnMut() -> bool) {
     panic!("{what}: not within {} s", limit.as_secs());
 }
 
+/// The next frame `face` delivers on either reader: `recv_bytes` (NDN packets and datagram
+/// frames) or the channel stream's lane (`recv_side_stream`).
 async fn recv(face: &Face) -> Bytes {
-    tokio::time::timeout(Duration::from_secs(5), face.recv_bytes())
-        .await
-        .expect("a frame within 5 s")
-        .unwrap()
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            wire = face.recv_bytes() => wire,
+            frame = face.recv_side_stream() => frame,
+        }
+    })
+    .await
+    .expect("a frame within 5 s")
+    .unwrap()
 }
 
 /// What `on`'s report says of the side path of its link to `key`.

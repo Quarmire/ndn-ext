@@ -133,10 +133,15 @@ async fn burst(tx: Arc<Link>, rx: Arc<Link>, dgrams: usize) {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
-            let wire = tokio::time::timeout(left, rx.face.recv_bytes())
-                .await
-                .expect("the stream frame arrives")
-                .unwrap();
+            let wire = tokio::time::timeout(left, async {
+                tokio::select! {
+                    wire = rx.face.recv_bytes() => wire,
+                    frame = rx.face.recv_side_stream() => frame,
+                }
+            })
+            .await
+            .expect("the stream frame arrives")
+            .unwrap();
             if wire.len() == STREAM_FRAME {
                 return;
             }
