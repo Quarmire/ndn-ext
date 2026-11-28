@@ -94,7 +94,8 @@ pub(crate) fn smoothed_rate(rate: f64, inst: f64, dt: Duration) -> f64 {
 /// The size of quinn's datagram send buffer
 /// (`TransportConfig::datagram_send_buffer_size`, which the link's transport
 /// configuration leaves at quinn's own 1 MiB): what the headroom is measured
-/// against, as `queued = DATAGRAM_SEND_BUFFER - datagram_send_buffer_space()`.
+/// against, as `queued = DATAGRAM_SEND_BUFFER - datagram_send_buffer_space()` less what the
+/// buffer counts as taken while empty.
 pub const DATAGRAM_SEND_BUFFER: usize = 1024 * 1024;
 
 /// The longest channel frame on the stream (a record's payload). A peer that
@@ -339,6 +340,14 @@ type Inbound = (Bytes, OwnedSemaphorePermit);
 /// [`LinkHandle`](crate::LinkHandle).
 pub(crate) struct SideCarrier {
     connection: quinn::Connection,
+    /// What the connection's datagram send buffer counts as taken with nothing queued in it:
+    /// the buffer's size less the space it reports while empty. Zero for quinn-proto 0.11.16,
+    /// which counts payload octets only; 32 for 0.11.19, which keeps the record of one more
+    /// datagram (`size_of::<Datagram>()`) in reserve, and counts one for each datagram queued
+    /// (so the octets it reports taken are the payload and 32 for each datagram). Read once
+    /// when the link comes up, so that an idle link reads no octets queued whichever the
+    /// library counts.
+    send_reserve: usize,
     /// The peer's hello carried `ChannelCaps` bit 0.
     peer_caps: bool,
     /// This side's hello did.
@@ -379,8 +388,13 @@ impl SideCarrier {
     ) -> Arc<Self> {
         let (tx, rx) = mpsc::channel(1024);
         let sent_bytes = connection.stats().udp_tx.bytes;
+        // Read before anything is queued on the connection: the link's face and its first
+        // datagram come after this carrier. See `SideCarrier::send_reserve`.
+        let send_reserve =
+            DATAGRAM_SEND_BUFFER.saturating_sub(connection.datagram_send_buffer_space());
         Arc::new(Self {
             connection,
+            send_reserve,
             peer_caps,
             our_caps,
             carry: policy.carry,
@@ -471,9 +485,13 @@ impl SideCarrier {
         }
     }
 
-    /// Octets waiting in the connection's datagram send buffer.
+    /// Octets waiting in the connection's datagram send buffer: what the buffer holds now,
+    /// by the connection's own count, beyond what it holds with nothing queued
+    /// ([`SideCarrier::send_reserve`]).
     fn queued(&self) -> usize {
-        DATAGRAM_SEND_BUFFER.saturating_sub(self.connection.datagram_send_buffer_space())
+        DATAGRAM_SEND_BUFFER
+            .saturating_sub(self.connection.datagram_send_buffer_space())
+            .saturating_sub(self.send_reserve)
     }
 
     /// The connection's current datagram size.

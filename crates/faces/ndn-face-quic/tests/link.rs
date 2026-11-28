@@ -1579,6 +1579,37 @@ async fn a_congested_sink_refuses_and_the_receiver_sees_exactly_the_gap() {
     );
 }
 
+/// A link with nothing queued says so, and says so again once what it queued has left: the read
+/// is what waits in the datagram send buffer, not what the QUIC library takes off the buffer's
+/// size. quinn-proto 0.11.19 counts a record of 32 octets for each queued datagram and keeps
+/// one more in reserve (0.11.16 counted payload only), so an empty buffer reports 32 octets
+/// less space than its size, and a read that is the size less the space is never zero.
+#[tokio::test]
+async fn a_link_with_nothing_queued_says_so_before_and_after_a_flood() {
+    let dialer = endpoint(ed_key(1), false);
+    let listener = endpoint(ec_key(2), true);
+    let (a, b) = channel_link(&dialer, &listener).await;
+    assert_eq!(
+        a.face.side_limits().queued,
+        0,
+        "a link that has sent nothing has nothing queued"
+    );
+    let ndn = Bytes::from(vec![0x05u8; 1000]);
+    for _ in 0..2_000 {
+        a.face.send_bytes(ndn.clone()).await.unwrap();
+    }
+    let start = std::time::Instant::now();
+    while a.face.side_limits().queued > 0 {
+        assert!(
+            start.elapsed() < T,
+            "the send buffer never drained: {} octets still queued",
+            a.face.side_limits().queued
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    drop(b);
+}
+
 #[tokio::test]
 async fn the_headroom_rule_bounds_what_a_channel_frame_waits_behind_ndn_datagrams() {
     const NDN: usize = 20_000;
