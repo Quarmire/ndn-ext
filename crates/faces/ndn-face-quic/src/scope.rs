@@ -1522,6 +1522,7 @@ mod tests {
     /// other names and the shared bucket as they were.
     #[test]
     fn rated_interests_take_a_bucket_of_their_own() {
+        let started = std::time::Instant::now();
         let shared = Arc::new(SharedRate::new(
             RateLimit {
                 burst: 1000,
@@ -1569,11 +1570,13 @@ mod tests {
         // Other names, Data of the rated name, are not held to it.
         assert_eq!(s.received(&plain), Judged::Pass);
         assert_eq!(s.received(&wire(data("/rated/x", 10))), Judged::Pass);
-        // The refused Interests took nothing of the shared bucket: 3 + 1 + 1.
+        // The refused Interests took nothing of the shared bucket: 3 + 1 + 1 taken, and what
+        // the bucket refilled (1,000 a second) while this ran, whatever the machine's speed.
         let left = shared.buckets.lock().unwrap().0.tokens;
+        let most = (995.0 + 1000.0 * started.elapsed().as_secs_f64()).min(1000.0);
         assert!(
-            (994.0..996.0).contains(&left),
-            "{left} tokens left of the shared bucket"
+            left >= 995.0 - 1e-6 && left <= most + 1e-6,
+            "{left} tokens left of the shared bucket, at most {most} after 5 taken"
         );
     }
 
