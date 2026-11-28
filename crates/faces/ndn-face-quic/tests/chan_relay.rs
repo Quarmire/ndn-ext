@@ -174,7 +174,7 @@ async fn one_copy(receivers: usize) {
             let got = next(items).await.expect("an item");
             assert_eq!(got.path.to_string(), path);
             assert_eq!(&got.bytes[..], payload.as_bytes());
-            assert_eq!(&got.writer, mesh.sender.node.name());
+            assert_eq!(&got.author.writer, mesh.sender.node.name());
         }
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
