@@ -18,8 +18,8 @@ use bytes::Bytes;
 use ndn_engine::side::{SideId, SideStats};
 use ndn_face_quic::LinkHandle;
 use ndn_heap::{
-    Ask, ChannelMode, GetNotice, GetOptions, Got, Items, Kind, Live, Name, Query, QueryPath,
-    Reply, Select, Targets, Via,
+    Ask, ChannelMode, GetNotice, GetOptions, Got, Items, Kind, Live, Name, Query, QueryPath, Reply,
+    Select, Targets, Via,
 };
 
 #[allow(dead_code)]
@@ -68,7 +68,11 @@ async fn drain(items: &mut Items) -> (Vec<Got>, Vec<GetNotice>) {
 
 /// Ask `server` once by the channel, again until it answers: the space's record takes a moment to
 /// reach the asker over the links.
-async fn ask_until_answered(party: &Party, server: &Name, bytes: &[u8]) -> (Vec<Got>, Vec<GetNotice>) {
+async fn ask_until_answered(
+    party: &Party,
+    server: &Name,
+    bytes: &[u8],
+) -> (Vec<Got>, Vec<GetNotice>) {
     let start = Instant::now();
     loop {
         // `get` refuses while the owner's first entries are not held yet (a `NotReady` that says
@@ -114,13 +118,7 @@ async fn quiet() {
 /// The whole scenario, in a sealed space (a public space lists no reader here: its receivers are
 /// followers, and a query needs a listed asker; that case is the heap's own test).
 async fn the_answer_reaches_only_the_asker() {
-    let mesh = Mesh::new(
-        &Runtimes::current(),
-        2,
-        true,
-        Build::default(),
-    )
-    .await;
+    let mesh = Mesh::new(&Runtimes::current(), 2, true, Build::default()).await;
     let relay = mesh.relay.as_ref().expect("a relay");
     let server = mesh.sender.node.name().clone();
     let (asker, other) = (&mesh.receivers[0], &mesh.receivers[1]);
@@ -152,7 +150,10 @@ async fn the_answer_reaches_only_the_asker() {
         here.spawn(async move {
             let start = Instant::now();
             loop {
-                match node.ask_channel_in(&space(), &server, ChannelMode::Ask).await {
+                match node
+                    .ask_channel_in(&space(), &server, ChannelMode::Ask)
+                    .await
+                {
                     Ok(info) => return info.channel,
                     Err(e) if start.elapsed() < Duration::from_secs(30) => {
                         let _ = e;
@@ -214,12 +215,7 @@ async fn the_answer_reaches_only_the_asker() {
 
     // A second query, measured: nothing else moves, so every counter's delta is the query's.
     quiet().await;
-    let sites = [
-        &mesh.sender.site,
-        relay,
-        &asker.site,
-        &other.site,
-    ];
+    let sites = [&mesh.sender.site, relay, &asker.site, &other.site];
     let before: Vec<SideStats> = sites.iter().map(|s| stats(s)).collect();
     let other_link_rx = rx_frames(&other.link);
     let relay_to_other_tx = tx_frames(&mesh.relay_links[2]);
@@ -234,15 +230,27 @@ async fn the_answer_reaches_only_the_asker() {
     let delta = |i: usize, f: fn(&SideStats) -> u64| f(&after[i]) - f(&before[i]);
     // The sender's forwarder, the relay and the asker's forwarder each passed one QUERY up and
     // one ANSWER down; the second receiver's forwarder saw neither.
-    for (i, hop) in ["the server's forwarder", "the relay", "the asker's forwarder"]
-        .iter()
-        .enumerate()
+    for (i, hop) in [
+        "the server's forwarder",
+        "the relay",
+        "the asker's forwarder",
+    ]
+    .iter()
+    .enumerate()
     {
         assert_eq!(delta(i, |s| s.queries), 1, "{hop} passed one QUERY up");
         assert_eq!(delta(i, |s| s.answers), 1, "{hop} passed one ANSWER down");
     }
-    assert_eq!(delta(3, |s| s.queries), 0, "the second receiver sent no query");
-    assert_eq!(delta(3, |s| s.answers), 0, "the second receiver's forwarder saw no answer");
+    assert_eq!(
+        delta(3, |s| s.queries),
+        0,
+        "the second receiver sent no query"
+    );
+    assert_eq!(
+        delta(3, |s| s.answers),
+        0,
+        "the second receiver's forwarder saw no answer"
+    );
     // The relay never fanned the answer out: one link carried it, toward the asker; the link
     // toward the second receiver carried nothing, and neither did its receiving end.
     assert_eq!(
@@ -269,7 +277,11 @@ async fn the_answer_reaches_only_the_asker() {
             0,
             "site {i} refused nothing of the side PIT: {s:?}"
         );
-        assert_eq!(s.wrong_source + s.malformed + s.unrouted, 0, "site {i}: {s:?}");
+        assert_eq!(
+            s.wrong_source + s.malformed + s.unrouted,
+            0,
+            "site {i}: {s:?}"
+        );
     }
     // The second receiver's live stream saw nothing at all.
     let nothing = tokio::time::timeout(Duration::from_millis(500), watching.next()).await;
@@ -316,7 +328,12 @@ async fn two_askers_behind_one_relay_each_get_only_their_own_answer() {
     assert_eq!(&c.0[0].bytes[..], b"for /carol/tablet");
     assert_eq!(&d.0[0].bytes[..], b"for /dave/watch");
     quiet().await;
-    for site in [&mesh.sender.site, mesh.relay.as_ref().unwrap(), &carol.site, &dave.site] {
+    for site in [
+        &mesh.sender.site,
+        mesh.relay.as_ref().unwrap(),
+        &carol.site,
+        &dave.site,
+    ] {
         assert_eq!(stats(site).breadcrumbs, 0);
     }
     // Each asker's forwarder passed exactly its own answer.
