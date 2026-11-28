@@ -156,6 +156,16 @@ const HEADROOM_YIELDS: u32 = 256;
 /// a late grant is a peer that is not following the protocol.
 const STREAM_GRANT_WAIT: Duration = Duration::from_secs(10);
 
+/// The longest a write to the channel stream may make no progress before the link is closed:
+/// the peer has granted no flow-control credit for this long, so it is not reading the stream
+/// it was granted. A link that sends `Keep`s and never reads would otherwise hold every
+/// sender waiting for room on it (the engine refreshes a sink on every `Keep`, read or not)
+/// for the life of the link. It is a bound on the peer's progress, not a judgement on its
+/// data: any octet the peer takes restarts it, so a slow link that moves is never closed.
+/// [`LinkHandle::set_stream_stall`](crate::LinkHandle::set_stream_stall) changes it for one
+/// link.
+pub const STREAM_STALL: Duration = Duration::from_secs(30);
+
 /// Why this side stopped a channel stream.
 const STREAM_MALFORMED: VarInt = VarInt::from_u32(1);
 
@@ -369,6 +379,8 @@ pub(crate) struct SideCarrier {
     /// queue's lock when `forward_side` queued nothing.
     queued_octets: AtomicUsize,
     wake: tokio::sync::Notify,
+    /// [`STREAM_STALL`] for this link, in milliseconds.
+    stall_ms: AtomicU64,
     /// Calls to the face's reader, to let it look at every source now and then.
     turn: AtomicU32,
     /// The headroom now, from the send rate last measured.
@@ -405,6 +417,7 @@ impl SideCarrier {
             queue: Mutex::new(Queue::default()),
             queued_octets: AtomicUsize::new(0),
             wake: tokio::sync::Notify::new(),
+            stall_ms: AtomicU64::new(STREAM_STALL.as_millis() as u64),
             turn: AtomicU32::new(0),
             headroom: AtomicUsize::new(QUEUE_FLOOR),
             rate: Mutex::new(RateSample {
@@ -440,6 +453,12 @@ impl SideCarrier {
         self.counters.snapshot()
     }
 
+    /// Change [`STREAM_STALL`] for this link (at least a millisecond).
+    pub(crate) fn set_stream_stall(&self, stall: Duration) {
+        let ms = u64::try_from(stall.as_millis()).unwrap_or(u64::MAX).max(1);
+        self.stall_ms.store(ms, Ordering::Relaxed);
+    }
+
     /// After the verdict: grant the peer its one stream and start the tasks
     /// that read it and write what `forward_side` queued. Does nothing for a
     /// link that does not carry.
@@ -468,21 +487,29 @@ impl SideCarrier {
         }
     }
 
+    /// Whether the link has ended (the peer closed it, this side did, or it was lost): it takes
+    /// no frame of either class, which `forward` refuses [`Closed`](SideRefused::Closed).
+    fn is_closed(&self) -> bool {
+        self.connection.close_reason().is_some()
+    }
+
     /// Whether [`forward`](Self::forward) would take a frame of `class` now and not refuse it
     /// [`Full`](SideRefused::Full): the datagram class while fewer octets wait in the send
-    /// buffer than the headroom, the stream class while its queue is under its bound. The read
-    /// `forward` makes first, without the frame; room is not reserved.
+    /// buffer than the headroom, the stream class while its queue is under its bound; and a
+    /// link that has ended, which refuses `Closed` and not `Full`, so there is nothing to wait
+    /// for. The read `forward` makes first, without the frame; room is not reserved.
     pub(crate) fn room(&self, class: SideClass) -> bool {
-        match class {
-            SideClass::Datagram => self.queued() < self.headroom(),
-            SideClass::Stream => {
-                self.queue
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .octets
-                    < STREAM_QUEUE_MAX
+        self.is_closed()
+            || match class {
+                SideClass::Datagram => self.queued() < self.headroom(),
+                SideClass::Stream => {
+                    self.queue
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .octets
+                        < STREAM_QUEUE_MAX
+                }
             }
-        }
     }
 
     /// [`room`](Self::room) for a frame of `len` octets: what `forward` would answer for it
@@ -494,6 +521,9 @@ impl SideCarrier {
     /// this read said room for and `forward` refused would be lost there, counted `sink_full`
     /// or `dropped_over_quota`.
     pub(crate) fn room_for(&self, len: usize, class: SideClass) -> bool {
+        if self.is_closed() {
+            return true;
+        }
         let fits = match class {
             SideClass::Datagram => self.queued() < self.headroom(),
             SideClass::Stream => {
@@ -735,6 +765,9 @@ impl SideCarrier {
                 }
             }
             SideClass::Stream => {
+                if self.is_closed() {
+                    return Err(Self::closed());
+                }
                 let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
                 if queue.octets + len + 4 > STREAM_QUEUE_MAX {
                     bump(&self.counters.sink_full);
@@ -863,13 +896,37 @@ impl SideCarrier {
             ));
         };
         let written = {
-            let write = send.write_all_chunks(chunks);
-            tokio::pin!(write);
-            match std::future::poll_fn(|cx| Poll::Ready(write.as_mut().poll(cx))).await {
-                Poll::Ready(done) => done,
-                Poll::Pending => {
-                    bump(&self.counters.stream_blocked);
-                    write.await
+            let stall = self.stream_stall();
+            let mut bufs: &mut [Bytes] = chunks;
+            let mut blocked = false;
+            loop {
+                if bufs.is_empty() {
+                    break Ok(());
+                }
+                // One look at what the stream takes: a write that finds credit completes at
+                // once, and one that finds none waits for the peer, for at most `stall`. The
+                // wait is for any progress (`write_chunks` completes when the stream takes an
+                // octet), so a peer that reads slowly keeps the stream and one that does not
+                // read at all is found out, whatever else it sends.
+                let done = {
+                    let mut step = std::pin::pin!(send.write_chunks(&mut *bufs));
+                    match std::future::poll_fn(|cx| Poll::Ready(step.as_mut().poll(cx))).await {
+                        Poll::Ready(done) => done,
+                        Poll::Pending => {
+                            if !blocked {
+                                blocked = true;
+                                bump(&self.counters.stream_blocked);
+                            }
+                            match tokio::time::timeout(stall, step).await {
+                                Ok(done) => done,
+                                Err(_) => return Err(self.close_stalled(stall)),
+                            }
+                        }
+                    }
+                };
+                match done {
+                    Ok(written) => bufs = &mut bufs[written.chunks..],
+                    Err(e) => break Err(e),
                 }
             }
         };
@@ -886,6 +943,27 @@ impl SideCarrier {
                 other => SideRefused::Io(other.to_string()),
             }),
         }
+    }
+
+    /// How long a write to the stream may make no progress now: [`STREAM_STALL`] unless
+    /// [`set_stream_stall`](Self::set_stream_stall) changed it.
+    fn stream_stall(&self) -> Duration {
+        Duration::from_millis(self.stall_ms.load(Ordering::Relaxed))
+    }
+
+    /// The peer took no octet of the channel stream for `stall`: it is not reading the stream
+    /// it was granted, whatever else it sends (a sink is kept live by its `Keep`s, read or not).
+    /// Close the link, with words the peer can read that say why and what to do, so that the
+    /// senders waiting on this link are told and the forwarder drops its sinks; the send in
+    /// flight is told the same.
+    fn close_stalled(&self, stall: Duration) -> SideRefused {
+        let text = format!(
+            "your device did not read the channel stream for {stall:?} while this device had \
+             channel frames to send it, so this link is closed; read the channel stream (or \
+             leave the channels you follow) and link again"
+        );
+        self.close_protocol(&text);
+        SideRefused::Io(text)
     }
 
     /// A marked datagram arrived: whether it is delivered. One that this link

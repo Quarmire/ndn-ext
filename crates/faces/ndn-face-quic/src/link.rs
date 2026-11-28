@@ -912,6 +912,15 @@ impl LinkHandle {
         self.side.stats()
     }
 
+    /// Change how long a write to this link's channel stream may make no progress before the
+    /// link is closed ([`STREAM_STALL`](crate::STREAM_STALL), 30 s, by default): a peer that
+    /// has granted no flow-control credit for this long is not reading the stream it was
+    /// granted. The link is closed with [`CloseReason::Protocol`] and words that say so, and
+    /// the senders waiting on it are told. At least a millisecond.
+    pub fn set_stream_stall(&self, stall: Duration) {
+        self.side.set_stream_stall(stall);
+    }
+
     /// The QUIC connection's own counters (packets, datagrams and frames each way, and the
     /// path's congestion window, losses and congestion events): read-only, for diagnosing a
     /// link's throughput. No address, no key.

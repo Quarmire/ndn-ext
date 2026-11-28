@@ -116,6 +116,6 @@ pub use scope::{
 };
 pub use side::{
     ChannelPolicy, DATAGRAM_SEND_BUFFER, QUEUE_CAP, QUEUE_FLOOR, STREAM_FRAME_MAX,
-    STREAM_QUEUE_MAX, SideLimits, SideStats,
+    STREAM_QUEUE_MAX, STREAM_STALL, SideLimits, SideStats,
 };
 pub use text::{PEER_TEXT_MAX, bounded_text, clean_text, sanitize_peer_text};

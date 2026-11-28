@@ -1630,6 +1630,135 @@ async fn forwarded_stream_frames_keep_their_order_and_a_full_queue_refuses() {
     );
 }
 
+/// A peer that holds its link up and never reads the channel stream (the engine refreshes a
+/// sink on every `Keep`, read or not, so the 30 s sink lapse does not end it) must not hold a
+/// sender for ever: a write that makes no progress for the stall bound ends, the sender is told
+/// why, and the link is closed with words the peer can read. Review F8.
+#[tokio::test]
+async fn a_peer_that_never_reads_its_channel_stream_is_closed_within_the_stall_bound() {
+    let dialer = endpoint(ed_key(1), false);
+    let listener = endpoint(ec_key(2), true);
+    let (a, b) = channel_link(&dialer, &listener).await;
+    let stall = Duration::from_secs(2);
+    a.handle.set_stream_stall(stall);
+    let (face, handle) = (Arc::new(a.face), a.handle);
+    // `b` never reads: nothing takes its face's frames, so its inbox fills, then QUIC's flow
+    // control, and the sender's write waits for credit that does not come.
+    let sender = tokio::spawn({
+        let face = Arc::clone(&face);
+        async move {
+            for tag in 0.. {
+                if let Err(e) = face
+                    .send_side(frame(tag, 1024 * 1024), SideClass::Stream)
+                    .await
+                {
+                    return (tag, e);
+                }
+            }
+            unreachable!()
+        }
+    });
+    let (sent, refused) = tokio::time::timeout(Duration::from_secs(30), sender)
+        .await
+        .expect("a send to a peer that never reads ended within the stall bound")
+        .unwrap();
+    let SideRefused::Io(why) = &refused else {
+        panic!("the sender was told {refused:?}, not why the stream stopped");
+    };
+    assert!(
+        why.contains("did not read the channel stream"),
+        "the refusal does not say why: {why}"
+    );
+    assert!(sent >= 1, "the first frames fit the peer's windows");
+    assert!(handle.side_stats().stream_blocked >= 1);
+    // The link is closed here with the reason, and the peer is told the same words.
+    match tokio::time::timeout(T, handle.closed()).await.unwrap() {
+        LinkError::RefusedHere { reason, text } => {
+            assert_eq!(reason, CloseReason::Protocol);
+            assert!(
+                text.contains("did not read the channel stream") && text.contains("link again"),
+                "the words say neither why nor what to do: {text}"
+            );
+        }
+        other => panic!("expected the close this side made, got {other}"),
+    }
+    match tokio::time::timeout(T, b.handle.closed()).await.unwrap() {
+        LinkError::Refused { reason, text } => {
+            assert_eq!(reason, Some(CloseReason::Protocol));
+            assert!(text.contains("did not read the channel stream"), "{text}");
+        }
+        other => panic!("the peer was not told why: {other}"),
+    }
+}
+
+/// A peer that reads slowly but reads is never closed: the stall bound is on progress, so every
+/// octet the peer takes starts it again, and a link that moves is not a link that stalled.
+#[tokio::test]
+async fn a_peer_that_reads_slowly_is_not_closed_as_stalled() {
+    let dialer = endpoint(ed_key(1), false);
+    let listener = endpoint(ec_key(2), true);
+    let (a, b) = channel_link(&dialer, &listener).await;
+    a.handle.set_stream_stall(Duration::from_secs(3));
+    let (face, handle) = (Arc::new(a.face), a.handle);
+    let sender = tokio::spawn({
+        let face = Arc::clone(&face);
+        async move {
+            for tag in 0.. {
+                if let Err(e) = face
+                    .send_side(frame(tag, 1024 * 1024), SideClass::Stream)
+                    .await
+                {
+                    return (tag, e);
+                }
+            }
+            unreachable!()
+        }
+    });
+    // 1 MiB every 200 ms for 8 s, far longer than the bound, with the sender blocked for
+    // most of it.
+    let start = std::time::Instant::now();
+    let mut read = 0;
+    while start.elapsed() < Duration::from_secs(8) {
+        let _ = recv(&b.face).await;
+        read += 1;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(read >= 20);
+    assert!(!sender.is_finished(), "the sender was refused: {sender:?}");
+    assert!(
+        !handle.is_closed(),
+        "a peer that reads was closed as stalled"
+    );
+    sender.abort();
+}
+
+/// A link that is closed refuses a stream frame `Closed` and says there is nothing to wait for
+/// (`side_room_for`), as a closed lane does: it used to queue frames for a writer that had
+/// stopped until the queue was full, and answer `Full`, and no room, for a link that would
+/// never take another octet.
+#[tokio::test]
+async fn a_closed_link_refuses_a_stream_frame_closed_and_has_no_room_to_wait_for() {
+    let dialer = endpoint(ed_key(1), false);
+    let listener = endpoint(ec_key(2), true);
+    let (a, _b) = channel_link(&dialer, &listener).await;
+    a.handle
+        .close(CloseReason::Released, "this device is done with the link");
+    tokio::time::timeout(T, a.handle.closed()).await.unwrap();
+    let f = frame(1, 1024 * 1024);
+    for _ in 0..8 {
+        assert_eq!(
+            a.face.forward_side(f.clone(), SideClass::Stream),
+            Err(SideRefused::Closed),
+            "a closed link took a stream frame into a queue nobody writes"
+        );
+    }
+    assert!(
+        a.face.side_room_for(&f, SideClass::Stream),
+        "a closed link refuses Closed, not Full: nothing to wait for"
+    );
+    assert!(a.face.side_room(SideClass::Stream));
+}
+
 /// A sink face that cannot take a frame refuses it `Full` and moves nothing, and the receiver
 /// sees exactly the gap: the frames the sink took arrive in order, none of the refused ones
 /// ever do, and the frame sent once the sink had room arrives after a hole of the refused
