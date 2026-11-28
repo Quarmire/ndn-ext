@@ -2601,6 +2601,14 @@ impl Transport for SpscFace {
         self.has_room_e2a()
     }
 
+    /// [`side_room`](Self::side_room) for this frame, with the refusals `forward_side` makes
+    /// first ([`check_side`](Self::check_side)): a frame it refuses another way (an NDN packet,
+    /// one over a slot) is no frame to wait for a free slot for, since waiting would end in the
+    /// same refusal, later. A slot takes any frame that fits it, so a free slot is room.
+    fn side_room_for(&self, frame: &[u8], _class: SideClass) -> bool {
+        self.check_side(frame).is_err() || self.has_room_e2a()
+    }
+
     /// The next packet of the a2e ring. A peer that corrupts the ring's cursors closes
     /// the face (`Err(Closed)`, the reason in [`closed_reason`](SpscFace::closed_reason));
     /// a peer that keeps the ring full does not hold the thread: every
@@ -4801,6 +4809,42 @@ mod tests {
         assert!(
             handle.try_recv().is_none(),
             "the refused frames were not pushed"
+        );
+    }
+
+    /// `side_room_for` answers for the frame in hand with the refusals `forward_side` makes
+    /// first: a full ring has no room for a frame it would take, and a frame it refuses another
+    /// way (an NDN packet, one over a slot) is no frame to wait for room for, since waiting
+    /// would end in the same refusal, later.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn side_room_for_a_frame_reads_what_forward_side_checks() {
+        let (face, _handle) = anon_pair(94, 2, 100);
+        let fits = marked(60, 1);
+        let over = marked(101, 1);
+        let ndn = Bytes::from_static(&[0x06, 0x05, 1, 2, 3, 4, 5]);
+        for class in [SideClass::Datagram, SideClass::Stream] {
+            assert!(face.side_room_for(&fits, class), "an empty ring has room");
+        }
+        for _ in 0..2 {
+            assert_eq!(face.forward_side(fits.clone(), SideClass::Datagram), Ok(()));
+        }
+        for class in [SideClass::Datagram, SideClass::Stream] {
+            assert!(!face.side_room_for(&fits, class), "a full ring has no room");
+            assert!(
+                face.side_room_for(&over, class),
+                "TooLarge, not Full: nothing to wait for"
+            );
+            assert!(
+                face.side_room_for(&ndn, class),
+                "Malformed, not Full: nothing to wait for"
+            );
+        }
+        assert_eq!(
+            face.forward_side(over, SideClass::Datagram),
+            Err(SideRefused::TooLarge {
+                size: 101,
+                max: 100
+            })
         );
     }
 
