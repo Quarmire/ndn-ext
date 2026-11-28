@@ -22,6 +22,12 @@ sha2          = { workspace = true }
 # ndn-rs already uses, so no new crypto backend. rustls 0.23 carries RFC 7250
 # raw public keys, which is what lets the TLS identity be the NDN key itself.
 quinn         = { version = "0.11", default-features = false, features = ["ring", "runtime-tokio", "rustls"] }
+# The datagram send buffer's accounting is the library's (`side::DATAGRAM_RECORD`): 0.11.19 keeps
+# a record's 32 octets in reserve and counts them for each queued datagram (0.11.16 counted
+# payload only). The floor is the release the accounting was read from, so a resolution cannot
+# pick the older one; the test `the_send_buffer_counts_as_the_queued_octets_read_assumes` fails
+# first if a later release counts otherwise. Nothing is used from the crate itself.
+quinn-proto   = { version = "0.11.19", default-features = false }
 rustls        = { version = "0.23", default-features = false, features = ["ring", "std"] }
 # The receive and send buffers of the link socket (`LinkEndpoint::from_socket`): quinn sets neither.
 socket2       = "0.6"

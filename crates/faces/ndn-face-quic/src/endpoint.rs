@@ -926,7 +926,10 @@ fn transport_config(
     congestion.initial_window(initial_window(path_mtu_max));
     t.congestion_controller_factory(Arc::new(congestion));
     // The datagram queues of a connection stay at quinn's own budget: datagrams flow before
-    // the verdict, so a larger one is memory any dialer may fill (see the test).
+    // the verdict, so a larger one is memory any dialer may fill (see the test). The send
+    // buffer is set to the figure the link's headroom is measured against, so that the one
+    // constant is both: `side::DATAGRAM_SEND_BUFFER`.
+    t.datagram_send_buffer_size(crate::side::DATAGRAM_SEND_BUFFER);
     t
 }
 

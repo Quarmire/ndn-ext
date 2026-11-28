@@ -91,12 +91,25 @@ pub(crate) fn smoothed_rate(rate: f64, inst: f64, dt: Duration) -> f64 {
     rate + share * (inst - rate)
 }
 
-/// The size of quinn's datagram send buffer
-/// (`TransportConfig::datagram_send_buffer_size`, which the link's transport
-/// configuration leaves at quinn's own 1 MiB): what the headroom is measured
-/// against, as `queued = DATAGRAM_SEND_BUFFER - datagram_send_buffer_space()` less what the
-/// buffer counts as taken while empty.
+/// The size of the datagram send buffer of every link's connection: the one place it is
+/// stated. The link's transport configuration sets it (`endpoint::transport_config`, so a
+/// connection's buffer is this size whichever way it was made), and what the headroom is
+/// measured against is derived from it, as `queued` is this less
+/// `datagram_send_buffer_space()` less [`DATAGRAM_RECORD`]. (It is quinn's own default too; a
+/// test pins that.)
 pub const DATAGRAM_SEND_BUFFER: usize = 1024 * 1024;
+
+/// What quinn-proto counts for the record of a datagram, `size_of::<Datagram>()`, in a
+/// connection's datagram send buffer. Vendored `quinn-proto-0.11.19/src/connection/datagrams.rs`:
+/// `DatagramBuffer::memory_used` is the queued payload plus this for each queued datagram, and
+/// `Datagrams::send_buffer_space` is the configured size less `memory_used` and less this once
+/// more, kept in reserve. So an empty buffer reports `DATAGRAM_SEND_BUFFER - DATAGRAM_RECORD`
+/// of space, and `memory_used = DATAGRAM_SEND_BUFFER - space - DATAGRAM_RECORD` whatever is
+/// queued. (0.11.16 counted payload only and kept none in reserve, so this is 0 there; the
+/// crate requires a quinn-proto release of the 0.11.19 accounting, and the test
+/// `the_send_buffer_counts_as_the_queued_octets_read_assumes` fails first if a release counts
+/// otherwise.)
+pub(crate) const DATAGRAM_RECORD: usize = 32;
 
 /// The longest channel frame on the stream (a record's payload). A peer that
 /// sends a longer one has sent more than this side grants: the link is closed
@@ -340,14 +353,6 @@ type Inbound = (Bytes, OwnedSemaphorePermit);
 /// [`LinkHandle`](crate::LinkHandle).
 pub(crate) struct SideCarrier {
     connection: quinn::Connection,
-    /// What the connection's datagram send buffer counts as taken with nothing queued in it:
-    /// the buffer's size less the space it reports while empty. Zero for quinn-proto 0.11.16,
-    /// which counts payload octets only; 32 for 0.11.19, which keeps the record of one more
-    /// datagram (`size_of::<Datagram>()`) in reserve, and counts one for each datagram queued
-    /// (so the octets it reports taken are the payload and 32 for each datagram). Read once
-    /// when the link comes up, so that an idle link reads no octets queued whichever the
-    /// library counts.
-    send_reserve: usize,
     /// The peer's hello carried `ChannelCaps` bit 0.
     peer_caps: bool,
     /// This side's hello did.
@@ -388,13 +393,8 @@ impl SideCarrier {
     ) -> Arc<Self> {
         let (tx, rx) = mpsc::channel(1024);
         let sent_bytes = connection.stats().udp_tx.bytes;
-        // Read before anything is queued on the connection: the link's face and its first
-        // datagram come after this carrier. See `SideCarrier::send_reserve`.
-        let send_reserve =
-            DATAGRAM_SEND_BUFFER.saturating_sub(connection.datagram_send_buffer_space());
         Arc::new(Self {
             connection,
-            send_reserve,
             peer_caps,
             our_caps,
             carry: policy.carry,
@@ -485,13 +485,16 @@ impl SideCarrier {
         }
     }
 
-    /// Octets waiting in the connection's datagram send buffer: what the buffer holds now,
-    /// by the connection's own count, beyond what it holds with nothing queued
-    /// ([`SideCarrier::send_reserve`]).
+    /// Octets waiting in the connection's datagram send buffer, by the connection's own count
+    /// (payload and [`DATAGRAM_RECORD`] for each queued datagram): the size the transport
+    /// configuration gives the buffer less the space it reports and less the one record it
+    /// keeps in reserve. Derived from the configuration and the library's constant on every
+    /// read, and from nothing the buffer held at any earlier moment, so that what was queued
+    /// when the link came up cannot skew it.
     fn queued(&self) -> usize {
         DATAGRAM_SEND_BUFFER
             .saturating_sub(self.connection.datagram_send_buffer_space())
-            .saturating_sub(self.send_reserve)
+            .saturating_sub(DATAGRAM_RECORD)
     }
 
     /// The connection's current datagram size.

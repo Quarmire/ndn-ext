@@ -1490,4 +1490,71 @@ mod tests {
         assert!(received_after.udp_rx.datagrams > received.udp_rx.datagrams);
         assert!(sent_after.path.cwnd > 0);
     }
+
+    /// A link that comes up with datagrams already queued on its connection still reads the
+    /// octets queued, to the octet: what the connection's buffer holds beyond what it holds
+    /// empty. The carrier takes no baseline from the buffer at link-up (it read one there, and
+    /// a buffer that held N octets then read N too few for the life of the link, which admits
+    /// that many NDN octets ahead of a channel frame). The datagrams are queued and the
+    /// carrier built with no await between, so the connection's driver, on this
+    /// single-threaded runtime, cannot send any of them first.
+    #[tokio::test]
+    async fn a_carrier_built_over_a_full_send_buffer_reads_what_is_queued() {
+        let (dialer, listener) = (endpoint(1, false), endpoint(2, true));
+        let (d, _l) = handshaken(&dialer, &listener).await;
+        let connection = d.connection.clone();
+        let empty = connection.datagram_send_buffer_space();
+        for _ in 0..10 {
+            connection
+                .send_datagram(Bytes::from(vec![0x05u8; 1000]))
+                .unwrap();
+        }
+        let held = empty - connection.datagram_send_buffer_space();
+        assert!(
+            held >= 10_000,
+            "ten datagrams of 1000 octets are queued: {held}"
+        );
+        let side = SideCarrier::new(
+            connection,
+            true,
+            true,
+            ChannelPolicy {
+                carry: true,
+                quota: None,
+            },
+            None,
+            Arc::new(std::sync::OnceLock::new()),
+        );
+        assert_eq!(
+            side.limits().queued,
+            held,
+            "the carrier reads every octet the buffer holds, not those queued after it was built"
+        );
+    }
+
+    /// What the queued-octets read rests on, of the QUIC library and of this crate's transport
+    /// configuration: a connection's empty datagram send buffer reports its configured size
+    /// less 32 octets of space, and each datagram queued takes its payload and 32 more off it.
+    /// A library that counts otherwise (quinn-proto 0.11.16 took payload only and kept none in
+    /// reserve) makes the read wrong, and fails here first.
+    #[tokio::test]
+    async fn the_send_buffer_counts_as_the_queued_octets_read_assumes() {
+        let (dialer, listener) = (endpoint(1, false), endpoint(2, true));
+        let (d, _l) = handshaken(&dialer, &listener).await;
+        let connection = d.connection.clone();
+        let empty = connection.datagram_send_buffer_space();
+        assert_eq!(
+            crate::side::DATAGRAM_SEND_BUFFER - empty,
+            crate::side::DATAGRAM_RECORD,
+            "an empty send buffer is configured at DATAGRAM_SEND_BUFFER and reports one record taken"
+        );
+        connection
+            .send_datagram(Bytes::from(vec![0x05u8; 1000]))
+            .unwrap();
+        assert_eq!(
+            empty - connection.datagram_send_buffer_space(),
+            1000 + crate::side::DATAGRAM_RECORD,
+            "a queued datagram takes its payload and one record"
+        );
+    }
 }
