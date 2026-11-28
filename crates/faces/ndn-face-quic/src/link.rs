@@ -1411,6 +1411,56 @@ mod tests {
         }
     }
 
+    /// A peer that starts a channel record (the length prefix, or the prefix and some of the
+    /// octets) and then sends nothing holds the stream's reader, the permit for the length it
+    /// named and the buffer it asked for for as long as the link stays up (security review F4 of
+    /// the stream lane). A record the peer does not finish within the link's stall bound ends the
+    /// stream, counted `dropped_malformed`: the link stays up, and so do its NDN packets.
+    #[tokio::test]
+    async fn a_channel_record_the_peer_leaves_half_written_ends_its_stream() {
+        let (dialer, listener) = (endpoint(1, false), endpoint(2, true));
+        for (what, written) in [
+            ("half a length prefix", vec![0, 0]),
+            ("a length prefix and no octets", vec![0, 0, 0, 10]),
+            (
+                "a length prefix and some octets",
+                vec![0, 0, 0, 10, SIDE_MARKER, 1],
+            ),
+        ] {
+            let (mut d, mut l) = handshaken(&dialer, &listener).await;
+            let raw = d.connection.clone();
+            hellos(&mut d, &mut l, (hello(1), hello(1))).await;
+            let (a, b) = admitted(d, l, (carrying(), carrying())).await;
+            b.handle.set_stream_stall(Duration::from_millis(300));
+            let mut stream = tokio::time::timeout(T, raw.open_uni())
+                .await
+                .unwrap()
+                .unwrap();
+            stream.write_all(&written).await.unwrap();
+            let start = std::time::Instant::now();
+            while b.handle.side_stats().dropped_malformed == 0 {
+                assert!(
+                    start.elapsed() < T,
+                    "{what}, then silence: the stream was not ended"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(
+                !a.handle.is_closed() && !b.handle.is_closed(),
+                "the link stays up"
+            );
+            let pkt = Bytes::from_static(&[0x05, 0x03, 0x07, 0x01, 0x41]);
+            a.face.send_bytes(pkt.clone()).await.unwrap();
+            assert_eq!(
+                tokio::time::timeout(T, b.face.recv_bytes())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                pkt
+            );
+        }
+    }
+
     /// The peer's channel stream is the one it was granted: when it finishes, or is reset,
     /// quinn must not hand the peer the credit for a second (the carrier reads one stream
     /// and never accepts another, so a second would only let the peer buffer a flow-control

@@ -184,3 +184,19 @@ async fn a_reliable_flood_into_a_consumer_that_is_not_reading_is_held_back_never
     );
     assert!(r.stream_held >= 1, "{r:?}");
 }
+
+/// The forwarder's wait for room at a sink ends well before a peer's write finds the link
+/// without progress. A lane holds the stream's inbox full while it waits, so the peer's writer
+/// sees no credit for as long as the wait lasts; if the wait were as long as `STREAM_STALL`, the
+/// peer would close the link first, and an honest sender would lose its link to a third party's
+/// sink that does not read (security review F2 of the stream lane). The wait is at most a third
+/// of the bound, so one wait, its release and the drain after it fit in it with room to spare.
+#[test]
+fn the_lanes_wait_for_a_sink_ends_well_before_the_peers_write_stall() {
+    assert!(
+        ndn_engine::side::STREAM_HOLD_MAX * 3 <= ndn_face_quic::STREAM_STALL,
+        "the lane waits {:?} for a sink; the peer's writer closes the link after {:?}",
+        ndn_engine::side::STREAM_HOLD_MAX,
+        ndn_face_quic::STREAM_STALL
+    );
+}

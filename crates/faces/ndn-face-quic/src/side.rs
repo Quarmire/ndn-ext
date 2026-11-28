@@ -124,6 +124,10 @@ pub const STREAM_QUEUE_MAX: usize = 4 * 1024 * 1024;
 /// side-stream task stops reading, and QUIC flow control slows the peer.
 const INBOX_BYTES: usize = 4 * 1024 * 1024;
 
+// The permit for a record is taken at its length prefix, and `acquire_many_owned` of more than the
+// whole budget would wait for ever.
+const _: () = assert!(STREAM_FRAME_MAX <= INBOX_BYTES);
+
 /// Octets one write of the stream writer task takes from its queue (frames are
 /// not split, so a write may pass this by one frame).
 const WRITE_BATCH: usize = 256 * 1024;
@@ -1130,7 +1134,28 @@ async fn side_stream(side: Arc<SideCarrier>, face: FaceId, inbox: mpsc::Sender<I
             }
         }
         // More octets: one read takes what the stream has (a chunk, which may hold many records).
-        match recv.read_chunk(READ_CHUNK, true).await {
+        // A record begun (the prefix, or the prefix and some octets) is held in this task along
+        // with the permit for the length it named and the buffer asked for: the peer finishes it
+        // within the link's stall bound or its stream ends. Only this wait counts: the time
+        // spent handing a frame on (the inbox, the quota) is the face's, not the peer's.
+        let read = recv.read_chunk(READ_CHUNK, true);
+        let read = if head_len != 0 || record.is_some() {
+            match tokio::time::timeout(side.stream_stall(), read).await {
+                Ok(read) => read,
+                Err(_) => {
+                    bump(&side.counters.dropped_malformed);
+                    stop_stream(
+                        face,
+                        &mut recv,
+                        "a channel record the peer left half written",
+                    );
+                    return;
+                }
+            }
+        } else {
+            read.await
+        };
+        match read {
             Ok(Some(next)) => chunk = next.bytes,
             // The peer finished its stream: between two records, or inside one.
             Ok(None) => {
