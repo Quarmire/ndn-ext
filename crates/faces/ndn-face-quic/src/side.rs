@@ -986,19 +986,18 @@ impl SideCarrier {
         true
     }
 
-    /// The next frame the stream delivered. Pending for good once the stream
-    /// reader has ended: a link whose stream broke still reads datagrams.
-    pub(crate) async fn next_stream_frame(&self) -> Bytes {
+    /// The next frame the stream delivered; `None` once the stream reader has ended (the
+    /// link still reads datagrams). Pending while the link has no stream reader.
+    pub(crate) async fn next_stream_frame(&self) -> Option<Bytes> {
         let mut rx = self.stream_rx.lock().await;
-        match rx.recv().await {
-            Some((frame, _permit)) => frame,
-            None => std::future::pending().await,
-        }
+        rx.recv().await.map(|(frame, _permit)| frame)
     }
 
-    /// Whether this link has a stream reader.
-    pub(crate) fn reads_stream(&self) -> bool {
-        self.enabled()
+    /// Whether the stream's frames reach the face through its own lane
+    /// ([`next_stream_frame`](Self::next_stream_frame)): both hellos carried the capability and
+    /// this side's policy carries. Fixed for the life of the link.
+    pub(crate) fn stream_lane(&self) -> bool {
+        self.peer_caps && self.our_caps && self.carry
     }
 
     fn close_protocol(&self, text: &str) {

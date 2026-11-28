@@ -360,12 +360,19 @@ async fn the_acks_of_a_burst_reach_the_peer_in_datagrams_that_fit() {
     assert_eq!(acked, BURST);
 }
 
-/// The next frame `face` delivers.
+/// The next frame `face` delivers on either of its readers: `recv_bytes` (NDN packets and
+/// datagram frames) or the channel stream's lane (`recv_side_stream`, which the forwarder reads
+/// apart so that it can wait for room at a sink without holding the rest back).
 async fn recv(face: &ndn_face_quic::LinkFace) -> Bytes {
-    tokio::time::timeout(T, face.recv_bytes())
-        .await
-        .unwrap()
-        .unwrap()
+    tokio::time::timeout(T, async {
+        tokio::select! {
+            wire = face.recv_bytes() => wire,
+            frame = face.recv_side_stream() => frame,
+        }
+    })
+    .await
+    .unwrap()
+    .unwrap()
 }
 
 /// The listener admits the dialer on an enrollment link: Interests under

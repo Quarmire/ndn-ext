@@ -1012,15 +1012,15 @@ impl LinkFace {
         }
     }
 
-    /// `recv_bytes` of a link with more than the datagram reader to listen to:
-    /// the Nacks this side's scope answers itself with, and the frames the
-    /// side stream delivered.
+    /// `recv_bytes` of a link that also listens for the Nacks its scope answers itself with.
+    /// (The channel stream's frames are not read here: they have a lane of their own,
+    /// [`recv_side_stream`](Transport::recv_side_stream), so that waiting for room at a sink can
+    /// never hold back what this reads.)
     async fn recv_bytes_from_all(&self) -> Result<Bytes, FaceError> {
         let mut answers = match &self.local_answers {
             Some((_, answers)) => Some(answers.lock().await),
             None => None,
         };
-        let streams = self.side.reads_stream();
         loop {
             let datagram = self.read_datagram();
             tokio::pin!(datagram);
@@ -1053,7 +1053,6 @@ impl LinkFace {
                         return Ok(answer);
                     }
                 }
-                frame = self.side.next_stream_frame(), if streams => return Ok(frame),
             }
         }
     }
@@ -1110,7 +1109,7 @@ impl Transport for LinkFace {
     }
 
     async fn recv_bytes(&self) -> Result<Bytes, FaceError> {
-        if self.local_answers.is_some() || self.side.reads_stream() {
+        if self.local_answers.is_some() {
             return self.recv_bytes_from_all().await;
         }
         loop {
@@ -1141,6 +1140,20 @@ impl Transport for LinkFace {
 
     fn side_room_for(&self, frame: &[u8], class: SideClass) -> bool {
         self.side.room_for(frame.len(), class)
+    }
+
+    /// The channel stream's frames come through [`recv_side_stream`](Self::recv_side_stream),
+    /// not `recv_bytes`, on a link that can carry them.
+    fn side_stream_lane(&self) -> bool {
+        self.side.stream_lane()
+    }
+
+    /// The next frame of the peer's channel stream, in order. Not taking one is the back
+    /// pressure: the stream's reader task stops at its inbox bound, stops reading the
+    /// connection's stream, and flow control slows the peer, whose write then
+    /// closes the link after [`STREAM_STALL`](crate::STREAM_STALL) without progress.
+    async fn recv_side_stream(&self) -> Result<Bytes, FaceError> {
+        self.side.next_stream_frame().await.ok_or(FaceError::Closed)
     }
 }
 
@@ -1419,7 +1432,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(
-                tokio::time::timeout(T, b.face.recv_bytes())
+                tokio::time::timeout(T, b.face.recv_side_stream())
                     .await
                     .unwrap()
                     .unwrap(),

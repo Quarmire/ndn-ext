@@ -446,15 +446,32 @@ impl Mesh {
         }
     }
 
+    /// The links of the mesh, in the order they were made: with a relay, the relay's link to
+    /// the sender and then one to each receiver; without one, the receiver's link to the sender
+    /// (`a_face` at the receiver's forwarder, `b_face` at the sender's).
+    pub fn joined(&self) -> &[Joined] {
+        &self._eps
+    }
+
     /// `asker` asks `sender`'s device for its channel (on `rt`, the asker's runtime, so that the
     /// session's tasks run there) until it answers: the space's record takes a moment to reach
     /// the asker, over the links.
     pub async fn ask(rt: &Handle, asker: &Node, sender: &Node) -> ndn_heap::ChannelInfo {
+        Self::ask_in(rt, asker, sender, ndn_heap::ChannelMode::Latest).await
+    }
+
+    /// [`ask`](Self::ask) for a channel of `mode`.
+    pub async fn ask_in(
+        rt: &Handle,
+        asker: &Node,
+        sender: &Node,
+        mode: ndn_heap::ChannelMode,
+    ) -> ndn_heap::ChannelInfo {
         let (asker, sender) = (asker.handle(), sender.name().clone());
         rt.spawn(async move {
             let start = Instant::now();
             loop {
-                match asker.ask_channel(&space(), &sender).await {
+                match asker.ask_channel_in(&space(), &sender, mode).await {
                     Ok(info) => return info,
                     Err(e) if start.elapsed() < Duration::from_secs(30) => {
                         let _ = e;

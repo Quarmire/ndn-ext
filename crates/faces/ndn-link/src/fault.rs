@@ -503,6 +503,14 @@ impl Transport for Faulted {
     fn side_room_for(&self, frame: &[u8], class: ndn_transport::SideClass) -> bool {
         self.inner.side_room_for(frame, class)
     }
+    fn side_stream_lane(&self) -> bool {
+        self.inner.side_stream_lane()
+    }
+    /// The channel stream is not subject to the plan: its frames are in order and lossless by
+    /// the stream's own guarantee, so it is passed through as the inner link delivers it.
+    async fn recv_side_stream(&self) -> Result<Bytes, FaceError> {
+        self.inner.recv_side_stream().await
+    }
 
     fn set_send_mtu(&self, mtu: Option<u64>) -> Result<Option<u64>, MtuError> {
         self.inner.set_send_mtu(mtu)
