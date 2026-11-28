@@ -5,7 +5,7 @@
 //! whose frames travel over ONE direct QUIC link on loopback: `Carrier` is an adapter over
 //! `LinkFace::forward_side` (datagrams, refused `Full` by the link's headroom rule),
 //! `LinkFace::send_side` (the stream) and `SideLimits`; frames come in by `LinkFace::recv_bytes`
-//! and `NodeHandle::deliver_frame`. The two nodes share one forwarder (a third runtime, `ctl`) for
+//! and `LinkFace::recv_side_stream` (the stream's own lane) and `NodeHandle::deliver_frame`. The two nodes share one forwarder (a third runtime, `ctl`) for
 //! the space's sync and the ask, so the setup's Interests do not cross the link; the frames do.
 //!
 //! Rows (`only`, comma separated):
@@ -631,9 +631,15 @@ struct Ctx {
     rt_rx: Arc<tokio::runtime::Runtime>,
 }
 
-/// Frames Carol reads off her end of the link go to her node, and Bob's to his.
+/// Frames Carol reads off her end of the link go to her node, and Bob's to his: NDN packets and
+/// datagram frames from `recv_bytes`, the channel stream's frames from `recv_side_stream`.
 async fn reader(link: Arc<Link>, node: NodeHandle, ingress: u64, dropped: Arc<AtomicU64>) {
-    while let Ok(frame) = link.face.recv_bytes().await {
+    loop {
+        let frame = tokio::select! {
+            wire = link.face.recv_bytes() => wire,
+            frame = link.face.recv_side_stream() => frame,
+        };
+        let Ok(frame) = frame else { break };
         if let Delivery::Dropped(_) = node.deliver_frame(frame, ingress).await {
             dropped.fetch_add(1, Ordering::Relaxed);
         }
