@@ -485,6 +485,33 @@ impl SideCarrier {
         }
     }
 
+    /// [`room`](Self::room) for a frame of `len` octets: what `forward` would answer for it
+    /// without taking it. The datagram class as `room` says and, where the link has a quota,
+    /// the quota's bucket holds enough for it ([`FairMember::would_admit`](crate::scope::FairMember::would_admit),
+    /// which spends nothing); the stream class while the queue holds this frame under its bound
+    /// (`room` only asks that the queue is under it) and the quota holds enough. A sender told
+    /// `Full` by the first hop keeps the frame and offers it again when this says room: a frame
+    /// this read said room for and `forward` refused would be lost there, counted `sink_full`
+    /// or `dropped_over_quota`.
+    pub(crate) fn room_for(&self, len: usize, class: SideClass) -> bool {
+        let fits = match class {
+            SideClass::Datagram => self.queued() < self.headroom(),
+            SideClass::Stream => {
+                self.queue
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .octets
+                    + len
+                    + 4
+                    <= STREAM_QUEUE_MAX
+            }
+        };
+        fits && self
+            .quota
+            .as_ref()
+            .is_none_or(|quota| quota.would_admit(Flow::Tx, len))
+    }
+
     /// Octets waiting in the connection's datagram send buffer, by the connection's own count
     /// (payload and [`DATAGRAM_RECORD`] for each queued datagram): the size the transport
     /// configuration gives the buffer less the space it reports and less the one record it

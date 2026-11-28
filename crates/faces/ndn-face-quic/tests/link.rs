@@ -1461,6 +1461,59 @@ async fn a_pools_flood_never_charges_an_own_link_that_has_no_quota() {
     );
 }
 
+/// A frame the link's quota would refuse is not room (`side_room_for`), so the first hop holds
+/// it back for its sender instead of handing it over to be dropped and counted
+/// `dropped_over_quota`; the bucket's refill makes room again. `side_room` without a frame is
+/// the queue's alone and still says yes.
+#[tokio::test]
+async fn room_for_a_frame_says_no_where_the_quota_would_refuse_it() {
+    let pool = FairShare::new(4000, 100, Duration::from_secs(1));
+    let granted_admission = Admission {
+        channel: ChannelPolicy {
+            carry: true,
+            quota: Some(pool.clone()),
+        },
+        ..Admission::default()
+    };
+    let (gd, gl) = (endpoint(ed_key(1), false), endpoint(ec_key(2), true));
+    let (_peer, granted) = link_with(
+        &gd,
+        &gl,
+        (hello(1), carrying()),
+        (hello(2), granted_admission),
+    )
+    .await;
+    // A second member of the pool is active: the granted link has a bucket of 2,000 a second.
+    let rival = pool.join();
+    assert!(rival.admit(ndn_face_quic::Flow::Rx, 1).is_ok());
+
+    let f = frame(0, 1000);
+    assert!(granted.face.side_room_for(&f, SideClass::Datagram));
+    let mut sent = 0;
+    while granted
+        .face
+        .forward_side(f.clone(), SideClass::Datagram)
+        .is_ok()
+    {
+        sent += 1;
+        assert!(sent < 20, "the quota never refused");
+    }
+    assert!(sent >= 2, "the burst of a share went out: {sent}");
+    assert!(
+        !granted.face.side_room_for(&f, SideClass::Datagram),
+        "forward refused the frame for the quota and the room read said yes"
+    );
+    assert!(
+        granted.face.side_room(SideClass::Datagram),
+        "the queue has room: only the quota refuses"
+    );
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert!(
+        granted.face.side_room_for(&f, SideClass::Datagram),
+        "the bucket refilled"
+    );
+}
+
 #[tokio::test]
 async fn a_channel_stream_carries_frames_in_order_both_ways_on_the_links_connection() {
     const FRAMES: u32 = 120;

@@ -1129,6 +1129,10 @@ impl Transport for LinkFace {
     fn side_room(&self, class: SideClass) -> bool {
         self.side.room(class)
     }
+
+    fn side_room_for(&self, frame: &[u8], class: SideClass) -> bool {
+        self.side.room_for(frame.len(), class)
+    }
 }
 
 #[cfg(test)]
