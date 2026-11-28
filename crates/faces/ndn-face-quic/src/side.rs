@@ -1037,43 +1037,67 @@ async fn side_stream(side: Arc<SideCarrier>, face: FaceId, inbox: mpsc::Sender<I
     // ever accept it (the peer could buffer a flow-control window of bytes nobody reads).
     side.connection
         .set_max_concurrent_uni_streams(VarInt::from_u32(0));
-    let mut buf = BytesMut::new();
+    // The record's length prefix, as far as it has been read.
+    let mut head = [0u8; 4];
+    let mut head_len = 0usize;
+    // The record being read: the buffer its octets go into (allocated once, at its length, and
+    // handed on as the frame: a frame the reader has not taken yet pins its own octets and not
+    // a buffer they were read into, and no octet is copied twice), its length and its permit.
+    let mut record: Option<(BytesMut, usize, OwnedSemaphorePermit)> = None;
+    // What is left of the last chunk the stream gave: a slice of quinn's own buffer, not a copy.
+    let mut chunk = Bytes::new();
     loop {
         if !side.carrying() {
             bump(&side.counters.refused);
             stop_stream(face, &mut recv, "the link no longer carries channel frames");
             return;
         }
-        // Every record that is whole in `buf`.
-        while buf.len() >= 4 {
-            let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-            if len > STREAM_FRAME_MAX {
-                bump(&side.counters.dropped_malformed);
-                side.close_protocol(&format!(
-                    "your device sent a channel frame of {len} bytes on the channel stream, over the \
-                     {STREAM_FRAME_MAX} bytes this device grants"
-                ));
-                return;
-            }
-            if len == 0 {
-                bump(&side.counters.dropped_malformed);
-                stop_stream(face, &mut recv, "a channel record of no octets");
-                return;
-            }
-            if buf.len() < 4 + len {
+        // Every octet of the chunk: the rest of a length prefix, the rest of a record, whole
+        // records.
+        while !chunk.is_empty() {
+            let Some((buf, len, _)) = record.as_mut() else {
+                let take = (4 - head_len).min(chunk.len());
+                head[head_len..head_len + take].copy_from_slice(&chunk[..take]);
+                head_len += take;
+                chunk.advance(take);
+                if head_len < 4 {
+                    break;
+                }
+                head_len = 0;
+                let len = u32::from_be_bytes(head) as usize;
+                if len > STREAM_FRAME_MAX {
+                    bump(&side.counters.dropped_malformed);
+                    side.close_protocol(&format!(
+                        "your device sent a channel frame of {len} bytes on the channel stream, over the \
+                         {STREAM_FRAME_MAX} bytes this device grants"
+                    ));
+                    return;
+                }
+                if len == 0 {
+                    bump(&side.counters.dropped_malformed);
+                    stop_stream(face, &mut recv, "a channel record of no octets");
+                    return;
+                }
+                let permit = tokio::select! {
+                    permit = Arc::clone(&side.inbox_budget).acquire_many_owned(len as u32) => match permit {
+                        Ok(permit) => permit,
+                        Err(_) => return,
+                    },
+                    _ = side.connection.closed() => return,
+                };
+                record = Some((BytesMut::with_capacity(len), len, permit));
+                continue;
+            };
+            let take = (*len - buf.len()).min(chunk.len());
+            buf.extend_from_slice(&chunk[..take]);
+            chunk.advance(take);
+            if buf.len() < *len {
                 break;
             }
-            let permit = tokio::select! {
-                permit = Arc::clone(&side.inbox_budget).acquire_many_owned(len as u32) => match permit {
-                    Ok(permit) => permit,
-                    Err(_) => return,
-                },
-                _ = side.connection.closed() => return,
+            let Some((buf, len, permit)) = record.take() else {
+                return;
             };
-            // A copy of its own: a frame the reader has not taken yet pins its
-            // own octets and not the buffer they were read into.
-            let frame = Bytes::copy_from_slice(&buf[4..4 + len]);
-            buf.advance(4 + len);
+            let frame = buf.freeze();
             if frame[0] != SIDE_MARKER {
                 bump(&side.counters.dropped_malformed);
                 stop_stream(
@@ -1105,12 +1129,12 @@ async fn side_stream(side: Arc<SideCarrier>, face: FaceId, inbox: mpsc::Sender<I
                 return;
             }
         }
-        // More octets: one read takes what the stream has, many records at a time.
+        // More octets: one read takes what the stream has (a chunk, which may hold many records).
         match recv.read_chunk(READ_CHUNK, true).await {
-            Ok(Some(chunk)) => buf.extend_from_slice(&chunk.bytes),
+            Ok(Some(next)) => chunk = next.bytes,
             // The peer finished its stream: between two records, or inside one.
             Ok(None) => {
-                if !buf.is_empty() {
+                if head_len != 0 || record.is_some() {
                     bump(&side.counters.dropped_malformed);
                 }
                 return;
